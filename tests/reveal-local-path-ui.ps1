@@ -126,6 +126,21 @@ function Send-PowerShellLine([string]$Line) {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Line + [char]13))
     $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64',$encoded)
 }
+function Read-ExplorerTrace {
+    try {
+        # The app publishes this JSON with an atomic rename on NTFS.
+        $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $trace = [IO.File]::Open($env:W11TERM_TEST_EXPLORER_TRACE, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, $sharing)
+    } catch [IO.FileNotFoundException] {
+        return
+    } catch [IO.IOException] {
+        if (($_.Exception.HResult -band 0xffff) -in 32,33) { return }
+        throw
+    }
+    $reader = [IO.StreamReader]::new($trace)
+    try { $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+}
 function Find-HintText([string]$Pattern) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $texts = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -175,9 +190,7 @@ try {
     [IO.File]::WriteAllText($target, $payload)
     Press-Key 0x52 # retry the same selection
     $trace = Wait-Until "the native Shell selection call ($diagnostics)" {
-        if ([IO.File]::Exists($env:W11TERM_TEST_EXPLORER_TRACE)) {
-            [IO.File]::ReadAllText($env:W11TERM_TEST_EXPLORER_TRACE) | ConvertFrom-Json
-        }
+        Read-ExplorerTrace
     }
     if (!$trace.path -or $null -eq $trace.hresult -or [IO.Path]::GetFileName($trace.path) -ne 'trace.rs' -or
         [IO.File]::ReadAllText($trace.path) -cne $payload) {
@@ -228,7 +241,7 @@ try {
         if ($entry -and $entry.Current.IsEnabled) { $entry }
     })
     $trace = Wait-Until 'Explorer folder handoff for the reported PowerShell directory' {
-        $result = [IO.File]::ReadAllText($env:W11TERM_TEST_EXPLORER_TRACE) | ConvertFrom-Json
+        $result = Read-ExplorerTrace
         if ($result.action -eq 'explore') { $result }
     }
     if (!$trace.path -or ![IO.File]::Exists((Join-Path $trace.path $proof))) {

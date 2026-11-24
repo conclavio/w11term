@@ -117,6 +117,7 @@ struct Review {
     name: String,
     members: Vec<Member>,
     sets: SshRecipientSets,
+    roster_defaults: SshRosterDefaults,
     selected_set: Option<String>,
     feedback: String,
 }
@@ -223,6 +224,25 @@ impl Review {
         }
         Ok(())
     }
+
+    fn window_members(&self, catalog: &Profiles) -> Result<Vec<(String, SshOptions)>> {
+        self.validate_profiles(catalog)?;
+        self.members
+            .iter()
+            .filter(|member| member.included)
+            .map(|member| {
+                ensure!(
+                    member.choice.is_none(),
+                    "Choose new panes for all included hosts to open a new window."
+                );
+                let options = member
+                    .options
+                    .clone()
+                    .context("The reviewed SSH profile is unavailable")?;
+                Ok((member.profile.clone(), options))
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -233,11 +253,31 @@ pub(super) struct State {
     filter: filter::Filter,
     page: usize,
     set_editor: Option<SetEditor>,
+    login_limit: SshGroupParallelLimit,
 }
 
 enum SetEditor {
     New(String),
     Update(Option<String>),
+    Manage(ManageSet),
+}
+
+#[derive(Default)]
+struct ManageSet {
+    selected: Option<String>,
+    name: String,
+    confirm_delete: bool,
+}
+
+impl ManageSet {
+    fn rename_target(&self, review: &Review) -> Option<&str> {
+        let name = self.name.trim();
+        (self.selected.is_some()
+            && !self.confirm_delete
+            && !name.is_empty()
+            && !review.sets.contains_key(name))
+        .then_some(name)
+    }
 }
 
 impl SetEditor {
@@ -275,16 +315,36 @@ pub enum Change {
     IncludeMatches(Vec<usize>, MatchSelection),
     ChooseMatches(Vec<usize>, ConnectionSelection),
     RecipientSet(String),
-    Approve(Vec<Launch>, Option<String>),
+    LoginLimit(SshGroupParallelLimit),
+    SaveLoginLimit(SshGroupParallelLimit),
+    Approve(
+        Vec<Launch>,
+        Option<String>,
+        LaunchLocation,
+        SshGroupParallelLimit,
+    ),
     Export(Vec<Launch>, Option<String>),
     BeginSaveSet,
     BeginUpdateSet,
+    BeginManageSets,
     SetName(String),
     SetTarget(String),
     SaveSet(String),
+    RenameSet {
+        from: String,
+        to: String,
+    },
+    ConfirmDeleteSet(String),
+    DeleteSet(String),
     BackFromSet,
     Refresh,
     Back,
+}
+
+#[derive(Clone, Copy)]
+pub enum LaunchLocation {
+    Tab,
+    Window,
 }
 
 #[derive(Clone, Copy)]
@@ -322,6 +382,13 @@ impl State {
     }
 
     fn replace(&mut self, review: Review) {
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|previous| self.login_limit == previous.roster_defaults.login_limit)
+        {
+            self.login_limit = review.roster_defaults.login_limit;
+        }
         self.revision += 1;
         self.review = Some(Box::new(review));
     }
@@ -330,6 +397,7 @@ impl State {
         self.filter.clear();
         self.page = 0;
         self.set_editor = None;
+        self.login_limit = review.roster_defaults.login_limit;
         self.replace(review);
     }
 
@@ -422,6 +490,9 @@ impl State {
         let selected_set = review.selected_set.clone();
         let export_offer = offered.clone();
         let export_set = selected_set.clone();
+        let window_offer = offered.clone();
+        let window_set = selected_set.clone();
+        let login_limit = self.login_limit;
         let set_names: Vec<_> = review
             .sets
             .iter()
@@ -519,6 +590,17 @@ impl State {
                             .font_size(24.0)
                             .text(format!("Review SSH group · {}", review.name)),
                         TextBlock::new().text(counts),
+                        StackPanel::new()
+                            .spacing(8.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                parallel_limit::picker("Parallel SSH logins", login_limit, true, move |limit| action(Change::LoginLimit(limit)), ctx),
+                                Button::new()
+                                    .automation_name("Save login limit")
+                                    .is_enabled(login_limit != review.roster_defaults.login_limit)
+                                    .on_click(ctx.callback(move |_| action(Change::SaveLoginLimit(login_limit))))
+                                    .content("Save as default"),
+                            )),
                         TextBox::new()
                             .automation_name("Find launch profiles")
                             .placeholder_text("Filter by profile name or SSH address")
@@ -561,6 +643,7 @@ impl State {
                                     ComboBox::new()
                                         .automation_name("Launch recipient set")
                                         .placeholder_text("Choose a recipient set")
+                                        .max_width(240.0)
                                         .items_source(set_names.clone())
                                         .selected_index(selected)
                                         .on_selection_changed(ctx.callback(
@@ -589,6 +672,15 @@ impl State {
                                         )
                                         .content("Update recipient set…")
                                 },
+                                if review.sets.is_empty() {
+                                    View::empty()
+                                } else {
+                                    Button::new()
+                                        .on_click(
+                                            ctx.callback(move |_| action(Change::BeginManageSets)),
+                                        )
+                                        .content("Manage sets…")
+                                },
                             )),
                         StackPanel::new()
                             .spacing(8.0)
@@ -601,6 +693,8 @@ impl State {
                                         action(Change::Approve(
                                             offered.clone(),
                                             selected_set.clone(),
+                                            LaunchLocation::Tab,
+                                            login_limit,
                                         ))
                                     }))
                                     .content("Open reviewed group"),
@@ -619,6 +713,31 @@ impl State {
                                 Button::new()
                                     .on_click(ctx.callback(move |_| action(Change::Back)))
                                     .content("Cancel"),
+                            )),
+                        StackPanel::new()
+                            .spacing(8.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                Button::new()
+                                    .is_enabled(reuse == 0 && new > 0)
+                                    .on_click(ctx.callback(move |_| {
+                                        action(Change::Approve(
+                                            window_offer.clone(),
+                                            window_set.clone(),
+                                            LaunchLocation::Window,
+                                            login_limit,
+                                        ))
+                                    }))
+                                    .content("Open reviewed group in new window"),
+                                if reuse == 0 {
+                                    View::empty()
+                                } else {
+                                    TextBlock::new()
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .text("Choose new panes for all included hosts to open a new window.")
+                                        .text_wrapping(TextWrapping::Wrap)
+                                        .into()
+                                },
                             )),
                         if filtered {
                             StackPanel::new()
@@ -692,6 +811,31 @@ impl State {
     }
 }
 
+fn existing_set_picker(
+    review: &Review,
+    selected: Option<&str>,
+    action: impl Fn(Change) -> Message + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let names: Vec<_> = review.sets.keys().cloned().collect();
+    let index = names
+        .iter()
+        .position(|name| Some(name.as_str()) == selected);
+    ComboBox::new()
+        .automation_name("Existing recipient set")
+        .placeholder_text("Choose a recipient set")
+        .items_source(names.clone())
+        .selected_index(index)
+        .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+            index
+                .and_then(|index| names.get(index))
+                .map_or(Message::ControlIdle, |name| {
+                    action(Change::SetTarget(name.clone()))
+                })
+        }))
+        .into()
+}
+
 fn save_set_view(
     review: &Review,
     editor: &SetEditor,
@@ -716,25 +860,9 @@ fn save_set_view(
         ),
         SetEditor::Update(selected) => {
             let previous = selected.as_ref().and_then(|name| review.sets.get(name));
-            let names: Vec<_> = review.sets.keys().cloned().collect();
-            let index = names
-                .iter()
-                .position(|name| Some(name) == selected.as_ref());
             (
                 "Update recipient set",
-                ComboBox::new()
-                    .automation_name("Existing recipient set")
-                    .placeholder_text("Choose a recipient set")
-                    .items_source(names.clone())
-                    .selected_index(index)
-                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                        index
-                            .and_then(|index| names.get(index))
-                            .map_or(Message::ControlIdle, |name| {
-                                action(Change::SetTarget(name.clone()))
-                            })
-                    }))
-                    .into(),
+                existing_set_picker(review, selected.as_deref(), action, ctx),
                 previous,
                 if previous.is_some() && editor.target(review).is_none() {
                     "The included profiles already match this set."
@@ -743,6 +871,7 @@ fn save_set_view(
                 },
             )
         }
+        SetEditor::Manage(editor) => return manage_set_view(review, editor, action, ctx),
     };
     let feedback = if review.feedback.is_empty() {
         hint
@@ -824,6 +953,96 @@ fn save_set_view(
                         .is_text_selection_enabled(true)
                         .text_wrapping(TextWrapping::Wrap),
                 )),
+            ),
+        ))
+}
+
+fn manage_set_view(
+    review: &Review,
+    editor: &ManageSet,
+    action: impl Fn(Change) -> Message + Copy + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let selected = editor.selected.as_deref();
+    let rename = selected.zip(editor.rename_target(review));
+    let rename = rename.map(|(from, to)| (from.to_owned(), to.to_owned()));
+    let can_rename = rename.is_some();
+    let delete = editor.selected.clone();
+    let confirm_delete = editor.confirm_delete;
+    let feedback = if !review.feedback.is_empty() {
+        review.feedback.clone()
+    } else if let Some(name) = selected.filter(|_| confirm_delete) {
+        format!("Delete recipient set {name}? Your current launch choices will stay selected.")
+    } else if review.sets.contains_key(editor.name.trim()) {
+        "A recipient set with this name already exists.".to_owned()
+    } else {
+        String::new()
+    };
+    let profiles = selected
+        .and_then(|name| review.sets.get(name))
+        .map(|names| names.join("\n"))
+        .unwrap_or_default();
+    Grid::new()
+        .margin(16.0)
+        .row_spacing(8.0)
+        .rows([GridLength::Auto, GridLength::STAR])
+        .children((
+            StackPanel::new().spacing(8.0).children((
+                TextBlock::new()
+                    .font_size(24.0)
+                    .text(format!("Manage recipient sets · {}", review.name)),
+                existing_set_picker(review, selected, action, ctx),
+                TextBox::new()
+                    .automation_name("New recipient set name")
+                    .placeholder_text("New recipient set name")
+                    .is_enabled(selected.is_some())
+                    .text(&editor.name)
+                    .on_text_changed(ctx.callback(move |name| action(Change::SetName(name)))),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .is_enabled(can_rename)
+                            .on_click(ctx.callback(move |_| {
+                                rename.as_ref().map_or(Message::ControlIdle, |(from, to)| {
+                                    action(Change::RenameSet {
+                                        from: from.clone(),
+                                        to: to.clone(),
+                                    })
+                                })
+                            }))
+                            .content("Rename recipient set"),
+                        Button::new()
+                            .is_enabled(selected.is_some())
+                            .on_click(ctx.callback(move |_| {
+                                delete.as_ref().map_or(Message::ControlIdle, |name| {
+                                    action(if confirm_delete {
+                                        Change::DeleteSet(name.clone())
+                                    } else {
+                                        Change::ConfirmDeleteSet(name.clone())
+                                    })
+                                })
+                            }))
+                            .content(if confirm_delete {
+                                "Confirm delete recipient set"
+                            } else {
+                                "Delete recipient set"
+                            }),
+                        Button::new()
+                            .on_click(ctx.callback(move |_| action(Change::BackFromSet)))
+                            .content("Back to launch review"),
+                    )),
+                TextBlock::new()
+                    .text(feedback)
+                    .text_wrapping(TextWrapping::Wrap),
+            )),
+            ScrollViewer::new().grid_row(1).content(
+                TextBlock::new()
+                    .automation_name("Recipient set profiles")
+                    .text(profiles)
+                    .is_text_selection_enabled(true)
+                    .text_wrapping(TextWrapping::Wrap),
             ),
         ))
 }
@@ -1001,6 +1220,33 @@ impl TerminalApp {
                     review.feedback = format!("{error:#}");
                 }
             }
+            Change::LoginLimit(limit) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.saved.reuse.login_limit = limit;
+                }
+            }
+            Change::SaveLoginLimit(limit)
+                if state.login_limit == limit && review.roster_defaults.login_limit != limit =>
+            {
+                let name = review.name.clone();
+                let members = review.profiles();
+                let expected = review.roster_defaults;
+                let result =
+                    self.save_saved_group_login_limit(id, &name, &members, expected, limit);
+                if let Some(page) = self.host_group_mut(id)
+                    && let Some(review) = page.saved.reuse.review.as_mut()
+                {
+                    review.feedback = match result {
+                        Ok(()) => {
+                            review.roster_defaults.login_limit = limit;
+                            "Saved the parallel SSH login limit".into()
+                        }
+                        Err(error) => {
+                            format!("{error:#} Refresh the launch review before saving again.")
+                        }
+                    };
+                }
+            }
             Change::Refresh => {
                 let updated = self.saved_group_reuse_review(
                     review.name.clone(),
@@ -1018,10 +1264,20 @@ impl TerminalApp {
                     }
                 }
             }
-            Change::Approve(offered, set)
-                if review.choices() == offered && review.selected_set == set =>
+            Change::Approve(offered, set, location, limit)
+                if review.choices() == offered
+                    && review.selected_set == set
+                    && state.login_limit == limit =>
             {
-                if let Err(error) = self.open_group_reusing_connections(id, ctx)
+                let result = match location {
+                    LaunchLocation::Tab => {
+                        self.open_group_reusing_connections(id, limit.concurrency(), ctx)
+                    }
+                    LaunchLocation::Window => {
+                        self.open_reviewed_group_window(id, limit.concurrency(), ctx)
+                    }
+                };
+                if let Err(error) = result
                     && let Some(page) = self.host_group_mut(id)
                     && let Some(review) = page.saved.reuse.review.as_mut()
                 {
@@ -1043,15 +1299,20 @@ impl TerminalApp {
                     }
                 }
             }
-            change @ (Change::BeginSaveSet | Change::BeginUpdateSet)
-                if review.included_profiles().next().is_some() =>
-            {
-                let editor = if matches!(change, Change::BeginSaveSet) {
-                    SetEditor::New(String::new())
-                } else if !review.sets.is_empty() {
-                    SetEditor::Update(review.selected_set.clone())
-                } else {
-                    return;
+            change @ (Change::BeginSaveSet | Change::BeginUpdateSet | Change::BeginManageSets) => {
+                let has_included = review.included_profiles().next().is_some();
+                let editor = match change {
+                    Change::BeginSaveSet if has_included => SetEditor::New(String::new()),
+                    Change::BeginUpdateSet if has_included && !review.sets.is_empty() => {
+                        SetEditor::Update(review.selected_set.clone())
+                    }
+                    Change::BeginManageSets if !review.sets.is_empty() => {
+                        SetEditor::Manage(ManageSet {
+                            selected: review.selected_set.clone(),
+                            ..Default::default()
+                        })
+                    }
+                    _ => return,
                 };
                 if let Some(page) = self.host_group_mut(id) {
                     let state = &mut page.saved.reuse;
@@ -1075,16 +1336,94 @@ impl TerminalApp {
             return;
         };
         match change {
-            Change::SetName(text) if let SetEditor::New(name) = editor => {
-                *name = text;
+            Change::SetName(text) => match editor {
+                SetEditor::New(name) => {
+                    *name = text;
+                    review.feedback.clear();
+                }
+                SetEditor::Manage(edit) if edit.name != text => {
+                    edit.name = text;
+                    edit.confirm_delete = false;
+                    review.feedback.clear();
+                }
+                _ => {}
+            },
+            Change::SetTarget(name) if review.sets.contains_key(&name) => match editor {
+                SetEditor::Update(selected) => {
+                    *selected = Some(name);
+                    review.feedback.clear();
+                }
+                SetEditor::Manage(edit) if edit.selected.as_ref() != Some(&name) => {
+                    *edit = ManageSet {
+                        selected: Some(name),
+                        ..Default::default()
+                    };
+                    review.feedback.clear();
+                }
+                _ => {}
+            },
+            Change::ConfirmDeleteSet(name)
+                if let SetEditor::Manage(edit) = editor
+                    && edit.selected.as_ref() == Some(&name) =>
+            {
+                edit.confirm_delete = true;
                 review.feedback.clear();
             }
-            Change::SetTarget(name)
-                if review.sets.contains_key(&name)
-                    && let SetEditor::Update(selected) = editor =>
+            change @ (Change::RenameSet { .. } | Change::DeleteSet(_))
+                if let SetEditor::Manage(edit) = editor =>
             {
-                *selected = Some(name);
-                review.feedback.clear();
+                let (name, rename) = match change {
+                    Change::RenameSet { from, to } if edit.rename_target(review) == Some(&to) => {
+                        (from, Some(to))
+                    }
+                    Change::DeleteSet(name) if edit.confirm_delete => (name, None),
+                    _ => return,
+                };
+                let Some(expected) = review.sets.get(&name) else {
+                    return;
+                };
+                if edit.selected.as_ref() != Some(&name) {
+                    return;
+                }
+                let group = &review.name;
+                let group_members = review.profiles();
+                let saved = if let Some(new_name) = &rename {
+                    self.store.rename_ssh_recipient_set(
+                        group,
+                        &group_members,
+                        &name,
+                        expected,
+                        new_name,
+                    )
+                } else {
+                    self.store.change_ssh_recipient_set(
+                        group,
+                        &group_members,
+                        &name,
+                        Some(expected),
+                        None,
+                    )
+                };
+                match saved {
+                    Ok(catalog) => {
+                        if review.selected_set.as_ref() == Some(&name) {
+                            review.selected_set = rename.clone();
+                        }
+                        // Keep the reviewed membership of every other set for stale checks.
+                        let members = review.sets.remove(&name);
+                        review.feedback = if let Some((new_name, members)) = rename.zip(members) {
+                            let feedback = format!("Renamed recipient set {name} to {new_name}");
+                            review.sets.insert(new_name, members);
+                            feedback
+                        } else {
+                            format!("Deleted recipient set {name}")
+                        };
+                        state.set_editor = None;
+                        state.revision += 1;
+                        self.use_group_catalog(catalog);
+                    }
+                    Err(error) => review.feedback = format!("{error:#}"),
+                }
             }
             Change::BackFromSet => {
                 state.set_editor = None;
@@ -1147,6 +1486,7 @@ impl TerminalApp {
     ) -> Result<Review> {
         let catalog = self.load_expected_host_group(&name, &profiles)?;
         let targets = self.host_group_targets();
+        let roster_defaults = catalog.ssh_roster_defaults(&name);
         let sets = catalog
             .ssh_recipient_sets
             .get(&name)
@@ -1174,6 +1514,7 @@ impl TerminalApp {
             name,
             members,
             sets,
+            roster_defaults,
             selected_set: None,
             feedback: String::new(),
         };
@@ -1232,6 +1573,7 @@ impl TerminalApp {
     fn open_group_reusing_connections(
         &mut self,
         source_tab: TabId,
+        login_limit: Option<usize>,
         ctx: &ComponentContext<Self>,
     ) -> Result<()> {
         let Some(Page::HostGroup(page)) = self.tabs.get(source_tab).map(|tab| &tab.page) else {
@@ -1285,8 +1627,44 @@ impl TerminalApp {
         } else {
             self.new_host_group_tab(Some(&name))
         };
-        self.start_host_group_panes(id, reused, fresh, ctx);
+        self.start_host_group_panes(id, reused, fresh, PaneLaunch::Select, login_limit, ctx);
         self.remember_group_launch(id, &name, &profiles, skipped == 0, feedback);
+        Ok(())
+    }
+
+    fn open_reviewed_group_window(
+        &mut self,
+        source_tab: TabId,
+        login_limit: Option<usize>,
+        ctx: &ComponentContext<Self>,
+    ) -> Result<()> {
+        let Some(Page::HostGroup(page)) = self.tabs.get(source_tab).map(|tab| &tab.page) else {
+            return Ok(());
+        };
+        let Some(review) = page.saved.reuse.review.as_deref() else {
+            return Ok(());
+        };
+        let previous = page.saved.reuse.return_to;
+        let name = review.name.clone();
+        let profiles = review.profiles();
+        let catalog = self.load_expected_host_group(&name, &profiles)?;
+        let members = review.window_members(&catalog)?;
+        self.open_group_child_window(
+            WindowGroup {
+                name,
+                profiles,
+                members,
+                login_limit,
+            },
+            ctx,
+        )?;
+        self.use_group_catalog(catalog);
+        if let Some(previous) = previous {
+            self.tabs.select(previous);
+            self.close_tab(source_tab, ctx);
+        } else if let Some(page) = self.host_group_mut(source_tab) {
+            page.saved.reuse.review = None;
+        }
         Ok(())
     }
 }
@@ -1318,6 +1696,7 @@ mod tests {
                 Member::new("East retired".into(), None, Vec::new()),
             ],
             sets: SshRecipientSets::new(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: Some("Fleet".into()),
             feedback: String::new(),
         });
@@ -1387,6 +1766,7 @@ mod tests {
                 skipped,
             ],
             sets: SshRecipientSets::new(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: Some("Fleet".into()),
             feedback: String::new(),
         });
@@ -1416,6 +1796,7 @@ mod tests {
                 Member::new("West".into(), Some(options("west")), Vec::new()),
             ],
             sets: SshRecipientSets::new(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: None,
             feedback: String::new(),
         };
@@ -1462,6 +1843,7 @@ mod tests {
                 Member::new("Offline".into(), None, Vec::new()),
             ],
             sets: sets.clone(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: None,
             feedback: String::new(),
         };

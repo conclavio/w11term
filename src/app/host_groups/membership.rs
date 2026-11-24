@@ -71,7 +71,7 @@ impl State {
                             ctx.callback(move |checked| action(Change::Check(pane, checked))),
                         )
                         .content(target.name.as_str()),
-                    TextBlock::new().text(target.state.label()),
+                    TextBlock::new().text(target.state.label().as_ref()),
                 )),
             )
         });

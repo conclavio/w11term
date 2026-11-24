@@ -1,4 +1,4 @@
-use super::{CommandLink, Event};
+use super::{CommandLink, Event, PendingSshAttempt, SshAttemptOutcome};
 use std::{
     collections::VecDeque,
     fmt,
@@ -11,6 +11,16 @@ const CAPACITY: usize = 128;
 pub enum NoticeTarget {
     Pane { pane: u64, sequence: u64 },
     GroupRun { tab: u64, submission: u64 },
+    GroupCanary { tab: u64, submission: u64 },
+    GroupLogins { tab: u64, sequence: u64 },
+}
+
+#[derive(Clone, Debug)]
+pub struct SshLoginResult {
+    pub pane: u64,
+    pub attempt: PendingSshAttempt,
+    pub host: String,
+    pub outcome: SshAttemptOutcome,
 }
 
 #[derive(Clone, Debug)]
@@ -22,6 +32,7 @@ pub struct Notice {
     pub message: String,
     pub unread: bool,
     pub command: Option<CommandLink>,
+    pub login_results: Option<Arc<[SshLoginResult]>>,
 }
 
 #[derive(Default)]
@@ -112,6 +123,7 @@ impl Inbox {
             source.clone(),
             message,
             event.command,
+            None,
             live && event.kind == "command-finished",
         );
     }
@@ -123,13 +135,70 @@ impl Inbox {
         source: &str,
         succeeded: usize,
         attention: usize,
+        skipped: usize,
     ) {
         let attention_verb = if attention == 1 { "needs" } else { "need" };
+        let mut message = format!(
+            "Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"
+        );
+        if skipped > 0 {
+            message.push_str(&format!(" · {skipped} skipped"));
+        }
         self.push(
             NoticeTarget::GroupRun { tab, submission },
             display_field(source).into(),
-            format!("Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"),
+            message,
             None,
+            None,
+            true,
+        );
+    }
+
+    pub fn group_canary_finished(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        host: &str,
+        succeeded: bool,
+    ) {
+        let result = if succeeded {
+            "Canary ready for approval"
+        } else {
+            "Canary did not report a successful exit"
+        };
+        self.push(
+            NoticeTarget::GroupCanary { tab, submission },
+            display_field(source).into(),
+            format!("{result} · {}", display_field(host)),
+            None,
+            None,
+            true,
+        );
+    }
+
+    pub fn group_connections_finished(
+        &self,
+        tab: u64,
+        sequence: u64,
+        source: &str,
+        results: Vec<SshLoginResult>,
+    ) {
+        let (mut connected, mut failed, mut stopped, mut closed) = (0, 0, 0, 0);
+        for result in &results {
+            match result.outcome {
+                SshAttemptOutcome::Connected => connected += 1,
+                SshAttemptOutcome::Failed(_) => failed += 1,
+                SshAttemptOutcome::Stopped => stopped += 1,
+                SshAttemptOutcome::Closed => closed += 1,
+            }
+        }
+        self.push(
+            NoticeTarget::GroupLogins { tab, sequence },
+            display_field(source).into(),
+            format!("SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"),
+            None,
+            Some(results.into()),
             true,
         );
     }
@@ -140,6 +209,7 @@ impl Inbox {
         source: Arc<str>,
         message: String,
         command: Option<CommandLink>,
+        login_results: Option<Arc<[SshLoginResult]>>,
         flash_pending: bool,
     ) {
         let mut state = self.state.lock().unwrap();
@@ -157,6 +227,7 @@ impl Inbox {
             message,
             unread: true,
             command,
+            login_results,
         });
         self.wake_ui(state);
     }
@@ -259,6 +330,16 @@ impl Inbox {
             .command
     }
 
+    pub fn group_login_notice(&self, target: NoticeTarget) -> Option<Notice> {
+        self.state
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.target == target && row.login_results.is_some())
+            .cloned()
+    }
+
     pub fn mark_read(&self, pane: u64, sequence: u64) -> bool {
         self.mark_target_read(NoticeTarget::Pane { pane, sequence })
     }
@@ -286,6 +367,33 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_canary_and_full_completion_for_the_same_run_are_read_independently() {
+        let inbox = Inbox::new(|| {});
+        let canary = NoticeTarget::GroupCanary {
+            tab: 4,
+            submission: 2,
+        };
+        let run = NoticeTarget::GroupRun {
+            tab: 4,
+            submission: 2,
+        };
+
+        inbox.group_canary_finished(4, 2, "Fleet", "East", true);
+        inbox.group_finished(4, 2, "Fleet", 2, 0, 0);
+
+        assert_eq!(inbox.unread_count(), 2);
+        assert!(inbox.mark_target_read(canary));
+        let rows = inbox.rows();
+        assert_eq!(rows[0].target, run);
+        assert!(rows[0].unread);
+        assert_eq!(rows[1].target, canary);
+        assert_eq!(rows[1].message, "Canary ready for approval · East");
+        assert!(!rows[1].unread);
+        assert!(inbox.mark_target_read(run));
+        assert_eq!(inbox.unread_count(), 0);
+    }
     use crate::events::Events;
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};

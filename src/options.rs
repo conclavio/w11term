@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    time::Duration,
 };
 mod group_prompt;
 mod local;
@@ -417,6 +418,119 @@ fn default_profiles_path() -> PathBuf {
 
 pub type SshRecipientSets = BTreeMap<String, Vec<String>>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshRosterOrder {
+    Label,
+    CheckedFirst,
+    AttentionFirst,
+    #[default]
+    #[serde(other)]
+    Tabs,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshGroupParallelLimit {
+    #[default]
+    Unlimited,
+    One,
+    Two,
+    Four,
+    Eight,
+    Sixteen,
+}
+
+impl SshGroupParallelLimit {
+    pub fn concurrency(self) -> Option<usize> {
+        match self {
+            Self::Unlimited => None,
+            Self::One => Some(1),
+            Self::Two => Some(2),
+            Self::Four => Some(4),
+            Self::Eight => Some(8),
+            Self::Sixteen => Some(16),
+        }
+    }
+}
+
+pub type SshGroupLoginLimit = SshGroupParallelLimit;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SshGroupCommandInterval {
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "500ms")]
+    HalfSecond,
+    #[serde(rename = "1s")]
+    OneSecond,
+    #[serde(rename = "2s")]
+    TwoSeconds,
+    #[serde(rename = "5s")]
+    FiveSeconds,
+    #[serde(rename = "10s")]
+    TenSeconds,
+}
+
+impl SshGroupCommandInterval {
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::None => Duration::ZERO,
+            Self::HalfSecond => Duration::from_millis(500),
+            Self::OneSecond => Duration::from_secs(1),
+            Self::TwoSeconds => Duration::from_secs(2),
+            Self::FiveSeconds => Duration::from_secs(5),
+            Self::TenSeconds => Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SshGroupQueueExpiry {
+    #[default]
+    #[serde(rename = "never")]
+    Never,
+    #[serde(rename = "5s")]
+    FiveSeconds,
+    #[serde(rename = "15s")]
+    FifteenSeconds,
+    #[serde(rename = "30s")]
+    ThirtySeconds,
+    #[serde(rename = "1m")]
+    OneMinute,
+    #[serde(rename = "5m")]
+    FiveMinutes,
+}
+
+impl SshGroupQueueExpiry {
+    pub fn duration(self) -> Option<Duration> {
+        let seconds = match self {
+            Self::Never => return None,
+            Self::FiveSeconds => 5,
+            Self::FifteenSeconds => 15,
+            Self::ThirtySeconds => 30,
+            Self::OneMinute => 60,
+            Self::FiveMinutes => 300,
+        };
+        Some(Duration::from_secs(seconds))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SshRosterDefaults {
+    pub order: SshRosterOrder,
+    pub show_last_output: bool,
+    pub show_terminal_line: bool,
+    pub require_all_ready: bool,
+    pub login_limit: SshGroupParallelLimit,
+    pub command_limit: SshGroupParallelLimit,
+    pub command_interval: SshGroupCommandInterval,
+    pub command_queue_expiry: SshGroupQueueExpiry,
+    pub stop_command_queue_on_failure: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profiles {
     pub profiles: BTreeMap<String, SshOptions>,
@@ -426,6 +540,7 @@ pub struct Profiles {
     pub startup_profile: Option<String>,
     pub ssh_host_groups: BTreeMap<String, Vec<String>>,
     pub ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
+    pub ssh_host_group_defaults: BTreeMap<String, SshRosterDefaults>,
     pub(crate) has_explicit_order: bool,
 }
 
@@ -439,6 +554,7 @@ impl Default for Profiles {
             startup_profile: None,
             ssh_host_groups: BTreeMap::new(),
             ssh_recipient_sets: BTreeMap::new(),
+            ssh_host_group_defaults: BTreeMap::new(),
             has_explicit_order: false,
         }
     }
@@ -472,6 +588,13 @@ impl Profiles {
         self.profiles
             .get(name)
             .filter(|options| !options.durable && !options.player.rustmush)
+    }
+
+    pub fn ssh_roster_defaults(&self, name: &str) -> SshRosterDefaults {
+        self.ssh_host_group_defaults
+            .get(name)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn resolve_ssh_host_group_members<'a>(
@@ -527,6 +650,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         ssh_host_groups: BTreeMap<String, Vec<String>>,
         #[serde(default)]
         ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
+        #[serde(default)]
+        ssh_host_group_defaults: BTreeMap<String, SshRosterDefaults>,
     }
     let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
@@ -540,6 +665,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         startup_profile: document.startup_profile,
         ssh_host_groups: document.ssh_host_groups,
         ssh_recipient_sets: document.ssh_recipient_sets,
+        ssh_host_group_defaults: document.ssh_host_group_defaults,
         ..Profiles::default()
     };
     for (name, value) in document.profiles {

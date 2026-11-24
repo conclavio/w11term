@@ -1,5 +1,8 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
-use crate::{session::Command, terminal::Snapshot};
+use crate::{
+    session::{Command, PaneDescription},
+    terminal::Snapshot,
+};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,7 @@ mod command_history;
 mod find;
 mod registry;
 mod security;
+mod ssh_groups;
 pub use command_history::CommandStatus;
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
@@ -83,6 +87,29 @@ pub enum Request {
         operation: crate::sftp::Operation,
     },
     List,
+    ListSshGroups,
+    GetSshGroupRoster {
+        window_id: WindowId,
+        tab_id: u64,
+    },
+    WaitSshGroupReady {
+        window_id: WindowId,
+        tab_id: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
+    GetSshGroupRun {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+    },
+    WaitSshGroupRun {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     WorkspaceIdentity,
     WorkspaceWindows {
         key: String,
@@ -139,6 +166,20 @@ fn default_wait_timeout() -> u64 {
 }
 #[derive(Debug)]
 pub enum UiRequest {
+    ListSshGroups {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    GetSshGroupRoster {
+        tab_id: u64,
+        wait_for_readiness: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    GetSshGroupRun {
+        tab_id: u64,
+        run_id: u64,
+        wait_for_settlement: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Open {
         profile: String,
         cols: Option<usize>,
@@ -156,7 +197,11 @@ pub enum UiRequest {
 impl UiRequest {
     pub fn fail(self, message: &str) {
         let reply = match self {
-            Self::Open { reply, .. } | Self::Resize { reply, .. } => reply,
+            Self::Open { reply, .. }
+            | Self::Resize { reply, .. }
+            | Self::ListSshGroups { reply }
+            | Self::GetSshGroupRoster { reply, .. }
+            | Self::GetSshGroupRun { reply, .. } => reply,
         };
         let _ = reply.send(Err(message.into()));
     }
@@ -228,6 +273,18 @@ impl Registry {
             .context("pane capture timed out")?
             .context("pane is closed")
     }
+
+    async fn describe_pane(pane: &Pane) -> Result<PaneDescription> {
+        let (reply, response) = oneshot::channel();
+        pane.input
+            .send(Command::DescribePane(reply))
+            .context("pane is closed")?;
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("pane description timed out")?
+            .context("pane is closed")
+    }
+
     pub async fn execute(&self, request: Request, capture_png: CapturePng) -> Result<Value> {
         match request {
             Request::Record { pane, path, timed } => {
@@ -310,7 +367,13 @@ impl Registry {
                 let journal = events
                     .wait(since, Duration::from_secs(timeout_seconds))
                     .await;
-                Ok(json!({"pane":pane,"journal":journal,"restart_token":events.restart_token()}))
+                let (restart_token, ssh_phase) = events.exit_snapshot();
+                let mut result =
+                    json!({"pane":pane,"journal":journal,"restart_token":restart_token});
+                if let Some(phase) = ssh_phase {
+                    result["ssh_connection"] = phase.as_json();
+                }
+                Ok(result)
             }
             Request::WaitForText {
                 pane,
@@ -396,18 +459,75 @@ impl Registry {
             }
             Request::WorkspaceIdentity => Ok(json!(self.legacy_workspace())),
             Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
+            Request::ListSshGroups => self.list_ssh_groups().await,
+            Request::GetSshGroupRoster { window_id, tab_id } => {
+                self.query_ssh_group_roster(window_id, tab_id, None).await
+            }
+            Request::WaitSshGroupReady {
+                window_id,
+                tab_id,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "SSH group wait timeout must be 1..=3600 seconds"
+                );
+                self.query_ssh_group_roster(
+                    window_id,
+                    tab_id,
+                    Some(Duration::from_secs(timeout_seconds)),
+                )
+                .await
+            }
+            Request::GetSshGroupRun {
+                window_id,
+                tab_id,
+                run_id,
+            } => {
+                self.query_ssh_group_run(window_id, tab_id, run_id, None)
+                    .await
+            }
+            Request::WaitSshGroupRun {
+                window_id,
+                tab_id,
+                run_id,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "SSH group wait timeout must be 1..=3600 seconds"
+                );
+                self.query_ssh_group_run(
+                    window_id,
+                    tab_id,
+                    run_id,
+                    Some(Duration::from_secs(timeout_seconds)),
+                )
+                .await
+            }
             Request::List => {
                 let mut sessions = Vec::new();
                 for (window_id, pane) in self.listing() {
-                    let mut session = match Self::capture(&pane).await {
-                        Ok((frame, size)) => json!({
-                            "title": frame.title,
-                            "status": frame.status,
-                            "cols": size.cols,
-                            "rows": size.rows,
-                            "prompt": frame.prompt,
-                            "connection_generation": frame.connection_generation,
-                        }),
+                    let mut session = match Self::describe_pane(&pane).await {
+                        Ok(PaneDescription {
+                            frame,
+                            restart_token,
+                            ssh_phase,
+                        }) => {
+                            let mut session = json!({
+                                "title": frame.title,
+                                "status": frame.status,
+                                "cols": frame.size.cols,
+                                "rows": frame.size.rows,
+                                "prompt": frame.prompt,
+                                "connection_generation": frame.connection_generation,
+                            });
+                            if let Some(phase) = ssh_phase {
+                                session["ssh_connection"] = phase.as_json();
+                                session["restart_token"] = json!(restart_token);
+                            }
+                            session
+                        }
                         Err(error) => {
                             json!({"status": "unavailable", "error": format!("{error:#}")})
                         }
@@ -725,6 +845,8 @@ async fn serve(
                 let pool = if matches!(
                     r,
                     Request::WaitForText { .. }
+                        | Request::WaitSshGroupRun { .. }
+                        | Request::WaitSshGroupReady { .. }
                         | Request::Events {
                             timeout_seconds: 1..,
                             ..
@@ -980,6 +1102,12 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,
             Request::WaitForText {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshGroupRun {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshGroupReady {
                 timeout_seconds, ..
             }
             | Request::Events {

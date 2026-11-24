@@ -118,7 +118,12 @@ try {
     $null = Control @('send-text','--pane',"$left",'--no-paste','source-marker')
     $null = Control @('send-text','--pane',"$right",'--no-paste','hidden-marker')
     $original = Control @('get-text','--pane',"$right")
-    Picker-Query 'DEV2'
+    $null = Open-PanePicker 'DEV2'
+    foreach ($key in 0x44,0x45,0x56,0x32) { $null = Press-FocusedKey $key }
+    $null = Wait-Until 'native keyboard input filters to DEV2' {
+        $rows = @(Get-PickerRows)
+        $rows.Count -eq 1 -and $rows[0] -like '*dev2*'
+    }
     Wait-Preview 'dev2' 'hidden-marker'
     Wait-Focus $left
     $null = Control @('send-text','--pane',"$right",'--no-paste','-live')

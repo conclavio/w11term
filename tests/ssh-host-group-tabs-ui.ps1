@@ -65,8 +65,7 @@ function Choose-SavedGroup([string]$Name) {
     $popup = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
     $popup.Expand()
     $item = Wait-Until "'$Name' in the group chooser" {
-        $entry = Find-Element $Name $listItem
-        if ($entry -and !$entry.Current.IsOffscreen) { $entry }
+        Find-Element $Name $listItem -Visible
     }
     $item.GetCurrentPattern($selectionItem).Select()
     $null = Wait-Until "'$Name' is selected in the group chooser" {
@@ -88,15 +87,23 @@ function Expect-Choice([string]$FieldName, [string]$Choice) {
 }
 function Choose-Option([string]$FieldName, [string]$Choice) {
     $combo = Wait-Until $FieldName { Find-Element $FieldName $comboBox }
-    $popup = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    $popup.Expand()
+    $selected = $combo.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+    if ($selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Choice) { return }
     $item = Wait-Until "visible option '$Choice'" {
-        $entry = Find-Element $Choice $listItem
-        if ($entry -and !$entry.Current.IsOffscreen) { $entry }
+        $field = Find-Element $FieldName $comboBox
+        if ($field) {
+            $expand = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+            if ($expand.Current.ExpandCollapseState -eq 'Collapsed') { $expand.Expand() }
+            Find-Element $Choice $listItem -Visible
+        }
     }
     $item.GetCurrentPattern($selectionItem).Select()
     Expect-Choice $FieldName $Choice
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    $field = Find-Element $FieldName $comboBox
+    if ($field) {
+        $expand = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        if ($expand.Current.ExpandCollapseState -eq 'Expanded') { $expand.Collapse() }
+    }
 }
 function Session([string]$Name) {
     Wait-Until "SSH pane '$Name'" { (Control @('list')).sessions | Where-Object label -ceq $Name }
@@ -289,6 +296,37 @@ try {
     if (($sets.'Fleet Lab'.'Before connect' -join ',') -cne 'North' -or @((Control @('list')).sessions).Count -ne 1) {
         throw 'Updating the preset saved the wrong hosts or opened an SSH session'
     }
+    $manageSets = 'Manage sets' + [char]0x2026
+    Click $manageSets
+    Expect-Choice 'Existing recipient set' 'Before connect'
+    (Field 'New recipient set name').SetValue('North pilot')
+    Click 'Rename recipient set'
+    $null = Wait-Until 'the reviewed set is renamed' { Find-Element 'Renamed recipient set Before connect to North pilot' }
+    Expect-Choice 'Launch recipient set' 'North pilot'
+    Expect-Field 'Find launch profiles' 'NORTH'
+    $null = Wait-CheckBox 'Include profile North' On
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if ($sets.'Fleet Lab'.'Before connect' -or ($sets.'Fleet Lab'.'North pilot' -join ',') -cne 'North') {
+        throw 'Renaming the recipient set altered its members or left the old name'
+    }
+    Click 'Cancel'
+    Wait-Focus $origin
+    Open-GroupCommandSearch 'review fleet lab north pilot'
+    Accept-GroupCommandWithEnter "Review SSH recipient set${dot}Fleet Lab${dot}North pilot"
+    Expect-Choice 'Launch recipient set' 'North pilot'
+    (Field 'Find launch profiles').SetValue('NORTH')
+    $null = Wait-CheckBox 'Include profile North' On
+    Click $manageSets
+    Click 'Delete recipient set'
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if (!$sets.'Fleet Lab'.'North pilot') { throw 'The set was deleted before confirmation' }
+    Click 'Confirm delete recipient set'
+    $null = Wait-Until 'the selected set is deleted' { Find-Element 'Deleted recipient set North pilot' }
+    $null = Wait-CheckBox 'Include profile North' On
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if ($sets.'Fleet Lab'.'North pilot' -or @((Control @('list')).sessions).Count -ne 1) {
+        throw 'Deleting the preset left the saved name or opened an SSH session'
+    }
     Click 'Cancel'
     Wait-Focus $origin
 
@@ -330,6 +368,47 @@ try {
         !(Find-Element 'Search recent group commands' $edit)
     }
 
+    $findHost = 'Find SSH host in group' + [char]0x2026
+    Choose-GroupCommand $findHost
+    (Field 'Find SSH host in group').SetValue('East')
+    $null = Wait-Until 'the West host picker excludes the other group' {
+        (Find-Element 'No matching SSH hosts in this roster') -and @(Get-PickerRows).Count -eq 0
+    }
+    Press-Key 27
+    $null = Wait-Until 'Escape returns to the West roster' {
+        !(Find-Element 'Find SSH host in group' $edit) -and (Find-Element 'Host filter' $edit)
+    }
+    Wait-Tab $westTab
+    (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
+    $null = Wait-Until 'the window-wide roster includes the running East pane' {
+        Find-Element "Pane $east${dot}Connected${dot}Waiting for a fresh prompt"
+    }
+    Choose-Option 'Filter host state' 'Ready'
+    Choose-GroupCommand $findHost
+    (Field 'Find SSH host in group').SetValue('East')
+    $null = Wait-Until 'the Ready filter keeps the running East pane out of the picker' {
+        (Find-Element 'No matching SSH hosts in this roster') -and @(Get-PickerRows).Count -eq 0
+    }
+    [IO.File]::WriteAllText((Join-Path $State 'release-east'), '')
+    $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','East finished east-probe')
+    $null = Wait-Until 'East appears in the open picker when it becomes ready' {
+        $results = @(Get-PickerRows)
+        $results.Count -eq 1 -and $results[0].Contains("test@127.0.0.1:$($config.East.port)")
+    }
+    $address = "test@127.0.0.1:$($config.West.port)"
+    (Field 'Find SSH host in group').SetValue($address)
+    $null = Wait-Until 'only West matches its SSH address' {
+        $results = @(Get-PickerRows)
+        $results.Count -eq 1 -and $results[0].Contains($address)
+    }
+    Press-Key 13
+    Wait-Focus $west
+    Choose-GroupCommand 'SSH host group'
+    Wait-Tab $westTab
+    Expect-Choice 'Filter host state' 'Ready'
+    Choose-Option 'Filter host state' 'All host states'
+    (Wait-CheckBox 'Show all window SSH panes' On).Toggle()
+
     Click "Focus result pane $west"
     Wait-Focus $west
     Choose-GroupCommand 'SSH host group'
@@ -344,8 +423,6 @@ try {
     $null = Wait-CheckBox $westName On
     (Wait-CheckBox 'Show all window SSH panes' On).Toggle()
 
-    [IO.File]::WriteAllText((Join-Path $State 'release-east'), '')
-    $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','East finished east-probe')
     Select-Tab $eastTab
     Expect-Field 'Group command' 'east-only draft'
     Expect-Field 'Host filter' 'east'
@@ -761,6 +838,56 @@ try {
     if ($sets.Fleet -or ($sets.Canaries -join ',') -cne 'East') { throw 'Deleting a set edited another set' }
     Click 'Back to SSH group'
     if (@((Control @('list')).sessions).Count -ne 4) { throw 'Roster and recipient edits changed the SSH sessions' }
+
+    $beforeAdd = @((Control @('list')).sessions)
+    (Field 'Host filter').SetValue('east')
+    Expect-Field 'Host filter' 'east'
+    $addProfiles = 'Add saved profiles' + [char]0x2026
+    Click $addProfiles
+    (Field 'Find saved SSH profiles').SetValue('WEST')
+    $null = Wait-CheckBox 'Add SSH profile West' Off
+    Click 'Check matches'
+    $null = Wait-CheckBox 'Add SSH profile West' On
+    (Field 'Find saved SSH profiles').SetValue('NORTH')
+    (Wait-CheckBox 'Add SSH profile North' Off).Toggle()
+    $null = Wait-CheckBox 'Add SSH profile North' On
+    Click 'Review selected profiles'
+    $westLabel = "West${dot}test@127.0.0.1:$($config.West.port)"
+    Choose-Option "Connection for $westLabel" "Reuse${dot}$westName"
+    $beforeStale = [IO.File]::ReadAllBytes($profiles)
+    $changed = [Text.Encoding]::UTF8.GetString($beforeStale) | ConvertFrom-Json
+    $changed.profiles.North.port = 1
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Use 2 checked hosts'
+    $null = Wait-Until 'a changed saved profile returns to the picker' {
+        Find-Element 'SSH profile North changed. Refresh saved profiles and review again.'
+    }
+    if (@((Control @('list')).sessions).Count -ne $beforeAdd.Count) { throw 'A stale profile review opened a pane' }
+    [IO.File]::WriteAllBytes($profiles, $beforeStale)
+    Click 'Refresh saved profiles'
+    Expect-Field 'Find saved SSH profiles' 'NORTH'
+    $null = Wait-CheckBox 'Add SSH profile North' On
+    Click 'Review selected profiles'
+    Choose-Option "Connection for $westLabel" "Reuse${dot}$westName"
+    Click 'Use 2 checked hosts'
+    $null = Wait-Until 'the selected profiles are added to the named roster' {
+        Find-Element "Reused 1${dot}Opened 1 from saved profiles"
+    }
+    Expect-Field 'Group command' 'retained roster draft'
+    Expect-Field 'Host filter' 'east'
+    $null = Wait-CheckBox $eastName On
+    $newNorth = Wait-Until 'exactly one fresh North pane is opened' {
+        $current = @((Control @('list')).sessions)
+        if ($current.Count -eq ($beforeAdd.Count + 1)) {
+            $current | Where-Object { $_.label -ceq 'North' -and $_.id -notin $beforeAdd.id }
+        }
+    }
+    (Field 'Host filter').SetValue('')
+    $null = Wait-CheckBox $westName Off
+    $null = Wait-CheckBox (Target-Label 'North' $newNorth.id) Off
+    if (((Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_host_groups.'Fleet East' -join ',') -cne 'East') {
+        throw 'Adding profiles changed the saved group membership'
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

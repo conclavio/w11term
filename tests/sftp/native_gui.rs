@@ -819,7 +819,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
         let (Source::Ssh(ssh), root, opens, server) = fixture_with_wire(
             false,
-            if use_633 { 3 } else { 2 },
+            if use_633 { 4 } else { 2 },
             Arc::default(),
             Some(wire),
         )
@@ -829,6 +829,15 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         };
         let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
         let peer_trace = trace.clone();
+        if use_633 {
+            let gate = root.path().join("hold-shell-request");
+            fs::write(&gate, b"").unwrap();
+            fs::write(
+                state.path().join("west-shell-gate-path"),
+                gate.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        }
         let release_preview = state.path().join("release-west-preview");
         let release_paused = state.path().join("release-west-paused");
         let release_away = state.path().join("release-west-away");
@@ -1019,7 +1028,10 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\ralt",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
-        assert_eq!(opens.load(Ordering::Relaxed), index + 2);
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            if index == 0 { 2 } else { 4 }
+        );
         assert_eq!(
             *trace.lock().unwrap(),
             expected[index],
@@ -1035,6 +1047,135 @@ fn recording_burst(host: &str) -> String {
         .map(|index| format!("{host} record row {index:02}"))
         .collect::<Vec<_>>()
         .join("\r\n")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews two real SSH prompts from a named native host group"]
+async fn native_ssh_host_group_opens_filtered_authentication_prompts() {
+    let state = tempfile::tempdir().unwrap();
+    let (Source::Ssh(mut trust), _trust_root, trust_opens, trust_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    trust.host_key = None;
+    trust.player.reconnect = false;
+    trust.host_key_alias = Some(format!(
+        "w11term-native-{}.invalid",
+        state.path().file_name().unwrap().to_string_lossy()
+    ));
+    let (Source::Ssh(mut login), _login_root, login_opens, login_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    login.authentication = Authentication::Password;
+    login.player.reconnect = false;
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": {"Trust host": trust, "Password host": login},
+            "ssh_host_groups": {"Prompt review": ["Trust host", "Password host"]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("ssh-host-group-prompts-ui.ps1", state.path());
+    assert_eq!(trust_opens.load(Ordering::Relaxed), 0);
+    assert_eq!(login_opens.load(Ordering::Relaxed), 0);
+    trust_server.abort();
+    login_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "stops and closes selected SSH panes from the Windows roster"]
+async fn native_ssh_host_group_stops_selected_pending_attempts() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for (name, attempts, pending) in [
+        ("Pending East", 3, true),
+        ("Pending West", 1, true),
+        ("Live shell", 1, false),
+    ] {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (Source::Ssh(mut ssh), root, opens, server) =
+            fixture_counting_accepts(false, attempts + 1, accepted.clone()).await
+        else {
+            unreachable!()
+        };
+        if name == "Pending East" {
+            ssh.authentication = Authentication::Password;
+        } else if name == "Pending West" {
+            ssh.host_key = None;
+            ssh.host_key_alias = Some(format!(
+                "w11term-stop-{}.invalid",
+                state.path().file_name().unwrap().to_string_lossy()
+            ));
+        }
+        ssh.player.reconnect = true;
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, attempts, pending, accepted, root, opens, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Stop attempts": ["Pending East", "Pending West", "Live shell"]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("ssh-host-group-stop-ui.ps1", state.path());
+    for (name, attempts, pending, accepted, _root, opens, server) in peers {
+        assert_eq!(accepted.load(Ordering::Relaxed), attempts, "{name}");
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            usize::from(!pending),
+            "{name}"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews and disconnects selected SSH shells in a Windows roster"]
+async fn native_ssh_host_group_disconnects_reviewed_shells_and_keeps_panes() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for (name, launches) in [("Fleet East", 3), ("Fleet West", 2), ("Witness", 1)] {
+        let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, launches).await
+        else {
+            unreachable!()
+        };
+        fs::write(root.path().join("exit-on-eot"), b"").unwrap();
+        if name == "Fleet East" {
+            let scrollback: String = (0..64)
+                .map(|line| format!("east history {line:02}\r\n"))
+                .collect();
+            fs::write(root.path().join("copy-history.vt"), scrollback).unwrap();
+        }
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, root, opens, launches, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Disconnect review": ["Fleet East", "Fleet West", "Witness"]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("ssh-host-group-disconnect-ui.ps1", state.path());
+    for (name, _root, opens, launches, server) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), launches, "{name}");
+        server.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1304,6 +1445,276 @@ async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
     drive_gui("saved-ssh-host-group-ui.ps1", state.path());
     for (_, opens, server) in peers {
         assert_eq!(opens.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a saved group in a second native window and closes just its sessions"]
+async fn native_saved_ssh_group_opens_in_an_independent_window() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for (name, count) in [("East", 3), ("West", 2)] {
+        let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, count).await
+        else {
+            unreachable!()
+        };
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((root, opens, server, count));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Fleet":["West","East"]},
+            "ssh_recipient_sets": {"Fleet":{"Canary":["East"]}},
+            "ssh_host_group_defaults": {"Fleet":{"require_all_ready":true}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-window-ui.ps1", state.path());
+    for (_, opens, server, count) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), count);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reconnects reviewed failed SSH logins and rejects a stale report review"]
+async fn native_ssh_group_notifies_when_watched_logins_settle() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut gates = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for name in ["West", "East", "North"] {
+        let connections = if name == "West" { 1 } else { 2 };
+        let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, connections).await
+        else {
+            unreachable!()
+        };
+        let gate = root.path().join("hold-shell-request");
+        fs::write(&gate, []).unwrap();
+        if name != "West" {
+            fs::write(root.path().join("reject-shell-request"), []).unwrap();
+        }
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        gates.insert(name.into(), serde_json::to_value(gate).unwrap());
+        peers.push((root, opens, server, connections));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Notices":["West","East","North"]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.path().join("shell-gates.json"),
+        serde_json::to_vec(&gates).unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-login-notice-ui.ps1", state.path());
+    for (_, opens, server, connections) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), connections);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "verifies manual and paced SSH rollouts, queue controls, canary approval, and notices"]
+async fn native_ssh_group_bounds_parallel_commands() {
+    use in_band_resize::Wire;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    let paced_arrivals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    for name in ["West", "East", "North"] {
+        let (wire, mut messages) = tokio::sync::mpsc::unbounded_channel();
+        let (Source::Ssh(ssh), root, _, server) =
+            fixture_with_wire(false, 1, Arc::default(), Some(wire)).await
+        else {
+            unreachable!()
+        };
+        let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trace = inputs.clone();
+        let fixtures = state.path().to_owned();
+        let arrivals = paced_arrivals.clone();
+        let responder = tokio::spawn(async move {
+            let prompt = b"\x1b]133;A\x07fixture$ \x1b]133;B\x07";
+            let mut peer = None;
+            while let Some(wire) = messages.recv().await {
+                match wire {
+                    Wire::Shell(id, handle) => {
+                        handle.data(id, prompt.as_slice()).await.unwrap();
+                        peer = Some(handle);
+                    }
+                    Wire::Input(id, bytes) => {
+                        trace.lock().unwrap().extend_from_slice(&bytes);
+                        let input = std::str::from_utf8(&bytes).unwrap();
+                        if input == "restore-prompt" {
+                            peer.as_ref()
+                                .unwrap()
+                                .data(
+                                    id,
+                                    [format!("\r\n{name} restored prompt\r\n").as_bytes(), prompt]
+                                        .concat(),
+                                )
+                                .await
+                                .unwrap();
+                            continue;
+                        }
+                        let Some(line) = input.strip_suffix('\r') else {
+                            continue;
+                        };
+                        if line == "pace" {
+                            arrivals
+                                .lock()
+                                .unwrap()
+                                .insert(name, std::time::Instant::now());
+                        }
+                        if name == "East" && line == "inspect" {
+                            assert!(
+                                fixtures.join("resume-inspect").is_file(),
+                                "East received the command while paused"
+                            );
+                        }
+                        if name == "West" && line.starts_with("canary-") {
+                            assert_eq!(line, "canary-ok", "a failed canary reached another host");
+                            assert!(
+                                fixtures.join("approve-canary-ok").is_file(),
+                                "West received the command without approval"
+                            );
+                        }
+                        let handle = peer.as_ref().unwrap();
+                        handle
+                            .data(
+                                id,
+                                format!("{line}\r\n\x1b]133;C\x07{name} started {line}\r\n")
+                                    .into_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        if name == "West" && line != "pace" {
+                            let gate = fixtures.join(format!("release-{line}"));
+                            while !gate.is_file() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        if name == "East" && matches!(line, "roll" | "canary-ok" | "canary-unknown")
+                        {
+                            let gate = fixtures.join(format!("release-east-{line}"));
+                            while !gate.is_file() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        let status = match line {
+                            "halt-on-failure" | "canary-fails" => ";17",
+                            "canary-unknown" => "",
+                            _ => ";0",
+                        };
+                        let end = format!("{name} finished {line}\r\n\x1b]133;D{status}\x07");
+                        handle
+                            .data(id, [end.as_bytes(), prompt.as_slice()].concat())
+                            .await
+                            .unwrap();
+                    }
+                    Wire::Window(..) => {}
+                }
+            }
+        });
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, root, server, responder, inputs));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Fleet":["West","East","North"]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-command-limit-ui.ps1", state.path());
+    let arrivals = paced_arrivals.lock().unwrap();
+    let elapsed = arrivals["East"].saturating_duration_since(arrivals["West"]);
+    // Allow for SSH packet delivery jitter. The queue deadline itself has an exact unit test.
+    assert!(
+        elapsed >= Duration::from_millis(4750),
+        "paced sends arrived {elapsed:?} apart"
+    );
+    drop(arrivals);
+    for (name, _root, server, responder, inputs) in peers {
+        let expected = match name {
+            "West" => {
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\r"
+                    .as_slice()
+            }
+            "East" => {
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\r"
+            }
+            _ => b"xrestore-promptskip-middle\r",
+        };
+        assert_eq!(inputs.lock().unwrap().as_slice(), expected, "{name}");
+        responder.abort();
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "queues limited launches, bulk reconnects and imported SSH hosts"]
+async fn native_reviewed_ssh_group_limits_parallel_logins() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for (name, needs_password, connections) in [
+        ("Login East", true, 3),
+        ("Login West", true, 3),
+        ("Ready", false, 2),
+        ("Imported East", true, 1),
+        ("Imported West", true, 1),
+    ] {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (Source::Ssh(mut ssh), root, opens, server) =
+            fixture_counting_accepts(false, connections, accepted.clone()).await
+        else {
+            unreachable!()
+        };
+        if needs_password {
+            ssh.authentication = Authentication::Password;
+        }
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((
+            name,
+            needs_password,
+            connections,
+            accepted,
+            root,
+            opens,
+            server,
+        ));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Limited":["Login East","Login West","Ready"]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-launch-limit-ui.ps1", state.path());
+    for (name, needs_password, connections, accepted, _, opens, server) in peers {
+        assert_eq!(accepted.load(Ordering::Relaxed), connections, "{name}");
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            connections * usize::from(!needs_password),
+            "{name}"
+        );
         server.abort();
     }
 }

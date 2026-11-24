@@ -23,6 +23,8 @@ struct Peer {
     channels: HashMap<ChannelId, Channel<server::Msg>>,
     wire: Option<tokio::sync::mpsc::UnboundedSender<in_band_resize::Wire>>,
     forwarded: HashSet<ChannelId>,
+    #[cfg(feature = "ui-smoke")]
+    withheld_session_open: Option<server::ChannelOpenHandle>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
     reject: bool,
@@ -48,6 +50,12 @@ impl server::Handler for Peer {
         _: &mut server::Session,
     ) -> anyhow::Result<()> {
         self.opens.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("withhold-session-open").is_file() {
+            // Keep the SSH connection responsive while leaving the request unanswered.
+            self.withheld_session_open = Some(reply);
+            return Ok(());
+        }
         self.channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
@@ -171,6 +179,20 @@ impl server::Handler for Peer {
         Ok(())
     }
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
+        #[cfg(feature = "ui-smoke")]
+        {
+            if self.root.join("withhold-shell-reply").is_file() {
+                return Ok(());
+            }
+            let gate = self.root.join("hold-shell-request");
+            while gate.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if self.root.join("reject-shell-request").is_file() {
+                s.channel_failure(c)?;
+                return Ok(());
+            }
+        }
         s.channel_success(c)?;
         if let Some(wire) = &self.wire {
             let _ = wire.send(in_band_resize::Wire::Shell(c, s.handle()));
@@ -897,6 +919,8 @@ async fn fixture_with_wire(
                 wire: wire.clone(),
                 channels: HashMap::new(),
                 forwarded: HashSet::new(),
+                #[cfg(feature = "ui-smoke")]
+                withheld_session_open: None,
                 root: root_path.clone(),
                 opens: opens_for_server.clone(),
                 reject,
@@ -1295,6 +1319,322 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnecting_one_shell_keeps_its_shared_ssh_transport_available() {
+    async fn disconnect(pane: &Session, connection: u64) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        pane.input
+            .send(Command::DisconnectSshShell { connection, reply })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    let (original, source, _root, opens, server) = fixture(false).await;
+    let generation = original.frames.load().connection_generation;
+    let child = Session::start_configured_with_connection(
+        source,
+        Default::default(),
+        false,
+        original.ssh_connection(),
+    );
+    let child_generation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(generation) = child.events.shell_generation() {
+                break generation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("second shell must use the fixture's single TCP connection");
+    assert!(disconnect(&original, generation + 1).await.is_err());
+    assert_eq!(original.ssh_connection_generation(), Some(generation));
+    disconnect(&original, generation).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while original.events.restart_token().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a deliberate disconnect must make the same pane restartable");
+    assert!(original.ssh_connection().is_none());
+    assert_eq!(child.ssh_connection_generation(), Some(child_generation));
+    let (reply, response) = tokio::sync::oneshot::channel();
+    child
+        .input
+        .send(Command::Raw(b"shared-shell-still-live".to_vec(), reply))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !child
+            .frames
+            .load()
+            .rows
+            .iter()
+            .any(|line| line.as_str().contains("shared-shell-still-live"))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sibling shell must still receive its echo");
+    assert_eq!(opens.load(Ordering::Relaxed), 2, "one channel per shell");
+    drop(original);
+    drop(child);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_group_connection_can_be_stopped_before_using_a_launch_slot() {
+    use w11term::events::SshConnectionPhase;
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), _root, opens, server) =
+        fixture_counting_accepts(false, 1, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let slot = gate.clone().try_acquire_owned().unwrap();
+    let start = || {
+        Session::start_group_ssh(
+            ssh.clone(),
+            wezterm_term::TerminalSize::default(),
+            false,
+            gate.clone(),
+        )
+    };
+    let stopped = start();
+    let waiting = start();
+    let attempt = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(attempt) = stopped.events.pending_ssh_attempt()
+                && waiting.events.pending_ssh_attempt().is_some()
+            {
+                break attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        stopped.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Queued)
+    );
+    assert_eq!(
+        waiting.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Queued)
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 0);
+    assert!(stopped.events.cancel_ssh_attempt(attempt));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stopped.events.restart_token().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        stopped.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Stopped)
+    );
+    drop(slot);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while waiting.events.ssh_connection_phase() != Some(SshConnectionPhase::Connected) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(gate.available_permits(), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "ui-smoke")]
+async fn ssh_shell_setup_times_out_and_releases_the_group_login_slot() {
+    use w11term::events::SshConnectionPhase;
+
+    async fn failure(pane: &Session) -> Arc<str> {
+        loop {
+            if let Some(SshConnectionPhase::Failed(reason)) = pane.events.ssh_connection_phase() {
+                return reason;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    let (Source::Ssh(mut stalled_open), open_root, open_requests, open_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(mut stalled_setup), setup_root, _, setup_server) = fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(healthy), _healthy_root, healthy_opens, healthy_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    stalled_open.player.reconnect = false;
+    stalled_setup.player.reconnect = false;
+    fs::write(open_root.path().join("withhold-session-open"), []).unwrap();
+    fs::write(setup_root.path().join("withhold-shell-reply"), []).unwrap();
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let start = |options| {
+        Session::start_group_ssh(
+            options,
+            wezterm_term::TerminalSize::default(),
+            false,
+            gate.clone(),
+        )
+    };
+    let opening = start(stalled_open);
+    let setting_up = Session::start(Source::Ssh(stalled_setup));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while open_requests.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first host did not request a session channel");
+    let waiting = start(healthy);
+    assert_eq!(
+        waiting.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Queued)
+    );
+    assert_eq!(healthy_opens.load(Ordering::Relaxed), 0);
+
+    let (open_error, setup_error, ()) = tokio::time::timeout(Duration::from_secs(25), async {
+        tokio::join!(failure(&opening), failure(&setting_up), async {
+            while waiting.events.ssh_connection_phase() != Some(SshConnectionPhase::Connected) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    })
+    .await
+    .expect("the stalled hosts did not time out or the queued host did not connect");
+    assert!(
+        open_error.contains("SSH session channel open timed out"),
+        "{open_error}"
+    );
+    assert!(
+        setup_error.contains("SSH PTY or shell setup timed out"),
+        "{setup_error}"
+    );
+    assert_eq!(healthy_opens.load(Ordering::Relaxed), 1);
+    assert_eq!(gate.available_permits(), 1);
+    open_server.abort();
+    setup_server.abort();
+    healthy_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_an_ssh_retry_keeps_the_pane_available_for_manual_reconnect() {
+    use in_band_resize::Wire;
+    use w11term::events::SshConnectionPhase;
+
+    async fn wait_for<T>(description: &str, mut poll: impl FnMut() -> Option<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = poll() {
+                    return result;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(description)
+    }
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (wire, mut messages) = tokio::sync::mpsc::unbounded_channel();
+    let (Source::Ssh(mut ssh), _root, _, server) =
+        fixture_with_wire(false, 2, accepted.clone(), Some(wire)).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let pane = Session::start(Source::Ssh(ssh));
+    let Wire::Shell(_, server_handle) =
+        tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("waiting for the first shell");
+    };
+    let generation = wait_for("first established shell", || {
+        pane.ssh_connection_generation()
+    })
+    .await;
+    assert_eq!(pane.events.pending_ssh_attempt(), None);
+    server_handle
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "fixture drops the SSH session".into(),
+            "en".into(),
+        )
+        .await
+        .unwrap();
+
+    let attempt = wait_for("the automatic retry to be scheduled", || {
+        if matches!(
+            pane.events.ssh_connection_phase(),
+            Some(SshConnectionPhase::Reconnecting { attempt: Some(_) })
+        ) {
+            pane.events.pending_ssh_attempt()
+        } else {
+            None
+        }
+    })
+    .await;
+    assert!(pane.events.cancel_ssh_attempt(attempt));
+    let restart = wait_for("the stopped pane to be restartable", || {
+        pane.events.restart_token()
+    })
+    .await;
+    assert_eq!(
+        pane.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Stopped)
+    );
+    assert_eq!(pane.events.pending_ssh_attempt(), None);
+    assert_eq!(pane.ssh_connection_generation(), None);
+
+    // The first automatic retry had a one-second delay.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    pane.restart_exited(restart).unwrap();
+    assert!(!pane.events.cancel_ssh_attempt(attempt));
+    wait_for(
+        "the manual reconnect to open a new shell in the same pane",
+        || {
+            pane.ssh_connection_generation()
+                .filter(|next| *next > generation)
+        },
+    )
+    .await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    drop(pane);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

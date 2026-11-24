@@ -381,9 +381,9 @@ enum SettingsEditor {
 enum Page {
     LocalForwards(local_forwards::Panel),
     SharedFolders(folder_shares::Panel),
-    Attention,
+    Attention(attention::AttentionPage),
     CommandHistory(command_history::HistoryPage),
-    HostGroup(host_groups::HostGroup),
+    HostGroup(Box<host_groups::HostGroup>),
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
@@ -1072,6 +1072,8 @@ pub enum Message {
     PickerChoose(u64),
     PlacePane(TabId, TabId, Direction),
     PickerFocus(u8),
+    PickerFromMenu(Shortcut),
+    PickerFocusAfterMenu(Arc<()>),
     LocalProfile(local_profile::Action),
     Files(FileAction),
     HintRevealed(Arc<()>, Result<(), String>),
@@ -2504,7 +2506,11 @@ impl TerminalApp {
             .map(|tab| tab.id)
     }
 
-    fn restart_exited_pane(&mut self, exit: ExitedPane) -> anyhow::Result<bool> {
+    fn restart_exited_pane(
+        &mut self,
+        exit: ExitedPane,
+        login_permits: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> anyhow::Result<bool> {
         let Some(id) = self.tab_for_pane(exit.pane) else {
             return Ok(false);
         };
@@ -2514,7 +2520,11 @@ impl TerminalApp {
         if live.session.events.restart_token() != Some(exit.token) {
             return Ok(false);
         }
-        live.session.restart_exited(exit.token)?;
+        if let Some(permits) = login_permits {
+            live.session.restart_group_ssh(exit.token, permits)?;
+        } else {
+            live.session.restart_exited(exit.token)?;
+        }
         self.clipboard.connection_changed(exit.pane, 0, true);
         live.reset_transport_input(&self.keyboard);
         Ok(true)
@@ -3426,6 +3436,13 @@ impl TerminalApp {
                 attention::set_long_commands(paste, enabled)
             }
             _ => match tab_menu_message(label) {
+                Message::Shortcut(
+                    shortcut @ (Shortcut::PanePicker
+                    | Shortcut::FindTab
+                    | Shortcut::FindAllPanes
+                    | Shortcut::CommandPalette
+                    | Shortcut::MovePaneToExistingTab),
+                ) => Message::PickerFromMenu(shortcut),
                 Message::Shortcut(Shortcut::ReopenClosedTab) => {
                     Message::ReopenClosedTab(closed_group)
                 }
@@ -4518,6 +4535,8 @@ impl Component for TerminalApp {
         let options = &input.options;
         let opening = &input.opening;
         let moving = input.transfer.is_some();
+        let group_window = input.group.as_ref();
+        let child_window = moving || group_window.is_some();
         let sender = context.sender();
         let clipboard = clipboard_paste::State::default();
         let paste_origin = clipboard.input_origin.clone();
@@ -4622,7 +4641,7 @@ impl Component for TerminalApp {
                 .expect("validated keyboard settings"),
         );
         let appearance = Arc::new(RwLock::new(appearance));
-        let grid = if !moving && (options.cols.is_some() || options.rows.is_some()) {
+        let grid = if !child_window && (options.cols.is_some() || options.rows.is_some()) {
             Some((options.cols.unwrap_or(120), options.rows.unwrap_or(32)))
         } else {
             None
@@ -4659,7 +4678,7 @@ impl Component for TerminalApp {
                 workspace.sources.clone(),
                 osc52,
             );
-        } else if !moving {
+        } else if !child_window {
             tabs.insert(
                 live_tab_sized(
                     label.clone(),
@@ -4691,7 +4710,8 @@ impl Component for TerminalApp {
         let new_window = input
             .transfer
             .as_ref()
-            .and_then(|transfer| transfer.new_window.as_ref());
+            .and_then(|transfer| transfer.new_window.as_ref())
+            .or_else(|| group_window.map(|group| group.claim()));
         let registry = new_window.map_or_else(
             || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
             |window| window.registry.clone(),
@@ -4749,7 +4769,7 @@ impl Component for TerminalApp {
             active_group,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
-            window_restored: moving || options.cols.is_some() || options.rows.is_some(),
+            window_restored: child_window || options.cols.is_some() || options.rows.is_some(),
             keyboard,
             broadcast_typing: None,
             _control: control,
@@ -4820,11 +4840,17 @@ impl Component for TerminalApp {
         }
         app.arm_window_tick(context);
         context.sender().send(Message::WindowTick);
-        app.activate(context);
+        if let Some(group_window) = group_window {
+            app.start_group_window(&group_window.launch, context);
+        } else {
+            app.activate(context);
+        }
         app.watch_control(context);
-        app.sync_selection(context);
+        if group_window.is_none() {
+            app.sync_selection(context);
+        }
         #[cfg(feature = "ui-smoke")]
-        if !moving && std::env::var_os("W11TERM_UI_SMOKE").is_some() {
+        if !child_window && std::env::var_os("W11TERM_UI_SMOKE").is_some() {
             if let Some(fixture) = std::env::var_os("W11TERM_IMPORT_SMOKE") {
                 let expected = std::path::PathBuf::from(fixture).with_file_name("profiles.json");
                 assert_eq!(
@@ -4900,6 +4926,7 @@ impl Component for TerminalApp {
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
+                | Message::PickerFocusAfterMenu(..)
                 | Message::PaneRatio(..)
                 | Message::PaneMeasured(_)
                 | Message::DividerPress(..)
@@ -4939,7 +4966,7 @@ impl Component for TerminalApp {
             }
             Message::RestartExited(exit) => {
                 // A native menu may still be delivering a callback for a previous exit or pane.
-                if let Err(error) = self.restart_exited_pane(exit) {
+                if let Err(error) = self.restart_exited_pane(exit, None) {
                     self.window_error =
                         Some(format!("Could not restart pane {}: {error:#}", exit.pane));
                 }
@@ -5077,6 +5104,8 @@ impl Component for TerminalApp {
                 self.place_pane(source, target, side, context)
             }
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
+            Message::PickerFromMenu(shortcut) => self.open_picker_from_menu(shortcut, context),
+            Message::PickerFocusAfterMenu(launch) => self.focus_picker_after_menu(&launch),
             Message::Files(action) => self.file_action(action, context),
             Message::AccessibleSelection(request) => {
                 if let Some(AppTab {
@@ -5345,6 +5374,36 @@ impl Component for TerminalApp {
                         .all(|task| task.status() != ComponentTaskStatus::Rejected)
                 {
                     self.watcher_retry = None;
+                }
+            }
+            Message::Control(w11term::control::UiRequest::ListSshGroups { reply }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(Ok(self.control_ssh_groups()));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::GetSshGroupRoster {
+                tab_id,
+                wait_for_readiness,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    self.control_ssh_group_roster(tab_id, wait_for_readiness, reply);
+                    if wait_for_readiness {
+                        self.update_host_group_timer(context);
+                    }
+                }
+            }
+            Message::Control(w11term::control::UiRequest::GetSshGroupRun {
+                tab_id,
+                run_id,
+                wait_for_settlement,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    self.control_ssh_group_run(tab_id, run_id, wait_for_settlement, reply);
+                    if wait_for_settlement {
+                        self.update_host_group_timer(context);
+                    }
                 }
             }
             Message::Control(w11term::control::UiRequest::Open {
@@ -6786,7 +6845,7 @@ impl Component for TerminalApp {
                 Page::Settings(Some(SettingsEditor::WordDelimiters(editor))) => {
                     word_delimiters::view(editor, context)
                 }
-                Page::Attention => self.attention_view(context),
+                Page::Attention(page) => self.attention_view(page, context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::HostGroup(page) => self.host_group_view(id, page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),

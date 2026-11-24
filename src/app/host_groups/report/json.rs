@@ -1,10 +1,16 @@
 use super::{CapturedOutput, Report};
-use crate::app::host_groups::{Delivery, DeliveryStatus, GroupExecution, SubmissionContent};
+use crate::app::host_groups::{
+    Delivery, DeliveryStatus, GroupExecution, Submission, SubmissionContent,
+    dispatch_policy::Policy,
+    progress::{Outcome, Summary},
+};
 use serde::Serialize;
+use serde_json::{Value, json};
 use std::{
     io::{self, Write},
     time::{Duration, Instant},
 };
+use w11term::events::GroupQueueActivity;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,24 +19,37 @@ pub(super) enum Kind {
     Environment,
 }
 
+impl Kind {
+    pub(super) fn of(content: &SubmissionContent) -> Self {
+        match content {
+            SubmissionContent::Command(_) => Self::Command,
+            SubmissionContent::Environment(_) => Self::Environment,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum DeliveryState {
+    Queued,
     Pending,
     Sent,
     Rejected { reason: String },
+    Skipped,
     Unconfirmed,
 }
 
 impl From<&DeliveryStatus> for DeliveryState {
     fn from(status: &DeliveryStatus) -> Self {
         match status {
+            DeliveryStatus::Queued(_) => Self::Queued,
             DeliveryStatus::Pending(..) => Self::Pending,
             DeliveryStatus::Sent => Self::Sent,
             DeliveryStatus::Rejected(reason) => Self::Rejected {
                 reason: reason.clone(),
             },
             DeliveryStatus::Unconfirmed => Self::Unconfirmed,
+            DeliveryStatus::Skipped => Self::Skipped,
         }
     }
 }
@@ -149,7 +168,75 @@ struct Document<'a> {
     kind: Kind,
     label: &'a str,
     command: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_policy: Option<&'a Policy>,
+    #[serde(skip_serializing_if = "GroupQueueActivity::is_empty")]
+    queue_activity: &'a GroupQueueActivity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_recipient_count: Option<usize>,
     recipients: Vec<DocumentRecipient<'a>>,
+}
+
+#[derive(Serialize)]
+pub(in crate::app::host_groups) struct RunSummary<'a> {
+    run_id: u64,
+    label: &'a str,
+    kind: Kind,
+    recipient_count: usize,
+    settled_count: usize,
+    outcomes: Summary,
+}
+
+impl<'a> RunSummary<'a> {
+    fn new(submission: &'a Submission, outcomes: Summary) -> Self {
+        Self {
+            run_id: submission.id,
+            label: submission.content.label(),
+            kind: Kind::of(&submission.content),
+            recipient_count: outcomes.total(),
+            settled_count: outcomes.settled(),
+            outcomes,
+        }
+    }
+}
+
+pub(in crate::app::host_groups) fn summarize_run(submission: &Submission) -> RunSummary<'_> {
+    let mut outcomes = Summary::default();
+    for delivery in &submission.results {
+        outcomes.add(Outcome::of(delivery));
+    }
+    RunSummary::new(submission, outcomes)
+}
+
+pub(in crate::app::host_groups) fn describe_run(
+    submission: &Submission,
+    require_settlement: bool,
+) -> Option<Value> {
+    let now = Instant::now();
+    let mut outcomes = Summary::default();
+    let recipients: Vec<_> = submission
+        .results
+        .iter()
+        .map(|delivery| {
+            let execution = delivery.execution();
+            outcomes.add(Outcome::with_execution(
+                &delivery.status,
+                execution.as_ref(),
+            ));
+            Recipient::capture(delivery, &submission.content, execution.as_ref(), now)
+        })
+        .collect();
+    if require_settlement && outcomes.settled() != outcomes.total() {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "summary": RunSummary::new(submission, outcomes),
+        "command": submission.content.command(),
+        "dispatch_policy": submission.dispatch_policy,
+        "queue_activity": submission.transcript.queue_activity(),
+        "recipients": recipients,
+    }))
 }
 
 impl Report {
@@ -163,6 +250,9 @@ impl Report {
             kind: self.kind,
             label: &self.label,
             command: matches!(self.kind, Kind::Command).then_some(self.label.as_str()),
+            dispatch_policy: self.dispatch_policy.as_ref(),
+            queue_activity: &self.queue_activity,
+            total_recipient_count: self.total_recipient_count,
             recipients: self
                 .sections
                 .iter()

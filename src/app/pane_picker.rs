@@ -226,6 +226,7 @@ impl Choice {
 enum Mode {
     Commands(command_palette::Search),
     Focus,
+    HostRoster(TabId),
     Text,
     Destination { source: TabId },
     Placement { source: TabId, target: TabId },
@@ -240,6 +241,7 @@ impl Mode {
 pub(super) struct Picker {
     mode: Mode,
     query: String,
+    launch: Arc<()>,
     input: ElementRef<TextBox>,
     default_side: ElementRef<Button>,
     matches: Vec<Choice>,
@@ -356,6 +358,7 @@ impl Picker {
 
     fn search_view(&self, app: &TerminalApp, ctx: &ViewContext<TerminalApp>) -> View {
         let moving = matches!(self.mode, Mode::Destination { .. });
+        let roster = matches!(self.mode, Mode::HostRoster(_));
         let wide = app.width >= 800.0;
         let preview_height = if wide {
             (app.window_height - 160.0).clamp(0.0, 300.0)
@@ -378,11 +381,15 @@ impl Picker {
                     .text(&self.query)
                     .placeholder_text(if moving {
                         "Find a destination by pane name, title, profile or user@host"
+                    } else if roster {
+                        "Search shown SSH hosts by pane name, title, profile or user@host"
                     } else {
                         "Search by pane name, title, profile or user@host"
                     })
                     .automation_name(if moving {
                         "Find destination pane"
+                    } else if roster {
+                        "Find SSH host in group"
                     } else {
                         "Find pane"
                     })
@@ -419,6 +426,8 @@ impl Picker {
                 "empty",
                 TextBlock::new().text(if moving && self.query.is_empty() {
                     "Open a terminal in another tab to move this pane."
+                } else if roster {
+                    "No matching SSH hosts in this roster"
                 } else {
                     "No matching panes"
                 }),
@@ -515,6 +524,16 @@ impl TerminalApp {
             Mode::Destination { source } => self.tabs.group_id(source),
             _ => None,
         };
+        let roster: Option<BTreeMap<_, _>> = match mode {
+            Mode::HostRoster(group) => Some(
+                self.roster_picker_hosts(group)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (pane, address))| (pane, (index, address)))
+                    .collect(),
+            ),
+            _ => None,
+        };
         let mut choices = vec![];
         for (tab, header) in self.tabs.headers().into_iter().enumerate() {
             if excluded.is_some() && self.tabs.group_id(header.id) == excluded {
@@ -527,14 +546,23 @@ impl TerminalApp {
                         page: Page::Terminal(live),
                     }) = self.tabs.get(leaf)
                     {
+                        let pane_id = live.session.pane_id;
+                        let destination = if let Some(roster) = &roster {
+                            let Some((_, address)) = roster.get(&pane_id) else {
+                                continue;
+                            };
+                            address.clone()
+                        } else {
+                            source_label(&live.source)
+                        };
                         choices.push(Choice {
                             read_only: live.read_only.get(),
                             pane_name: live.pane_name.as_ref().map(|n| n.as_str().to_owned()),
                             tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
-                            pane: live.session.pane_id,
+                            pane: pane_id,
                             label: label.clone(),
                             title: live.session.frames.load().title.clone(),
-                            destination: source_label(&live.source),
+                            destination,
                             profile: live.profile_name.clone(),
                             tab_number: tab + 1,
                             pane_number: pane + 1,
@@ -542,6 +570,9 @@ impl TerminalApp {
                     }
                 }
             }
+        }
+        if let Some(roster) = roster {
+            choices.sort_by_key(|choice| roster[&choice.pane].0);
         }
         choices
     }
@@ -583,6 +614,13 @@ impl TerminalApp {
         );
     }
 
+    pub(super) fn open_group_run_picker(&mut self, group: TabId, ctx: &ComponentContext<Self>) {
+        self.start_picker(
+            Mode::Commands(command_palette::Search::GroupRuns(group)),
+            ctx,
+        );
+    }
+
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
@@ -591,6 +629,9 @@ impl TerminalApp {
             }
             Mode::Commands(command_palette::Search::GroupRecent(group)) => {
                 self.group_recent_command_rows(group, query)
+            }
+            Mode::Commands(command_palette::Search::GroupRuns(group)) => {
+                self.group_run_rows(group, query)
             }
             _ => self.command_rows(query),
         }
@@ -633,6 +674,63 @@ impl TerminalApp {
 
     pub(super) fn open_picker(&mut self, ctx: &ComponentContext<Self>) {
         self.start_picker(Mode::Focus, ctx);
+    }
+
+    pub(super) fn open_roster_picker(&mut self, group: TabId, ctx: &ComponentContext<Self>) {
+        if self.host_group_command_target() == Some(group) {
+            self.start_picker(Mode::HostRoster(group), ctx);
+        }
+    }
+
+    pub(super) fn refresh_roster_picker(&mut self, ctx: &ComponentContext<Self>) {
+        let Some(picker) = self
+            .picker
+            .as_ref()
+            .filter(|picker| matches!(picker.mode, Mode::HostRoster(_)))
+        else {
+            return;
+        };
+        let matches = Picker::filter(self.picker_choices(picker.mode), &picker.query);
+        let selected = picker
+            .matches
+            .get(picker.selected)
+            .and_then(|previous| matches.iter().position(|row| row.pane == previous.pane))
+            .unwrap_or_else(|| picker.selected.min(matches.len().saturating_sub(1)));
+        let picker = self.picker.as_mut().unwrap();
+        picker.matches = matches;
+        picker.selected = selected;
+        self.sync_picker_preview(ctx);
+    }
+
+    pub(super) fn open_picker_from_menu(
+        &mut self,
+        shortcut: Shortcut,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.picker.is_some() {
+            return;
+        }
+        self.update(Message::Shortcut(shortcut), ctx);
+        if let Some(picker) = &self.picker {
+            let launch = picker.launch.clone();
+            // WinUI's MenuFlyout restores focus to its owner when it closes.
+            // Give the new editor a second chance after the close animation.
+            ctx.spawn_background(move |_| {
+                std::thread::sleep(Duration::from_millis(200));
+                Message::PickerFocusAfterMenu(launch)
+            });
+        }
+    }
+
+    pub(super) fn focus_picker_after_menu(&self, launch: &Arc<()>) {
+        if let Some(picker) = self.picker.as_ref().filter(|picker| {
+            Arc::ptr_eq(&picker.launch, launch)
+                && picker.placement().is_none()
+                && picker.query.is_empty()
+                && !picker.text.revealing
+        }) {
+            let _ = picker.input.request_focus();
+        }
     }
 
     pub(super) fn open_text_picker(&mut self, ctx: &ComponentContext<Self>) {
@@ -703,6 +801,7 @@ impl TerminalApp {
             .unwrap_or(0);
         self.picker = Some(Picker {
             mode,
+            launch: Arc::new(()),
             input: ElementRef::new(),
             default_side: ElementRef::new(),
             query: String::new(),
@@ -848,6 +947,15 @@ impl TerminalApp {
     }
 
     pub(super) fn choose_picker_pane(&mut self, pane: u64, ctx: &ComponentContext<Self>) {
+        if let Some(Mode::HostRoster(group)) = self.picker.as_ref().map(|picker| picker.mode)
+            && !self
+                .roster_picker_hosts(group)
+                .iter()
+                .any(|(id, _)| *id == pane)
+        {
+            self.refresh_roster_picker(ctx);
+            return;
+        }
         let id = self.tab_for_pane(pane);
         let Some(picker) = &mut self.picker else {
             return;

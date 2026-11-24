@@ -442,10 +442,15 @@ mod tests {
         let old_view = p.frames.load();
         let old_live = p.capture().0;
         assert_ne!(old_view.first_stable_row, old_live.first_stable_row);
+        assert_eq!(old_live.last_visible_text_line().as_deref(), Some("five"));
         p.advance(&mut terminal, b"\x1b[?2026h\rnew live", 2, "test", 0);
         publish(&mut p, &terminal, 2);
         assert!(p.frames.load().same_presentation(&old_view));
         assert!(p.capture().0.same_presentation(&old_live));
+        assert_eq!(
+            p.live.load().last_visible_text_line().as_deref(),
+            Some("five")
+        );
         p.advance(&mut terminal, b"\x1b[?2026l", 2, "test", 0);
         publish(&mut p, &terminal, 2);
         assert!(
@@ -456,5 +461,13 @@ mod tests {
                 .any(|r| r.as_str().contains("new live"))
         );
         assert_eq!(p.frames.load().scroll_offset, 2);
+        assert_eq!(
+            p.live.load().last_visible_text_line().as_deref(),
+            Some("new live")
+        );
+        assert_ne!(
+            p.frames.load().last_visible_text_line().as_deref(),
+            Some("new live")
+        );
     }
 }

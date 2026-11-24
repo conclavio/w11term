@@ -1,7 +1,7 @@
 use crate::{
     clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     demo,
-    events::ShellPrompt,
+    events::{ShellPrompt, SshConnectionPhase},
     options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
@@ -34,7 +34,10 @@ use presentation::Presentation;
 pub use timed_replay::{ReplayAction, ReplayState, ReplayStatus};
 
 #[derive(Debug)]
-pub struct ClaimedRestart(pub(crate) u64);
+pub struct ClaimedRestart {
+    pub(crate) token: u64,
+    pub(crate) login_permits: Option<Arc<tokio::sync::Semaphore>>,
+}
 
 #[derive(Debug)]
 pub enum Command {
@@ -67,6 +70,7 @@ pub enum Command {
     Authenticate(crate::options::Authentication),
     Events(tokio::sync::oneshot::Sender<crate::events::Events>),
     Frames(tokio::sync::oneshot::Sender<FrameStore>),
+    DescribePane(tokio::sync::oneshot::Sender<PaneDescription>),
     Inspect(bool),
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<(u64, terminal::TerminalModes)>),
@@ -107,6 +111,10 @@ pub enum Command {
     },
     InterruptGroupCommand {
         target: crate::events::GroupInterruptTarget,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    DisconnectSshShell {
+        connection: u64,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
@@ -240,6 +248,13 @@ impl Command {
     }
 }
 
+#[derive(Debug)]
+pub struct PaneDescription {
+    pub(crate) frame: Arc<Snapshot>,
+    pub(crate) restart_token: Option<u64>,
+    pub(crate) ssh_phase: Option<SshConnectionPhase>,
+}
+
 pub struct Session {
     /// Process-local identity used by external clients across reconnects and layout changes.
     pub pane_id: u64,
@@ -248,6 +263,7 @@ pub struct Session {
     pub player: Arc<std::sync::RwLock<crate::options::PlayerOptions>>,
     pub input: mpsc::UnboundedSender<Command>,
     pub frames: FrameStore,
+    live_frames: FrameStore,
     pub remote_clipboard: Arc<RemoteClipboardAccess>,
     ssh_connection: ssh::ShareSlot,
     direct_ssh_shell: bool,
@@ -275,8 +291,28 @@ fn has_cell_pixels(size: TerminalSize) -> bool {
 }
 
 impl Session {
+    /// Read the newest committed screen even while the pane shows scrollback.
+    pub fn live_snapshot(&self) -> Arc<Snapshot> {
+        self.live_frames.load()
+    }
+
     pub fn restart_exited(&self, token: u64) -> anyhow::Result<()> {
         self.events.restart_exited(&self.input, token)
+    }
+
+    pub fn restart_group_ssh(
+        &self,
+        token: u64,
+        login_permits: Arc<tokio::sync::Semaphore>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_direct_ssh_shell(), "Pane is not a direct SSH shell");
+        self.events
+            .queue_restart(&self.input, token, Some(login_permits))
+    }
+
+    /// Claim the reviewed exit before immediately removing the SSH pane.
+    pub fn claim_exited_ssh_for_close(&self, token: u64) -> bool {
+        self.is_direct_ssh_shell() && self.events.close_if_exited(token)
     }
 
     pub fn start(source: Source) -> Self {
@@ -304,6 +340,11 @@ impl Session {
         self.ssh_connection
             .generation()
             .and_then(|(current, link)| (current == generation).then_some(link))
+    }
+    pub fn ssh_connection_generation(&self) -> Option<u64> {
+        self.ssh_connection
+            .generation()
+            .map(|(generation, _)| generation)
     }
     pub fn ssh_connection_changes(&self) -> tokio::sync::watch::Receiver<()> {
         self.ssh_connection.subscribe()
@@ -343,6 +384,24 @@ impl Session {
             connection,
             None,
             None,
+            None,
+        )
+    }
+
+    pub fn start_group_ssh(
+        options: crate::options::SshOptions,
+        size: TerminalSize,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        launch_gate: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self::start_worker(
+            Source::Ssh(options),
+            Some(size),
+            clipboard_policy.into(),
+            None,
+            None,
+            None,
+            Some(launch_gate),
         )
     }
 
@@ -352,6 +411,7 @@ impl Session {
             Source::ViewRecording(path),
             has_cell_pixels(size).then_some(size),
             RemoteClipboardPolicy::Disabled,
+            None,
             None,
             None,
             None,
@@ -367,6 +427,7 @@ impl Session {
             Source::Replay(path),
             has_cell_pixels(size).then_some(size),
             clipboard_policy.into(),
+            None,
             None,
             None,
             None,
@@ -396,6 +457,7 @@ impl Session {
             connection,
             None,
             Some(startup),
+            None,
         )
     }
 
@@ -412,6 +474,7 @@ impl Session {
             clipboard_policy.into(),
             connection,
             Some(ssh::DurableStart::Attach(saved)),
+            None,
             None,
         )
     }
@@ -430,6 +493,7 @@ impl Session {
             None,
             Some(ssh::DurableStart::Discover),
             None,
+            None,
         )
     }
 
@@ -446,6 +510,7 @@ impl Session {
             clipboard_policy.into(),
             None,
             Some(ssh::DurableStart::DiscoverHerdr),
+            None,
             None,
         )
     }
@@ -479,6 +544,7 @@ impl Session {
         connection: Option<ssh::ConnectionShare>,
         saved: Option<ssh::DurableStart>,
         startup: Option<crate::workspace::SshStartup>,
+        launch_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
@@ -489,6 +555,14 @@ impl Session {
             _ => None,
         };
         let events = crate::events::Events::with_group_prompt_pattern(group_prompt_pattern);
+        if matches!(source, Source::Ssh(_)) {
+            let phase = if launch_gate.is_some() {
+                crate::events::SshConnectionPhase::Queued
+            } else {
+                crate::events::SshConnectionPhase::Connecting
+            };
+            events.set_ssh_connection_phase(phase);
+        }
         let player = Arc::new(std::sync::RwLock::new(match &source {
             Source::Ssh(ssh) => ssh.player.clone(),
             _ => Default::default(),
@@ -545,6 +619,7 @@ impl Session {
         ));
         let worker_frames = frames.clone();
         let live_frames = FrameStore::new((*frames.load()).clone());
+        let worker_live_frames = live_frames.clone();
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
         let ssh_connection = ssh::ShareSlot::default();
@@ -554,12 +629,16 @@ impl Session {
             .unzip();
         let durable = durable.map(Arc::new);
         let worker_durable = durable.clone();
-        let sharing = ssh::Sharing::new(
+        let mut sharing = ssh::Sharing::new(
             ssh_connection.clone(),
             connection.filter(|_| matches!(source, Source::Ssh(_))),
             lifecycle,
             startup,
         );
+        sharing.launch_gate = launch_gate.map(|permits| ssh::LoginGate {
+            permits,
+            admitted_phase: crate::events::SshConnectionPhase::Connecting,
+        });
         let worker = thread::Builder::new()
             .name("terminal-session".into())
             .spawn(move || {
@@ -584,7 +663,7 @@ impl Session {
                             events: worker_events,
                             player: worker_player,
                             notices: notice_rx,
-                            live_frames,
+                            live_frames: worker_live_frames,
                             sharing,
                             replay_ready: initial_grid.is_some(),
                         },
@@ -599,6 +678,7 @@ impl Session {
             player,
             input: commands,
             frames,
+            live_frames,
             remote_clipboard,
             ssh_connection,
             direct_ssh_shell,
@@ -667,6 +747,7 @@ async fn run(
         launch::Launcher::new(source.clone(), sharing, prompts.clone(), events.clone());
     let mut launch_id = 1u64;
     let mut phase = Phase::Running;
+    let mut ssh_exit = None;
     let mut queued_before_connection = 0usize;
     let mut show_progress = interactive;
     let endpoint = match &source {
@@ -696,7 +777,7 @@ async fn run(
     let mut transports = tokio::task::JoinSet::new();
     match source {
         Source::Local(_) | Source::Ssh(_) => {
-            status = launch.start(&mut transports, size, transport_input, output_tx);
+            status = launch.start(&mut transports, size, transport_input, output_tx, None);
         }
         Source::Replay(ref path) | Source::ViewRecording(ref path) => {
             let capture = if matches!(source, Source::ViewRecording(_)) {
@@ -826,8 +907,15 @@ async fn run(
         }
         if phase == Phase::PublishingExit {
             phase = Phase::Exited;
+            let ssh_phase = is_ssh.then(|| {
+                ssh_exit
+                    .take()
+                    .unwrap_or(crate::events::SshConnectionPhase::Disconnected)
+            });
             if restartable {
-                events.pane_exited(launch_id);
+                events.pane_exited(launch_id, ssh_phase);
+            } else if let Some(phase) = ssh_phase {
+                events.set_ssh_connection_phase(phase);
             }
         }
         if inspecting {
@@ -1038,6 +1126,17 @@ async fn run(
                         }
                         Ok(())
                     }
+                    Some(Command::DisconnectSshShell { connection, reply }) => {
+                        let request = TransportInput::DisconnectShell { connection, reply };
+                        if !group_shell || player.read().unwrap().rustmush {
+                            request.reject_input("Disconnect requires a direct SSH shell.");
+                        } else if phase != Phase::Running || connection_generation != connection {
+                            request.reject_input("The SSH shell changed before disconnect.");
+                        } else if let Err(error) = writer.send(request) {
+                            error.0.reject_input("The SSH shell already closed.");
+                        }
+                        Ok(())
+                    }
                     Some(Command::ClipboardPaste(request, reply)) => {
                         use clipboard::Decision;
                         if let ClipboardPaste::InsertHistory { connection, command, text } = &request {
@@ -1083,7 +1182,7 @@ async fn run(
                         }
                         Ok(())
                     }
-                    Some(Command::RestartExited(ClaimedRestart(token))) => {
+                    Some(Command::RestartExited(ClaimedRestart { token, login_permits })) => {
                         if phase == Phase::Exited && restartable && token == launch_id {
                             launch_id += 1;
                             phase = Phase::Restarting { reset: true };
@@ -1097,7 +1196,11 @@ async fn run(
                             writer = tx;
                             let (output_tx, new_output) = mpsc::channel(32);
                             output = new_output;
-                            status = launch.start(&mut transports, size, rx, output_tx);
+                            let gate = login_permits.map(|permits| ssh::LoginGate {
+                                permits,
+                                admitted_phase: crate::events::SshConnectionPhase::Reconnecting { attempt: None },
+                            });
+                            status = launch.start(&mut transports, size, rx, output_tx, gate);
                             presentation.dirty = true;
                             search.refresh(&terminal, scroll_offset);
                         }
@@ -1141,6 +1244,15 @@ async fn run(
                     Some(Command::Authenticate(auth))=>{launch.set_authentication(auth.clone());let _=writer.send(TransportInput::Authenticate(auth));Ok(())},
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
+                    Some(Command::DescribePane(reply)) => {
+                        let (restart_token, ssh_phase) = events.exit_snapshot();
+                        let _ = reply.send(PaneDescription {
+                            frame: live_frames.load(),
+                            restart_token,
+                            ssh_phase,
+                        });
+                        Ok(())
+                    }
                     Some(Command::Inspect(enabled))=>{
                         inspecting=enabled;
                         if !enabled { frames.set_inspection(None); }
@@ -1415,7 +1527,14 @@ async fn run(
                             events.push("sound-error",serde_json::json!({"reason":"audio queue full"}));
                         }
                     }
-                    if let Some(Err(error)) = joined { status = format!("Terminal transport failed: {error}"); }
+                    if let Some(Err(error)) = joined {
+                        status = format!("Terminal transport failed: {error}");
+                        if is_ssh {
+                            ssh_exit = Some(crate::events::SshConnectionPhase::Failed(
+                                crate::events::display_field(&status).into(),
+                            ));
+                        }
+                    }
                     // A peer that exits halfway through a synchronized update
                     // cannot deliver an end marker. Publish its final image
                     // before making the restart token visible.
@@ -1436,6 +1555,9 @@ async fn run(
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
                         ssh::Event::Disconnected => {
+                            if is_ssh {
+                                events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Disconnected);
+                            }
                             if let Some(matcher) = &mut prompt_matcher { matcher.reset(); }
                             terminal.clear_color_scheme_subscription();
                             terminal.clear_resize_subscription();
@@ -1449,6 +1571,22 @@ async fn run(
                             };
                             events.set_terminal_activity(wezterm_term::Progress::None, program);
                             show_progress = interactive;
+                        }
+                        ssh::Event::Reconnecting(attempt) => {
+                            events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Reconnecting {
+                                attempt: Some(attempt),
+                            });
+                        }
+                        ssh::Event::ConnectionFailed(reason) => {
+                            ssh_exit = Some(crate::events::SshConnectionPhase::Failed(
+                                crate::events::display_field(&reason).into(),
+                            ));
+                            status = format!("SSH: {reason}");
+                            log::info!("{status}");
+                        }
+                        ssh::Event::ConnectionStopped => {
+                            ssh_exit = Some(crate::events::SshConnectionPhase::Stopped);
+                            status = "SSH connection attempt stopped".into();
                         }
                         ssh::Event::Data(bytes) => {
                             if observed.receiver_count() > 0 {
@@ -1505,6 +1643,9 @@ async fn run(
                             connection_generation = generation;
                             phase = Phase::Running;
                             events.command_stream(live_commands.then_some(generation));
+                            if is_ssh {
+                                events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connected);
+                            }
                         }
                     }
                 }

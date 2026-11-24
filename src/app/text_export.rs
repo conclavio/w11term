@@ -6,6 +6,8 @@ pub(super) const SCROLLBACK_LABEL: &str = "Save scrollback as text…";
 pub(super) const COMMAND_OUTPUT_LABEL: &str = "Save output as text…";
 pub(super) const GROUP_REPORT_LABEL: &str = "Save results…";
 pub(super) const GROUP_JSON_LABEL: &str = "Save results as JSON…";
+pub(super) const GROUP_SHOWN_REPORT_LABEL: &str = "Save shown results…";
+pub(super) const GROUP_SHOWN_JSON_LABEL: &str = "Save shown results as JSON…";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupReportFormat {
@@ -20,14 +22,29 @@ pub enum Subject {
         pane: u64,
         command: u64,
     },
-    HostGroupResults(u64, GroupReportFormat),
+    HostGroupResults {
+        submission: u64,
+        format: GroupReportFormat,
+        shown: bool,
+    },
     HostGroupShownOutput(u64),
     HostGroupDiff {
         submission: u64,
         reference: u64,
         selected: u64,
     },
+    HostGroupRunDiff {
+        baseline: u64,
+        run: u64,
+        pane: u64,
+    },
+    HostGroupRunComparison {
+        baseline: u64,
+        run: u64,
+    },
     SshHostList,
+    SshGroupDefinition,
+    SshLoginReport(u64),
 }
 
 impl Subject {
@@ -35,11 +52,22 @@ impl Subject {
         match self {
             Self::Scrollback(pane) => format!("scrollback for pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
-            Self::HostGroupResults(_, GroupReportFormat::Text) => "SSH group results".into(),
-            Self::HostGroupResults(_, GroupReportFormat::Json) => "SSH group JSON results".into(),
+            Self::HostGroupResults { format, shown, .. } => {
+                let scope = if shown { "shown " } else { "" };
+                let format = if format == GroupReportFormat::Json {
+                    "JSON "
+                } else {
+                    ""
+                };
+                format!("{scope}SSH group {format}results")
+            }
             Self::HostGroupShownOutput(_) => "shown SSH group output".into(),
             Self::HostGroupDiff { .. } => "SSH group differences".into(),
+            Self::HostGroupRunDiff { .. } => "SSH group run differences".into(),
+            Self::HostGroupRunComparison { .. } => "SSH group run comparison".into(),
             Self::SshHostList => "SSH host list".into(),
+            Self::SshGroupDefinition => "SSH group definition".into(),
+            Self::SshLoginReport(_) => "SSH login report".into(),
         }
     }
 
@@ -49,13 +77,21 @@ impl Subject {
             Self::CommandOutput { pane, command } => {
                 file_picker::Purpose::CommandOutput(format!("pane-{pane}-command-{command}.txt"))
             }
-            Self::HostGroupResults(submission, GroupReportFormat::Text) => {
-                file_picker::Purpose::GroupReport(format!("ssh-group-submission-{submission}.txt"))
-            }
-            Self::HostGroupResults(submission, GroupReportFormat::Json) => {
-                file_picker::Purpose::GroupJsonReport(format!(
-                    "ssh-group-submission-{submission}.json"
-                ))
+            Self::HostGroupResults {
+                submission,
+                format,
+                shown,
+            } => {
+                let scope = if shown { "-shown" } else { "" };
+                let stem = format!("ssh-group-submission-{submission}{scope}");
+                match format {
+                    GroupReportFormat::Text => {
+                        file_picker::Purpose::GroupReport(format!("{stem}.txt"))
+                    }
+                    GroupReportFormat::Json => {
+                        file_picker::Purpose::GroupJsonReport(format!("{stem}.json"))
+                    }
+                }
             }
             Self::HostGroupShownOutput(submission) => file_picker::Purpose::GroupOutputExcerpt(
                 format!("ssh-group-output-excerpt-{submission}.txt"),
@@ -67,7 +103,23 @@ impl Subject {
             } => file_picker::Purpose::GroupOutputDiff(format!(
                 "ssh-group-diff-{submission}-{reference}-to-{selected}.txt"
             )),
+            Self::HostGroupRunDiff {
+                baseline,
+                run,
+                pane,
+            } => file_picker::Purpose::GroupOutputDiff(format!(
+                "ssh-group-run-diff-{baseline}-to-{run}-pane-{pane}.txt"
+            )),
+            Self::HostGroupRunComparison { baseline, run } => {
+                file_picker::Purpose::GroupRunComparison(format!(
+                    "ssh-group-run-comparison-{baseline}-to-{run}.json"
+                ))
+            }
             Self::SshHostList => file_picker::Purpose::SshHostList,
+            Self::SshGroupDefinition => file_picker::Purpose::SshGroupDefinition,
+            Self::SshLoginReport(sequence) => {
+                file_picker::Purpose::SshLoginReport(format!("ssh-login-results-{sequence}.txt"))
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 //! A pane can explicitly lend an authenticated connection to a new shell
 //! channel. No global host cache or saved authentication answers are involved.
-use super::Handler;
-use crate::{options::SshOptions, prompts::Prompts};
+use super::{Handler, SESSION_SETUP_TIMEOUT};
+use crate::{events::SshConnectionPhase, options::SshOptions, prompts::Prompts};
 use anyhow::{Context, Result};
 use russh::{Channel, client};
 use std::path::PathBuf;
@@ -115,7 +115,10 @@ impl ConnectionShare {
                 });
             let _ = send.send(result);
         });
-        Ok(receive.await.context("SSH channel opener stopped")??)
+        Ok(tokio::time::timeout(SESSION_SETUP_TIMEOUT, receive)
+            .await
+            .context("SSH session channel open timed out")?
+            .context("SSH channel opener stopped")??)
     }
 }
 
@@ -254,12 +257,18 @@ impl ShareSlot {
     }
 }
 
+pub(crate) struct LoginGate {
+    pub permits: Arc<Semaphore>,
+    pub admitted_phase: SshConnectionPhase,
+}
+
 #[derive(Default)]
 pub(crate) struct Sharing {
     pub startup: Option<crate::workspace::SshStartup>,
     pub published: ShareSlot,
     pub offered: Option<ConnectionShare>,
     pub durable: Option<super::durability::Worker>,
+    pub launch_gate: Option<LoginGate>,
     generations: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -286,6 +295,7 @@ impl Sharing {
             offered: self.offered.take(),
             durable: self.durable.take(),
             startup: self.startup.clone(),
+            launch_gate: self.launch_gate.take(),
             generations: self.generations.clone(),
         }
     }

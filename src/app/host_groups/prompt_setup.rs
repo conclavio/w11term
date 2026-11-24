@@ -124,7 +124,7 @@ impl State {
 }
 
 pub(super) fn button(id: TabId, target: &Target, ctx: &ViewContext<TerminalApp>) -> View {
-    if !target.connected || matches!(target.state, TargetState::Authentication) {
+    if !target.connected || target.state.is_authenticating() {
         return View::empty();
     }
     let pane = target.pane;
@@ -175,9 +175,7 @@ impl TerminalApp {
             return;
         };
         let Some(target) = page.shown(&roster).find(|target| {
-            target.pane == pane
-                && target.connected
-                && !matches!(target.state, TargetState::Authentication)
+            target.pane == pane && target.connected && !target.state.is_authenticating()
         }) else {
             return;
         };

@@ -1,12 +1,14 @@
 use super::{
-    CommandLink, GroupExecution, GroupOutput, Submission, execution_caption, execution_time_caption,
+    CommandLink, Delivery, GroupExecution, GroupOutput, Submission, dispatch_policy,
+    execution_caption, execution_time_caption, queue_activity,
 };
 use anyhow::{Context, Result};
 use std::{fmt::Write as _, io, sync::Arc, time::Instant};
-use w11term::events::GroupCommandResult;
+use w11term::events::{GroupCommandResult, GroupQueueActivity};
 use wezterm_term::CompletedCommand;
 
 mod json;
+pub(super) use json::{describe_run, summarize_run};
 
 const OUTPUT_END: &str = "\r\n";
 const OUTPUT_SHORTENED: &str = "[Output shortened to fit the clipboard]\r\n";
@@ -16,6 +18,9 @@ pub(super) struct Report {
     id: u64,
     label: String,
     kind: json::Kind,
+    dispatch_policy: Option<dispatch_policy::Policy>,
+    queue_activity: GroupQueueActivity,
+    total_recipient_count: Option<usize>,
     sections: Vec<Section>,
 }
 
@@ -91,18 +96,28 @@ impl Output {
 impl Report {
     pub(super) fn capture(
         submission: &Submission,
-        mut retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
+        retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
     ) -> Self {
-        let now = Instant::now();
-        let sections = submission
+        let rows = submission
             .results
             .iter()
-            .map(|delivery| {
+            .map(|delivery| (delivery, delivery.execution()));
+        Self::capture_rows(submission, Instant::now(), rows, retained)
+    }
+
+    pub(super) fn capture_rows<'a>(
+        submission: &Submission,
+        now: Instant,
+        rows: impl IntoIterator<Item = (&'a Delivery, Option<GroupExecution>)>,
+        mut retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
+    ) -> Self {
+        let sections: Vec<_> = rows
+            .into_iter()
+            .map(|(delivery, execution)| {
                 let mut heading = format!("\r\n{}\r\n", delivery.description());
                 if let Some(command) = submission.content.host_command(delivery.target.pane) {
                     let _ = writeln!(heading, "  {command}\r");
                 }
-                let execution = delivery.execution();
                 if let Some(execution) = &execution {
                     let _ = writeln!(heading, "  {}\r", execution_caption(execution));
                     if let Some(timing) = execution_time_caption(execution, now) {
@@ -155,17 +170,27 @@ impl Report {
         Self {
             id: submission.id,
             label: submission.content.label().to_owned(),
-            kind: if submission.content.command().is_some() {
-                json::Kind::Command
-            } else {
-                json::Kind::Environment
-            },
+            kind: json::Kind::of(&submission.content),
+            dispatch_policy: submission.dispatch_policy.clone(),
+            queue_activity: submission.transcript.queue_activity(),
+            total_recipient_count: (sections.len() < submission.results.len())
+                .then_some(submission.results.len()),
             sections,
         }
     }
 
     fn text_title(&self) -> String {
-        format!("Submitted · {}\r\n", self.label)
+        let mut header =
+            dispatch_policy::report_heading(&self.label, self.dispatch_policy.as_ref());
+        if let Some(total) = self.total_recipient_count {
+            let _ = writeln!(
+                header,
+                "Shown results · {} of {total} recipients\r",
+                self.sections.len()
+            );
+        }
+        header.push_str(&queue_activity::text(&self.queue_activity));
+        header
     }
 
     pub(super) fn clipboard(&self, limit: usize) -> Result<String> {
@@ -228,11 +253,13 @@ impl Report {
 mod tests {
     use super::*;
     use crate::app::host_groups::{
-        Delivery, DeliveryStatus, GroupInterruptTarget, SubmissionContent, Target, TargetState,
+        CommandOffer, Delivery, DeliveryStatus, GroupInterruptTarget, SshGroupCommandInterval,
+        SshGroupParallelLimit, SshGroupQueueExpiry, SubmissionContent, Target, TargetState,
         filter::Names,
     };
     use std::{collections::BTreeMap, time::Duration};
     use tokio::sync::{oneshot, watch};
+    use w11term::events::GroupQueueEventKind;
 
     fn captured(pane: u64, text: String, truncated: bool) -> Delivery {
         let capture = GroupCommandResult {
@@ -268,17 +295,50 @@ mod tests {
 
     #[test]
     fn report_uses_exact_history_or_labels_the_retained_preview() {
-        let submission = Submission {
+        let mut skipped = captured(9, String::new(), false);
+        skipped.status = DeliveryStatus::Skipped;
+        let mut submission = Submission {
             id: 1,
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
             saved_recordings: Default::default(),
+            command_queue: None,
+            dispatch_policy: None,
+            show_queue_activity: false,
+            control_waiters: Vec::new(),
             transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
                 captured(8, "missing tail".into(), true),
+                skipped,
             ],
         };
+        submission.dispatch_policy = Some(
+            CommandOffer {
+                text: "show".into(),
+                targets: submission
+                    .results
+                    .iter()
+                    .map(|delivery| delivery.target.clone())
+                    .collect(),
+                limit: SshGroupParallelLimit::Two,
+                interval: SshGroupCommandInterval::HalfSecond,
+                queue_expiry: SshGroupQueueExpiry::FiveSeconds,
+                stop_queue_on_failure: true,
+                canary: Some(7),
+                notify_canary: false,
+            }
+            .dispatch_policy(),
+        );
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::CanaryReady);
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::CanaryApproved);
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::HostSkipped { pane_id: 9 });
         let snapshot = Report::capture(&submission, |pane, link| {
             assert_eq!(
                 link,
@@ -296,7 +356,19 @@ mod tests {
                 })
             })
         });
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::Cancelled);
         let report = snapshot.clipboard(1024).unwrap();
+        assert!(report.contains("[Queue activity]"));
+        assert!(
+            report.find("Canary ready for approval").unwrap()
+                < report.find("Approved remaining hosts").unwrap()
+        );
+        assert!(!report.contains("Cancelled queued commands"));
+        assert!(report.starts_with(
+            "Submitted · show\r\nDispatch · parallel limit 2 · 500ms between sends · queue expires after 5s · stop on failure · canary Host 7\r\n"
+        ));
         assert!(report.contains(
             "Host 7 · Sent to SSH channel\r\n  Exit 17\r\n  Shell time · 1.25 s\r\n  Output\r\nfull output\r\nsecond line"
         ));
@@ -306,10 +378,32 @@ mod tests {
         snapshot.write_to(&mut file).unwrap();
         assert_eq!(file, report.as_bytes());
         let document = json(&snapshot);
+        assert!(document.get("total_recipient_count").is_none());
         assert_eq!(document["schema_version"], 1);
         assert_eq!(document["submission_id"], 1);
         assert_eq!(document["kind"], "command");
         assert_eq!(document["command"], "show");
+        assert_eq!(
+            document["dispatch_policy"],
+            serde_json::json!({
+                "parallel_limit": 2,
+                "interval_ms": 500,
+                "queue_expiry_ms": 5000,
+                "stop_on_failure": true,
+                "canary": {"pane_id": 7, "label": "Host 7"}
+            })
+        );
+        let activity = &document["queue_activity"];
+        assert_eq!(activity["omitted"], 0);
+        let events = activity["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["kind"], "canary_ready");
+        assert_eq!(events[1]["kind"], "canary_approved");
+        assert_eq!(events[2]["kind"], "host_skipped");
+        assert_eq!(events[2]["pane_id"], 9);
+        assert!(
+            events[0]["elapsed_ms"].as_u64().unwrap() <= events[1]["elapsed_ms"].as_u64().unwrap()
+        );
         let hosts = document["recipients"].as_array().unwrap();
         assert_eq!(hosts[0]["name"], "Host 7");
         assert_eq!(hosts[0]["address"], "ops@lab.example:2222");
@@ -321,6 +415,8 @@ mod tests {
         assert_eq!(hosts[0]["output"]["text"], "full output\r\nsecond line");
         assert_eq!(hosts[1]["output"]["state"], "preview");
         assert_eq!(hosts[1]["output"]["text"], "missing tail");
+        assert_eq!(hosts[2]["delivery"]["state"], "skipped");
+        assert!(hosts[2]["execution"].is_null());
     }
 
     #[test]
@@ -332,6 +428,10 @@ mod tests {
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
             saved_recordings: Default::default(),
+            command_queue: None,
+            dispatch_policy: None,
+            show_queue_activity: false,
+            control_waiters: Vec::new(),
             transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),
@@ -360,6 +460,26 @@ mod tests {
         assert_eq!(withheld["delivery"]["state"], "rejected");
         assert_eq!(withheld["delivery"]["reason"], "SSH connection closed");
         assert!(withheld["execution"].is_null() && withheld["output"].is_null());
+
+        let shown = Report::capture_rows(
+            &submission,
+            Instant::now(),
+            [2, 0].map(|index| {
+                let delivery = &submission.results[index];
+                (delivery, delivery.execution())
+            }),
+            |_, _| None,
+        );
+        let text = shown.clipboard(2048).unwrap();
+        assert!(text.contains("Shown results · 2 of 3 recipients\r\n"));
+        assert!(text.find("Host 9").unwrap() < text.find("Host 7").unwrap());
+        assert!(!text.contains("Host 8"));
+        let document = json(&shown);
+        assert_eq!(document["total_recipient_count"], 3);
+        let recipients = document["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(recipients[0]["pane_id"], 9);
+        assert_eq!(recipients[1]["pane_id"], 7);
     }
 
     #[test]
@@ -386,6 +506,10 @@ mod tests {
             ])),
             recording: Default::default(),
             saved_recordings: Default::default(),
+            command_queue: None,
+            dispatch_policy: None,
+            show_queue_activity: false,
+            control_waiters: Vec::new(),
             transcript: Default::default(),
             results: vec![captured(7, String::new(), false), running, pending],
         };
@@ -393,6 +517,8 @@ mod tests {
         let document = json(&snapshot);
         assert_eq!(document["kind"], "environment");
         assert!(document["command"].is_null());
+        assert!(document.get("dispatch_policy").is_none());
+        assert!(document.get("queue_activity").is_none());
         let hosts = document["recipients"].as_array().unwrap();
         assert_eq!(hosts[0]["pane_id"], 7);
         assert_eq!(hosts[0]["command"], "export POLYSH_RANK=0");

@@ -167,6 +167,65 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 51. **Save included launch profiles as a recipient set.** Name the full checked selection, recheck its saved profiles during the catalog update, and return to the same launch review with the new set selected.
 52. **Choose connections for launch matches together.** Use fresh panes or select unique live matches for included profiles across pages. Preserve explicit choices when reuse is ambiguous.
 53. **Update a recipient set before connecting.** Review additions and removals against a chosen set and confirm the update against its saved membership.
+54. **Manage recipient sets before connecting.** Rename an existing set or confirm its deletion while keeping the current launch choices.
+55. **Filter the live roster by host state.** Combine live SSH and prompt state with the name filter. Keep hidden selections and recheck the visible scope before dispatch.
+56. **See the last command output in the roster.** Opt in per tab to see each shown host’s most recent completed capture and exit status. Open the exact capture in command history.
+57. **Require all selected recipients to be ready.** Wait for a verified prompt from every visible, checked host before offering a normal or recorded send. Recheck the reviewed prompts on dispatch.
+58. **Copy the visible roster as text.** Include host addresses, pane IDs, selection, and current states for checked and unchecked hosts shown by the active filters.
+59. **Sort the visible roster.** Order the display and copied report by tab, label, check state, or readiness. Use tab order for dispatch and ranked assignments.
+60. **Save roster defaults for a named group.** Remember sort order, output previews, and the all-recipient readiness setting across launches. Move those defaults with a group rename.
+61. **Add saved profiles to a live roster.** Search and check profiles across pages, review fresh or reused connections, and recheck the chosen profiles before adding them. Preserve the group’s draft, filters, and current send selection.
+62. **Show connection progress in the roster.** Display initial connections, automatic retry attempts, and manual reconnects as distinct live states. Include those states in roster filtering and copied reports.
+63. **Show SSH failures in the roster.** Give ended SSH attempts a failure state with a short diagnostic, filter failed panes together, and let operators retry when a pane can reconnect.
+64. **Open pending SSH prompts from the roster.** Show host-key verification and sign-in states separately. Open the first visible pending prompt in roster order and recheck its identity on click.
+65. **Disconnect selected SSH shells.** Review the checked, shown connections before ending them. Recheck each approved connection generation and keep the panes, scrollback, and roster selection available for reconnect.
+66. **Use roster actions from the command palette.** Copy the shown hosts, open the next pending prompt in roster order, reconnect selected hosts, and review a disconnect from the keyboard. Use the active group's filters and recheck the same recipients and connections as the roster buttons.
+67. **Count matching hosts by live state.** Follow the active group and host query. Show the count in each state and how many matches are visible under the state filter.
+68. **Search and focus a shown SSH host.** Open a pane picker scoped to the current roster. Show a preview and recheck the group membership and filters before focusing the pane.
+69. **Stop selected SSH attempts.** Stop pending handshakes, authentication prompts, or automatic retries for checked hosts shown by the roster. Keep the panes available for manual reconnect and reject requests after the shell becomes ready.
+70. **Report SSH lifecycle changes to the control pipe.** Include the pane’s current SSH phase and journal its transitions. Report the final phase with the restart token so scripts can handle stopped or failed panes directly.
+71. **List SSH phases across all panes.** Include the current phase and restart token in each SSH pane’s control-list entry. Read existing terminal metadata without copying screen rows for each pane.
+72. **Close ended SSH panes.** Review the checked, shown panes whose attempts have ended. Claim the reviewed exit before closing each pane, so a concurrent restart keeps it open. Respect pinned tabs and retain neighboring splits.
+73. **Recall recent group commands with Ctrl+R.** Open the current tab’s searchable command history from the keyboard. Enter recalls the selected command into the draft for review.
+74. **Preview the current terminal line in the roster.** Use each shown host’s live primary screen even when a pane is scrolled back. Mask concealed cells and keep the preview opt-in.
+75. **Duplicate a saved SSH group.** Copy its ordered profiles, recipient sets, and roster defaults to a new name. Recheck the reviewed source and save the copy atomically.
+76. **Share a saved SSH group definition.** Export the group name, ordered profile names, recipient sets, and roster defaults as versioned JSON. Review its local profile matches and recheck their settings when saving the imported group.
+77. **Map imported members to local profiles.** Let the operator choose a distinct local profile for each file entry, preserve the member and recipient-set order, and recheck the chosen profile settings when saving.
+78. **Open a saved SSH group in its own window.** Start the saved roster and its own fresh SSH panes together using the normal profile verification and authentication paths.
+79. **Open a reviewed group subset in its own window.** Launch only the included profiles or selected recipient set with fresh panes. Recheck the review and keep the partial roster from replacing the saved membership.
+80. **Limit simultaneous logins for a reviewed SSH group.** Let the operator choose a limit for fresh connections, show queued panes in the roster, and allow a queued attempt to be stopped.
+81. **Save a group login limit.** Let the operator keep the reviewed limit for later launches, including direct launches in a tab or window.
+82. **Queue bulk SSH reconnects.** Use the saved limit for **Reconnect selected**, share slots across batches in the same roster, and keep the stopped attempt and its scrollback in its original pane.
+83. **Limit logins for imported hosts.** Set a limit in the host list or saved-profile review before opening new panes. Use the roster's saved limit as the starting point when there is one.
+84. **Notify when group logins finish.** Watch the reviewed pending attempts and post one Attention entry after all settle, even when another tab is active. Keep later attempts separate.
+85. **Bound SSH shell setup waits.** Time out stalled session-channel opens and terminal setup replies so a remote host cannot hold a login slot or wait in the roster indefinitely.
+86. **Inspect the hosts behind a login alert.** Retain their original outcomes and diagnostics in the inbox and link back to the original panes.
+87. **Export a login report.** Copy or save the captured outcomes and diagnostics as text from their Attention inbox entry.
+88. **Retry failed logins from a report.** Review the original failures that still have a restartable pane in the group. Recheck the attempts at confirmation and use the roster's login queue.
+89. **Limit parallel commands within a submission.** Queue checked, ready hosts in roster order, recheck each prompt when its slot becomes available, and allow cancellation before sending. The same limit applies to recorded runs.
+90. **Save a group command limit.** Store the chosen command concurrency with the roster defaults so it follows group launches, copies, and portable definitions.
+91. **Stop queued commands on failure.** Optionally withhold the remaining commands when a host settles without confirmed success. Preserve the results of commands already sent.
+92. **Pause and resume a rolling run.** Hold unsent commands while inspecting results, and resume against the reviewed prompts. Continue to apply the submission's stop-on-failure setting.
+93. **Require canary approval.** Run a command on one selected host and withhold the rest until the canary reports exit 0 and the operator approves. Respect the original prompt checks, parallel limit, and recording.
+94. **Notify when a canary finishes.** Offer an opt-in Attention Inbox entry that opens the run for approval or failure review, with a separate alert for full run completion.
+95. **Preview command dispatch order.** Show the checked, visible recipients in the actual queue order, including the canary, unavailable hosts, and the parallel limit. Freeze the order on submission.
+96. **Reorder a rollout.** Move ready recipients earlier or later in a finite queue preview. Keep the canary first, preserve roster sorting, and use the custom order for one submission.
+97. **Pace command dispatch.** Give each run an optional minimum gap between SSH sends. Enforce it alongside the parallel limit and canary gate, with a visible waiting state while the queue is running.
+98. **Save dispatch pacing for a named group.** Remember its interval across launches, copies, renames, and portable definitions. Read existing definitions without an interval as no delay.
+99. **Keep dispatch settings with command results.** Show the run's effective parallel limit, pacing, stop-on-failure, and selected canary in results, reports, and recordings.
+100. **Record queue decisions.** Keep an elapsed-time timeline of pauses, resumes, canary decisions, and stops. Include the bounded timeline in results, reports, and recording summaries.
+101. **Skip an individual queued host.** Withhold a reviewed command from one unsent recipient. Keep the remaining queue and separately report the skipped host.
+102. **Expire unsent commands.** Set a deadline from submission that applies while a queue is paused or awaiting canary approval. Report the expiry and let already dispatched commands finish.
+103. **Find recipients in command results.** Search historical recipient names and SSH addresses alongside the outcome filter. Scope interrupts and retries to the matching rows, and keep full-run counts and exports.
+104. **Share filtered command results.** Copy the displayed recipient rows or save them as text or JSON. Preserve their order and identify how many original recipients the report covers.
+105. **Read retained group runs from the CLI.** Discover group tabs across the process and read a scoped run's dispatch policy and recipient outcomes without changing focus. Use the original pane and command IDs to retrieve retained shell output.
+106. **Wait for a group run from the CLI.** Return a final result snapshot when every recipient settles, including while the group is in the background. Report timeouts and runs that leave retained history.
+107. **Read a live group roster from the CLI.** Report scoped hosts, checked and shown status, and prompt readiness with the same filters and sort as the group tab. Leave the active view in place.
+108. **Wait for checked hosts to be ready from the CLI.** Wait for verified prompts on the original checked, shown panes. Return the current roster when they are ready and report a changed selection or timeout.
+109. **Find a retained group run.** Search by full command text or exact run number, including repeated commands. Jump directly to the selected results while keeping the draft and roster selection.
+110. **Compare a host across group runs.** Pick an earlier capture for the same pane and SSH address, show output changes with original line numbers and exit codes, and export the full diff.
+111. **Compare two group runs across hosts.** Summarize changes to output, exit status, and participation. Open a specific host's diff and return to the same comparison.
+112. **Share a group run comparison.** Copy the summary or export versioned JSON with both runs, counts and every host classification.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

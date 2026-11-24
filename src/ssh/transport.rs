@@ -1,8 +1,9 @@
+use super::SESSION_SETUP_TIMEOUT;
 use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use crate::{
-    events::Events,
+    events::{AttemptGuard, Events, SshAttemptOutcome},
     options::{Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
@@ -13,7 +14,7 @@ use russh::{
     keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
 use std::{sync::Arc, time::Duration};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use wezterm_term::TerminalSize;
 use zeroize::Zeroizing;
 
@@ -25,6 +26,11 @@ pub enum Event {
     Status(String),
     SessionListUpdated(String),
     Connected(u64),
+    /// A retry has been scheduled and supersedes the previous transport.
+    Reconnecting(u32),
+    /// Final SSH failure from the transport launcher.
+    ConnectionFailed(String),
+    ConnectionStopped,
     /// Ordered after the last bytes from this generation and before any retry.
     Disconnected,
 }
@@ -38,6 +44,52 @@ impl std::fmt::Display for Permanent {
 impl std::error::Error for Permanent {}
 fn stop(message: impl Into<String>) -> anyhow::Error {
     Permanent(message.into()).into()
+}
+
+#[derive(Debug)]
+pub(crate) struct AttemptStopped;
+
+impl std::fmt::Display for AttemptStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SSH connection attempt stopped")
+    }
+}
+
+impl std::error::Error for AttemptStopped {}
+
+#[derive(Default)]
+struct PendingAttempt {
+    guard: Option<AttemptGuard>,
+    cancelled: Option<oneshot::Receiver<()>>,
+}
+
+impl PendingAttempt {
+    fn begin(&mut self, events: &Events) {
+        let (guard, cancelled) = events.begin_ssh_attempt();
+        self.guard = Some(guard);
+        self.cancelled = Some(cancelled);
+    }
+
+    fn finish(guard: &mut Option<AttemptGuard>, outcome: SshAttemptOutcome) -> Result<()> {
+        if let Some(guard) = guard.take()
+            && !guard.finish(outcome)
+        {
+            return Err(AttemptStopped.into());
+        }
+        Ok(())
+    }
+
+    async fn wait_for_stop(cancelled: &mut Option<oneshot::Receiver<()>>) {
+        if let Some(receiver) = cancelled {
+            let result = receiver.await;
+            *cancelled = None;
+            if result.is_ok() {
+                return;
+            }
+        }
+        // The sender also closes when the attempt becomes an established shell.
+        std::future::pending().await
+    }
 }
 pub(crate) struct Handler {
     options: SshOptions,
@@ -434,6 +486,9 @@ fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOpti
         TransportInput::Resize(new) => *size = new,
         TransportInput::Authenticate(auth) => options.authentication = auth,
         TransportInput::Data(_) | TransportInput::Automatic(_) => {}
+        message @ TransportInput::DisconnectShell { .. } => {
+            message.reject_input("The SSH shell changed before disconnect.");
+        }
         message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. }) => {
             message.reject_input("SSH is reconnecting; input was not queued or sent");
         }
@@ -652,12 +707,43 @@ impl Driver {
 
     pub(super) async fn run(&mut self, program: &Program) -> Result<()> {
         program.validate_target(&self.options)?;
+        let can_stop = matches!(program, Program::Shell(None))
+            && !self.options.durable
+            && !self.options.player.rustmush
+            && self
+                .sharing
+                .startup
+                .as_ref()
+                .is_none_or(|launch| launch.command.is_empty());
+        let mut attempt = PendingAttempt::default();
+        if can_stop {
+            attempt.begin(&self.events);
+        }
+        let result = self.run_pending(program, can_stop, &mut attempt).await;
+        let outcome = match &result {
+            Err(error) => SshAttemptOutcome::Failed(
+                crate::events::display_field(&format!("{error:#}")).into(),
+            ),
+            Ok(()) => SshAttemptOutcome::Closed,
+        };
+        PendingAttempt::finish(&mut attempt.guard, outcome)?;
+        result
+    }
+
+    async fn run_pending(
+        &mut self,
+        program: &Program,
+        can_stop: bool,
+        attempt: &mut PendingAttempt,
+    ) -> Result<()> {
         let mut failures = 0u32;
         let mut dropped_at: Option<tokio::time::Instant> = None;
         loop {
             let deadline = dropped_at.map(|since| since + Duration::from_secs(300));
             let connected = {
-                let future = connect_shell(
+                let launch_gate = self.sharing.launch_gate.take();
+                let events = &self.events;
+                let connect = connect_shell(
                     self.options.clone(),
                     self.prompts.clone(),
                     &mut self.passwords,
@@ -665,9 +751,27 @@ impl Driver {
                     self.sharing.published.clone(),
                     program.peer_fingerprint(),
                 );
+                let future = async {
+                    // The slot covers login and opening the SSH channel. Active
+                    // shells and automatic retries do not occupy a slot.
+                    let _permit = if let Some(gate) = launch_gate {
+                        let permit = gate
+                            .permits
+                            .acquire_owned()
+                            .await
+                            .context("The SSH group login queue closed")?;
+                        events.set_ssh_connection_phase(gate.admitted_phase);
+                        Some(permit)
+                    } else {
+                        None
+                    };
+                    connect.await
+                };
                 tokio::pin!(future);
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
                         _ = tokio::time::sleep_until(deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))), if deadline.is_some() => anyhow::bail!("automatic reconnection stopped after 300 seconds"),
                         result = &mut future => break result,
                         message = self.input.recv() => match message {
@@ -681,7 +785,13 @@ impl Driver {
                 Ok(session) => {
                     self.generation = self.sharing.next_generation();
                     let started = tokio::time::Instant::now();
-                    let result = run_channel(session, self, program).await;
+                    let result = tokio::select! {
+                        biased;
+                        _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => {
+                            return Err(AttemptStopped.into());
+                        }
+                        result = run_channel(session, self, program, &mut attempt.guard) => result,
+                    };
                     self.output.send(Event::Disconnected).await?;
                     if let Some(game) = &mut self.game {
                         game.disconnected();
@@ -698,6 +808,9 @@ impl Driver {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             };
+            if error.is::<AttemptStopped>() {
+                return Err(error);
+            }
             if self.command_dispatched && error.downcast_ref::<Permanent>().is_none() {
                 return Err(error.context(
                     "Workspace command interrupted; reopen the workspace to run it again",
@@ -716,12 +829,16 @@ impl Driver {
                 return Err(error.context("automatic reconnection stopped after 300 seconds"));
             }
             failures += 1;
+            if can_stop && attempt.guard.is_none() {
+                attempt.begin(&self.events);
+            }
             program.reconnecting(&format!("Link lost: {error:#}"));
             let delay = Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
             self.events.push(
                 "reconnecting",
                 serde_json::json!({"attempt":failures,"delay_seconds":delay.as_secs()}),
             );
+            self.output.send(Event::Reconnecting(failures)).await?;
             self.output
                 .send(Event::Status(format!(
                     "Link lost · reconnecting in {} s (attempt {failures}) · {error:#}",
@@ -734,6 +851,8 @@ impl Driver {
             tokio::pin!(wait);
             loop {
                 tokio::select! {
+                    biased;
+                    _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
                     _ = &mut wait => break,
                     message = self.input.recv() => match message {
                         Some(message) => self.discard_input(message),
@@ -744,7 +863,12 @@ impl Driver {
         }
     }
 }
-async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Program) -> Result<()> {
+async fn run_channel(
+    mut shell: OpenShell,
+    driver: &mut Driver,
+    program: &Program,
+    attempt: &mut Option<AttemptGuard>,
+) -> Result<()> {
     let _published = shell.published.shell_lifetime(&shell.link);
     if let Some(reference) = program.herdr_reference() {
         return run_herdr_channel(shell, driver, program, &reference).await;
@@ -803,19 +927,26 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
         sftp_rx,
         cleanup_rx,
     ));
+    let setup_deadline = tokio::time::Instant::now() + SESSION_SETUP_TIMEOUT;
+    const SETUP_TIMEOUT: &str = "SSH PTY or shell setup timed out";
     if !managed {
-        request_terminal(channel, options, *size).await?;
-        if let Some(probe) = &probe {
-            channel
-                .set_env(false, game_resume::ENVIRONMENT, probe.marker())
-                .await?;
-        }
-        if let Some(startup) = &sharing.startup {
-            *command_dispatched = !startup.command.is_empty();
-            channel.exec(true, startup.exec_request()).await?;
-        } else {
-            channel.request_shell(true).await?;
-        }
+        tokio::time::timeout_at(setup_deadline, async {
+            request_terminal(channel, options, *size).await?;
+            if let Some(probe) = &probe {
+                channel
+                    .set_env(false, game_resume::ENVIRONMENT, probe.marker())
+                    .await?;
+            }
+            if let Some(startup) = &sharing.startup {
+                *command_dispatched = !startup.command.is_empty();
+                channel.exec(true, startup.exec_request()).await?;
+            } else {
+                channel.request_shell(true).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context(SETUP_TIMEOUT)??;
     } else if size.cols != original_size.cols
         || size.rows != original_size.rows
         || size.pixel_width != original_size.pixel_width
@@ -831,6 +962,8 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             .await?;
     }
     let mut pending = if managed { 0 } else { 2u8 };
+    let setup_timeout = tokio::time::sleep_until(setup_deadline);
+    tokio::pin!(setup_timeout);
     let (auth, mut auth_rx) = tokio::sync::oneshot::channel();
     let mut probing = probe.is_some();
     let mut auth_pending = probing;
@@ -859,6 +992,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     }
     loop {
         tokio::select! {
+            _ = &mut setup_timeout, if pending > 0 => anyhow::bail!(SETUP_TIMEOUT),
             (redeeming, outcome, follow_up) = &mut sideband, if probing => {
                 if waiting_for_resume {
                     queued_before_unlock = input.len();
@@ -901,6 +1035,9 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             message = input.recv() => {
                 if process_exited {
                     match message {
+                        Some(message @ TransportInput::DisconnectShell { .. }) => {
+                            message.reject_input("The SSH shell already exited.");
+                        }
                         Some(message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. })) => {
                             message.reject_input("Remote process exited; input was not sent");
                         }
@@ -915,6 +1052,19 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 let discard_input = waiting_for_resume || queued_before_unlock > 0;
                 queued_before_unlock = queued_before_unlock.saturating_sub(1);
                 match message {
+                    Some(TransportInput::DisconnectShell { connection, reply }) => {
+                        if managed || options.player.rustmush ||
+                            sharing.startup.as_ref().is_some_and(|startup| !startup.command.is_empty())
+                        {
+                            let _ = reply.send(Err("Disconnect requires a direct SSH shell.".into()));
+                        } else if connection != generation || pending != 0 {
+                            let _ = reply.send(Err("The SSH shell changed before disconnect.".into()));
+                        } else {
+                            // The channel guard closes this shell. A sibling may still own the link.
+                            let _ = reply.send(Ok(()));
+                            return Ok(());
+                        }
+                    }
                     Some(TransportInput::Authenticate(auth)) => options.authentication = auth,
                     Some(TransportInput::Sftp(job)) => {
                         forward_sftp(&sftp_tx,&cleanup_tx,job);
@@ -953,7 +1103,17 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             }
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
-                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link,generation);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
+                Some(russh::ChannelMsg::Success) if pending > 0 => {
+                    pending -= 1;
+                    if pending == 0 {
+                        PendingAttempt::finish(attempt, SshAttemptOutcome::Connected)?;
+                        shell.published.publish(&shell.link, generation);
+                        program.ready();
+                        events.push("connected", serde_json::json!({"generation":generation}));
+                        output.send(Event::Connected(generation)).await?;
+                        output.send(Event::Status(format!("{}@{}:{}", options.user, options.host, options.port))).await?;
+                    }
+                },
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),
                 // Exit status is advisory until EOF/close; the peer can still
                 // deliver final terminal bytes after reporting it.
@@ -1039,6 +1199,9 @@ async fn run_herdr_channel(
                 Some(TransportInput::Resize(size))=>{driver.size=size; viewer.resize(u16::try_from(size.cols)?,u16::try_from(size.rows)?).await?;}
                 Some(TransportInput::Authenticate(auth))=>driver.options.authentication=auth,
                 Some(TransportInput::Sftp(job))=>forward_sftp(&sftp_tx,&cleanup_tx,job),
+                Some(message @ TransportInput::DisconnectShell { .. }) => {
+                    message.reject_input("Disconnect requires a direct SSH shell.");
+                }
                 None=>{viewer.close().await?;return Ok(());}
             },
             data=viewer.next_data()=>match data? {

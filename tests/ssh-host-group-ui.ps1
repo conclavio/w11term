@@ -4,6 +4,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
+Add-Type -AssemblyName System.Windows.Forms
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'group-result-clipboard.txt'
@@ -110,18 +111,28 @@ function Select-ComboValue([string]$ControlName, [string]$Name) {
 function Set-ResultFilter([string]$Name) {
     Select-ComboValue 'Filter submission results' $Name
 }
-function Expect-ResultOrder([uint64[]]$Panes) {
-    $expected = ($Panes | ForEach-Object { "Focus result pane $_" }) -join '|'
-    $null = Wait-Until "result order '$expected'" {
+function Roster-Snapshot {
+    (Control @('get-ssh-group-roster','--window',"$groupWindow",'--tab',"$groupTab")).roster
+}
+function Set-RecipientSearch([string]$Query) {
+    $field = Wait-Until 'result recipient search' { Find-Element 'Search result recipients' $edit }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+}
+function Expect-PaneButtonOrder([string]$Prefix, [uint64[]]$Panes) {
+    $expected = ($Panes | ForEach-Object { "$Prefix$_" }) -join '|'
+    $null = Wait-Until "pane order '$expected'" {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $byButton = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
         $actual = foreach ($entry in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $byButton)) {
             $name = $entry.Current.Name
-            if ($name.StartsWith('Focus result pane ', [StringComparison]::Ordinal)) { $name }
+            if ($name.StartsWith($Prefix, [StringComparison]::Ordinal)) { $name }
         }
         ($actual -join '|') -ceq $expected
     }
+}
+function Expect-ResultOrder([uint64[]]$Panes) {
+    Expect-PaneButtonOrder 'Focus result pane ' $Panes
 }
 function Result-Progress([string]$Caption) {
     $null = Wait-Until 'submission progress counts' { Find-Element $Caption }
@@ -163,6 +174,7 @@ function Wait-RecordingStatus([string]$Prefix, [string]$Path, [switch]$PassThru)
 $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+$readyJob = $null
 $logReader = $null
 $explorer = $null
 $priorExplorerWindows = @()
@@ -176,12 +188,35 @@ try {
         throw 'Expected two SSH panes and PowerShell in their own tabs'
     }
     $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','east$')
-    $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west$')
+    $westShellGate = [IO.File]::ReadAllText((Join-Path $State 'west-shell-gate-path'))
     Press-Key 0x77 # F8 selects the East tab in the fixture keymap.
     Wait-Focus $east
     Press-Key 0x10 # An unencoded Shift must not consume the verified prompt.
     Run-Palette 'SSH host group'
     Pane-Status $east "Connected${dot}Ready"
+    Pane-Status $west 'Connecting'
+    $owner = (Control @('list-ssh-groups')).windows | Where-Object { $_.groups.label -ccontains 'SSH host group' }
+    $groupWindow = $owner.window_id
+    $groupTab = ($owner.groups | Where-Object label -ceq 'SSH host group').tab_id
+    if (!$groupWindow -or !$groupTab) { throw 'The CLI did not list the active SSH group' }
+    $readyArgs = @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab")
+    $hostStateFilter = 'Filter host state'
+    Select-ComboValue $hostStateFilter 'Connecting'
+    $null = Wait-Until 'the connecting filter isolates West during its shell request' {
+        (Find-Element "Focus pane $west" $button) -and !(Find-Element "Focus pane $east" $button) -and
+            !(Find-Element "Reconnect SSH pane $west" $button)
+    }
+    $roster = Roster-Snapshot
+    $eastRoster = $roster.hosts | Where-Object pane_id -eq $east
+    $westRoster = $roster.hosts | Where-Object pane_id -eq $west
+    if ($roster.scope -cne 'window' -or $roster.filter.state -cne 'connecting' -or $roster.counts.hosts -ne 2 -or
+        $roster.counts.shown -ne 1 -or $eastRoster.shown -or $eastRoster.prompt_verification -cne 'shell_markers' -or
+        !$westRoster.shown -or $westRoster.connected -or $westRoster.state -cne 'connecting' -or
+        $null -ne ($roster.hosts | Where-Object pane_id -eq $local)) {
+        throw 'The CLI roster did not preserve the live filter and SSH pane states'
+    }
+    Remove-Item -LiteralPath $westShellGate
+    Select-ComboValue $hostStateFilter 'All host states'
     Pane-Status $west "Connected${dot}Ready"
     if (Find-Element "Focus pane $local" $button) { throw 'The local shell appeared in the SSH roster' }
     $eastName = Target-Name East $east
@@ -194,6 +229,10 @@ try {
     $null = Wait-Until 'an empty filter result cannot send' {
         $entry = Find-Element 'Send to 0 hosts' $button
         $entry -and !$entry.Current.IsEnabled
+    }
+    $emptyWait = & $Cli --pid $app.Id @readyArgs --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $emptyWait.ok -or $emptyWait.error -notlike 'No checked, shown*') {
+        throw 'The readiness wait accepted an empty host scope'
     }
     $eastAddress = "EaST 127.0.0.1:$($profileData.East.port)"
     Set-HostFilter $eastAddress
@@ -218,6 +257,23 @@ try {
     Submit 'one' 'Send to 1 host'
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
+    $showLastOutput = 'Show last command output'
+    $openEastOutput = "Open last command for pane $east"
+    $openWestOutput = "Open last command for pane $west"
+    if (Find-Element $openEastOutput $button) { throw 'The roster output preview was on by default' }
+    (Wait-CheckBox $showLastOutput Off).Toggle()
+    $null = Wait-Until 'the checked preview shows the last completed output on East' {
+        Find-Element "Pane $east${dot}Last command${dot}Exit 0${dot}east-accepted one"
+    }
+    Click $openEastOutput
+    $null = Wait-Until 'the roster preview opens that exact command history entry' {
+        Find-Element "Selected, one${dot}exit 0" $button
+    }
+    Run-Palette 'SSH host group'
+    (Wait-CheckBox $showLastOutput On).Toggle()
+    $null = Wait-Until 'turning off the preview hides the history shortcut' {
+        !(Find-Element $openEastOutput $button)
+    }
     Click 'Deselect shown'
     $null = Wait-CheckBox $eastName Off
     Set-HostFilter ''
@@ -249,7 +305,17 @@ try {
     Select-ComboValue 'Sort submission results' 'Longest shell time'
     Expect-ResultOrder @($west, $east)
     $null = Wait-Until 'East output in the group' { Find-Element 'east-accepted both' }
+    Set-RecipientSearch "WEST TEST@127.0.0.1:$($profileData.West.port)"
+    Expect-ResultOrder @($west)
+    Result-Progress 'Showing 1 of 2 recipients'
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
+    Set-ResultFilter 'Succeeded'
+    Expect-ResultOrder @()
+    Result-Progress 'Showing 0 of 2 recipients'
+    Click 'Clear recipient search'
+    Expect-ResultOrder @($east)
+    Set-ResultFilter 'All results'
+    Expect-ResultOrder @($west, $east)
     $liveButton = 'Live output' + [char]0x2026
     Click $liveButton
     $null = Wait-Until 'completed East output in the live feed' {
@@ -348,7 +414,8 @@ try {
     $logReader = $null
     $recorded = [IO.File]::ReadAllText($logFile)
     $expectedLines = @(
-        "Submitted$($dot)both", "$eastName$($dot)east-accepted both",
+        "Submitted$($dot)both", "Dispatch$($dot)unlimited parallel$($dot)no delay",
+        "$eastName$($dot)east-accepted both",
         "$westName$($dot)west live first", "$westName$($dot)west while paused",
         "$westName$($dot)west while away", '[Host outcomes]',
         "$eastName$($dot)Sent to SSH channel$($dot)Exit 0",
@@ -422,15 +489,19 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-Until 'West remains hidden after host list export' { !(Find-Element "Focus pane $west" $button) }
     $null = Wait-Until 'the full East output is retained' { Find-Element "View output for pane $east" $button }
+    Set-RecipientSearch 'east'
+    Expect-ResultOrder @($east)
     Click 'Copy results'
     $null = Wait-Until 'the current report contains full output and both host outcomes' {
         $report = Read-ClipboardFixture
         $report -and $report.StartsWith("Submitted${dot}while-slow") -and
+            $report.Contains("Dispatch${dot}unlimited parallel${dot}no delay") -and
             $report.Contains("$eastName${dot}Sent to SSH channel") -and
             $report.Contains("  Exit 0") -and $report.Contains("east-report-tail") -and
             $report.Contains("$westName${dot}Not sent${dot}Waiting for a fresh prompt")
     }
     $null = Wait-Until 'copy confirmation' { Find-Element 'Copied results' }
+    Click 'Clear recipient search'
     $saveResults = 'Save results' + [char]0x2026
     $destination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3.txt'
     Click $saveResults
@@ -459,6 +530,89 @@ try {
     $exported = [IO.File]::ReadAllText($destination, [Text.UTF8Encoding]::new($false, $true))
     if ($exported -cne (Read-ClipboardFixture)) { throw 'The saved report omitted retained output or host status' }
     Click $savedStatus
+    Click "Compare earlier run for pane $east"
+    $null = Wait-Until 'the cross-run comparison opens for East' { Find-Element 'SSH output across runs' }
+    Select-ComboValue 'Earlier group run' "Run 2${dot}both"
+    Click 'Compare output'
+    $null = Wait-Until 'the diff compares complete captures from the same pane' {
+        (Find-Element "Run 2${dot}both${dot}Exit 0") -and
+            (Find-Element "Run 3${dot}while-slow${dot}Exit 0") -and
+            (Find-Element "Removed line 1${dot}east-accepted both") -and
+            (Find-Element "Added line 1${dot}east-accepted while-slow")
+    }
+    Click 'Back to results'
+    Click ('Compare runs' + [char]0x2026)
+    $null = Wait-Until 'group run comparison opens' { Find-Element 'SSH group run comparison' }
+    Select-ComboValue 'Earlier group run' "Run 1${dot}one"
+    Click 'Compare runs'
+    $null = Wait-Until 'the comparison separates hosts only in the current run' {
+        (Find-Element "1 changed${dot}0 unchanged${dot}0 earlier only${dot}1 current only${dot}0 unavailable") -and
+            (Find-Element "$westName${dot}Current run only")
+    }
+    Select-ComboValue 'Earlier group run' "Run 2${dot}both"
+    Click 'Compare runs'
+    $overviewSummary = "1 changed${dot}0 unchanged${dot}0 earlier only${dot}0 current only${dot}1 unavailable"
+    $null = Wait-Until 'the comparison separates an unavailable shared host from changed output' {
+        (Find-Element $overviewSummary) -and (Find-Element "$eastName${dot}Output changed") -and
+            (Find-Element "$westName${dot}Comparison unavailable") -and
+            !(Find-Element "View run differences for pane $west" $button)
+    }
+    Click 'Copy comparison'
+    $null = Wait-Until 'the clipboard includes both run labels and all host classifications' {
+        $report = Read-ClipboardFixture
+        (Find-Element 'Copied comparison') -and $report -and
+            $report.Contains("Earlier${dot}Run 2${dot}both") -and
+            $report.Contains("Current${dot}Run 3${dot}while-slow") -and
+            $report.Contains($overviewSummary) -and
+            $report.Contains("$eastName${dot}Output changed") -and
+            $report.Contains("$westName${dot}Comparison unavailable") -and
+            !$report.Contains('east-report-tail')
+    }
+    Click ('Save comparison as JSON' + [char]0x2026)
+    $dialog = Wait-Until 'owned group run comparison save dialog' { Find-OwnedDialog 'Save SSH group run comparison as JSON' }
+    $null = Wait-Until 'save the group run comparison JSON' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $comparisonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-run-comparison-2-to-3.json'
+    $null = Wait-Until 'the group run comparison JSON is published' { [IO.File]::Exists($comparisonPath) }
+    $comparisonText = [IO.File]::ReadAllText($comparisonPath, [Text.UTF8Encoding]::new($false, $true))
+    $comparison = $comparisonText | ConvertFrom-Json
+    $eastComparison = $comparison.hosts | Where-Object pane_id -EQ $east
+    $westComparison = $comparison.hosts | Where-Object pane_id -EQ $west
+    if ($comparison.schema_version -ne 1 -or $comparison.earlier.run_id -ne 2 -or
+        $comparison.earlier.label -cne 'both' -or $comparison.current.run_id -ne 3 -or
+        $comparison.current.label -cne 'while-slow' -or $comparison.hosts.Count -ne 2 -or
+        $comparison.counts.changed -ne 1 -or $comparison.counts.unavailable -ne 1 -or
+        $eastComparison.name -cne 'East' -or $eastComparison.address -cne "test@127.0.0.1:$($profileData.East.port)" -or
+        $eastComparison.change -cne 'output_changed' -or
+        $eastComparison.earlier_exit_code -ne 0 -or $eastComparison.current_exit_code -ne 0 -or
+        $westComparison.name -cne 'West' -or $westComparison.address -cne "test@127.0.0.1:$($profileData.West.port)" -or
+        $westComparison.change -cne 'unavailable' -or $westComparison.detail -notlike '*Run 2*' -or
+        $null -ne $westComparison.earlier_exit_code -or $null -ne $westComparison.current_exit_code -or
+        $comparisonText.Contains('east-report-tail')) {
+        throw 'The JSON comparison did not preserve the run and host classifications'
+    }
+    Click "View run differences for pane $east"
+    $null = Wait-Until 'the group overview opens the same pane diff' {
+        (Find-Element 'SSH output across runs') -and (Find-Element 'Back to run overview' $button) -and
+            (Find-Element "Added line 1${dot}east-accepted while-slow")
+    }
+    Click ('Save full run differences' + [char]0x2026)
+    $dialog = Wait-Until 'owned run differences save dialog' { Find-OwnedDialog 'Save SSH group differences' }
+    $null = Wait-Until 'save the cross-run differences' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $runDiffPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR "ssh-group-run-diff-2-to-3-pane-$east.txt"
+    $null = Wait-Until 'the export includes the entire later output and both run headers' {
+        if (![IO.File]::Exists($runDiffPath)) { return }
+        $diff = [IO.File]::ReadAllText($runDiffPath)
+        $diff.Contains("Run 2${dot}both${dot}Exit 0") -and $diff.Contains("Run 3${dot}while-slow${dot}Exit 0") -and
+            $diff.Contains('east-report-tail') -and ([regex]::Matches($diff, 'east-report-line')).Count -eq 35
+    }
+    Click 'Back to run overview'
+    $null = Wait-Until 'the overview preserves the baseline and classifications' {
+        (Find-Element 'SSH group run comparison') -and (Find-Element $overviewSummary)
+    }
+    Click 'Back to results'
+    $null = Wait-Until 'the cross-run comparison returns to the current submission' {
+        (Find-Element "Submitted${dot}while-slow") -and !(Find-Element 'SSH output across runs')
+    }
     Set-ResultFilter 'Succeeded'
     $null = Wait-Until 'the rejected result is hidden in the filtered view' {
         (Find-Element "Focus result pane $east" $button) -and !(Find-Element "Focus result pane $west" $button)
@@ -476,6 +630,11 @@ try {
         $json.command -cne 'while-slow' -or $json.recipients.Count -ne 2) {
         throw 'The JSON report did not identify the entire viewed submission'
     }
+    $policy = $json.dispatch_policy
+    if (!$policy -or $null -ne $policy.parallel_limit -or $policy.interval_ms -ne 0 -or
+        $false -ne $policy.stop_on_failure -or $null -ne $policy.canary) {
+        throw 'The JSON report did not preserve the effective dispatch policy'
+    }
     $eastJson, $westJson = $json.recipients
     if ($eastJson.pane_id -ne $east -or $eastJson.profile -cne 'East' -or
         $eastJson.address -cne "test@127.0.0.1:$($profileData.East.port)" -or
@@ -490,6 +649,40 @@ try {
         $westJson.delivery.reason -cne 'Waiting for a fresh prompt' -or
         $null -ne $westJson.execution -or $null -ne $westJson.output) {
         throw 'The JSON report omitted or misclassified the hidden rejected host'
+    }
+    if ($json.PSObject.Properties.Name -contains 'total_recipient_count') {
+        throw 'The full report was marked as a subset'
+    }
+    Set-RecipientSearch 'west'
+    $null = Wait-Until 'an empty result filter has no shown export' {
+        (Find-Element 'Showing 0 of 2 recipients') -and !(Find-Element 'Copy shown results' $button)
+    }
+    Click 'Clear recipient search'
+    Click 'Copy shown results'
+    $shownText = Wait-Until 'clipboard holds only the successful result' {
+        $report = Read-ClipboardFixture
+        if ($report -and $report.Contains("Shown results${dot}1 of 2 recipients") -and
+            $report.Contains("$eastName${dot}Sent to SSH channel") -and
+            $report.Contains('east-report-tail') -and !$report.Contains($westName)) { $report }
+    }
+    Click ('Save shown results' + [char]0x2026)
+    $dialog = Wait-Until 'shown group text Save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
+    $null = Wait-Until 'save the shown group text report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $shownTextPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.txt'
+    $null = Wait-Until 'the saved text matches the shown clipboard report' {
+        [IO.File]::Exists($shownTextPath) -and
+            [IO.File]::ReadAllText($shownTextPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $shownText
+    }
+    Click ('Save shown results as JSON' + [char]0x2026)
+    $dialog = Wait-Until 'shown group JSON Save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
+    $null = Wait-Until 'save the shown group JSON report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $shownJsonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.json'
+    $null = Wait-Until 'the shown JSON report is published' { [IO.File]::Exists($shownJsonPath) }
+    $shownJson = [IO.File]::ReadAllText($shownJsonPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    if ($shownJson.total_recipient_count -ne 2 -or $shownJson.recipients.Count -ne 1 -or
+        $shownJson.recipients[0].pane_id -ne $east -or
+        $shownJson.recipients[0].output.text -cne $eastJson.output.text) {
+        throw 'The filtered JSON report lost the original recipient count or the shown result'
     }
     Set-ResultFilter 'All results'
     $null = Wait-Until 'the hidden West result is outside the retry scope' {
@@ -510,8 +703,28 @@ try {
     Wait-CommandDraft 'draft before withheld retry'
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
-    Click 'Previous submission'
-    $null = Wait-Until 'earlier submission' { Find-Element "Submitted${dot}both" }
+    $findRun = 'Find run' + [char]0x2026
+    $runSearch = 'Search group runs'
+    Click $findRun
+    (Wait-PickerEditor $runSearch 'the run picker button').GetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern).SetValue('not-a-submission')
+    $null = Wait-Until 'run search reports an empty result' { Find-Element 'No matching group runs' }
+    Press-Key 27
+    $null = Wait-Until 'Escape returns to the same submission' {
+        !(Find-Element $runSearch $edit) -and (Find-Element "Submitted${dot}while-slow")
+    }
+    if ((Command-Editor).Current.Value -cne 'draft before withheld retry') { throw 'Closing the run picker changed the draft' }
+    Click $findRun
+    (Wait-PickerEditor $runSearch 'the reopened run picker').GetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern).SetValue('BOTH')
+    $null = Wait-Until 'only the matching run is offered' {
+        (Find-Element "Run 2${dot}both" $button) -and !(Find-Element "Run 3${dot}while-slow" $button)
+    }
+    Press-Key 13
+    $null = Wait-Until 'run search jumps to the earlier submission' { Find-Element "Submitted${dot}both" }
+    if ((Command-Editor).Current.Value -cne 'draft before withheld retry') { throw 'Choosing a run changed the draft' }
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     Outcome $westName 'Running'
     $compareButton = 'Compare results' + [char]0x2026
     Click $compareButton
@@ -671,10 +884,26 @@ try {
     }
     Run-Palette 'SSH host group'
     Outcome $westName 'Exit 17'
-    Click 'Next submission'
-    $null = Wait-Until 'later submission restored' { Find-Element "Submitted${dot}while-slow" }
+    Run-Palette ('Find group run' + [char]0x2026)
+    (Wait-PickerEditor $runSearch 'Find group run from the palette').GetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern).SetValue('#3')
+    $null = Wait-Until 'the run number selects the exact submission' {
+        (Find-Element "Run 3${dot}while-slow" $button) -and !(Find-Element "Run 2${dot}both" $button)
+    }
+    Press-Key 13
+    $null = Wait-Until 'later submission restored by run number' { Find-Element "Submitted${dot}while-slow" }
     Click 'Attention inbox, 1 unread'
-    Click "Unread${dot}SSH host group${dot}Run 2${dot}Group run finished${dot}1 succeeded${dot}1 needs attention"
+    $runNotice = "Unread${dot}SSH host group${dot}Run 2${dot}Group run finished${dot}1 succeeded${dot}1 needs attention"
+    $null = Wait-Until 'the attention view is active before reading the background roster' {
+        Find-Element $runNotice $button
+    }
+    $beforeRosterFocus = [FixtureMessages]::GetForegroundWindow()
+    $backgroundRoster = Roster-Snapshot
+    if ($backgroundRoster.counts.hosts -ne 2 -or [FixtureMessages]::GetForegroundWindow() -ne $beforeRosterFocus -or
+        !(Find-Element $runNotice $button)) {
+        throw 'Reading the background group roster changed focus or lost its hosts'
+    }
+    Click $runNotice
     $null = Wait-Until 'the alert opens its original run and marks the inbox read' {
         (Find-Element "Submitted${dot}both") -and (Find-Element 'Attention inbox, 0 unread' $button)
     }
@@ -690,25 +919,179 @@ try {
     Outcome $westName "Not sent${dot}Waiting for a fresh prompt"
     Send-Raw $west 'alt'
     Pane-Status $west "Connected${dot}Alternate screen"
+    $rosterSort = 'Sort SSH roster'
+    $null = Combo-Popup $rosterSort 'Tab order'
+    Expect-PaneButtonOrder 'Focus pane ' @($east, $west)
+    Select-ComboValue $rosterSort 'Needs attention first'
+    Expect-PaneButtonOrder 'Focus pane ' @($west, $east)
     Submit 'while-alt' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Alternate screen"
+    Expect-ResultOrder @($east, $west)
+    (Wait-CheckBox $showLastOutput Off).Toggle()
+    $null = Wait-Until 'the alternate-screen host has no roster preview' {
+        (Find-Element $openEastOutput $button) -and !(Find-Element $openWestOutput $button)
+    }
+    $copyRoster = 'Copy shown roster'
+    Pane-Status $east "Connected${dot}Ready"
+    (Wait-CheckBox $westName On).Toggle()
+    $null = Wait-CheckBox $westName Off
+    $null = Wait-Until 'the roster summarizes both ready and alternate-screen hosts' {
+        Find-Element "2 matching hosts${dot}Ready (1)${dot}Alternate screen (1)"
+    }
+    Click $copyRoster
+    $null = Wait-Until 'the copied roster includes both the ready and unchecked alternate-screen host' {
+        $report = Read-ClipboardFixture
+        (Find-Element 'Copied roster with 2 hosts') -and $report -and
+            $report.Contains("2 shown${dot}1 checked") -and
+            $report.Contains("Checked${dot}$eastName${dot}Connected${dot}Ready") -and
+            $report.Contains("Unchecked${dot}$westName${dot}Connected${dot}Alternate screen") -and
+            $report.IndexOf($westName) -lt $report.IndexOf($eastName) -and
+            !$report.Contains('east-accepted while-alt')
+    }
+    Select-ComboValue $rosterSort 'Checked first'
+    Expect-PaneButtonOrder 'Focus pane ' @($east, $west)
+    (Wait-CheckBox $westName Off).Toggle()
+    $null = Wait-CheckBox $westName On
+    Select-ComboValue $rosterSort 'Needs attention first'
+    Select-ComboValue $hostStateFilter 'Ready'
+    $null = Wait-Until 'the ready filter scopes the roster and send count to East' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and $send.Current.IsEnabled -and (Find-Element "Focus pane $east" $button) -and
+            !(Find-Element "Focus pane $west" $button) -and
+            (Find-Element '1 selected host is hidden by the filter.') -and
+            (Find-Element "Showing 1 of 2 matching hosts${dot}Ready (1)${dot}Alternate screen (1)")
+    }
+    $roster = Roster-Snapshot
+    if ($roster.schema_version -ne 1 -or $roster.label -cne 'SSH host group' -or
+        $roster.filter.state -cne 'ready' -or $roster.sort -cne 'attention-first' -or $roster.counts.checked -ne 2 -or
+        $roster.counts.checked_shown -ne 1 -or $roster.counts.ready_checked_shown -ne 1 -or !$roster.selection_ready -or
+        $roster.hosts[0].pane_id -ne $west -or $roster.hosts[0].shown -or !$roster.hosts[0].checked -or
+        $roster.hosts[0].state -cne 'alternate' -or $roster.hosts[1].pane_id -ne $east -or !$roster.hosts[1].shown -or
+        $roster.hosts[1].profile -cne 'East' -or $roster.hosts[1].address -cne "test@127.0.0.1:$($profileData.East.port)") {
+        throw 'The CLI roster lost the checked hidden host, display order, or readiness'
+    }
+    Select-ComboValue $hostStateFilter 'Alternate screen'
+    Run-Palette 'Copy shown SSH roster'
+    $null = Wait-Until 'only the host shown by the state filter is copied' {
+        $report = Read-ClipboardFixture
+        (Find-Element 'Copied roster with 1 host') -and $report -and
+            $report.Contains("1 shown${dot}1 checked") -and
+            $report.Contains("Checked${dot}$westName${dot}Connected${dot}Alternate screen") -and
+            !$report.Contains($eastName)
+    }
+    Set-HostFilter 'east'
+    $null = Wait-Until 'the text filter still applies inside the selected host state' {
+        $copy = Find-Element $copyRoster $button
+        (Find-Element 'No SSH panes match this filter.') -and $copy -and !$copy.Current.IsEnabled -and
+            (Find-Element "Showing 0 of 1 matching host${dot}Ready (1)")
+    }
+    Set-HostFilter ''
+    $null = Wait-CheckBox $westName On
+    $null = Wait-Until 'West is shown with its original check but cannot receive a command' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and !$send.Current.IsEnabled -and !(Find-Element "Focus pane $east" $button)
+    }
+    Select-ComboValue $hostStateFilter 'All host states'
+    $roster = Roster-Snapshot
+    if ($roster.require_all_ready -or !$roster.selection_ready -or $roster.counts.ready_checked_shown -ne 1 -or
+        $roster.counts.checked_shown -ne 2) {
+        throw 'Expected the normal send policy to allow East while West was still unavailable'
+    }
+    $readyTimeout = & $Cli --pid $app.Id @readyArgs --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $readyTimeout.ok -or $readyTimeout.error -notlike '*timed out before all*') {
+        throw 'The readiness wait did not require both shown checked hosts'
+    }
+    $readyOutput = Join-Path $State 'wait-group-ready.json'
+    $readyJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $readyArgs + @('--timeout','15')) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $readyOutput
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'Attention view before releasing the West prompt' {
+        Find-Element 'Attention inbox' ([System.Windows.Automation.ControlType]::Text)
+    }
+    $readyFocus = [FixtureMessages]::GetForegroundWindow()
+    if ($readyJob.HasExited) { throw 'The readiness wait ended while West was in the alternate screen' }
     Send-Raw $west 'prompt'
+    if (!$readyJob.WaitForExit(10000)) { throw 'The readiness wait did not finish while the group was in the background' }
+    $readyReply = [IO.File]::ReadAllText($readyOutput) | ConvertFrom-Json
+    $readyRoster = $readyReply.result.roster
+    if (!$readyReply.ok -or $readyRoster.counts.checked_shown -ne 2 -or
+        $readyRoster.counts.ready_checked_shown -ne 2 -or
+        [FixtureMessages]::GetForegroundWindow() -ne $readyFocus -or
+        !(Find-Element 'Attention inbox' ([System.Windows.Automation.ControlType]::Text))) {
+        throw "The readiness wait lost its original host scope or changed focus: $($readyReply.error)"
+    }
+    Run-Palette 'SSH host group'
+    Select-ComboValue $hostStateFilter 'Ready'
     Pane-Status $west "Connected${dot}Ready"
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
+    Select-ComboValue $hostStateFilter 'All host states'
+    Expect-PaneButtonOrder 'Focus pane ' @($east, $west)
+    Select-ComboValue $rosterSort 'Tab order'
+    $null = Wait-Until 'the retained preview returns when West leaves the alternate screen' {
+        Find-Element $openWestOutput $button
+    }
     $previous = (Control @('inspect','--pane',"$west")).connection_generation
+    [IO.File]::WriteAllText($westShellGate, '')
     Send-Raw $west 'drop'
+    Pane-Status $west "Reconnecting${dot}attempt 1"
+    Select-ComboValue $hostStateFilter 'Reconnecting'
+    $null = Wait-Until 'the retry filter isolates West and shows its attempt' {
+        (Find-Element "Pane $west${dot}Reconnecting${dot}attempt 1") -and
+            !(Find-Element "Focus pane $east" $button) -and !(Find-Element "Reconnect SSH pane $west" $button)
+    }
+    Click $copyRoster
+    $null = Wait-Until 'the roster report carries the automatic retry' {
+        $report = Read-ClipboardFixture
+        $report -and $report.Contains("$westName${dot}Reconnecting${dot}attempt 1") -and !$report.Contains($eastName)
+    }
+    Remove-Item -LiteralPath $westShellGate
+    Select-ComboValue $hostStateFilter 'All host states'
     $null = Wait-Until 'replacement SSH transport' {
         (Control @('inspect','--pane',"$west")).connection_generation -gt $previous
     }
     Pane-Status $west "Connected${dot}Prompt unverified"
+    if (Find-Element $openWestOutput $button) { throw 'The roster preview carried across an SSH reconnect' }
     Submit 'while-reconnecting' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Prompt unverified"
+    $requireReady = 'Require all recipients ready'
+    $sendRecordedOption = 'Send and record' + [char]0x2026
+    (Wait-CheckBox $requireReady Off).Toggle()
+    (Command-Editor).SetValue('after-reconnect')
+    $null = Wait-Until 'both send actions wait for the unverified checked host' {
+        $send = Find-Element 'Send to 2 hosts' $button
+        $record = Find-Element $sendRecordedOption $button
+        $send -and !$send.Current.IsEnabled -and $record -and !$record.Current.IsEnabled -and
+            (Find-Element "1 of 2 selected hosts ready${dot}waiting for all")
+    }
+    Set-HostFilter 'east'
+    $null = Wait-Until 'strict readiness respects the visible recipient scope' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and $send.Current.IsEnabled
+    }
+    Set-HostFilter ''
+    $null = Wait-Until 'returning West to the scope blocks sending again' {
+        $send = Find-Element 'Send to 2 hosts' $button
+        $send -and !$send.Current.IsEnabled
+    }
     Send-Raw $west 'prompt'
     Pane-Status $west "Connected${dot}Ready"
+    $null = Wait-Until 'both send actions become available when both prompts are fresh' {
+        $send = Find-Element 'Send to 2 hosts' $button
+        $record = Find-Element $sendRecordedOption $button
+        $send -and $send.Current.IsEnabled -and $record -and $record.Current.IsEnabled
+    }
+    if (Find-Element "Submitted${dot}after-reconnect") { throw 'The ready check sent the draft automatically' }
     Submit 'after-reconnect' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Exit 17'
+    $null = Wait-Until 'the roster preview uses the replacement SSH connection output' {
+        Find-Element "Pane $west${dot}Last command${dot}Exit 17${dot}west-accepted after-reconnect"
+    }
+    (Wait-CheckBox $showLastOutput On).Toggle()
+    (Wait-CheckBox $requireReady On).Toggle()
     $null = Wait-Until 'finished results cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
@@ -727,9 +1110,18 @@ try {
     $null = Wait-Until 'East is selected and hidden' {
         Find-Element '1 selected host is hidden by the filter.'
     }
+    Set-RecipientSearch 'east'
+    Expect-ResultOrder @($east)
+    $null = Wait-Until 'disjoint roster and result filters disable interrupt' {
+        $entry = Find-Element 'Interrupt selected' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    Set-RecipientSearch 'west'
+    Expect-ResultOrder @($west)
     Click 'Interrupt selected'
     Outcome $westName 'Ctrl+C sent'
     Outcome $westName 'Exit 130'
+    Click 'Clear recipient search'
     Outcome $eastName 'Running'
     $null = Wait-Until 'only hidden East remains running' {
         $entry = Find-Element 'Interrupt selected' $button
@@ -753,10 +1145,15 @@ try {
     Click 'Interrupt selected'
     Outcome $eastName 'Exit 130'
     Outcome $westName 'Exit 130'
+    Set-RecipientSearch 'west'
+    Expect-ResultOrder @($west)
     Click 'Previous submission'
     $null = Wait-Until 'show the previous interrupt' { Find-Element "Submitted${dot}interrupt-pair" }
+    Expect-ResultOrder @($west)
     Click 'Previous submission'
     $null = Wait-Until 'show the command to load' { Find-Element "Submitted${dot}after-reconnect" }
+    Expect-ResultOrder @($west)
+    Click 'Clear recipient search'
     Set-HostFilter 'west'
     $null = Wait-Until 'East is selected but hidden during reuse' {
         Find-Element '1 selected host is hidden by the filter.'
@@ -865,8 +1262,29 @@ try {
         $bulk = Find-Element 'Reconnect selected' $button
         $bulk -and !$bulk.Current.IsEnabled -and !(Find-Element "Reconnect SSH pane $east" $button)
     }
+    $rejectWest = Join-Path (Split-Path -LiteralPath $westShellGate) 'reject-shell-request'
+    [IO.File]::WriteAllText($rejectWest, '')
+    [IO.File]::WriteAllText($westShellGate, '')
+    Click "Reconnect SSH pane $west"
+    Pane-Status $west 'Reconnecting'
+    Remove-Item -LiteralPath $westShellGate
+    Pane-Status $west "Connection failed${dot}reconnect available"
+    Select-ComboValue $hostStateFilter 'Connection failed'
+    $failureReason = "Pane $west${dot}remote server rejected a PTY or shell request (1 outstanding)"
+    $null = Wait-Until 'the failure filter shows only West and its SSH diagnostic' {
+        (Find-Element $failureReason) -and (Find-Element "Reconnect SSH pane $west" $button) -and
+            !(Find-Element "Focus pane $east" $button)
+    }
+    Click $copyRoster
+    $null = Wait-Until 'the copied roster includes the failed connection state' {
+        $report = Read-ClipboardFixture
+        $report -and $report.Contains("$westName${dot}Connection failed${dot}reconnect available")
+    }
+    Remove-Item -LiteralPath $rejectWest
+    Select-ComboValue $hostStateFilter 'All host states'
     Click "Reconnect SSH pane $west"
     Pane-Status $west "Connected${dot}Ready"
+    if (Find-Element $failureReason) { throw 'The previous SSH error remained after reconnect' }
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName Off
     if ((Command-Editor).Current.Value -cne 'draft before reconnect') {
@@ -934,10 +1352,17 @@ try {
     $null = Wait-Until 'Escape closes recent search' { !(Find-Element $recent $edit) }
     if ((Command-Editor).Current.Value -cne 'unsent recent witness') { throw 'Escape changed the draft' }
     Run-Palette ('Recent group commands' + [char]0x2026)
-    $null = Wait-Until 'recent search receives keyboard focus' {
-        $field = Find-Element $recent $edit
-        $field -and $field.Current.HasKeyboardFocus
+    $null = Wait-PickerEditor $recent 'Recent group commands from the palette'
+    Press-Key 27
+    $null = Wait-Until 'the palette search closes' { !(Find-Element $recent $edit) }
+    $entry = Wait-Until 'the SSH group command editor' { Find-Element 'Group command' $edit }
+    $entry.SetFocus()
+    $null = Wait-Until 'fixture owns input in its command editor' {
+        $entry.Current.HasKeyboardFocus -and [FixtureMessages]::GetForegroundWindow() -eq $window
     }
+    if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'Fixture lost keyboard input' }
+    [Windows.Forms.SendKeys]::SendWait('^r')
+    $null = Wait-PickerEditor $recent 'Ctrl+R'
     (Command-Editor $recent).SetValue('WHILE-SLO')
     $null = Wait-Until 'recent search finds an older full command without regard to case' {
         (Find-Element 'while-slow' $button) -and !(Find-Element 'shared-status' $button)
@@ -1021,6 +1446,10 @@ try {
         }
     }
     if ([IO.File]::ReadAllText($burstPath) -cne $beforeCollision) { throw 'The existing recording was modified' }
+    (Wait-CheckBox $requireReady Off).Toggle()
+    Select-ComboValue $hostStateFilter 'Ready'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     (Command-Editor).SetValue('never-send-with-stale-prompt')
     Click $sendRecorded
     $dialog = Wait-Until 'file picker before a host changes prompt state' { Find-OwnedDialog 'Record SSH group output' }
@@ -1033,6 +1462,8 @@ try {
     if ([IO.File]::ReadAllText((Join-Path $env:W11TERM_EXPORT_SMOKE_DIR $nextName)).Trim() -cne '[No command was sent]') {
         throw 'A stale review was presented as a recorded submission'
     }
+    Select-ComboValue $hostStateFilter 'All host states'
+    (Wait-CheckBox $requireReady On).Toggle()
     Pane-Status $west "Connected$($dot)Alternate screen"
     (Command-Editor).SetValue('record-one')
     Click $sendRecorded
@@ -1069,6 +1500,10 @@ try {
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
+    if ($readyJob) {
+        if (!$readyJob.HasExited) { $readyJob.Kill(); $readyJob.WaitForExit() }
+        $readyJob.Dispose()
+    }
     if ($logReader) { $logReader.Dispose() }
     if ($explorer) {
         foreach ($item in @($explorer.Windows())) {

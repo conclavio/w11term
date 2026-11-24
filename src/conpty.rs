@@ -97,6 +97,9 @@ fn write_input(
                 let _ = job.reply.send(Err("SFTP requires an SSH session".into()));
             }
             TransportInput::Authenticate(_) => {}
+            message @ TransportInput::DisconnectShell { .. } => {
+                message.reject_input("Disconnect requires a direct SSH shell.");
+            }
         }
     }
     Ok(())

@@ -14,7 +14,7 @@ $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
 
 function Catalog {
-    # ProfileStore atomically replaces the path while this fixture polls it.
+    # Read after the app acknowledges saves so this handle cannot block replacement.
     $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
     $stream = [IO.File]::Open($profiles, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
     $reader = [IO.StreamReader]::new($stream)
@@ -50,6 +50,31 @@ function Filter-Roster([string]$Query) {
 function Filter-GroupProfiles([string]$Query) {
     $field = Wait-Until 'saved group profile search' { Find-Element 'Find group profiles' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+}
+function Roster-Choice([string]$Name, [switch]$Choose, [string]$ControlName = 'Sort SSH roster') {
+    $comboType = [System.Windows.Automation.ControlType]::ComboBox
+    $listItem = [System.Windows.Automation.ControlType]::ListItem
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selection = [System.Windows.Automation.SelectionPattern]::Pattern
+    if ($Choose) {
+        $option = Wait-Until "the '$Name' option for $ControlName" {
+            $combo = Find-Element $ControlName $comboType
+            if (!$combo) { return }
+            $popup = $combo.GetCurrentPattern($expand)
+            if ($popup.Current.ExpandCollapseState -eq 'Collapsed') { $popup.Expand() }
+            $choice = Find-Element $Name $listItem
+            if ($choice -and !$choice.Current.IsOffscreen) { $choice }
+        }
+        $option.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    }
+    $combo = Wait-Until "$ControlName is '$Name'" {
+        $item = Find-Element $ControlName $comboType
+        if (!$item) { return }
+        $items = $item.GetCurrentPattern($selection).Current.GetSelection()
+        if ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Name) { $item }
+    }
+    $popup = $combo.GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 function Launch-Window {
     $launchArgs = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
@@ -199,6 +224,177 @@ try {
         $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
     }
 
+    $saveDefaults = 'Save roster defaults'
+    $showOutput = 'Show last command output'
+    $allReady = 'Require all recipients ready'
+    Roster-Choice 'Tab order'
+    Roster-Choice 'Host label' -Choose
+    Roster-Choice 'Unlimited' -ControlName 'Parallel SSH commands'
+    Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands' -Choose
+    Roster-Choice 'No delay' -ControlName 'Time between sends'
+    Roster-Choice '2 seconds' -ControlName 'Time between sends' -Choose
+    Roster-Choice 'Never' -ControlName 'Expire unsent commands'
+    Roster-Choice '15 seconds' -ControlName 'Expire unsent commands' -Choose
+    (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
+    $null = Wait-CheckBox 'Stop queue on failure' On
+    (Wait-CheckBox $allReady Off).Toggle()
+    (Wait-CheckBox $showOutput Off).Toggle()
+    $null = Wait-CheckBox $allReady On
+    $null = Wait-CheckBox $showOutput On
+    Click $saveDefaults
+    $null = Wait-Until 'the defaults are saved for Fleet' {
+        if (!(Find-Element 'Saved roster defaults')) { return }
+        $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
+        $savedDefaults.order -ceq 'label' -and $savedDefaults.command_limit -ceq 'two' -and
+            $savedDefaults.command_interval -ceq '2s' -and $savedDefaults.command_queue_expiry -ceq '15s' -and
+            $savedDefaults.show_last_output -and $savedDefaults.require_all_ready -and
+            $savedDefaults.stop_command_queue_on_failure
+    }
+    (Wait-CheckBox $showOutput On).Toggle()
+    $null = Wait-CheckBox $showOutput Off
+    Roster-Choice '10 seconds' -ControlName 'Time between sends' -Choose
+    Close-GroupWindow
+    Launch-Window
+    Open-FleetPalette
+    Click "Open SSH group${dot}Fleet"
+    $null = Wait-Until 'reopened Fleet with its own roster defaults' { Find-Element 'Opened 2 SSH panes for Fleet' }
+    Roster-Choice 'Host label'
+    Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands'
+    Roster-Choice '2 seconds' -ControlName 'Time between sends'
+    Roster-Choice '15 seconds' -ControlName 'Expire unsent commands'
+    $null = Wait-CheckBox 'Stop queue on failure' On
+    $null = Wait-CheckBox $allReady On
+    $null = Wait-CheckBox $showOutput On
+    $null = Wait-Until 'the loaded preferences match the saved defaults' {
+        $save = Find-Element $saveDefaults $button
+        $save -and !$save.Current.IsEnabled
+    }
+    $sessions = Wait-Until 'the restarted window has the group panes' {
+        $current = @((Control @('list')).sessions)
+        if ($current.Count -eq 3) { ,$current }
+    }
+
+    $duplicate = 'Duplicate group' + [char]0x2026
+    Click $duplicate
+    $null = Wait-Until 'the copy review names the source' { Find-Element 'Copy from Fleet' }
+    Click 'Cancel'
+    $null = Wait-Until 'the copy review closes on cancel' { Find-Element $duplicate $button }
+    if ((Catalog).ssh_host_groups.PSObject.Properties.Name.Count -ne 1) { throw 'Cancel changed the groups' }
+    Click $duplicate
+    $nameField = Wait-Until 'new group name field' { Find-Element 'New SSH group name' $edit }
+    $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Fleet')
+    Click 'Save copy'
+    $null = Wait-Until 'the existing group name is refused' { Find-Element 'An SSH group named Fleet already exists' }
+    $nameField = Wait-Until 'the copy name can be corrected' { Find-Element 'New SSH group name' $edit }
+    $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Fleet copy')
+    Click 'Save copy'
+    $null = Wait-Until 'the group copy is saved' {
+        if (!(Find-Element 'SSH group copied')) { return }
+        $saved = Catalog
+        ($saved.ssh_host_groups.'Fleet copy' -join ',') -ceq 'West,East' -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.order -ceq 'label' -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.show_last_output -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.command_limit -ceq 'two' -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.command_interval -ceq '2s'
+    }
+    if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Copying the group opened SSH panes' }
+    Click 'Edit group'
+    Click 'Delete group'
+    Click 'Confirm delete group'
+    $null = Wait-Until 'the copy is deleted and the original remains' {
+        (Find-Element 'Edit group' $button) -and ((Catalog).ssh_host_groups.Fleet -join ',') -ceq 'West,East' -and
+            -not ((Catalog).ssh_host_groups.'Fleet copy')
+    }
+
+    $definitionCatalog = Catalog
+    $definitionCatalog | Add-Member -NotePropertyName ssh_recipient_sets -NotePropertyValue @{ Fleet = @{ Canary = @('East','West') } }
+    [IO.File]::WriteAllText($profiles, ($definitionCatalog | ConvertTo-Json -Depth 30))
+    $definitionFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group.json'
+    Click ('Export group definition' + [char]0x2026)
+    $dialog = Wait-Until 'group definition save dialog' { Find-OwnedDialog 'Save SSH group definition' }
+    $null = Wait-Until 'save the group definition' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the versioned group definition is exported' { Test-Path -LiteralPath $definitionFile }
+    $exported = [IO.File]::ReadAllText($definitionFile) | ConvertFrom-Json
+    if ($exported.format -cne 'w11term-ssh-group' -or $exported.version -ne 1 -or
+        ($exported.group.members -join ',') -cne 'West,East' -or
+        ($exported.group.recipient_sets.Canary -join ',') -cne 'East,West' -or
+        !$exported.group.roster_defaults.show_last_output -or
+        $exported.group.roster_defaults.command_interval -cne '2s' -or $exported.profiles) {
+        throw 'The group file did not preserve its portable definition'
+    }
+
+    Click ('Import group definition' + [char]0x2026)
+    $dialog = Wait-Until 'group definition open dialog' { Find-OwnedDialog 'Open SSH group definition' }
+    $null = Wait-Until 'the group definition path is entered' {
+        [FixtureDialog]::SetFilename($dialog, $definitionFile, '')
+    }
+    $null = Wait-Until 'open the definition for review' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $westAddr = "West${dot}test@127.0.0.1:$($definitionCatalog.profiles.West.port)"
+    $null = Wait-Until 'the import resolves the current local West profile' { Find-Element $westAddr }
+    $nameField = Wait-Until 'imported group name field' { Find-Element 'Imported SSH group name' $edit }
+    $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Portable Fleet')
+    $changed = Catalog
+    $changed.profiles.West.port = 1
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Save imported group'
+    $null = Wait-Until 'the changed profile requires another review' {
+        Find-Element 'The SSH profiles changed on disk. Review the group definition again.'
+    }
+    if ((Catalog).ssh_host_groups.'Portable Fleet') { throw 'A stale profile review saved the group' }
+    $missing = Catalog
+    $missing.profiles.PSObject.Properties.Remove('West')
+    [IO.File]::WriteAllText($profiles, ($missing | ConvertTo-Json -Depth 30))
+    Click 'Refresh local profiles'
+    $null = Wait-Until 'the unavailable profile blocks saving' {
+        $save = Find-Element 'Save imported group' $button
+        ($save -and !$save.Current.IsEnabled) -and (Find-Element "West${dot}Local SSH profile unavailable")
+    }
+    $missing.profiles | Add-Member -NotePropertyName 'West Local' -NotePropertyValue $changed.profiles.West
+    [IO.File]::WriteAllText($profiles, ($missing | ConvertTo-Json -Depth 30))
+    Click 'Choose local profile for West'
+    $null = Wait-Until 'profile search is shown' { Find-Element 'Find local SSH profiles' $edit }
+    Click 'Back to import review'
+    $null = Wait-Until 'going back kept the current mapping' { Find-Element "West${dot}Local SSH profile unavailable" }
+    Click 'Choose local profile for West'
+    Click 'Next profiles'
+    Click 'Use local profile East'
+    $null = Wait-Until 'two file entries cannot use the same local profile' {
+        $save = Find-Element 'Save imported group' $button
+        ($save -and !$save.Current.IsEnabled) -and
+            (Find-Element 'Choose a different local profile for each imported member.')
+    }
+    Click 'Choose local profile for West'
+    $search = Wait-Until 'the new picker exposes local profile search' { Find-Element 'Find local SSH profiles' $edit }
+    $search.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('wEsT local 127.0.0.1')
+    $null = Wait-Until 'local profile search matches the name and host' {
+        (Find-Element 'Use local profile West Local' $button) -and !(Find-Element 'Use local profile East' $button)
+    }
+    Click 'Use local profile West Local'
+    $null = Wait-Until 'the remapped profile and address are shown' {
+        Find-Element "West${dot}West Local${dot}test@127.0.0.1:1"
+    }
+    Click 'Save imported group'
+    $null = Wait-Until 'the reviewed group is saved with its settings' {
+        if (!(Find-Element 'SSH group imported')) { return }
+        $saved = Catalog
+        ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West Local,East' -and
+            ($saved.ssh_recipient_sets.'Portable Fleet'.Canary -join ',') -ceq 'East,West Local' -and
+            $saved.ssh_host_group_defaults.'Portable Fleet'.show_last_output -and
+            $saved.ssh_host_group_defaults.'Portable Fleet'.command_limit -ceq 'two' -and
+            $saved.ssh_host_group_defaults.'Portable Fleet'.command_interval -ceq '2s'
+    }
+    if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Importing the definition opened SSH panes' }
+    $restored = Catalog
+    $restored.profiles.PSObject.Properties.Remove('West Local')
+    $restored.profiles | Add-Member -NotePropertyName 'West' -NotePropertyValue $definitionCatalog.profiles.West
+    [IO.File]::WriteAllText($profiles, ($restored | ConvertTo-Json -Depth 30))
+    Click 'Edit group'
+    Click 'Delete group'
+    Click 'Confirm delete group'
+    $null = Wait-Until 'the imported group is removed while the source remains' {
+        (Find-Element 'Edit group' $button) -and -not ((Catalog).ssh_host_groups.'Portable Fleet')
+    }
+
     Click 'Edit group'
     $null = Wait-CheckBox 'Group member East' On
     Filter-GroupProfiles 'west'
@@ -215,12 +411,17 @@ try {
     if ($groups.Fleet -or ($groups.'East only' -join ',') -cne 'East') {
         throw 'The renamed group has the wrong saved membership'
     }
+    $defaults = (Catalog).ssh_host_group_defaults
+    if ($defaults.Fleet -or $defaults.'East only'.order -cne 'label' -or
+        $defaults.'East only'.command_interval -cne '2s') {
+        throw 'Roster defaults did not follow the group rename'
+    }
     Click 'Edit group'
     Click 'Delete group'
     Click 'Confirm delete group'
     $null = Wait-Until 'group editor closes after delete' { Find-Element 'New group' $button }
     $saved = Catalog
-    if ($saved.ssh_host_groups -or !$saved.profiles.East -or !$saved.profiles.West -or $saved.other -ne 17) {
+    if ($saved.ssh_host_groups -or $saved.ssh_host_group_defaults -or !$saved.profiles.East -or !$saved.profiles.West -or $saved.other -ne 17) {
         throw 'The deletion changed unrelated profile data or left the group behind'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'Editing or deleting the group changed its running sessions' }

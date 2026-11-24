@@ -1,13 +1,16 @@
 use super::{GroupExecution, Inbox};
+use serde::Serialize;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
+    time::Instant,
 };
 use tokio::sync::{broadcast, oneshot};
 use wezterm_term::LiveOutputBatch;
 
 const TRANSCRIPT_LINES: usize = 128;
 const RECORDING_QUEUE: usize = 1024;
+const QUEUE_EVENT_LIMIT: usize = 32;
 
 #[derive(Clone, Debug, Default)]
 pub struct GroupTranscript(Arc<Mutex<Transcript>>);
@@ -15,6 +18,7 @@ pub struct GroupTranscript(Arc<Mutex<Transcript>>);
 #[derive(Debug, Default)]
 struct Transcript {
     snapshot: GroupTranscriptSnapshot,
+    queue_activity: QueueActivity,
     recording: Option<Recording>,
     next_recording: u64,
     hosts: Vec<HostRecord>,
@@ -62,6 +66,69 @@ pub enum GroupRecordingEnd {
 pub struct GroupRecordingSummary {
     pub end: GroupRecordingEnd,
     pub hosts: Vec<(u64, GroupRecordingOutcome)>,
+    pub queue_activity: GroupQueueActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GroupQueueEventKind {
+    Paused,
+    Resumed,
+    CanaryReady,
+    CanaryApproved,
+    CanaryFailed,
+    StoppedOnFailure,
+    Expired,
+    Cancelled,
+    HostSkipped { pane_id: u64 },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupQueueEvent {
+    pub elapsed_ms: u64,
+    #[serde(flatten)]
+    pub kind: GroupQueueEventKind,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct GroupQueueActivity {
+    pub omitted: u64,
+    pub events: VecDeque<GroupQueueEvent>,
+}
+
+impl GroupQueueActivity {
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct QueueActivity {
+    started_at: Instant,
+    snapshot: GroupQueueActivity,
+}
+
+impl Default for QueueActivity {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            snapshot: GroupQueueActivity::default(),
+        }
+    }
+}
+
+impl QueueActivity {
+    fn push(&mut self, kind: GroupQueueEventKind, now: Instant) {
+        if self.snapshot.events.len() == QUEUE_EVENT_LIMIT {
+            self.snapshot.events.pop_front();
+            self.snapshot.omitted = self.snapshot.omitted.saturating_add(1);
+        }
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.started_at).as_millis())
+            .unwrap_or(u64::MAX);
+        self.snapshot
+            .events
+            .push_back(GroupQueueEvent { elapsed_ms, kind });
+    }
 }
 
 #[derive(Debug)]
@@ -69,6 +136,7 @@ pub enum GroupRecordingOutcome {
     AwaitingDelivery,
     DeliveryUnconfirmed,
     Rejected(Arc<str>),
+    Skipped,
     Sent(Option<GroupExecution>),
 }
 
@@ -81,9 +149,18 @@ struct HostRecord {
 }
 
 impl HostRecord {
+    fn succeeded(&self) -> bool {
+        matches!(self.outcome(), GroupRecordingOutcome::Sent(Some(GroupExecution::Finished(result)))
+            if result.exit_code == Some(0))
+    }
+
+    fn skipped(&self) -> bool {
+        matches!(self.receipt.0.get(), Some(WriteOutcome::Skipped))
+    }
+
     fn outcome(&self) -> GroupRecordingOutcome {
         match self.receipt.0.get() {
-            Some(Ok(())) => {
+            Some(WriteOutcome::Acknowledged) => {
                 let execution = self.execution.clone().filter(|state| {
                     self.active
                         || matches!(
@@ -95,7 +172,8 @@ impl HostRecord {
                 });
                 GroupRecordingOutcome::Sent(execution)
             }
-            Some(Err(reason)) => GroupRecordingOutcome::Rejected(reason.clone()),
+            Some(WriteOutcome::Rejected(reason)) => GroupRecordingOutcome::Rejected(reason.clone()),
+            Some(WriteOutcome::Skipped) => GroupRecordingOutcome::Skipped,
             None if self.active => GroupRecordingOutcome::AwaitingDelivery,
             None => GroupRecordingOutcome::DeliveryUnconfirmed,
         }
@@ -123,23 +201,31 @@ pub struct GroupTranscriptHost {
     index: usize,
     verify_delivery: bool,
     receipt: GroupWriteReceipt,
+    _execution_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[derive(Debug)]
+enum WriteOutcome {
+    Acknowledged,
+    Rejected(Arc<str>),
+    Skipped,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct GroupWriteReceipt(Arc<OnceLock<Result<(), Arc<str>>>>);
+pub struct GroupWriteReceipt(Arc<OnceLock<WriteOutcome>>);
 
 impl GroupWriteReceipt {
     pub(crate) fn acknowledge(&self) {
-        let _ = self.0.set(Ok(()));
+        let _ = self.0.set(WriteOutcome::Acknowledged);
     }
 
     /// Record a refusal before any bytes could be sent.
     pub fn reject(&self, reason: &str) {
-        let _ = self.0.set(Err(reason.into()));
+        let _ = self.0.set(WriteOutcome::Rejected(reason.into()));
     }
 
     fn acknowledged(&self) -> bool {
-        self.0.get().is_some_and(Result::is_ok)
+        matches!(self.0.get(), Some(WriteOutcome::Acknowledged))
     }
 }
 
@@ -186,6 +272,7 @@ impl GroupTranscript {
             index,
             verify_delivery: false,
             receipt,
+            _execution_slot: None,
         }
     }
 
@@ -208,6 +295,26 @@ impl GroupTranscript {
         }
     }
 
+    /// Whether this host settled with a confirmed zero exit status.
+    pub fn settled_host_succeeded(&self, pane: u64) -> Option<bool> {
+        self.0
+            .lock()
+            .unwrap()
+            .hosts
+            .iter()
+            .find(|host| host.pane == pane && !host.active)
+            .map(HostRecord::succeeded)
+    }
+
+    pub fn has_unsuccessful_result(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .hosts
+            .iter()
+            .any(|host| !host.active && !host.skipped() && !host.succeeded())
+    }
+
     pub fn set_completion_notice(
         &self,
         armed: bool,
@@ -225,6 +332,18 @@ impl GroupTranscript {
                 source: source.into(),
             });
         }
+    }
+
+    pub fn note_queue_activity(&self, kind: GroupQueueEventKind) {
+        self.0
+            .lock()
+            .unwrap()
+            .queue_activity
+            .push(kind, Instant::now());
+    }
+
+    pub fn queue_activity(&self) -> GroupQueueActivity {
+        self.0.lock().unwrap().queue_activity.snapshot.clone()
     }
 
     pub fn snapshot(&self) -> GroupTranscriptSnapshot {
@@ -279,15 +398,14 @@ impl GroupTranscript {
             let succeeded = transcript
                 .hosts
                 .iter()
-                .filter(|host| {
-                    matches!(
-                        host.outcome(),
-                        GroupRecordingOutcome::Sent(Some(GroupExecution::Finished(result)))
-                            if result.exit_code == Some(0)
-                    )
-                })
+                .filter(|host| host.succeeded())
                 .count();
-            let attention = transcript.hosts.len() - succeeded;
+            let skipped = transcript
+                .hosts
+                .iter()
+                .filter(|host| host.skipped())
+                .count();
+            let attention = transcript.hosts.len() - succeeded - skipped;
             drop(transcript);
             notice.inbox.group_finished(
                 notice.tab,
@@ -295,6 +413,7 @@ impl GroupTranscript {
                 &notice.source,
                 succeeded,
                 attention,
+                skipped,
             );
         }
     }
@@ -310,6 +429,18 @@ impl Drop for GroupTranscriptHost {
 }
 
 impl GroupTranscriptHost {
+    pub fn hold_execution_slot(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self._execution_slot = Some(permit);
+    }
+
+    /// Settle a host that the operator removed while it was still queued.
+    pub fn skip_queued(self) {
+        if self.receipt.0.set(WriteOutcome::Skipped).is_ok() {
+            self.transcript
+                .note_queue_activity(GroupQueueEventKind::HostSkipped { pane_id: self.pane });
+        }
+    }
+
     pub fn delivery_receipt(&self) -> GroupWriteReceipt {
         self.receipt.clone()
     }
@@ -363,9 +494,11 @@ impl Transcript {
                 .iter()
                 .map(|host| (host.pane, host.outcome()))
                 .collect();
-            let _ = recording
-                .ended
-                .send(GroupRecordingSummary { end: reason, hosts });
+            let _ = recording.ended.send(GroupRecordingSummary {
+                end: reason,
+                hosts,
+                queue_activity: self.queue_activity.snapshot.clone(),
+            });
         }
     }
 
@@ -396,6 +529,85 @@ mod tests {
     use wezterm_term::LiveOutputLine;
 
     #[test]
+    fn queue_activity_retains_recent_events_in_elapsed_order() {
+        let mut activity = QueueActivity::default();
+        for index in 0..QUEUE_EVENT_LIMIT + 2 {
+            let kind = if index % 2 == 0 {
+                GroupQueueEventKind::Paused
+            } else {
+                GroupQueueEventKind::Resumed
+            };
+            let at = activity.started_at + std::time::Duration::from_millis(index as u64);
+            activity.push(kind, at);
+        }
+        assert_eq!(activity.snapshot.omitted, 2);
+        assert_eq!(activity.snapshot.events.len(), QUEUE_EVENT_LIMIT);
+        assert_eq!(
+            activity.snapshot.events.front().unwrap().kind,
+            GroupQueueEventKind::Paused
+        );
+        assert_eq!(
+            activity.snapshot.events.back().unwrap().kind,
+            GroupQueueEventKind::Resumed
+        );
+        assert!(
+            activity
+                .snapshot
+                .events
+                .iter()
+                .map(|event| event.elapsed_ms)
+                .eq(2..QUEUE_EVENT_LIMIT as u64 + 2)
+        );
+    }
+
+    #[test]
+    fn a_queued_skip_settles_without_triggering_failure() {
+        let inbox = Inbox::new(|| {});
+        let group = GroupTranscript::default();
+        let skipped = group.host(1);
+        let failed = group.host(2);
+        let (_recording, mut stream) = group
+            .start_recording(GroupRecordingMode::UntilSettled)
+            .unwrap();
+        group.finish_dispatch();
+        group.set_completion_notice(true, &inbox, 8, 5, "Fleet");
+
+        skipped.skip_queued();
+        assert!(!group.has_unsuccessful_result());
+        assert!(inbox.rows().is_empty());
+
+        failed.delivery_receipt().reject("Prompt changed");
+        drop(failed);
+        assert!(group.has_unsuccessful_result());
+        assert_eq!(
+            inbox.rows()[0].message,
+            "Group run finished · 0 succeeded · 1 needs attention · 1 skipped"
+        );
+        let summary = stream.ended.try_recv().unwrap();
+        assert!(matches!(
+            summary.hosts[0],
+            (1, GroupRecordingOutcome::Skipped)
+        ));
+        assert_eq!(
+            summary.queue_activity.events[0].kind,
+            GroupQueueEventKind::HostSkipped { pane_id: 1 }
+        );
+    }
+
+    #[test]
+    fn a_settled_prompt_without_an_exit_status_is_unsuccessful() {
+        let group = GroupTranscript::default();
+        let appliance = group.host(7);
+        appliance.delivery_receipt().acknowledge();
+        appliance.set_execution(&GroupExecution::PromptReturned);
+        assert!(!group.has_unsuccessful_result());
+        assert_eq!(group.settled_host_succeeded(7), None);
+        drop(appliance);
+        assert_eq!(group.settled_host_succeeded(7), Some(false));
+        assert!(group.has_unsuccessful_result());
+    }
+
+    #[test]
     fn armed_completion_reports_the_final_recipient_outcomes_once() {
         let inbox = Inbox::new(|| {});
         let group = GroupTranscript::default();
@@ -419,9 +631,14 @@ mod tests {
                 truncated: false,
             },
         })));
+        assert_eq!(group.settled_host_succeeded(1), None);
         drop(east);
+        assert_eq!(group.settled_host_succeeded(1), Some(true));
+        assert_eq!(group.settled_host_succeeded(2), None);
         assert!(inbox.rows().is_empty());
+        assert!(!group.has_unsuccessful_result());
         drop(west);
+        assert!(group.has_unsuccessful_result());
         assert_eq!(group.completion_state(), GroupCompletionState::Settled);
         group.set_completion_notice(true, &inbox, 8, 4, "Fleet");
         let rows = inbox.rows();

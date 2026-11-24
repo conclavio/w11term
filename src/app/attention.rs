@@ -1,5 +1,6 @@
-use super::*;
-use w11term::events::NoticeTarget;
+use super::{host_groups::FailedLogin, *};
+use std::{fmt::Write as _, io::Write as _};
+use w11term::events::{NoticeTarget, SshAttemptOutcome, SshLoginResult};
 
 pub(super) const LONG_COMMANDS: &str = "Notify for long commands";
 
@@ -21,11 +22,47 @@ pub enum Action {
     Open,
     WatchCommand(bool),
     LongCommands(clipboard_paste::Origin, bool),
-    Visit { pane: u64, sequence: u64 },
-    VisitGroup { tab: TabId, submission: u64 },
-    ViewCommand { pane: u64, sequence: u64 },
+    Visit {
+        pane: u64,
+        sequence: u64,
+    },
+    VisitGroup(NoticeTarget),
+    ViewCommand {
+        pane: u64,
+        sequence: u64,
+    },
+    ViewLoginResults(NoticeTarget),
+    BackFromLoginResults(NoticeTarget),
+    VisitLoginPane {
+        target: NoticeTarget,
+        pane: u64,
+    },
+    ExportLoginReport(NoticeTarget, LoginReportAction),
+    ReviewLoginReconnect(NoticeTarget),
+    FinishLoginReconnect {
+        target: NoticeTarget,
+        offered: Arc<[FailedLogin]>,
+        reconnect: bool,
+    },
     MarkAllRead,
     Clear,
+}
+
+pub enum LoginReportAction {
+    Copy,
+    Save,
+}
+
+pub(super) enum AttentionPage {
+    Inbox,
+    Logins {
+        target: NoticeTarget,
+        changed: bool,
+    },
+    Reconnect {
+        target: NoticeTarget,
+        offered: Arc<[FailedLogin]>,
+    },
 }
 
 impl TerminalApp {
@@ -59,14 +96,19 @@ impl TerminalApp {
                     .tabs
                     .entries()
                     .iter()
-                    .find(|entry| matches!(entry.value.page, Page::Attention))
+                    .find(|entry| matches!(entry.value.page, Page::Attention(_)))
                     .map(|entry| entry.id);
                 if let Some(id) = existing {
+                    if let Some(Page::Attention(page)) =
+                        self.tabs.get_mut(id).map(|tab| &mut tab.page)
+                    {
+                        *page = AttentionPage::Inbox;
+                    }
                     self.tabs.select(id);
                 } else {
                     self.tabs.insert(AppTab {
                         label: "Attention inbox".into(),
-                        page: Page::Attention,
+                        page: Page::Attention(AttentionPage::Inbox),
                     });
                 }
             }
@@ -83,16 +125,24 @@ impl TerminalApp {
                     self.find(true, None, ctx);
                 }
             }
-            Action::VisitGroup { tab, submission } => {
-                if !self.group_run_retained(tab, submission)
-                    || !self
-                        .inbox
-                        .mark_target_read(NoticeTarget::GroupRun { tab, submission })
+            Action::VisitGroup(target) => match target {
+                NoticeTarget::GroupRun { tab, submission }
+                | NoticeTarget::GroupCanary { tab, submission }
+                    if self.group_run_retained(tab, submission)
+                        && self.inbox.mark_target_read(target) =>
                 {
-                    return;
+                    self.show_group_run(tab, submission);
                 }
-                self.show_group_run(tab, submission);
-            }
+                NoticeTarget::GroupLogins { tab, .. }
+                    if matches!(
+                        self.tabs.get(tab).map(|entry| &entry.page),
+                        Some(Page::HostGroup(_))
+                    ) && self.inbox.mark_target_read(target) =>
+                {
+                    self.tabs.select(tab);
+                }
+                _ => return,
+            },
             Action::ViewCommand { pane, sequence } => {
                 if let Some(link) = self.inbox.command_link(pane, sequence)
                     && self.open_command_history(pane, Some(link), ctx)
@@ -100,6 +150,68 @@ impl TerminalApp {
                     self.inbox.mark_read(pane, sequence);
                 }
                 return;
+            }
+            Action::ViewLoginResults(target) => {
+                if matches!(self.active_attention(), Some(AttentionPage::Inbox))
+                    && self.inbox.group_login_notice(target).is_some()
+                    && self.inbox.mark_target_read(target)
+                {
+                    self.set_attention(AttentionPage::Logins {
+                        target,
+                        changed: false,
+                    });
+                }
+                return;
+            }
+            Action::BackFromLoginResults(target) => {
+                if self.viewing_login_results(target) {
+                    self.set_attention(AttentionPage::Inbox);
+                }
+                return;
+            }
+            Action::VisitLoginPane { target, pane } => {
+                if self.viewing_login_results(target)
+                    && self
+                        .inbox
+                        .group_login_notice(target)
+                        .and_then(|row| row.login_results)
+                        .is_some_and(|results| results.iter().any(|result| result.pane == pane))
+                    && let Some(id) = self.tab_for_pane(pane)
+                {
+                    self.tabs.select(id);
+                } else {
+                    return;
+                }
+            }
+            Action::ExportLoginReport(target, action) => {
+                self.export_login_report(target, action, ctx);
+                return;
+            }
+            Action::ReviewLoginReconnect(target) => {
+                if self.viewing_login_results(target) {
+                    let offered = self.eligible_login_reconnects(target);
+                    if offered.is_empty() {
+                        self.set_attention(AttentionPage::Logins {
+                            target,
+                            changed: true,
+                        });
+                    } else {
+                        self.set_attention(AttentionPage::Reconnect {
+                            target,
+                            offered: offered.into(),
+                        });
+                    }
+                }
+                return;
+            }
+            Action::FinishLoginReconnect {
+                target,
+                offered,
+                reconnect,
+            } => {
+                if !self.finish_login_reconnect(target, &offered, reconnect) {
+                    return;
+                }
             }
             Action::MarkAllRead => {
                 self.inbox.mark_all_read();
@@ -129,7 +241,16 @@ impl TerminalApp {
             .content(text)
     }
 
-    pub(super) fn attention_view(&self, ctx: &ViewContext<Self>) -> View {
+    pub(super) fn attention_view(&self, page: &AttentionPage, ctx: &ViewContext<Self>) -> View {
+        match page {
+            AttentionPage::Inbox => {}
+            AttentionPage::Logins { target, changed } => {
+                return self.login_results_view(*target, *changed, ctx);
+            }
+            AttentionPage::Reconnect { target, offered } => {
+                return self.login_reconnect_view(*target, offered, ctx);
+            }
+        }
         let rows = self.inbox.rows();
         let content = if rows.is_empty() {
             TextBlock::new().text("No bells or notifications").into()
@@ -139,35 +260,76 @@ impl TerminalApp {
                     let status = if row.unread { "Unread" } else { "Read" };
                     let (pane, sequence) = match row.target {
                         NoticeTarget::Pane { pane, sequence } => (pane, sequence),
-                        NoticeTarget::GroupRun { tab, submission } => {
-                            let enabled = self.group_run_retained(tab, submission);
+                        target @ (NoticeTarget::GroupRun { tab, .. }
+                        | NoticeTarget::GroupCanary { tab, .. }
+                        | NoticeTarget::GroupLogins { tab, .. }) => {
+                            let (enabled, detail, key) = match target {
+                                NoticeTarget::GroupRun { submission, .. }
+                                | NoticeTarget::GroupCanary { submission, .. } => {
+                                    let kind = if matches!(target, NoticeTarget::GroupCanary { .. }) {
+                                        "canary"
+                                    } else {
+                                        "run"
+                                    };
+                                    let enabled = self.group_run_retained(tab, submission);
+                                    let expired = if enabled {
+                                        ""
+                                    } else {
+                                        " (results unavailable)"
+                                    };
+                                    (
+                                        enabled,
+                                        format!(" · Run {submission}{expired}"),
+                                        format!("group-{kind}-{tab}/{submission}"),
+                                    )
+                                }
+                                NoticeTarget::GroupLogins { sequence, .. } => {
+                                    let enabled = matches!(
+                                        self.tabs.get(tab).map(|entry| &entry.page),
+                                        Some(Page::HostGroup(_))
+                                    );
+                                    let detail = if enabled { "" } else { " (closed)" };
+                                    (
+                                        enabled,
+                                        detail.into(),
+                                        format!("group-logins-{tab}/{sequence}"),
+                                    )
+                                }
+                                NoticeTarget::Pane { .. } => unreachable!(),
+                            };
                             let source = self
                                 .tabs
                                 .get(tab)
                                 .map_or(row.source.as_ref(), |tab| tab.label.as_str());
-                            let expired = if enabled {
-                                ""
-                            } else {
-                                " (results unavailable)"
-                            };
-                            let label = format!(
-                                "{status} · {source} · Run {submission}{expired} · {}",
-                                row.message
-                            );
-                            return KeyedView::new(
-                                format!("group-{tab}/{submission}"),
-                                Button::new()
+                            let label = format!("{status} · {source}{detail} · {}", row.message);
+                            let visit = Button::new()
                                     .automation_name(label.clone())
                                     .is_enabled(enabled)
                                     .on_click(ctx.callback(move |_| {
-                                        Message::Attention(Action::VisitGroup { tab, submission })
+                                        Message::Attention(Action::VisitGroup(target))
                                     }))
                                     .content(
                                         TextBlock::new()
                                             .text(label)
                                             .text_wrapping(TextWrapping::Wrap),
-                                    ),
-                            );
+                                    );
+                            let content = if let NoticeTarget::GroupLogins { sequence, .. } = target {
+                                Grid::new()
+                                    .columns([GridLength::STAR, GridLength::Auto])
+                                    .column_spacing(8.0)
+                                    .children((
+                                        visit,
+                                        Button::new()
+                                            .grid_column(1)
+                                            .style(ButtonStyle::Subtle)
+                                            .automation_name(format!("View SSH login results for {source}, notice {sequence}"))
+                                            .on_click(ctx.callback(move |_| Message::Attention(Action::ViewLoginResults(target))))
+                                            .content("View login results"),
+                                    ))
+                            } else {
+                                visit
+                            };
+                            return KeyedView::new(key, content);
                         }
                     };
                     let tab = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id));
@@ -239,6 +401,305 @@ impl TerminalApp {
                 Border::new().grid_row(2).content(content),
             ))
     }
+
+    fn viewing_login_results(&self, target: NoticeTarget) -> bool {
+        matches!(self.active_attention(), Some(AttentionPage::Logins { target: open, .. }) if *open == target)
+    }
+
+    fn active_attention(&self) -> Option<&AttentionPage> {
+        match &self.tabs.active()?.page {
+            Page::Attention(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    fn set_attention(&mut self, next: AttentionPage) {
+        if let Some(id) = self.tabs.active_id()
+            && let Some(Page::Attention(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
+        {
+            *page = next;
+        }
+    }
+
+    fn eligible_login_reconnects(&self, target: NoticeTarget) -> Vec<FailedLogin> {
+        let NoticeTarget::GroupLogins { tab, .. } = target else {
+            return Vec::new();
+        };
+        let Some(results) = self
+            .inbox
+            .group_login_notice(target)
+            .and_then(|row| row.login_results)
+        else {
+            return Vec::new();
+        };
+        self.report_failed_logins(tab, &results)
+    }
+
+    fn finish_login_reconnect(
+        &mut self,
+        target: NoticeTarget,
+        offered: &Arc<[FailedLogin]>,
+        reconnect: bool,
+    ) -> bool {
+        if !matches!(self.active_attention(), Some(AttentionPage::Reconnect { target: open, offered: visible })
+            if *open == target && Arc::ptr_eq(offered, visible))
+        {
+            return false;
+        }
+        if !reconnect {
+            self.set_attention(AttentionPage::Logins {
+                target,
+                changed: false,
+            });
+            return false;
+        }
+        let NoticeTarget::GroupLogins { tab, .. } = target else {
+            return false;
+        };
+        let changed = self.eligible_login_reconnects(target) != offered.as_ref();
+        self.set_attention(AttentionPage::Logins { target, changed });
+        if changed {
+            return false;
+        }
+        self.restart_report_failed_logins(tab, offered);
+        true
+    }
+
+    fn export_login_report(
+        &mut self,
+        target: NoticeTarget,
+        action: LoginReportAction,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if !self.viewing_login_results(target) {
+            return;
+        }
+        let NoticeTarget::GroupLogins { sequence, .. } = target else {
+            return;
+        };
+        let Some(notice) = self.inbox.group_login_notice(target) else {
+            return;
+        };
+        let Some(results) = notice.login_results.as_deref() else {
+            return;
+        };
+        let text = login_report_text(&notice.source, &notice.message, results);
+        match action {
+            LoginReportAction::Copy => {
+                self.export.status = Some(match w11term::clipboard::write(&text) {
+                    Ok(()) => "Copied SSH login report".into(),
+                    Err(error) => format!("Could not copy SSH login report. {error}"),
+                });
+            }
+            LoginReportAction::Save => self.begin_text_export(
+                text_export::Subject::SshLoginReport(sequence),
+                move |file| file.write_all(text.as_bytes()),
+                ctx,
+            ),
+        }
+    }
+
+    fn login_results_view(
+        &self,
+        target: NoticeTarget,
+        changed: bool,
+        ctx: &ViewContext<Self>,
+    ) -> View {
+        let notice = self.inbox.group_login_notice(target);
+        let available = notice.is_some();
+        let content = notice
+            .as_ref()
+            .and_then(|notice| notice.login_results.as_deref())
+            .map_or_else(
+                || {
+                    TextBlock::new()
+                        .text("These login results have expired")
+                        .into()
+                },
+                |results| {
+                    ScrollViewer::new().content(StackPanel::new().spacing(8.0).keyed_children(
+                        results.iter().map(|result| {
+                            let pane = result.pane;
+                            let (status, reason) = login_outcome(&result.outcome);
+                            let diagnostic = reason.map_or_else(View::empty, |reason| {
+                                TextBlock::new()
+                                    .text(reason)
+                                    .text_wrapping(TextWrapping::Wrap)
+                                    .into()
+                            });
+                            KeyedView::new(
+                                pane,
+                                Grid::new()
+                                    .columns([GridLength::STAR, GridLength::Auto])
+                                    .column_spacing(8.0)
+                                    .children((
+                                        StackPanel::new().spacing(2.0).children((
+                                            TextBlock::new()
+                                                .text(format!("{} · {status}", result.host))
+                                                .text_wrapping(TextWrapping::Wrap),
+                                            diagnostic,
+                                        )),
+                                        Button::new()
+                                            .grid_column(1)
+                                            .style(ButtonStyle::Subtle)
+                                            .is_enabled(self.tab_for_pane(pane).is_some())
+                                            .automation_name(format!("Open SSH login pane {pane}"))
+                                            .on_click(ctx.callback(move |_| {
+                                                Message::Attention(Action::VisitLoginPane {
+                                                    target,
+                                                    pane,
+                                                })
+                                            }))
+                                            .content("Open pane"),
+                                    )),
+                            )
+                        }),
+                    ))
+                },
+            );
+        Grid::new()
+            .margin(16.0)
+            .row_spacing(12.0)
+            .rows([GridLength::Auto, GridLength::STAR])
+            .children((
+                StackPanel::new().spacing(8.0).children((
+                    TextBlock::new().text("SSH login results").font_size(24.0),
+                    notice.as_ref().map_or_else(View::empty, |notice| {
+                        TextBlock::new().text(notice.source.as_ref()).into()
+                    }),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .is_enabled(available)
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::ExportLoginReport(
+                                        target,
+                                        LoginReportAction::Copy,
+                                    ))
+                                }))
+                                .content("Copy login report"),
+                            Button::new()
+                                .is_enabled(available && self.export.pending.is_none())
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::ExportLoginReport(
+                                        target,
+                                        LoginReportAction::Save,
+                                    ))
+                                }))
+                                .content("Save login report…"),
+                            Button::new()
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::BackFromLoginResults(target))
+                                }))
+                                .content("Back to inbox"),
+                        )),
+                    if self.eligible_login_reconnects(target).is_empty() {
+                        View::empty()
+                    } else {
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::Attention(Action::ReviewLoginReconnect(target))
+                            }))
+                            .content("Review failed logins")
+                    },
+                    if changed {
+                        TextBlock::new()
+                            .text("The failed logins changed. Review the remaining hosts again.")
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into()
+                    } else {
+                        View::empty()
+                    },
+                )),
+                Border::new().grid_row(1).content(content),
+            ))
+    }
+
+    fn login_reconnect_view(
+        &self,
+        target: NoticeTarget,
+        offered: &Arc<[FailedLogin]>,
+        ctx: &ViewContext<Self>,
+    ) -> View {
+        let confirm = offered.clone();
+        let cancel = offered.clone();
+        let count = offered.len();
+        let hosts = if count == 1 { "host" } else { "hosts" };
+        Grid::new()
+            .margin(16.0)
+            .row_spacing(12.0)
+            .rows([GridLength::Auto, GridLength::STAR])
+            .children((
+                StackPanel::new().spacing(8.0).children((
+                    TextBlock::new()
+                        .font_size(24.0)
+                        .text("Review SSH reconnects"),
+                    TextBlock::new().text("Start a fresh SSH login in each listed pane."),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .automation_name("Reconnect reviewed logins")
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::FinishLoginReconnect {
+                                        target,
+                                        offered: confirm.clone(),
+                                        reconnect: true,
+                                    })
+                                }))
+                                .content(format!("Reconnect {count} {hosts}")),
+                            Button::new()
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::FinishLoginReconnect {
+                                        target,
+                                        offered: cancel.clone(),
+                                        reconnect: false,
+                                    })
+                                }))
+                                .content("Cancel reconnect review"),
+                        )),
+                )),
+                ScrollViewer::new().grid_row(1).content(
+                    StackPanel::new()
+                        .spacing(6.0)
+                        .keyed_children(offered.iter().enumerate().map(|(index, result)| {
+                            KeyedView::new(
+                                index,
+                                TextBlock::new()
+                                    .text(&result.host)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )
+                        })),
+                ),
+            ))
+    }
+}
+
+fn login_outcome(outcome: &SshAttemptOutcome) -> (&'static str, Option<&str>) {
+    match outcome {
+        SshAttemptOutcome::Connected => ("Connected", None),
+        SshAttemptOutcome::Failed(reason) => (
+            "Failed",
+            Some(reason.as_ref()).filter(|reason| !reason.is_empty()),
+        ),
+        SshAttemptOutcome::Stopped => ("Stopped", None),
+        SshAttemptOutcome::Closed => ("Closed", None),
+    }
+}
+
+fn login_report_text(source: &str, summary: &str, results: &[SshLoginResult]) -> String {
+    let mut text = format!("SSH login results\n{source}\n{summary}\n\n");
+    for result in results {
+        let (status, reason) = login_outcome(&result.outcome);
+        writeln!(text, "{} · {status}", result.host).expect("String writes cannot fail");
+        if let Some(reason) = reason {
+            writeln!(text, "  {reason}").expect("String writes cannot fail");
+        }
+    }
+    text
 }
 
 pub(super) fn flash_background_window(hwnd: windows::Win32::Foundation::HWND) {

@@ -36,7 +36,7 @@ impl State {
     pub(super) fn start(
         path: PathBuf,
         transcript: &GroupTranscript,
-        label: Arc<str>,
+        header: String,
         names: BTreeMap<u64, String>,
         mode: GroupRecordingMode,
         open: impl FnOnce(&Path) -> anyhow::Result<File> + Send + 'static,
@@ -51,7 +51,7 @@ impl State {
             .name("w11term group output recorder".into())
             .spawn(move || {
                 let result = open(&destination).and_then(|file| {
-                    write_file(file, &destination, &label, &names, stream, || {
+                    write_file(file, &destination, &header, &names, stream, || {
                         status.send_replace(WriterStatus::Recording);
                     })
                 });
@@ -129,13 +129,13 @@ impl PreparedFile {
     pub(super) fn start(
         mut self,
         transcript: &GroupTranscript,
-        label: Arc<str>,
+        header: String,
         names: BTreeMap<u64, String>,
     ) -> Result<State, String> {
         State::start(
             self.path,
             transcript,
-            label,
+            header,
             names,
             GroupRecordingMode::UntilSettled,
             move |_| {
@@ -174,10 +174,12 @@ fn ready(submission: &Submission) -> bool {
         .results
         .iter()
         .any(|delivery| matches!(delivery.status, DeliveryStatus::Sent))
-        && submission
-            .results
-            .iter()
-            .all(|delivery| !matches!(delivery.status, DeliveryStatus::Pending(..)))
+        && submission.results.iter().all(|delivery| {
+            !matches!(
+                delivery.status,
+                DeliveryStatus::Queued(_) | DeliveryStatus::Pending(..)
+            )
+        })
 }
 
 pub(super) fn names<'a>(targets: impl Iterator<Item = &'a Target>) -> BTreeMap<u64, String> {
@@ -225,6 +227,7 @@ fn write_outcomes(
     names: &BTreeMap<u64, String>,
     summary: GroupRecordingSummary,
 ) -> io::Result<()> {
+    file.write_all(queue_activity::text(&summary.queue_activity).as_bytes())?;
     if !summary.hosts.is_empty() {
         writeln!(file, "[Host outcomes]\r")?;
     }
@@ -236,6 +239,7 @@ fn write_outcomes(
             GroupRecordingOutcome::AwaitingDelivery => "Awaiting delivery".into(),
             GroupRecordingOutcome::DeliveryUnconfirmed => "Delivery unconfirmed".into(),
             GroupRecordingOutcome::Rejected(reason) => format!("Not sent · {reason}"),
+            GroupRecordingOutcome::Skipped => "Skipped before sending".into(),
             GroupRecordingOutcome::Sent(None) => "Sent to SSH channel · result unavailable".into(),
             GroupRecordingOutcome::Sent(Some(execution)) => {
                 format!("Sent to SSH channel · {}", execution_caption(&execution))
@@ -252,12 +256,12 @@ fn write_outcomes(
 
 fn write_output(
     file: &mut impl Write,
-    label: &str,
+    header: &str,
     names: &BTreeMap<u64, String>,
     mut stream: GroupTranscriptStream,
     opened: impl FnOnce(),
 ) -> io::Result<()> {
-    writeln!(file, "Submitted · {label}\r")?;
+    file.write_all(header.as_bytes())?;
     if stream.history.omitted > 0 {
         writeln!(
             file,
@@ -291,6 +295,7 @@ fn write_output(
     let summary = stream.ended.try_recv().unwrap_or(GroupRecordingSummary {
         end: GroupRecordingEnd::Stopped,
         hosts: Vec::new(),
+        queue_activity: Default::default(),
     });
     write_outcomes(file, names, summary)?;
     file.flush()
@@ -307,13 +312,13 @@ fn create_file(path: &Path) -> anyhow::Result<File> {
 fn write_file(
     file: File,
     path: &Path,
-    label: &str,
+    header: &str,
     names: &BTreeMap<u64, String>,
     stream: GroupTranscriptStream,
     opened: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let mut file = BufWriter::new(file);
-    write_output(&mut file, label, names, stream, opened)
+    write_output(&mut file, header, names, stream, opened)
         .with_context(|| format!("Writing {}. The file may be incomplete", path.display()))?;
     file.get_ref()
         .sync_all()
@@ -419,7 +424,10 @@ impl TerminalApp {
         submission.recording = State::start(
             path,
             &submission.transcript,
-            submission.content.label().into(),
+            dispatch_policy::report_heading(
+                submission.content.label(),
+                submission.dispatch_policy.as_ref(),
+            ),
             names(targets),
             GroupRecordingMode::Manual,
             create_file,
@@ -455,6 +463,7 @@ mod tests {
         finish
             .send(GroupRecordingSummary {
                 end: GroupRecordingEnd::Stopped,
+                queue_activity: Default::default(),
                 hosts: vec![
                     (1, GroupRecordingOutcome::DeliveryUnconfirmed),
                     (
@@ -482,7 +491,7 @@ mod tests {
         write_file(
             create_file(&path).unwrap(),
             &path,
-            "show",
+            &dispatch_policy::report_heading("show", None),
             &names,
             stream,
             || {},

@@ -7,7 +7,10 @@ fn retryable(delivery: &Delivery) -> bool {
             delivery.execution(),
             Some(GroupExecution::Finished(result)) if result.exit_code.is_some_and(|code| code != 0)
         ),
-        DeliveryStatus::Pending(..) | DeliveryStatus::Unconfirmed => false,
+        DeliveryStatus::Queued(_)
+        | DeliveryStatus::Pending(..)
+        | DeliveryStatus::Unconfirmed
+        | DeliveryStatus::Skipped => false,
     }
 }
 
@@ -17,15 +20,15 @@ impl HostGroup {
         submission: &Submission,
         visible: impl Iterator<Item = u64>,
     ) -> BTreeSet<u64> {
-        if submission.content.command().is_none()
-            || !self.result_filter.includes(progress::Outcome::Attention)
-        {
+        if submission.content.command().is_none() {
             return BTreeSet::new();
         }
         let candidates: BTreeSet<_> = submission
             .results
             .iter()
-            .filter(|delivery| retryable(delivery))
+            .filter(|delivery| {
+                retryable(delivery) && self.matches_result(delivery, progress::Outcome::Attention)
+            })
             .map(|delivery| delivery.target.pane)
             .collect();
         visible.filter(|pane| candidates.contains(pane)).collect()
@@ -202,6 +205,16 @@ mod tests {
         assert!(!group.prepare_retry(1, &targets, offered.clone()));
         group.result_filter = progress::Filter::Only(progress::Outcome::Attention);
         assert!(!group.prepare_retry(1, &targets, BTreeSet::from([1, 6])));
+        group.recipient_search.set_query("WITHHELD WEST".into());
+        assert!(!group.prepare_retry(1, &targets, offered.clone()));
+        assert_eq!(
+            group.retry_candidates(
+                group.viewed_submission(1).unwrap(),
+                [1, 2, 3, 4, 5, 6].into_iter()
+            ),
+            BTreeSet::from([2])
+        );
+        group.recipient_search.clear();
         assert!(group.prepare_retry(1, &targets, offered.clone()));
         assert_eq!(group.selected, offered);
         assert_eq!(group.draft, "show  status");

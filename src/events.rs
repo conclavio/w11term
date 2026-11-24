@@ -12,15 +12,19 @@ use tokio::sync::Notify;
 mod group_command;
 mod group_transcript;
 mod inbox;
+mod ssh_attempt;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
-    GroupCompletionState, GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome,
-    GroupRecordingSummary, GroupTranscript, GroupTranscriptHost, GroupTranscriptLine,
-    GroupTranscriptRecording, GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
+    GroupCompletionState, GroupQueueActivity, GroupQueueEvent, GroupQueueEventKind,
+    GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
+    GroupTranscript, GroupTranscriptHost, GroupTranscriptLine, GroupTranscriptRecording,
+    GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;
-pub use inbox::{Inbox, NoticeTarget};
+pub use inbox::{Inbox, NoticeTarget, SshLoginResult};
+pub(crate) use ssh_attempt::AttemptGuard;
+pub use ssh_attempt::{PendingSshAttempt, SshAttemptCompletion, SshAttemptOutcome};
 
 const CAPACITY: usize = 4096;
 const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);
@@ -39,6 +43,34 @@ pub struct CommandLink {
     pub generation: u64,
     pub id: u64,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshConnectionPhase {
+    Queued,
+    Connecting,
+    Reconnecting { attempt: Option<u32> },
+    Connected,
+    Disconnected,
+    Stopped,
+    Failed(Arc<str>),
+}
+
+impl SshConnectionPhase {
+    pub(crate) fn as_json(&self) -> Value {
+        use serde_json::json;
+
+        match self {
+            Self::Queued => json!({"phase": "queued"}),
+            Self::Connecting => json!({"phase": "connecting"}),
+            Self::Reconnecting { attempt } => json!({"phase": "reconnecting", "attempt": attempt}),
+            Self::Connected => json!({"phase": "connected"}),
+            Self::Disconnected => json!({"phase": "disconnected"}),
+            Self::Stopped => json!({"phase": "stopped"}),
+            Self::Failed(reason) => json!({"phase": "failed", "reason": reason.as_ref()}),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Batch {
     pub events: Vec<Event>,
@@ -61,6 +93,8 @@ struct State {
     group_serial: u64,
     next_prompt: u64,
     notify_long_commands: bool,
+    ssh_connection_phase: Option<SshConnectionPhase>,
+    ssh_attempts: ssh_attempt::Attempts,
     restart_token: Option<u64>,
     restart_closed: bool,
 }
@@ -253,10 +287,47 @@ impl Events {
         self.state.lock().unwrap().restart_token
     }
 
+    pub fn ssh_connection_phase(&self) -> Option<SshConnectionPhase> {
+        self.state.lock().unwrap().ssh_connection_phase.clone()
+    }
+
+    pub(crate) fn exit_snapshot(&self) -> (Option<u64>, Option<SshConnectionPhase>) {
+        let state = self.state.lock().unwrap();
+        (state.restart_token, state.ssh_connection_phase.clone())
+    }
+
+    pub(crate) fn set_ssh_connection_phase(&self, phase: SshConnectionPhase) {
+        let mut state = self.state.lock().unwrap();
+        let changed = Self::record_ssh_phase(&mut state, phase);
+        drop(state);
+        if changed {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn record_ssh_phase(state: &mut State, phase: SshConnectionPhase) -> bool {
+        if state.ssh_connection_phase.as_ref() == Some(&phase) {
+            return false;
+        }
+        let data = phase.as_json();
+        state.ssh_connection_phase = Some(phase);
+        Self::append_locked(state, "ssh-connection", data, None);
+        true
+    }
+
     pub(crate) fn restart_exited(
         &self,
         input: &tokio::sync::mpsc::UnboundedSender<crate::session::Command>,
         token: u64,
+    ) -> anyhow::Result<()> {
+        self.queue_restart(input, token, None)
+    }
+
+    pub(crate) fn queue_restart(
+        &self,
+        input: &tokio::sync::mpsc::UnboundedSender<crate::session::Command>,
+        token: u64,
+        login_permits: Option<Arc<tokio::sync::Semaphore>>,
     ) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         anyhow::ensure!(
@@ -264,22 +335,39 @@ impl Events {
             "Pane is running, unavailable, or the exit token has expired"
         );
         state.restart_token = None;
+        let phase = if login_permits.is_some() {
+            SshConnectionPhase::Queued
+        } else {
+            SshConnectionPhase::Reconnecting { attempt: None }
+        };
+        let sent = input.send(crate::session::Command::RestartExited(
+            crate::session::ClaimedRestart {
+                token,
+                login_permits,
+            },
+        ));
+        let changed = sent.is_ok()
+            && state.ssh_connection_phase.is_some()
+            && Self::record_ssh_phase(&mut state, phase);
         if let Some((_, _, inbox)) = &state.inbox {
             inbox.refresh();
         }
-        input
-            .send(crate::session::Command::RestartExited(
-                crate::session::ClaimedRestart(token),
-            ))
-            .map_err(|_| anyhow::anyhow!("The terminal pane has closed"))
+        drop(state);
+        if changed {
+            self.changed.notify_waiters();
+        }
+        sent.map_err(|_| anyhow::anyhow!("The terminal pane has closed"))
     }
 
-    pub(crate) fn pane_exited(&self, token: u64) {
+    pub(crate) fn pane_exited(&self, token: u64, ssh_phase: Option<SshConnectionPhase>) {
         let mut state = self.state.lock().unwrap();
         if state.restart_closed {
             return;
         }
         state.restart_token = Some(token);
+        if let Some(phase) = ssh_phase {
+            Self::record_ssh_phase(&mut state, phase);
+        }
         if let Some((_, _, inbox)) = &state.inbox {
             inbox.refresh();
         }
@@ -292,13 +380,31 @@ impl Events {
     }
 
     pub(crate) fn close_restart(&self) {
+        self.disable_restart(None);
+    }
+
+    pub(crate) fn close_if_exited(&self, token: u64) -> bool {
+        self.disable_restart(Some(token))
+    }
+
+    fn disable_restart(&self, expected_exit: Option<u64>) -> bool {
         let mut state = self.state.lock().unwrap();
+        if expected_exit.is_some() && state.restart_token != expected_exit {
+            return false;
+        }
         state.restart_closed = true;
+        let changed = state.ssh_connection_phase.is_some()
+            && Self::record_ssh_phase(&mut state, SshConnectionPhase::Disconnected);
         if state.restart_token.take().is_some()
             && let Some((_, _, inbox)) = &state.inbox
         {
             inbox.refresh();
         }
+        drop(state);
+        if changed {
+            self.changed.notify_waiters();
+        }
+        true
     }
 
     /// None while disconnected or on streams that may repaint historical bytes.
@@ -720,6 +826,12 @@ impl Events {
         data: Value,
         command: Option<CommandLink>,
     ) {
+        Self::append_locked(&mut state, kind, data, command);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn append_locked(state: &mut State, kind: &str, data: Value, command: Option<CommandLink>) {
         state.next += 1;
         let sequence = state.next;
         let timestamp_ms = SystemTime::now()
@@ -740,8 +852,6 @@ impl Events {
         if state.events.len() > CAPACITY {
             state.events.pop_front();
         }
-        drop(state);
-        self.changed.notify_waiters();
     }
     pub fn since(&self, cursor: u64) -> Batch {
         let state = self.state.lock().unwrap();
@@ -777,6 +887,72 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_an_exited_pane_and_restarting_it_claim_the_same_exit() {
+        use SshConnectionPhase::*;
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let events = Events::default();
+        events.pane_exited(4, Some(Stopped));
+
+        assert!(!events.close_if_exited(3));
+        assert!(events.restart_exited(&commands, 4).is_ok());
+        assert!(!events.close_if_exited(4));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(crate::session::Command::RestartExited(_))
+        ));
+
+        events.pane_exited(5, Some(Stopped));
+        assert!(events.close_if_exited(5));
+        assert!(events.restart_exited(&commands, 5).is_err());
+        assert!(received.try_recv().is_err());
+        events.pane_exited(6, Some(Stopped));
+        assert_eq!(events.exit_snapshot(), (None, Some(Disconnected)));
+    }
+
+    #[test]
+    fn ssh_lifecycle_records_each_change_and_keeps_the_exit_token_with_the_phase() {
+        use SshConnectionPhase::*;
+        use serde_json::json;
+        let events = Events::default();
+        assert_eq!(events.exit_snapshot(), (None, None));
+        events.set_ssh_connection_phase(Connecting);
+        events.set_ssh_connection_phase(Connecting);
+        events.set_ssh_connection_phase(Reconnecting { attempt: Some(2) });
+        events.pane_exited(7, Some(Stopped));
+        assert_eq!(events.exit_snapshot(), (Some(7), Some(Stopped)));
+
+        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
+        events.restart_exited(&commands, 7).unwrap();
+        assert_eq!(
+            events.exit_snapshot(),
+            (None, Some(Reconnecting { attempt: None }))
+        );
+        events.set_ssh_connection_phase(Connected);
+        events.set_ssh_connection_phase(Disconnected);
+        events.pane_exited(8, Some(Failed("fixture failure".into())));
+        let changes: Vec<_> = events
+            .since(0)
+            .events
+            .into_iter()
+            .filter(|event| event.kind == "ssh-connection")
+            .map(|event| event.data)
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                json!({"phase":"connecting"}),
+                json!({"phase":"reconnecting","attempt":2}),
+                json!({"phase":"stopped"}),
+                json!({"phase":"reconnecting","attempt":null}),
+                json!({"phase":"connected"}),
+                json!({"phase":"disconnected"}),
+                json!({"phase":"failed","reason":"fixture failure"}),
+            ],
+        );
+    }
+
     #[test]
     fn current_recording_survives_journal_eviction_and_wakes_only_its_own_window() {
         use std::sync::atomic::{AtomicUsize, Ordering};

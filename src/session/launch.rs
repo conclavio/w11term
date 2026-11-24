@@ -50,6 +50,7 @@ impl Launcher {
         size: TerminalSize,
         input: mpsc::UnboundedReceiver<TransportInput>,
         output: mpsc::Sender<ssh::Event>,
+        reconnect_gate: Option<ssh::LoginGate>,
     ) -> String {
         match &self.source {
             Source::Local(shell) => {
@@ -80,7 +81,10 @@ impl Launcher {
                     options.user, options.host, options.port
                 );
                 let options = options.clone();
-                let sharing = self.sharing.for_launch();
+                let mut sharing = self.sharing.for_launch();
+                if reconnect_gate.is_some() {
+                    sharing.launch_gate = reconnect_gate;
+                }
                 let prompts = self.prompts.clone();
                 let events = self.events.clone();
                 tasks.spawn_on(
@@ -95,11 +99,14 @@ impl Launcher {
                             sharing,
                         )
                         .await;
-                        let message = match result {
-                            Ok(()) => "Disconnected".into(),
-                            Err(error) => format!("SSH: {error:#}"),
+                        let event = match result {
+                            Ok(()) => ssh::Event::Status("Disconnected".into()),
+                            Err(error) if error.is::<ssh::AttemptStopped>() => {
+                                ssh::Event::ConnectionStopped
+                            }
+                            Err(error) => ssh::Event::ConnectionFailed(format!("{error:#}")),
                         };
-                        let _ = output.send(ssh::Event::Status(message)).await;
+                        let _ = output.send(event).await;
                     },
                     ssh::NETWORK.handle(),
                 );

@@ -1,5 +1,5 @@
 //! Profile persistence preserves unrelated JSON fields and replaces the file atomically.
-use crate::options::{Profiles, SshOptions, SshRecipientSets, load_profiles};
+use crate::options::{Profiles, SshOptions, SshRecipientSets, SshRosterDefaults, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
@@ -7,6 +7,8 @@ mod bookmarks;
 pub use bookmarks::{BookmarkPeer, bookmark_directory};
 mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
+mod group_file;
+pub use group_file::{decode_group_file, encode_group_file, read_group_file, remap_group_profiles};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileSnapshot {
@@ -36,6 +38,36 @@ const SHARE_EPOCH: &str = "folder_share_epoch";
 const STARTUP_PROFILE: &str = "startup_profile";
 const SSH_HOST_GROUPS: &str = "ssh_host_groups";
 const SSH_RECIPIENT_SETS: &str = "ssh_recipient_sets";
+const SSH_HOST_GROUP_DEFAULTS: &str = "ssh_host_group_defaults";
+
+enum RosterDefaultsEdit {
+    Set(String, SshRosterDefaults),
+    Move(String, Option<String>),
+    Copy(String, String),
+    Replace(String, SshRosterDefaults),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedSshGroup {
+    pub name: String,
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_sets: Option<SshRecipientSets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_defaults: Option<SshRosterDefaults>,
+}
+
+impl SavedSshGroup {
+    pub fn capture(catalog: &Profiles, name: &str) -> Option<Self> {
+        Some(Self {
+            name: name.into(),
+            members: catalog.ssh_host_groups.get(name)?.clone(),
+            recipient_sets: catalog.ssh_recipient_sets.get(name).cloned(),
+            roster_defaults: catalog.ssh_host_group_defaults.get(name).copied(),
+        })
+    }
+}
 
 #[derive(Default)]
 struct CatalogEdit {
@@ -43,6 +75,7 @@ struct CatalogEdit {
     startup: Option<Option<String>>, // None leaves the setting untouched.
     ssh_host_groups: Option<BTreeMap<String, Vec<String>>>,
     ssh_recipient_sets: Option<BTreeMap<String, SshRecipientSets>>,
+    roster_defaults: Option<RosterDefaultsEdit>,
 }
 
 #[derive(Clone)]
@@ -245,11 +278,59 @@ impl ProfileStore {
             let ssh_recipient_sets = original
                 .filter(|(old, _)| *old != name)
                 .and_then(|(old, _)| recipient_sets_after_group_edit(catalog, old, Some(name)));
+            let roster_defaults = original
+                .filter(|(old, _)| *old != name)
+                .map(|(old, _)| RosterDefaultsEdit::Move(old.into(), Some(name.into())));
             Ok(CatalogEdit {
                 ssh_host_groups: Some(groups),
                 ssh_recipient_sets,
+                roster_defaults,
                 ..Default::default()
             })
+        })
+    }
+
+    /// Duplicate the reviewed saved definition in one catalog replacement.
+    pub fn duplicate_ssh_host_group(&self, name: &str, source: &SavedSshGroup) -> Result<Profiles> {
+        validate_group_name(name)?;
+        self.modify(|_, catalog| {
+            ensure!(
+                SavedSshGroup::capture(catalog, &source.name).as_ref() == Some(source),
+                "The source SSH group changed on disk. Reopen the copy before saving."
+            );
+            catalog.resolve_ssh_host_group_members(&source.members)?;
+            add_ssh_group(
+                catalog,
+                name,
+                source,
+                RosterDefaultsEdit::Copy(source.name.clone(), name.into()),
+            )
+        })
+    }
+
+    pub fn import_ssh_group_definition(
+        &self,
+        name: &str,
+        group: &SavedSshGroup,
+        reviewed: &[SshOptions],
+    ) -> Result<Profiles> {
+        validate_group_name(name)?;
+        group_file::validate(group)?;
+        self.modify(|_, catalog| {
+            let resolved = catalog.resolve_ssh_host_group_members(&group.members)?;
+            ensure!(
+                resolved.into_iter().eq(reviewed),
+                "The SSH profiles changed on disk. Review the group definition again."
+            );
+            add_ssh_group(
+                catalog,
+                name,
+                group,
+                match group.roster_defaults {
+                    Some(defaults) => RosterDefaultsEdit::Replace(name.into(), defaults),
+                    None => RosterDefaultsEdit::Move(name.into(), None),
+                },
+            )
         })
     }
 
@@ -336,6 +417,35 @@ impl ProfileStore {
             Ok(CatalogEdit {
                 ssh_host_groups: Some(groups),
                 ssh_recipient_sets: recipient_sets_after_group_edit(catalog, name, None),
+                roster_defaults: Some(RosterDefaultsEdit::Move(name.into(), None)),
+                ..Default::default()
+            })
+        })
+    }
+
+    pub fn save_ssh_roster_defaults(
+        &self,
+        name: &str,
+        expected_members: &[String],
+        expected: SshRosterDefaults,
+        defaults: SshRosterDefaults,
+    ) -> Result<Profiles> {
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.ssh_host_groups.get(name).map(Vec::as_slice) == Some(expected_members),
+                "The SSH group changed on disk. Reopen it before saving roster defaults."
+            );
+            ensure!(
+                catalog
+                    .ssh_host_group_defaults
+                    .get(name)
+                    .copied()
+                    .unwrap_or_default()
+                    == expected,
+                "Roster defaults changed on disk. Reopen the SSH group before saving."
+            );
+            Ok(CatalogEdit {
+                roster_defaults: Some(RosterDefaultsEdit::Set(name.into(), defaults)),
                 ..Default::default()
             })
         })
@@ -351,6 +461,37 @@ impl ProfileStore {
     ) -> Result<Profiles> {
         self.edit_ssh_recipient_set(group, expected_group, name, expected, replacement, |_| {
             Ok(())
+        })
+    }
+
+    pub fn rename_ssh_recipient_set(
+        &self,
+        group: &str,
+        expected_group: &[String],
+        name: &str,
+        expected: &[String],
+        new_name: &str,
+    ) -> Result<Profiles> {
+        validate_recipient_set_name(new_name)?;
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.ssh_host_groups.get(group).map(Vec::as_slice) == Some(expected_group),
+                "The SSH group changed on disk. Reopen the group before editing recipient sets."
+            );
+            let mut groups = catalog.ssh_recipient_sets.clone();
+            let sets = groups.entry(group.to_owned()).or_default();
+            let available = !sets.contains_key(new_name);
+            let members = sets
+                .remove(name)
+                .filter(|members| available && members.as_slice() == expected)
+                .context(
+                    "This name is already in use or the recipient set changed. Reopen recipient sets.",
+                )?;
+            sets.insert(new_name.to_owned(), members);
+            Ok(CatalogEdit {
+                ssh_recipient_sets: Some(groups),
+                ..Default::default()
+            })
         })
     }
 
@@ -376,13 +517,7 @@ impl ProfileStore {
         replacement: Option<&[String]>,
         verify: impl FnOnce(&Profiles) -> Result<()>,
     ) -> Result<Profiles> {
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 128
-                && name == name.trim()
-                && !name.chars().any(char::is_control),
-            "Enter a recipient set name on one line and within 128 bytes"
-        );
+        validate_recipient_set_name(name)?;
         self.modify(|_, catalog| {
             ensure!(
                 catalog.ssh_host_groups.get(group).map(Vec::as_slice) == Some(expected_group),
@@ -903,6 +1038,9 @@ impl ProfileStore {
                 fields.insert(SSH_RECIPIENT_SETS.into(), serde_json::to_value(groups)?);
             }
         }
+        if let Some(edit) = edit.roster_defaults {
+            patch_roster_defaults(fields, edit)?;
+        }
         // Return the catalog from the exact document being committed.
         let result = crate::options::parse_profiles(&serde_json::to_vec(&document)?, &self.path)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -921,6 +1059,110 @@ impl ProfileStore {
         file.persist(&self.path).context("Saving profiles")?;
         Ok(result)
     }
+}
+
+fn add_ssh_group(
+    catalog: &Profiles,
+    name: &str,
+    group: &SavedSshGroup,
+    roster_defaults: RosterDefaultsEdit,
+) -> Result<CatalogEdit> {
+    ensure!(
+        !catalog.ssh_host_groups.contains_key(name),
+        "An SSH group named {name} already exists"
+    );
+    let mut groups = catalog.ssh_host_groups.clone();
+    groups.insert(name.into(), group.members.clone());
+    let mut sets = catalog.ssh_recipient_sets.clone();
+    if let Some(recipient_sets) = &group.recipient_sets {
+        sets.insert(name.into(), recipient_sets.clone());
+    } else {
+        sets.remove(name);
+    }
+    Ok(CatalogEdit {
+        ssh_host_groups: Some(groups),
+        ssh_recipient_sets: Some(sets),
+        roster_defaults: Some(roster_defaults),
+        ..Default::default()
+    })
+}
+
+fn patch_roster_defaults(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    edit: RosterDefaultsEdit,
+) -> Result<()> {
+    match edit {
+        RosterDefaultsEdit::Set(name, defaults) => {
+            let groups = fields
+                .entry(SSH_HOST_GROUP_DEFAULTS)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("SSH group defaults must be an object")?;
+            let entry = groups
+                .entry(name)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("Roster defaults must be an object")?;
+            let changes = serde_json::to_value(defaults)?;
+            let changes = changes
+                .as_object()
+                .context("Roster defaults must be an object")?;
+            entry.extend(changes.clone());
+        }
+        RosterDefaultsEdit::Move(from, to) => {
+            if let Some(groups) = fields
+                .get_mut(SSH_HOST_GROUP_DEFAULTS)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                let original = groups.remove(&from);
+                if let Some(to) = to {
+                    if let Some(original) = original {
+                        groups.insert(to, original);
+                    } else {
+                        groups.remove(&to);
+                    }
+                }
+                if groups.is_empty() {
+                    fields.remove(SSH_HOST_GROUP_DEFAULTS);
+                }
+            }
+        }
+        RosterDefaultsEdit::Copy(from, to) => {
+            if let Some(groups) = fields
+                .get_mut(SSH_HOST_GROUP_DEFAULTS)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if let Some(original) = groups.get(&from).cloned() {
+                    groups.insert(to, original);
+                } else {
+                    groups.remove(&to);
+                }
+                if groups.is_empty() {
+                    fields.remove(SSH_HOST_GROUP_DEFAULTS);
+                }
+            }
+        }
+        RosterDefaultsEdit::Replace(name, defaults) => {
+            let groups = fields
+                .entry(SSH_HOST_GROUP_DEFAULTS)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("SSH group defaults must be an object")?;
+            groups.insert(name, serde_json::to_value(defaults)?);
+        }
+    }
+    Ok(())
+}
+
+fn validate_recipient_set_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 128
+            && name == name.trim()
+            && !name.chars().any(char::is_control),
+        "Enter a recipient set name on one line and within 128 bytes"
+    );
+    Ok(())
 }
 
 fn recipient_sets_after_group_edit(
@@ -1216,6 +1458,173 @@ mod tests {
         );
         store.delete_ssh_host_group("Renamed", &updated).unwrap();
         assert!(other.catalog().unwrap().ssh_recipient_sets.is_empty());
+    }
+
+    #[test]
+    fn rename_recipient_set_preserves_order_and_rejects_stale_membership_or_a_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{
+            "East":{"host":"east.test","user":"ops","auth":"none"},
+            "West":{"host":"west.test","user":"ops","auth":"none"}
+        },"ssh_host_groups":{"Fleet":["East","West"]},
+          "ssh_recipient_sets":{"Fleet":{"Canary":["West","East"],"Reserved":["East"]}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path).unwrap();
+        let group = ["East".into(), "West".into()];
+        let members = ["West".into(), "East".into()];
+        for (expected_group, expected, new_name) in [
+            (group.as_slice(), group.as_slice(), "Pilots"),
+            (members.as_slice(), members.as_slice(), "Pilots"),
+            (group.as_slice(), members.as_slice(), "Reserved"),
+        ] {
+            assert!(
+                store
+                    .rename_ssh_recipient_set("Fleet", expected_group, "Canary", expected, new_name)
+                    .is_err()
+            );
+        }
+        let catalog = store
+            .rename_ssh_recipient_set("Fleet", &group, "Canary", &members, "Pilots")
+            .unwrap();
+        let sets = &catalog.ssh_recipient_sets["Fleet"];
+        assert!(!sets.contains_key("Canary"));
+        assert_eq!(sets["Pilots"], members);
+        assert_eq!(sets["Reserved"], ["East"]);
+        assert_eq!(catalog.ssh_host_groups["Fleet"], group);
+    }
+
+    #[test]
+    fn roster_defaults_follow_group_rename_and_reject_stale_writes() {
+        use crate::options::{
+            SshGroupCommandInterval, SshGroupParallelLimit, SshGroupQueueExpiry, SshRosterOrder,
+        };
+        use serde_json::Value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{
+                "East":{"host":"east.test","user":"ops","auth":"none"},
+                "West":{"host":"west.test","user":"ops","auth":"none"}
+            },"ssh_host_groups":{"Fleet":["East"],"Other":["West"]},
+            "ssh_host_group_defaults":{"Fleet":{"layout_hint":7},"Other":{"show_last_output":true}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let other = ProfileStore::new(path.clone()).unwrap();
+        let members = ["East".to_owned()];
+        let expected = store.catalog().unwrap().ssh_host_group_defaults["Fleet"];
+        assert_eq!(expected, SshRosterDefaults::default());
+        let defaults = SshRosterDefaults {
+            order: SshRosterOrder::CheckedFirst,
+            show_last_output: true,
+            show_terminal_line: true,
+            require_all_ready: true,
+            login_limit: SshGroupParallelLimit::Four,
+            command_limit: SshGroupParallelLimit::Two,
+            command_interval: SshGroupCommandInterval::HalfSecond,
+            command_queue_expiry: SshGroupQueueExpiry::ThirtySeconds,
+            stop_command_queue_on_failure: true,
+        };
+        assert!(
+            store
+                .save_ssh_roster_defaults("Fleet", &["West".to_owned()], expected, defaults)
+                .is_err()
+        );
+        store
+            .save_ssh_roster_defaults("Fleet", &members, expected, defaults)
+            .unwrap();
+        assert!(
+            other
+                .save_ssh_roster_defaults("Fleet", &members, expected, expected)
+                .is_err()
+        );
+        let renamed = other
+            .save_ssh_host_group("Renamed", &members, Some(("Fleet", &members)))
+            .unwrap();
+        assert_eq!(renamed.ssh_host_group_defaults["Renamed"], defaults);
+        assert!(!renamed.ssh_host_group_defaults.contains_key("Fleet"));
+        let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["ssh_host_group_defaults"]["Renamed"]["layout_hint"], 7);
+        assert_eq!(
+            raw["ssh_host_group_defaults"]["Renamed"]["command_interval"],
+            "500ms"
+        );
+        assert_eq!(
+            raw["ssh_host_group_defaults"]["Renamed"]["command_queue_expiry"],
+            "30s"
+        );
+        let remaining = other.delete_ssh_host_group("Renamed", &members).unwrap();
+        assert_eq!(remaining.ssh_host_group_defaults.len(), 1);
+        assert!(remaining.ssh_host_group_defaults["Other"].show_last_output);
+    }
+
+    #[test]
+    fn duplicating_a_saved_group_copies_its_order_sets_and_defaults_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{
+                "East":{"host":"east.test","user":"ops","auth":"none"},
+                "West":{"host":"west.test","user":"ops","auth":"none"}
+            },
+            "ssh_host_groups":{"Fleet":["West","East"]},
+            "ssh_recipient_sets":{"Fleet":{"Canary":["East"]}},
+            "ssh_host_group_defaults":{"Fleet":{"show_terminal_line":true,"extra":7}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let catalog = store.catalog().unwrap();
+        let source = SavedSshGroup::capture(&catalog, "Fleet").unwrap();
+
+        let copied = store
+            .duplicate_ssh_host_group("Fleet copy", &source)
+            .unwrap();
+        assert_eq!(
+            SavedSshGroup::capture(&copied, "Fleet copy"),
+            Some(SavedSshGroup {
+                name: "Fleet copy".into(),
+                ..source.clone()
+            })
+        );
+        assert_eq!(
+            SavedSshGroup::capture(&copied, "Fleet"),
+            Some(source.clone())
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["ssh_host_group_defaults"]["Fleet copy"]["extra"], 7);
+
+        let original_set = ["East".into()];
+        let replacement_set = ["West".into()];
+        store
+            .change_ssh_recipient_set(
+                "Fleet",
+                &source.members,
+                "Canary",
+                Some(&original_set),
+                Some(&replacement_set),
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(store.duplicate_ssh_host_group("Stale", &source).is_err());
+        let fresh = SavedSshGroup::capture(&store.catalog().unwrap(), "Fleet").unwrap();
+        assert!(
+            store
+                .duplicate_ssh_host_group("Fleet copy", &fresh)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            store.catalog().unwrap().ssh_recipient_sets["Fleet copy"]["Canary"],
+            original_set
+        );
     }
 }
 

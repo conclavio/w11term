@@ -91,9 +91,65 @@ Turn on **Use wildcards** for a list such as `web-[01][0-9], db-??, !*-canary`. 
 
 The command editor shows how many selected, visible hosts are ready. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
 
+Turn on **Require all recipients ready** to wait for every visible, checked host to have a verified prompt before **Send** or **Send and record** becomes available. Choose when to send once they are ready. The app checks every prompt again before dispatch, and each pane reports its own delivery outcome.
+
+Set **Parallel SSH commands** to run a submission in batches. The default is **Unlimited**. With a limit, the results show queued hosts and the next host gets a slot when an earlier command settles. A queued command still needs the original verified prompt. **Cancel queued commands** withholds the remaining sends while active commands continue.
+
+With a parallel limit, send interval, or expiry, turn on **Stop queue on failure** to withhold the remaining commands as soon as a host settles without a confirmed zero exit status. Active commands continue. **Save roster defaults** remembers this choice for a named group.
+
+Use **Preview send order** to see how the checked, visible hosts will be dispatched. Queues with a parallel limit, pacing, or expiry follow the current roster sort, with a chosen canary promoted to the first send. Immediate unlimited sends use tab order. The preview shows unavailable hosts and the concurrency that applies after canary approval. For these queues, select **Earlier** or **Later** to move a ready host in the next run. **Use roster order** clears the draft order. Sending uses that order for the submitted queue and starts the next draft in roster order.
+
+Set **Time between sends** to leave a minimum gap between dispatches within each run. The first host can start immediately. Later hosts still need a free parallel slot and any required canary approval. **No delay** is the default.
+
+Set **Expire unsent commands** to cap how long the current run can wait to dispatch. The timer starts on submission and keeps running during pauses and canary approval. When it expires, queued hosts are withheld and active commands can finish. **Never** is the default.
+
+Use **Pause queue** to hold unsent commands while you inspect results. Active commands continue, and stop-on-failure still applies. **Resume queue** rechecks the original prompts before sending again. Use **Skip host** on a queued result to remove just that recipient. The remaining queue keeps its limits and canary approval requirement. Skips are counted separately from failures.
+
+Choose a **Canary host** from the checked recipients to run on that shell first. It needs a fresh OSC 133 prompt and at least one other ready recipient. After a confirmed exit 0, inspect the result and select **Approve remaining hosts** to continue at the chosen concurrency. If the canary fails or its exit status is unavailable, the remaining commands are withheld. Check **Notify when canary finishes** before sending to get an Attention Inbox entry that opens the exact run when the canary succeeds or needs attention.
+
+Use the host-state dropdown to show ready shells, disconnected panes, or another current state. The state filter combines with the name or wildcard filter and keeps checks on hidden hosts. Sending and other actions on checked hosts use the visible selection.
+
+The live state count summarizes every host matching the name or wildcard filter. When a state filter hides hosts, the summary shows how many are visible out of the matching total.
+
+The roster shows **Connecting** while the first shell opens and **Reconnecting** during a retry. Automatic retries show their attempt number. These states are available in the host-state filter and the copied roster.
+
+Filter by **Connection failed** to find panes whose SSH attempt ended with an error. Each failed row shows a short diagnostic and offers **Reconnect** when the pane can restart.
+
+Choose **Stop selected SSH attempts** to stop connecting, signing in, or retrying for the checked hosts shown by the roster. The command palette also offers **Stop pending SSH connections**. A stopped pane keeps its scrollback and can be reconnected explicitly.
+
+Choose **Notify when logins finish** to watch the currently checked, shown SSH attempts. When all of those attempts settle, the Attention inbox gets one entry with the connected, failed, stopped, and closed counts. Select it to return to the roster. **Cancel login notification** disarms the watch.
+
+Choose **View login results** beside a login alert for each watched host's address, original outcome, and any failure message. A later reconnect leaves the original report intact. Open a pane from the report while that pane is still available.
+
+Use **Copy login report** or **Save login report…** to share the captured results as plain text. Saved reports use UTF-8.
+
+Use **Review failed logins** to see which failures from the report can still be retried. Confirm to reconnect the listed panes through the roster's login queue. If a pane has already reconnected or the eligible hosts change, review the remaining hosts again.
+
+Choose **Close ended SSH panes…** to review and close checked, visible panes whose connection has ended. Closing discards their scrollback. Panes in pinned tabs stay open, and a pane that reconnects before confirmation is kept. The command palette offers **Review close for ended SSH panes**.
+
+Choose **Open next SSH prompt** to open the first pending host-key or sign-in prompt in the displayed roster. The button shows how many visible hosts are waiting and follows the roster filters and sort order. Select the group tab to return to the roster.
+
+Turn on **Show last command output** in a group tab to see the exit status and a short excerpt from each visible host’s latest completed shell capture. **Open history** opens that capture in the host’s command history. The preview uses the current SSH connection and hides during authentication and alternate-screen applications.
+
+Turn on **Show current terminal line** to see the bottommost text line in each shown host’s live screen, including shells without integration. The preview masks concealed cells and hides during authentication and alternate-screen applications.
+
+Choose **Copy shown roster** to copy a plain-text status report. It includes every host shown by the current filters, its check state, SSH address, pane ID, and connection or prompt status.
+
+Use **Sort SSH roster** to display hosts in tab order, alphabetically by label, checked first, or with hosts needing attention first. The copied roster follows the display order. Command dispatch and `POLYSH_RANK` use tab order.
+
+In a named SSH group tab, choose **Save roster defaults** to remember its sort order, output previews, readiness requirement, parallel command limit, send interval, and queue expiry. These defaults apply when you open the group again and travel with exported group definitions.
+
 When an SSH shell has exited or its connection attempts have ended, use **Reconnect** on its roster row or **Reconnect selected** for checked hosts shown by the filter. Each attempt starts a fresh SSH login in the same pane with its scrollback and selection intact. Previous submissions stay available, and the replacement shell needs a fresh prompt before it can receive another group command.
 
+Choose **Disconnect selected…** to review the connected, checked shells shown by the roster filters. Confirm to end those shells and keep their panes, scrollback, and selection. A changed connection or selection requires a fresh review. Use **Reconnect** when you want to start a new shell.
+
+From an SSH group tab, open the command palette to copy the shown SSH roster, open the next sign-in or host-key prompt, reconnect selected hosts, or review a disconnect. These commands follow the current roster filters and apply the same recipient and connection checks as the roster buttons.
+
+Choose **Find SSH host in group…** from the command palette to search the shown hosts by pane name, title, profile, or SSH address. The picker follows the group’s live filters and shows a preview. Press Enter to focus the host or Esc to return to the roster.
+
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.
+
+Choose **Find run…** in the results or **Find group run…** in the command palette to jump to a retained submission. Search its command text or enter a run number such as `#3`. Runs appear newest first, with repeated commands listed separately. Enter opens the selected result and Escape returns to the current submission. The command draft and checked hosts stay in place.
 
 While a verified command runs, its result shows elapsed time. On completion it shows **Shell time**, the interval between the shell markers as received by w11term. Network and output buffering can affect that interval. Timing is available when the shell reports the start of command output and the command can be matched to the submission.
 
@@ -111,7 +167,9 @@ After saving, choose **Show in File Explorer** to select the file or **Copy reco
 
 Choose **Send and record…** beside the group command to attach a recorder before dispatch. Pick a new text file and w11term will recheck the command, checked hosts, and their prompts before sending. Cancelling the picker or choosing an existing file leaves the command unsent. If the checked scope changes while the file is being prepared, it records that no command was sent. The recorder saves automatically once every host finishes, rejects the send, or loses its connection, even while another tab is active. To finish sooner, choose **Stop recording** in the live output view.
 
-The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status. Result filters apply to **Interrupt selected**. **Copy results** includes the full submission.
+The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status.
+
+Use **Search result recipients** to find recipients by profile, pane, or SSH address. Search ignores case and combines with the outcome filter. It follows you through earlier and later submissions in the same tab and clears on a new run or when you open a run from Attention. The table shows how many recipients match. **Interrupt selected** and **Prepare retry** use the matching results and the live roster scope.
 
 Choose **Notify when run finishes** on a pending submission to get one entry in the Attention inbox once all its hosts settle. The alert includes success and attention counts, and selecting it takes you back to the retained submission. If another application has focus, the owning taskbar button flashes. Use **Cancel run notification** to disarm it while the run is pending.
 
@@ -119,7 +177,7 @@ Use **Sort submission results** to show the longest or shortest shell times firs
 
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.
 
-Choose **Recent commands…** or find **Recent group commands…** in the command palette to search the last 50 distinct commands submitted from this tab, newest first. Search matches the full command without regard to case. Press Enter to load the selected command as a draft or Esc to return to your current draft. The host filter and checked hosts stay as they are. Recent commands are kept in memory for the life of the group tab.
+Press **Ctrl+R** in an SSH host group, choose **Recent commands…**, or find **Recent group commands…** in the command palette to search the last 50 distinct commands submitted from this tab, newest first. Search matches the full command without regard to case. Press Enter to load the selected command as a draft or Esc to return to your current draft. The host filter and checked hosts stay as they are. Recent commands are kept in memory for the life of the group tab.
 
 Choose **Prepare retry** to load the exact command and select original recipients with a confirmed nonzero exit or withheld delivery. The roster and result filters scope the selection to the hosts you can see. Review the command and checked hosts, then choose **Send** when the targets have fresh prompts. **Restore draft** also restores the previous host selection and roster filter. Unconfirmed delivery and exit outcomes remain available in **Needs attention** for inspection.
 
@@ -131,17 +189,31 @@ Choose **Copy results** to copy the viewed submission as plain text, including e
 
 Choose **Save results…** to write a UTF-8 report of the viewed submission. It includes every recipient and all retained output from completed commands, even when the roster or result filters hide a host. A host still running appears with its status at the time you opened the Save dialog.
 
+When the result filters show a nonempty subset, use **Copy shown results**, **Save shown results…**, or **Save shown results as JSON…**. These reports keep the displayed recipient order, the original recipient count, and the run's dispatch settings and queue activity. Text reports identify the subset in their heading. JSON reports include `total_recipient_count`, with the shown hosts in `recipients`.
+
+Scripts can discover open groups with `w11term-cli list-ssh-groups`, check live selection with `get-ssh-group-roster`, and wait for verified prompts with `wait-ssh-group-ready`. Use `get-ssh-group-run` to inspect a run and `wait-ssh-group-run` to wait for final outcomes. [SSH group control commands](CONTROL.md#ssh-group-rosters-and-runs)
+
+Command results, reports, and output recordings show the dispatch settings captured for that run. These settings stay with the run when you change the next draft. **Show queue activity** lists pauses, resumes, canary decisions, and stops with elapsed time since submission. Reports and completed recordings include the most recent 32 queue events and count any earlier events omitted.
+
 Text and JSON reports include the known per-host times when you open the Save dialog. In JSON, `execution.elapsed_ms` is the running time for a verified running command and `execution.duration_ms` is the final time for a completed command.
 
 **Save results as JSON…** exports the same snapshot for scripts. The document has `schema_version: 1`, a `submission_id` scoped to its group tab, `kind` (`command` or `environment`), `label`, `command`, and an ordered `recipients` array. Each recipient has `pane_id`, `name`, `profile`, `address`, and `command`. A command submission puts the shared command at the top level. An environment export puts the commands on the recipients.
 
-- `delivery.state` and `interrupt.state` use `pending`, `sent`, `rejected`, or `unconfirmed`. A rejection includes `reason`. The `interrupt` field is `null` until an interrupt is requested.
+- Command submissions include `dispatch_policy` with the numeric `parallel_limit` (null means unlimited), `interval_ms`, effective `stop_on_failure`, and a `canary` with its `pane_id` and `label` when selected. The canary field is null for a run without one. With an expiry configured, `queue_expiry_ms` gives the time allowed for unsent commands.
+- When queue events exist, `queue_activity` contains an `omitted` count and an ordered `events` array with `elapsed_ms` and `kind` for each event.
+- `delivery.state` and `interrupt.state` use `pending`, `sent`, `rejected`, or `unconfirmed`. A queued command uses `queued` until dispatch and `skipped` if removed before sending. A host skip in `queue_activity` carries its `pane_id`. A rejection includes `reason`. The `interrupt` field is `null` until an interrupt is requested.
 - `execution.state` uses `awaiting_markers`, `awaiting_prompt`, `running`, `prompt_returned`, `completed`, or `unavailable`. A completed execution includes `connection_generation`, `command_id`, and `exit_code`. The exit code is `null` when the shell supplied none.
 - `output.state` uses `complete` or `preview` with `text`, or `unavailable` with `reason`. A run without a completed capture has `output: null`. A complete, empty capture uses an empty `text` string.
 
 Choose **Compare results…** to group the viewed submission by exact captured output and verified exit code. Smaller groups appear first. Each distinct result shows its hosts, an output preview, and where its output first differs from the largest group. If sizes tie, the earliest group in the submission is the reference. Running commands, unverified exits, and results with only a truncated preview are listed separately. Use **Refresh comparison** to include results that arrived after opening the view.
 
 Choose **View differences** on a result to see added and removed lines against the reference group with original line numbers and both exit codes. Large differences show a bounded excerpt. Use **View full output** from the comparison to inspect a longer result in its command history.
+
+Use **Compare with earlier run…** on a completed host result to compare the same pane and SSH address across two retained runs. Pick the earlier run and choose **Compare output**. Both sides need complete output and a reported exit code. The view shows the two run IDs, command labels, and exit codes. Choose **Save full run differences…** to export the complete line changes.
+
+Use **Compare runs…** to see those changes across the entire group. The overview separates changes in output and exit status, hosts in one run only, and unavailable comparisons. Turn on **Show unchanged hosts** to include identical results. Choose **Compare runs** again to refresh the captures. Open **View differences** on a comparable host for the detailed diff and return to the same overview when finished.
+
+Use **Copy comparison** or **Save comparison as JSON…** to share the run labels, counts and every host classification, including unchanged hosts hidden in the overview. The JSON report uses `schema_version` 1 and includes `earlier` and `current` runs, `counts` and `hosts`. Each host entry identifies its pane, profile label, SSH address and classification. Exit codes are available when both runs provided comparable captures. An unavailable comparison includes a detail message.
 
 Choose **Use as reference** on a result group when a particular host is the expected baseline. Refresh keeps that choice while the host still belongs to a comparable group. **Use largest group** restores automatic selection.
 
@@ -153,11 +225,33 @@ While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its 
 
 In **SSH host group**, choose **New group**, name it, and check the saved SSH profiles to include. **Open group** uses the current group tab. **Open in new tab** and the palette command **Open SSH group** create a named group tab. Each launch starts a fresh SSH tab for every member. Unavailable profiles are reported before any member tabs open. Uncheck a pane to pause delivery to it. **Edit group** changes the saved name or members, and **Delete group** removes the saved group. Group definitions live with their profiles in `profiles.json`. Renaming a profile updates its group memberships, and deleting a profile removes it from those groups.
 
+Choose **Duplicate group…** to save the selected group under a new name. The copy keeps its profile order, recipient sets, and roster defaults. It appears in the saved groups list and can be opened separately.
+
+Choose **Export group definition…** to save a portable JSON file with the saved group name, ordered profile names, recipient sets, and roster defaults. To use the file elsewhere, open **Import group definition…** and review the matching local SSH profiles and their addresses. If a profile is missing, create it locally and choose **Refresh local profiles**. Saving adds the group to the catalog for later launch.
+
+Use **Choose local profile…** on an imported member to map it to a differently named local profile. Search by name or SSH address. Each imported member needs a distinct local profile, and the saved recipient sets follow the mapping in their original order.
+
+Choose **Open group in new window** to keep the roster and its fresh SSH panes together in a separate window. The new window uses the group’s saved roster defaults.
+
+To open just a subset or a recipient set in its own window, use **Review group launch…** and choose new panes for the included hosts. **Open reviewed group in new window** rechecks the review before connecting. A partial roster keeps the saved group’s full membership available for future launches.
+
+Set **Parallel SSH logins** in the launch review to limit how many fresh connections authenticate at once. The default is **Unlimited**. A queued pane shows **Waiting to connect** and can be stopped from the roster. A slot becomes available after login and opening an SSH session channel, so active shells do not count against the limit.
+
+The server has 15 seconds to open a session channel and another 15 seconds to acknowledge terminal setup. If either stage times out, the roster reports the SSH error or retry. These limits start after authentication.
+
+Choose **Save as default** beside the login limit to use it in future reviews and when opening the saved group directly in a tab or window.
+
+In a saved group's roster, **Reconnect selected** uses the same saved limit. Overlapping batches in the same roster share the queue. Each queued retry keeps its original pane and can be stopped from the roster.
+
+**Parallel SSH logins** is also available when reviewing an imported host list or adding saved profiles to a roster. A named roster starts these reviews at its saved limit. Changing the value in the review applies to this launch.
+
 When creating or editing a group, filter by profile name or SSH address. **Check matches** and **Uncheck matches** apply to every matching profile across pages. **Move up** and **Move down** change a checked profile’s position in the full group. Fresh tabs open in the saved order.
 
 Group tabs keep their own drafts, filters, host selections, and results. A named tab shows the panes opened for that group and panes added with **Import host list…**. Turn on **Show all window SSH panes** to include other connections in the roster. Turning it off clears checks on those other panes. **New SSH group tab** opens an independent window-wide roster with an empty selection. **SSH host group** returns to the most recently used group tab.
 
 In a named tab, choose **Manage live panes…** to add or remove existing SSH panes from its roster. Search by profile, pane name, or SSH address, then choose **Apply membership**. Newly added panes appear unchecked for command delivery. Removing a member clears its send selection and leaves its SSH session open. These changes apply to the current tab. Choose **Update saved group…** to review additions and removals for the group that opened the tab, based on roster membership. The preview shows skipped panes without an available saved profile or outside the window. Reopen the group if its saved membership changed elsewhere.
+
+Choose **Add saved profiles…** to search saved SSH profiles by name or address. Check profiles and review the choice of new or matching live panes. The added panes join the live roster unchecked, and the current draft, filters, and checked hosts stay in place.
 
 Choose **Review group launch…** for a saved group to pick which hosts to open. Check individual profiles or choose a **Launch recipient set** such as *Canaries*. Each included profile offers live panes that match its settings. A single match is suggested. With several matches, choose the exact pane or open a new one. **Open reviewed group** checks the included profiles, approved connections, and selected recipient set again before opening the tab. Use **Refresh review** if any of them changes. A partial launch uses just its chosen hosts in the new roster. Use **Edit group** to change the underlying saved membership.
 
@@ -168,6 +262,8 @@ Filter the review by profile name or SSH address to find members in a large grou
 Choose **Save as recipient set…** in the launch review to name and save the included profiles before connecting. The saved set becomes the selected set in the review and is available for future launches from the command palette.
 
 Use **Update recipient set…** to apply the current inclusion choices to an existing set. Pick the set and review its additions and removals before confirming the update.
+
+Use **Manage sets…** to rename or delete a saved set before connecting. Deleting a set keeps the current host and connection choices in launch review.
 
 From a terminal, search the command palette for **Review SSH group** and the group name, or **Review SSH recipient set** with the group and set names. Press Enter to open the review with the matching hosts checked. **Open reviewed group** turns that tab into the live roster. **Cancel** returns you to the tab you came from.
 

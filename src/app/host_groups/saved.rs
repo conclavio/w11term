@@ -1,6 +1,8 @@
 use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Result, ensure};
 
+mod definition;
+mod duplicate;
 mod roster_update;
 pub use roster_update::Action as RosterUpdateAction;
 pub(super) use roster_update::update_button;
@@ -9,10 +11,13 @@ pub(super) use roster_update::update_button;
 pub(super) struct SavedUi {
     selected: Option<String>,
     editor: Option<Editor>,
+    duplicate: Option<Box<duplicate::Draft>>,
+    definition: Option<definition::State>,
     next_editor: u64,
     pub(super) feedback: String,
     pub(super) reuse: reuse::State,
     roster_update: roster_update::State,
+    roster_defaults: SshRosterDefaults,
     pub(super) recipient_sets: super::recipient_sets::State,
 }
 
@@ -140,7 +145,11 @@ impl SavedUi {
     }
 
     pub(super) fn is_editing(&self) -> bool {
-        self.editor.is_some() || self.roster_update.is_open() || self.recipient_sets.is_open()
+        self.editor.is_some()
+            || self.duplicate.is_some()
+            || self.definition.is_some()
+            || self.roster_update.is_open()
+            || self.recipient_sets.is_open()
     }
 
     pub(super) fn can_update_roster(&self) -> bool {
@@ -192,8 +201,42 @@ pub enum Action {
         members: Vec<String>,
         new_tab: bool,
     },
+    OpenWindow {
+        name: String,
+        members: Vec<String>,
+    },
     Draft(u64, DraftAction),
+    Duplicate(duplicate::Action),
+    Definition(definition::Action),
     UpdateRoster(RosterUpdateAction),
+    SaveRosterDefaults {
+        group: String,
+        defaults: SshRosterDefaults,
+    },
+}
+
+pub(super) fn roster_defaults_button(
+    id: TabId,
+    page: &HostGroup,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let Some((name, _)) = page.saved.origin() else {
+        return View::empty();
+    };
+    let group = name.to_owned();
+    let defaults = page.roster_preferences;
+    Button::new()
+        .is_enabled(defaults != page.saved.roster_defaults)
+        .on_click(ctx.callback(move |_| {
+            Message::HostGroup(HostAction::Saved(
+                id,
+                Action::SaveRosterDefaults {
+                    group: group.clone(),
+                    defaults,
+                },
+            ))
+        }))
+        .content("Save roster defaults")
 }
 
 pub enum DraftAction {
@@ -237,6 +280,9 @@ impl TerminalApp {
                 }
             }
             Action::NewFromSelection(offered) => self.new_saved_group_from_selection(id, offered),
+            Action::SaveRosterDefaults { group, defaults } => {
+                self.save_host_group_roster_defaults(id, &group, defaults);
+            }
             Action::Edit(name) => {
                 self.refresh_profiles();
                 let original = self
@@ -268,7 +314,20 @@ impl TerminalApp {
                     }
                 }
             }
+            Action::OpenWindow { name, members } => {
+                if self.host_group_command_target() != Some(id) {
+                    return;
+                }
+                if let Err(error) = self.launch_saved_group_window(&name, &members, ctx) {
+                    self.refresh_profiles();
+                    if let Some(page) = self.host_group_mut(id) {
+                        page.saved.feedback = format!("{error:#}");
+                    }
+                }
+            }
             Action::Draft(editor, action) => self.edit_saved_host_group(id, editor, action),
+            Action::Duplicate(action) => self.handle_duplicate_group(id, action),
+            Action::Definition(action) => self.handle_group_definition(id, action, ctx),
             Action::UpdateRoster(action) => self.handle_roster_update(id, action),
         }
     }
@@ -419,6 +478,71 @@ impl TerminalApp {
         self.bind_folder_shares();
     }
 
+    pub(super) fn save_saved_group_login_limit(
+        &mut self,
+        id: TabId,
+        name: &str,
+        members: &[String],
+        expected: SshRosterDefaults,
+        login_limit: SshGroupParallelLimit,
+    ) -> Result<()> {
+        let updated = SshRosterDefaults {
+            login_limit,
+            ..expected
+        };
+        let catalog = self
+            .store
+            .save_ssh_roster_defaults(name, members, expected, updated)?;
+        self.use_group_catalog(catalog);
+        if let Some(page) = self.host_group_mut(id)
+            && page.saved.origin() == Some((name, members))
+        {
+            page.saved.roster_defaults.login_limit = login_limit;
+            page.roster_preferences.login_limit = login_limit;
+        }
+        Ok(())
+    }
+
+    fn save_host_group_roster_defaults(
+        &mut self,
+        id: TabId,
+        offered_group: &str,
+        offered_defaults: SshRosterDefaults,
+    ) {
+        if self.host_group_command_target() != Some(id) {
+            return;
+        }
+        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
+            return;
+        };
+        let Some((name, members)) = page.saved.origin() else {
+            return;
+        };
+        let expected = page.saved.roster_defaults;
+        if name != offered_group
+            || page.roster_preferences != offered_defaults
+            || expected == offered_defaults
+        {
+            return;
+        }
+        let result = self
+            .store
+            .save_ssh_roster_defaults(name, members, expected, offered_defaults);
+        let feedback = match result {
+            Ok(catalog) => {
+                self.use_group_catalog(catalog);
+                if let Some(page) = self.host_group_mut(id) {
+                    page.saved.roster_defaults = offered_defaults;
+                }
+                "Saved roster defaults".into()
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        if let Some(page) = self.host_group_mut(id) {
+            page.saved.feedback = feedback;
+        }
+    }
+
     pub(super) fn load_expected_host_group(
         &self,
         name: &str,
@@ -448,11 +572,14 @@ impl TerminalApp {
         full_roster: bool,
         feedback: String,
     ) {
+        let defaults = self.catalog.ssh_roster_defaults(name);
         if let Some(page) = self.host_group_mut(id) {
             if page.roster.is_some() {
                 page.saved
                     .roster_update
                     .remember(name, members, full_roster);
+                page.saved.roster_defaults = defaults;
+                page.roster_preferences = defaults;
             }
             page.saved.selected = Some(name.into());
             page.saved.feedback = feedback;
@@ -511,6 +638,7 @@ impl TerminalApp {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
+        let login_limit = catalog.ssh_roster_defaults(name).login_limit.concurrency();
         self.use_group_catalog(catalog);
         let id = id.unwrap_or_else(|| self.new_host_group_tab(Some(name)));
         if self
@@ -532,6 +660,8 @@ impl TerminalApp {
             id,
             BTreeSet::new(),
             expected.iter().cloned().map(Some).zip(members),
+            PaneLaunch::Select,
+            login_limit,
             ctx,
         );
         self.remember_group_launch(
@@ -542,6 +672,68 @@ impl TerminalApp {
             format!("Opened {} SSH panes for {name}", expected.len()),
         );
         Ok(())
+    }
+
+    fn launch_saved_group_window(
+        &mut self,
+        name: &str,
+        expected: &[String],
+        ctx: &ComponentContext<Self>,
+    ) -> Result<()> {
+        self.check_saved_group_launch()?;
+        let catalog = self.load_expected_host_group(name, expected)?;
+        let members = expected
+            .iter()
+            .cloned()
+            .zip(
+                catalog
+                    .resolve_ssh_host_group_members(expected)?
+                    .into_iter()
+                    .cloned(),
+            )
+            .collect();
+        let login_limit = catalog.ssh_roster_defaults(name).login_limit.concurrency();
+        self.use_group_catalog(catalog);
+        self.open_group_child_window(
+            WindowGroup {
+                name: name.into(),
+                profiles: expected.to_vec(),
+                members,
+                login_limit,
+            },
+            ctx,
+        )
+    }
+
+    pub(in crate::app) fn start_group_window(
+        &mut self,
+        group: &WindowGroup,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let id = self.new_host_group_tab(Some(&group.name));
+        self.start_host_group_panes(
+            id,
+            BTreeSet::new(),
+            group
+                .members
+                .iter()
+                .cloned()
+                .map(|(name, ssh)| (Some(name), ssh)),
+            PaneLaunch::Select,
+            group.login_limit,
+            ctx,
+        );
+        self.remember_group_launch(
+            id,
+            &group.name,
+            &group.profiles,
+            group.members.len() == group.profiles.len(),
+            format!(
+                "Opened {} SSH panes for {}",
+                group.members.len(),
+                group.name
+            ),
+        );
     }
 
     pub(super) fn open_host_group_from_palette(
@@ -567,29 +759,47 @@ impl TerminalApp {
         let selected = saved.name(&self.catalog);
         let selection = selected.and_then(|name| names.iter().position(|item| item == name));
         let members = selected.and_then(|name| self.catalog.ssh_host_groups.get(name));
-        let review_actions = selected.zip(members).map(|(name, members)| {
-            let launch = reuse::button(id, name, members, ctx);
-            let name = name.to_owned();
-            let members = members.clone();
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    launch,
-                    Button::new()
-                        .is_enabled(!members.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            Message::HostGroup(HostAction::HostListExport(
-                                id,
-                                host_list_export::Action::OpenSaved {
-                                    name: name.clone(),
-                                    members: members.clone(),
-                                },
-                            ))
-                        }))
-                        .content("Export saved group hosts…"),
-                ))
-        });
+        let review_actions = selected
+            .zip(members)
+            .map_or_else(View::empty, |(name, members)| {
+                let launch = reuse::button(id, name, members, ctx);
+                let duplicate = duplicate::button(id, name, ctx);
+                let group_window = name.to_owned();
+                let group_window_members = members.clone();
+                let name = name.to_owned();
+                let members = members.clone();
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        launch,
+                        Button::new()
+                            .is_enabled(!members.is_empty())
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(HostAction::HostListExport(
+                                    id,
+                                    host_list_export::Action::OpenSaved {
+                                        name: name.clone(),
+                                        members: members.clone(),
+                                    },
+                                ))
+                            }))
+                            .content("Export saved group hosts…"),
+                        duplicate,
+                        Button::new()
+                            .is_enabled(!group_window_members.is_empty())
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(HostAction::Saved(
+                                    id,
+                                    Action::OpenWindow {
+                                        name: group_window.clone(),
+                                        members: group_window_members.clone(),
+                                    },
+                                ))
+                            }))
+                            .content("Open group in new window"),
+                    ))
+            });
         let action = move |action| Message::HostGroup(HostAction::Saved(id, action));
         let mut items = Vec::new();
         if let Some((name, members)) = selected.zip(members) {
@@ -668,9 +878,17 @@ impl TerminalApp {
                     .text_trimming(TextTrimming::CharacterEllipsis),
             ));
         }
-        if let Some(review_actions) = review_actions {
-            details.push(KeyedView::new("review-group-actions", review_actions));
-        }
+        details.push(KeyedView::new(
+            "review-group-actions",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((review_actions, import::saved_profiles_button(id, ctx))),
+        ));
+        details.push(KeyedView::new(
+            "group-definition-actions",
+            definition::buttons(id, selected, self.export.pending.is_some(), ctx),
+        ));
         if !saved.feedback.is_empty() {
             details.push(KeyedView::new(
                 "feedback",
@@ -699,6 +917,12 @@ impl TerminalApp {
         saved: &SavedUi,
         ctx: &ViewContext<Self>,
     ) -> Option<View> {
+        if let Some(definition) = &saved.definition {
+            return Some(definition.view(id, &saved.feedback, ctx));
+        }
+        if let Some(draft) = &saved.duplicate {
+            return Some(draft.view(id, &saved.feedback, ctx));
+        }
         if let Some(review) = saved.roster_update.view(id, ctx) {
             return Some(review);
         }

@@ -118,6 +118,10 @@ impl TerminalConfiguration for Config {
 pub enum TransportInput {
     Authenticate(crate::options::Authentication),
     Sftp(crate::sftp::Job),
+    DisconnectShell {
+        connection: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Data(Vec<u8>),
     /// Parser-generated reply on a viewer transport that distinguishes it from user input.
     Automatic(Vec<u8>),
@@ -135,7 +139,7 @@ pub enum TransportInput {
 impl TransportInput {
     pub(crate) fn reject_input(self, reason: &str) {
         match self {
-            Self::Raw(_, reply) => {
+            Self::Raw(_, reply) | Self::DisconnectShell { reply, .. } => {
                 let _ = reply.send(Err(reason.into()));
             }
             Self::Scoped { reply, kind, .. } => kind.reject(reply, reason),
@@ -709,6 +713,58 @@ impl Snapshot {
             .find(|command| command.id == link.id)
     }
 
+    /// Summarize the newest completed command and identify its retained history entry.
+    pub fn latest_command_output_preview(&self) -> Option<(crate::events::CommandLink, String)> {
+        let command = self.command_history.back()?;
+        let status = command.exit_code.map_or_else(
+            || "Exit status unavailable".to_owned(),
+            |code| format!("Exit {code}"),
+        );
+        let line = match &command.output {
+            Ok(text) => command_output_tail(text),
+            Err(_) => "Output unavailable".to_owned(),
+        };
+        Some((
+            crate::events::CommandLink {
+                generation: self.connection_generation,
+                id: command.id,
+            },
+            format!("{status} · {line}"),
+        ))
+    }
+
+    /// Summarize the lowest nonblank row of this snapshot, masking concealed cells.
+    pub fn last_visible_text_line(&self) -> Option<String> {
+        self.rows.iter().rev().find_map(|row| {
+            let mut text = String::new();
+            let mut remaining = 200;
+            for cell in row
+                .visible_cells()
+                .take_while(|cell| cell.cell_index() < self.cols)
+            {
+                let value = if cell.attrs().invisible() {
+                    " "
+                } else {
+                    cell.str()
+                };
+                let value = if text.is_empty() {
+                    value.trim_start()
+                } else {
+                    value
+                };
+                for ch in value.chars().take(remaining) {
+                    text.push(ch);
+                    remaining -= 1;
+                }
+                if remaining == 0 {
+                    break;
+                }
+            }
+            let caption = crate::events::display_field(&text);
+            (!caption.is_empty()).then_some(caption)
+        })
+    }
+
     /// A bounded single-line caption from the application's window title.
     /// A shell that has only set an icon title still uses its profile label.
     pub fn application_title(&self) -> Option<&str> {
@@ -981,6 +1037,24 @@ impl Snapshot {
                 .iter()
                 .all(|(id, image)| old.images.get(id).is_some_and(|old| old.hash == image.hash))
     }
+}
+
+fn command_output_tail(text: &str) -> String {
+    const SCAN_BYTES: usize = 4096;
+    let start = text.ceil_char_boundary(text.len().saturating_sub(SCAN_BYTES));
+    text[start..]
+        .rsplit(['\r', '\n', '\u{2028}', '\u{2029}'])
+        .find_map(|line| {
+            let caption = crate::events::display_field(line.trim());
+            (!caption.is_empty()).then_some(caption)
+        })
+        .unwrap_or_else(|| {
+            if start == 0 {
+                "No output".to_owned()
+            } else {
+                "Open history for earlier output".to_owned()
+            }
+        })
 }
 
 /// Only an immutable frame crosses onto the UI thread. Output is never queued as frames.
@@ -1710,6 +1784,47 @@ mod tests {
             assert_eq!(recorded.len(), index + 1);
             assert_eq!(recorded[index], serde_json::json!({"exit_code": 17}));
         }
+    }
+
+    #[test]
+    fn latest_command_preview_uses_the_last_completed_output_and_its_link() {
+        let (mut term, _) = engine();
+        term.advance_bytes(
+            b"\x1b]133;C\x07older\r\n\x1b]133;D;0\x07\x1b]133;C\x07first\r\nlast\r\n\x1b]133;D;17\x07",
+        );
+        let mut frame = Snapshot::capture(&term, None, 0, 0, String::new(), 0);
+        frame.connection_generation = 3;
+        let (link, preview) = frame.latest_command_output_preview().unwrap();
+        assert_eq!(link.generation, 3);
+        assert_eq!(link.id, term.last_command().unwrap().id);
+        assert_eq!(frame.command_for_link(link).unwrap().exit_code, Some(17));
+        assert_eq!(preview, "Exit 17 · last");
+    }
+
+    #[test]
+    fn visible_text_preview_skips_blank_rows_and_masks_concealed_cells() {
+        let (mut term, _) = engine();
+        let read = |term: &Terminal| {
+            Snapshot::capture(term, None, 0, 0, String::new(), 0).last_visible_text_line()
+        };
+        assert_eq!(read(&term), None);
+        term.advance_bytes("older\r\n  latest \x1b[8msecret\x1b[28m雪\r\n\x1b[8mhidden\x1b[28m");
+        assert_eq!(read(&term).as_deref(), Some("latest 雪"));
+    }
+
+    #[test]
+    fn command_output_tail_is_plain_text_and_bounds_its_unicode_scan() {
+        assert_eq!(
+            command_output_tail("first\r\n\tlast  \u{202e}雪\r\n\r\n"),
+            "last 雪"
+        );
+        assert_eq!(command_output_tail(" \r\n\t"), "No output");
+        assert_eq!(
+            command_output_tail(&format!("earlier\n{}", " ".repeat(4096))),
+            "Open history for earlier output"
+        );
+        let long = "雪".repeat(2048);
+        assert_eq!(command_output_tail(&long), "雪".repeat(200));
     }
 
     #[test]

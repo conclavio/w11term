@@ -266,6 +266,33 @@ impl Registry {
             .context("Window's GUI control handler is unavailable")
     }
 
+    pub(super) fn window_ui(&self, id: WindowId) -> Result<UiHandler> {
+        self.state
+            .lock()
+            .unwrap()
+            .windows
+            .get(&id)
+            .with_context(|| format!("unknown window {id}"))?
+            .ui
+            .clone()
+            .with_context(|| format!("GUI control handler for window {id} is unavailable"))
+    }
+
+    pub(super) fn all_window_uis(&self) -> Result<Vec<(WindowId, UiHandler)>> {
+        self.state
+            .lock()
+            .unwrap()
+            .windows
+            .iter()
+            .map(|(&id, window)| {
+                let ui = window.ui.clone().with_context(|| {
+                    format!("GUI control handler for window {id} is unavailable")
+                })?;
+                Ok((id, ui))
+            })
+            .collect()
+    }
+
     /// Recheck an already-queued request on the GUI thread. A transfer may
     /// have completed since the control worker first chose this window.
     pub fn for_this_window(&self, request: UiRequest) -> Option<UiRequest> {
@@ -458,6 +485,7 @@ mod tests {
         registry.set_ui(move |request| {
             let reply = match request {
                 UiRequest::Open { reply, .. } | UiRequest::Resize { reply, .. } => reply,
+                _ => unreachable!("unexpected window control request"),
             };
             let _ = reply.send(Ok(json!(id)));
         });

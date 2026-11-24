@@ -1,0 +1,490 @@
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
+      [Parameter(Mandatory)][string]$State)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
+$env:W11TERM_DATA_DIR = Join-Path $State 'data'
+$env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = $State
+$profiles = Join-Path $State 'profiles.json'
+$config = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles
+$dot = ' ' + [char]0xb7 + ' '
+$group = "SSH group${dot}Fleet"
+$button = [System.Windows.Automation.ControlType]::Button
+$edit = [System.Windows.Automation.ControlType]::Edit
+$item = [System.Windows.Automation.SelectionItemPattern]::Pattern
+
+function Click([string]$Name) {
+    Invoke-Button (Wait-Until "enabled '$Name'" {
+        $entry = Find-Element $Name $button
+        if ($entry -and $entry.Current.IsEnabled) { $entry }
+    })
+}
+function Read-GroupRecording([string]$Path) {
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    } catch [IO.FileNotFoundException] {
+        return
+    }
+    $reader = [IO.StreamReader]::new($stream)
+    try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+function Set-Command([string]$Command) {
+    $field = Wait-Until 'group command' { Find-Element 'Group command' $edit }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
+}
+function Run-Snapshot([uint64]$Run) {
+    Control @('get-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$Run")
+}
+function Select-GroupOption([string]$Name, [string]$Label) {
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $field = Wait-Until "enabled '$Name'" { $entry = Find-Element $Name $combo; if ($entry -and $entry.Current.IsEnabled) { $entry } }
+    $popup = $field.GetCurrentPattern($expand)
+    $popup.Expand()
+    $option = Wait-Until "visible option '$Label'" {
+        Find-Element $Label ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $option.GetCurrentPattern($item).Select()
+    $null = Wait-Until "'$Name' selected '$Label'" {
+        $entry = Find-Element $Name $combo
+        $selected = $entry.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+        $selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Label
+    }
+    $popup = (Find-Element $Name $combo).GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+
+$launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '--rows', '36')
+$app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+$waitJob = $null
+try {
+    $window = Wait-InputWindow
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    Run-Palette "Open SSH group${dot}Fleet" -Enter
+    $listing = Control @('list-ssh-groups')
+    $owner = $listing.windows | Where-Object { $_.groups.label -ccontains $group }
+    $listedGroup = $owner.groups | Where-Object label -ceq $group
+    $groupWindow = $owner.window_id
+    $groupTab = $listedGroup.tab_id
+    if (!$groupWindow -or !$groupTab -or $listedGroup.runs.Count -ne 0) {
+        throw 'The new group was missing from the CLI listing or already had runs'
+    }
+    $panes = @{}
+    $labels = @{}
+    foreach ($name in 'West','East','North') {
+        $panes[$name] = Wait-Until "$name pane" { ((Control @('list')).sessions | Where-Object label -ceq $name).id }
+        $null = Control @('wait-for-text','--pane',"$($panes[$name])",'--timeout','10','fixture$')
+        $labels[$name] = "$name${dot}test@127.0.0.1:$($config.$name.port)${dot}Pane $($panes[$name])"
+    }
+    Select-GroupOption 'Parallel SSH commands' '1 at a time'
+    Set-Command 'roll'
+    Click 'Preview send order'
+    $null = Wait-Until 'tab order starts the preview with West' {
+        (Find-Element 'Send to one host at a time.') -and (Find-Element "1. $($labels.West)")
+    }
+    Select-GroupOption 'Sort SSH roster' 'Host label'
+    $null = Wait-Until 'the preview follows the new roster sort' {
+        (Find-Element "1. $($labels.East)") -and (Find-Element "2. $($labels.North)") -and
+            (Find-Element "3. $($labels.West)") -and !(Find-Element "1. $($labels.West)")
+    }
+    Click "Move $($labels.East) later"
+    $null = Wait-Until 'moving East later puts North first' { Find-Element "1. $($labels.North)" }
+    Click 'Use roster order'
+    $null = Wait-Until 'discarding the manual order restores the current sort' {
+        (Find-Element "1. $($labels.East)") -and !(Find-Element 'Use roster order' $button)
+    }
+
+    Click "Move $($labels.West) earlier"
+    $null = Wait-Until 'West moves one position earlier' { Find-Element "2. $($labels.West)" }
+    Click "Move $($labels.West) earlier"
+    $null = Wait-Until 'West becomes the first planned recipient' { Find-Element "1. $($labels.West)" }
+    Click "Move $($labels.North) earlier"
+    $null = Wait-Until 'the exact manual order is visible before sending' {
+        (Find-Element "1. $($labels.West)") -and (Find-Element "2. $($labels.North)") -and (Find-Element "3. $($labels.East)")
+    }
+    Click 'Send to 3 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started roll')
+    $null = Wait-Until 'North and East are queued in the results' {
+        (Find-Element "$($labels.North)${dot}Queued") -and (Find-Element "$($labels.East)${dot}Queued")
+    }
+    Select-GroupOption 'Sort SSH roster' 'Tab order'
+    $null = Control @('send-text','--pane',"$($panes.North)",'--no-paste','x')
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the group is in the background' { Find-Element 'No bells or notifications' }
+    $activeWindow = [FixtureMessages]::GetForegroundWindow()
+    $null = Wait-Until 'CLI shows one running host and two queued in the background run' {
+        $snapshot = Run-Snapshot 1
+        $run = $snapshot.run
+        $snapshot.window_id -eq $groupWindow -and $snapshot.tab_id -eq $groupTab -and
+            $run.schema_version -eq 1 -and $run.command -ceq 'roll' -and $run.summary.outcomes.running -eq 1 -and
+            $run.summary.outcomes.waiting -eq 2 -and $run.dispatch_policy.parallel_limit -eq 1 -and
+            $run.recipients[0].pane_id -eq $panes.West -and $run.recipients[0].execution.state -ceq 'running' -and
+            $run.recipients[1].pane_id -eq $panes.North -and $run.recipients[1].delivery.state -ceq 'queued'
+    }
+    $groupRun = (Control @('list-ssh-groups')).windows.groups.runs | Where-Object run_id -eq 1
+    if ($groupRun.label -cne 'roll' -or $groupRun.recipient_count -ne 3 -or $groupRun.settled_count -ne 0 -or
+        !(Find-Element 'No bells or notifications') -or [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
+        throw 'CLI discovery changed the visible page or did not summarize the background run'
+    }
+    $waitArgs = @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run','1')
+    $timedOut = & $Cli --pid $app.Id @waitArgs --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before settlement*') {
+        throw 'A held run did not return a wait timeout'
+    }
+    $waitOutput = Join-Path $State 'wait-run-1.json'
+    $waitJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $waitArgs + @('--timeout','15')) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $waitOutput
+    New-Item -ItemType File -Path (Join-Path $State 'release-roll') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started roll')
+    $null = Wait-Until 'the CLI reads the running East host while the wait is pending' {
+        $run = (Run-Snapshot 1).run
+        $run.recipients[1].delivery.state -ceq 'rejected' -and
+            $run.recipients[2].execution.state -ceq 'running'
+    }
+    if ($waitJob.HasExited) { throw 'The group wait ended before East finished' }
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-roll') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished roll')
+    if (!$waitJob.WaitForExit(10000)) {
+        throw 'Wait did not finish after the background run settled'
+    }
+    $waitReply = [IO.File]::ReadAllText($waitOutput) | ConvertFrom-Json
+    if (!$waitReply.ok) { throw "Wait did not return the completed background run: $($waitReply.error)" }
+    $settled = $waitReply.result
+    $run = $settled.run
+    $westResult, $northResult, $eastResult = $run.recipients
+    if ($settled.window_id -ne $groupWindow -or $settled.tab_id -ne $groupTab -or
+        $run.summary.settled_count -ne 3 -or $run.summary.outcomes.succeeded -ne 2 -or
+        $run.summary.outcomes.attention -ne 1 -or $westResult.execution.exit_code -ne 0 -or
+        $northResult.delivery.state -cne 'rejected' -or $northResult.delivery.reason -notlike 'The verified prompt changed*' -or
+        $eastResult.execution.exit_code -ne 0 -or $eastResult.execution.command_id -le 0 -or
+        $null -eq $eastResult.execution.connection_generation -or
+        ($eastResult.PSObject.Properties.Name -contains 'output')) {
+        throw 'Wait did not return the final recipient outcomes'
+    }
+    $again = Control ($waitArgs + @('--timeout','1'))
+    if ($again.run.summary.settled_count -ne 3 -or !(Find-Element 'No bells or notifications') -or
+        [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
+        throw 'Waiting again did not return the settled run or changed focus'
+    }
+    $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
+    $null = Wait-Until 'North was tried before East despite the new roster sort' {
+        Find-Element "$($labels.North)${dot}Not sent${dot}The verified prompt changed before the command was sent."
+    }
+    $eastExecution = (Run-Snapshot 1).run.recipients[2].execution
+    $output = Control @('get-command','--pane',"$($panes.East)",'--id',"$($eastExecution.command_id)",
+        '--connection-generation',"$($eastExecution.connection_generation)")
+    if ($output.output_error -or $output.output -notlike '*East finished roll*') {
+        throw 'The completed result did not link to the original pane output'
+    }
+    $missing = & $Cli --pid $app.Id get-ssh-group-run --window $groupWindow --tab $groupTab --run 900 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $missing.ok -or $missing.error -notlike '*not retained*') {
+        throw 'An unknown run did not return an explicit lookup error'
+    }
+    Click 'Preview send order'
+    $null = Wait-Until 'the next draft goes back to the roster order' {
+        (Find-Element "1. $($labels.West)") -and (Find-Element "2. $($labels.East)") -and
+            !(Find-Element 'Use roster order' $button)
+    }
+    Click 'Back to roster and results'
+
+    (Wait-CheckBox $labels.North On).Toggle()
+    $null = Wait-CheckBox $labels.North Off
+    Set-Command 'keep-first'
+    Click ('Send and record' + [char]0x2026)
+    $dialog = Wait-Until 'output recording dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'start the bounded recording' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started keep-first')
+    Click 'Cancel queued commands'
+    $null = Wait-Until 'East was canceled before sending' {
+        Find-Element "$($labels.East)${dot}Not sent${dot}Cancelled before sending."
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-keep-first') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished keep-first')
+    $log = Join-Path $State 'ssh-group-output-2.txt'
+    $null = Wait-Until 'the recording includes the cancelled delivery and finite limit' {
+        $recorded = Read-GroupRecording $log
+        $recorded -and $recorded.Contains('Cancelled before sending.') -and
+            $recorded.Contains("Dispatch${dot}parallel limit 1${dot}no delay") -and
+            $recorded.Contains('[Queue activity]') -and $recorded.Contains('Cancelled queued commands')
+    }
+    (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
+    $null = Wait-CheckBox 'Stop queue on failure' On
+    Set-Command 'halt-on-failure'
+    Click 'Send to 2 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started halt-on-failure')
+    $null = Wait-Until 'East is queued until West settles' {
+        Find-Element "$($labels.East)${dot}Queued"
+    }
+    Click 'Pause queue'
+    $null = Wait-Until 'queue is paused before West fails' { Find-Element 'Command queue paused' }
+    New-Item -ItemType File -Path (Join-Path $State 'release-halt-on-failure') | Out-Null
+    $null = Wait-Until 'the failure withholds the remaining command' {
+        (Find-Element "$($labels.West)${dot}Exit 17") -and
+            (Find-Element "$($labels.East)${dot}Not sent${dot}Queue stopped after an unsuccessful host.") -and
+            !(Find-Element 'Resume queue' $button)
+    }
+
+    Click 'Show queue activity'
+    $null = Wait-Until 'the paused run records why it stopped' {
+        (Find-Element 'Paused queue') -and (Find-Element 'Stopped after an unsuccessful host')
+    }
+    Click 'Hide queue activity'
+
+    Set-Command 'inspect'
+    Click 'Send to 2 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started inspect')
+    Click 'Pause queue'
+    $null = Wait-Until 'the next run is paused' { Find-Element 'Command queue paused' }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the paused group is in the background' { Find-Element 'No bells or notifications' }
+    New-Item -ItemType File -Path (Join-Path $State 'release-inspect') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished inspect')
+    $tab = Wait-Until 'the group tab after pausing' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
+    $null = Wait-Until 'the queue remains paused with a free slot' {
+        (Find-Element 'Command queue paused') -and (Find-Element "$($labels.West)${dot}Exit 0") -and
+            (Find-Element "$($labels.East)${dot}Queued")
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'resume-inspect') | Out-Null
+    Click 'Resume queue'
+    $null = Wait-Until 'the queue resumed' { !(Find-Element 'Command queue paused') }
+    $null = Wait-Until 'East was sent the resumed command' {
+        Find-Element "$($labels.East)${dot}Sent to SSH channel"
+    }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
+    Click 'Show queue activity'
+    $null = Wait-Until 'the completed run retains pause and resume events' {
+        (Find-Element 'Paused queue') -and (Find-Element 'Resumed queue')
+    }
+    Click 'Hide queue activity'
+
+    Select-GroupOption 'Parallel SSH commands' 'Unlimited'
+    Select-GroupOption 'Canary host' $labels.East
+    Set-Command 'canary-ok'
+    (Wait-CheckBox $labels.East On).Toggle()
+    $null = Wait-Until 'removing the canary blocks submission' {
+        $send = Find-Element 'Run canary first' $button
+        ($send -and !$send.Current.IsEnabled) -and
+            (Find-Element 'The canary must be checked, visible, and at a fresh shell marker.')
+    }
+    (Wait-CheckBox $labels.East Off).Toggle()
+    (Wait-CheckBox 'Notify when canary finishes' Off).Toggle()
+    $null = Wait-CheckBox 'Notify when canary finishes' On
+    Click 'Preview send order'
+    $null = Wait-Until 'the preview puts the chosen canary ahead of the other ready host' {
+        (Find-Element "Canary first${dot}$($labels.East)") -and (Find-Element "Ready${dot}$($labels.West)") -and
+            (Find-Element 'After approval, send to all remaining ready hosts.')
+    }
+    Click ('Run canary and record' + [char]0x2026)
+    $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-ok')
+    $null = Wait-Until 'only East runs before a canary result' {
+        (Find-Element "$($labels.West)${dot}Queued") -and
+            (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
+            !(Find-Element 'Approve remaining hosts' $button)
+    }
+    Click 'Notify when run finishes'
+    $null = Wait-Until 'both notifications are armed' {
+        (Find-Element 'Cancel run notification' $button) -and (Find-Element 'Cancel canary notification' $button)
+    }
+    Click 'Preview send order'
+    $null = Wait-Until 'the preview is open before leaving the group' { Find-Element 'Back to roster and results' $button }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the canary group is in the background' { Find-Element 'No bells or notifications' }
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-canary-ok') | Out-Null
+    $canaryNotice = "$group${dot}Run 5${dot}Canary ready for approval${dot}$($labels.East)"
+    Click "Unread${dot}$canaryNotice"
+    $null = Wait-Until 'the canary notice opens the run requiring approval' {
+        (Find-Element "$($labels.East)${dot}Exit 0") -and
+            (Find-Element "$($labels.West)${dot}Queued") -and
+            (Find-Element "$($labels.East)${dot}Canary succeeded. Review its result before continuing.") -and
+            (Find-Element 'Approve remaining hosts' $button)
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-canary-ok') | Out-Null
+    New-Item -ItemType File -Path (Join-Path $State 'approve-canary-ok') | Out-Null
+    Click 'Approve remaining hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished canary-ok')
+    Click 'Attention inbox, 1 unread'
+    $null = Wait-Until 'the canary notice stays read while the run completion is unread' {
+        Find-Element "Read${dot}$canaryNotice" $button
+    }
+    Click "Unread${dot}$group${dot}Run 5${dot}Group run finished${dot}2 succeeded${dot}0 need attention"
+    $canaryPolicy = "Dispatch${dot}unlimited parallel${dot}no delay${dot}canary $($labels.East)"
+    Select-GroupOption 'Time between sends' '1 second'
+    $null = Wait-Until 'changing the draft interval leaves the completed canary policy intact' {
+        Find-Element $canaryPolicy
+    }
+    Select-GroupOption 'Time between sends' 'No delay'
+    $log = Join-Path $State 'ssh-group-output-5.txt'
+    $null = Wait-Until 'the recording names the original canary' {
+        $recorded = Read-GroupRecording $log
+        if (!$recorded -or !$recorded.Contains($canaryPolicy) -or !$recorded.Contains('[Group run settled]')) { return }
+        $readyIndex = $recorded.IndexOf('Canary ready for approval')
+        $approveIndex = $recorded.IndexOf('Approved remaining hosts')
+        $readyIndex -ge 0 -and $approveIndex -gt $readyIndex
+    }
+
+    Set-Command 'canary-fails'
+    Click 'Run canary first'
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}$group${dot}Run 6${dot}Canary did not report a successful exit${dot}$($labels.East)"
+    $null = Wait-Until 'a failed canary notice opens the exact run that withheld West' {
+        (Find-Element "$($labels.East)${dot}Exit 17") -and
+            (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
+            !(Find-Element 'Approve remaining hosts' $button)
+    }
+
+    Set-Command 'canary-unknown'
+    Click 'Run canary first'
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-unknown')
+    Click 'Cancel canary notification'
+    $null = Wait-Until 'canary notification is disarmed' { !(Find-Element 'Cancel canary notification' $button) }
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-canary-unknown') | Out-Null
+    $null = Wait-Until 'a canary without an exit status withholds West without an alert' {
+        (Find-Element "$($labels.East)${dot}Completed${dot}exit status unavailable") -and
+            (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
+            !(Find-Element 'Approve remaining hosts' $button) -and
+            (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+
+    (Wait-CheckBox 'Notify when canary finishes' On).Toggle()
+    $null = Wait-CheckBox 'Notify when canary finishes' Off
+    Set-Command 'canary-stale'
+    Click 'Run canary first'
+    $null = Wait-Until 'the canary succeeds before West changes its prompt' {
+        (Find-Element "$($labels.East)${dot}Exit 0") -and
+            (Find-Element "$($labels.West)${dot}Queued") -and (Find-Element 'Approve remaining hosts' $button)
+    }
+    $null = Control @('send-text','--pane',"$($panes.West)",'--no-paste','x')
+    Click 'Approve remaining hosts'
+    $null = Wait-Until 'approval still rechecks the queued prompt' {
+        Find-Element "$($labels.West)${dot}Not sent${dot}The verified prompt changed before the command was sent."
+    }
+
+    $null = Control @('send-text','--pane',"$($panes.West)",'--no-paste','restore-prompt')
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West restored prompt')
+    Select-GroupOption 'Canary host' 'No canary'
+    Select-GroupOption 'Time between sends' '5 seconds'
+    Set-Command 'pace'
+    Click 'Preview send order'
+    $null = Wait-Until 'the unlimited queue shows its dispatch interval and order' {
+        (Find-Element "Dispatch interval${dot}5s") -and
+            (Find-Element "1. $($labels.West)") -and (Find-Element "2. $($labels.East)")
+    }
+    Click 'Send to 2 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished pace')
+    $null = Wait-Until 'East still waits after the first command finishes' {
+        (Find-Element 'Waiting for the next send interval') -and (Find-Element "$($labels.East)${dot}Queued") -and
+            (Find-Element "Dispatch${dot}unlimited parallel${dot}5s between sends${dot}stop on failure")
+    }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the group is in the background during the interval' { Find-Element "Read${dot}$canaryNotice" $button }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','15','East finished pace')
+
+    $tab = Wait-Until 'the group tab after the paced run' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
+    $null = Control @('send-text','--pane',"$($panes.North)",'--no-paste','restore-prompt')
+    $null = Control @('wait-for-text','--pane',"$($panes.North)",'--timeout','10','North restored prompt')
+    (Wait-CheckBox $labels.North Off).Toggle()
+    $null = Wait-CheckBox $labels.North On
+    Select-GroupOption 'Time between sends' 'No delay'
+    Select-GroupOption 'Parallel SSH commands' '1 at a time'
+    $null = Wait-CheckBox 'Stop queue on failure' On
+    Set-Command 'skip-middle'
+    Click ('Send and record' + [char]0x2026)
+    $dialog = Wait-Until 'skip run recording dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'start the skip run' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started skip-middle')
+    $null = Wait-Until 'only queued hosts can be skipped' {
+        (Find-Element "Skip queued pane $($panes.East)" $button) -and
+            (Find-Element "Skip queued pane $($panes.North)" $button) -and
+            !(Find-Element "Skip queued pane $($panes.West)" $button)
+    }
+    Click "Skip queued pane $($panes.East)"
+    $null = Wait-Until 'East is skipped while North remains queued' {
+        (Find-Element "$($labels.East)${dot}Skipped before sending") -and
+            (Find-Element "$($labels.North)${dot}Queued") -and
+            !(Find-Element "Skip queued pane $($panes.East)" $button)
+    }
+    Click 'Notify when run finishes'
+    $null = Wait-Until 'the skip completion notice is armed' { Find-Element 'Cancel run notification' $button }
+    New-Item -ItemType File -Path (Join-Path $State 'release-skip-middle') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.North)",'--timeout','10','North finished skip-middle')
+
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}$group${dot}Run 10${dot}Group run finished${dot}2 succeeded${dot}0 need attention${dot}1 skipped"
+    $null = Wait-Until 'the skip appears as a settled outcome without attention' {
+        Find-Element "3 of 3 settled${dot}0 waiting${dot}0 running${dot}2 succeeded${dot}0 need attention${dot}1 skipped"
+    }
+    Select-GroupOption 'Filter submission results' 'Skipped'
+    $null = Wait-Until 'the skipped result can be isolated' {
+        (Find-Element "Focus result pane $($panes.East)" $button) -and
+            !(Find-Element "Focus result pane $($panes.West)" $button)
+    }
+    $log = Join-Path $State 'ssh-group-output-10.txt'
+    $null = Wait-Until 'the saved recording identifies the skipped host' {
+        $recorded = Read-GroupRecording $log
+        $recorded -and $recorded.Contains("Skipped queued host${dot}Pane $($panes.East)") -and
+            $recorded.Contains("$($labels.East)${dot}Skipped before sending") -and $recorded.Contains('[Group run settled]')
+    }
+
+    Select-GroupOption 'Filter submission results' 'All results'
+    Select-GroupOption 'Expire unsent commands' '5 seconds'
+    Set-Command 'deadline'
+    Click 'Preview send order'
+    $null = Wait-Until 'the queue deadline is visible in preview' { Find-Element 'Unsent commands expire after 5s' }
+    Click ('Send and record' + [char]0x2026)
+    $dialog = Wait-Until 'deadline recording dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'start the deadline run' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started deadline')
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    Click 'Pause queue'
+    Click 'Notify when run finishes'
+    $null = Wait-Until 'the queue is paused and waiting for the run notice' {
+        (Find-Element 'Command queue paused') -and (Find-Element 'Cancel run notification' $button)
+    }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the deadline passes with the paused group in the background' { $elapsed.ElapsedMilliseconds -ge 5200 }
+    New-Item -ItemType File -Path (Join-Path $State 'release-deadline') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished deadline')
+    Click "Unread${dot}$group${dot}Run 11${dot}Group run finished${dot}1 succeeded${dot}2 need attention"
+    $null = Wait-Until 'background expiry withheld the queued hosts but kept the active command' {
+        (Find-Element "$($labels.East)${dot}Not sent${dot}Queue expired before sending.") -and
+            (Find-Element "$($labels.North)${dot}Not sent${dot}Queue expired before sending.") -and
+            (Find-Element "$($labels.West)${dot}Exit 0") -and !(Find-Element 'Resume queue' $button)
+    }
+    $log = Join-Path $State 'ssh-group-output-11.txt'
+    $null = Wait-Until 'the recording keeps the deadline, expiry, and final outcomes' {
+        $recorded = Read-GroupRecording $log
+        $recorded -and $recorded.Contains('queue expires after 5s') -and $recorded.Contains('Expired unsent commands') -and
+            $recorded.Contains('Queue expired before sending.') -and $recorded.Contains('[Group run settled]')
+    }
+
+    Select-GroupOption 'Canary host' $labels.East
+    Set-Command 'deadline-approval'
+    Click 'Run canary first'
+    $null = Wait-Until 'a successful canary waits for approval before the deadline' {
+        (Find-Element "$($labels.East)${dot}Exit 0") -and (Find-Element 'Approve remaining hosts' $button)
+    }
+    $null = Wait-Until 'expiry closes the canary approval gate and withholds the remaining hosts' {
+        (Find-Element "$($labels.West)${dot}Not sent${dot}Queue expired before sending.") -and
+            (Find-Element "$($labels.North)${dot}Not sent${dot}Queue expired before sending.") -and
+            !(Find-Element 'Approve remaining hosts' $button)
+    }
+} catch {
+    throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
+} finally {
+    if ($waitJob) {
+        if (!$waitJob.HasExited) { $waitJob.Kill(); $waitJob.WaitForExit() }
+        $waitJob.Dispose()
+    }
+    if (!$app.HasExited) {
+        $null = $app.CloseMainWindow()
+        if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
+    }
+    $app.Dispose()
+}

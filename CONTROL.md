@@ -97,6 +97,10 @@ Each entry’s `label` is its launch label and `title` is the application-report
 
 Each entry also has a `label` and `status`. Available sessions report `title`, `cols`, `rows`, `connection_generation`, and `prompt`. An unavailable session retains its IDs and flags and reports an `error`. Prompts expose public challenge metadata only. The connection generation increases after each new SSH login. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels.
 
+Available SSH entries also report the current `ssh_connection` and
+`restart_token` using the same fields as `events`. One `list` request can
+show the lifecycle state of all SSH panes in a process.
+
 ## Live pane inspection
 
 `inspect --pane ID` reads the selected pane’s local terminal parser once. It works on background and read-only panes and preserves keyboard focus. During a synchronized update, `inspect` can already show the new modes while `get-text` still returns the last committed screen.
@@ -167,6 +171,89 @@ output. Keep the pane ID, command ID and connection generation together. A looku
 fails if its record has been evicted or its connection generation has changed.
 After a reconnect, list again to see the new session’s history.
 
+<a id="retained-ssh-group-runs"></a>
+
+## SSH group rosters and runs
+
+`list-ssh-groups` lists live SSH group tabs across the selected process. The
+reply includes `pid` and a `windows` array with `window_id` and `groups` for
+each window. A group has `tab_id`, `label`, and `runs` in submission order,
+oldest first. A tab retains the eight newest runs. A group can have an empty
+run list.
+
+`get-ssh-group-roster --window ID --tab ID` returns the current roster for
+those IDs. The reply includes `window_id`, `tab_id`, and a `roster` object
+with `schema_version: 1`, `label`, `scope` (`group` or `window`), `sort`,
+`filter`, and `hosts` in roster sort order. The filter reports its `query`,
+`wildcards`, `state`, and any pattern `error`. Each in-scope host has
+`pane_id`, `name`, `profile`, `address`, `state`, `connected`, `checked`,
+and `shown`. A checked host hidden by the current filter stays in the reply
+with `shown: false`. Ready hosts include `prompt_verification` as
+`shell_markers` or `pattern`. Reconnecting hosts can carry `reconnect_attempt`.
+Host states are `ready`, `waiting`, `unverified`, `queued`, `connecting`,
+`reconnecting`, `disconnected`, `failed`, `stopped`, `host_key`,
+`authentication`, `read_only`, and `alternate`. The state filter also
+supports `all`.
+
+The `counts` object includes `hosts`, `shown`, `checked`, `checked_shown`,
+and `ready_checked_shown`. `selection_ready` reports whether the shown
+checked hosts meet the group's `require_all_ready` prompt rule. The Send
+button also depends on the current draft and review.
+The query leaves the group's selection and window focus in place.
+
+`wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]` returns the
+same roster snapshot when every initially checked, shown host has a verified
+prompt. It always requires all of those hosts, including when partial sends
+are enabled for the group. Use a roster filter that keeps the intended hosts
+shown as their state changes. A changed checked-and-shown set, empty scope,
+closed tab, or timeout returns an error. The wait defaults to 30 seconds and
+accepts 1 through 3600. It can complete with the roster in the background.
+
+Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
+`recipient_count`, `settled_count`, and `outcomes` counts for `waiting`,
+`running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
+background tab or window without changing selection or keyboard focus.
+
+`get-ssh-group-run --window ID --tab ID --run ID` takes the three IDs from
+the listing. An evicted run or closed tab or window returns a lookup error.
+The reply includes `window_id`, `tab_id`, and a `run` object with
+`schema_version: 1`, `summary`, `command`, `dispatch_policy`,
+`queue_activity`, and `recipients` in the original dispatch order. Recipient
+rows carry the same pane identity, delivery, execution, and interrupt
+statuses as saved group reports. Environment assignments appear in their
+recipient rows.
+
+The detail reply carries metadata. To read a completed recipient's retained
+output, use `get-command` with its `pane_id` and the
+`execution.command_id` and `execution.connection_generation` in the reply.
+The usual pane history retention rules apply.
+
+`wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]`
+returns the same detail reply once all recipients settle. It handles running,
+paused, and canary-gated queues in the background. The timeout defaults to
+30 seconds and accepts 1 through 3600. A settled run returns immediately.
+Check the recipient statuses and exit codes to decide whether the run succeeded.
+Timeout, a closed window or tab, or an evicted run returns an error. A timeout
+leaves the original run in progress.
+
+```powershell
+w11term-cli --pid 12345 list-ssh-groups
+w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
+w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
+w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
+w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
+```
+
+Direct pipe clients use these JSON requests.
+
+```json
+{"verb":"list-ssh-groups"}
+{"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
+{"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
+{"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
+{"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
+```
+
 ## Waiting, geometry, tabs, and events
 
 `find-text` searches each selected pane’s retained scrollback and visible screen once. Use `--pane ID` for one pane or `--all-panes` for every pane in the process, across all its windows. The default is a case-insensitive Unicode literal. Use `--regex` for Rust regex syntax and `--match-case` to select case-sensitive matching. Both modes join soft wraps and stop at hard line breaks. Patterns can be up to 4,096 UTF-8 bytes. Use `--` before a pattern beginning with two hyphens. An alternate-screen pane searches its current screen.
@@ -219,6 +306,15 @@ bytes. `lost=true` reports eviction. Events include `bell`, `title`, `notificati
 `sound`, connection/reconnection, assets, and recording. A bell event does not imply
 audible playback; inspect the `sound` outcome. See [the game protocol](docs/game-client-protocol.md).
 The CLI allows the requested wait timeout plus 15 seconds for these replies.
+
+For SSH panes the reply also includes `ssh_connection`, an object with a
+`phase` of `queued`, `connecting`, `connected`, `reconnecting`, `disconnected`,
+`stopped`, or `failed`. Reconnecting includes an `attempt` number for an
+automatic retry and `null` for an explicit restart. A queued pane is waiting for
+a slot in a group launch. Failed includes a short
+`reason`. The journal adds an `ssh-connection` event on each phase change
+with the same data shape. The connection snapshot and restart token describe
+the pane at reply time, including when recorded transitions have aged out.
 
 A command completion watch armed in the GUI adds one `command-finished` event to
 the originating pane. Its data is `{"exit_code":17}` for a reported status or

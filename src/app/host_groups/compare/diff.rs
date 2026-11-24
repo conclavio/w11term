@@ -155,7 +155,7 @@ fn line_parts(text: &str) -> (&str, &'static str) {
 }
 
 impl Difference {
-    fn build(before: &str, after: &str) -> Self {
+    pub(super) fn build(before: &str, after: &str) -> Self {
         let sections = ChangedSections::new(before, after);
         let mut difference = Self {
             unaligned: sections.unaligned(),
@@ -217,10 +217,15 @@ struct Side {
     output: report::Output,
 }
 
-fn write_changes(mut file: impl Write, before: &str, after: &str) -> io::Result<()> {
+pub(super) fn write_changes(
+    mut file: impl Write,
+    before: &str,
+    after: &str,
+    identical: &str,
+) -> io::Result<()> {
     let sections = ChangedSections::new(before, after);
     if sections.before().is_empty() && sections.after().is_empty() {
-        return writeln!(file, "Output is identical. The exit codes differ.\r");
+        return writeln!(file, "{identical}\r");
     }
     if sections.unaligned() {
         writeln!(
@@ -248,35 +253,10 @@ impl Panel {
                 .text(value)
                 .text_wrapping(TextWrapping::Wrap)
         };
-        let content = match &self.result {
-            None => text("Comparing output lines…").into(),
-            Some(Err(message)) => text(message).into(),
-            Some(Ok(diff)) if diff.changes.is_empty() => {
-                text("Output is identical. The exit codes differ.").into()
-            }
-            Some(Ok(diff)) => StackPanel::new().spacing(5.0).children((
-                if diff.unaligned {
-                    text("The changed sections are too large to align. Lines are shown by source.")
-                        .into()
-                } else {
-                    View::empty()
-                },
-                if diff.limited {
-                    text("More changed lines are available in the full output.").into()
-                } else {
-                    View::empty()
-                },
-                StackPanel::new()
-                    .spacing(4.0)
-                    .keyed_children(diff.changes.iter().enumerate().map(|(index, change)| {
-                        let verb = change.edit.verb();
-                        KeyedView::new(
-                            index,
-                            text(&format!("{verb} line {} · {}", change.line, change.text)),
-                        )
-                    })),
-            )),
-        };
+        let content = result_view(
+            self.result.as_ref(),
+            "Output is identical. The exit codes differ.",
+        );
         Grid::new()
             .margin(16.0)
             .row_spacing(8.0)
@@ -352,7 +332,12 @@ impl TerminalApp {
                 let mut file = io::BufWriter::new(file);
                 writeln!(file, "Submitted · {command}\r")?;
                 writeln!(file, "{}\r\n{}\r", reference.heading, selected.heading)?;
-                write_changes(&mut file, reference.output.text(), selected.output.text())?;
+                write_changes(
+                    &mut file,
+                    reference.output.text(),
+                    selected.output.text(),
+                    "Output is identical. The exit codes differ.",
+                )?;
                 file.flush()
             },
             ctx,
@@ -437,6 +422,44 @@ impl TerminalApp {
     }
 }
 
+pub(super) fn result_view(
+    result: Option<&Result<Difference, &'static str>>,
+    identical: &str,
+) -> View {
+    let text = |value: &str| {
+        TextBlock::new()
+            .text(value)
+            .text_wrapping(TextWrapping::Wrap)
+    };
+    match result {
+        None => text("Comparing output lines…").into(),
+        Some(Err(message)) => text(message).into(),
+        Some(Ok(diff)) if diff.changes.is_empty() => text(identical).into(),
+        Some(Ok(diff)) => StackPanel::new().spacing(5.0).children((
+            if diff.unaligned {
+                text("The changed sections are too large to align. Lines are shown by source.")
+                    .into()
+            } else {
+                View::empty()
+            },
+            if diff.limited {
+                text("More changed lines are available in the full output.").into()
+            } else {
+                View::empty()
+            },
+            StackPanel::new()
+                .spacing(4.0)
+                .keyed_children(diff.changes.iter().enumerate().map(|(index, change)| {
+                    let verb = change.edit.verb();
+                    KeyedView::new(
+                        index,
+                        text(&format!("{verb} line {} · {}", change.line, change.text)),
+                    )
+                })),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,7 +522,7 @@ mod tests {
         after.push_str(&final_line);
         after.push(' ');
         let mut bytes = Vec::new();
-        write_changes(&mut bytes, &before, &after).unwrap();
+        write_changes(&mut bytes, &before, &after, "Identical.").unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("Line alignment limit reached."));
         assert_eq!(text.matches("Removed line ").count(), 1100);
@@ -510,7 +533,13 @@ mod tests {
     #[test]
     fn export_reuses_line_alignment_and_preserves_source_whitespace() {
         let mut bytes = Vec::new();
-        write_changes(&mut bytes, "old \r\ncommon\r\n", "new\ncommon\r\n").unwrap();
+        write_changes(
+            &mut bytes,
+            "old \r\ncommon\r\n",
+            "new\ncommon\r\n",
+            "Identical.",
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             "Removed line 1 · old \r\nAdded line 1 · new [LF]\r\n"
