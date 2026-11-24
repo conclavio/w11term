@@ -361,6 +361,47 @@ try {
         !(Find-Element 'Search recent group commands' $edit)
     }
 
+    $findHost = 'Find SSH host in group' + [char]0x2026
+    Choose-GroupCommand $findHost
+    (Field 'Find SSH host in group').SetValue('East')
+    $null = Wait-Until 'the West host picker excludes the other group' {
+        (Find-Element 'No matching SSH hosts in this roster') -and @(Get-PickerRows).Count -eq 0
+    }
+    Press-Key 27
+    $null = Wait-Until 'Escape returns to the West roster' {
+        !(Find-Element 'Find SSH host in group' $edit) -and (Find-Element 'Host filter' $edit)
+    }
+    Wait-Tab $westTab
+    (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
+    $null = Wait-Until 'the window-wide roster includes the running East pane' {
+        Find-Element "Pane $east${dot}Connected${dot}Waiting for a fresh prompt"
+    }
+    Choose-Option 'Filter host state' 'Ready'
+    Choose-GroupCommand $findHost
+    (Field 'Find SSH host in group').SetValue('East')
+    $null = Wait-Until 'the Ready filter keeps the running East pane out of the picker' {
+        (Find-Element 'No matching SSH hosts in this roster') -and @(Get-PickerRows).Count -eq 0
+    }
+    [IO.File]::WriteAllText((Join-Path $State 'release-east'), '')
+    $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','East finished east-probe')
+    $null = Wait-Until 'East appears in the open picker when it becomes ready' {
+        $results = @(Get-PickerRows)
+        $results.Count -eq 1 -and $results[0].Contains("test@127.0.0.1:$($config.East.port)")
+    }
+    $address = "test@127.0.0.1:$($config.West.port)"
+    (Field 'Find SSH host in group').SetValue($address)
+    $null = Wait-Until 'only West matches its SSH address' {
+        $results = @(Get-PickerRows)
+        $results.Count -eq 1 -and $results[0].Contains($address)
+    }
+    Press-Key 13
+    Wait-Focus $west
+    Choose-GroupCommand 'SSH host group'
+    Wait-Tab $westTab
+    Expect-Choice 'Filter host state' 'Ready'
+    Choose-Option 'Filter host state' 'All host states'
+    (Wait-CheckBox 'Show all window SSH panes' On).Toggle()
+
     Click "Focus result pane $west"
     Wait-Focus $west
     Choose-GroupCommand 'SSH host group'
@@ -375,8 +416,6 @@ try {
     $null = Wait-CheckBox $westName On
     (Wait-CheckBox 'Show all window SSH panes' On).Toggle()
 
-    [IO.File]::WriteAllText((Join-Path $State 'release-east'), '')
-    $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','East finished east-probe')
     Select-Tab $eastTab
     Expect-Field 'Group command' 'east-only draft'
     Expect-Field 'Host filter' 'east'

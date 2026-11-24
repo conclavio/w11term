@@ -2,6 +2,7 @@ use super::*;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RosterCommand {
+    FindHost,
     Copy(BTreeSet<u64>),
     OpenPrompt { pane: u64, prompt: u64 },
     Reconnect(Vec<ExitedPane>),
@@ -11,6 +12,7 @@ pub enum RosterCommand {
 impl RosterCommand {
     pub(in crate::app) fn label(&self) -> &'static str {
         match self {
+            Self::FindHost => "Find SSH host in group…",
             Self::Copy(_) => "Copy shown SSH roster",
             Self::OpenPrompt { .. } => "Open next SSH sign-in or host-key prompt",
             Self::Reconnect(_) => "Reconnect selected SSH hosts",
@@ -20,6 +22,7 @@ impl RosterCommand {
 
     pub(in crate::app) fn into_action(self, group: TabId) -> Action {
         match self {
+            Self::FindHost => Action::FindHost(group),
             Self::Copy(offered) => Action::CopyRoster(group, offered),
             Self::OpenPrompt { pane, prompt } => Action::VisitPrompt(group, pane, prompt),
             Self::Reconnect(exits) => {
@@ -42,9 +45,10 @@ impl TerminalApp {
         if shown.is_empty() {
             return Vec::new();
         }
-        let mut commands = vec![RosterCommand::Copy(
-            shown.iter().map(|target| target.pane).collect(),
-        )];
+        let mut commands = vec![
+            RosterCommand::FindHost,
+            RosterCommand::Copy(shown.iter().map(|target| target.pane).collect()),
+        ];
         let exits = reconnect::selected_exits(page, &shown);
         if !exits.is_empty() {
             commands.push(RosterCommand::Reconnect(exits));

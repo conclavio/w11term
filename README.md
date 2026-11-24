@@ -117,6 +117,8 @@ Choose **Disconnect selected…** to review the connected, checked shells shown 
 
 From an SSH group tab, open the command palette to copy the shown SSH roster, open the next sign-in or host-key prompt, reconnect selected hosts, or review a disconnect. These commands follow the current roster filters and apply the same recipient and connection checks as the roster buttons.
 
+Choose **Find SSH host in group…** from the command palette to search the shown hosts by pane name, title, profile, or SSH address. The picker follows the group’s live filters and shows a preview. Press Enter to focus the host or Esc to return to the roster.
+
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.
 
 While a verified command runs, its result shows elapsed time. On completion it shows **Shell time**, the interval between the shell markers as received by w11term. Network and output buffering can affect that interval. Timing is available when the shell reports the start of command output and the command can be matched to the submission.

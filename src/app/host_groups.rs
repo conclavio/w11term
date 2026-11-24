@@ -628,6 +628,7 @@ pub enum Action {
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
     VisitPrompt(TabId, u64, u64),
+    FindHost(TabId),
     ViewSubmission(TabId, u64),
     NotifyCompletion(TabId, u64, bool),
     LiveOutput(TabId, u64, live_output::Action),
@@ -1053,6 +1054,22 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn roster_picker_hosts(&self, id: TabId) -> Vec<(u64, String)> {
+        if self.host_group_command_target() != Some(id) {
+            return Vec::new();
+        }
+        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
+            return Vec::new();
+        };
+        let targets = self.host_group_targets();
+        let mut shown: Vec<_> = page.shown(&targets).collect();
+        page.sort_shown(&mut shown);
+        shown
+            .into_iter()
+            .map(|target| (target.pane, target.names.address().to_owned()))
+            .collect()
+    }
+
     pub(super) fn handle_host_group(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
             Action::Open | Action::NewTab => {
@@ -1117,6 +1134,7 @@ impl TerminalApp {
                         }
                     }
                 }
+                self.refresh_roster_picker(ctx);
                 self.update_host_group_timer(ctx);
             }
             Action::Edit(id, text) => {
@@ -1196,6 +1214,7 @@ impl TerminalApp {
                 }
             }
             Action::Visit(id, pane) => self.focus_host_group_pane(id, pane, ctx),
+            Action::FindHost(id) => self.open_roster_picker(id, ctx),
             Action::VisitPrompt(id, pane, prompt) => {
                 if self.host_group_command_target() == Some(id) {
                     let targets = self.host_group_targets();
