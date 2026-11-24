@@ -133,6 +133,12 @@ pub enum Request {
         run_id: u64,
         action: SshGroupQueueAction,
     },
+    InterruptSshGroupCommand {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane_id: u64,
+    },
     SaveSshGroupReport {
         window_id: WindowId,
         tab_id: u64,
@@ -278,6 +284,12 @@ pub enum UiRequest {
         action: SshGroupQueueAction,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    InterruptSshGroupCommand {
+        tab_id: u64,
+        run_id: u64,
+        pane_id: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     CaptureSshGroupReport {
         tab_id: u64,
         run_id: u64,
@@ -316,7 +328,8 @@ impl UiRequest {
             | Self::GetSshGroupRoster { reply, .. }
             | Self::SubmitSshGroupCommand { reply, .. }
             | Self::GetSshGroupRun { reply, .. }
-            | Self::SshGroupQueue { reply, .. } => reply,
+            | Self::SshGroupQueue { reply, .. }
+            | Self::InterruptSshGroupCommand { reply, .. } => reply,
             Self::ReadSshGroupOutput { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
                 return;
@@ -635,6 +648,16 @@ impl Registry {
                 action,
             } => {
                 self.change_ssh_group_queue(window_id, tab_id, run_id, action)
+                    .await
+            }
+            Request::InterruptSshGroupCommand {
+                window_id,
+                tab_id,
+                run_id,
+                pane_id,
+            } => {
+                ensure!(pane_id != 0, "pane IDs must be positive");
+                self.interrupt_ssh_group_command(window_id, tab_id, run_id, pane_id)
                     .await
             }
             Request::SaveSshGroupReport {

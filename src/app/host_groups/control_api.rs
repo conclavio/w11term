@@ -124,6 +124,44 @@ impl Submission {
 }
 
 impl TerminalApp {
+    pub(super) fn control_group_run(
+        &mut self,
+        tab: TabId,
+        run: u64,
+    ) -> Result<&mut Submission, String> {
+        self.host_group_by_id_mut(tab)
+            .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))?
+            .submissions
+            .iter_mut()
+            .find(|submission| submission.id == run)
+            .ok_or_else(|| format!("SSH group run {run} is not retained in tab {tab}"))
+    }
+
+    pub(in crate::app) fn control_interrupt_ssh_group_command(
+        &mut self,
+        tab: TabId,
+        run: u64,
+        pane: u64,
+    ) -> Result<Value, String> {
+        let submission = self.control_group_run(tab, run)?;
+        let index = submission
+            .results
+            .iter()
+            .position(|delivery| delivery.target.pane == pane)
+            .ok_or("The specified pane is not a recipient in this run")?;
+        let delivery = &mut submission.results[index];
+        delivery.poll();
+        let target = delivery
+            .interrupt_target()
+            .ok_or("This pane has no verified running command available to interrupt")?;
+
+        let status = self.dispatch_group_interrupt(pane, target);
+        let submission = self.control_group_run(tab, run)?;
+        submission.results[index].interrupt = Some(status);
+        submission.refresh_deliveries();
+        Ok(report::describe_run(submission, false).expect("an unfiltered run snapshot"))
+    }
+
     pub(in crate::app) fn control_capture_ssh_group_report(
         &mut self,
         tab: TabId,
@@ -393,19 +431,12 @@ impl TerminalApp {
         wait_for_settlement: bool,
         reply: ControlReply,
     ) {
-        let Some(AppTab {
-            page: Page::HostGroup(page),
-            ..
-        }) = self.tabs.get_mut(tab)
-        else {
-            let _ = reply.send(Err(format!("unknown SSH group tab {tab} in this window")));
-            return;
-        };
-        let Some(submission) = page.submissions.iter_mut().find(|item| item.id == run) else {
-            let _ = reply.send(Err(format!(
-                "SSH group run {run} is not retained in tab {tab}"
-            )));
-            return;
+        let submission = match self.control_group_run(tab, run) {
+            Ok(submission) => submission,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
         };
         if wait_for_settlement {
             submission.control_waiters.push(reply);

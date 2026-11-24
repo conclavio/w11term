@@ -1317,31 +1317,7 @@ impl TerminalApp {
             .collect();
         let mut outcomes: BTreeMap<_, _> = selected
             .into_iter()
-            .map(|(pane, link)| {
-                let status = match self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) {
-                    Some(AppTab {
-                        page: Page::Terminal(live),
-                        ..
-                    }) if live.session.is_direct_ssh_shell() => {
-                        let (reply, received) = oneshot::channel();
-                        if live
-                            .session
-                            .input
-                            .send(Command::InterruptGroupCommand {
-                                target: link,
-                                reply,
-                            })
-                            .is_ok()
-                        {
-                            DeliveryStatus::Pending(Instant::now(), received)
-                        } else {
-                            DeliveryStatus::Rejected("The pane closed.".into())
-                        }
-                    }
-                    _ => DeliveryStatus::Rejected("The SSH shell is no longer available.".into()),
-                };
-                (pane, status)
-            })
+            .map(|(pane, link)| (pane, self.dispatch_group_interrupt(pane, link)))
             .collect();
         if let Some(run) = self
             .host_group_mut(id)
@@ -1353,6 +1329,26 @@ impl TerminalApp {
                 }
             }
         }
+    }
+
+    fn dispatch_group_interrupt(&self, pane: u64, target: GroupInterruptTarget) -> DeliveryStatus {
+        let live = match self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) {
+            Some(AppTab {
+                page: Page::Terminal(live),
+                ..
+            }) if live.session.is_direct_ssh_shell() => live,
+            _ => return DeliveryStatus::Rejected("The SSH shell is no longer available.".into()),
+        };
+        let (reply, received) = oneshot::channel();
+        if live
+            .session
+            .input
+            .send(Command::InterruptGroupCommand { target, reply })
+            .is_err()
+        {
+            return DeliveryStatus::Rejected("The pane closed.".into());
+        }
+        DeliveryStatus::Pending(Instant::now(), received)
     }
 
     fn focus_host_group_pane(&mut self, id: TabId, pane: u64, ctx: &ComponentContext<Self>) {

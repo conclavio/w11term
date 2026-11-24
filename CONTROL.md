@@ -303,6 +303,17 @@ rows carry the same pane identity, delivery, execution, and interrupt
 statuses as saved group reports. Environment assignments appear in their
 recipient rows.
 
+`interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID`
+requests Ctrl+C for one verified running command on a named recipient.
+The target must still be running the command from that retained run on
+the same direct SSH connection. The terminal rechecks the connection,
+command identity, and input mode immediately before the write. The
+action works in background tabs and uses the explicit pane ID regardless
+of the roster selection. It returns a run snapshot. Check the recipient's
+`interrupt.state` for `pending`, `sent`, `rejected`, or `unconfirmed`.
+A `sent` receipt confirms delivery to the SSH channel. The command's
+final outcome is recorded separately under `execution`.
+
 When a per-recipient expected-output check resolves, `run.output_expectation`
 contains its `query`, `regex`, and `match_case` settings. Each checked
 recipient has its own `output_expectation` field with the value `matched`,
@@ -443,6 +454,7 @@ w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 pause
 w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 approve-canary --pane 17
 w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 skip --pane 19
+w11term-cli --pid 12345 interrupt-ssh-group-command --window 1 --tab 9 --run 3 --pane 17
 w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
@@ -469,6 +481,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":"pause"}
 {"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":{"approve_canary":{"pane_id":17}}}
 {"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":{"skip":{"pane_id":19}}}
+{"verb":"interrupt-ssh-group-command","window_id":1,"tab_id":9,"run_id":3,"pane_id":17}
 {"verb":"save-ssh-group-report","window_id":1,"tab_id":9,"run_id":3,"path":"C:\\Reports\\group report.json","format":"json","overwrite":false}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}

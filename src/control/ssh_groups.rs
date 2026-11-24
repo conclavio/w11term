@@ -199,6 +199,27 @@ pub fn validate_group_panes(pane_ids: &[u64]) -> Result<()> {
 }
 
 impl Registry {
+    pub(super) async fn interrupt_ssh_group_command(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        pane: u64,
+    ) -> Result<Value> {
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::InterruptSshGroupCommand {
+            tab_id: tab,
+            run_id: run,
+            pane_id: pane,
+            reply,
+        });
+        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group interrupt was not acknowledged. Check the run before retrying");
+        };
+        Ok(json!({ "window_id": window, "tab_id": tab, "run": run.map_err(anyhow::Error::msg)? }))
+    }
+
     pub(super) async fn change_ssh_group_queue(
         &self,
         window: WindowId,
@@ -851,6 +872,19 @@ mod tests {
                     .send(Ok(json!({ "queue": {"state":"paused", "unsent":1} })))
                     .unwrap();
             }
+            UiRequest::InterruptSshGroupCommand {
+                tab_id,
+                run_id,
+                pane_id,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id, pane_id), (9, 2, 7));
+                reply
+                    .send(Ok(
+                        json!({"recipients":[{"pane_id":7,"interrupt":{"state":"pending"}}]}),
+                    ))
+                    .unwrap();
+            }
             UiRequest::SubmitSshGroupCommand {
                 tab_id,
                 pane_ids,
@@ -912,6 +946,14 @@ mod tests {
         assert_eq!(
             paused,
             json!({"window_id":3, "tab_id":9, "run":{"queue":{"state":"paused","unsent":1}}})
+        );
+        let interrupted = second
+            .interrupt_ssh_group_command(3, 9, 2, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            interrupted,
+            json!({"window_id":3,"tab_id":9,"run":{"recipients":[{"pane_id":7,"interrupt":{"state":"pending"}}]}})
         );
         let opened = second.open_ssh_group(3, "East Fleet".into()).await.unwrap();
         assert_eq!(opened, json!({ "window_id": 3, "tab_id": 10 }));

@@ -587,23 +587,14 @@ impl TerminalApp {
             SshGroupQueueAction::Skip { pane_id } => Action::SkipHost(pane_id),
         };
         if self
-            .command_queue_run(id, run)?
+            .control_group_run(id, run)?
             .change_queue(action, Instant::now())?
         {
             self.poll_command_queues();
         }
-        let submission = self.command_queue_run(id, run)?;
+        let submission = self.control_group_run(id, run)?;
         submission.refresh_deliveries();
         Ok(report::describe_run(submission, false).expect("an unfiltered run snapshot"))
-    }
-
-    fn command_queue_run(&mut self, id: TabId, run: u64) -> Result<&mut Submission, String> {
-        self.host_group_by_id_mut(id)
-            .ok_or_else(|| format!("unknown SSH group tab {id} in this window"))?
-            .submissions
-            .iter_mut()
-            .find(|submission| submission.id == run)
-            .ok_or_else(|| format!("SSH group run {run} is not retained in tab {id}"))
     }
 }
 

@@ -44,6 +44,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "open-ssh-group"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
+            | "interrupt-ssh-group-command"
             | "ssh-group-queue"
             | "save-ssh-group-report"
             | "submit-ssh-group-command"
@@ -541,6 +542,19 @@ mod tests {
                 }
             )
         ));
+        assert!(matches!(
+            parse_line("interrupt-ssh-group-command --window 11 --tab 12 --run 4 --pane 8")
+                .unwrap(),
+            (
+                None,
+                Request::InterruptSshGroupCommand {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4,
+                    pane_id: 8,
+                }
+            )
+        ));
         for invalid in [
             "--pane 7 list-ssh-groups",
             "list-ssh-groups --window 2",
@@ -557,6 +571,10 @@ mod tests {
             "get-ssh-group-run --window 2 --tab 3 --run 4 --run 5",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --pane 7",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --timeout 1",
+            "interrupt-ssh-group-command --window 2 --tab 3 --run 4",
+            "interrupt-ssh-group-command --window 2 --tab 3 --run 4 --pane 0",
+            "interrupt-ssh-group-command --window 2 --tab 3 --pane 7",
+            "interrupt-ssh-group-command --window 2 --tab 3 --run 4 --pane 7 --pane 8",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 0",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 3601",
             "wait-ssh-group-output --window 2 --tab 3 --run 4",

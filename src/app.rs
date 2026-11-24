@@ -5430,6 +5430,18 @@ impl Component for TerminalApp {
                     self.update_host_group_timer(context);
                 }
             }
+            Message::Control(w11term::control::UiRequest::InterruptSshGroupCommand {
+                tab_id,
+                run_id,
+                pane_id,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply
+                        .send(self.control_interrupt_ssh_group_command(tab_id, run_id, pane_id));
+                    self.update_host_group_timer(context);
+                }
+            }
             Message::Control(w11term::control::UiRequest::CaptureSshGroupReport {
                 tab_id,
                 run_id,

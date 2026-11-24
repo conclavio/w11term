@@ -1390,14 +1390,29 @@ try {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
     }
+    $interruptRun = ((Control @('list-ssh-groups')).windows.groups.runs | Where-Object label -ceq 'interrupt-pair').run_id
+    $interruptArgs = @('interrupt-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$interruptRun")
+    $outside = & $Cli --pid $app.Id @interruptArgs --pane $local | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $outside.ok -or $outside.error -notlike '*not a recipient in this run*') {
+        throw 'An SSH group interrupt accepted a pane that was outside the run'
+    }
+    $interrupted = Control ($interruptArgs + @('--pane',"$east"))
+    $eastReceipt = $interrupted.run.recipients | Where-Object pane_id -eq $east
+    if ($interrupted.window_id -ne $groupWindow -or $interrupted.tab_id -ne $groupTab -or
+        $eastReceipt.interrupt.state -notin @('pending','sent')) {
+        throw 'The scoped interrupt did not report delivery state for East'
+    }
     (Wait-CheckBox $eastName Off).Toggle()
     $null = Wait-CheckBox $eastName On
-    Click 'Interrupt selected'
     Outcome $eastName 'Ctrl+C sent'
     Outcome $eastName 'Exit 130'
     Submit 'interrupt-both' 'Send to 2 hosts'
     Outcome $eastName 'Running'
     Outcome $westName 'Running'
+    $stale = & $Cli --pid $app.Id @interruptArgs --pane $east | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $stale.ok -or $stale.error -notlike '*no verified running command*') {
+        throw 'An interrupt for the previous run reached a newer command on the same pane'
+    }
     Click 'Interrupt selected'
     Outcome $eastName 'Exit 130'
     Outcome $westName 'Exit 130'
