@@ -617,6 +617,8 @@ impl TerminalApp {
         text: Arc<str>,
         transcript: &GroupTranscript,
     ) -> Delivery {
+        let host = transcript.host(target.pane);
+        let receipt = host.delivery_receipt();
         let mut execution = None;
         let status = match target.state {
             TargetState::Ready(prompt) | TargetState::Matched(prompt) => {
@@ -643,7 +645,7 @@ impl TerminalApp {
                                 text,
                                 reply,
                                 execution: observe,
-                                transcript: transcript.host(target.pane),
+                                transcript: host,
                             })
                             .is_ok()
                         {
@@ -658,6 +660,9 @@ impl TerminalApp {
             }
             state => DeliveryStatus::Rejected(state.label().into()),
         };
+        if let DeliveryStatus::Rejected(reason) = &status {
+            receipt.reject(reason);
+        }
         Delivery {
             target,
             status,

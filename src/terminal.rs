@@ -132,6 +132,18 @@ pub enum TransportInput {
     Resize(TerminalSize),
 }
 
+impl TransportInput {
+    pub(crate) fn reject_input(self, reason: &str) {
+        match self {
+            Self::Raw(_, reply) => {
+                let _ = reply.send(Err(reason.into()));
+            }
+            Self::Scoped { reply, kind, .. } => kind.reject(reply, reason),
+            _ => unreachable!("only acknowledged input has a reply"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ScopedInput {
     Clipboard,
@@ -140,6 +152,17 @@ pub enum ScopedInput {
 }
 
 impl ScopedInput {
+    pub(crate) fn reject(
+        &self,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reason: &str,
+    ) {
+        if let Self::GroupCommand(receipt) = self {
+            receipt.reject(reason);
+        }
+        let _ = reply.send(Err(reason.into()));
+    }
+
     pub(crate) fn stale_error(&self) -> &'static str {
         match self {
             Self::Clipboard => {

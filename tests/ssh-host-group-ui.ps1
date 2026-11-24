@@ -266,7 +266,9 @@ try {
     $expectedLines = @(
         "Submitted$($dot)both", "$eastName$($dot)east-accepted both",
         "$westName$($dot)west live first", "$westName$($dot)west while paused",
-        "$westName$($dot)west while away", '[Recording stopped]'
+        "$westName$($dot)west while away", '[Host outcomes]',
+        "$eastName$($dot)Sent to SSH channel$($dot)Exit 0",
+        "$westName$($dot)Sent to SSH channel$($dot)Running", '[Recording stopped]'
     )
     # Refocusing a terminal can reflow it, which adds a host-specific gap notice.
     $gap = 'A portion of this host' + [char]0x2019 + 's output was skipped.'
@@ -708,12 +710,17 @@ try {
     $logReader.Dispose()
     $logReader = $null
     Run-Palette 'SSH host group'
-    Outcome $westName 'Exit 0'
+    Outcome $westName 'Exit 17'
     Wait-RecordingStatus 'Saved live output to ' $burstPath
     $burst = [IO.File]::ReadAllLines($burstPath)
-    if ($burst[0] -cne "Submitted$($dot)record-fast" -or $burst[-2] -cne "$westName$($dot)west record tail" -or
-        $burst[-1] -cne '[Group run settled]') {
-        throw 'The automatic recording is missing the header, final output line, or completion marker'
+    $expectedTail = @(
+        "$westName$($dot)west record tail", '[Host outcomes]',
+        "$eastName$($dot)Sent to SSH channel$($dot)Exit 0",
+        "$westName$($dot)Sent to SSH channel$($dot)Exit 17", '[Group run settled]'
+    )
+    if ($burst[0] -cne "Submitted$($dot)record-fast" -or
+        ($burst[-5..-1] -join '|') -cne ($expectedTail -join '|')) {
+        throw "Unexpected final output and outcomes: $($burst[-5..-1] -join ' | ')"
     }
     foreach ($side in @('east', 'west')) {
         $prefix = if ($side -eq 'east') { $eastName + $dot } else { $westName + $dot }
@@ -748,6 +755,23 @@ try {
     }
     if ([IO.File]::ReadAllText((Join-Path $env:W11TERM_EXPORT_SMOKE_DIR $nextName)).Trim() -cne '[No command was sent]') {
         throw 'A stale review was presented as a recorded submission'
+    }
+    Pane-Status $west "Connected$($dot)Alternate screen"
+    (Command-Editor).SetValue('record-one')
+    Click $sendRecorded
+    $dialog = Wait-Until 'file picker for a group with an unavailable host' { Find-OwnedDialog 'Record SSH group output' }
+    $withheldPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'withheld.txt'
+    $null = Wait-Until 'enter the filename for the partially delivered submission' {
+        [FixtureDialog]::SetFilename($dialog, $withheldPath, $nextName)
+    }
+    $null = Wait-Until 'approve the new output path' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the final submission is shown' { Find-Element "Submitted$($dot)record-one" }
+    Wait-RecordingStatus 'Saved live output to ' $withheldPath
+    $outcomes = [IO.File]::ReadAllLines($withheldPath)
+    if ("$eastName$($dot)Sent to SSH channel$($dot)Exit 0" -cnotin $outcomes -or
+        "$westName$($dot)Not sent$($dot)Alternate screen" -cnotin $outcomes -or
+        $outcomes[-1] -cne '[Group run settled]') {
+        throw "The recording footer omitted the rejected host: $($outcomes -join ' | ')"
     }
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"

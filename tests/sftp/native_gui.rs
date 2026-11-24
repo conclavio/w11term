@@ -950,7 +950,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                 }
                                 if use_633 && line == "record-fast" {
                                     let output = format!(
-                                        "\r\n\x1b]633;E;record-fast\x07\x1b]633;C\x07{}\r\nwest record tail\x1b]633;D;0\x07\r\n",
+                                        "\r\n\x1b]633;E;record-fast\x07\x1b]633;C\x07{}\r\nwest record tail\x1b]633;D;17\x07\r\n",
                                         recording_burst("west")
                                     );
                                     let response = [output.as_bytes(), prompt].concat();
@@ -1015,7 +1015,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
     .unwrap();
     drive_gui("ssh-host-group-ui.ps1", state.path());
     let expected: [&[u8]; 2] = [
-        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\rrecord-fast\r",
+        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\rrecord-fast\rrecord-one\r",
         b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\ralt",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {

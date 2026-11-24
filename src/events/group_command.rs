@@ -82,6 +82,7 @@ impl GroupRun {
         status: watch::Sender<GroupExecution>,
         transcript: GroupTranscriptHost,
     ) -> Self {
+        transcript.set_execution(&status.borrow());
         Self {
             target,
             expected,
@@ -111,12 +112,11 @@ impl GroupRun {
     }
 
     pub(super) fn abandon(self, reason: &'static str) {
-        self.status
-            .send_replace(GroupExecution::Unavailable(reason));
+        self.publish(GroupExecution::Unavailable(reason));
     }
 
     pub(super) fn prompt_returned(self) {
-        self.status.send_replace(GroupExecution::PromptReturned);
+        self.publish(GroupExecution::PromptReturned);
     }
 
     pub(super) fn awaiting_prompt(&self) -> bool {
@@ -129,13 +129,17 @@ impl GroupRun {
             .as_ref()
             .is_some_and(|started| started.id == id)
         {
-            self.status
-                .send_replace(if label == Some(self.expected.as_ref()) {
-                    GroupExecution::Running(self.target)
-                } else {
-                    GroupExecution::AwaitingMarkers
-                });
+            self.publish(if label == Some(self.expected.as_ref()) {
+                GroupExecution::Running(self.target)
+            } else {
+                GroupExecution::AwaitingMarkers
+            });
         }
+    }
+
+    fn publish(&self, execution: GroupExecution) {
+        self.transcript.set_execution(&execution);
+        self.status.send_replace(execution);
     }
 
     pub(super) fn is_running(&self, target: GroupInterruptTarget) -> bool {
@@ -158,7 +162,7 @@ impl GroupRun {
             && let Some((id, label)) = started
         {
             if self.started.is_some() {
-                self.status.send_replace(GroupExecution::Unavailable(
+                self.publish(GroupExecution::Unavailable(
                     "Overlapping shell markers interrupted the command capture.",
                 ));
                 return false;
@@ -188,24 +192,23 @@ impl GroupRun {
                     }
             });
             if matched {
-                self.status
-                    .send_replace(GroupExecution::Finished(Arc::new(GroupCommandResult {
-                        link: CommandLink {
-                            generation: self.target.generation,
-                            id: command.id,
-                        },
-                        exit_code: command.exit_code,
-                        output: command.into(),
-                    })));
+                self.publish(GroupExecution::Finished(Arc::new(GroupCommandResult {
+                    link: CommandLink {
+                        generation: self.target.generation,
+                        id: command.id,
+                    },
+                    exit_code: command.exit_code,
+                    output: command.into(),
+                })));
             } else {
-                self.status.send_replace(GroupExecution::Unavailable(
+                self.publish(GroupExecution::Unavailable(
                     "The shell did not confirm the submitted command line.",
                 ));
             }
             return false;
         }
         if fresh_prompt {
-            self.status.send_replace(GroupExecution::Unavailable(
+            self.publish(GroupExecution::Unavailable(
                 "The shell returned to a prompt without a matching result.",
             ));
             return false;
