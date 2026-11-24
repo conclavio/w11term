@@ -293,6 +293,10 @@ impl TerminalApp {
                 "Finish reviewing the host list before opening another group."
             );
             ensure!(
+                !page.edit_membership_open(),
+                "Finish editing live pane membership before opening another group."
+            );
+            ensure!(
                 !page.prompt_setup.is_open(),
                 "Finish prompt setup before opening another group."
             );
@@ -325,9 +329,11 @@ impl TerminalApp {
             let label = self.unique_host_group_label(&format!("SSH group · {name}"), Some(id));
             if let Some(tab) = self.tabs.get_mut(id)
                 && let Page::HostGroup(page) = &mut tab.page
+                && let Some(roster) = &mut page.roster
             {
                 tab.label = label;
-                page.roster = Some(Box::default());
+                roster.panes.clear();
+                roster.show_window = false;
             }
         }
         self.start_host_group_panes(id, expected.iter().cloned().map(Some).zip(members), ctx);

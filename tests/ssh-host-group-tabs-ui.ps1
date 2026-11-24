@@ -73,6 +73,24 @@ function Submit([string]$Command) {
     Click 'Send to 1 host'
     $null = Wait-Until "'$Command' was submitted" { Find-Element "Submitted${dot}$Command" }
 }
+function Choose-GroupCommand([string]$Command) {
+    # The fixture can exercise the palette through its own UIA providers even
+    # when another window owns the desktop foreground.
+    Press-Key 0x76
+    (Field 'Search commands').SetValue($Command)
+    $null = Wait-Until "invoke group command '$Command'" {
+        try {
+            $item = Find-Element $Command $button
+            if ($item -and $item.Current.IsEnabled) {
+                Invoke-Button $item
+                return $true
+            }
+        } catch {
+            if ($_.Exception.GetBaseException() -isnot [System.Windows.Automation.ElementNotAvailableException]) { throw }
+        }
+    }
+    $null = Wait-Until 'the group command closes the palette' { !(Find-Element 'Search commands' $edit) }
+}
 
 $argsForApp = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','110','--rows','34')
 $app = Start-Process -FilePath $Gui -ArgumentList $argsForApp -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -80,7 +98,7 @@ try {
     $window = Wait-InputWindow
     $eastTab = "SSH group${dot}Fleet East"
     $westTab = "SSH group${dot}Fleet West"
-    Run-Palette "Open SSH group${dot}Fleet East"
+    Choose-GroupCommand "Open SSH group${dot}Fleet East"
     Wait-Tab $eastTab
     $east = (Session 'East').id
     $eastName = Target-Label 'East' $east
@@ -110,7 +128,7 @@ try {
 
     Click "Focus result pane $west"
     Wait-Focus $west
-    Run-Palette 'SSH host group'
+    Choose-GroupCommand 'SSH host group'
     Wait-Tab $westTab
     (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
     (Wait-CheckBox $eastName Off).Toggle()
@@ -133,7 +151,7 @@ try {
             !(Find-Element "Submitted${dot}west-probe")
     }
 
-    Run-Palette 'New SSH group tab'
+    Choose-GroupCommand 'New SSH group tab'
     Wait-Tab 'SSH host group'
     $null = Wait-CheckBox $eastName Off
     $null = Wait-CheckBox $westName Off
@@ -143,6 +161,56 @@ try {
     $null = Wait-CheckBox $westName On
     $null = Wait-Until 'West retains its own results and narrow scope' {
         (Find-Element "Submitted${dot}west-probe") -and !(Find-Element "Focus pane $east" $button)
+    }
+
+    Select-Tab $eastTab
+    (Field 'Host filter').SetValue('')
+    $manage = 'Manage live panes' + [char]0x2026
+    Click $manage
+    $null = Wait-CheckBox "Include $eastName" On
+    $null = Wait-CheckBox "Include $westName" Off
+    (Field 'Find SSH panes').SetValue("WEST $($config.West.port)")
+    $null = Wait-Until 'membership search isolates West' {
+        (Find-Element "Include $westName") -and !(Find-Element "Include $eastName")
+    }
+    (Wait-CheckBox "Include $westName" Off).Toggle()
+    $null = Wait-CheckBox "Include $westName" On
+    Click 'Cancel'
+    $null = Wait-Until 'cancel leaves the committed East roster intact' {
+        (Find-Element $manage $button) -and !(Find-Element "Focus pane $west" $button)
+    }
+    Click $manage
+    (Wait-CheckBox "Include $westName" Off).Toggle()
+    $null = Wait-CheckBox "Include $westName" On
+    Click 'Apply membership'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName Off
+    Expect-Field 'Group command' 'east-only draft'
+    $null = Wait-Until 'adding a member preserves the previous submission' { Find-Element "Submitted${dot}east-probe" }
+    (Wait-CheckBox $eastName On).Toggle()
+    $null = Wait-CheckBox $eastName Off
+    (Wait-CheckBox $westName Off).Toggle()
+    $null = Wait-CheckBox $westName On
+    Submit 'shared-probe'
+    $null = Wait-Until 'West receives the intentionally selected command' { Find-Element "$westName${dot}Exit 0" }
+
+    Click $manage
+    (Wait-CheckBox "Include $westName" On).Toggle()
+    $null = Wait-CheckBox "Include $westName" Off
+    Click 'Apply membership'
+    $null = Wait-Until 'removal hides West on the named East roster' {
+        (Find-Element $manage $button) -and !(Find-Element "Focus pane $west" $button)
+    }
+    (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
+    $null = Wait-CheckBox $westName Off
+    Select-Tab $westTab
+    $null = Wait-CheckBox $westName On
+    $null = Wait-Until 'the other group retains its selection and own result' {
+        (Find-Element "Submitted${dot}west-probe") -and !(Find-Element "Submitted${dot}shared-probe")
+    }
+    $current = (Session 'West')
+    if ($current.id -ne $west -or @((Control @('list')).sessions).Count -ne 3) {
+        throw 'Editing membership replaced a running SSH session'
     }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
