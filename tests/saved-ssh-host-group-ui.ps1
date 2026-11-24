@@ -14,7 +14,7 @@ $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
 
 function Catalog {
-    # ProfileStore atomically replaces the path while this fixture polls it.
+    # Read after the app acknowledges saves so this handle cannot block replacement.
     $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
     $stream = [IO.File]::Open($profiles, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
     $reader = [IO.StreamReader]::new($stream)
@@ -235,8 +235,9 @@ try {
     $null = Wait-CheckBox $showOutput On
     Click $saveDefaults
     $null = Wait-Until 'the defaults are saved for Fleet' {
+        if (!(Find-Element 'Saved roster defaults')) { return }
         $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
-        (Find-Element 'Saved roster defaults') -and $savedDefaults.order -ceq 'label' -and
+        $savedDefaults.order -ceq 'label' -and
             $savedDefaults.show_last_output -and $savedDefaults.require_all_ready
     }
     (Wait-CheckBox $showOutput On).Toggle()
@@ -273,9 +274,9 @@ try {
     $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Fleet copy')
     Click 'Save copy'
     $null = Wait-Until 'the group copy is saved' {
+        if (!(Find-Element 'SSH group copied')) { return }
         $saved = Catalog
-        (Find-Element 'SSH group copied') -and
-            ($saved.ssh_host_groups.'Fleet copy' -join ',') -ceq 'West,East' -and
+        ($saved.ssh_host_groups.'Fleet copy' -join ',') -ceq 'West,East' -and
             $saved.ssh_host_group_defaults.'Fleet copy'.order -ceq 'label' -and
             $saved.ssh_host_group_defaults.'Fleet copy'.show_last_output
     }
@@ -356,9 +357,9 @@ try {
     }
     Click 'Save imported group'
     $null = Wait-Until 'the reviewed group is saved with its settings' {
+        if (!(Find-Element 'SSH group imported')) { return }
         $saved = Catalog
-        (Find-Element 'SSH group imported') -and
-            ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West Local,East' -and
+        ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West Local,East' -and
             ($saved.ssh_recipient_sets.'Portable Fleet'.Canary -join ',') -ceq 'East,West Local' -and
             $saved.ssh_host_group_defaults.'Portable Fleet'.show_last_output
     }

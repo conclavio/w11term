@@ -75,15 +75,24 @@ function Assert-PreviewOnly {
 function Open-HostListFile([string]$Name) {
     Click $openFile
     $dialog = Wait-Until 'owned host list file picker' { Find-OwnedDialog 'Open SSH host list' }
-    if ($Name) { Select-DialogItem $dialog $Name }
+    if ($Name) {
+        $path = Join-Path $env:W11TERM_HOST_LIST_SMOKE_DIR $Name
+        $null = Wait-Until "enter host list fixture '$Name'" { [FixtureDialog]::SetFilename($dialog, $path, '') }
+    }
     $buttonId = if ($Name) { 1 } else { 2 }
     $null = Wait-Until 'close the host list file picker' { [FixtureDialog]::ClickButton($dialog, $buttonId) }
     $null = Wait-Until 'host list picker dismissed' { !(Find-OwnedDialog 'Open SSH host list') }
 }
-function Expect-HostList([string]$Expected) {
-    $null = Wait-Until 'host list editor contains the expected text' {
-        $text = (Text-Field 'SSH host list').Current.Value
-        $text.Replace("`r`n", "`n").Replace("`r", "`n") -ceq $Expected
+function Expect-HostList([string]$Expected, [string]$Step) {
+    try {
+        $null = Wait-Until "host list editor contains the expected text $Step" {
+            $text = (Text-Field 'SSH host list').Current.Value
+            $text.Replace("`r`n", "`n").Replace("`r", "`n") -ceq $Expected
+        }
+    } catch {
+        $field = Find-Element 'SSH host list' $edit
+        if ($field) { Write-Host "Host list editor contains: $($field.GetCurrentPattern($value).Current.Value)" }
+        throw
     }
 }
 function Expect-Connection([string]$HostLabel, [string]$Choice) {
@@ -106,16 +115,18 @@ try {
     Click 'SSH host group' $menu
     Click $label
     (Text-Field 'Default SSH user').SetValue('test')
+    $null = Wait-Until 'default user is set' { (Text-Field 'Default SSH user').Current.Value -ceq 'test' }
     $typed = 'test@keep.example:22'
     (Text-Field 'SSH host list').SetValue($typed)
+    Expect-HostList $typed 'before opening the picker'
     Open-HostListFile
-    Expect-HostList $typed
+    Expect-HostList $typed 'after cancelling the picker'
     Open-HostListFile 'bad-hosts'
     $errorText = 'Could not open the host list. Choose a UTF-8 or BOM-marked UTF-16 text file.'
     $null = Wait-Until 'invalid host list is reported' { Find-Element $errorText }
-    Expect-HostList $typed
+    Expect-HostList $typed 'after trying the invalid file'
     Open-HostListFile 'fleet-hosts'
-    Expect-HostList $fleetText
+    Expect-HostList $fleetText 'after opening the valid file'
     $null = Wait-Until 'loading clears the file error' { !(Find-Element $errorText) }
     if ((Text-Field 'Default SSH user').Current.Value -cne 'test') { throw 'Loading changed the default SSH user' }
     Assert-PreviewOnly
