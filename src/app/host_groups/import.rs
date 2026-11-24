@@ -6,6 +6,7 @@ mod file;
 mod list;
 mod ranges;
 mod review;
+mod save_group;
 use review::{Approval, Review};
 
 const LABEL: &str = "Import host list…";
@@ -47,6 +48,8 @@ pub enum Change {
     Check(usize, bool),
     Connection(usize, Option<reuse::Connection>),
     ReuseUnique,
+    BeginSaveGroup(BTreeSet<usize>),
+    SaveGroup(save_group::Action),
     Edit,
     Cancel,
     Open(Approval),
@@ -228,6 +231,12 @@ impl TerminalApp {
         match change {
             Change::Preview => return self.preview_host_import(id, revision),
             Change::Open(approval) => return self.open_host_import(id, revision, approval, ctx),
+            Change::BeginSaveGroup(checked) => {
+                return self.begin_import_group_save(id, revision, checked);
+            }
+            Change::SaveGroup(save_group::Action::Save) => {
+                return self.save_import_group(id, revision);
+            }
             _ => {}
         }
         let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
@@ -331,6 +340,19 @@ impl TerminalApp {
             Change::ReuseUnique => {
                 if let Some(review) = &mut draft.review {
                     review.reuse_unique();
+                    draft.error = None;
+                }
+            }
+            Change::SaveGroup(change) => {
+                if let Some(review) = &mut draft.review
+                    && let Some(editor) = &mut review.save
+                {
+                    if matches!(change, save_group::Action::Back) {
+                        review.save = None;
+                        state.revision += 1;
+                    } else {
+                        editor.edit(change);
+                    }
                     draft.error = None;
                 }
             }

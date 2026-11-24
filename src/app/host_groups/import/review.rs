@@ -7,6 +7,7 @@ pub struct Approval(BTreeMap<usize, Option<reuse::Connection>>);
 pub(super) struct Review {
     pub(super) rows: Vec<list::Row>,
     pub(super) checked: BTreeSet<usize>,
+    pub(super) save: Option<save_group::Editor>,
     choices: BTreeMap<usize, Choice>,
 }
 
@@ -57,6 +58,7 @@ impl Review {
             rows,
             checked,
             choices,
+            save: None,
         }
     }
 
@@ -105,6 +107,9 @@ impl Review {
         error: View,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
+        if let Some(editor) = &self.save {
+            return editor.view(action, cancel, error, ctx);
+        }
         let rows = self.rows.iter().enumerate().map(|(index, row)| {
             let view = match &row.target {
                 Ok(target) => {
@@ -139,6 +144,7 @@ impl Review {
             KeyedView::new(index, view)
         });
         let approval = self.approval();
+        let checked = self.checked.clone();
         let reused = approval.0.values().flatten().count();
         let count = approval.0.len();
         let fresh = count - reused;
@@ -182,6 +188,17 @@ impl Review {
                                 )
                                 .content(format!("{verb} {count} checked {unit}")),
                             unique,
+                        )),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .is_enabled(count > 0)
+                                .on_click(ctx.callback(move |_| {
+                                    action(Change::BeginSaveGroup(checked.clone()))
+                                }))
+                                .content("Save checked hosts as group…"),
                             Button::new()
                                 .on_click(ctx.callback(move |_| action(Change::Edit)))
                                 .content("Edit host list"),
@@ -221,7 +238,7 @@ fn launch_plan(
 }
 
 impl TerminalApp {
-    fn import_draft(&self, id: TabId, revision: u64) -> Option<&Draft> {
+    pub(super) fn import_draft(&self, id: TabId, revision: u64) -> Option<&Draft> {
         let Page::HostGroup(page) = &self.tabs.get(id)?.page else {
             return None;
         };
@@ -272,11 +289,9 @@ impl TerminalApp {
         let Some(draft) = self.import_draft(id, revision) else {
             return;
         };
-        let Some(review) = draft
-            .review
-            .as_ref()
-            .filter(|review| !approval.0.is_empty() && review.approval() == approval)
-        else {
+        let Some(review) = draft.review.as_ref().filter(|review| {
+            review.save.is_none() && !approval.0.is_empty() && review.approval() == approval
+        }) else {
             return;
         };
         let catalog = match self.store.catalog() {
@@ -327,7 +342,7 @@ impl TerminalApp {
         }
     }
 
-    fn report_import_error(&mut self, id: TabId, error: anyhow::Error) {
+    pub(super) fn report_import_error(&mut self, id: TabId, error: anyhow::Error) {
         if let Some(page) = self.host_group_mut(id)
             && let Some(draft) = &mut page.import.draft
         {

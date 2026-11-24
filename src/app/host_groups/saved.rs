@@ -56,6 +56,11 @@ impl Selection {
 }
 
 impl SavedUi {
+    pub(super) fn select_imported_group(&mut self, name: String) {
+        self.selected = Some(name);
+        self.feedback.clear();
+    }
+
     pub(super) fn is_editing(&self) -> bool {
         self.editor.is_some() || self.roster_update.is_open() || self.recipient_sets.is_open()
     }

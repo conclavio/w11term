@@ -20,6 +20,17 @@ pub struct ProfileStore {
     path: PathBuf,
 }
 
+pub enum ImportedGroupMember<'a> {
+    Existing {
+        name: &'a str,
+        reviewed: &'a SshOptions,
+    },
+    New {
+        name: &'a str,
+        options: &'a SshOptions,
+    },
+}
+
 const SHARE_TOKEN: &str = "folder_share_id";
 const SHARE_EPOCH: &str = "folder_share_epoch";
 const STARTUP_PROFILE: &str = "startup_profile";
@@ -152,6 +163,41 @@ fn replace_profile_member(members: &mut Vec<String>, old: &str, new: Option<&str
     });
 }
 
+fn validate_group_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name == name.trim() && !name.chars().any(char::is_control),
+        "Enter a group name on one line"
+    );
+    Ok(())
+}
+
+fn validate_ssh_profile(name: &str, options: &SshOptions) -> Result<()> {
+    ensure!(
+        crate::assets::name(&options.player.bell),
+        "Bell must be system, off, or a sound name (letters, digits, _ and -)"
+    );
+    ensure!(!name.trim().is_empty(), "Enter a profile name");
+    ensure!(
+        name == name.trim(),
+        "Profile name cannot start or end with spaces"
+    );
+    ensure!(
+        !options.host.trim().is_empty() && !options.user.trim().is_empty(),
+        "Enter a host and user"
+    );
+    ensure!(options.port != 0, "Port must be between 1 and 65535");
+    options.validate_route()
+}
+
+fn replace_share_epoch(object: &mut serde_json::Map<String, serde_json::Value>) {
+    object.remove(SHARE_TOKEN);
+    // Distinguish a recreated profile even when its visible options match.
+    object.insert(
+        SHARE_EPOCH.into(),
+        format!("{:032x}", rand::random::<u128>()).into(),
+    );
+}
+
 impl ProfileStore {
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -180,10 +226,7 @@ impl ProfileStore {
         members: &[String],
         original: Option<(&str, &[String])>,
     ) -> Result<Profiles> {
-        ensure!(
-            !name.is_empty() && name == name.trim() && !name.chars().any(char::is_control),
-            "Enter a group name on one line"
-        );
+        validate_group_name(name)?;
         self.modify(|_, catalog| {
             let mut groups = catalog.ssh_host_groups.clone();
             if let Some((old, expected)) = original {
@@ -205,6 +248,78 @@ impl ProfileStore {
             Ok(CatalogEdit {
                 ssh_host_groups: Some(groups),
                 ssh_recipient_sets,
+                ..Default::default()
+            })
+        })
+    }
+
+    /// Save the group and any new SSH profiles in a single catalog replacement.
+    pub fn save_imported_ssh_group(
+        &self,
+        name: &str,
+        entries: &[ImportedGroupMember<'_>],
+        verify_review: impl FnOnce(&Profiles) -> Result<()>,
+    ) -> Result<Profiles> {
+        validate_group_name(name)?;
+        ensure!(!entries.is_empty(), "Check at least one SSH host");
+        self.modify(|profiles, catalog| {
+            verify_review(catalog)?;
+            ensure!(
+                !catalog.ssh_host_groups.contains_key(name),
+                "An SSH group named {name} already exists"
+            );
+            let mut seen = std::collections::BTreeSet::new();
+            let mut members = Vec::with_capacity(entries.len());
+            let mut order = None;
+            for entry in entries {
+                let member = match *entry {
+                    ImportedGroupMember::Existing { name, reviewed } => {
+                        ensure!(
+                            catalog.ssh_host_group_member(name) == Some(reviewed),
+                            "SSH profile {name} changed. Preview the host list again."
+                        );
+                        name
+                    }
+                    ImportedGroupMember::New { name, options } => {
+                        validate_ssh_profile(name, options)?;
+                        ensure!(
+                            !name.chars().any(char::is_control),
+                            "Enter a profile name on one line"
+                        );
+                        ensure!(
+                            !profiles.contains_key(name) && !catalog.local.contains_key(name),
+                            "Profile {name} already exists"
+                        );
+                        ensure!(
+                            !options.durable && !options.player.rustmush,
+                            "Choose a direct SSH shell for the new profile"
+                        );
+                        let mut value = serde_json::to_value(options)?;
+                        replace_share_epoch(
+                            value
+                                .as_object_mut()
+                                .context("SSH profile must be an object")?,
+                        );
+                        profiles.insert(name.into(), value);
+                        if catalog.has_explicit_order {
+                            order
+                                .get_or_insert_with(|| catalog.profile_order.clone())
+                                .push(name.into());
+                        }
+                        name
+                    }
+                };
+                ensure!(
+                    seen.insert(member),
+                    "SSH profile {member} appears more than once"
+                );
+                members.push(member.to_owned());
+            }
+            let mut groups = catalog.ssh_host_groups.clone();
+            groups.insert(name.to_owned(), members);
+            Ok(CatalogEdit {
+                order,
+                ssh_host_groups: Some(groups),
                 ..Default::default()
             })
         })
@@ -555,21 +670,7 @@ impl ProfileStore {
         expected: Option<&SshOptions>,
         copy: Option<&ProfileSnapshot>,
     ) -> Result<Profiles> {
-        ensure!(
-            crate::assets::name(&options.player.bell),
-            "Bell must be system, off, or a sound name (letters, digits, _ and -)"
-        );
-        ensure!(!name.trim().is_empty(), "Enter a profile name");
-        ensure!(
-            name == name.trim(),
-            "Profile name cannot start or end with spaces"
-        );
-        ensure!(
-            !options.host.trim().is_empty() && !options.user.trim().is_empty(),
-            "Enter a host and user"
-        );
-        ensure!(options.port != 0, "Port must be between 1 and 65535");
-        options.validate_route()?;
+        validate_ssh_profile(name, options)?;
         self.modify(|profiles, catalog| {
             if let Some(copy) = copy {
                 ensure!(
@@ -617,13 +718,7 @@ impl ProfileStore {
                             || old.host_key_alias != options.host_key_alias
                     })
             {
-                object.remove(SHARE_TOKEN);
-                // Distinguish a recreated profile even when its visible options
-                // match a still-open folder picker from the old incarnation.
-                object.insert(
-                    SHARE_EPOCH.into(),
-                    format!("{:032x}", rand::random::<u128>()).into(),
-                );
+                replace_share_epoch(object);
             }
             let keep_identity = expected
                 .is_some_and(|previous| previous.authentication == options.authentication)
@@ -818,6 +913,75 @@ fn recipient_sets_after_group_edit(
 mod tests {
     use super::*;
     use crate::options::Authentication;
+
+    #[test]
+    fn imported_group_and_new_profiles_commit_together_in_review_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let original = br#"{"profiles":{"West":{"host":"west.example","user":"ops","auth":"agent","note":"keep"}},"profile_order":["West"],"other":7}"#;
+        std::fs::write(&path, original).unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let catalog = store.catalog().unwrap();
+        let new_host = SshOptions::from_destination("ops@east.example:2222").unwrap();
+        let mut changed = catalog.profiles["West"].clone();
+        changed.port = 2200;
+        let entries = [
+            ImportedGroupMember::New {
+                name: "East",
+                options: &new_host,
+            },
+            ImportedGroupMember::Existing {
+                name: "West",
+                reviewed: &changed,
+            },
+        ];
+        assert!(
+            store
+                .save_imported_ssh_group("Fleet", &entries, |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let entries = [
+            ImportedGroupMember::New {
+                name: "East",
+                options: &new_host,
+            },
+            ImportedGroupMember::Existing {
+                name: "West",
+                reviewed: &catalog.profiles["West"],
+            },
+        ];
+        assert!(
+            store
+                .save_imported_ssh_group("Fleet", &entries, |_| anyhow::bail!("stale review"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let saved = store
+            .save_imported_ssh_group("Fleet", &entries, |_| Ok(()))
+            .unwrap();
+        assert_eq!(saved.ssh_host_groups["Fleet"], ["East", "West"]);
+        assert_eq!(saved.profile_order.last().unwrap(), "East");
+        assert_eq!(
+            saved
+                .resolve_ssh_host_group_members(&saved.ssh_host_groups["Fleet"])
+                .unwrap(),
+            [&new_host, &catalog.profiles["West"]]
+        );
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["other"], 7);
+        assert_eq!(raw["profiles"]["West"]["note"], "keep");
+        assert!(raw["profiles"]["East"][SHARE_EPOCH].is_string());
+        raw["profile_order"] = serde_json::json!(["West", "Old name", "East"]);
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        store
+            .save_imported_ssh_group("Existing only", &entries[1..], |_| Ok(()))
+            .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(written["profile_order"], raw["profile_order"]);
+    }
 
     #[test]
     fn saving_preserves_other_fields_and_refuses_to_overwrite_existing_profiles() {
