@@ -151,6 +151,45 @@ enum TargetState {
     Matched(PromptToken),
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum RosterStatus {
+    #[default]
+    All,
+    Ready,
+    Waiting,
+    Unverified,
+    Disconnected,
+    Authentication,
+    ReadOnly,
+    Alternate,
+}
+
+impl RosterStatus {
+    const OPTIONS: [Self; 8] = [
+        Self::All,
+        Self::Ready,
+        Self::Waiting,
+        Self::Unverified,
+        Self::Disconnected,
+        Self::Authentication,
+        Self::ReadOnly,
+        Self::Alternate,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All host states",
+            Self::Ready => "Ready",
+            Self::Waiting => "Waiting for a fresh prompt",
+            Self::Unverified => "Prompt unverified",
+            Self::Disconnected => "Disconnected",
+            Self::Authentication => "Authentication required",
+            Self::ReadOnly => "Read-only",
+            Self::Alternate => "Alternate screen",
+        }
+    }
+}
+
 impl TargetState {
     fn is_ready(self) -> bool {
         self.prompt().is_some()
@@ -163,17 +202,23 @@ impl TargetState {
         }
     }
 
+    fn status(self) -> RosterStatus {
+        match self {
+            Self::Offline | Self::Restartable(_) => RosterStatus::Disconnected,
+            Self::Authentication => RosterStatus::Authentication,
+            Self::ReadOnly => RosterStatus::ReadOnly,
+            Self::Alternate => RosterStatus::Alternate,
+            Self::Unverified => RosterStatus::Unverified,
+            Self::InUse => RosterStatus::Waiting,
+            Self::Ready(_) | Self::Matched(_) => RosterStatus::Ready,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
-            Self::Offline => "Disconnected",
             Self::Restartable(_) => "Disconnected · reconnect available",
-            Self::Authentication => "Authentication required",
-            Self::ReadOnly => "Read-only",
-            Self::Alternate => "Alternate screen",
-            Self::Unverified => "Prompt unverified",
-            Self::InUse => "Waiting for a fresh prompt",
-            Self::Ready(_) => "Ready",
             Self::Matched(_) => "Ready · prompt match",
+            _ => self.status().label(),
         }
     }
 }
@@ -439,6 +484,7 @@ pub enum Action {
     Edit(TabId, String),
     Filter(TabId, String),
     FilterWildcards(TabId, bool),
+    FilterStatus(TabId, RosterStatus),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
     RecipientSets(TabId, recipient_sets::Action),
@@ -915,6 +961,11 @@ impl TerminalApp {
                     page.filter.set_wildcards(wildcards);
                 }
             }
+            Action::FilterStatus(id, status) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.filter.set_status(status);
+                }
+            }
             Action::ShowWindowRoster(id, show) => {
                 if self.host_group_command_target() == Some(id)
                     && let Some(page) = self.host_group_mut(id)
@@ -1317,7 +1368,7 @@ impl TerminalApp {
         };
         let filter_input = Grid::new()
             .column_spacing(8.0)
-            .columns([GridLength::STAR, GridLength::Auto])
+            .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
             .children((
                 TextBox::new()
                     .automation_name("Host filter")
@@ -1338,6 +1389,26 @@ impl TerminalApp {
                         Message::HostGroup(Action::FilterWildcards(id, checked))
                     }))
                     .content("Use wildcards"),
+                ComboBox::new()
+                    .grid_column(2)
+                    .automation_name("Filter host state")
+                    .items_source(
+                        RosterStatus::OPTIONS
+                            .map(|status| status.label().to_owned())
+                            .to_vec(),
+                    )
+                    .selected_index(
+                        RosterStatus::OPTIONS
+                            .iter()
+                            .position(|&status| status == page.filter.status()),
+                    )
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index
+                            .and_then(|index| RosterStatus::OPTIONS.get(index))
+                            .map_or(Message::ControlIdle, |&status| {
+                                Message::HostGroup(Action::FilterStatus(id, status))
+                            })
+                    })),
             ));
         let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
             filter_input,

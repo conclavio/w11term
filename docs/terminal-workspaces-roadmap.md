@@ -168,6 +168,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 52. **Choose connections for launch matches together.** Use fresh panes or select unique live matches for included profiles across pages. Preserve explicit choices when reuse is ambiguous.
 53. **Update a recipient set before connecting.** Review additions and removals against a chosen set and confirm the update against its saved membership.
 54. **Manage recipient sets before connecting.** Rename an existing set or confirm its deletion while keeping the current launch choices.
+55. **Filter the live roster by host state.** Combine live SSH and prompt state with the name filter. Keep hidden selections and recheck the visible scope before dispatch.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

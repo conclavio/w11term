@@ -693,8 +693,31 @@ try {
     Submit 'while-alt' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Alternate screen"
+    $hostStateFilter = 'Filter host state'
+    Select-ComboValue $hostStateFilter 'Ready'
+    $null = Wait-Until 'the ready filter scopes the roster and send count to East' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and $send.Current.IsEnabled -and (Find-Element "Focus pane $east" $button) -and
+            !(Find-Element "Focus pane $west" $button) -and
+            (Find-Element '1 selected host is hidden by the filter.')
+    }
+    Select-ComboValue $hostStateFilter 'Alternate screen'
+    Set-HostFilter 'east'
+    $null = Wait-Until 'the text filter still applies inside the selected host state' {
+        Find-Element 'No SSH panes match this filter.'
+    }
+    Set-HostFilter ''
+    $null = Wait-CheckBox $westName On
+    $null = Wait-Until 'West is shown with its original check but cannot receive a command' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and !$send.Current.IsEnabled -and !(Find-Element "Focus pane $east" $button)
+    }
+    Select-ComboValue $hostStateFilter 'Ready'
     Send-Raw $west 'prompt'
     Pane-Status $west "Connected${dot}Ready"
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
+    Select-ComboValue $hostStateFilter 'All host states'
     $previous = (Control @('inspect','--pane',"$west")).connection_generation
     Send-Raw $west 'drop'
     $null = Wait-Until 'replacement SSH transport' {
@@ -1021,6 +1044,9 @@ try {
         }
     }
     if ([IO.File]::ReadAllText($burstPath) -cne $beforeCollision) { throw 'The existing recording was modified' }
+    Select-ComboValue $hostStateFilter 'Ready'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     (Command-Editor).SetValue('never-send-with-stale-prompt')
     Click $sendRecorded
     $dialog = Wait-Until 'file picker before a host changes prompt state' { Find-OwnedDialog 'Record SSH group output' }
@@ -1033,6 +1059,7 @@ try {
     if ([IO.File]::ReadAllText((Join-Path $env:W11TERM_EXPORT_SMOKE_DIR $nextName)).Trim() -cne '[No command was sent]') {
         throw 'A stale review was presented as a recorded submission'
     }
+    Select-ComboValue $hostStateFilter 'All host states'
     Pane-Status $west "Connected$($dot)Alternate screen"
     (Command-Editor).SetValue('record-one')
     Click $sendRecorded

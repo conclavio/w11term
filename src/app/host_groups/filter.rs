@@ -1,4 +1,4 @@
-use super::Target;
+use super::{RosterStatus, Target};
 use regex::{RegexSet, RegexSetBuilder};
 use std::{fmt::Write, sync::Arc};
 
@@ -10,6 +10,7 @@ pub(super) struct Filter {
     query: String,
     wildcards: bool,
     matcher: Matcher,
+    status: RosterStatus,
 }
 
 #[derive(Clone, Default)]
@@ -70,6 +71,14 @@ impl Filter {
         self.wildcards
     }
 
+    pub(super) fn status(&self) -> RosterStatus {
+        self.status
+    }
+
+    pub(super) fn set_status(&mut self, status: RosterStatus) {
+        self.status = status;
+    }
+
     pub(super) fn set_query(&mut self, query: String) {
         if self.query != query {
             self.query = query;
@@ -87,6 +96,7 @@ impl Filter {
     pub(super) fn clear(&mut self) {
         self.query.clear();
         self.matcher = Matcher::All;
+        self.status = RosterStatus::All;
     }
 
     fn refresh(&mut self) {
@@ -108,6 +118,9 @@ impl Filter {
     }
 
     pub(super) fn matches(&self, target: &Target) -> bool {
+        if self.status != RosterStatus::All && self.status != target.state.status() {
+            return false;
+        }
         match &self.matcher {
             Matcher::All => true,
             Matcher::Invalid(_) => false,
@@ -347,5 +360,36 @@ mod tests {
         group.filter.set_query("edge*".into());
         group.filter.set_wildcards(false);
         assert_eq!(group.selected_shown(&targets), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn live_state_intersects_name_filters_and_keeps_hidden_checks() {
+        let mut targets = [
+            target(1, "East", "web-01", 22, "Production East"),
+            target(2, "West", "web-02", 22, "Production West"),
+            target(3, "Cache", "cache-01", 22, "Cache"),
+        ];
+        targets[1].state = TargetState::Alternate;
+        let mut group = HostGroup {
+            selected: BTreeSet::from([1, 2, 3]),
+            ..Default::default()
+        };
+        group.filter.set_query("production".into());
+        group.filter.set_status(RosterStatus::Disconnected);
+        assert_eq!(group.selected_shown(&targets), BTreeSet::from([1]));
+        group.filter.set_status(RosterStatus::Alternate);
+        assert_eq!(group.selected_shown(&targets), BTreeSet::from([2]));
+
+        targets[1].state = TargetState::InUse;
+        assert!(group.selected_shown(&targets).is_empty());
+        group.filter.set_status(RosterStatus::Waiting);
+        assert_eq!(group.selected_shown(&targets), BTreeSet::from([2]));
+
+        group.filter.set_wildcards(true);
+        group.filter.set_query("web-*, !*West".into());
+        assert!(group.selected_shown(&targets).is_empty());
+        group.filter.clear();
+        assert_eq!(group.selected, BTreeSet::from([1, 2, 3]));
+        assert_eq!(group.selected_shown(&targets), group.selected);
     }
 }
