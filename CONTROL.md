@@ -220,6 +220,14 @@ bytes. `lost=true` reports eviction. Events include `bell`, `title`, `notificati
 audible playback; inspect the `sound` outcome. See [the game protocol](docs/game-client-protocol.md).
 The CLI allows the requested wait timeout plus 15 seconds for these replies.
 
+For SSH panes the reply also includes `ssh_connection`, an object with a
+`phase` of `connecting`, `connected`, `reconnecting`, `disconnected`,
+`stopped`, or `failed`. Reconnecting includes an `attempt` number for an
+automatic retry and `null` for an explicit restart. Failed includes a short
+`reason`. The journal adds an `ssh-connection` event on each phase change
+with the same data shape. The connection snapshot and restart token describe
+the pane at reply time, including when recorded transitions have aged out.
+
 A command completion watch armed in the GUI adds one `command-finished` event to
 the originating pane. Its data is `{"exit_code":17}` for a reported status or
 `{"exit_code":null}` when the shell supplied none. Command lines and output stay

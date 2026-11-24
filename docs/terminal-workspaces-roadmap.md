@@ -183,6 +183,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 67. **Count matching hosts by live state.** Follow the active group and host query. Show the count in each state and how many matches are visible under the state filter.
 68. **Search and focus a shown SSH host.** Open a pane picker scoped to the current roster. Show a preview and recheck the group membership and filters before focusing the pane.
 69. **Stop selected SSH attempts.** Stop pending handshakes, authentication prompts, or automatic retries for checked hosts shown by the roster. Keep the panes available for manual reconnect and reject requests after the shell becomes ready.
+70. **Report SSH lifecycle changes to the control pipe.** Include the pane’s current SSH phase and journal its transitions. Report the final phase with the restart token so scripts can handle stopped or failed panes directly.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

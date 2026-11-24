@@ -24,9 +24,19 @@ function Get-ExitToken([int]$Pane) {
     (Control @('events','--pane',"$Pane")).restart_token
 }
 function Wait-Stopped([int]$Pane) {
-    $null = Wait-Until "pane $Pane to stop and offer reconnect" {
-        (Find-Element "Pane $Pane${dot}Connection stopped${dot}reconnect available") -and
-            (Find-Element "Reconnect SSH pane $Pane" $button) -and (Get-ExitToken $Pane)
+    $stopped = Wait-Until "pane $Pane to stop and offer reconnect" {
+        $state = Control @('events','--pane',"$Pane")
+        if ((Find-Element "Pane $Pane${dot}Connection stopped${dot}reconnect available") -and
+            (Find-Element "Reconnect SSH pane $Pane" $button) -and $state.restart_token -and
+            $state.ssh_connection.phase -eq 'stopped' -and
+            ($state.journal.events | Where-Object { $_.kind -eq 'ssh-connection' -and $_.data.phase -eq 'stopped' })) {
+            $state
+        }
+    }
+    $snapshot = Control @('events','--pane',"$Pane",'--since',"$($stopped.journal.next)")
+    if ($snapshot.ssh_connection.phase -ne 'stopped' -or $snapshot.restart_token -ne $stopped.restart_token -or
+        ($snapshot.journal.events | Where-Object kind -eq 'ssh-connection')) {
+        throw 'Reading from the latest cursor lost the stopped phase or restart token, or repeated a transition'
     }
 }
 
@@ -36,6 +46,10 @@ try {
     $window = Wait-InputWindow
     $null = Wait-Until 'the control pipe' {
         Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json")
+    }
+    $demo = ((Control @('list')).sessions | Where-Object label -ceq 'Terminal lab').id
+    if ((Control @('events','--pane',"$demo")).PSObject.Properties.Name -contains 'ssh_connection') {
+        throw 'A non-SSH pane reported an SSH connection'
     }
     Run-Palette "Open SSH group${dot}Stop attempts"
     $sessions = Wait-Until 'three SSH panes' {
@@ -53,6 +67,11 @@ try {
     $ready = Control @('wait-for-text','--pane',"$live",'--timeout','15','ready')
     $generation = ((Control @('list')).sessions | Where-Object id -eq $live).connection_generation
     if (!$generation -or !$ready) { throw 'The live control shell did not connect' }
+    $null = Wait-Until 'the control pipe reports the connected shell and its initial phase' {
+        $state = Control @('events','--pane',"$live")
+        $changes = @($state.journal.events | Where-Object kind -eq 'ssh-connection' | ForEach-Object { $_.data.phase })
+        $state.ssh_connection.phase -eq 'connected' -and ($changes -join ',') -eq 'connecting,connected'
+    }
 
     Set-HostQuery 'East'
     $null = Wait-Until 'the West attempt is hidden' { !(Find-Element "Focus pane $west" $button) }
@@ -67,7 +86,9 @@ try {
 
     Click "Reconnect SSH pane $east"
     $null = Wait-Until 'the same East pane starts a fresh authentication attempt' {
-        (Find-Element "Pane $east${dot}Authentication required") -and !(Get-ExitToken $east)
+        $state = Control @('events','--pane',"$east")
+        (Find-Element "Pane $east${dot}Authentication required") -and !$state.restart_token -and
+            $state.ssh_connection.phase -eq 'reconnecting' -and !$state.ssh_connection.attempt
     }
     Run-Palette 'Stop pending SSH connections' -Enter
     Wait-Stopped $east

@@ -839,15 +839,15 @@ async fn run(
         }
         if phase == Phase::PublishingExit {
             phase = Phase::Exited;
-            if is_ssh {
-                events.set_ssh_connection_phase(
-                    ssh_exit
-                        .take()
-                        .unwrap_or(crate::events::SshConnectionPhase::Disconnected),
-                );
-            }
+            let ssh_phase = is_ssh.then(|| {
+                ssh_exit
+                    .take()
+                    .unwrap_or(crate::events::SshConnectionPhase::Disconnected)
+            });
             if restartable {
-                events.pane_exited(launch_id);
+                events.pane_exited(launch_id, ssh_phase);
+            } else if let Some(phase) = ssh_phase {
+                events.set_ssh_connection_phase(phase);
             }
         }
         if inspecting {

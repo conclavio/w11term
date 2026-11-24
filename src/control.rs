@@ -310,7 +310,13 @@ impl Registry {
                 let journal = events
                     .wait(since, Duration::from_secs(timeout_seconds))
                     .await;
-                Ok(json!({"pane":pane,"journal":journal,"restart_token":events.restart_token()}))
+                let (restart_token, ssh_phase) = events.exit_snapshot();
+                let mut result =
+                    json!({"pane":pane,"journal":journal,"restart_token":restart_token});
+                if let Some(phase) = ssh_phase {
+                    result["ssh_connection"] = phase.as_json();
+                }
+                Ok(result)
             }
             Request::WaitForText {
                 pane,
