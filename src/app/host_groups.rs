@@ -16,6 +16,7 @@ mod membership;
 mod output_recording;
 mod progress;
 mod prompt_setup;
+mod recent_commands;
 mod recipient_sets;
 mod reconnect;
 mod recorded_send;
@@ -30,6 +31,7 @@ pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffe
 
 pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
+pub(super) const RECENT_COMMANDS_LABEL: &str = "Recent group commands…";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;
 
@@ -46,6 +48,7 @@ pub(super) struct HostGroup {
     command_save: save_command::State,
     recorded_send: recorded_send::State,
     submissions: VecDeque<Submission>,
+    recent_commands: recent_commands::RecentCommands,
     viewing: u64,
     next_submission: u64,
     copy_feedback: String,
@@ -334,7 +337,8 @@ impl HostGroup {
         self.next_submission += 1;
         self.viewing = self.next_submission;
         self.result_filter = progress::Filter::All;
-        if content.command().is_some() {
+        if let SubmissionContent::Command(command) = &content {
+            self.recent_commands.record(self.viewing, command.clone());
             self.previous_draft = None;
         }
         self.copy_feedback.clear();
@@ -444,8 +448,10 @@ pub enum Action {
     Transfer(TabId, transfer::Action),
     Environment(TabId, environment::Action),
     OpenSavedCommands(TabId),
+    OpenRecentCommands(TabId),
     FocusLoadedCommand(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
+    LoadRecentCommand(TabId, u64),
     SaveCommand(TabId, save_command::Action),
     RestoreDraft(TabId),
     CopyResults(TabId, u64),
@@ -994,6 +1000,11 @@ impl TerminalApp {
                     self.open_group_command_library(id, ctx);
                 }
             }
+            Action::OpenRecentCommands(id) => {
+                if self.host_group_command_target() == Some(id) {
+                    self.open_group_recent_commands(id, ctx);
+                }
+            }
             Action::FocusLoadedCommand(id) => {
                 if self.host_group_command_target() == Some(id)
                     && let Some(page) = self.host_group_mut(id)
@@ -1008,6 +1019,15 @@ impl TerminalApp {
                     && let Some(page) = self.host_group_mut(id)
                 {
                     page.load_draft(entry.text);
+                    let _ = page.command_editor.request_focus();
+                }
+            }
+            Action::LoadRecentCommand(id, submission) => {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
+                    && let Some(command) = page.recent_commands.get(submission)
+                {
+                    page.load_draft(command.to_owned());
                     let _ = page.command_editor.request_focus();
                 }
             }
@@ -1376,6 +1396,9 @@ impl TerminalApp {
         let saved_commands = Button::new()
             .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenSavedCommands(id))))
             .content("Saved commands…");
+        let recent_commands = Button::new()
+            .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenRecentCommands(id))))
+            .content("Recent commands…");
         let save_command = page.command_save.button(id, &page.draft, ctx);
         let restore = if page.previous_draft.is_some() {
             Button::new()
@@ -1417,7 +1440,14 @@ impl TerminalApp {
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
-                        .children((send, send_recorded, saved_commands, save_command, restore)),
+                        .children((
+                            send,
+                            send_recorded,
+                            recent_commands,
+                            saved_commands,
+                            save_command,
+                            restore,
+                        )),
                     page.command_save.view(id, ctx),
                     page.recorded_send.feedback(),
                     retry::feedback(page),

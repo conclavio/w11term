@@ -146,6 +146,14 @@ try {
     $null = Wait-Until 'only the West submission result is shown' {
         (Find-Element "$westName${dot}Exit 0") -and !(Find-Element "Submitted${dot}east-probe")
     }
+    Click ('Recent commands' + [char]0x2026)
+    $null = Wait-Until 'West recent commands excludes the East submission' {
+        (Find-Element 'west-probe' $button) -and !(Find-Element 'east-probe' $button)
+    }
+    Press-Key 27
+    $null = Wait-Until 'West recent command picker closes' {
+        !(Find-Element 'Search recent group commands' $edit)
+    }
 
     Click "Focus result pane $west"
     Wait-Focus $west

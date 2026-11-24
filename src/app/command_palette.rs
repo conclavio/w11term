@@ -1,6 +1,34 @@
 use super::*;
 use w11term::shortcuts::BINDINGS;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum Search {
+    Window,
+    GroupLibrary(TabId),
+    GroupRecent(TabId),
+}
+
+impl Search {
+    fn placeholder(self) -> &'static str {
+        match self {
+            Self::Window => "Search commands",
+            Self::GroupLibrary(_) => "Search saved commands",
+            Self::GroupRecent(_) => "Search recent group commands",
+        }
+    }
+
+    fn empty(self, query: &str) -> &'static str {
+        match self {
+            Self::GroupLibrary(_) if query.is_empty() => "Add saved commands in Settings.",
+            Self::GroupRecent(_) if query.is_empty() => {
+                "Commands submitted in this tab will appear here."
+            }
+            Self::GroupRecent(_) => "No matching recent commands",
+            _ => "No matching commands",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandId {
     Menu(String),
@@ -27,6 +55,8 @@ pub enum CommandId {
         w11term::saved_commands::Entry,
     ),
     GroupSavedCommand(TabId, w11term::saved_commands::Entry),
+    SearchGroupRecentCommands(TabId),
+    GroupRecentCommand(TabId, u64),
     OpenSavedHostGroup(String, Vec<String>),
     ManageRecipientSets(TabId, String),
     ApplyRecipientSet(TabId, host_groups::RecipientSetOffer),
@@ -451,6 +481,12 @@ impl TerminalApp {
         }
         if let Some(group) = self.host_group_command_target() {
             rows.extend(self.group_saved_rows(group));
+            rows.push(Row {
+                id: CommandId::SearchGroupRecentCommands(group),
+                label: host_groups::RECENT_COMMANDS_LABEL.into(),
+                chord: String::new(),
+                enabled: true,
+            });
             if let Some((name, sets)) = self.recipient_sets_for_tab(group) {
                 rows.push(Row {
                     id: CommandId::ManageRecipientSets(group, name.into()),
@@ -500,6 +536,17 @@ impl TerminalApp {
         filter(self.group_saved_rows(group).collect(), query)
     }
 
+    pub(super) fn group_recent_command_rows(&self, group: TabId, query: &str) -> Vec<Row> {
+        self.recent_group_commands(group, query)
+            .map(|(submission, command)| Row {
+                id: CommandId::GroupRecentCommand(group, submission),
+                label: command.into(),
+                chord: String::new(),
+                enabled: true,
+            })
+            .collect()
+    }
+
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
             CommandId::RenamePane(target) => tab_title::show_pane(target),
@@ -525,6 +572,12 @@ impl TerminalApp {
             CommandId::SavedCommand(None, _) => return,
             CommandId::GroupSavedCommand(group, entry) => {
                 Message::HostGroup(host_groups::Action::LoadSavedCommand(group, entry))
+            }
+            CommandId::SearchGroupRecentCommands(group) => {
+                Message::HostGroup(host_groups::Action::OpenRecentCommands(group))
+            }
+            CommandId::GroupRecentCommand(group, submission) => {
+                Message::HostGroup(host_groups::Action::LoadRecentCommand(group, submission))
             }
             CommandId::OpenSavedHostGroup(name, members) => {
                 Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
@@ -599,16 +652,17 @@ pub(super) fn view(
     selected: usize,
     query: &str,
     input: &ElementRef<TextBox>,
-    saved_only: bool,
+    mode: Search,
     app: &TerminalApp,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let page = ((app.window_height - 156.0) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
-    let search_label = if saved_only {
-        "Search saved commands"
+    let search_label = mode.placeholder();
+    let trimming = if matches!(mode, Search::GroupRecent(_)) {
+        TextTrimming::CharacterEllipsis
     } else {
-        "Search commands"
+        TextTrimming::None
     };
     let search = Grid::new()
         .columns([GridLength::STAR, GridLength::Auto])
@@ -651,6 +705,7 @@ pub(super) fn view(
                     .children((
                         TextBlock::new()
                             .text(&row.label)
+                            .text_trimming(trimming)
                             .horizontal_alignment(HorizontalAlignment::Left),
                         TextBlock::new().grid_column(1).text(&row.chord),
                     )),
@@ -660,11 +715,7 @@ pub(super) fn view(
     if rows.is_empty() {
         results.push(KeyedView::new(
             "empty",
-            TextBlock::new().text(if saved_only && query.is_empty() {
-                "Add saved commands in Settings."
-            } else {
-                "No matching commands"
-            }),
+            TextBlock::new().text(mode.empty(query)),
         ));
     } else if rows.len() > page {
         let last = (first + page).min(rows.len());
