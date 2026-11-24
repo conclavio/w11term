@@ -46,6 +46,7 @@ pub enum SshGroupQueueAction {
     Pause,
     Resume,
     Stop,
+    ApproveCanary { pane_id: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]

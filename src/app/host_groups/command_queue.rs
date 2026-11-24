@@ -74,7 +74,7 @@ const QUEUE_EXPIRIES: [(&str, SshGroupQueueExpiry); 6] = [
 
 pub enum Action {
     SetPaused(bool),
-    ApproveCanary,
+    ApproveCanary(u64),
     CancelCanaryNotice,
     SkipHost(u64),
     Cancel,
@@ -282,14 +282,17 @@ impl Submission {
             .iter()
             .filter(|result| matches!(result.status, DeliveryStatus::Queued(_)))
             .count();
-        let state = match (unsent, queue.canary, queue.paused) {
-            (0, _, _) => "drained",
-            (_, Some(CanaryGate::Pending(_)), _) => "canary_running",
-            (_, Some(CanaryGate::AwaitingApproval(_)), _) => "canary_approval",
-            (_, None, true) => "paused",
-            (_, None, false) => "dispatching",
-        };
-        Some(json!({ "state": state, "unsent": unsent }))
+        Some(match (unsent, queue.canary, queue.paused) {
+            (0, _, _) => json!({ "state": "drained", "unsent": unsent }),
+            (_, Some(CanaryGate::Pending(pane)), _) => {
+                json!({ "state": "canary_running", "unsent": unsent, "canary_pane_id": pane })
+            }
+            (_, Some(CanaryGate::AwaitingApproval(pane)), _) => {
+                json!({ "state": "canary_approval", "unsent": unsent, "canary_pane_id": pane })
+            }
+            (_, None, true) => json!({ "state": "paused", "unsent": unsent }),
+            (_, None, false) => json!({ "state": "dispatching", "unsent": unsent }),
+        })
     }
 
     pub(super) fn has_queue(&self) -> bool {
@@ -365,9 +368,15 @@ impl Submission {
                 self.transcript.note_queue_activity(event);
                 return Ok(!paused);
             }
-            Action::ApproveCanary
-                if matches!(queue.canary, Some(CanaryGate::AwaitingApproval(_))) =>
-            {
+            Action::ApproveCanary(pane) => {
+                match queue.canary {
+                    Some(CanaryGate::AwaitingApproval(expected)) if expected == pane => {}
+                    Some(CanaryGate::Pending(expected)) if expected == pane => {
+                        return Err("The canary has not reported a successful exit yet");
+                    }
+                    Some(_) => return Err("The specified pane is not the canary for this run"),
+                    None => return Err("This SSH group run is not awaiting canary approval"),
+                }
                 queue.canary = None;
                 self.transcript
                     .note_queue_activity(GroupQueueEventKind::CanaryApproved);
@@ -569,6 +578,7 @@ impl TerminalApp {
             SshGroupQueueAction::Pause => Action::SetPaused(true),
             SshGroupQueueAction::Resume => Action::SetPaused(false),
             SshGroupQueueAction::Stop => Action::Cancel,
+            SshGroupQueueAction::ApproveCanary { pane_id } => Action::ApproveCanary(pane_id),
         };
         if self
             .command_queue_run(id, run)?
@@ -612,7 +622,7 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
         ),
         Some(CanaryGate::AwaitingApproval(pane)) => (
             Button::new()
-                .on_click(ctx.callback(move |_| event(Action::ApproveCanary)))
+                .on_click(ctx.callback(move |_| event(Action::ApproveCanary(pane))))
                 .content("Approve remaining hosts"),
             Some(format!(
                 "{} · Canary succeeded. Review its result before continuing.",

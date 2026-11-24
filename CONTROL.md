@@ -314,10 +314,18 @@ and execution. Pause and resume require an
 ungated queue. Stop is available while a canary is pending. Actions on
 an expired queue or a run with no unsent commands return an error.
 
+`ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID`
+releases the run's canary gate after that pane reports a verified exit
+code of zero. Read `queue.canary_pane_id` from the same run before
+approving. Approval requires the exact canary pane and a queue in
+`canary_approval`. Remaining recipients still pass the existing prompt
+checks, dispatch limits, and queue deadline.
+
 The action returns the same detail reply as `get-ssh-group-run`. When a
 run uses a queue, the reply has a `queue` object with `unsent` and `state`.
 The state is `dispatching`, `paused`, `canary_running`, `canary_approval`, or
-`drained`. Drained means there are no unsent recipients. Check
+`drained`. Both canary states include `canary_pane_id`. Drained means there
+are no unsent recipients. Check
 `queue_activity` and the recipient states for dispatch and cancellation
 outcomes. Queue actions work in a background tab or window.
 
@@ -415,6 +423,7 @@ w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 pause
+w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 approve-canary --pane 17
 w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
@@ -437,6 +446,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
 {"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":"pause"}
+{"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":{"approve_canary":{"pane_id":17}}}
 {"verb":"save-ssh-group-report","window_id":1,"tab_id":9,"run_id":3,"path":"C:\\Reports\\group report.json","format":"json","overwrite":false}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}

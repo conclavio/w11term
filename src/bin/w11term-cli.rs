@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn parses_explicit_ssh_group_queue_actions() {
-        let parse_queue = |action: &str| {
+        let parse_queue = |action: &[&str]| {
             parse(
                 [
                     "ssh-group-queue",
@@ -307,40 +307,35 @@ mod tests {
                     "3",
                     "--run",
                     "4",
-                    action,
                 ]
+                .into_iter()
+                .chain(action.iter().copied())
                 .map(str::to_owned),
             )
         };
         for action in ["pause", "resume", "stop"] {
-            let (_, request) = parse_queue(action).unwrap();
+            let (_, request) = parse_queue(&[action]).unwrap();
             assert_eq!(
                 serde_json::to_value(request).unwrap(),
                 serde_json::json!({"verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,"action":action})
             );
         }
-        assert!(parse_queue("cancel").is_err());
+        let (_, approval) = parse_queue(&["approve-canary", "--pane", "5"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(approval).unwrap(),
+            serde_json::json!({
+                "verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,
+                "action":{"approve_canary":{"pane_id":5}}
+            })
+        );
+        assert!(parse_queue(&["cancel"]).is_err());
+        assert!(parse_queue(&["approve-canary"]).is_err());
+        assert!(parse_queue(&["approve-canary", "--pane", "0"]).is_err());
+        assert!(parse_queue(&["approve-canary", "--pane", "5", "--pane", "6"]).is_err());
+        assert!(parse_queue(&["pause", "--pane", "5"]).is_err());
         assert!(
             parse(["ssh-group-queue", "--window", "2", "--tab", "3", "pause"].map(str::to_owned))
                 .is_err()
-        );
-        assert!(
-            parse(
-                [
-                    "ssh-group-queue",
-                    "--window",
-                    "2",
-                    "--tab",
-                    "3",
-                    "--run",
-                    "4",
-                    "--pane",
-                    "5",
-                    "pause"
-                ]
-                .map(str::to_owned)
-            )
-            .is_err()
         );
     }
 

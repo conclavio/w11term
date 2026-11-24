@@ -319,6 +319,12 @@ try {
     if ($LASTEXITCODE -eq 0 -or $blocked.ok -or $blocked.error -notlike '*while the canary is pending*') {
         throw 'Resuming a command queue bypassed its canary gate'
     }
+    $running = (Run-Snapshot 5).run.queue
+    $early = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 approve-canary --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $early.ok -or $early.error -notlike '*successful exit yet*' -or
+        $running.state -cne 'canary_running' -or $running.canary_pane_id -ne $panes.East) {
+        throw 'The CLI could not identify the running canary or accepted approval before its exit'
+    }
     $null = Wait-Until 'only East runs before a canary result' {
         (Find-Element "$($labels.West)${dot}Queued") -and
             (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
@@ -341,11 +347,27 @@ try {
             (Find-Element "$($labels.East)${dot}Canary succeeded. Review its result before continuing.") -and
             (Find-Element 'Approve remaining hosts' $button)
     }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the approved run will stay in the background' {
+        Find-Element "Read${dot}$canaryNotice" $button
+    }
+    $approvalFocus = [FixtureMessages]::GetForegroundWindow()
+    $wrong = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 approve-canary --pane $panes.West | ConvertFrom-Json
+    $waiting = (Run-Snapshot 5).run.queue
+    if ($wrong.ok -or $wrong.error -notlike '*not the canary for this run*' -or
+        $waiting.state -cne 'canary_approval' -or $waiting.canary_pane_id -ne $panes.East -or $waiting.unsent -ne 1) {
+        throw 'Approving a different pane changed the waiting canary gate'
+    }
     New-Item -ItemType File -Path (Join-Path $State 'release-canary-ok') | Out-Null
     New-Item -ItemType File -Path (Join-Path $State 'approve-canary-ok') | Out-Null
-    Click 'Approve remaining hosts'
+    $approved = (Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run','5',
+            'approve-canary','--pane',"$($panes.East)")).run.queue
+    if ($approved.state -notin @('dispatching','drained') -or $null -ne $approved.canary_pane_id -or
+        [FixtureMessages]::GetForegroundWindow() -ne $approvalFocus -or
+        !(Find-Element "Read${dot}$canaryNotice" $button)) {
+        throw 'Approving the correct canary left the gate in place or changed focus'
+    }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished canary-ok')
-    Click 'Attention inbox, 1 unread'
     $null = Wait-Until 'the canary notice stays read while the run completion is unread' {
         Find-Element "Read${dot}$canaryNotice" $button
     }
