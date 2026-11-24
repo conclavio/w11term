@@ -49,6 +49,8 @@ Each visible pane needs its own grid, frame subscription, selection and pointer 
 
 Preserve the existing control API’s meaning of `--pane`. Keep one focused terminal marked `active` and expose tab membership and visibility separately. Retain the current single-pane resize behavior. For a visible split, adjust the layout to satisfy the requested cell grid or return a clear geometry error. File transfers, screenshots and raw writes directed at another pane must leave focus where the user put it. [Current control contract](../CONTROL.md#waiting-geometry-tabs-and-events)
 
+**Search the window’s tabs.** Find terminal and utility tabs by their current display title or tab position, including tabs beyond the visible strip. Switch to the tab’s remembered pane and keep Escape available to dismiss the search.
+
 **Acceptance.** Open two loopback terminals with distinct output. Move the divider, zoom and restore a pane, and continue addressing both original IDs from the CLI. Verify each reported grid and PNG, keyboard input on the focused side, and uninterrupted output on the other. Reopen the saved workspace and check its profiles, proportions and focus.
 
 ## Release 2 · SFTP drawer and SSH profiles

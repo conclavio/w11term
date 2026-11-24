@@ -568,6 +568,10 @@ impl TerminalApp {
         );
     }
 
+    pub(super) fn open_tab_search(&mut self, ctx: &ComponentContext<Self>) {
+        self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
+    }
+
     pub(super) fn open_group_recent_commands(
         &mut self,
         group: TabId,
@@ -581,6 +585,7 @@ impl TerminalApp {
 
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
+            Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
             Mode::Commands(command_palette::Search::GroupLibrary(group)) => {
                 self.group_saved_command_rows(group, query)
             }
@@ -670,9 +675,11 @@ impl TerminalApp {
             if mode == Mode::Commands(command_palette::Search::Window) {
                 self.refresh_profiles();
             }
-            if !matches!(
+            if matches!(
                 mode,
-                Mode::Commands(command_palette::Search::GroupRecent(_))
+                Mode::Commands(
+                    command_palette::Search::Window | command_palette::Search::GroupLibrary(_)
+                )
             ) {
                 self.reload_saved_commands();
             }
@@ -683,9 +690,16 @@ impl TerminalApp {
             (self.picker_choices(mode), vec![])
         };
         let active = self.tabs.active().and_then(AppTab::pane_id);
-        let selected = matches
-            .iter()
-            .position(|row| Some(row.pane) == active)
+        let selected_tab = (mode == Mode::Commands(command_palette::Search::Tabs))
+            .then(|| self.tabs.active_group_id())
+            .flatten()
+            .and_then(|group| {
+                commands
+                    .iter()
+                    .position(|row| row.id == command_palette::CommandId::FocusTab(group))
+            });
+        let selected = selected_tab
+            .or_else(|| matches.iter().position(|row| Some(row.pane) == active))
             .unwrap_or(0);
         self.picker = Some(Picker {
             mode,
