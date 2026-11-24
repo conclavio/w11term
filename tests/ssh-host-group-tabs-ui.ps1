@@ -83,11 +83,22 @@ function Submit([string]$Command) {
     Click 'Send to 1 host'
     $null = Wait-Until "'$Command' was submitted" { Find-Element "Submitted${dot}$Command" }
 }
-function Choose-GroupCommand([string]$Command) {
+function Open-GroupCommandSearch([string]$Query) {
     # The fixture can exercise the palette through its own UIA providers even
     # when another window owns the desktop foreground.
     Press-Key 0x76
-    (Field 'Search commands').SetValue($Command)
+    (Field 'Search commands').SetValue($Query)
+}
+function Accept-GroupCommandWithEnter([string]$Command) {
+    $null = Wait-Until "enabled group command '$Command'" {
+        $item = Find-Element $Command $button
+        $item -and $item.Current.IsEnabled
+    }
+    Press-Key 13
+    $null = Wait-Until 'Enter closes the command palette' { !(Find-Element 'Search commands' $edit) }
+}
+function Choose-GroupCommand([string]$Command) {
+    Open-GroupCommandSearch $Command
     $null = Wait-Until "invoke group command '$Command'" {
         try {
             $item = Find-Element $Command $button
@@ -360,24 +371,46 @@ try {
     Click 'Back to SSH group'
 
     $null = Wait-CheckBox 'Show all window SSH panes' On
+    Select-Tab $westTab
+    Open-GroupCommandSearch 'recipient canaries'
+    $null = Wait-Until 'the West group does not offer the East group canaries' {
+        Find-Element 'No matching commands'
+    }
+    Press-Key 27
+    $null = Wait-Until 'Esc closes the command palette' { !(Find-Element 'Search commands' $edit) }
+    Select-Tab $eastTab
     (Field 'Host filter').SetValue('west')
     Expect-Field 'Host filter' 'west'
-    Click $setsButton
-    Click 'Apply recipient set Canaries'
+    Open-GroupCommandSearch 'canaries recipient'
+    $applyCanaries = "Apply recipient set${dot}Canaries"
+    $null = Wait-Until 'the palette has the reviewed Canaries set' { Find-Element $applyCanaries $button }
+    $beforePresetEdit = [IO.File]::ReadAllBytes($profiles)
+    $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $changed.ssh_recipient_sets.'Fleet East'.Canaries = @('West')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Accept-GroupCommandWithEnter $applyCanaries
+    $null = Wait-Until 'a changed preset cannot be applied from an old palette row' {
+        Find-Element 'The recipient set changed on disk. Open it again before applying.'
+    }
+    Expect-Field 'Host filter' 'west'
+    $null = Wait-CheckBox $westName On
+    [IO.File]::WriteAllBytes($profiles, $beforePresetEdit)
+    Open-GroupCommandSearch 'CANARIES recipient'
+    Accept-GroupCommandWithEnter $applyCanaries
     $null = Wait-CheckBox 'Show all window SSH panes' Off
     Expect-Field 'Host filter' ''
     Expect-Field 'Group command' 'retained roster draft'
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName Off
-    Click $setsButton
-    Click 'Apply recipient set Fleet'
+    Open-GroupCommandSearch "Apply recipient set${dot}Fleet"
+    Accept-GroupCommandWithEnter "Apply recipient set${dot}Fleet"
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     Click $manage
     (Wait-CheckBox "Include $westName" On).Toggle()
     $null = Wait-CheckBox "Include $westName" Off
     Click 'Apply membership'
-    Click $setsButton
+    Choose-GroupCommand ('Manage recipient sets' + [char]0x2026)
     Click 'Apply recipient set Fleet'
     $null = Wait-Until 'a missing roster member blocks the whole preset' {
         Find-Element 'West has no matching live pane in this roster.'

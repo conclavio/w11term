@@ -30,7 +30,16 @@ struct RecipientGroup<'a> {
 
 pub enum Action {
     Open,
+    OpenFromPalette(String),
+    ApplyFromPalette(Offer),
     Edit(u64, Change),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Offer {
+    pub group: String,
+    pub name: String,
+    pub members: Vec<String>,
 }
 
 pub enum Change {
@@ -215,6 +224,17 @@ impl State {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn recipient_sets_for_tab(
+        &self,
+        id: TabId,
+    ) -> Option<(&str, Option<&SshRecipientSets>)> {
+        let Page::HostGroup(page) = &self.tabs.get(id)?.page else {
+            return None;
+        };
+        let (group, _) = page.saved.origin()?;
+        Some((group, self.catalog.ssh_recipient_sets.get(group)))
+    }
+
     fn recipient_candidates(&self, roster: &MemberRoster, catalog: &Profiles) -> Candidates {
         let mut matches = Candidates::new();
         for entry in self.tabs.entries() {
@@ -238,12 +258,19 @@ impl TerminalApp {
 
     pub(super) fn handle_recipient_sets(&mut self, id: TabId, action: Action) {
         let result = match action {
-            Action::Open if self.host_group_command_target() == Some(id) => {
-                self.open_recipient_sets(id)
-            }
             Action::Edit(revision, change) if self.tabs.active_id() == Some(id) => {
                 self.edit_recipient_sets(id, revision, change)
             }
+            _ if self.host_group_command_target() != Some(id) => return,
+            Action::Open => self.open_recipient_sets(id),
+            Action::OpenFromPalette(group)
+                if self
+                    .recipient_sets_for_tab(id)
+                    .is_some_and(|(name, _)| name == group) =>
+            {
+                self.open_recipient_sets(id)
+            }
+            Action::ApplyFromPalette(offer) => self.apply_recipient_set(id, &offer),
             _ => return,
         };
         if let Err(error) = result
@@ -328,8 +355,13 @@ impl TerminalApp {
             Change::Back => state.editor = None,
             Change::ConfirmDelete(name) => editor.confirm_delete = Some(name),
             Change::Apply(name) => {
-                if let Some(previous) = editor.sets.get(&name).cloned() {
-                    self.apply_recipient_set(id, &name, &previous)?;
+                if let Some(members) = editor.sets.get(&name).cloned() {
+                    let offer = Offer {
+                        group: editor.group.clone(),
+                        name,
+                        members,
+                    };
+                    self.apply_recipient_set(id, &offer)?;
                 }
             }
             Change::Create | Change::Replace(_) | Change::Delete(_) => {
@@ -354,7 +386,7 @@ impl TerminalApp {
         Ok(())
     }
 
-    fn apply_recipient_set(&mut self, id: TabId, name: &str, previous: &[String]) -> Result<()> {
+    fn apply_recipient_set(&mut self, id: TabId, offer: &Offer) -> Result<()> {
         let RecipientGroup {
             roster,
             name: group,
@@ -362,17 +394,17 @@ impl TerminalApp {
             catalog,
             ..
         } = self.current_recipient_group(id)?;
+        ensure!(group == offer.group, "The active SSH group changed.");
         ensure!(
             catalog
                 .ssh_recipient_sets
                 .get(group)
-                .and_then(|sets| sets.get(name))
-                .map(Vec::as_slice)
-                == Some(previous),
-            "The recipient set changed on disk. Reopen Recipient sets."
+                .and_then(|sets| sets.get(&offer.name))
+                == Some(&offer.members),
+            "The recipient set changed on disk. Open it again before applying."
         );
         let selected = resolve(
-            previous,
+            &offer.members,
             members,
             &self.recipient_candidates(roster, &catalog),
         )?;
@@ -381,7 +413,7 @@ impl TerminalApp {
             page.filter.clear();
             page.selected = selected;
             page.saved.recipient_sets.editor = None;
-            page.saved.feedback = format!("Applied recipient set {name}");
+            page.saved.feedback = format!("Applied recipient set {}", offer.name);
         }
         Ok(())
     }

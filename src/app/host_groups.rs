@@ -21,6 +21,8 @@ mod save_command;
 mod saved;
 mod transfer;
 
+pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffer};
+
 pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);

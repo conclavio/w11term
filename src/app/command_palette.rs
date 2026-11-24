@@ -28,6 +28,8 @@ pub enum CommandId {
     ),
     GroupSavedCommand(TabId, w11term::saved_commands::Entry),
     OpenSavedHostGroup(String, Vec<String>),
+    ManageRecipientSets(TabId, String),
+    ApplyRecipientSet(TabId, host_groups::RecipientSetOffer),
     TabAction(Shortcut, Option<TabId>),
     SetTabPinned(Option<TabId>, bool),
     SetTabColor(TabId, Option<TabColor>),
@@ -449,6 +451,27 @@ impl TerminalApp {
         }
         if let Some(group) = self.host_group_command_target() {
             rows.extend(self.group_saved_rows(group));
+            if let Some((name, sets)) = self.recipient_sets_for_tab(group) {
+                rows.push(Row {
+                    id: CommandId::ManageRecipientSets(group, name.into()),
+                    label: "Manage recipient sets…".into(),
+                    chord: String::new(),
+                    enabled: true,
+                });
+                rows.extend(sets.into_iter().flatten().map(|(set, members)| Row {
+                    id: CommandId::ApplyRecipientSet(
+                        group,
+                        host_groups::RecipientSetOffer {
+                            group: name.into(),
+                            name: set.clone(),
+                            members: members.clone(),
+                        },
+                    ),
+                    label: format!("Apply recipient set · {set}"),
+                    chord: String::new(),
+                    enabled: true,
+                }));
+            }
         } else {
             let origin = self.saved_command_origin();
             rows.extend(self.saved_commands.entries().iter().map(|entry| Row {
@@ -505,6 +528,18 @@ impl TerminalApp {
             }
             CommandId::OpenSavedHostGroup(name, members) => {
                 Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
+            }
+            CommandId::ManageRecipientSets(group, name) => {
+                Message::HostGroup(host_groups::Action::RecipientSets(
+                    group,
+                    host_groups::RecipientSetAction::OpenFromPalette(name),
+                ))
+            }
+            CommandId::ApplyRecipientSet(group, offer) => {
+                Message::HostGroup(host_groups::Action::RecipientSets(
+                    group,
+                    host_groups::RecipientSetAction::ApplyFromPalette(offer),
+                ))
             }
             CommandId::TabAction(shortcut, group) => {
                 bind_tab_action(Message::Shortcut(shortcut), group)
