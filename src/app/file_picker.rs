@@ -29,6 +29,7 @@ pub(super) enum Purpose {
     CommandOutput(String),
     GroupReport(String),
     GroupJsonReport(String),
+    GroupOutputExcerpt(String),
     GroupLiveRecording(String),
     SshHostList,
     StartRecording,
@@ -294,6 +295,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             | Purpose::CommandOutput(_)
             | Purpose::GroupReport(_)
             | Purpose::GroupJsonReport(_)
+            | Purpose::GroupOutputExcerpt(_)
             | Purpose::SshHostList => {
                 #[cfg(feature = "ui-smoke")]
                 if fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")? {
@@ -314,6 +316,11 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                         w!("Save SSH group results as JSON"),
                         suggestion.as_str(),
                         w!("json"),
+                    ),
+                    Purpose::GroupOutputExcerpt(suggestion) => (
+                        w!("Save shown SSH group output"),
+                        suggestion.as_str(),
+                        w!("txt"),
                     ),
                     Purpose::SshHostList => (w!("Save SSH host list"), "ssh-hosts.txt", w!("txt")),
                     _ => (w!("Save scrollback as text"), "terminal.txt", w!("txt")),

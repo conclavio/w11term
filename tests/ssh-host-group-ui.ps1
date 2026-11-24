@@ -281,7 +281,9 @@ try {
     }
     Select-ComboValue $outputHosts $westName
     $null = Wait-Until 'the text search also respects the selected output host' {
-        (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'east-accepted both')
+        $copy = Find-Element 'Copy shown output' $button
+        $copy -and !$copy.Current.IsEnabled -and
+            (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'east-accepted both')
     }
     Click 'Pause output'
     $null = Wait-Until 'output is paused' { Find-Element 'Resume output' $button }
@@ -314,6 +316,20 @@ try {
     $null = Wait-Until 'the same output view returns after focusing its source pane' {
         (Find-Element 'SSH group live output') -and (Find-Element 'west while paused') -and
             (Find-Element 'west while away') -and !(Find-Element 'east-accepted both')
+    }
+    Click 'Copy shown output'
+    $excerpt = "Submitted${dot}both`r`n$westName${dot}west while away`r`n$westName${dot}west while paused`r`n"
+    $null = Wait-Until 'clipboard contains just the two matching lines in newest-first order' {
+        (Read-ClipboardFixture) -ceq $excerpt
+    }
+    $null = Wait-Until 'confirm the excerpt was copied' { Find-Element 'Copied shown output' }
+    $excerptPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-output-excerpt-2.txt'
+    Click ('Save shown output' + [char]0x2026)
+    $dialog = Wait-Until 'owned shown output save dialog' { Find-OwnedDialog 'Save shown SSH group output' }
+    $null = Wait-Until 'save the shown output' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved excerpt matches the clipboard' {
+        [IO.File]::Exists($excerptPath) -and
+            [IO.File]::ReadAllText($excerptPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $excerpt
     }
     Click 'Clear output filters'
     $null = Wait-Until 'clearing the filters restores all retained output' {
