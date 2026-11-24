@@ -1335,6 +1335,11 @@ async fn native_ssh_host_group_downloads_to_distinct_files() {
         if let Some(bytes) = bytes {
             fs::write(reports.join("snapshot.bin"), bytes).unwrap();
         }
+        if name == "Fetch West" {
+            let archive = root.path().join("archive");
+            fs::create_dir(&archive).unwrap();
+            fs::write(archive.join("snapshot.bin"), b"archived west").unwrap();
+        }
         if name == "Fetch East" {
             fs::write(reports.join("cancel.bin"), &east).unwrap();
             fs::write(root.path().join("transfer-trace"), []).unwrap();
@@ -1381,8 +1386,17 @@ async fn native_ssh_host_group_downloads_to_distinct_files() {
         }
     }
     received.sort_by_key(Vec::len);
-    assert_eq!(received, [west, east]);
-    assert_eq!(directories, 2);
+    assert_eq!(
+        received,
+        [
+            b"archived west".to_vec(),
+            west.clone(),
+            west,
+            east.clone(),
+            east
+        ]
+    );
+    assert_eq!(directories, 3);
     assert_eq!(fs::read(picker.join("snapshot.bin")).unwrap(), b"existing");
     for (name, _root, opens, server, channels) in peers {
         assert_eq!(opens.load(Ordering::Relaxed), channels, "{name}");
