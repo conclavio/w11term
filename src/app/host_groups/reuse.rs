@@ -5,6 +5,13 @@ use w11term::options::SshRecipientSets;
 pub(super) const LABEL: &str = "Review group launch…";
 const FRESH: &str = "Open a new SSH pane";
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Offer {
+    pub group: String,
+    pub profiles: Vec<String>,
+    pub recipient_set: Option<(String, Vec<String>)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Connection {
     pub(super) pane: u64,
@@ -201,6 +208,7 @@ impl Review {
 pub(super) struct State {
     revision: u64,
     review: Option<Box<Review>>,
+    return_to: Option<TabId>,
 }
 
 pub enum Action {
@@ -399,6 +407,39 @@ pub(super) fn button(
 }
 
 impl TerminalApp {
+    pub(super) fn review_host_group_from_palette(
+        &mut self,
+        offer: Offer,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if let Err(error) = self.open_launch_review(offer, ctx) {
+            self.refresh_profiles();
+            self.window_error = Some(format!("{error:#}"));
+        }
+    }
+
+    fn open_launch_review(&mut self, offer: Offer, ctx: &ComponentContext<Self>) -> Result<()> {
+        self.check_saved_group_launch()?;
+        let previous = self.tabs.active_id().context("There is no active tab")?;
+        let mut review = self.saved_group_reuse_review(offer.group, offer.profiles, None)?;
+        if let Some((name, members)) = offer.recipient_set {
+            ensure!(
+                review.sets.get(&name) == Some(&members),
+                "Recipient set {name} changed. Open the command palette again."
+            );
+            review.select_set(name)?;
+        }
+        let id = self.new_host_group_tab(Some(&review.name));
+        if let Some(page) = self.host_group_mut(id) {
+            page.saved.reuse.return_to = Some(previous);
+            page.saved.reuse.replace(review);
+        }
+        self.tabs.select(id);
+        self.sync_selection(ctx);
+        self.activate(ctx);
+        Ok(())
+    }
+
     pub(super) fn handle_host_group_reuse(
         &mut self,
         id: TabId,
@@ -442,7 +483,10 @@ impl TerminalApp {
         };
         match change {
             Change::Back => {
-                if let Some(page) = self.host_group_mut(id) {
+                if let Some(previous) = state.return_to {
+                    self.tabs.select(previous);
+                    self.close_tab(id, ctx);
+                } else if let Some(page) = self.host_group_mut(id) {
                     page.saved.reuse.review = None;
                 }
             }
@@ -613,6 +657,7 @@ impl TerminalApp {
         let Some(review) = page.saved.reuse.review.as_deref() else {
             return Ok(());
         };
+        let standalone = page.saved.reuse.return_to.is_some();
         let name = review.name.clone();
         let profiles = review.profiles();
         let catalog = self.load_expected_host_group(&name, &profiles)?;
@@ -650,8 +695,13 @@ impl TerminalApp {
         self.use_group_catalog(catalog);
         if let Some(page) = self.host_group_mut(source_tab) {
             page.saved.reuse.review = None;
+            page.saved.reuse.return_to = None;
         }
-        let id = self.new_host_group_tab(Some(&name));
+        let id = if standalone {
+            source_tab
+        } else {
+            self.new_host_group_tab(Some(&name))
+        };
         self.start_host_group_panes(id, reused, fresh, ctx);
         self.remember_group_launch(id, &name, &profiles, skipped == 0, feedback);
         Ok(())

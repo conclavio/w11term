@@ -58,6 +58,7 @@ pub enum CommandId {
     SearchGroupRecentCommands(TabId),
     GroupRecentCommand(TabId, u64),
     OpenSavedHostGroup(String, Vec<String>),
+    ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
     ManageRecipientSets(TabId, String),
     ApplyRecipientSet(TabId, host_groups::RecipientSetOffer),
     TabAction(Shortcut, Option<TabId>),
@@ -276,17 +277,42 @@ impl TerminalApp {
             }
         }
         menu_rows(self.profile_items(), true, &mut rows);
-        rows.extend(
-            self.catalog
-                .ssh_host_groups
-                .iter()
-                .map(|(name, members)| Row {
-                    id: CommandId::OpenSavedHostGroup(name.clone(), members.clone()),
-                    label: format!("Open SSH group · {name}"),
-                    chord: String::new(),
-                    enabled: !members.is_empty(),
+        let can_review_group = self.check_saved_group_launch().is_ok();
+        for (name, members) in &self.catalog.ssh_host_groups {
+            rows.push(Row {
+                id: CommandId::OpenSavedHostGroup(name.clone(), members.clone()),
+                label: format!("Open SSH group · {name}"),
+                chord: String::new(),
+                enabled: !members.is_empty(),
+            });
+            rows.push(Row {
+                id: CommandId::ReviewSavedHostGroup(host_groups::LaunchReviewOffer {
+                    group: name.clone(),
+                    profiles: members.clone(),
+                    recipient_set: None,
                 }),
-        );
+                label: format!("Review SSH group · {name}"),
+                chord: String::new(),
+                enabled: can_review_group && !members.is_empty(),
+            });
+            if let Some(sets) = self.catalog.ssh_recipient_sets.get(name) {
+                rows.extend(sets.iter().map(|(set, profiles)| Row {
+                    id: CommandId::ReviewSavedHostGroup(host_groups::LaunchReviewOffer {
+                        group: name.clone(),
+                        profiles: members.clone(),
+                        recipient_set: Some((set.clone(), profiles.clone())),
+                    }),
+                    label: format!("Review SSH recipient set · {name} · {set}"),
+                    chord: String::new(),
+                    enabled: can_review_group
+                        && !profiles.is_empty()
+                        && profiles.iter().all(|profile| {
+                            members.contains(profile)
+                                && self.catalog.ssh_host_group_member(profile).is_some()
+                        }),
+                }));
+            }
+        }
         let live = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live),
             _ => None,
@@ -581,6 +607,9 @@ impl TerminalApp {
             }
             CommandId::OpenSavedHostGroup(name, members) => {
                 Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
+            }
+            CommandId::ReviewSavedHostGroup(offer) => {
+                Message::HostGroup(host_groups::Action::ReviewNamedGroup(offer))
             }
             CommandId::ManageRecipientSets(group, name) => {
                 Message::HostGroup(host_groups::Action::RecipientSets(
