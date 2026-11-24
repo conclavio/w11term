@@ -1,13 +1,14 @@
 use super::Events;
+use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingSshAttempt(u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SshAttemptOutcome {
     Connected,
-    Failed,
+    Failed(Arc<str>),
     Stopped,
     Closed,
 }
@@ -17,7 +18,10 @@ pub struct SshAttemptCompletion(watch::Receiver<Option<SshAttemptOutcome>>);
 impl SshAttemptCompletion {
     pub fn outcome(&self) -> Option<SshAttemptOutcome> {
         let closed = self.0.has_changed().is_err();
-        (*self.0.borrow()).or(closed.then_some(SshAttemptOutcome::Closed))
+        self.0
+            .borrow()
+            .clone()
+            .or(closed.then_some(SshAttemptOutcome::Closed))
     }
 }
 
@@ -169,9 +173,10 @@ mod tests {
             .watch_ssh_attempt(events.pending_ssh_attempt().unwrap())
             .unwrap();
         assert_eq!(watched.outcome(), None);
-        assert!(failed.finish(SshAttemptOutcome::Failed));
+        let outcome = SshAttemptOutcome::Failed("connection refused".into());
+        assert!(failed.finish(outcome.clone()));
         drop(failed);
-        assert_eq!(watched.outcome(), Some(SshAttemptOutcome::Failed));
+        assert_eq!(watched.outcome(), Some(outcome));
 
         let (closed, _) = events.begin_ssh_attempt();
         let watched = events

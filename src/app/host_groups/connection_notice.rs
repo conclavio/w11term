@@ -1,5 +1,5 @@
 use super::{reconnect::Attempt, *};
-use w11term::events::{SshAttemptCompletion, SshAttemptOutcome};
+use w11term::events::{SshAttemptCompletion, SshLoginResult};
 
 pub enum Action {
     Arm(Vec<Attempt>),
@@ -14,7 +14,13 @@ pub(super) struct State {
 
 struct Watch {
     sequence: u64,
-    attempts: Vec<SshAttemptCompletion>,
+    attempts: Vec<WatchedHost>,
+}
+
+struct WatchedHost {
+    pane: u64,
+    host: String,
+    completion: SshAttemptCompletion,
 }
 
 impl State {
@@ -55,7 +61,7 @@ impl State {
         }
     }
 
-    fn arm(&mut self, attempts: Vec<SshAttemptCompletion>) {
+    fn arm(&mut self, attempts: Vec<WatchedHost>) {
         self.next += 1;
         self.watch = Some(Watch {
             sequence: self.next,
@@ -63,23 +69,27 @@ impl State {
         });
     }
 
-    fn poll(&mut self) -> Option<(u64, String)> {
-        let watch = self.watch.as_ref()?;
-        let (mut connected, mut failed, mut stopped, mut closed) = (0, 0, 0, 0);
-        for attempt in &watch.attempts {
-            match attempt.outcome()? {
-                SshAttemptOutcome::Connected => connected += 1,
-                SshAttemptOutcome::Failed => failed += 1,
-                SshAttemptOutcome::Stopped => stopped += 1,
-                SshAttemptOutcome::Closed => closed += 1,
-            }
+    fn poll(&mut self) -> Option<(u64, Vec<SshLoginResult>)> {
+        if self
+            .watch
+            .as_ref()?
+            .attempts
+            .iter()
+            .any(|host| host.completion.outcome().is_none())
+        {
+            return None;
         }
-        let sequence = watch.sequence;
-        self.watch = None;
-        let message = format!(
-            "SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"
-        );
-        Some((sequence, message))
+        let watch = self.watch.take()?;
+        let results = watch
+            .attempts
+            .into_iter()
+            .map(|host| SshLoginResult {
+                pane: host.pane,
+                host: host.host,
+                outcome: host.completion.outcome().expect("the attempt has settled"),
+            })
+            .collect();
+        Some((watch.sequence, results))
     }
 }
 
@@ -113,14 +123,26 @@ impl TerminalApp {
                     return;
                 }
                 let roster = self.host_group_targets();
-                let current = self.pending_attempts(page, &page.shown(&roster).collect::<Vec<_>>());
+                let shown = page.shown(&roster).collect::<Vec<_>>();
+                let current = self.pending_attempts(page, &shown);
                 let attempts = if current == offered {
+                    let visible = shown
+                        .iter()
+                        .map(|host| (host.pane, host))
+                        .collect::<BTreeMap<_, _>>();
                     offered
                         .iter()
                         .map(|attempt| {
-                            self.direct_ssh_session(attempt.pane)?
+                            let completion = self
+                                .direct_ssh_session(attempt.pane)?
                                 .events
-                                .watch_ssh_attempt(attempt.token)
+                                .watch_ssh_attempt(attempt.token)?;
+                            let host = visible.get(&attempt.pane)?.names.display(attempt.pane);
+                            Some(WatchedHost {
+                                pane: attempt.pane,
+                                host,
+                                completion,
+                            })
                         })
                         .collect::<Option<Vec<_>>>()
                 } else {
@@ -151,10 +173,10 @@ impl TerminalApp {
                 label,
                 page: Page::HostGroup(page),
             }) = self.tabs.get_mut(id)
-                && let Some((sequence, message)) = page.connection_notice.poll()
+                && let Some((sequence, results)) = page.connection_notice.poll()
             {
                 self.inbox
-                    .group_connections_finished(id, sequence, label, message);
+                    .group_connections_finished(id, sequence, label, results);
             }
         }
     }

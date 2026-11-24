@@ -21,7 +21,7 @@ pub use group_transcript::{
     GroupTranscriptRecording, GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;
-pub use inbox::{Inbox, NoticeTarget};
+pub use inbox::{Inbox, NoticeTarget, SshLoginResult};
 pub(crate) use ssh_attempt::AttemptGuard;
 pub use ssh_attempt::{PendingSshAttempt, SshAttemptCompletion, SshAttemptOutcome};
 

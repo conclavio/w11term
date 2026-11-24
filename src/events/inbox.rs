@@ -1,4 +1,4 @@
-use super::{CommandLink, Event};
+use super::{CommandLink, Event, SshAttemptOutcome};
 use std::{
     collections::VecDeque,
     fmt,
@@ -15,6 +15,13 @@ pub enum NoticeTarget {
 }
 
 #[derive(Clone, Debug)]
+pub struct SshLoginResult {
+    pub pane: u64,
+    pub host: String,
+    pub outcome: SshAttemptOutcome,
+}
+
+#[derive(Clone, Debug)]
 pub struct Notice {
     arrival: u64,
     flash_pending: bool,
@@ -23,6 +30,7 @@ pub struct Notice {
     pub message: String,
     pub unread: bool,
     pub command: Option<CommandLink>,
+    pub login_results: Option<Arc<[SshLoginResult]>>,
 }
 
 #[derive(Default)]
@@ -113,6 +121,7 @@ impl Inbox {
             source.clone(),
             message,
             event.command,
+            None,
             live && event.kind == "command-finished",
         );
     }
@@ -131,6 +140,7 @@ impl Inbox {
             display_field(source).into(),
             format!("Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"),
             None,
+            None,
             true,
         );
     }
@@ -140,13 +150,23 @@ impl Inbox {
         tab: u64,
         sequence: u64,
         source: &str,
-        message: String,
+        results: Vec<SshLoginResult>,
     ) {
+        let (mut connected, mut failed, mut stopped, mut closed) = (0, 0, 0, 0);
+        for result in &results {
+            match result.outcome {
+                SshAttemptOutcome::Connected => connected += 1,
+                SshAttemptOutcome::Failed(_) => failed += 1,
+                SshAttemptOutcome::Stopped => stopped += 1,
+                SshAttemptOutcome::Closed => closed += 1,
+            }
+        }
         self.push(
             NoticeTarget::GroupLogins { tab, sequence },
             display_field(source).into(),
-            message,
+            format!("SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"),
             None,
+            Some(results.into()),
             true,
         );
     }
@@ -157,6 +177,7 @@ impl Inbox {
         source: Arc<str>,
         message: String,
         command: Option<CommandLink>,
+        login_results: Option<Arc<[SshLoginResult]>>,
         flash_pending: bool,
     ) {
         let mut state = self.state.lock().unwrap();
@@ -174,6 +195,7 @@ impl Inbox {
             message,
             unread: true,
             command,
+            login_results,
         });
         self.wake_ui(state);
     }
@@ -274,6 +296,16 @@ impl Inbox {
             .iter()
             .find(|row| row.target == NoticeTarget::Pane { pane, sequence })?
             .command
+    }
+
+    pub fn group_login_notice(&self, target: NoticeTarget) -> Option<Notice> {
+        self.state
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.target == target && row.login_results.is_some())
+            .cloned()
     }
 
     pub fn mark_read(&self, pane: u64, sequence: u64) -> bool {

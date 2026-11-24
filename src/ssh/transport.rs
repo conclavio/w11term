@@ -720,10 +720,11 @@ impl Driver {
             attempt.begin(&self.events);
         }
         let result = self.run_pending(program, can_stop, &mut attempt).await;
-        let outcome = if result.is_err() {
-            SshAttemptOutcome::Failed
-        } else {
-            SshAttemptOutcome::Closed
+        let outcome = match &result {
+            Err(error) => SshAttemptOutcome::Failed(
+                crate::events::display_field(&format!("{error:#}")).into(),
+            ),
+            Ok(()) => SshAttemptOutcome::Closed,
         };
         PendingAttempt::finish(&mut attempt.guard, outcome)?;
         result

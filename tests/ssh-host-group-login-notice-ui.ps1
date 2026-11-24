@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
+$config = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles
 $gates = [IO.File]::ReadAllText((Join-Path $State 'shell-gates.json')) | ConvertFrom-Json
 $dot = ' ' + [char]0xb7 + ' '
 $button = [System.Windows.Automation.ControlType]::Button
@@ -46,7 +47,27 @@ try {
     $null = Wait-Until 'one new unread notification while the group is in the background' {
         Find-Element 'Attention inbox, 1 unread' $button
     }
-    Click-Button "Unread${dot}SSH group${dot}Notices${dot}$message"
+    $exit = Wait-Until 'the failed login is restartable' {
+        (Control @('events','--pane',"$east")).restart_token
+    }
+    Remove-Item -LiteralPath (Join-Path (Split-Path -LiteralPath $gates.East) 'reject-shell-request')
+    $null = Control @('restart','--pane',"$east",'--exit-token',"$exit")
+    $null = Control @('wait-for-text','--pane',"$east",'--timeout','10','ready')
+
+    $viewResults = "View SSH login results for SSH group${dot}Notices, notice 2"
+    Click-Button $viewResults
+    $success = "West${dot}test@127.0.0.1:$($config.West.port)${dot}Pane $west${dot}Connected"
+    $failure = "East${dot}test@127.0.0.1:$($config.East.port)${dot}Pane $east${dot}Failed"
+    $null = Wait-Until 'the report retains the original failure after East reconnects' {
+        (Find-Element $success) -and (Find-Element $failure) -and
+            (Find-Element 'remote server rejected a PTY or shell request (1 outstanding)')
+    }
+    Click-Button "Open SSH login pane $east"
+    Wait-Focus $east
+    Click-Button 'Attention inbox, 0 unread'
+    Click-Button $viewResults
+    Click-Button 'Back to inbox'
+    Click-Button "Read${dot}SSH group${dot}Notices${dot}$message"
     $null = Wait-Until 'visiting the notice selects the original roster and marks it read' {
         (Find-Element 'Host filter') -and (Find-Element 'Attention inbox, 0 unread' $button)
     }
