@@ -42,6 +42,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "list-ssh-groups"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
+            | "submit-ssh-group-command"
             | "wait-ssh-group-run"
             | "wait-ssh-group-output"
             | "get-ssh-group-output"
@@ -203,6 +204,46 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_ssh_group_submission_without_rewriting_the_command() {
+        let base = [
+            "--pid",
+            "7",
+            "submit-ssh-group-command",
+            "--window",
+            "2",
+            "--tab",
+            "3",
+        ];
+        let submit = |extra: &[&str]| {
+            parse(
+                base.into_iter()
+                    .chain(extra.iter().copied())
+                    .map(str::to_owned),
+            )
+        };
+        let (pid, request) =
+            submit(&["--pane", "9", "--pane", "5", "--", "show  status; pwd"]).unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb":"submit-ssh-group-command", "window_id":2, "tab_id":3,
+                "pane_ids":[9,5], "command":"show  status; pwd",
+            }),
+        );
+        for invalid in [
+            &["show"][..],
+            &["--pane", "0", "show"],
+            &["--pane", "5", "--pane", "5", "show"],
+            &["--pane", "5", "show\rstatus"],
+            &["--pane", "5", "--run", "1", "show"],
+            &["--pane", "5", "show", "status"],
+        ] {
+            assert!(submit(invalid).is_err(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn parses_ssh_group_discovery_and_scoped_run_ids() {

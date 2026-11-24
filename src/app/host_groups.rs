@@ -170,6 +170,12 @@ pub struct CommandOffer {
     notify_canary: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmissionOrigin {
+    Interactive,
+    Control,
+}
+
 enum SubmissionContent {
     Command(Arc<str>),
     Environment(BTreeMap<u64, Arc<str>>),
@@ -605,26 +611,54 @@ impl HostGroup {
         })
     }
 
+    fn command_offer(&self, text: Arc<str>, targets: Vec<Target>) -> CommandOffer {
+        CommandOffer {
+            text,
+            targets,
+            limit: self.roster_preferences.command_limit,
+            interval: self.roster_preferences.command_interval,
+            queue_expiry: self.roster_preferences.command_queue_expiry,
+            stop_queue_on_failure: self.roster_preferences.stop_command_queue_on_failure,
+            canary: self.canary,
+            notify_canary: self.canary.is_some() && self.notify_canary,
+        }
+    }
+
     fn submit(
         &mut self,
         content: SubmissionContent,
         results: Vec<Delivery>,
         transcript: GroupTranscript,
     ) -> &mut Submission {
+        self.retain_submission(content, results, transcript, SubmissionOrigin::Interactive)
+    }
+
+    fn retain_submission(
+        &mut self,
+        content: SubmissionContent,
+        results: Vec<Delivery>,
+        transcript: GroupTranscript,
+        origin: SubmissionOrigin,
+    ) -> &mut Submission {
         transcript.finish_dispatch();
-        self.preview_command_order = false;
         self.next_submission += 1;
-        self.viewing = self.next_submission;
-        self.result_filter = progress::Filter::All;
-        self.recipient_search.clear();
-        if let SubmissionContent::Command(command) = &content {
-            self.recent_commands.record(self.viewing, command.clone());
-            self.previous_draft = None;
+        let id = self.next_submission;
+        if origin == SubmissionOrigin::Interactive {
+            self.preview_command_order = false;
+            self.viewing = id;
+            self.result_filter = progress::Filter::All;
+            self.recipient_search.clear();
+            self.copy_feedback.clear();
+            self.retry_feedback.clear();
         }
-        self.copy_feedback.clear();
-        self.retry_feedback.clear();
+        if let SubmissionContent::Command(command) = &content {
+            self.recent_commands.record(id, command.clone());
+            if origin == SubmissionOrigin::Interactive {
+                self.previous_draft = None;
+            }
+        }
         self.submissions.push_back(Submission {
-            id: self.viewing,
+            id,
             content,
             results,
             transcript,
@@ -636,8 +670,16 @@ impl HostGroup {
             control_waiters: Vec::new(),
             output_lifetime: None,
         });
-        if self.submissions.len() > SUBMISSION_LIMIT {
-            self.submissions.pop_front();
+        if self.submissions.len() > SUBMISSION_LIMIT
+            && self
+                .submissions
+                .pop_front()
+                .is_some_and(|old| old.id == self.viewing)
+        {
+            self.viewing = self.submissions[0].id;
+            self.result_filter = progress::Filter::All;
+            self.copy_feedback.clear();
+            self.retry_feedback.clear();
         }
         self.submissions
             .back_mut()
@@ -1144,7 +1186,14 @@ impl TerminalApp {
         offer: CommandOffer,
         transcript: GroupTranscript,
         recording: output_recording::State,
-    ) {
+        origin: SubmissionOrigin,
+    ) -> Option<u64> {
+        if !matches!(
+            self.tabs.get(id).map(|tab| &tab.page),
+            Some(Page::HostGroup(_))
+        ) {
+            return None;
+        }
         let policy = offer.dispatch_policy();
         let CommandOffer {
             text,
@@ -1176,23 +1225,33 @@ impl TerminalApp {
                 }
             })
             .collect();
-        if let Some(page) = self.host_group_mut(id) {
+        let Page::HostGroup(page) = &mut self.tabs.get_mut(id)?.page else {
+            unreachable!("the group remains open during dispatch");
+        };
+        if origin == SubmissionOrigin::Interactive {
             page.manual_command_order.clear();
-            let submission = page.submit(SubmissionContent::Command(text), results, transcript);
-            submission.recording = recording;
-            submission.command_queue = slots.map(|slots| {
-                command_queue::Queue::new(
-                    slots,
-                    policy.stop_on_failure,
-                    canary,
-                    notify_canary,
-                    interval,
-                    deadline,
-                )
-            });
-            submission.dispatch_policy = Some(policy);
         }
+        let submission = page.retain_submission(
+            SubmissionContent::Command(text),
+            results,
+            transcript,
+            origin,
+        );
+        submission.recording = recording;
+        submission.command_queue = slots.map(|slots| {
+            command_queue::Queue::new(
+                slots,
+                policy.stop_on_failure,
+                canary,
+                notify_canary,
+                interval,
+                deadline,
+            )
+        });
+        submission.dispatch_policy = Some(policy);
+        let run = submission.id;
         self.poll_command_queues();
+        Some(run)
     }
 
     fn interrupt_hosts(
@@ -1730,6 +1789,7 @@ impl TerminalApp {
                     offer,
                     GroupTranscript::default(),
                     Default::default(),
+                    SubmissionOrigin::Interactive,
                 );
             }
         }
@@ -2299,19 +2359,13 @@ impl TerminalApp {
             .placeholder_text("Enter one shell command")
             .text(&page.draft)
             .on_text_changed(ctx.callback(move |text| Message::HostGroup(Action::Edit(id, text))));
-        let offer = CommandOffer {
+        let offer = page.command_offer(
             text,
-            targets: command_order::recipients(page, shown.iter().copied())
+            command_order::recipients(page, shown.iter().copied())
                 .into_iter()
                 .cloned()
                 .collect(),
-            limit: page.roster_preferences.command_limit,
-            interval: page.roster_preferences.command_interval,
-            queue_expiry: page.roster_preferences.command_queue_expiry,
-            stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
-            canary: page.canary,
-            notify_canary: page.canary.is_some() && page.notify_canary,
-        };
+        );
         let (body_key, body) = if page.preview_command_order {
             (
                 "command-order",

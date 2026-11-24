@@ -1993,6 +1993,44 @@ try {
         $missing.output.state -cne 'complete' -or !$missing.output.text.Contains('west-accepted check-each-host')) {
         throw 'The JSON export lost the expected output check, its recipient outcomes, or the captured output'
     }
+    $submitArgs = @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab")
+    $badScope = & $Cli --pid $app.Id @submitArgs --pane $west --pane $local 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $badScope.ok -or $badScope.error -notlike "*SSH pane $local*outside*") {
+        throw 'The CLI accepted a local pane as an SSH group recipient'
+    }
+    Send-Raw $west 'alt'
+    Pane-Status $west "Connected${dot}Alternate screen"
+    $notReady = & $Cli --pid $app.Id @submitArgs --pane $east --pane $west 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $notReady.ok -or $notReady.error -notlike "*SSH pane $west*not ready*") {
+        throw 'The CLI accepted a submission while one of its explicitly named SSH panes was unready'
+    }
+    Send-Raw $west 'prompt'
+    Pane-Status $west "Connected${dot}Ready"
+    (Command-Editor).SetValue('untouched command draft')
+    Set-HostFilter 'east'
+    Press-Key 0x77
+    Wait-Focus $east
+    $submitForeground = [FixtureMessages]::GetForegroundWindow()
+    $launched = Control ($submitArgs + @('--pane',"$west",'cli-only  west'))
+    if ($launched.window_id -ne $groupWindow -or $launched.tab_id -ne $groupTab -or $launched.run_id -ne ($everyHostRun + 1)) {
+        throw 'The CLI did not create exactly one retained run for the accepted request'
+    }
+    $verified = (Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($launched.run_id)",'--timeout','15')).run
+    if ($verified.command -cne 'cli-only  west' -or $verified.recipients.Count -ne 1 -or
+        $verified.recipients[0].pane_id -ne $west -or $verified.recipients[0].delivery.state -cne 'sent' -or
+        $verified.recipients[0].execution.exit_code -ne 17 -or
+        [FixtureMessages]::GetForegroundWindow() -ne $submitForeground) {
+        throw 'The CLI submission changed focus or lost its recipient, command, or outcome'
+    }
+    Wait-Focus $east
+    Run-Palette 'SSH host group'
+    $null = Wait-Until 'background submission preserved the displayed results and draft' {
+        (Find-Element "Submitted${dot}check-each-host") -and
+            (Command-Editor).Current.Value -ceq 'untouched command draft' -and
+            (Find-Element "Focus pane $east" $button) -and !(Find-Element "Focus pane $west" $button)
+    }
+    Set-HostFilter ''
     Click 'Previous submission'
     $null = Wait-Until 'move back to the earlier missing-output check' { Find-Element "Submitted${dot}check-expected" }
     Click 'Previous submission'

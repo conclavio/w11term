@@ -214,6 +214,25 @@ Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
 background tab or window without changing selection or keyboard focus.
 
+`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--] COMMAND`
+sends one shell line of up to 4,096 UTF-8 bytes to explicitly named panes.
+Pass the command as one quoted argument to preserve spaces. Use `--` before
+a command beginning with two hyphens. The panes must be distinct, belong
+to the group's current roster scope, and each have a fresh verified prompt.
+The host filter and checkboxes in the group UI have no bearing on this
+explicit recipient list. If a recipient fails validation, the entire request
+is rejected before dispatch. If a prompt changes after validation, the
+affected pane's run result records that delivery was withheld.
+
+The group applies its configured queue policy, including manual approval
+after a canary. When a canary is configured, the explicit list must include
+that pane at a fresh shell marker and at least one other ready pane. The
+response returns `window_id`, `tab_id`, and a new `run_id` as soon as the
+run is accepted. Use the run ID below to confirm delivery, check shell exit
+status, or follow output. A background submission preserves the window focus,
+group draft, and roster selection. If the submission is unacknowledged, check
+the retained runs before retrying.
+
 `get-ssh-group-run --window ID --tab ID --run ID` takes the three IDs from
 the listing. An evicted run or closed tab or window returns a lookup error.
 The reply includes `window_id`, `tab_id`, and a `run` object with
@@ -308,6 +327,7 @@ for recipient exit statuses.
 w11term-cli --pid 12345 list-ssh-groups
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 -- "uname -a"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
@@ -322,6 +342,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"list-ssh-groups"}
 {"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"uname -a"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}

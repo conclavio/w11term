@@ -99,6 +99,12 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    SubmitSshGroupCommand {
+        window_id: WindowId,
+        tab_id: u64,
+        pane_ids: Vec<u64>,
+        command: String,
+    },
     GetSshGroupRun {
         window_id: WindowId,
         tab_id: u64,
@@ -213,6 +219,12 @@ pub enum UiRequest {
         wait_for_readiness: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    SubmitSshGroupCommand {
+        tab_id: u64,
+        pane_ids: Vec<u64>,
+        command: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     GetSshGroupRun {
         tab_id: u64,
         run_id: u64,
@@ -247,6 +259,7 @@ impl UiRequest {
             | Self::Resize { reply, .. }
             | Self::ListSshGroups { reply }
             | Self::GetSshGroupRoster { reply, .. }
+            | Self::SubmitSshGroupCommand { reply, .. }
             | Self::GetSshGroupRun { reply, .. } => reply,
             Self::ReadSshGroupOutput { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
@@ -258,6 +271,7 @@ impl UiRequest {
 }
 
 pub use ssh_groups::SshGroupOutput;
+pub use ssh_groups::validate_group_submission;
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -537,6 +551,15 @@ impl Registry {
                 run_id,
             } => {
                 self.query_ssh_group_run(window_id, tab_id, run_id, None)
+                    .await
+            }
+            Request::SubmitSshGroupCommand {
+                window_id,
+                tab_id,
+                pane_ids,
+                command,
+            } => {
+                self.submit_ssh_group_command(window_id, tab_id, pane_ids, command)
                     .await
             }
             Request::WaitSshGroupRun {

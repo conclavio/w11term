@@ -262,7 +262,13 @@ impl TerminalApp {
         }
         let transcript = GroupTranscript::default();
         self.arm_group_send_alert(id, &review.offer, alert, &transcript);
-        self.submit_group_command(id, review.offer, transcript, Default::default());
+        self.submit_group_command(
+            id,
+            review.offer,
+            transcript,
+            Default::default(),
+            SubmissionOrigin::Interactive,
+        );
     }
 
     pub(super) fn arm_group_send_alert(

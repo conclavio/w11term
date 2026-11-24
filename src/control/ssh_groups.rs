@@ -2,7 +2,10 @@ use super::*;
 use crate::events::{GroupTranscriptLine, GroupTranscriptOutput};
 use anyhow::bail;
 use regex::Regex;
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 use tokio::{
     sync::{broadcast::error::RecvError, watch},
     time::Instant,
@@ -68,7 +71,50 @@ fn describe_output_line(line: &GroupTranscriptLine, label: &str, address: &str) 
     })
 }
 
+pub fn validate_group_submission(pane_ids: &[u64], command: &str) -> Result<()> {
+    ensure!(
+        crate::saved_commands::valid_command_text(command),
+        "provide one nonempty shell command line of up to 4096 UTF-8 bytes"
+    );
+    ensure!(
+        !pane_ids.is_empty(),
+        "provide at least one explicit SSH pane ID"
+    );
+    let mut seen = BTreeSet::new();
+    for &pane in pane_ids {
+        ensure!(pane != 0, "pane IDs must be positive");
+        ensure!(
+            seen.insert(pane),
+            "pane ID {pane} was specified more than once"
+        );
+    }
+    Ok(())
+}
+
 impl Registry {
+    pub(super) async fn submit_ssh_group_command(
+        &self,
+        window: WindowId,
+        tab: u64,
+        pane_ids: Vec<u64>,
+        command: String,
+    ) -> Result<Value> {
+        validate_group_submission(&pane_ids, &command)?;
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::SubmitSshGroupCommand {
+            tab_id: tab,
+            pane_ids,
+            command,
+            reply,
+        });
+        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group submission was not acknowledged. Check retained runs before retrying");
+        };
+        let run = run.map_err(anyhow::Error::msg)?;
+        Ok(json!({ "window_id": window, "tab_id": tab, "run_id": run }))
+    }
+
     pub(super) async fn query_ssh_group_roster(
         &self,
         window: WindowId,
@@ -526,6 +572,17 @@ mod tests {
                     .send(Ok(json!({ "summary": { "run_id": run_id } })))
                     .unwrap();
             }
+            UiRequest::SubmitSshGroupCommand {
+                tab_id,
+                pane_ids,
+                command,
+                reply,
+            } => {
+                assert_eq!(tab_id, 9);
+                assert_eq!(pane_ids, [8, 7]);
+                assert_eq!(command, "show  status");
+                reply.send(Ok(json!(3))).unwrap();
+            }
             UiRequest::GetSshGroupRoster {
                 tab_id,
                 wait_for_readiness,
@@ -552,6 +609,22 @@ mod tests {
             ])
         );
         let lookup = second.query_ssh_group_run(3, 9, 2, None).await.unwrap();
+        let submission = second
+            .submit_ssh_group_command(3, 9, vec![8, 7], "show  status".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            submission,
+            json!({ "window_id": 3, "tab_id": 9, "run_id": 3 })
+        );
+        assert!(
+            second
+                .submit_ssh_group_command(3, 9, vec![7, 7], "show".into())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("specified more than once")
+        );
         assert_eq!(
             lookup,
             json!({ "window_id": 3, "tab_id": 9, "run": { "summary": { "run_id": 2 } } })

@@ -164,7 +164,13 @@ impl TerminalApp {
                 if let Some(alert) = alert {
                     self.arm_group_send_alert(id, &offer, alert, &transcript);
                 }
-                self.submit_group_command(id, offer, transcript, recording);
+                self.submit_group_command(
+                    id,
+                    offer,
+                    transcript,
+                    recording,
+                    SubmissionOrigin::Interactive,
+                );
             }
             Err(error) => {
                 if let Some(state) = self.recorded_send_state(id) {

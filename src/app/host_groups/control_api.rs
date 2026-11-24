@@ -81,6 +81,56 @@ impl Submission {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn control_submit_ssh_group_command(
+        &mut self,
+        tab: TabId,
+        pane_ids: &[u64],
+        command: String,
+    ) -> Result<u64, String> {
+        let targets = self.host_group_targets();
+        let Some(Page::HostGroup(page)) = self.tabs.get_mut(tab).map(|tab| &mut tab.page) else {
+            return Err(format!("unknown SSH group tab {tab} in this window"));
+        };
+        if let Some(run) = page.submissions.back_mut() {
+            run.refresh_deliveries();
+        }
+        if page.sending() || page.recorded_send.pending() {
+            return Err("This SSH group still has a submission in progress".into());
+        }
+
+        let scoped: BTreeMap<_, _> = page
+            .scoped_targets(&targets)
+            .map(|target| (target.pane, target))
+            .collect();
+        let mut recipients = Vec::with_capacity(pane_ids.len());
+        for pane in pane_ids {
+            let target = scoped
+                .get(pane)
+                .copied()
+                .ok_or_else(|| format!("SSH pane {pane} is outside this group's roster"))?;
+            if !target.state.is_ready() {
+                return Err(format!(
+                    "SSH pane {pane} is not ready. {}",
+                    target.state.label()
+                ));
+            }
+            recipients.push(target.clone());
+        }
+        command_queue::canary_readiness(&recipients, page.canary).map_err(|_| {
+            "Include the configured canary at a fresh shell marker and at least one other ready SSH pane"
+                .to_owned()
+        })?;
+        let offer = page.command_offer(command.into(), recipients);
+        self.submit_group_command(
+            tab,
+            offer,
+            GroupTranscript::default(),
+            Default::default(),
+            SubmissionOrigin::Control,
+        )
+        .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))
+    }
+
     pub(in crate::app) fn control_ssh_group_roster(
         &mut self,
         tab: TabId,
