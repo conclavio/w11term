@@ -26,7 +26,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         match arg.as_str() {
             "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
             | "save-text" | "restart" | "list-commands" | "get-command" | "inspect"
-            | "playback"
+            | "playback" | "list-ssh-groups" | "get-ssh-group-run"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -160,6 +160,36 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_ssh_group_discovery_and_scoped_run_ids() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("list-ssh-groups --pid 7").unwrap(),
+            (Some(7), Request::ListSshGroups)
+        ));
+        assert!(matches!(
+            parse_line("--pid 7 get-ssh-group-run --tab 12 --run 4 --window 11").unwrap(),
+            (
+                Some(7),
+                Request::GetSshGroupRun {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4
+                }
+            )
+        ));
+        for invalid in [
+            "--pane 7 list-ssh-groups",
+            "list-ssh-groups --window 2",
+            "get-ssh-group-run --window 2 --tab 3",
+            "get-ssh-group-run --window 2 --tab 0 --run 4",
+            "get-ssh-group-run --window 2 --tab 3 --run 4 --run 5",
+            "get-ssh-group-run --window 2 --tab 3 --run 4 --pane 7",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn playback_requires_one_pane_and_at_most_one_action() {

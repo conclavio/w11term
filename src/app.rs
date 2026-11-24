@@ -5376,6 +5376,20 @@ impl Component for TerminalApp {
                     self.watcher_retry = None;
                 }
             }
+            Message::Control(w11term::control::UiRequest::ListSshGroups { reply }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(Ok(self.control_ssh_groups()));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::GetSshGroupRun {
+                tab_id,
+                run_id,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_ssh_group_run(tab_id, run_id));
+                }
+            }
             Message::Control(w11term::control::UiRequest::Open {
                 profile,
                 cols,

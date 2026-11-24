@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{CommandStatus, Request};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -27,6 +27,9 @@ pub fn parse(
     let mut command_id = None;
     let mut status = None;
     let mut connection_generation = None;
+    let mut window_id = None;
+    let mut tab_id = None;
+    let mut run_id = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
             args.next()
@@ -72,6 +75,18 @@ pub fn parse(
             }
             "--connection-generation" if verb == "get-command" => {
                 connection_generation = Some(value(&mut args)?.parse()?)
+            }
+            "--window" | "--tab" | "--run" if verb == "get-ssh-group-run" => {
+                let id: u64 = value(&mut args)?
+                    .parse()
+                    .with_context(|| format!("{arg} requires a positive integer"))?;
+                ensure!(id != 0, "{arg} requires a positive integer");
+                let slot = match arg.as_str() {
+                    "--window" => &mut window_id,
+                    "--tab" => &mut tab_id,
+                    _ => &mut run_id,
+                };
+                ensure!(slot.replace(id).is_none(), "specify {arg} only once");
             }
             "--" if matches!(verb, "find-text" | "wait-for-text") => {
                 ensure!(text.is_none(), "only one pattern is accepted");
@@ -150,6 +165,18 @@ pub fn parse(
             connection_generation: connection_generation
                 .context("--connection-generation is required (from list-commands)")?,
         },
+        "list-ssh-groups" => {
+            ensure!(pane.is_none(), "list-ssh-groups does not accept --pane");
+            Request::ListSshGroups
+        }
+        "get-ssh-group-run" => {
+            ensure!(pane.is_none(), "get-ssh-group-run does not accept --pane");
+            Request::GetSshGroupRun {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                tab_id: tab_id.context("--tab is required (from list-ssh-groups)")?,
+                run_id: run_id.context("--run is required (from list-ssh-groups)")?,
+            }
+        }
         "restart" => Request::Restart {
             pane: pane.context("--pane is required")?,
             exit_token: exit_token.context("--exit-token is required (from events)")?,

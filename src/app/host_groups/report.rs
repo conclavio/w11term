@@ -8,6 +8,7 @@ use w11term::events::{GroupCommandResult, GroupQueueActivity};
 use wezterm_term::CompletedCommand;
 
 mod json;
+pub(super) use json::{describe_run, summarize_run};
 
 const OUTPUT_END: &str = "\r\n";
 const OUTPUT_SHORTENED: &str = "[Output shortened to fit the clipboard]\r\n";
@@ -169,11 +170,7 @@ impl Report {
         Self {
             id: submission.id,
             label: submission.content.label().to_owned(),
-            kind: if submission.content.command().is_some() {
-                json::Kind::Command
-            } else {
-                json::Kind::Environment
-            },
+            kind: json::Kind::of(&submission.content),
             dispatch_policy: submission.dispatch_policy.clone(),
             queue_activity: submission.transcript.queue_activity(),
             total_recipient_count: (sections.len() < submission.results.len())

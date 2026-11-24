@@ -119,7 +119,7 @@ impl HostGroup {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub(super) struct Summary {
     waiting: usize,
     running: usize,

@@ -171,6 +171,45 @@ output. Keep the pane ID, command ID and connection generation together. A looku
 fails if its record has been evicted or its connection generation has changed.
 After a reconnect, list again to see the new session’s history.
 
+## Retained SSH group runs
+
+`list-ssh-groups` lists live SSH group tabs across the selected process. The
+reply includes `pid` and a `windows` array with `window_id` and `groups` for
+each window. A group has `tab_id`, `label`, and `runs` in submission order,
+oldest first. A tab retains the eight newest runs. A group can have an empty
+run list.
+
+Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
+`recipient_count`, `settled_count`, and `outcomes` counts for `waiting`,
+`running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
+background tab or window without changing selection or keyboard focus.
+
+`get-ssh-group-run --window ID --tab ID --run ID` takes the three IDs from
+the listing. An evicted run or closed tab or window returns a lookup error.
+The reply includes `window_id`, `tab_id`, and a `run` object with
+`schema_version: 1`, `summary`, `command`, `dispatch_policy`,
+`queue_activity`, and `recipients` in the original dispatch order. Recipient
+rows carry the same pane identity, delivery, execution, and interrupt
+statuses as saved group reports. Environment assignments appear in their
+recipient rows.
+
+The detail reply carries metadata. To read a completed recipient's retained
+output, use `get-command` with its `pane_id` and the
+`execution.command_id` and `execution.connection_generation` in the reply.
+The usual pane history retention rules apply.
+
+```powershell
+w11term-cli --pid 12345 list-ssh-groups
+w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
+```
+
+Direct pipe clients use these JSON requests.
+
+```json
+{"verb":"list-ssh-groups"}
+{"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
+```
+
 ## Waiting, geometry, tabs, and events
 
 `find-text` searches each selected pane’s retained scrollback and visible screen once. Use `--pane ID` for one pane or `--all-panes` for every pane in the process, across all its windows. The default is a case-insensitive Unicode literal. Use `--regex` for Rust regex syntax and `--match-case` to select case-sensitive matching. Both modes join soft wraps and stop at hard line breaks. Patterns can be up to 4,096 UTF-8 bytes. Use `--` before a pattern beginning with two hyphens. An alternate-screen pane searches its current screen.

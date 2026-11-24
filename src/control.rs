@@ -28,6 +28,7 @@ mod command_history;
 mod find;
 mod registry;
 mod security;
+mod ssh_groups;
 pub use command_history::CommandStatus;
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
@@ -86,6 +87,12 @@ pub enum Request {
         operation: crate::sftp::Operation,
     },
     List,
+    ListSshGroups,
+    GetSshGroupRun {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+    },
     WorkspaceIdentity,
     WorkspaceWindows {
         key: String,
@@ -142,6 +149,14 @@ fn default_wait_timeout() -> u64 {
 }
 #[derive(Debug)]
 pub enum UiRequest {
+    ListSshGroups {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    GetSshGroupRun {
+        tab_id: u64,
+        run_id: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Open {
         profile: String,
         cols: Option<usize>,
@@ -159,7 +174,10 @@ pub enum UiRequest {
 impl UiRequest {
     pub fn fail(self, message: &str) {
         let reply = match self {
-            Self::Open { reply, .. } | Self::Resize { reply, .. } => reply,
+            Self::Open { reply, .. }
+            | Self::Resize { reply, .. }
+            | Self::ListSshGroups { reply }
+            | Self::GetSshGroupRun { reply, .. } => reply,
         };
         let _ = reply.send(Err(message.into()));
     }
@@ -417,6 +435,12 @@ impl Registry {
             }
             Request::WorkspaceIdentity => Ok(json!(self.legacy_workspace())),
             Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
+            Request::ListSshGroups => self.list_ssh_groups().await,
+            Request::GetSshGroupRun {
+                window_id,
+                tab_id,
+                run_id,
+            } => self.get_ssh_group_run(window_id, tab_id, run_id).await,
             Request::List => {
                 let mut sessions = Vec::new();
                 for (window_id, pane) in self.listing() {

@@ -1,8 +1,11 @@
 use super::{CapturedOutput, Report};
 use crate::app::host_groups::{
-    Delivery, DeliveryStatus, GroupExecution, SubmissionContent, dispatch_policy::Policy,
+    Delivery, DeliveryStatus, GroupExecution, Submission, SubmissionContent,
+    dispatch_policy::Policy,
+    progress::{Outcome, Summary},
 };
 use serde::Serialize;
+use serde_json::{Value, json};
 use std::{
     io::{self, Write},
     time::{Duration, Instant},
@@ -14,6 +17,15 @@ use w11term::events::GroupQueueActivity;
 pub(super) enum Kind {
     Command,
     Environment,
+}
+
+impl Kind {
+    pub(super) fn of(content: &SubmissionContent) -> Self {
+        match content {
+            SubmissionContent::Command(_) => Self::Command,
+            SubmissionContent::Environment(_) => Self::Environment,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -163,6 +175,62 @@ struct Document<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     total_recipient_count: Option<usize>,
     recipients: Vec<DocumentRecipient<'a>>,
+}
+
+#[derive(Serialize)]
+pub(in crate::app::host_groups) struct RunSummary<'a> {
+    run_id: u64,
+    label: &'a str,
+    kind: Kind,
+    recipient_count: usize,
+    settled_count: usize,
+    outcomes: Summary,
+}
+
+impl<'a> RunSummary<'a> {
+    fn new(submission: &'a Submission, outcomes: Summary) -> Self {
+        Self {
+            run_id: submission.id,
+            label: submission.content.label(),
+            kind: Kind::of(&submission.content),
+            recipient_count: outcomes.total(),
+            settled_count: outcomes.settled(),
+            outcomes,
+        }
+    }
+}
+
+pub(in crate::app::host_groups) fn summarize_run(submission: &Submission) -> RunSummary<'_> {
+    let mut outcomes = Summary::default();
+    for delivery in &submission.results {
+        outcomes.add(Outcome::of(delivery));
+    }
+    RunSummary::new(submission, outcomes)
+}
+
+pub(in crate::app::host_groups) fn describe_run(submission: &Submission) -> Value {
+    let now = Instant::now();
+    let mut outcomes = Summary::default();
+    let recipients: Vec<_> = submission
+        .results
+        .iter()
+        .map(|delivery| {
+            let execution = delivery.execution();
+            outcomes.add(Outcome::with_execution(
+                &delivery.status,
+                execution.as_ref(),
+            ));
+            Recipient::capture(delivery, &submission.content, execution.as_ref(), now)
+        })
+        .collect();
+    json!({
+        "schema_version": 1,
+        "summary": RunSummary::new(submission, outcomes),
+        "command": submission.content.command(),
+        "dispatch_policy": submission.dispatch_policy,
+        "queue_activity": submission.transcript.queue_activity(),
+        "recipients": recipients,
+    })
 }
 
 impl Report {

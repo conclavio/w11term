@@ -17,6 +17,7 @@ mod command_queue;
 mod compare;
 mod completion;
 mod connection_notice;
+mod control_api;
 mod disconnect;
 mod dispatch_policy;
 mod environment;

@@ -34,6 +34,9 @@ function Set-Command([string]$Command) {
     $field = Wait-Until 'group command' { Find-Element 'Group command' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
 }
+function Run-Snapshot([uint64]$Run) {
+    Control @('get-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$Run")
+}
 function Select-GroupOption([string]$Name, [string]$Label) {
     $combo = [System.Windows.Automation.ControlType]::ComboBox
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
@@ -59,6 +62,14 @@ try {
     $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
     Run-Palette "Open SSH group${dot}Fleet" -Enter
+    $listing = Control @('list-ssh-groups')
+    $owner = $listing.windows | Where-Object { $_.groups.label -ccontains $group }
+    $listedGroup = $owner.groups | Where-Object label -ceq $group
+    $groupWindow = $owner.window_id
+    $groupTab = $listedGroup.tab_id
+    if (!$groupWindow -or !$groupTab -or $listedGroup.runs.Count -ne 0) {
+        throw 'The new group was missing from the CLI listing or already had runs'
+    }
     $panes = @{}
     $labels = @{}
     foreach ($name in 'West','East','North') {
@@ -101,6 +112,21 @@ try {
     $null = Control @('send-text','--pane',"$($panes.North)",'--no-paste','x')
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the group is in the background' { Find-Element 'No bells or notifications' }
+    $activeWindow = [FixtureMessages]::GetForegroundWindow()
+    $null = Wait-Until 'CLI shows one running host and two queued in the background run' {
+        $snapshot = Run-Snapshot 1
+        $run = $snapshot.run
+        $snapshot.window_id -eq $groupWindow -and $snapshot.tab_id -eq $groupTab -and
+            $run.schema_version -eq 1 -and $run.command -ceq 'roll' -and $run.summary.outcomes.running -eq 1 -and
+            $run.summary.outcomes.waiting -eq 2 -and $run.dispatch_policy.parallel_limit -eq 1 -and
+            $run.recipients[0].pane_id -eq $panes.West -and $run.recipients[0].execution.state -ceq 'running' -and
+            $run.recipients[1].pane_id -eq $panes.North -and $run.recipients[1].delivery.state -ceq 'queued'
+    }
+    $groupRun = (Control @('list-ssh-groups')).windows.groups.runs | Where-Object run_id -eq 1
+    if ($groupRun.label -cne 'roll' -or $groupRun.recipient_count -ne 3 -or $groupRun.settled_count -ne 0 -or
+        !(Find-Element 'No bells or notifications') -or [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
+        throw 'CLI discovery changed the visible page or did not summarize the background run'
+    }
     New-Item -ItemType File -Path (Join-Path $State 'release-roll') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started roll')
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
@@ -110,6 +136,28 @@ try {
     }
     New-Item -ItemType File -Path (Join-Path $State 'release-east-roll') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished roll')
+    $null = Wait-Until 'CLI reports completed exit codes, a withheld host, and output lookup IDs' {
+        $run = (Run-Snapshot 1).run
+        $westResult = $run.recipients[0]
+        $northResult = $run.recipients[1]
+        $eastResult = $run.recipients[2]
+        $run.summary.settled_count -eq 3 -and $run.summary.outcomes.succeeded -eq 2 -and
+            $run.summary.outcomes.attention -eq 1 -and $westResult.execution.exit_code -eq 0 -and
+            $northResult.delivery.state -ceq 'rejected' -and $northResult.delivery.reason -like 'The verified prompt changed*' -and
+            $eastResult.execution.exit_code -eq 0 -and $eastResult.execution.command_id -gt 0 -and
+            $null -ne $eastResult.execution.connection_generation -and
+            !($eastResult.PSObject.Properties.Name -contains 'output')
+    }
+    $eastExecution = (Run-Snapshot 1).run.recipients[2].execution
+    $output = Control @('get-command','--pane',"$($panes.East)",'--id',"$($eastExecution.command_id)",
+        '--connection-generation',"$($eastExecution.connection_generation)")
+    if ($output.output_error -or $output.output -notlike '*East finished roll*') {
+        throw 'The completed result did not link to the original pane output'
+    }
+    $missing = & $Cli --pid $app.Id get-ssh-group-run --window $groupWindow --tab $groupTab --run 900 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $missing.ok -or $missing.error -notlike '*not retained*') {
+        throw 'An unknown run did not return an explicit lookup error'
+    }
     Click 'Preview send order'
     $null = Wait-Until 'the next draft goes back to the roster order' {
         (Find-Element "1. $($labels.West)") -and (Find-Element "2. $($labels.East)") -and
