@@ -1242,7 +1242,7 @@ mod tests {
             crate::events::GroupTranscript::default().host(1),
         );
         term.advance_bytes(b"echo east\r\n\x1b]133;C\x07");
-        let GroupExecution::Running(target) = *outcome.borrow() else {
+        let GroupExecution::Running { target, .. } = *outcome.borrow() else {
             panic!("expected running command")
         };
         assert!(events.group_command_running(target));
@@ -1282,7 +1282,7 @@ mod tests {
         term.advance_bytes(b"\r\n\x1b]633;C\x07west result\r\n");
         assert!(matches!(*late.borrow(), GroupExecution::AwaitingMarkers));
         term.advance_bytes(b"\x1b]633;E;echo west\x07");
-        assert!(matches!(*late.borrow(), GroupExecution::Running(_)));
+        assert!(matches!(*late.borrow(), GroupExecution::Running { .. }));
         term.advance_bytes(b"\x1b]633;D;0\x07");
         assert!(matches!(&*late.borrow(), GroupExecution::Finished(result)
             if result.exit_code == Some(0) && result.link.id != term.command_history()[0].id));
@@ -1397,7 +1397,7 @@ mod tests {
                 crate::events::GroupTranscript::default().host(1),
             );
             term.advance_bytes(b"run\r\n\x1b]133;C\x07");
-            let GroupExecution::Running(target) = *outcome.borrow() else {
+            let GroupExecution::Running { target, .. } = *outcome.borrow() else {
                 panic!("expected running command")
             };
             assert_eq!(target.generation, 1);
@@ -1446,12 +1446,12 @@ mod tests {
             crate::events::GroupTranscript::default().host(1),
         );
         term.advance_bytes(b"run\r\n\x1b]133;C\x07");
-        let GroupExecution::Running(link) = *outcome.borrow() else {
+        let GroupExecution::Running { target, .. } = *outcome.borrow() else {
             panic!("expected running command")
         };
         events.command_stream(None);
         events.command_stream(Some(2));
-        assert!(!events.group_command_running(link));
+        assert!(!events.group_command_running(target));
         term.advance_bytes(
             b"\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07new\r\n\x1b]133;D;0\x07",
         );

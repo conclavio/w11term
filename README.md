@@ -93,6 +93,8 @@ When an SSH shell has exited or its connection attempts have ended, use **Reconn
 
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.
 
+While a verified command runs, its result shows elapsed time. On completion it shows **Shell time**, the interval between the shell markers as received by w11term. Network and output buffering can affect that interval. Timing is available when the shell reports the start of command output and the command can be matched to the submission.
+
 Choose **Live output…** on a submission to follow recent output from all its hosts, newest first. Each line identifies its source and lets you focus that pane. **Pause output** freezes the view while the shells continue, and **Resume output** catches up to the newest retained lines. The feed keeps 128 lines per submission and marks skipped or shortened output. It shows completed text lines from verified shell markers and the final line when the command ends. For prompt-only appliances or a full transcript, open the source pane or its command history.
 
 In **Live output…**, choose **Record output…** to write that submission's host-labeled output to a new UTF-8 text file in arrival order. The recording starts with the retained lines and continues while the view is paused or another tab is focused. Missing or shortened lines are marked in the file. Choose **Stop recording** to finish writing and see the saved path.
@@ -118,6 +120,8 @@ Choose **Save as command…** to add the draft to the shared library. Enter a na
 Choose **Copy results** to copy the viewed submission as plain text, including every recipient’s delivery, execution and interrupt status. The report uses full output retained in each pane and labels any preview that stands in for expired output. Large reports shorten output to fit the clipboard while retaining every host’s status.
 
 Choose **Save results…** to write a UTF-8 report of the viewed submission. It includes every recipient and all retained output from completed commands, even when the roster or result filters hide a host. A host still running appears with its status at the time you opened the Save dialog.
+
+Text and JSON reports include the known per-host times when you open the Save dialog. In JSON, `execution.elapsed_ms` is the running time for a verified running command and `execution.duration_ms` is the final time for a completed command.
 
 **Save results as JSON…** exports the same snapshot for scripts. The document has `schema_version: 1`, a `submission_id` scoped to its group tab, `kind` (`command` or `environment`), `label`, `command`, and an ordered `recipients` array. Each recipient has `pane_id`, `name`, `profile`, `address`, and `command`. A command submission puts the shared command at the top level. An environment export puts the commands on the recipients.
 

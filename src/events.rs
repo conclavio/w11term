@@ -492,11 +492,13 @@ impl Events {
         completed: Option<wezterm_term::ShellCommandCompletion<'_>>,
     ) {
         let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
         if let Some(run) = &mut state.group_run
             && !run.marker(
                 marker,
                 started,
                 completed.as_ref().map(|ended| ended.command),
+                now,
             )
         {
             state.group_run = None;
@@ -507,7 +509,7 @@ impl Events {
             completed
                 .filter(|ended| ended.had_output_start)
                 .map(|ended| ended.command.id),
-            Instant::now(),
+            now,
         );
     }
 

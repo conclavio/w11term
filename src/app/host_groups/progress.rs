@@ -17,7 +17,7 @@ impl Outcome {
                 Some(GroupExecution::AwaitingMarkers | GroupExecution::AwaitingPrompt) => {
                     Self::Waiting
                 }
-                Some(GroupExecution::Running(_)) => Self::Running,
+                Some(GroupExecution::Running { .. }) => Self::Running,
                 Some(GroupExecution::Finished(result)) if result.exit_code == Some(0) => {
                     Self::Succeeded
                 }
@@ -96,7 +96,10 @@ impl Summary {
 mod tests {
     use super::*;
     use crate::app::host_groups::{Target, TargetState};
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
     use tokio::sync::{oneshot, watch};
     use w11term::events::{CommandLink, GroupCommandResult, GroupInterruptTarget, GroupOutput};
 
@@ -123,6 +126,7 @@ mod tests {
                 id: 2,
             },
             exit_code,
+            duration: Duration::ZERO,
             output: GroupOutput::Unavailable("Output expired"),
         }))
     }
@@ -142,10 +146,13 @@ mod tests {
             (
                 delivery(
                     Sent,
-                    Some(GroupExecution::Running(GroupInterruptTarget {
-                        generation: 1,
-                        serial: 2,
-                    })),
+                    Some(GroupExecution::Running {
+                        target: GroupInterruptTarget {
+                            generation: 1,
+                            serial: 2,
+                        },
+                        started_at: Instant::now(),
+                    }),
                 ),
                 Outcome::Running,
             ),
