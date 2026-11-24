@@ -15,6 +15,7 @@ mod prompt_setup;
 mod reconnect;
 mod report;
 mod retry;
+mod reuse;
 mod save_command;
 mod saved;
 mod transfer;
@@ -338,6 +339,7 @@ pub enum Action {
     FilterWildcards(TabId, bool),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
+    Reuse(TabId, reuse::Action),
     Select(TabId, u64, bool),
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
@@ -412,6 +414,7 @@ impl TerminalApp {
                     && !page.comparison.is_open()
                     && !page.import.is_open()
                     && !page.edit_membership_open()
+                    && !page.saved.reuse.is_open()
                     && !page.prompt_setup.is_open()
                     && !page.transfer.is_open() =>
             {
@@ -424,10 +427,10 @@ impl TerminalApp {
     fn start_host_group_panes(
         &mut self,
         id: TabId,
+        mut selected: BTreeSet<u64>,
         targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
         ctx: &ComponentContext<Self>,
     ) {
-        let mut selected = BTreeSet::new();
         for (profile, ssh) in targets {
             let source = Source::Ssh(ssh);
             let label = profile.clone().unwrap_or_else(|| source_label(&source));
@@ -680,6 +683,7 @@ impl TerminalApp {
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Import(id, action) => self.handle_host_import(id, action, ctx),
             Action::Membership(id, action) => self.handle_group_membership(id, action),
+            Action::Reuse(id, action) => self.handle_host_group_reuse(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
             Action::Transfer(id, action) => self.handle_host_group_transfer(id, action, ctx),
@@ -946,6 +950,9 @@ impl TerminalApp {
             return view;
         }
         if let Some(view) = page.import.view(id, ctx) {
+            return view;
+        }
+        if let Some(view) = page.saved.reuse.view(id, ctx) {
             return view;
         }
         if let Some(roster) = page

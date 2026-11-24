@@ -358,7 +358,7 @@ impl TerminalApp {
                         state.draft = None;
                         state.revision += 1;
                         self.use_group_catalog(catalog);
-                        self.start_host_group_panes(id, launch, ctx);
+                        self.start_host_group_panes(id, BTreeSet::new(), launch, ctx);
                         if let Some(page) = self.host_group_mut(id) {
                             page.import.feedback = if count == 1 {
                                 "Opened 1 SSH pane from the host list".into()

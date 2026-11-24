@@ -7,6 +7,7 @@ pub(super) struct SavedUi {
     editor: Option<Editor>,
     next_editor: u64,
     pub(super) feedback: String,
+    pub(super) reuse: reuse::State,
 }
 
 struct Editor {
@@ -276,6 +277,31 @@ impl TerminalApp {
         self.bind_folder_shares();
     }
 
+    pub(super) fn resolve_saved_host_group(
+        &self,
+        name: &str,
+        expected: &[String],
+    ) -> Result<(Profiles, Vec<SshOptions>)> {
+        let catalog = self.store.catalog()?;
+        ensure!(
+            catalog.ssh_host_groups.get(name).map(Vec::as_slice) == Some(expected),
+            "The SSH group changed on disk. Select it again."
+        );
+        let members = catalog
+            .resolve_ssh_host_group_members(expected)?
+            .into_iter()
+            .cloned()
+            .collect();
+        Ok((catalog, members))
+    }
+
+    pub(super) fn remember_group_launch(&mut self, id: TabId, name: &str, feedback: String) {
+        if let Some(page) = self.host_group_mut(id) {
+            page.saved.selected = Some(name.into());
+            page.saved.feedback = feedback;
+        }
+    }
+
     fn open_saved_host_group(
         &mut self,
         id: Option<TabId>,
@@ -297,6 +323,10 @@ impl TerminalApp {
                 "Finish editing live pane membership before opening another group."
             );
             ensure!(
+                !page.saved.reuse.is_open(),
+                "Finish reviewing the SSH group launch before opening another group."
+            );
+            ensure!(
                 !page.prompt_setup.is_open(),
                 "Finish prompt setup before opening another group."
             );
@@ -309,16 +339,7 @@ impl TerminalApp {
                 "Return from the comparison before opening another group."
             );
         }
-        let catalog = self.store.catalog()?;
-        ensure!(
-            catalog.ssh_host_groups.get(name).map(Vec::as_slice) == Some(expected),
-            "The SSH group changed on disk. Select it again."
-        );
-        let members = catalog
-            .resolve_ssh_host_group_members(expected)?
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let (catalog, members) = self.resolve_saved_host_group(name, expected)?;
         self.use_group_catalog(catalog);
         let id = id.unwrap_or_else(|| self.new_host_group_tab(Some(name)));
         if self
@@ -336,11 +357,17 @@ impl TerminalApp {
                 roster.show_window = false;
             }
         }
-        self.start_host_group_panes(id, expected.iter().cloned().map(Some).zip(members), ctx);
-        if let Some(page) = self.host_group_mut(id) {
-            page.saved.selected = Some(name.into());
-            page.saved.feedback = format!("Opened {} SSH panes for {name}", expected.len());
-        }
+        self.start_host_group_panes(
+            id,
+            BTreeSet::new(),
+            expected.iter().cloned().map(Some).zip(members),
+            ctx,
+        );
+        self.remember_group_launch(
+            id,
+            name,
+            format!("Opened {} SSH panes for {name}", expected.len()),
+        );
         Ok(())
     }
 
@@ -367,6 +394,9 @@ impl TerminalApp {
         let selected = saved.name(&self.catalog);
         let selection = selected.and_then(|name| names.iter().position(|item| item == name));
         let members = selected.and_then(|name| self.catalog.ssh_host_groups.get(name));
+        let reuse = selected
+            .zip(members)
+            .map(|(name, members)| reuse::button(id, name, members, ctx));
         let action = move |action| Message::HostGroup(HostAction::Saved(id, action));
         let mut items = Vec::new();
         if let Some((name, members)) = selected.zip(members) {
@@ -444,6 +474,9 @@ impl TerminalApp {
                     .text(members)
                     .text_trimming(TextTrimming::CharacterEllipsis),
             ));
+        }
+        if let Some(reuse) = reuse {
+            details.push(KeyedView::new("review-reuse", reuse));
         }
         if !saved.feedback.is_empty() {
             details.push(KeyedView::new(
