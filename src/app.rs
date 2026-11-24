@@ -843,6 +843,7 @@ fn tab_menu_message(label: String) -> Message {
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         "Command palette…" => Message::Shortcut(Shortcut::CommandPalette),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
+        command_palette::FIND_TAB_LABEL => Message::Shortcut(Shortcut::FindTab),
         pane_picker::FIND_TEXT_LABEL => Message::Shortcut(Shortcut::FindAllPanes),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Select all terminal text" => Message::Shortcut(Shortcut::SelectAll),
@@ -3765,6 +3766,11 @@ impl TerminalApp {
             ),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             self.binding_menu(
+                "find-tab",
+                command_palette::FIND_TAB_LABEL,
+                KeyAction::FindTab,
+            ),
+            self.binding_menu(
                 "find-all-panes",
                 pane_picker::FIND_TEXT_LABEL,
                 KeyAction::FindAllPanes,
@@ -5966,6 +5972,7 @@ impl Component for TerminalApp {
                 }
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::FindTab => self.open_tab_search(context),
                 Shortcut::FindAllPanes => self.open_text_picker(context),
                 Shortcut::MovePaneToExistingTab => self.open_move_picker(context),
                 Shortcut::PickerPlace(side) => {

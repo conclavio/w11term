@@ -1,9 +1,12 @@
 use super::*;
 use w11term::shortcuts::BINDINGS;
 
+pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Search {
     Window,
+    Tabs,
     GroupLibrary(TabId),
     GroupRecent(TabId),
 }
@@ -12,6 +15,7 @@ impl Search {
     fn placeholder(self) -> &'static str {
         match self {
             Self::Window => "Search commands",
+            Self::Tabs => "Search tabs",
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
         }
@@ -24,6 +28,7 @@ impl Search {
                 "Commands submitted in this tab will appear here."
             }
             Self::GroupRecent(_) => "No matching recent commands",
+            Self::Tabs => "No matching tabs",
             _ => "No matching commands",
         }
     }
@@ -57,6 +62,7 @@ pub enum CommandId {
     GroupSavedCommand(TabId, w11term::saved_commands::Entry),
     SearchGroupRecentCommands(TabId),
     GroupRecentCommand(TabId, u64),
+    FocusTab(TabId),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
     ManageRecipientSets(TabId, String),
@@ -196,6 +202,49 @@ fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
 }
 
 impl TerminalApp {
+    pub(super) fn tab_search_rows(&self, query: &str) -> Vec<Row> {
+        let follow_titles = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .application_tab_titles;
+        let active = self.tabs.active_group_id();
+        let query = query.trim().to_lowercase();
+        let words: Vec<_> = query.split_whitespace().collect();
+        let mut matches = Vec::new();
+        for (index, tab) in self.tabs.headers().into_iter().enumerate() {
+            let group = tab.group_id();
+            let label = self.tab_label(tab.id, follow_titles).into_owned();
+            let title = label.to_lowercase();
+            let position = format!("Tab {}", index + 1);
+            let position_query = position.to_lowercase();
+            let terms = format!("{title} {position_query}");
+            if words.iter().all(|word| terms.contains(word)) {
+                let rank = (
+                    title != query,
+                    position_query != query,
+                    !title.starts_with(&query),
+                );
+                matches.push((
+                    rank,
+                    Row {
+                        id: CommandId::FocusTab(group),
+                        label,
+                        chord: if Some(group) == active {
+                            format!("{position} · Current")
+                        } else {
+                            position
+                        },
+                        enabled: true,
+                    },
+                ));
+            }
+        }
+        matches.sort_by_key(|(rank, _)| *rank);
+        matches.into_iter().map(|(_, row)| row).collect()
+    }
+
     pub(super) fn command_rows(&self, query: &str) -> Vec<Row> {
         let mut rows = vec![];
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
@@ -605,6 +654,7 @@ impl TerminalApp {
             CommandId::GroupRecentCommand(group, submission) => {
                 Message::HostGroup(host_groups::Action::LoadRecentCommand(group, submission))
             }
+            CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
             CommandId::OpenSavedHostGroup(name, members) => {
                 Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
             }
@@ -688,7 +738,7 @@ pub(super) fn view(
     let page = ((app.window_height - 156.0) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
     let search_label = mode.placeholder();
-    let trimming = if matches!(mode, Search::GroupRecent(_)) {
+    let trimming = if matches!(mode, Search::Tabs | Search::GroupRecent(_)) {
         TextTrimming::CharacterEllipsis
     } else {
         TextTrimming::None
@@ -705,7 +755,11 @@ pub(super) fn view(
             Button::new()
                 .grid_column(1)
                 .style(ButtonStyle::Subtle)
-                .automation_name("Close command palette")
+                .automation_name(if mode == Search::Tabs {
+                    "Close tab search"
+                } else {
+                    "Close command palette"
+                })
                 .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerCancel)))
                 .content(TextBlock::new().text("×")),
         ));
@@ -755,7 +809,11 @@ pub(super) fn view(
                 .spacing(8.0)
                 .children((
                     Button::new()
-                        .automation_name("Previous commands")
+                        .automation_name(if mode == Search::Tabs {
+                            "Previous tabs"
+                        } else {
+                            "Previous commands"
+                        })
                         .is_enabled(first > 0)
                         .on_click(ctx.callback(move |_| {
                             Message::Shortcut(Shortcut::PickerMove(-(page as isize)))
@@ -765,7 +823,11 @@ pub(super) fn view(
                         .vertical_alignment(VerticalAlignment::Center)
                         .text(format!("{}–{last} of {}", first + 1, rows.len())),
                     Button::new()
-                        .automation_name("Next commands")
+                        .automation_name(if mode == Search::Tabs {
+                            "Next tabs"
+                        } else {
+                            "Next commands"
+                        })
                         .is_enabled(last < rows.len())
                         .on_click(ctx.callback(move |_| {
                             Message::Shortcut(Shortcut::PickerMove(page as isize))

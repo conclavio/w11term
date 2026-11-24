@@ -37,6 +37,7 @@ pub enum Action {
     MovePaneToExistingTab,
     CommandPalette,
     PanePicker,
+    FindTab,
     Find,
     FindNext,
     FindPrevious,
@@ -182,6 +183,7 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
+    Binding::new(FindTab, "find_tab", "Find tab", 0, Mods::NONE),
     Binding::new(Find, "find", "Find in scrollback", 0x46, CTRL_SHIFT),
     Binding::new(FindNext, "find_next", "Find next", 0x72, Mods::NONE),
     Binding::new(
