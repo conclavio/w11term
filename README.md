@@ -173,6 +173,8 @@ From the command palette, choose **Find armed SSH output alerts…** to review a
 
 Choose **Send with alert…** to catch a match from the start of a command. Review the command and recipients, set the search rule, then choose **Send with alert**. w11term rechecks the command and prompts and arms the alert before dispatch, including for queued and canary runs.
 
+Turn on **Record full output** in the same review to choose a new text file before sending. The alert uses your search rule, and the recording captures all marked output and final outcomes until the run settles. Cancelling the file picker leaves the command unsent.
+
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.

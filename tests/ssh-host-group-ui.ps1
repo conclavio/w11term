@@ -285,7 +285,26 @@ try {
     }
     Click $alertedSend
     (Command-Editor $alertSearch).SetValue('east-accepted one')
-    Click 'Send with alert'
+    $chooseRecording = 'Choose recording file' + [char]0x2026
+    (Wait-CheckBox 'Record full output' Off).Toggle()
+    Click $chooseRecording
+    $dialog = Wait-Until 'the combined send opens a recording destination' { Find-OwnedDialog 'Record SSH group output' }
+    if (Find-Element "Submitted${dot}one") { throw 'The command was sent before the file was chosen' }
+    $null = Wait-Until 'cancel the recorded alert' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'cancelling the file picker keeps the command unsent' {
+        !(Find-OwnedDialog 'Record SSH group output') -and
+            (Find-Element $alertedSend $button) -and !(Find-Element "Submitted${dot}one")
+    }
+    Click $alertedSend
+    (Command-Editor $alertSearch).SetValue('east-accepted one')
+    (Wait-CheckBox 'Record full output' Off).Toggle()
+    Click $chooseRecording
+    $dialog = Wait-Until 'reopen the recording destination for the alert' { Find-OwnedDialog 'Record SSH group output' }
+    $firstAlertRecording = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'first-alert-run.txt'
+    $null = Wait-Until 'set the destination for the recorded alert' {
+        [FixtureDialog]::SetFilename($dialog, $firstAlertRecording, 'ssh-group-output-1.txt')
+    }
+    $null = Wait-Until 'approve the recording destination and send' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'the first output of the quick run triggers its pre-armed alert' {
         (Find-Element "Submitted${dot}one") -and (Find-Element 'Attention inbox, 1 unread' $button)
     }
@@ -293,6 +312,14 @@ try {
     Click "Unread${dot}SSH host group${dot}Run 1${dot}Matched output${dot}$eastName${dot}east-accepted one"
     $null = Wait-Until 'the pre-armed alert opens its original run' {
         (Find-Element "Submitted${dot}one") -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Wait-RecordingStatus 'Saved live output to ' $firstAlertRecording
+    $firstRecording = [IO.File]::ReadAllLines($firstAlertRecording)
+    if ($firstRecording[0] -cne "Submitted${dot}one" -or
+        "$eastName${dot}east-accepted one" -cnotin $firstRecording -or
+        "$eastName${dot}Sent to SSH channel${dot}Exit 0" -cnotin $firstRecording -or
+        $firstRecording[-1] -cne '[Group run settled]') {
+        throw 'The recorded alert omitted the matching output or final result'
     }
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"

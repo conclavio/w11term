@@ -60,6 +60,8 @@ pub(super) use run_search::{
     WINDOW_OUTPUT_ALERT_SEARCH_LABEL, WINDOW_RUN_SEARCH_LABEL, WindowRunScope,
 };
 const REQUIRE_READY: &str = "Require all recipients ready";
+const REVIEW_CHANGED: &str =
+    "The command, hosts or prompts changed. Review them before sending again.";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;
 
@@ -1518,7 +1520,7 @@ impl TerminalApp {
             Action::RecordOutput(id, submission, action) => {
                 self.handle_group_output_recording(id, submission, action, ctx);
             }
-            Action::AlertedSend(id, action) => self.handle_alerted_send(id, action),
+            Action::AlertedSend(id, action) => self.handle_alerted_send(id, action, ctx),
             Action::Compare(id, submission, action) => {
                 self.handle_host_group_comparison(id, submission, action, ctx);
             }

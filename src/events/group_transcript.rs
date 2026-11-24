@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn prearmed_output_alert_matches_before_dispatch_finishes() {
+    fn prearmed_output_alert_matches_before_dispatch_finishes_and_recording_continues() {
         let group = GroupTranscript::default();
         let inbox = Inbox::new(|| {});
         group.arm_output_alert(GroupOutputAlert {
@@ -826,6 +826,9 @@ mod tests {
                 host: None,
             }),
         });
+        let (_recording, mut stream) = group
+            .start_recording(GroupRecordingMode::UntilSettled)
+            .unwrap();
         let host = group.host(1);
         host.append(LiveOutputBatch {
             lines: vec![LiveOutputLine {
@@ -847,6 +850,25 @@ mod tests {
             }
         );
         assert!(group.output_alert_rule().is_none());
+        host.append(LiveOutputBatch {
+            lines: ["ready", "later output"]
+                .into_iter()
+                .map(|text| LiveOutputLine {
+                    text: text.into(),
+                    shortened: false,
+                })
+                .collect(),
+            gap: false,
+        });
+        drop(host);
+        assert_eq!(inbox.rows().len(), 1);
+        for expected in ["ready", "ready", "later output"] {
+            assert_eq!(&*stream.incoming.try_recv().unwrap().text, expected);
+        }
+        assert_eq!(
+            stream.ended.try_recv().unwrap().end,
+            GroupRecordingEnd::Settled
+        );
     }
 
     #[test]

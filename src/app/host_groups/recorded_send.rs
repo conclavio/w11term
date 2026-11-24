@@ -3,8 +3,13 @@ use output_recording::PreparedFile;
 
 #[derive(Default)]
 pub(super) struct State {
-    plan: Option<Box<CommandOffer>>,
+    plan: Option<Box<Plan>>,
     feedback: Option<String>,
+}
+
+struct Plan {
+    offer: CommandOffer,
+    alert: Option<alerted_send::Alert>,
 }
 
 pub enum Action {
@@ -70,13 +75,24 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         match action {
-            Action::Pick(offer) => self.pick_recorded_send(id, offer, ctx),
+            Action::Pick(offer) => self.pick_recorded_send(id, offer, None, ctx),
             Action::Picked(result) => self.finish_recorded_send(id, result),
         }
     }
 
-    fn pick_recorded_send(&mut self, id: TabId, offer: CommandOffer, ctx: &ComponentContext<Self>) {
+    pub(super) fn pick_recorded_send(
+        &mut self,
+        id: TabId,
+        offer: CommandOffer,
+        alert: Option<alerted_send::Alert>,
+        ctx: &ComponentContext<Self>,
+    ) {
         if !self.group_send_matches(id, &offer, true) {
+            if alert.is_some()
+                && let Some(state) = self.recorded_send_state(id)
+            {
+                state.feedback = Some(REVIEW_CHANGED.into());
+            }
             return;
         }
         let owner = self.keyboard.hwnd().map(|owner| owner.0 as usize);
@@ -94,7 +110,7 @@ impl TerminalApp {
             return;
         };
         let run = page.next_submission + 1;
-        state.plan = Some(Box::new(offer));
+        state.plan = Some(Box::new(Plan { offer, alert }));
         let reply = move |result| {
             Message::HostGroup(super::Action::RecordedSend(id, Action::Picked(result)))
         };
@@ -128,7 +144,7 @@ impl TerminalApp {
         else {
             return;
         };
-        let offer = *plan;
+        let Plan { offer, alert } = *plan;
         let send = || self.group_send_matches(id, &offer, true);
         let transcript = GroupTranscript::default();
         let recording = match result {
@@ -140,13 +156,16 @@ impl TerminalApp {
                     output_recording::names(offer.targets.iter()),
                 )
                 .map_err(|error| format!("Could not start the recording · {error}")),
-            Ok(Some(_)) => Err(
-                "The command, hosts or prompts changed. Review them before sending again.".into(),
-            ),
+            Ok(Some(_)) => Err(REVIEW_CHANGED.into()),
             Err(error) => Err(format!("Could not prepare the recording · {error}")),
         };
         match recording {
-            Ok(recording) => self.submit_group_command(id, offer, transcript, recording),
+            Ok(recording) => {
+                if let Some(alert) = alert {
+                    self.arm_group_send_alert(id, &offer, alert, &transcript);
+                }
+                self.submit_group_command(id, offer, transcript, recording);
+            }
             Err(error) => {
                 if let Some(state) = self.recorded_send_state(id) {
                     state.feedback = Some(error);

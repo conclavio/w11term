@@ -242,6 +242,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 126. **Review and cancel armed output alerts from run results.** Show the saved query, match options, and host scope in both live output and results, with a cancel action in each view.
 127. **Find armed output alerts across tabs.** Search the window by query, host scope, group title, command, or run number, and open the owning run without losing its active Live output view.
 128. **Arm an output alert before sending a command.** Review the recipients and search rule together, then attach the one-shot matcher before the first host can emit output.
+129. **Record a run and alert on its output.** Choose a file from the send-with-alert review and attach both the full recorder and the one-shot matcher before dispatch.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
