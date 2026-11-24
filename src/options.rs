@@ -433,6 +433,7 @@ pub enum SshRosterOrder {
 pub struct SshRosterDefaults {
     pub order: SshRosterOrder,
     pub show_last_output: bool,
+    pub show_terminal_line: bool,
     pub require_all_ready: bool,
 }
 

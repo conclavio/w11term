@@ -733,6 +733,38 @@ impl Snapshot {
         ))
     }
 
+    /// Summarize the lowest nonblank row of this snapshot, masking concealed cells.
+    pub fn last_visible_text_line(&self) -> Option<String> {
+        self.rows.iter().rev().find_map(|row| {
+            let mut text = String::new();
+            let mut remaining = 200;
+            for cell in row
+                .visible_cells()
+                .take_while(|cell| cell.cell_index() < self.cols)
+            {
+                let value = if cell.attrs().invisible() {
+                    " "
+                } else {
+                    cell.str()
+                };
+                let value = if text.is_empty() {
+                    value.trim_start()
+                } else {
+                    value
+                };
+                for ch in value.chars().take(remaining) {
+                    text.push(ch);
+                    remaining -= 1;
+                }
+                if remaining == 0 {
+                    break;
+                }
+            }
+            let caption = crate::events::display_field(&text);
+            (!caption.is_empty()).then_some(caption)
+        })
+    }
+
     /// A bounded single-line caption from the application's window title.
     /// A shell that has only set an icon title still uses its profile label.
     pub fn application_title(&self) -> Option<&str> {
@@ -1767,6 +1799,17 @@ mod tests {
         assert_eq!(link.id, term.last_command().unwrap().id);
         assert_eq!(frame.command_for_link(link).unwrap().exit_code, Some(17));
         assert_eq!(preview, "Exit 17 · last");
+    }
+
+    #[test]
+    fn visible_text_preview_skips_blank_rows_and_masks_concealed_cells() {
+        let (mut term, _) = engine();
+        let read = |term: &Terminal| {
+            Snapshot::capture(term, None, 0, 0, String::new(), 0).last_visible_text_line()
+        };
+        assert_eq!(read(&term), None);
+        term.advance_bytes("older\r\n  latest \x1b[8msecret\x1b[28m雪\r\n\x1b[8mhidden\x1b[28m");
+        assert_eq!(read(&term).as_deref(), Some("latest 雪"));
     }
 
     #[test]

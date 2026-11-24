@@ -260,6 +260,7 @@ pub struct Session {
     pub player: Arc<std::sync::RwLock<crate::options::PlayerOptions>>,
     pub input: mpsc::UnboundedSender<Command>,
     pub frames: FrameStore,
+    live_frames: FrameStore,
     pub remote_clipboard: Arc<RemoteClipboardAccess>,
     ssh_connection: ssh::ShareSlot,
     direct_ssh_shell: bool,
@@ -287,6 +288,11 @@ fn has_cell_pixels(size: TerminalSize) -> bool {
 }
 
 impl Session {
+    /// Read the newest committed screen even while the pane shows scrollback.
+    pub fn live_snapshot(&self) -> Arc<Snapshot> {
+        self.live_frames.load()
+    }
+
     pub fn restart_exited(&self, token: u64) -> anyhow::Result<()> {
         self.events.restart_exited(&self.input, token)
     }
@@ -570,6 +576,7 @@ impl Session {
         ));
         let worker_frames = frames.clone();
         let live_frames = FrameStore::new((*frames.load()).clone());
+        let worker_live_frames = live_frames.clone();
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
         let ssh_connection = ssh::ShareSlot::default();
@@ -609,7 +616,7 @@ impl Session {
                             events: worker_events,
                             player: worker_player,
                             notices: notice_rx,
-                            live_frames,
+                            live_frames: worker_live_frames,
                             sharing,
                             replay_ready: initial_grid.is_some(),
                         },
@@ -624,6 +631,7 @@ impl Session {
             player,
             input: commands,
             frames,
+            live_frames,
             remote_clipboard,
             ssh_connection,
             direct_ssh_shell,

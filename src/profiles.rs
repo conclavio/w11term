@@ -1402,6 +1402,7 @@ mod tests {
         let defaults = SshRosterDefaults {
             order: SshRosterOrder::CheckedFirst,
             show_last_output: true,
+            show_terminal_line: true,
             require_all_ready: true,
         };
         assert!(

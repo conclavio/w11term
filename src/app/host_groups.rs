@@ -626,6 +626,7 @@ pub enum Action {
     FilterStatus(TabId, RosterStatus),
     OrderRoster(TabId, RosterOrder),
     ShowLastOutput(TabId, bool),
+    ShowTerminalLine(TabId, bool),
     RequireAllReady(TabId, bool),
     CopyRoster(TabId, BTreeSet<u64>),
     ShowWindowRoster(TabId, bool),
@@ -1183,6 +1184,11 @@ impl TerminalApp {
                     page.roster_preferences.show_last_output = show;
                 }
             }
+            Action::ShowTerminalLine(id, show) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.roster_preferences.show_terminal_line = show;
+                }
+            }
             Action::RequireAllReady(id, require) => {
                 if let Some(page) = self
                     .host_group_mut(id)
@@ -1501,6 +1507,23 @@ impl TerminalApp {
         )
     }
 
+    fn host_group_terminal_line(&self, target: &Target) -> Option<String> {
+        if !target.connected || target.state.is_authenticating() {
+            return None;
+        }
+        let session = self.direct_ssh_session(target.pane)?;
+        let frame = session.live_snapshot();
+        if frame.alternate
+            || frame.prompt.is_some()
+            || session
+                .ssh_connection_at(frame.connection_generation)
+                .is_none()
+        {
+            return None;
+        }
+        frame.last_visible_text_line()
+    }
+
     pub(super) fn host_group_view(
         &self,
         id: TabId,
@@ -1659,6 +1682,19 @@ impl TerminalApp {
                         if page.roster_preferences.show_last_output {
                             self.host_group_output_preview(id, target, ctx)
                                 .unwrap_or_else(View::empty)
+                        } else {
+                            View::empty()
+                        },
+                        if page.roster_preferences.show_terminal_line {
+                            self.host_group_terminal_line(target)
+                                .map_or_else(View::empty, |line| {
+                                    let caption = format!("Live line · {line}");
+                                    TextBlock::new()
+                                        .automation_name(format!("Pane {pane} · {caption}"))
+                                        .text_trimming(TextTrimming::CharacterEllipsis)
+                                        .text(caption)
+                                        .into()
+                                })
                         } else {
                             View::empty()
                         },
@@ -1854,6 +1890,17 @@ impl TerminalApp {
                 .spacing(8.0)
                 .children((
                     environment::button(id, page, &selected, ctx),
+                    Button::new()
+                        .is_enabled(!shown_ids.is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            Message::HostGroup(Action::CopyRoster(id, shown_ids.clone()))
+                        }))
+                        .content("Copy shown roster"),
+                )),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
                     CheckBox::new()
                         .automation_name("Show last command output")
                         .is_checked(page.roster_preferences.show_last_output)
@@ -1861,12 +1908,13 @@ impl TerminalApp {
                             Message::HostGroup(Action::ShowLastOutput(id, show))
                         }))
                         .content("Show last command output"),
-                    Button::new()
-                        .is_enabled(!shown_ids.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            Message::HostGroup(Action::CopyRoster(id, shown_ids.clone()))
+                    CheckBox::new()
+                        .automation_name("Show current terminal line")
+                        .is_checked(page.roster_preferences.show_terminal_line)
+                        .on_is_checked_changed(ctx.callback(move |show| {
+                            Message::HostGroup(Action::ShowTerminalLine(id, show))
                         }))
-                        .content("Copy shown roster"),
+                        .content("Show current terminal line"),
                 )),
             if page.roster_copy_feedback.is_empty() {
                 View::empty()

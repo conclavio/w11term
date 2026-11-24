@@ -23,6 +23,10 @@ function Set-HostQuery([string]$Query) {
 function Get-ExitToken([int]$Pane) {
     (Control @('events','--pane',"$Pane")).restart_token
 }
+function Send-Display([int]$Pane, [string]$Text) {
+    $bytes = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
+    $null = Control @('send-text','--pane',"$Pane",'--no-paste','--base64',$bytes)
+}
 function Wait-Stopped([int]$Pane) {
     $stopped = Wait-Until "pane $Pane to stop and offer reconnect" {
         $state = Control @('events','--pane',"$Pane")
@@ -136,8 +140,25 @@ try {
     }
     if (!(Get-ExitToken $west)) { throw 'Closing the shown pane also changed the hidden West pane' }
 
-    $null = Control @('send-text','--pane',"$live",'--no-paste','live-witness')
+    Set-HostQuery ''
+    $preview = 'Show current terminal line'
+    $line = "Pane $live${dot}Live line${dot}live-witness"
+    $toggle = Wait-CheckBox $preview Off
+    Send-Display $live ('live-witness' + [char]27 + '[8mconcealed' + [char]27 + '[28m')
     $null = Control @('wait-for-text','--pane',"$live",'--timeout','10','live-witness')
+    if (Find-Element $line) { throw 'The terminal line was visible before opting in' }
+    $toggle.Toggle()
+    $null = Wait-Until 'the unmarked shell line without concealed cells' { Find-Element $line }
+    Send-Display $live ([string][char]27 + '[?1049halt-screen-witness')
+    $null = Control @('wait-for-text','--pane',"$live",'--timeout','10','alt-screen-witness')
+    $null = Wait-Until 'the preview hides in the alternate screen' {
+        (Find-Element "Pane $live${dot}Connected${dot}Alternate screen") -and
+            !(Find-Element $line) -and !(Find-Element "Pane $live${dot}Live line${dot}alt-screen-witness")
+    }
+    Send-Display $live ([string][char]27 + '[?1049l')
+    $null = Wait-Until 'the original primary line returns' { Find-Element $line }
+    (Wait-CheckBox $preview On).Toggle()
+    $null = Wait-Until 'the preview hides after opting out' { !(Find-Element $line) }
     $listed = (Control @('list')).sessions | Where-Object id -eq $live
     if ($listed.connection_generation -ne $generation -or $listed.ssh_connection.phase -ne 'connected' -or
         ($listed.PSObject.Properties.Name -notcontains 'restart_token') -or $listed.restart_token) {

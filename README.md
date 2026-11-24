@@ -109,6 +109,8 @@ Choose **Open next SSH prompt** to open the first pending host-key or sign-in pr
 
 Turn on **Show last command output** in a group tab to see the exit status and a short excerpt from each visible host’s latest completed shell capture. **Open history** opens that capture in the host’s command history. The preview uses the current SSH connection and hides during authentication and alternate-screen applications.
 
+Turn on **Show current terminal line** to see the bottommost text line in each shown host’s live screen, including shells without integration. The preview masks concealed cells and hides during authentication and alternate-screen applications.
+
 Choose **Copy shown roster** to copy a plain-text status report. It includes every host shown by the current filters, its check state, SSH address, pane ID, and connection or prompt status.
 
 Use **Sort SSH roster** to display hosts in tab order, alphabetically by label, checked first, or with hosts needing attention first. The copied roster follows the display order. Command dispatch and `POLYSH_RANK` use tab order.
