@@ -16,6 +16,7 @@ pub enum Action {
     SetPaused(bool),
     ApproveCanary,
     CancelCanaryNotice,
+    SkipHost(u64),
     Cancel,
 }
 
@@ -52,6 +53,13 @@ impl Queue {
             interval,
             last_dispatch: None,
         }
+    }
+
+    pub(super) fn is_canary(&self, pane: u64) -> bool {
+        matches!(
+            self.canary,
+            Some(CanaryGate::Pending(id) | CanaryGate::AwaitingApproval(id)) if id == pane
+        )
     }
 
     fn waiting_for_interval(&self, now: Instant) -> bool {
@@ -379,6 +387,19 @@ impl TerminalApp {
                 submission.reject_queued_commands("Cancelled before sending.");
             }
             Action::CancelCanaryNotice => queue.notify_canary = false,
+            Action::SkipHost(pane) if !queue.is_canary(pane) => {
+                if let Some(delivery) = submission
+                    .results
+                    .iter_mut()
+                    .find(|delivery| delivery.target.pane == pane)
+                    && let DeliveryStatus::Queued(waiting) = &mut delivery.status
+                    && let Some(host) = waiting.0.take()
+                {
+                    host.skip_queued();
+                    delivery.status = DeliveryStatus::Skipped;
+                    self.poll_command_queues();
+                }
+            }
             Action::SetPaused(paused) if queue.canary.is_none() && queue.paused != paused => {
                 queue.paused = paused;
                 let event = if paused {

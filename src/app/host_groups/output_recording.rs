@@ -239,6 +239,7 @@ fn write_outcomes(
             GroupRecordingOutcome::AwaitingDelivery => "Awaiting delivery".into(),
             GroupRecordingOutcome::DeliveryUnconfirmed => "Delivery unconfirmed".into(),
             GroupRecordingOutcome::Rejected(reason) => format!("Not sent · {reason}"),
+            GroupRecordingOutcome::Skipped => "Skipped before sending".into(),
             GroupRecordingOutcome::Sent(None) => "Sent to SSH channel · result unavailable".into(),
             GroupRecordingOutcome::Sent(Some(execution)) => {
                 format!("Sent to SSH channel · {}", execution_caption(&execution))

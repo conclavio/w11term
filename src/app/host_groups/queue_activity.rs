@@ -2,15 +2,20 @@ use super::*;
 use std::fmt::Write as _;
 use w11term::events::{GroupQueueActivity, GroupQueueEvent, GroupQueueEventKind};
 
-fn label(kind: GroupQueueEventKind) -> &'static str {
+fn label(kind: GroupQueueEventKind) -> Cow<'static, str> {
     match kind {
-        GroupQueueEventKind::Paused => "Paused queue",
-        GroupQueueEventKind::Resumed => "Resumed queue",
-        GroupQueueEventKind::CanaryReady => "Canary ready for approval",
-        GroupQueueEventKind::CanaryApproved => "Approved remaining hosts",
-        GroupQueueEventKind::CanaryFailed => "Stopped after the canary did not confirm success",
-        GroupQueueEventKind::StoppedOnFailure => "Stopped after an unsuccessful host",
-        GroupQueueEventKind::Cancelled => "Cancelled queued commands",
+        GroupQueueEventKind::Paused => "Paused queue".into(),
+        GroupQueueEventKind::Resumed => "Resumed queue".into(),
+        GroupQueueEventKind::CanaryReady => "Canary ready for approval".into(),
+        GroupQueueEventKind::CanaryApproved => "Approved remaining hosts".into(),
+        GroupQueueEventKind::CanaryFailed => {
+            "Stopped after the canary did not confirm success".into()
+        }
+        GroupQueueEventKind::StoppedOnFailure => "Stopped after an unsuccessful host".into(),
+        GroupQueueEventKind::Cancelled => "Cancelled queued commands".into(),
+        GroupQueueEventKind::HostSkipped { pane_id } => {
+            format!("Skipped queued host · Pane {pane_id}").into()
+        }
     }
 }
 
@@ -70,7 +75,7 @@ pub(super) fn view(id: TabId, submission: &Submission, ctx: &ViewContext<Termina
         KeyedView::new(
             index.to_string(),
             TextBlock::new()
-                .automation_name(label(event.kind))
+                .automation_name(label(event.kind).as_ref())
                 .text(caption(event))
                 .text_wrapping(TextWrapping::Wrap),
         )

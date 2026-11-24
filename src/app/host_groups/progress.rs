@@ -7,6 +7,7 @@ pub enum Outcome {
     Running,
     Succeeded,
     Attention,
+    Skipped,
 }
 
 impl Outcome {
@@ -21,6 +22,7 @@ impl Outcome {
         match status {
             DeliveryStatus::Queued(_) | DeliveryStatus::Pending(..) => Self::Waiting,
             DeliveryStatus::Rejected(_) | DeliveryStatus::Unconfirmed => Self::Attention,
+            DeliveryStatus::Skipped => Self::Skipped,
             DeliveryStatus::Sent => match execution {
                 Some(GroupExecution::AwaitingMarkers | GroupExecution::AwaitingPrompt) => {
                     Self::Waiting
@@ -74,12 +76,13 @@ pub enum Filter {
     Only(Outcome),
 }
 
-pub(super) const FILTERS: [(Filter, &str); 5] = [
+pub(super) const FILTERS: [(Filter, &str); 6] = [
     (Filter::All, "All results"),
     (Filter::Only(Outcome::Waiting), "Waiting"),
     (Filter::Only(Outcome::Running), "Running"),
     (Filter::Only(Outcome::Succeeded), "Succeeded"),
     (Filter::Only(Outcome::Attention), "Needs attention"),
+    (Filter::Only(Outcome::Skipped), "Skipped"),
 ];
 
 impl Filter {
@@ -94,6 +97,7 @@ pub(super) struct Summary {
     running: usize,
     succeeded: usize,
     attention: usize,
+    skipped: usize,
 }
 
 impl Summary {
@@ -103,11 +107,12 @@ impl Summary {
             Outcome::Running => self.running += 1,
             Outcome::Succeeded => self.succeeded += 1,
             Outcome::Attention => self.attention += 1,
+            Outcome::Skipped => self.skipped += 1,
         }
     }
 
     pub(super) fn settled(&self) -> usize {
-        self.succeeded + self.attention
+        self.succeeded + self.attention + self.skipped
     }
 
     pub(super) fn total(&self) -> usize {
@@ -120,7 +125,7 @@ impl Summary {
         } else {
             "need attention"
         };
-        format!(
+        let mut caption = format!(
             "{} of {} settled · {} waiting · {} running · {} succeeded · {} {attention}",
             self.settled(),
             self.total(),
@@ -128,7 +133,11 @@ impl Summary {
             self.running,
             self.succeeded,
             self.attention
-        )
+        );
+        if self.skipped > 0 {
+            caption.push_str(&format!(" · {} skipped", self.skipped));
+        }
+        caption
     }
 }
 
@@ -267,6 +276,15 @@ mod tests {
         assert_eq!(
             summary.caption(),
             "7 of 11 settled · 3 waiting · 1 running · 1 succeeded · 6 need attention"
+        );
+        let skipped = Outcome::of(&delivery(DeliveryStatus::Skipped, None));
+        assert_eq!(skipped, Outcome::Skipped);
+        assert!(Filter::Only(Outcome::Skipped).includes(skipped));
+        assert!(!Filter::Only(Attention).includes(skipped));
+        summary.add(skipped);
+        assert_eq!(
+            summary.caption(),
+            "8 of 12 settled · 3 waiting · 1 running · 1 succeeded · 6 need attention · 1 skipped"
         );
     }
 }

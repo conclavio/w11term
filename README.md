@@ -101,7 +101,7 @@ Use **Preview send order** to see how the checked, visible hosts will be dispatc
 
 Set **Time between sends** to leave a minimum gap between dispatches within each run. The first host can start immediately. Later hosts still need a free parallel slot and any required canary approval. **No delay** is the default.
 
-Use **Pause queue** to hold unsent commands while you inspect results. Active commands continue, and stop-on-failure still applies. **Resume queue** rechecks the original prompts before sending again.
+Use **Pause queue** to hold unsent commands while you inspect results. Active commands continue, and stop-on-failure still applies. **Resume queue** rechecks the original prompts before sending again. Use **Skip host** on a queued result to remove just that recipient. The remaining queue keeps its limits and canary approval requirement. Skips are counted separately from failures.
 
 Choose a **Canary host** from the checked recipients to run on that shell first. It needs a fresh OSC 133 prompt and at least one other ready recipient. After a confirmed exit 0, inspect the result and select **Approve remaining hosts** to continue at the chosen concurrency. If the canary fails or its exit status is unavailable, the remaining commands are withheld. Check **Notify when canary finishes** before sending to get an Attention Inbox entry that opens the exact run when the canary succeeds or needs attention.
 
@@ -191,7 +191,7 @@ Text and JSON reports include the known per-host times when you open the Save di
 
 - Command submissions include `dispatch_policy` with the numeric `parallel_limit` (null means unlimited), `interval_ms`, effective `stop_on_failure`, and a `canary` with its `pane_id` and `label` when selected. The canary field is null for a run without one.
 - When queue events exist, `queue_activity` contains an `omitted` count and an ordered `events` array with `elapsed_ms` and `kind` for each event.
-- `delivery.state` and `interrupt.state` use `pending`, `sent`, `rejected`, or `unconfirmed`. A rejection includes `reason`. The `interrupt` field is `null` until an interrupt is requested.
+- `delivery.state` and `interrupt.state` use `pending`, `sent`, `rejected`, or `unconfirmed`. A queued command uses `queued` until dispatch and `skipped` if removed before sending. A host skip in `queue_activity` carries its `pane_id`. A rejection includes `reason`. The `interrupt` field is `null` until an interrupt is requested.
 - `execution.state` uses `awaiting_markers`, `awaiting_prompt`, `running`, `prompt_returned`, `completed`, or `unavailable`. A completed execution includes `connection_generation`, `command_id`, and `exit_code`. The exit code is `null` when the shell supplied none.
 - `output.state` uses `complete` or `preview` with `text`, or `unavailable` with `reason`. A run without a completed capture has `output: null`. A complete, empty capture uses an empty `text` string.
 

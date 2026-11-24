@@ -277,6 +277,8 @@ mod tests {
 
     #[test]
     fn report_uses_exact_history_or_labels_the_retained_preview() {
+        let mut skipped = captured(9, String::new(), false);
+        skipped.status = DeliveryStatus::Skipped;
         let mut submission = Submission {
             id: 1,
             content: SubmissionContent::Command("show".into()),
@@ -289,6 +291,7 @@ mod tests {
             results: vec![
                 captured(7, "preview".into(), true),
                 captured(8, "missing tail".into(), true),
+                skipped,
             ],
         };
         submission.dispatch_policy = Some(
@@ -313,6 +316,9 @@ mod tests {
         submission
             .transcript
             .note_queue_activity(GroupQueueEventKind::CanaryApproved);
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::HostSkipped { pane_id: 9 });
         let snapshot = Report::capture(&submission, |pane, link| {
             assert_eq!(
                 link,
@@ -368,9 +374,11 @@ mod tests {
         let activity = &document["queue_activity"];
         assert_eq!(activity["omitted"], 0);
         let events = activity["events"].as_array().unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0]["kind"], "canary_ready");
         assert_eq!(events[1]["kind"], "canary_approved");
+        assert_eq!(events[2]["kind"], "host_skipped");
+        assert_eq!(events[2]["pane_id"], 9);
         assert!(
             events[0]["elapsed_ms"].as_u64().unwrap() <= events[1]["elapsed_ms"].as_u64().unwrap()
         );
@@ -385,6 +393,8 @@ mod tests {
         assert_eq!(hosts[0]["output"]["text"], "full output\r\nsecond line");
         assert_eq!(hosts[1]["output"]["state"], "preview");
         assert_eq!(hosts[1]["output"]["text"], "missing tail");
+        assert_eq!(hosts[2]["delivery"]["state"], "skipped");
+        assert!(hosts[2]["execution"].is_null());
     }
 
     #[test]

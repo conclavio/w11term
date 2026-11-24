@@ -7,9 +7,10 @@ fn retryable(delivery: &Delivery) -> bool {
             delivery.execution(),
             Some(GroupExecution::Finished(result)) if result.exit_code.is_some_and(|code| code != 0)
         ),
-        DeliveryStatus::Queued(_) | DeliveryStatus::Pending(..) | DeliveryStatus::Unconfirmed => {
-            false
-        }
+        DeliveryStatus::Queued(_)
+        | DeliveryStatus::Pending(..)
+        | DeliveryStatus::Unconfirmed
+        | DeliveryStatus::Skipped => false,
     }
 }
 

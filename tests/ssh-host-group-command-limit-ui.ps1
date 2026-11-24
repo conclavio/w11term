@@ -311,6 +311,53 @@ try {
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the group is in the background during the interval' { Find-Element "Read${dot}$canaryNotice" $button }
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','15','East finished pace')
+
+    $tab = Wait-Until 'the group tab after the paced run' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
+    $null = Control @('send-text','--pane',"$($panes.North)",'--no-paste','restore-prompt')
+    $null = Control @('wait-for-text','--pane',"$($panes.North)",'--timeout','10','North restored prompt')
+    (Wait-CheckBox $labels.North Off).Toggle()
+    $null = Wait-CheckBox $labels.North On
+    Select-GroupOption 'Time between sends' 'No delay'
+    Select-GroupOption 'Parallel SSH commands' '1 at a time'
+    $null = Wait-CheckBox 'Stop queue on failure' On
+    Set-Command 'skip-middle'
+    Click ('Send and record' + [char]0x2026)
+    $dialog = Wait-Until 'skip run recording dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'start the skip run' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started skip-middle')
+    $null = Wait-Until 'only queued hosts can be skipped' {
+        (Find-Element "Skip queued pane $($panes.East)" $button) -and
+            (Find-Element "Skip queued pane $($panes.North)" $button) -and
+            !(Find-Element "Skip queued pane $($panes.West)" $button)
+    }
+    Click "Skip queued pane $($panes.East)"
+    $null = Wait-Until 'East is skipped while North remains queued' {
+        (Find-Element "$($labels.East)${dot}Skipped before sending") -and
+            (Find-Element "$($labels.North)${dot}Queued") -and
+            !(Find-Element "Skip queued pane $($panes.East)" $button)
+    }
+    Click 'Notify when run finishes'
+    $null = Wait-Until 'the skip completion notice is armed' { Find-Element 'Cancel run notification' $button }
+    New-Item -ItemType File -Path (Join-Path $State 'release-skip-middle') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.North)",'--timeout','10','North finished skip-middle')
+
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}$group${dot}Run 10${dot}Group run finished${dot}2 succeeded${dot}0 need attention${dot}1 skipped"
+    $null = Wait-Until 'the skip appears as a settled outcome without attention' {
+        Find-Element "3 of 3 settled${dot}0 waiting${dot}0 running${dot}2 succeeded${dot}0 need attention${dot}1 skipped"
+    }
+    Select-GroupOption 'Filter submission results' 'Skipped'
+    $null = Wait-Until 'the skipped result can be isolated' {
+        (Find-Element "Focus result pane $($panes.East)" $button) -and
+            !(Find-Element "Focus result pane $($panes.West)" $button)
+    }
+    $log = Join-Path $State 'ssh-group-output-10.txt'
+    $null = Wait-Until 'the saved recording identifies the skipped host' {
+        $recorded = Read-GroupRecording $log
+        $recorded -and $recorded.Contains("Skipped queued host${dot}Pane $($panes.East)") -and
+            $recorded.Contains("$($labels.East)${dot}Skipped before sending") -and $recorded.Contains('[Group run settled]')
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

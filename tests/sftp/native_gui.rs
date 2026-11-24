@@ -1556,12 +1556,13 @@ async fn native_ssh_group_bounds_parallel_commands() {
                     Wire::Input(id, bytes) => {
                         trace.lock().unwrap().extend_from_slice(&bytes);
                         let input = std::str::from_utf8(&bytes).unwrap();
-                        if name == "West" && input == "restore-prompt" {
+                        if input == "restore-prompt" {
                             peer.as_ref()
                                 .unwrap()
                                 .data(
                                     id,
-                                    [b"\r\nWest restored prompt\r\n".as_slice(), prompt].concat(),
+                                    [format!("\r\n{name} restored prompt\r\n").as_bytes(), prompt]
+                                        .concat(),
                                 )
                                 .await
                                 .unwrap();
@@ -1650,13 +1651,13 @@ async fn native_ssh_group_bounds_parallel_commands() {
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
             "West" => {
-                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\r"
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\r"
                     .as_slice()
             }
             "East" => {
                 b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\r"
             }
-            _ => b"x",
+            _ => b"xrestore-promptskip-middle\r",
         };
         assert_eq!(inputs.lock().unwrap().as_slice(), expected, "{name}");
         responder.abort();

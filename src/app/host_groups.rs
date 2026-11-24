@@ -388,6 +388,7 @@ enum DeliveryStatus {
     Pending(Instant, oneshot::Receiver<Result<(), String>>),
     Sent,
     Rejected(String),
+    Skipped,
     Unconfirmed,
 }
 
@@ -437,6 +438,7 @@ impl Delivery {
             DeliveryStatus::Pending(..) => "Sending".to_owned(),
             DeliveryStatus::Sent => "Sent to SSH channel".to_owned(),
             DeliveryStatus::Rejected(reason) => format!("Not sent · {reason}"),
+            DeliveryStatus::Skipped => "Skipped before sending".to_owned(),
             DeliveryStatus::Unconfirmed => "Delivery unconfirmed".to_owned(),
         };
         format!("{} · {state}", self.target.name)
@@ -451,7 +453,7 @@ impl Delivery {
 
     fn interrupt_caption(&self) -> Option<Cow<'_, str>> {
         Some(match self.interrupt.as_ref()? {
-            DeliveryStatus::Queued(_) => return None,
+            DeliveryStatus::Queued(_) | DeliveryStatus::Skipped => return None,
             DeliveryStatus::Pending(..) => "Sending Ctrl+C".into(),
             DeliveryStatus::Sent => "Ctrl+C sent".into(),
             DeliveryStatus::Rejected(reason) => format!("Ctrl+C withheld · {reason}").into(),
@@ -2532,14 +2534,7 @@ impl TerminalApp {
         details.extend(shown.into_iter().map(|(delivery, execution)| {
             KeyedView::new(
                 format!("delivery-{}-{}", submission.id, delivery.target.pane),
-                self.host_group_result_row(
-                    id,
-                    delivery,
-                    &submission.content,
-                    execution.as_ref(),
-                    now,
-                    ctx,
-                ),
+                self.host_group_result_row(id, delivery, submission, execution.as_ref(), now, ctx),
             )
         }));
     }
@@ -2548,7 +2543,7 @@ impl TerminalApp {
         &self,
         id: TabId,
         delivery: &Delivery,
-        content: &SubmissionContent,
+        submission: &Submission,
         execution: Option<&GroupExecution>,
         now: Instant,
         ctx: &ViewContext<Self>,
@@ -2560,7 +2555,7 @@ impl TerminalApp {
                 .text(delivery.description())
                 .text_wrapping(TextWrapping::Wrap),
         )];
-        if let Some(command) = content.host_command(pane) {
+        if let Some(command) = submission.content.host_command(pane) {
             rows.push(KeyedView::new(
                 "command",
                 TextBlock::new()
@@ -2635,6 +2630,27 @@ impl TerminalApp {
                     .automation_name(format!("{} · {caption}", delivery.target.name))
                     .text(caption.as_ref())
                     .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        if matches!(delivery.status, DeliveryStatus::Queued(_))
+            && submission
+                .command_queue
+                .as_ref()
+                .is_some_and(|queue| !queue.is_canary(pane))
+        {
+            let run = submission.id;
+            rows.push(KeyedView::new(
+                "skip",
+                Button::new()
+                    .automation_name(format!("Skip queued pane {pane}"))
+                    .on_click(ctx.callback(move |_| {
+                        Message::HostGroup(Action::CommandQueue(
+                            id,
+                            run,
+                            command_queue::Action::SkipHost(pane),
+                        ))
+                    }))
+                    .content("Skip host"),
             ));
         }
         if self.tab_for_pane(pane).is_some() {

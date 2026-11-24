@@ -23,6 +23,7 @@ enum DeliveryState {
     Pending,
     Sent,
     Rejected { reason: String },
+    Skipped,
     Unconfirmed,
 }
 
@@ -36,6 +37,7 @@ impl From<&DeliveryStatus> for DeliveryState {
                 reason: reason.clone(),
             },
             DeliveryStatus::Unconfirmed => Self::Unconfirmed,
+            DeliveryStatus::Skipped => Self::Skipped,
         }
     }
 }

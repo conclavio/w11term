@@ -135,12 +135,19 @@ impl Inbox {
         source: &str,
         succeeded: usize,
         attention: usize,
+        skipped: usize,
     ) {
         let attention_verb = if attention == 1 { "needs" } else { "need" };
+        let mut message = format!(
+            "Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"
+        );
+        if skipped > 0 {
+            message.push_str(&format!(" · {skipped} skipped"));
+        }
         self.push(
             NoticeTarget::GroupRun { tab, submission },
             display_field(source).into(),
-            format!("Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"),
+            message,
             None,
             None,
             true,
@@ -374,7 +381,7 @@ mod tests {
         };
 
         inbox.group_canary_finished(4, 2, "Fleet", "East", true);
-        inbox.group_finished(4, 2, "Fleet", 2, 0);
+        inbox.group_finished(4, 2, "Fleet", 2, 0, 0);
 
         assert_eq!(inbox.unread_count(), 2);
         assert!(inbox.mark_target_read(canary));
