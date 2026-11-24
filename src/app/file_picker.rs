@@ -28,6 +28,7 @@ pub(super) enum Purpose {
     Scrollback,
     CommandOutput(String),
     GroupReport(String),
+    GroupJsonReport(String),
     GroupLiveRecording(String),
     SshHostList,
     StartRecording,
@@ -292,25 +293,35 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             Purpose::Scrollback
             | Purpose::CommandOutput(_)
             | Purpose::GroupReport(_)
+            | Purpose::GroupJsonReport(_)
             | Purpose::SshHostList => {
                 #[cfg(feature = "ui-smoke")]
                 if fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")? {
                     options |= FOS_DONTADDTORECENT;
                 }
-                let (title, suggestion) = match &purpose {
-                    Purpose::CommandOutput(suggestion) => {
-                        (w!("Save command output as text"), suggestion.as_str())
-                    }
-                    Purpose::GroupReport(suggestion) => {
-                        (w!("Save SSH group results as text"), suggestion.as_str())
-                    }
-                    Purpose::SshHostList => (w!("Save SSH host list"), "ssh-hosts.txt"),
-                    _ => (w!("Save scrollback as text"), "terminal.txt"),
+                let (title, suggestion, extension) = match &purpose {
+                    Purpose::CommandOutput(suggestion) => (
+                        w!("Save command output as text"),
+                        suggestion.as_str(),
+                        w!("txt"),
+                    ),
+                    Purpose::GroupReport(suggestion) => (
+                        w!("Save SSH group results as text"),
+                        suggestion.as_str(),
+                        w!("txt"),
+                    ),
+                    Purpose::GroupJsonReport(suggestion) => (
+                        w!("Save SSH group results as JSON"),
+                        suggestion.as_str(),
+                        w!("json"),
+                    ),
+                    Purpose::SshHostList => (w!("Save SSH host list"), "ssh-hosts.txt", w!("txt")),
+                    _ => (w!("Save scrollback as text"), "terminal.txt", w!("txt")),
                 };
                 dialog.SetTitle(title)?;
                 let wide: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
-                dialog.SetDefaultExtension(w!("txt"))?;
+                dialog.SetDefaultExtension(extension)?;
                 // The atomic writer creates its own sibling file and reports any write errors.
                 options |= FOS_OVERWRITEPROMPT | FOS_NOTESTFILECREATE;
                 let sink: IFileDialogEvents = Overwrite {

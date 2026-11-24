@@ -380,6 +380,38 @@ try {
     $exported = [IO.File]::ReadAllText($destination, [Text.UTF8Encoding]::new($false, $true))
     if ($exported -cne (Read-ClipboardFixture)) { throw 'The saved report omitted retained output or host status' }
     Click $savedStatus
+    Set-ResultFilter 'Succeeded'
+    $null = Wait-Until 'the rejected result is hidden in the filtered view' {
+        (Find-Element "Focus result pane $east" $button) -and !(Find-Element "Focus result pane $west" $button)
+    }
+    $jsonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'group results.json'
+    Click ('Save results as JSON' + [char]0x2026)
+    $dialog = Wait-Until 'owned group JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
+    $null = Wait-Until 'enter the JSON destination' {
+        [FixtureDialog]::SetFilename($dialog, $jsonPath, 'ssh-group-submission-3.json')
+    }
+    $null = Wait-Until 'save the group JSON report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the JSON report is published' { [IO.File]::Exists($jsonPath) }
+    $json = [IO.File]::ReadAllText($jsonPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    if ($json.schema_version -ne 1 -or $json.submission_id -ne 3 -or $json.kind -cne 'command' -or
+        $json.command -cne 'while-slow' -or $json.recipients.Count -ne 2) {
+        throw 'The JSON report did not identify the entire viewed submission'
+    }
+    $eastJson, $westJson = $json.recipients
+    if ($eastJson.pane_id -ne $east -or $eastJson.profile -cne 'East' -or
+        $eastJson.address -cne "test@127.0.0.1:$($profileData.East.port)" -or
+        $eastJson.delivery.state -cne 'sent' -or $eastJson.execution.state -cne 'completed' -or
+        $eastJson.execution.exit_code -ne 0 -or $eastJson.output.state -cne 'complete' -or
+        !$eastJson.output.text.Contains('east-report-tail') -or
+        ([regex]::Matches($eastJson.output.text, 'east-report-line')).Count -ne 35) {
+        throw 'The JSON report lost the completed host identity, exit status, or full retained output'
+    }
+    if ($westJson.pane_id -ne $west -or $westJson.delivery.state -cne 'rejected' -or
+        $westJson.delivery.reason -cne 'Waiting for a fresh prompt' -or
+        $null -ne $westJson.execution -or $null -ne $westJson.output) {
+        throw 'The JSON report omitted or misclassified the hidden rejected host'
+    }
+    Set-ResultFilter 'All results'
     $null = Wait-Until 'the hidden West result is outside the retry scope' {
         $entry = Find-Element 'Prepare retry' $button
         $entry -and !$entry.Current.IsEnabled

@@ -4,18 +4,38 @@ use std::{fmt::Write as _, io, sync::Arc};
 use w11term::events::GroupCommandResult;
 use wezterm_term::CompletedCommand;
 
+mod json;
+
 const OUTPUT_END: &str = "\r\n";
 const OUTPUT_SHORTENED: &str = "[Output shortened to fit the clipboard]\r\n";
 const OUTPUT_PREVIEW: &str = "  Output preview · full output unavailable\r\n";
 
 pub(super) struct Report {
-    title: String,
+    id: u64,
+    label: String,
+    kind: json::Kind,
     sections: Vec<Section>,
 }
 
 struct Section {
     heading: String,
-    output: Option<Output>,
+    metadata: json::Recipient,
+    output: Option<CapturedOutput>,
+}
+
+enum CapturedOutput {
+    Empty,
+    Captured(Output),
+    Unavailable(&'static str),
+}
+
+impl Section {
+    fn text_output(&self) -> Option<&Output> {
+        match &self.output {
+            Some(CapturedOutput::Captured(output)) => Some(output),
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct Output {
@@ -85,14 +105,14 @@ impl Report {
                 if let Some(interrupt) = delivery.interrupt_caption() {
                     let _ = writeln!(heading, "  {interrupt}\r");
                 }
-                let mut output = None;
-                if let Some(GroupExecution::Finished(result)) = execution {
+                let output = if let Some(GroupExecution::Finished(result)) = &execution {
                     match &result.output {
                         GroupOutput::Captured { text, .. } if text.is_empty() => {
                             heading.push_str("  No output captured\r\n");
+                            Some(CapturedOutput::Empty)
                         }
                         GroupOutput::Captured { .. } => {
-                            output = Output::capture(result, |link| {
+                            let output = Output::capture(result.clone(), |link| {
                                 retained(delivery.target.pane, link)
                             });
                             if let Some(captured) = &output {
@@ -102,28 +122,47 @@ impl Report {
                                     OUTPUT_PREVIEW
                                 });
                             }
+                            output.map(CapturedOutput::Captured)
                         }
                         GroupOutput::Unavailable(reason) => {
                             let _ = writeln!(heading, "  Output unavailable · {reason}\r");
+                            Some(CapturedOutput::Unavailable(reason))
                         }
                     }
+                } else {
+                    None
+                };
+                Section {
+                    heading,
+                    metadata: json::Recipient::capture(
+                        delivery,
+                        &submission.content,
+                        execution.as_ref(),
+                    ),
+                    output,
                 }
-                Section { heading, output }
             })
             .collect();
 
         Self {
-            title: format!("Submitted · {}\r\n", submission.content.label()),
+            id: submission.id,
+            label: submission.content.label().to_owned(),
+            kind: if submission.content.command().is_some() {
+                json::Kind::Command
+            } else {
+                json::Kind::Environment
+            },
             sections,
         }
     }
 
+    fn text_title(&self) -> String {
+        format!("Submitted · {}\r\n", self.label)
+    }
+
     pub(super) fn clipboard(&self, limit: usize) -> Result<String> {
-        let mut report = self.title.clone();
-        let outputs = self
-            .sections
-            .iter()
-            .filter_map(|section| section.output.as_ref());
+        let mut report = self.text_title();
+        let outputs = self.sections.iter().filter_map(Section::text_output);
         let output_count = outputs.clone().count();
         let text_bytes: usize = outputs.map(|output| output.text().len()).sum();
         let metadata_bytes = report.len()
@@ -145,7 +184,7 @@ impl Report {
         let mut outputs_left = output_count;
         for section in &self.sections {
             report.push_str(&section.heading);
-            if let Some(output) = &section.output {
+            if let Some(output) = section.text_output() {
                 let text = output.text();
                 let end = if shorten {
                     text.floor_char_boundary(text.len().min(available / outputs_left))
@@ -165,10 +204,10 @@ impl Report {
     }
 
     pub(super) fn write_to(&self, file: &mut impl io::Write) -> io::Result<()> {
-        file.write_all(self.title.as_bytes())?;
+        file.write_all(self.text_title().as_bytes())?;
         for section in &self.sections {
             file.write_all(section.heading.as_bytes())?;
-            if let Some(output) = &section.output {
+            if let Some(output) = section.text_output() {
                 file.write_all(output.text().as_bytes())?;
                 file.write_all(OUTPUT_END.as_bytes())?;
             }
@@ -181,9 +220,11 @@ impl Report {
 mod tests {
     use super::*;
     use crate::app::host_groups::{
-        Delivery, DeliveryStatus, SubmissionContent, Target, TargetState,
+        Delivery, DeliveryStatus, GroupInterruptTarget, SubmissionContent, Target, TargetState,
+        filter::Names,
     };
-    use tokio::sync::watch;
+    use std::{collections::BTreeMap, time::Instant};
+    use tokio::sync::{oneshot, watch};
 
     fn captured(pane: u64, text: String, truncated: bool) -> Delivery {
         let capture = GroupCommandResult {
@@ -199,7 +240,7 @@ mod tests {
             target: Target {
                 pane,
                 name: format!("Host {pane}"),
-                names: Default::default(),
+                names: Names::new(&format!("Host {pane}"), "lab.example", "ops", 2222),
                 profile: None,
                 connected: true,
                 state: TargetState::InUse,
@@ -208,6 +249,12 @@ mod tests {
             execution: Some(execution),
             interrupt: None,
         }
+    }
+
+    fn json(report: &Report) -> serde_json::Value {
+        let mut bytes = Vec::new();
+        report.write_json(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[test]
@@ -249,6 +296,21 @@ mod tests {
         let mut file = Vec::new();
         snapshot.write_to(&mut file).unwrap();
         assert_eq!(file, report.as_bytes());
+        let document = json(&snapshot);
+        assert_eq!(document["schema_version"], 1);
+        assert_eq!(document["submission_id"], 1);
+        assert_eq!(document["kind"], "command");
+        assert_eq!(document["command"], "show");
+        let hosts = document["recipients"].as_array().unwrap();
+        assert_eq!(hosts[0]["name"], "Host 7");
+        assert_eq!(hosts[0]["address"], "ops@lab.example:2222");
+        assert_eq!(hosts[0]["delivery"]["state"], "sent");
+        assert_eq!(hosts[0]["execution"]["exit_code"], 17);
+        assert_eq!(hosts[0]["execution"]["command_id"], 3);
+        assert_eq!(hosts[0]["output"]["state"], "complete");
+        assert_eq!(hosts[0]["output"]["text"], "full output\r\nsecond line");
+        assert_eq!(hosts[1]["output"]["state"], "preview");
+        assert_eq!(hosts[1]["output"]["text"], "missing tail");
     }
 
     #[test]
@@ -279,5 +341,57 @@ mod tests {
         let file = String::from_utf8(file).unwrap();
         assert!(file.contains(&"雪".repeat(400)) && file.contains(&"月".repeat(400)));
         assert!(!file.contains(OUTPUT_SHORTENED));
+        let document = json(&snapshot);
+        assert_eq!(
+            document["recipients"][0]["output"]["text"],
+            "雪".repeat(400)
+        );
+        let withheld = &document["recipients"][2];
+        assert_eq!(withheld["delivery"]["state"], "rejected");
+        assert_eq!(withheld["delivery"]["reason"], "SSH connection closed");
+        assert!(withheld["execution"].is_null() && withheld["output"].is_null());
+    }
+
+    #[test]
+    fn json_preserves_host_assignments_and_distinguishes_running_pending_and_empty_output() {
+        let mut running = captured(8, String::new(), false);
+        let (_, execution) = watch::channel(GroupExecution::Running(GroupInterruptTarget {
+            generation: 1,
+            serial: 4,
+        }));
+        running.execution = Some(execution);
+        running.interrupt = Some(DeliveryStatus::Unconfirmed);
+        let mut pending = captured(9, String::new(), false);
+        let (_, reply) = oneshot::channel();
+        pending.status = DeliveryStatus::Pending(Instant::now(), reply);
+        let submission = Submission {
+            id: 4,
+            content: SubmissionContent::Environment(BTreeMap::from([
+                (7, "export POLYSH_RANK=0".into()),
+                (8, "export POLYSH_RANK=1".into()),
+                (9, "export POLYSH_RANK=2".into()),
+            ])),
+            recording: Default::default(),
+            saved_recordings: Default::default(),
+            transcript: Default::default(),
+            results: vec![captured(7, String::new(), false), running, pending],
+        };
+        let snapshot = Report::capture(&submission, |_, _| None);
+        let document = json(&snapshot);
+        assert_eq!(document["kind"], "environment");
+        assert!(document["command"].is_null());
+        let hosts = document["recipients"].as_array().unwrap();
+        assert_eq!(hosts[0]["pane_id"], 7);
+        assert_eq!(hosts[0]["command"], "export POLYSH_RANK=0");
+        assert_eq!(
+            hosts[0]["output"],
+            serde_json::json!({"state": "complete", "text": ""})
+        );
+        assert_eq!(hosts[1]["execution"]["state"], "running");
+        assert_eq!(hosts[1]["interrupt"]["state"], "unconfirmed");
+        assert!(hosts[1]["output"].is_null());
+        assert_eq!(hosts[2]["command"], "export POLYSH_RANK=2");
+        assert_eq!(hosts[2]["delivery"]["state"], "pending");
+        assert!(hosts[2]["execution"].is_null() && hosts[2]["output"].is_null());
     }
 }

@@ -427,7 +427,7 @@ pub enum Action {
     SaveCommand(TabId, save_command::Action),
     RestoreDraft(TabId),
     CopyResults(TabId, u64),
-    SaveResults(TabId, u64),
+    SaveResults(TabId, u64, text_export::GroupReportFormat),
     ViewOutput(TabId, u64, CommandLink),
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, Arc<str>, Vec<Target>),
@@ -999,13 +999,16 @@ impl TerminalApp {
                 }
             }
             Action::CopyResults(id, submission) => self.copy_host_group_results(id, submission),
-            Action::SaveResults(id, submission) => {
+            Action::SaveResults(id, submission, format) => {
                 if self.export.pending.is_none()
                     && let Some(report) = self.capture_host_group_report(id, submission)
                 {
                     self.begin_text_export(
-                        text_export::Subject::HostGroupResults(submission),
-                        move |file| report.write_to(file),
+                        text_export::Subject::HostGroupResults(submission, format),
+                        move |file| match format {
+                            text_export::GroupReportFormat::Text => report.write_to(file),
+                            text_export::GroupReportFormat::Json => report.write_json(file),
+                        },
                         ctx,
                     );
                 }
@@ -1503,7 +1506,11 @@ impl TerminalApp {
                         Button::new()
                             .is_enabled(self.export.pending.is_none())
                             .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::SaveResults(id, submission_id))
+                                Message::HostGroup(Action::SaveResults(
+                                    id,
+                                    submission_id,
+                                    text_export::GroupReportFormat::Text,
+                                ))
                             }))
                             .content(text_export::GROUP_REPORT_LABEL),
                         Button::new()
@@ -1533,15 +1540,30 @@ impl TerminalApp {
                             },
                         )
                     })),
-                Button::new()
-                    .on_click(ctx.callback(move |_| {
-                        Message::HostGroup(Action::Compare(
-                            id,
-                            submission_id,
-                            compare::Action::Open,
-                        ))
-                    }))
-                    .content("Compare results…"),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::Compare(
+                                    id,
+                                    submission_id,
+                                    compare::Action::Open,
+                                ))
+                            }))
+                            .content("Compare results…"),
+                        Button::new()
+                            .is_enabled(self.export.pending.is_none())
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::SaveResults(
+                                    id,
+                                    submission_id,
+                                    text_export::GroupReportFormat::Json,
+                                ))
+                            }))
+                            .content(text_export::GROUP_JSON_LABEL),
+                    )),
                 retry::button(
                     id,
                     page,
