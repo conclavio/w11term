@@ -11,6 +11,7 @@ mod address;
 mod close_ended;
 mod compare;
 mod completion;
+mod connection_notice;
 mod disconnect;
 mod environment;
 mod filter;
@@ -73,6 +74,7 @@ pub(super) struct HostGroup {
     import: import::State,
     host_list_export: Box<host_list_export::State>,
     reconnect_feedback: String,
+    connection_notice: connection_notice::State,
     close_ended: Box<close_ended::State>,
     disconnect: Box<disconnect::State>,
     retry_feedback: String,
@@ -662,6 +664,7 @@ pub enum Action {
     HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
     StopPending(TabId, Vec<reconnect::Attempt>),
+    ConnectionNotice(TabId, connection_notice::Action),
     CloseEnded(TabId, close_ended::Action),
     Disconnect(TabId, disconnect::Action),
     FilterResults(TabId, u64, progress::Filter),
@@ -806,7 +809,9 @@ impl TerminalApp {
         if matches!(
             self.tabs.active().map(|tab| &tab.page),
             Some(Page::HostGroup(_))
-        ) {
+        ) || self.tabs.entries().iter().any(|entry| {
+            matches!(&entry.value.page, Page::HostGroup(page) if page.connection_notice.is_armed())
+        }) {
             if self.host_group_timer.is_none() {
                 let sender = ctx.sender();
                 self.host_group_timer =
@@ -1141,6 +1146,7 @@ impl TerminalApp {
             Action::Reuse(id, action) => self.handle_host_group_reuse(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::StopPending(id, attempts) => self.stop_pending_host_group(id, &attempts),
+            Action::ConnectionNotice(id, action) => self.handle_connection_notice(id, action, ctx),
             Action::CloseEnded(id, action) => self.handle_close_ended(id, action, ctx),
             Action::Disconnect(id, action) => self.handle_group_disconnect(id, action),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
@@ -1150,10 +1156,12 @@ impl TerminalApp {
             Action::Environment(id, action) => self.handle_host_group_environment(id, action),
             Action::RecordedSend(id, action) => self.handle_recorded_send(id, action, ctx),
             Action::Tick => {
+                self.poll_connection_notices();
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
                     Some(Page::HostGroup(_))
                 ) {
+                    self.update_host_group_timer(ctx);
                     return;
                 }
                 let panes: BTreeSet<_> = self

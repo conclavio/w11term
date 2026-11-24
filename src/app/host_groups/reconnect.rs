@@ -3,8 +3,8 @@ use w11term::events::PendingSshAttempt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attempt {
-    pane: u64,
-    token: PendingSshAttempt,
+    pub(super) pane: u64,
+    pub(super) token: PendingSshAttempt,
 }
 
 pub enum Request {
@@ -187,7 +187,11 @@ pub(super) fn selection_controls(
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let visible_exit = shown.iter().any(|target| target.state.exit().is_some());
-    if !visible_exit && pending.is_empty() && page.reconnect_feedback.is_empty() {
+    if !visible_exit
+        && pending.is_empty()
+        && page.reconnect_feedback.is_empty()
+        && !page.connection_notice.is_armed()
+    {
         return View::empty();
     }
     let exits = selected_exits(page, shown);
@@ -215,6 +219,7 @@ pub(super) fn selection_controls(
             .text_wrapping(TextWrapping::Wrap)
             .into()
     };
+    let notice = page.connection_notice.button(id, &pending, ctx);
     let stop = if pending.is_empty() {
         View::empty()
     } else {
@@ -230,7 +235,7 @@ pub(super) fn selection_controls(
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(8.0)
-            .children((button, stop)),
+            .children((button, stop, notice)),
         feedback,
     ))
 }

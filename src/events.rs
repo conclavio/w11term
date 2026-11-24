@@ -23,7 +23,7 @@ pub use group_transcript::{
 pub(crate) use inbox::display_field;
 pub use inbox::{Inbox, NoticeTarget};
 pub(crate) use ssh_attempt::AttemptGuard;
-pub use ssh_attempt::PendingSshAttempt;
+pub use ssh_attempt::{PendingSshAttempt, SshAttemptCompletion, SshAttemptOutcome};
 
 const CAPACITY: usize = 4096;
 const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);

@@ -2,7 +2,7 @@ use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use crate::{
-    events::{AttemptGuard, Events},
+    events::{AttemptGuard, Events, SshAttemptOutcome},
     options::{Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
@@ -69,9 +69,9 @@ impl PendingAttempt {
         self.cancelled = Some(cancelled);
     }
 
-    fn finish(guard: &mut Option<AttemptGuard>) -> Result<()> {
+    fn finish(guard: &mut Option<AttemptGuard>, outcome: SshAttemptOutcome) -> Result<()> {
         if let Some(guard) = guard.take()
-            && !guard.finish()
+            && !guard.finish(outcome)
         {
             return Err(AttemptStopped.into());
         }
@@ -719,7 +719,12 @@ impl Driver {
             attempt.begin(&self.events);
         }
         let result = self.run_pending(program, can_stop, &mut attempt).await;
-        PendingAttempt::finish(&mut attempt.guard)?;
+        let outcome = if result.is_err() {
+            SshAttemptOutcome::Failed
+        } else {
+            SshAttemptOutcome::Closed
+        };
+        PendingAttempt::finish(&mut attempt.guard, outcome)?;
         result
     }
 
@@ -1089,7 +1094,7 @@ async fn run_channel(
                 Some(russh::ChannelMsg::Success) if pending > 0 => {
                     pending -= 1;
                     if pending == 0 {
-                        PendingAttempt::finish(attempt)?;
+                        PendingAttempt::finish(attempt, SshAttemptOutcome::Connected)?;
                         shell.published.publish(&shell.link, generation);
                         program.ready();
                         events.push("connected", serde_json::json!({"generation":generation}));

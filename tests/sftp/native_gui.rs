@@ -1482,6 +1482,47 @@ async fn native_saved_ssh_group_opens_in_an_independent_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reports watched group logins once while the Attention inbox is active"]
+async fn native_ssh_group_notifies_when_watched_logins_settle() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut gates = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for name in ["West", "East"] {
+        let (Source::Ssh(ssh), root, opens, server) = fixture_server(false).await else {
+            unreachable!()
+        };
+        let gate = root.path().join("hold-shell-request");
+        fs::write(&gate, []).unwrap();
+        if name == "East" {
+            fs::write(root.path().join("reject-shell-request"), []).unwrap();
+        }
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        gates.insert(name.into(), serde_json::to_value(gate).unwrap());
+        peers.push((root, opens, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Notices":["West","East"]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.path().join("shell-gates.json"),
+        serde_json::to_vec(&gates).unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-login-notice-ui.ps1", state.path());
+    for (_, opens, server) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "queues limited launches, bulk reconnects and imported SSH hosts"]
 async fn native_reviewed_ssh_group_limits_parallel_logins() {
     let state = tempfile::tempdir().unwrap();

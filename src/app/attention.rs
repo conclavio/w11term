@@ -22,7 +22,7 @@ pub enum Action {
     WatchCommand(bool),
     LongCommands(clipboard_paste::Origin, bool),
     Visit { pane: u64, sequence: u64 },
-    VisitGroup { tab: TabId, submission: u64 },
+    VisitGroup(NoticeTarget),
     ViewCommand { pane: u64, sequence: u64 },
     MarkAllRead,
     Clear,
@@ -83,16 +83,23 @@ impl TerminalApp {
                     self.find(true, None, ctx);
                 }
             }
-            Action::VisitGroup { tab, submission } => {
-                if !self.group_run_retained(tab, submission)
-                    || !self
-                        .inbox
-                        .mark_target_read(NoticeTarget::GroupRun { tab, submission })
+            Action::VisitGroup(target) => match target {
+                NoticeTarget::GroupRun { tab, submission }
+                    if self.group_run_retained(tab, submission)
+                        && self.inbox.mark_target_read(target) =>
                 {
-                    return;
+                    self.show_group_run(tab, submission);
                 }
-                self.show_group_run(tab, submission);
-            }
+                NoticeTarget::GroupLogins { tab, .. }
+                    if matches!(
+                        self.tabs.get(tab).map(|entry| &entry.page),
+                        Some(Page::HostGroup(_))
+                    ) && self.inbox.mark_target_read(target) =>
+                {
+                    self.tabs.select(tab);
+                }
+                _ => return,
+            },
             Action::ViewCommand { pane, sequence } => {
                 if let Some(link) = self.inbox.command_link(pane, sequence)
                     && self.open_command_history(pane, Some(link), ctx)
@@ -139,28 +146,48 @@ impl TerminalApp {
                     let status = if row.unread { "Unread" } else { "Read" };
                     let (pane, sequence) = match row.target {
                         NoticeTarget::Pane { pane, sequence } => (pane, sequence),
-                        NoticeTarget::GroupRun { tab, submission } => {
-                            let enabled = self.group_run_retained(tab, submission);
+                        target @ (NoticeTarget::GroupRun { tab, .. }
+                        | NoticeTarget::GroupLogins { tab, .. }) => {
+                            let (enabled, detail, key) = match target {
+                                NoticeTarget::GroupRun { submission, .. } => {
+                                    let enabled = self.group_run_retained(tab, submission);
+                                    let expired = if enabled {
+                                        ""
+                                    } else {
+                                        " (results unavailable)"
+                                    };
+                                    (
+                                        enabled,
+                                        format!(" · Run {submission}{expired}"),
+                                        format!("group-{tab}/{submission}"),
+                                    )
+                                }
+                                NoticeTarget::GroupLogins { sequence, .. } => {
+                                    let enabled = matches!(
+                                        self.tabs.get(tab).map(|entry| &entry.page),
+                                        Some(Page::HostGroup(_))
+                                    );
+                                    let detail = if enabled { "" } else { " (closed)" };
+                                    (
+                                        enabled,
+                                        detail.into(),
+                                        format!("group-logins-{tab}/{sequence}"),
+                                    )
+                                }
+                                NoticeTarget::Pane { .. } => unreachable!(),
+                            };
                             let source = self
                                 .tabs
                                 .get(tab)
                                 .map_or(row.source.as_ref(), |tab| tab.label.as_str());
-                            let expired = if enabled {
-                                ""
-                            } else {
-                                " (results unavailable)"
-                            };
-                            let label = format!(
-                                "{status} · {source} · Run {submission}{expired} · {}",
-                                row.message
-                            );
+                            let label = format!("{status} · {source}{detail} · {}", row.message);
                             return KeyedView::new(
-                                format!("group-{tab}/{submission}"),
+                                key,
                                 Button::new()
                                     .automation_name(label.clone())
                                     .is_enabled(enabled)
                                     .on_click(ctx.callback(move |_| {
-                                        Message::Attention(Action::VisitGroup { tab, submission })
+                                        Message::Attention(Action::VisitGroup(target))
                                     }))
                                     .content(
                                         TextBlock::new()

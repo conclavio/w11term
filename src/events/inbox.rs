@@ -11,6 +11,7 @@ const CAPACITY: usize = 128;
 pub enum NoticeTarget {
     Pane { pane: u64, sequence: u64 },
     GroupRun { tab: u64, submission: u64 },
+    GroupLogins { tab: u64, sequence: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +130,22 @@ impl Inbox {
             NoticeTarget::GroupRun { tab, submission },
             display_field(source).into(),
             format!("Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"),
+            None,
+            true,
+        );
+    }
+
+    pub fn group_connections_finished(
+        &self,
+        tab: u64,
+        sequence: u64,
+        source: &str,
+        message: String,
+    ) {
+        self.push(
+            NoticeTarget::GroupLogins { tab, sequence },
+            display_field(source).into(),
+            message,
             None,
             true,
         );

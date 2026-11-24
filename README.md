@@ -103,6 +103,8 @@ Filter by **Connection failed** to find panes whose SSH attempt ended with an er
 
 Choose **Stop selected SSH attempts** to stop connecting, signing in, or retrying for the checked hosts shown by the roster. The command palette also offers **Stop pending SSH connections**. A stopped pane keeps its scrollback and can be reconnected explicitly.
 
+Choose **Notify when logins finish** to watch the currently checked, shown SSH attempts. When all of those attempts settle, the Attention inbox gets one entry with the connected, failed, stopped, and closed counts. Select it to return to the roster. **Cancel login notification** disarms the watch.
+
 Choose **Close ended SSH panes…** to review and close checked, visible panes whose connection has ended. Closing discards their scrollback. Panes in pinned tabs stay open, and a pane that reconnects before confirmation is kept. The command palette offers **Review close for ended SSH panes**.
 
 Choose **Open next SSH prompt** to open the first pending host-key or sign-in prompt in the displayed roster. The button shows how many visible hosts are waiting and follows the roster filters and sort order. Select the group tab to return to the roster.
