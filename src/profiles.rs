@@ -354,16 +354,17 @@ impl ProfileStore {
         })
     }
 
-    /// Create a new set and recheck the launch review under the catalog write lock.
-    pub fn create_reviewed_ssh_recipient_set(
+    /// Save a recipient set and recheck the launch review under the catalog write lock.
+    pub fn save_reviewed_ssh_recipient_set(
         &self,
         group: &str,
         expected_group: &[String],
         name: &str,
+        expected: Option<&[String]>,
         members: &[String],
         verify: impl FnOnce(&Profiles) -> Result<()>,
     ) -> Result<Profiles> {
-        self.edit_ssh_recipient_set(group, expected_group, name, None, Some(members), verify)
+        self.edit_ssh_recipient_set(group, expected_group, name, expected, Some(members), verify)
     }
 
     fn edit_ssh_recipient_set(

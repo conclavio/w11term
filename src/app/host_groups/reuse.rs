@@ -232,7 +232,33 @@ pub(super) struct State {
     return_to: Option<TabId>,
     filter: filter::Filter,
     page: usize,
-    set_name: Option<String>,
+    set_editor: Option<SetEditor>,
+}
+
+enum SetEditor {
+    New(String),
+    Update(Option<String>),
+}
+
+impl SetEditor {
+    fn target<'a>(&'a self, review: &'a Review) -> Option<(&'a str, Option<&'a [String]>)> {
+        match self {
+            Self::New(name)
+                if !name.trim().is_empty() && !review.sets.contains_key(name.trim()) =>
+            {
+                Some((name.trim(), None))
+            }
+            Self::Update(Some(name)) => {
+                let previous = review.sets.get(name)?;
+                (!previous
+                    .iter()
+                    .map(String::as_str)
+                    .eq(review.included_profiles()))
+                .then_some((name.as_str(), Some(previous.as_slice())))
+            }
+            _ => None,
+        }
+    }
 }
 
 pub enum Action {
@@ -252,8 +278,10 @@ pub enum Change {
     Approve(Vec<Launch>, Option<String>),
     Export(Vec<Launch>, Option<String>),
     BeginSaveSet,
+    BeginUpdateSet,
     SetName(String),
-    SaveSet,
+    SetTarget(String),
+    SaveSet(String),
     BackFromSet,
     Refresh,
     Back,
@@ -301,7 +329,7 @@ impl State {
     fn open(&mut self, review: Review) {
         self.filter.clear();
         self.page = 0;
-        self.set_name = None;
+        self.set_editor = None;
         self.replace(review);
     }
 
@@ -378,8 +406,8 @@ impl State {
         let action = move |change| {
             Message::HostGroup(super::Action::Reuse(id, Action::Form(revision, change)))
         };
-        if let Some(name) = self.set_name.as_deref() {
-            return Some(save_set_view(review, name, action, ctx));
+        if let Some(editor) = &self.set_editor {
+            return Some(save_set_view(review, editor, action, ctx));
         }
         let offered = review.choices();
         let reuse = offered
@@ -551,6 +579,16 @@ impl State {
                                     .is_enabled(reuse + new > 0)
                                     .on_click(ctx.callback(move |_| action(Change::BeginSaveSet)))
                                     .content("Save as recipient set…"),
+                                if review.sets.is_empty() {
+                                    View::empty()
+                                } else {
+                                    Button::new()
+                                        .is_enabled(reuse + new > 0)
+                                        .on_click(
+                                            ctx.callback(move |_| action(Change::BeginUpdateSet)),
+                                        )
+                                        .content("Update recipient set…")
+                                },
                             )),
                         StackPanel::new()
                             .spacing(8.0)
@@ -656,17 +694,96 @@ impl State {
 
 fn save_set_view(
     review: &Review,
-    name: &str,
+    editor: &SetEditor,
     action: impl Fn(Change) -> Message + Copy + 'static,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
-    let exists = review.sets.contains_key(name.trim());
-    let feedback = if exists {
-        "A recipient set with this name already exists."
+    let (label, field, previous, hint): (_, View, _, _) = match editor {
+        SetEditor::New(name) => (
+            "Save recipient set",
+            TextBox::new()
+                .automation_name("Launch recipient set name")
+                .placeholder_text("Recipient set name")
+                .text(name)
+                .on_text_changed(ctx.callback(move |name| action(Change::SetName(name))))
+                .into(),
+            None,
+            if review.sets.contains_key(name.trim()) {
+                "A recipient set with this name already exists."
+            } else {
+                ""
+            },
+        ),
+        SetEditor::Update(selected) => {
+            let previous = selected.as_ref().and_then(|name| review.sets.get(name));
+            let names: Vec<_> = review.sets.keys().cloned().collect();
+            let index = names
+                .iter()
+                .position(|name| Some(name) == selected.as_ref());
+            (
+                "Update recipient set",
+                ComboBox::new()
+                    .automation_name("Existing recipient set")
+                    .placeholder_text("Choose a recipient set")
+                    .items_source(names.clone())
+                    .selected_index(index)
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index
+                            .and_then(|index| names.get(index))
+                            .map_or(Message::ControlIdle, |name| {
+                                action(Change::SetTarget(name.clone()))
+                            })
+                    }))
+                    .into(),
+                previous,
+                if previous.is_some() && editor.target(review).is_none() {
+                    "The included profiles already match this set."
+                } else {
+                    ""
+                },
+            )
+        }
+    };
+    let feedback = if review.feedback.is_empty() {
+        hint
     } else {
         &review.feedback
     };
-    let profiles = review.included_profiles().collect::<Vec<_>>().join("\n");
+    let target = editor.target(review).map(|(name, _)| name.to_owned());
+    let valid = target.is_some();
+    let profiles: Vec<_> = review.included_profiles().collect();
+    let changes = previous.map_or_else(View::empty, |previous| {
+        let included: BTreeSet<_> = profiles.iter().copied().collect();
+        let saved: BTreeSet<_> = previous.iter().map(String::as_str).collect();
+        let added: Vec<_> = profiles
+            .iter()
+            .copied()
+            .filter(|name| !saved.contains(name))
+            .collect();
+        let removed: Vec<_> = previous
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !included.contains(name))
+            .collect();
+        let rows = [("Add", added), ("Remove", removed)]
+            .into_iter()
+            .filter(|(_, names)| !names.is_empty())
+            .map(|(label, names)| {
+                KeyedView::new(
+                    label,
+                    TextBlock::new()
+                        .text(format!("{label} {}", names.join(", ")))
+                        .text_wrapping(TextWrapping::Wrap),
+                )
+            });
+        if included == saved && valid {
+            TextBlock::new()
+                .text("Update the saved profile order.")
+                .into()
+        } else {
+            StackPanel::new().spacing(6.0).keyed_children(rows)
+        }
+    });
     Grid::new()
         .margin(16.0)
         .row_spacing(8.0)
@@ -675,21 +792,21 @@ fn save_set_view(
             StackPanel::new().spacing(8.0).children((
                 TextBlock::new()
                     .font_size(24.0)
-                    .text(format!("Save recipient set · {}", review.name)),
-                TextBox::new()
-                    .automation_name("Launch recipient set name")
-                    .placeholder_text("Recipient set name")
-                    .text(name)
-                    .on_text_changed(ctx.callback(move |name| action(Change::SetName(name)))),
+                    .text(format!("{label} · {}", review.name)),
+                field,
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
                     .children((
                         Button::new()
                             .style(ButtonStyle::Accent)
-                            .is_enabled(!name.trim().is_empty() && !exists)
-                            .on_click(ctx.callback(move |_| action(Change::SaveSet)))
-                            .content("Save recipient set"),
+                            .is_enabled(valid)
+                            .on_click(ctx.callback(move |_| {
+                                target.as_ref().map_or(Message::ControlIdle, |name| {
+                                    action(Change::SaveSet(name.clone()))
+                                })
+                            }))
+                            .content(label),
                         Button::new()
                             .on_click(ctx.callback(move |_| action(Change::BackFromSet)))
                             .content("Back to launch review"),
@@ -699,11 +816,14 @@ fn save_set_view(
                     .text_wrapping(TextWrapping::Wrap),
             )),
             ScrollViewer::new().grid_row(1).content(
-                TextBlock::new()
-                    .automation_name("Recipient set profiles")
-                    .text(profiles)
-                    .is_text_selection_enabled(true)
-                    .text_wrapping(TextWrapping::Wrap),
+                StackPanel::new().spacing(8.0).children((
+                    changes,
+                    TextBlock::new()
+                        .automation_name("Recipient set profiles")
+                        .text(profiles.join("\n"))
+                        .is_text_selection_enabled(true)
+                        .text_wrapping(TextWrapping::Wrap),
+                )),
             ),
         ))
 }
@@ -808,7 +928,7 @@ impl TerminalApp {
         else {
             return;
         };
-        if state.set_name.is_some() {
+        if state.set_editor.is_some() {
             self.edit_launch_set(id, change);
             return;
         }
@@ -923,12 +1043,21 @@ impl TerminalApp {
                     }
                 }
             }
-            Change::BeginSaveSet if review.included_profiles().next().is_some() => {
+            change @ (Change::BeginSaveSet | Change::BeginUpdateSet)
+                if review.included_profiles().next().is_some() =>
+            {
+                let editor = if matches!(change, Change::BeginSaveSet) {
+                    SetEditor::New(String::new())
+                } else if !review.sets.is_empty() {
+                    SetEditor::Update(review.selected_set.clone())
+                } else {
+                    return;
+                };
                 if let Some(page) = self.host_group_mut(id) {
                     let state = &mut page.saved.reuse;
                     if let Some(review) = &mut state.review {
                         review.feedback.clear();
-                        state.set_name = Some(String::new());
+                        state.set_editor = Some(editor);
                         state.revision += 1;
                     }
                 }
@@ -942,26 +1071,39 @@ impl TerminalApp {
             return;
         };
         let state = &mut page.saved.reuse;
-        let (Some(review), Some(name)) = (&mut state.review, &mut state.set_name) else {
+        let (Some(review), Some(editor)) = (&mut state.review, &mut state.set_editor) else {
             return;
         };
         match change {
-            Change::SetName(text) => {
+            Change::SetName(text) if let SetEditor::New(name) = editor => {
                 *name = text;
                 review.feedback.clear();
             }
+            Change::SetTarget(name)
+                if review.sets.contains_key(&name)
+                    && let SetEditor::Update(selected) = editor =>
+            {
+                *selected = Some(name);
+                review.feedback.clear();
+            }
             Change::BackFromSet => {
-                state.set_name = None;
+                state.set_editor = None;
                 state.revision += 1;
                 review.feedback.clear();
             }
-            Change::SaveSet => {
-                let name = name.trim().to_owned();
+            Change::SaveSet(name) => {
+                let Some((_, expected)) =
+                    editor.target(review).filter(|(target, _)| *target == name)
+                else {
+                    return;
+                };
+                let updating = expected.is_some();
                 let members: Vec<_> = review.included_profiles().map(str::to_owned).collect();
-                match self.store.create_reviewed_ssh_recipient_set(
+                match self.store.save_reviewed_ssh_recipient_set(
                     &review.name,
                     &review.profiles(),
                     &name,
+                    expected,
                     &members,
                     |catalog| review.validate_profiles(catalog),
                 ) {
@@ -971,9 +1113,10 @@ impl TerminalApp {
                             .get(&review.name)
                             .cloned()
                             .unwrap_or_default();
-                        review.feedback = format!("Saved recipient set {name}");
+                        let verb = if updating { "Updated" } else { "Saved" };
+                        review.feedback = format!("{verb} recipient set {name}");
                         review.selected_set = Some(name);
-                        state.set_name = None;
+                        state.set_editor = None;
                         state.revision += 1;
                         self.use_group_catalog(catalog);
                     }

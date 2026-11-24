@@ -252,6 +252,43 @@ try {
     }
     Expect-Choice 'Launch recipient set' 'Before connect'
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Reopening the new recipient set started an SSH session' }
+    $updateSet = 'Update recipient set' + [char]0x2026
+    Click $updateSet
+    Expect-Choice 'Existing recipient set' 'Before connect'
+    $null = Wait-Until 'an unchanged recipient set needs no save' {
+        $save = Find-Element 'Update recipient set' $button
+        ($save -and !$save.Current.IsEnabled) -and
+            (Find-Element 'The included profiles already match this set.')
+    }
+    Click 'Back to launch review'
+    (Field 'Find launch profiles').SetValue('NORTH')
+    $null = Wait-CheckBox 'Include profile North' Off
+    Click 'Include only matches'
+    $null = Wait-CheckBox 'Include profile North' On
+    Click $updateSet
+    Choose-Option 'Existing recipient set' 'Before connect'
+    $null = Wait-Until 'the update previews both membership changes' {
+        (Find-Element 'Add North') -and (Find-Element 'Remove East')
+    }
+    $beforeUpdate = [IO.File]::ReadAllBytes($profiles)
+    $changed = [Text.Encoding]::UTF8.GetString($beforeUpdate) | ConvertFrom-Json
+    $changed.ssh_recipient_sets.'Fleet Lab'.'Before connect' = @('Lab 01')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Update recipient set'
+    $null = Wait-Until 'a concurrent update cannot be replaced by the stale preview' {
+        Find-Element 'This name is already in use or the recipient set changed. Reopen recipient sets.'
+    }
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if (($sets.'Fleet Lab'.'Before connect' -join ',') -cne 'Lab 01') { throw 'A stale update replaced the recipient set' }
+    [IO.File]::WriteAllBytes($profiles, $beforeUpdate)
+    Click 'Update recipient set'
+    $null = Wait-Until 'the reviewed change is saved' { Find-Element 'Updated recipient set Before connect' }
+    Expect-Choice 'Launch recipient set' 'Before connect'
+    Expect-Field 'Find launch profiles' 'NORTH'
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if (($sets.'Fleet Lab'.'Before connect' -join ',') -cne 'North' -or @((Control @('list')).sessions).Count -ne 1) {
+        throw 'Updating the preset saved the wrong hosts or opened an SSH session'
+    }
     Click 'Cancel'
     Wait-Focus $origin
 
