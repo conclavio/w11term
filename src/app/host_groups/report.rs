@@ -1,6 +1,6 @@
 use super::{
-    CommandLink, GroupExecution, GroupOutput, Submission, dispatch_policy, execution_caption,
-    execution_time_caption, queue_activity,
+    CommandLink, Delivery, GroupExecution, GroupOutput, Submission, dispatch_policy,
+    execution_caption, execution_time_caption, queue_activity,
 };
 use anyhow::{Context, Result};
 use std::{fmt::Write as _, io, sync::Arc, time::Instant};
@@ -19,6 +19,7 @@ pub(super) struct Report {
     kind: json::Kind,
     dispatch_policy: Option<dispatch_policy::Policy>,
     queue_activity: GroupQueueActivity,
+    total_recipient_count: Option<usize>,
     sections: Vec<Section>,
 }
 
@@ -94,18 +95,28 @@ impl Output {
 impl Report {
     pub(super) fn capture(
         submission: &Submission,
-        mut retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
+        retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
     ) -> Self {
-        let now = Instant::now();
-        let sections = submission
+        let rows = submission
             .results
             .iter()
-            .map(|delivery| {
+            .map(|delivery| (delivery, delivery.execution()));
+        Self::capture_rows(submission, Instant::now(), rows, retained)
+    }
+
+    pub(super) fn capture_rows<'a>(
+        submission: &Submission,
+        now: Instant,
+        rows: impl IntoIterator<Item = (&'a Delivery, Option<GroupExecution>)>,
+        mut retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
+    ) -> Self {
+        let sections: Vec<_> = rows
+            .into_iter()
+            .map(|(delivery, execution)| {
                 let mut heading = format!("\r\n{}\r\n", delivery.description());
                 if let Some(command) = submission.content.host_command(delivery.target.pane) {
                     let _ = writeln!(heading, "  {command}\r");
                 }
-                let execution = delivery.execution();
                 if let Some(execution) = &execution {
                     let _ = writeln!(heading, "  {}\r", execution_caption(execution));
                     if let Some(timing) = execution_time_caption(execution, now) {
@@ -165,6 +176,8 @@ impl Report {
             },
             dispatch_policy: submission.dispatch_policy.clone(),
             queue_activity: submission.transcript.queue_activity(),
+            total_recipient_count: (sections.len() < submission.results.len())
+                .then_some(submission.results.len()),
             sections,
         }
     }
@@ -172,6 +185,13 @@ impl Report {
     fn text_title(&self) -> String {
         let mut header =
             dispatch_policy::report_heading(&self.label, self.dispatch_policy.as_ref());
+        if let Some(total) = self.total_recipient_count {
+            let _ = writeln!(
+                header,
+                "Shown results · {} of {total} recipients\r",
+                self.sections.len()
+            );
+        }
         header.push_str(&queue_activity::text(&self.queue_activity));
         header
     }
@@ -360,6 +380,7 @@ mod tests {
         snapshot.write_to(&mut file).unwrap();
         assert_eq!(file, report.as_bytes());
         let document = json(&snapshot);
+        assert!(document.get("total_recipient_count").is_none());
         assert_eq!(document["schema_version"], 1);
         assert_eq!(document["submission_id"], 1);
         assert_eq!(document["kind"], "command");
@@ -440,6 +461,26 @@ mod tests {
         assert_eq!(withheld["delivery"]["state"], "rejected");
         assert_eq!(withheld["delivery"]["reason"], "SSH connection closed");
         assert!(withheld["execution"].is_null() && withheld["output"].is_null());
+
+        let shown = Report::capture_rows(
+            &submission,
+            Instant::now(),
+            [2, 0].map(|index| {
+                let delivery = &submission.results[index];
+                (delivery, delivery.execution())
+            }),
+            |_, _| None,
+        );
+        let text = shown.clipboard(2048).unwrap();
+        assert!(text.contains("Shown results · 2 of 3 recipients\r\n"));
+        assert!(text.find("Host 9").unwrap() < text.find("Host 7").unwrap());
+        assert!(!text.contains("Host 8"));
+        let document = json(&shown);
+        assert_eq!(document["total_recipient_count"], 3);
+        let recipients = document["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(recipients[0]["pane_id"], 9);
+        assert_eq!(recipients[1]["pane_id"], 7);
     }
 
     #[test]

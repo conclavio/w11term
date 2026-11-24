@@ -167,7 +167,7 @@ Choose **Send and record…** beside the group command to attach a recorder befo
 
 The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status.
 
-Use **Search result recipients** to find recipients by profile, pane, or SSH address. Search ignores case and combines with the outcome filter. It follows you through earlier and later submissions in the same tab and clears on a new run or when you open a run from Attention. The table shows how many recipients match. **Interrupt selected** and **Prepare retry** use the matching results and the live roster scope. Copying and exporting results includes the full submission.
+Use **Search result recipients** to find recipients by profile, pane, or SSH address. Search ignores case and combines with the outcome filter. It follows you through earlier and later submissions in the same tab and clears on a new run or when you open a run from Attention. The table shows how many recipients match. **Interrupt selected** and **Prepare retry** use the matching results and the live roster scope.
 
 Choose **Notify when run finishes** on a pending submission to get one entry in the Attention inbox once all its hosts settle. The alert includes success and attention counts, and selecting it takes you back to the retained submission. If another application has focus, the owning taskbar button flashes. Use **Cancel run notification** to disarm it while the run is pending.
 
@@ -186,6 +186,8 @@ Choose **Save as command…** to add the draft to the shared library. Enter a na
 Choose **Copy results** to copy the viewed submission as plain text, including every recipient’s delivery, execution and interrupt status. The report uses full output retained in each pane and labels any preview that stands in for expired output. Large reports shorten output to fit the clipboard while retaining every host’s status.
 
 Choose **Save results…** to write a UTF-8 report of the viewed submission. It includes every recipient and all retained output from completed commands, even when the roster or result filters hide a host. A host still running appears with its status at the time you opened the Save dialog.
+
+When the result filters show a nonempty subset, use **Copy shown results**, **Save shown results…**, or **Save shown results as JSON…**. These reports keep the displayed recipient order, the original recipient count, and the run's dispatch settings and queue activity. Text reports identify the subset in their heading. JSON reports include `total_recipient_count`, with the shown hosts in `recipients`.
 
 Command results, reports, and output recordings show the dispatch settings captured for that run. These settings stay with the run when you change the next draft. **Show queue activity** lists pauses, resumes, canary decisions, and stops with elapsed time since submission. Reports and completed recordings include the most recent 32 queue events and count any earlier events omitted.
 

@@ -160,6 +160,8 @@ struct Document<'a> {
     dispatch_policy: Option<&'a Policy>,
     #[serde(skip_serializing_if = "GroupQueueActivity::is_empty")]
     queue_activity: &'a GroupQueueActivity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_recipient_count: Option<usize>,
     recipients: Vec<DocumentRecipient<'a>>,
 }
 
@@ -176,6 +178,7 @@ impl Report {
             command: matches!(self.kind, Kind::Command).then_some(self.label.as_str()),
             dispatch_policy: self.dispatch_policy.as_ref(),
             queue_activity: &self.queue_activity,
+            total_recipient_count: self.total_recipient_count,
             recipients: self
                 .sections
                 .iter()

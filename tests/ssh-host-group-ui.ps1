@@ -545,6 +545,40 @@ try {
         $null -ne $westJson.execution -or $null -ne $westJson.output) {
         throw 'The JSON report omitted or misclassified the hidden rejected host'
     }
+    if ($json.PSObject.Properties.Name -contains 'total_recipient_count') {
+        throw 'The full report was marked as a subset'
+    }
+    Set-RecipientSearch 'west'
+    $null = Wait-Until 'an empty result filter has no shown export' {
+        (Find-Element 'Showing 0 of 2 recipients') -and !(Find-Element 'Copy shown results' $button)
+    }
+    Click 'Clear recipient search'
+    Click 'Copy shown results'
+    $shownText = Wait-Until 'clipboard holds only the successful result' {
+        $report = Read-ClipboardFixture
+        if ($report -and $report.Contains("Shown results${dot}1 of 2 recipients") -and
+            $report.Contains("$eastName${dot}Sent to SSH channel") -and
+            $report.Contains('east-report-tail') -and !$report.Contains($westName)) { $report }
+    }
+    Click ('Save shown results' + [char]0x2026)
+    $dialog = Wait-Until 'shown group text Save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
+    $null = Wait-Until 'save the shown group text report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $shownTextPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.txt'
+    $null = Wait-Until 'the saved text matches the shown clipboard report' {
+        [IO.File]::Exists($shownTextPath) -and
+            [IO.File]::ReadAllText($shownTextPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $shownText
+    }
+    Click ('Save shown results as JSON' + [char]0x2026)
+    $dialog = Wait-Until 'shown group JSON Save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
+    $null = Wait-Until 'save the shown group JSON report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $shownJsonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.json'
+    $null = Wait-Until 'the shown JSON report is published' { [IO.File]::Exists($shownJsonPath) }
+    $shownJson = [IO.File]::ReadAllText($shownJsonPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    if ($shownJson.total_recipient_count -ne 2 -or $shownJson.recipients.Count -ne 1 -or
+        $shownJson.recipients[0].pane_id -ne $east -or
+        $shownJson.recipients[0].output.text -cne $eastJson.output.text) {
+        throw 'The filtered JSON report lost the original recipient count or the shown result'
+    }
     Set-ResultFilter 'All results'
     $null = Wait-Until 'the hidden West result is outside the retry scope' {
         $entry = Find-Element 'Prepare retry' $button

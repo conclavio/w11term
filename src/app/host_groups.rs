@@ -681,7 +681,10 @@ impl HostGroup {
 pub enum Action {
     Open,
     NewTab,
-    OpenNamedGroup { name: String, members: Vec<String> },
+    OpenNamedGroup {
+        name: String,
+        members: Vec<String>,
+    },
     ReviewNamedGroup(LaunchReviewOffer),
     Saved(TabId, saved::Action),
     Tick,
@@ -731,8 +734,13 @@ pub enum Action {
     LoadRecentCommand(TabId, u64),
     SaveCommand(TabId, save_command::Action),
     RestoreDraft(TabId),
-    CopyResults(TabId, u64),
-    SaveResults(TabId, u64, text_export::GroupReportFormat),
+    CopyResults(TabId, u64, Option<Arc<[u64]>>),
+    SaveResults(
+        TabId,
+        u64,
+        text_export::GroupReportFormat,
+        Option<Arc<[u64]>>,
+    ),
     ViewOutput(TabId, u64, CommandLink),
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, CommandOffer),
@@ -1535,13 +1543,20 @@ impl TerminalApp {
                     let _ = page.command_editor.request_focus();
                 }
             }
-            Action::CopyResults(id, submission) => self.copy_host_group_results(id, submission),
-            Action::SaveResults(id, submission, format) => {
+            Action::CopyResults(id, submission, offered) => {
+                self.copy_host_group_results(id, submission, offered.as_deref())
+            }
+            Action::SaveResults(id, submission, format, offered) => {
                 if self.export.pending.is_none()
-                    && let Some(report) = self.capture_host_group_report(id, submission)
+                    && let Some(report) =
+                        self.capture_host_group_report(id, submission, offered.as_deref())
                 {
                     self.begin_text_export(
-                        text_export::Subject::HostGroupResults(submission, format),
+                        text_export::Subject::HostGroupResults {
+                            submission,
+                            format,
+                            shown: offered.is_some(),
+                        },
                         move |file| match format {
                             text_export::GroupReportFormat::Text => report.write_to(file),
                             text_export::GroupReportFormat::Json => report.write_json(file),
@@ -1646,7 +1661,12 @@ impl TerminalApp {
         }
     }
 
-    fn capture_host_group_report(&self, id: TabId, submission_id: u64) -> Option<report::Report> {
+    fn capture_host_group_report(
+        &mut self,
+        id: TabId,
+        submission_id: u64,
+        offered: Option<&[u64]>,
+    ) -> Option<report::Report> {
         if self.tabs.active_id() != Some(id) {
             return None;
         }
@@ -1654,22 +1674,46 @@ impl TerminalApp {
             return None;
         };
         let submission = page.viewed_submission(submission_id)?;
-        Some(report::Report::capture(submission, |pane, link| {
-            self.history_frame(pane)?.command_for_link(link).cloned()
-        }))
+        let retained = |pane, link| self.history_frame(pane)?.command_for_link(link).cloned();
+        let Some(offered) = offered else {
+            return Some(report::Report::capture(submission, retained));
+        };
+        let now = Instant::now();
+        let (summary, rows) = page.result_rows(submission, now);
+        if rows.is_empty()
+            || rows.len() == summary.total()
+            || !rows
+                .iter()
+                .map(|(delivery, _)| delivery.target.pane)
+                .eq(offered.iter().copied())
+        {
+            if let Some(page) = self.host_group_mut(id) {
+                page.copy_feedback =
+                    "Results changed. Review the shown recipients and try again.".into();
+            }
+            return None;
+        }
+        Some(report::Report::capture_rows(
+            submission, now, rows, retained,
+        ))
     }
 
-    fn copy_host_group_results(&mut self, id: TabId, submission_id: u64) {
-        let Some(report) = self.capture_host_group_report(id, submission_id) else {
+    fn copy_host_group_results(&mut self, id: TabId, submission_id: u64, offered: Option<&[u64]>) {
+        let Some(report) = self.capture_host_group_report(id, submission_id, offered) else {
             return;
         };
         let copied = report
             .clipboard(w11term::clipboard::MAX_TEXT)
             .and_then(|text| w11term::clipboard::write(&text));
         if let Some(page) = self.host_group_mut(id) {
+            let scope = if offered.is_some() {
+                "shown results"
+            } else {
+                "results"
+            };
             page.copy_feedback = match copied {
-                Ok(()) => "Copied results".into(),
-                Err(error) => format!("Could not copy results · {error}"),
+                Ok(()) => format!("Copied {scope}"),
+                Err(error) => format!("Could not copy {scope} · {error}"),
             };
         }
     }
@@ -2354,19 +2398,8 @@ impl TerminalApp {
         };
         let submission = &page.submissions[index];
         let submission_id = submission.id;
-        let mut summary = progress::Summary::default();
-        let mut shown: Vec<_> = submission
-            .results
-            .iter()
-            .filter_map(|delivery| {
-                let execution = delivery.execution();
-                let outcome =
-                    progress::Outcome::with_execution(&delivery.status, execution.as_ref());
-                summary.add(outcome);
-                page.matches_result(delivery, outcome)
-                    .then_some((delivery, execution))
-            })
-            .collect();
+        let now = Instant::now();
+        let (summary, shown) = page.result_rows(submission, now);
         let interrupt_targets: Vec<_> = shown
             .iter()
             .filter(|(delivery, _)| selected_shown.contains(&delivery.target.pane))
@@ -2464,6 +2497,48 @@ impl TerminalApp {
         } else {
             View::empty()
         };
+        let copy = |label, offered: Option<Arc<[u64]>>| {
+            Button::new()
+                .on_click(ctx.callback(move |_| {
+                    Message::HostGroup(Action::CopyResults(id, submission_id, offered.clone()))
+                }))
+                .content(label)
+        };
+        let save = |label, format, offered: Option<Arc<[u64]>>| {
+            Button::new()
+                .is_enabled(self.export.pending.is_none())
+                .on_click(ctx.callback(move |_| {
+                    Message::HostGroup(Action::SaveResults(
+                        id,
+                        submission_id,
+                        format,
+                        offered.clone(),
+                    ))
+                }))
+                .content(label)
+        };
+        let shown_exports = if !shown.is_empty() && shown.len() < summary.total() {
+            let offered: Arc<[u64]> = shown.iter().map(|(row, _)| row.target.pane).collect();
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    copy("Copy shown results", Some(offered.clone())),
+                    save(
+                        text_export::GROUP_SHOWN_REPORT_LABEL,
+                        text_export::GroupReportFormat::Text,
+                        Some(offered.clone()),
+                    ),
+                    save(
+                        text_export::GROUP_SHOWN_JSON_LABEL,
+                        text_export::GroupReportFormat::Json,
+                        Some(offered),
+                    ),
+                ))
+                .into()
+        } else {
+            View::empty()
+        };
         details.push(KeyedView::new(
             "results",
             StackPanel::new().spacing(4.0).children((
@@ -2516,21 +2591,12 @@ impl TerminalApp {
                         } else {
                             View::empty()
                         },
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::CopyResults(id, submission_id))
-                            }))
-                            .content("Copy results"),
-                        Button::new()
-                            .is_enabled(self.export.pending.is_none())
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::SaveResults(
-                                    id,
-                                    submission_id,
-                                    text_export::GroupReportFormat::Text,
-                                ))
-                            }))
-                            .content(text_export::GROUP_REPORT_LABEL),
+                        copy("Copy results", None),
+                        save(
+                            text_export::GROUP_REPORT_LABEL,
+                            text_export::GroupReportFormat::Text,
+                            None,
+                        ),
                         Button::new()
                             .on_click(ctx.callback(move |_| {
                                 Message::HostGroup(Action::LiveOutput(
@@ -2548,6 +2614,7 @@ impl TerminalApp {
                     .children((result_filter, result_order)),
                 recipient_search,
                 result_count,
+                shown_exports,
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
@@ -2561,16 +2628,11 @@ impl TerminalApp {
                                 ))
                             }))
                             .content("Compare results…"),
-                        Button::new()
-                            .is_enabled(self.export.pending.is_none())
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::SaveResults(
-                                    id,
-                                    submission_id,
-                                    text_export::GroupReportFormat::Json,
-                                ))
-                            }))
-                            .content(text_export::GROUP_JSON_LABEL),
+                        save(
+                            text_export::GROUP_JSON_LABEL,
+                            text_export::GroupReportFormat::Json,
+                            None,
+                        ),
                         completion::button(id, submission, ctx),
                     )),
                 command_queue::controls(id, submission, ctx),
@@ -2598,8 +2660,6 @@ impl TerminalApp {
                 TextBlock::new().text("No recipients match this result filter."),
             ));
         }
-        let now = Instant::now();
-        page.result_order.apply(&mut shown, now);
         details.extend(shown.into_iter().map(|(delivery, execution)| {
             KeyedView::new(
                 format!("delivery-{}-{}", submission.id, delivery.target.pane),

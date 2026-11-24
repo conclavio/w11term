@@ -1,4 +1,4 @@
-use super::{Delivery, DeliveryStatus, GroupExecution, HostGroup};
+use super::{Delivery, DeliveryStatus, GroupExecution, HostGroup, Submission};
 use std::{cmp::Reverse, time::Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +95,27 @@ impl HostGroup {
     pub(super) fn matches_result(&self, delivery: &Delivery, outcome: Outcome) -> bool {
         self.result_filter.includes(outcome)
             && self.recipient_search.matches_query(&delivery.target)
+    }
+
+    pub(super) fn result_rows<'a>(
+        &self,
+        submission: &'a Submission,
+        now: Instant,
+    ) -> (Summary, Vec<(&'a Delivery, Option<GroupExecution>)>) {
+        let mut summary = Summary::default();
+        let mut shown: Vec<_> = submission
+            .results
+            .iter()
+            .filter_map(|delivery| {
+                let execution = delivery.execution();
+                let outcome = Outcome::with_execution(&delivery.status, execution.as_ref());
+                summary.add(outcome);
+                self.matches_result(delivery, outcome)
+                    .then_some((delivery, execution))
+            })
+            .collect();
+        self.result_order.apply(&mut shown, now);
+        (summary, shown)
     }
 }
 
