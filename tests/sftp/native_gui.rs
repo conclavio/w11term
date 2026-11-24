@@ -833,6 +833,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         let release_paused = state.path().join("release-west-paused");
         let release_away = state.path().join("release-west-away");
         let release_slow = state.path().join("release-west-result");
+        let release_recording = state.path().join("release-record-fast");
         let responder = tokio::spawn(async move {
             use in_band_resize::Wire;
             let prompt = if use_633 {
@@ -947,10 +948,25 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                     });
                                     continue;
                                 }
+                                if use_633 && line == "record-fast" {
+                                    let output = format!(
+                                        "\r\n\x1b]633;E;record-fast\x07\x1b]633;C\x07{}\r\nwest record tail\x1b]633;D;0\x07\r\n",
+                                        recording_burst("west")
+                                    );
+                                    let response = [output.as_bytes(), prompt].concat();
+                                    let gate = release_recording.clone();
+                                    let handle = handle.clone();
+                                    tokio::spawn(async move {
+                                        while !gate.is_file() {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        }
+                                        let _ = handle.data(id, response).await;
+                                    });
+                                    continue;
+                                }
                                 let complete = if use_633 {
                                     let (output, code) = match line {
                                         "shared-status" => ("fleet-status-ok".to_owned(), 0),
-                                        "record-fast" => (recording_burst("west"), 0),
                                         _ => (format!("west-accepted {line}"), 17),
                                     };
                                     format!(

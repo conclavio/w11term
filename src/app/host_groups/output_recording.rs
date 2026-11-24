@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use w11term::events::{GroupTranscriptLine, GroupTranscriptRecording, GroupTranscriptStream};
+use w11term::events::{
+    GroupRecordingEnd, GroupRecordingMode, GroupTranscriptLine, GroupTranscriptRecording,
+    GroupTranscriptStream,
+};
 
 #[derive(Default)]
 pub(super) enum State {
@@ -33,10 +36,11 @@ impl State {
         transcript: &GroupTranscript,
         label: Arc<str>,
         names: BTreeMap<u64, String>,
+        mode: GroupRecordingMode,
         open: impl FnOnce(&Path) -> anyhow::Result<File> + Send + 'static,
     ) -> Result<Self, String> {
         let (recording, stream) = transcript
-            .start_recording()
+            .start_recording(mode)
             .ok_or("This output already has a recorder")?;
         let (status, worker) = watch::channel(WriterStatus::Opening);
         let destination = path.clone();
@@ -119,15 +123,22 @@ impl PreparedFile {
         label: Arc<str>,
         names: BTreeMap<u64, String>,
     ) -> Result<State, String> {
-        State::start(self.path, transcript, label, names, move |_| {
-            self.file
-                .rewind()
-                .context("Starting the output recording")?;
-            self.file
-                .set_len(0)
-                .context("Starting the output recording")?;
-            Ok(self.file)
-        })
+        State::start(
+            self.path,
+            transcript,
+            label,
+            names,
+            GroupRecordingMode::UntilSettled,
+            move |_| {
+                self.file
+                    .rewind()
+                    .context("Starting the output recording")?;
+                self.file
+                    .set_len(0)
+                    .context("Starting the output recording")?;
+                Ok(self.file)
+            },
+        )
     }
 }
 
@@ -226,7 +237,11 @@ fn write_output(
             Err(RecvError::Closed) => break,
         }
     }
-    writeln!(file, "[Recording stopped]\r")?;
+    let ending = match stream.ended.try_recv() {
+        Ok(GroupRecordingEnd::Settled) => "[Group run settled]",
+        _ => "[Recording stopped]",
+    };
+    writeln!(file, "{ending}\r")?;
     file.flush()
 }
 
@@ -358,6 +373,7 @@ impl TerminalApp {
             &submission.transcript,
             submission.content.label().into(),
             names(targets),
+            GroupRecordingMode::Manual,
             create_file,
         )
         .unwrap_or_else(|error| State::Written(Err(error)));
@@ -387,6 +403,8 @@ mod tests {
             sender.send(entry).unwrap();
         }
         drop(sender);
+        let (finish, ended) = oneshot::channel();
+        finish.send(GroupRecordingEnd::Stopped).unwrap();
         let stream = GroupTranscriptStream {
             history: GroupTranscriptSnapshot {
                 omitted: 2,
@@ -397,6 +415,7 @@ mod tests {
                 .into(),
             },
             incoming,
+            ended,
         };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("output.txt");

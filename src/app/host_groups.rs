@@ -322,6 +322,7 @@ impl HostGroup {
         results: Vec<Delivery>,
         transcript: GroupTranscript,
     ) -> &mut Submission {
+        transcript.finish_dispatch();
         self.next_submission += 1;
         self.viewing = self.next_submission;
         self.result_filter = progress::Filter::All;
