@@ -34,6 +34,7 @@ pub use reuse::Offer as LaunchReviewOffer;
 pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
 pub(super) const RECENT_COMMANDS_LABEL: &str = "Recent group commands…";
+const REQUIRE_READY: &str = "Require all recipients ready";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;
 
@@ -44,6 +45,7 @@ pub(super) struct HostGroup {
     selected: BTreeSet<u64>,
     filter: filter::Filter,
     show_last_output: bool,
+    require_all_ready: bool,
     draft: String,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
@@ -376,6 +378,10 @@ impl HostGroup {
             .collect()
     }
 
+    fn readiness_allows_send(&self, ready: usize, total: usize) -> bool {
+        ready > 0 && (!self.require_all_ready || ready == total)
+    }
+
     fn sending(&self) -> bool {
         self.submissions.back().is_some_and(|submission| {
             submission
@@ -487,6 +493,7 @@ pub enum Action {
     FilterWildcards(TabId, bool),
     FilterStatus(TabId, RosterStatus),
     ShowLastOutput(TabId, bool),
+    RequireAllReady(TabId, bool),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
     RecipientSets(TabId, recipient_sets::Action),
@@ -783,12 +790,16 @@ impl TerminalApp {
         };
         let roster = self.host_group_targets();
         let selection = targets.iter().map(|target| target.pane).collect();
+        let ready = targets
+            .iter()
+            .filter(|target| target.state.is_ready())
+            .count();
         !page.sending()
-            && !targets.is_empty()
+            && page.readiness_allows_send(ready, targets.len())
             && page.selected_shown(&roster) == selection
             && page.draft == text
             && w11term::saved_commands::valid_command_text(text)
-            && (!verify_prompts
+            && ((!verify_prompts && !page.require_all_ready)
                 || targets.iter().all(|reviewed| {
                     roster.iter().any(|current| {
                         current.pane == reviewed.pane
@@ -971,6 +982,14 @@ impl TerminalApp {
             Action::ShowLastOutput(id, show) => {
                 if let Some(page) = self.host_group_mut(id) {
                     page.show_last_output = show;
+                }
+            }
+            Action::RequireAllReady(id, require) => {
+                if let Some(page) = self
+                    .host_group_mut(id)
+                    .filter(|page| !page.recorded_send.pending())
+                {
+                    page.require_all_ready = require;
                 }
             }
             Action::ShowWindowRoster(id, show) => {
@@ -1339,10 +1358,14 @@ impl TerminalApp {
             .collect::<Vec<_>>();
         let text: Arc<str> = page.draft.as_str().into();
         let valid_text = w11term::saved_commands::valid_command_text(&text);
+        let ready = selected
+            .iter()
+            .filter(|target| target.state.is_ready())
+            .count();
         let enabled = valid_text
             && !page.sending()
             && !page.recorded_send.pending()
-            && selected.iter().any(|target| target.state.is_ready());
+            && page.readiness_allows_send(ready, selected.len());
         let send_label = format!(
             "Send to {} {}",
             selected.len(),
@@ -1556,13 +1579,13 @@ impl TerminalApp {
         } else if selected.is_empty() {
             "Select panes with a fresh shell marker or a configured prompt match.".into()
         } else {
-            let ready = selected
-                .iter()
-                .filter(|target| target.state.is_ready())
-                .count();
             let count = selected.len();
             let hosts = if count == 1 { "host" } else { "hosts" };
-            format!("{ready} of {count} selected {hosts} ready")
+            if page.require_all_ready && ready < count {
+                format!("{ready} of {count} selected {hosts} ready · waiting for all")
+            } else {
+                format!("{ready} of {count} selected {hosts} ready")
+            }
         };
         let entry = TextBox::new()
             .element_ref(&page.command_editor)
@@ -1637,9 +1660,24 @@ impl TerminalApp {
                     page.recorded_send.feedback(),
                     retry::feedback(page),
                     hidden_selection,
-                    TextBlock::new()
-                        .text(instructions)
-                        .text_wrapping(TextWrapping::Wrap),
+                    Grid::new()
+                        .column_spacing(12.0)
+                        .columns([GridLength::Auto, GridLength::STAR])
+                        .children((
+                            CheckBox::new()
+                                .automation_name(REQUIRE_READY)
+                                .is_checked(page.require_all_ready)
+                                .is_enabled(!page.recorded_send.pending())
+                                .on_is_checked_changed(ctx.callback(move |require| {
+                                    Message::HostGroup(Action::RequireAllReady(id, require))
+                                }))
+                                .content(REQUIRE_READY),
+                            TextBlock::new()
+                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text(instructions)
+                                .text_wrapping(TextWrapping::Wrap),
+                        )),
                 )),
                 ScrollViewer::new()
                     .grid_row(4)
@@ -1989,6 +2027,19 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_send_readiness_requires_a_recipient_and_respects_the_tab_option() {
+        let mut group = HostGroup::default();
+        assert!(!group.readiness_allows_send(0, 0));
+        assert!(!group.readiness_allows_send(0, 2));
+        assert!(group.readiness_allows_send(1, 2));
+
+        group.require_all_ready = true;
+        assert!(!group.readiness_allows_send(0, 0));
+        assert!(!group.readiness_allows_send(1, 2));
+        assert!(group.readiness_allows_send(2, 2));
+    }
 
     #[test]
     fn roster_filter_matches_profile_pane_and_address_and_scopes_selection() {

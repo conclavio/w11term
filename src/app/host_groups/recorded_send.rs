@@ -86,9 +86,7 @@ impl TerminalApp {
         targets: Vec<Target>,
         ctx: &ComponentContext<Self>,
     ) {
-        if !targets.iter().any(|target| target.state.is_ready())
-            || !self.group_send_matches(id, &text, &targets, true)
-        {
+        if !self.group_send_matches(id, &text, &targets, true) {
             return;
         }
         let owner = self.keyboard.hwnd().map(|owner| owner.0 as usize);

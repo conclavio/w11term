@@ -91,6 +91,8 @@ Turn on **Use wildcards** for a list such as `web-[01][0-9], db-??, !*-canary`. 
 
 The command editor shows how many selected, visible hosts are ready. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
 
+Turn on **Require all recipients ready** to wait for every visible, checked host to have a verified prompt before **Send** or **Send and record** becomes available. Choose when to send once they are ready. The app checks every prompt again before dispatch, and each pane reports its own delivery outcome.
+
 Use the host-state dropdown to show ready shells, disconnected panes, or another current state. The state filter combines with the name or wildcard filter and keeps checks on hidden hosts. Sending and other actions on checked hosts use the visible selection.
 
 Turn on **Show last command output** in a group tab to see the exit status and a short excerpt from each visible host’s latest completed shell capture. **Open history** opens that capture in the host’s command history. The preview uses the current SSH connection and hides during authentication and alternate-screen applications.

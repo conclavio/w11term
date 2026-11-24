@@ -752,8 +752,34 @@ try {
     Submit 'while-reconnecting' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Prompt unverified"
+    $requireReady = 'Require all recipients ready'
+    $sendRecordedOption = 'Send and record' + [char]0x2026
+    (Wait-CheckBox $requireReady Off).Toggle()
+    (Command-Editor).SetValue('after-reconnect')
+    $null = Wait-Until 'both send actions wait for the unverified checked host' {
+        $send = Find-Element 'Send to 2 hosts' $button
+        $record = Find-Element $sendRecordedOption $button
+        $send -and !$send.Current.IsEnabled -and $record -and !$record.Current.IsEnabled -and
+            (Find-Element "1 of 2 selected hosts ready${dot}waiting for all")
+    }
+    Set-HostFilter 'east'
+    $null = Wait-Until 'strict readiness respects the visible recipient scope' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and $send.Current.IsEnabled
+    }
+    Set-HostFilter ''
+    $null = Wait-Until 'returning West to the scope blocks sending again' {
+        $send = Find-Element 'Send to 2 hosts' $button
+        $send -and !$send.Current.IsEnabled
+    }
     Send-Raw $west 'prompt'
     Pane-Status $west "Connected${dot}Ready"
+    $null = Wait-Until 'both send actions become available when both prompts are fresh' {
+        $send = Find-Element 'Send to 2 hosts' $button
+        $record = Find-Element $sendRecordedOption $button
+        $send -and $send.Current.IsEnabled -and $record -and $record.Current.IsEnabled
+    }
+    if (Find-Element "Submitted${dot}after-reconnect") { throw 'The ready check sent the draft automatically' }
     Submit 'after-reconnect' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Exit 17'
@@ -761,6 +787,7 @@ try {
         Find-Element "Pane $west${dot}Last command${dot}Exit 17${dot}west-accepted after-reconnect"
     }
     (Wait-CheckBox $showLastOutput On).Toggle()
+    (Wait-CheckBox $requireReady On).Toggle()
     $null = Wait-Until 'finished results cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
@@ -1073,6 +1100,7 @@ try {
         }
     }
     if ([IO.File]::ReadAllText($burstPath) -cne $beforeCollision) { throw 'The existing recording was modified' }
+    (Wait-CheckBox $requireReady Off).Toggle()
     Select-ComboValue $hostStateFilter 'Ready'
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
@@ -1089,6 +1117,7 @@ try {
         throw 'A stale review was presented as a recorded submission'
     }
     Select-ComboValue $hostStateFilter 'All host states'
+    (Wait-CheckBox $requireReady On).Toggle()
     Pane-Status $west "Connected$($dot)Alternate screen"
     (Command-Editor).SetValue('record-one')
     Click $sendRecorded
