@@ -11,6 +11,7 @@ use w11term::options::{
 };
 use w11term::prompts::Question;
 mod address;
+mod alerted_send;
 mod close_ended;
 mod command_order;
 mod command_queue;
@@ -82,6 +83,7 @@ pub(super) struct HostGroup {
     focus_loaded_command: bool,
     command_save: save_command::State,
     recorded_send: recorded_send::State,
+    alerted_send: alerted_send::State,
     submissions: VecDeque<Submission>,
     recent_commands: recent_commands::RecentCommands,
     viewing: u64,
@@ -745,6 +747,7 @@ pub enum Action {
     LiveOutput(TabId, u64, live_output::Action),
     RecordOutput(TabId, u64, output_recording::Action),
     RecordedSend(TabId, recorded_send::Action),
+    AlertedSend(TabId, alerted_send::Action),
     Compare(TabId, u64, compare::Action),
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
@@ -1515,6 +1518,7 @@ impl TerminalApp {
             Action::RecordOutput(id, submission, action) => {
                 self.handle_group_output_recording(id, submission, action, ctx);
             }
+            Action::AlertedSend(id, action) => self.handle_alerted_send(id, action),
             Action::Compare(id, submission, action) => {
                 self.handle_host_group_comparison(id, submission, action, ctx);
             }
@@ -1716,6 +1720,7 @@ impl TerminalApp {
                 }
                 if let Some(page) = self.host_group_mut(id) {
                     page.recorded_send.clear_feedback();
+                    page.alerted_send.clear_feedback();
                 }
                 self.submit_group_command(
                     id,
@@ -1866,6 +1871,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &mut ViewContext<Self>,
     ) -> View {
+        if let Some(view) = page.alerted_send.view(id, ctx) {
+            return view;
+        }
         if let Some(view) = page.close_ended.review(id, ctx) {
             return view;
         }
@@ -2319,6 +2327,7 @@ impl TerminalApp {
             ctx,
         );
         let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
+        let send_alerted = alerted_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
             .style(ButtonStyle::Accent)
             .is_enabled(enabled)
@@ -2412,6 +2421,7 @@ impl TerminalApp {
                         .children((
                             send,
                             send_recorded,
+                            send_alerted,
                             recent_commands,
                             saved_commands,
                             save_command,
@@ -2419,6 +2429,7 @@ impl TerminalApp {
                         )),
                     page.command_save.view(id, ctx),
                     page.recorded_send.feedback(),
+                    page.alerted_send.feedback(),
                     retry::feedback(page),
                     hidden_selection,
                     Grid::new()

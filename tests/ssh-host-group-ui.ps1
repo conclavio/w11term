@@ -264,7 +264,36 @@ try {
     $null = Wait-Until 'the wildcard exclusion removes West from the send scope' {
         (Find-Element "Focus pane $east" $button) -and !(Find-Element "Focus pane $west" $button)
     }
-    Submit 'one' 'Send to 1 host'
+    (Command-Editor).SetValue('one')
+    $alertedSend = 'Send with alert' + [char]0x2026
+    $alertSearch = 'Search for the output alert'
+    Click $alertedSend
+    $null = Wait-Until 'an empty alert rule cannot send the command' {
+        $confirm = Find-Element 'Send with alert' $button
+        $confirm -and !$confirm.Current.IsEnabled
+    }
+    (Wait-CheckBox 'Regular expression' Off).Toggle()
+    $null = Wait-CheckBox 'Regular expression' On
+    (Command-Editor $alertSearch).SetValue('(')
+    $null = Wait-Until 'an invalid pattern cannot send the command' {
+        $confirm = Find-Element 'Send with alert' $button
+        $confirm -and !$confirm.Current.IsEnabled -and (Find-Element 'unclosed group')
+    }
+    Click 'Cancel'
+    $null = Wait-Until 'cancelling the alert review preserves the unsent draft' {
+        (Find-Element 'Send to 1 host' $button) -and !(Find-Element "Submitted${dot}one")
+    }
+    Click $alertedSend
+    (Command-Editor $alertSearch).SetValue('east-accepted one')
+    Click 'Send with alert'
+    $null = Wait-Until 'the first output of the quick run triggers its pre-armed alert' {
+        (Find-Element "Submitted${dot}one") -and (Find-Element 'Attention inbox, 1 unread' $button)
+    }
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}SSH host group${dot}Run 1${dot}Matched output${dot}$eastName${dot}east-accepted one"
+    $null = Wait-Until 'the pre-armed alert opens its original run' {
+        (Find-Element "Submitted${dot}one") -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
     $showLastOutput = 'Show last command output'

@@ -809,6 +809,47 @@ mod tests {
     }
 
     #[test]
+    fn prearmed_output_alert_matches_before_dispatch_finishes() {
+        let group = GroupTranscript::default();
+        let inbox = Inbox::new(|| {});
+        group.arm_output_alert(GroupOutputAlert {
+            inbox: inbox.clone(),
+            tab: 4,
+            submission: 2,
+            source: "Fleet".into(),
+            hosts: BTreeMap::from([(1, "East".into())]),
+            pattern: Regex::new("^ready$").unwrap(),
+            rule: Arc::new(GroupOutputAlertRule {
+                query: "^ready$".into(),
+                regex: true,
+                match_case: true,
+                host: None,
+            }),
+        });
+        let host = group.host(1);
+        host.append(LiveOutputBatch {
+            lines: vec![LiveOutputLine {
+                text: "ready".into(),
+                shortened: false,
+            }],
+            gap: false,
+        });
+        group.finish_dispatch();
+        let rows = inbox.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].target,
+            NoticeTarget::GroupOutput {
+                tab: 4,
+                submission: 2,
+                pane: 1,
+                line_id: 1,
+            }
+        );
+        assert!(group.output_alert_rule().is_none());
+    }
+
+    #[test]
     fn output_alert_consumes_the_first_new_line_from_its_host_scope() {
         let inbox = Inbox::new(|| {});
         let group = GroupTranscript::default();

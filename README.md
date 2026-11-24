@@ -171,6 +171,8 @@ Choose **View matching output** in the Attention inbox for the matched line and 
 
 From the command palette, choose **Find armed SSH output alerts…** to review alerts across group tabs in the current window. Search by saved query, host scope, tab title, command, or run number such as `#4`. Enter opens the run, preserving its Live output view if it is already open for that run. Alerts leave the picker when they fire, are cancelled, or the run settles.
 
+Choose **Send with alert…** to catch a match from the start of a command. Review the command and recipients, set the search rule, then choose **Send with alert**. w11term rechecks the command and prompts and arms the alert before dispatch, including for queued and canary runs.
+
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.

@@ -58,12 +58,17 @@ impl Timeline {
 
 #[derive(Default)]
 struct Filter {
-    query: String,
-    matcher: Option<Result<Regex, String>>,
-    regex: bool,
-    sensitive: bool,
+    search: OutputSearch,
     show_context: bool,
     host: Option<HostFilter>,
+}
+
+#[derive(Default)]
+pub(super) struct OutputSearch {
+    pub(super) query: String,
+    pub(super) matcher: Option<Result<Regex, String>>,
+    pub(super) regex: bool,
+    pub(super) sensitive: bool,
 }
 
 struct HostFilter {
@@ -88,8 +93,8 @@ impl From<&Target> for HostFilter {
     }
 }
 
-impl Filter {
-    fn configure(&mut self, query: String, regex: bool, sensitive: bool) {
+impl OutputSearch {
+    pub(super) fn configure(&mut self, query: String, regex: bool, sensitive: bool) {
         if (self.query.as_str(), self.regex, self.sensitive) == (query.as_str(), regex, sensitive) {
             return;
         }
@@ -112,20 +117,31 @@ impl Filter {
         self.sensitive = sensitive;
     }
 
-    fn set_query(&mut self, query: String) {
+    pub(super) fn set_query(&mut self, query: String) {
         self.configure(query, self.regex, self.sensitive);
     }
 
-    fn error(&self) -> Option<&str> {
+    pub(super) fn error(&self) -> Option<&str> {
         self.matcher.as_ref()?.as_ref().err().map(String::as_str)
     }
 
+    pub(super) fn alert_rule(&self, host: Option<String>) -> Arc<GroupOutputAlertRule> {
+        Arc::new(GroupOutputAlertRule {
+            query: self.query.clone(),
+            regex: self.regex,
+            match_case: self.sensitive,
+            host,
+        })
+    }
+}
+
+impl Filter {
     fn filters_lines(&self) -> bool {
-        self.host.is_some() || self.matcher.is_some()
+        self.host.is_some() || self.search.matcher.is_some()
     }
 
     fn active(&self) -> bool {
-        self.filters_lines() || self.regex || self.sensitive || self.show_context
+        self.filters_lines() || self.search.regex || self.search.sensitive || self.show_context
     }
 
     fn includes_host(&self, line: &GroupTranscriptLine, address: &str) -> bool {
@@ -135,7 +151,7 @@ impl Filter {
     }
 
     fn matches_text(&self, line: &GroupTranscriptLine) -> bool {
-        self.matcher.as_ref().is_none_or(|result| {
+        self.search.matcher.as_ref().is_none_or(|result| {
             result
                 .as_ref()
                 .is_ok_and(|pattern| pattern.is_match(&line.text))
@@ -143,7 +159,7 @@ impl Filter {
     }
 
     fn includes_context(&self) -> bool {
-        self.show_context && self.matcher.is_some()
+        self.show_context && self.search.matcher.is_some()
     }
 }
 
@@ -414,16 +430,14 @@ impl HostGroup {
                 output.paused = pause;
             }
             Action::Resume => output.paused = None,
-            Action::Search(query) => output.filter.set_query(query),
+            Action::Search(query) => output.filter.search.set_query(query),
             Action::UseRegex(regex) => {
-                output
-                    .filter
-                    .configure(output.filter.query.clone(), regex, output.filter.sensitive)
+                let search = &mut output.filter.search;
+                search.configure(search.query.clone(), regex, search.sensitive)
             }
             Action::MatchCase(sensitive) => {
-                output
-                    .filter
-                    .configure(output.filter.query.clone(), output.filter.regex, sensitive)
+                let search = &mut output.filter.search;
+                search.configure(search.query.clone(), search.regex, sensitive)
             }
             Action::ShowContext(show) => output.filter.show_context = show,
             Action::OldestFirst(enabled) => output.timeline.oldest_first = enabled,
@@ -484,7 +498,7 @@ impl TerminalApp {
             return;
         };
         let filter = &output.filter;
-        let Some(Ok(pattern)) = &filter.matcher else {
+        let Some(Ok(pattern)) = &filter.search.matcher else {
             return;
         };
         let hosts = submission
@@ -506,12 +520,9 @@ impl TerminalApp {
             source: label.clone(),
             hosts,
             pattern: pattern.clone(),
-            rule: Arc::new(GroupOutputAlertRule {
-                query: filter.query.clone(),
-                regex: filter.regex,
-                match_case: filter.sensitive,
-                host: filter.host.as_ref().map(|host| host.label.clone()),
-            }),
+            rule: filter
+                .search
+                .alert_rule(filter.host.as_ref().map(|host| host.label.clone())),
         });
     }
 
@@ -652,7 +663,13 @@ impl TerminalApp {
         {
             View::empty()
         } else {
-            let can_arm = !host_absent && output.filter.matcher.as_ref().is_some_and(Result::is_ok);
+            let can_arm = !host_absent
+                && output
+                    .filter
+                    .search
+                    .matcher
+                    .as_ref()
+                    .is_some_and(Result::is_ok);
             Button::new()
                 .is_enabled(can_arm)
                 .on_click(ctx.callback(move |_| send(Action::ArmOutputAlert)))
@@ -702,7 +719,7 @@ impl TerminalApp {
                 TextBox::new()
                     .automation_name("Find in live output")
                     .placeholder_text("Find text in live output")
-                    .text(&output.filter.query)
+                    .text(&output.filter.search.query)
                     .on_text_changed(ctx.callback(move |query| send(Action::Search(query)))),
                 hosts,
                 Button::new()
@@ -717,14 +734,14 @@ impl TerminalApp {
             .children((
                 CheckBox::new()
                     .automation_name("Regular expression in live output")
-                    .is_checked(output.filter.regex)
+                    .is_checked(output.filter.search.regex)
                     .on_is_checked_changed(
                         ctx.callback(move |enabled| send(Action::UseRegex(enabled))),
                     )
                     .content("Regular expression"),
                 CheckBox::new()
                     .automation_name("Match case in live output")
-                    .is_checked(output.filter.sensitive)
+                    .is_checked(output.filter.search.sensitive)
                     .on_is_checked_changed(
                         ctx.callback(move |enabled| send(Action::MatchCase(enabled))),
                     )
@@ -821,12 +838,16 @@ impl TerminalApp {
                         armed_alert_view(id, submission_id, rule, ctx)
                     }),
                     timeline_options,
-                    output.filter.error().map_or_else(View::empty, |error| {
-                        TextBlock::new()
-                            .text(format!("Live output search · {error}"))
-                            .text_wrapping(TextWrapping::Wrap)
-                            .into()
-                    }),
+                    output
+                        .filter
+                        .search
+                        .error()
+                        .map_or_else(View::empty, |error| {
+                            TextBlock::new()
+                                .text(format!("Live output search · {error}"))
+                                .text_wrapping(TextWrapping::Wrap)
+                                .into()
+                        }),
                     Grid::new()
                         .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
                         .column_spacing(8.0)
@@ -881,7 +902,7 @@ mod tests {
         let mut filter = Filter::default();
         assert!(filter.includes_host(&other, "east"));
         assert!(filter.matches_text(&other));
-        filter.set_query("[état]".into());
+        filter.search.set_query("[état]".into());
         assert!(filter.matches_text(&east) && filter.matches_text(&west));
         assert!(!filter.matches_text(&other));
         filter.host = Some(HostFilter {
@@ -892,7 +913,7 @@ mod tests {
         assert!(!filter.includes_host(&east, "east"));
         assert!(filter.includes_host(&west, "west"));
         assert!(!filter.includes_host(&west, "different destination"));
-        filter.set_query(String::new());
+        filter.search.set_query(String::new());
         assert!(filter.matches_text(&other));
         assert!(!filter.includes_host(&east, "east"));
         assert!(filter.active());
@@ -909,19 +930,19 @@ mod tests {
         };
         let pattern = "^ERROR [0-9]{3}$";
         let mut filter = Filter::default();
-        filter.configure(pattern.into(), true, false);
+        filter.search.configure(pattern.into(), true, false);
         assert!(filter.matches_text(&line));
-        filter.configure(pattern.into(), true, true);
+        filter.search.configure(pattern.into(), true, true);
         assert!(!filter.matches_text(&line));
-        assert!(filter.error().is_none());
-        filter.set_query("(".into());
-        assert!(filter.error().is_some());
+        assert!(filter.search.error().is_none());
+        filter.search.set_query("(".into());
+        assert!(filter.search.error().is_some());
         assert!(!filter.matches_text(&line));
-        filter.set_query("界".repeat(MAX_QUERY_BYTES));
-        assert!(filter.error().unwrap().contains("UTF-8 bytes"));
+        filter.search.set_query("界".repeat(MAX_QUERY_BYTES));
+        assert!(filter.search.error().unwrap().contains("UTF-8 bytes"));
         assert!(!filter.matches_text(&line));
-        filter.set_query(String::new());
-        assert!(filter.error().is_none());
+        filter.search.set_query(String::new());
+        assert!(filter.search.error().is_none());
         assert!(filter.active());
         assert!(filter.matches_text(&line));
     }
@@ -966,7 +987,7 @@ mod tests {
             copy_feedback: None,
         };
         let hosts = BTreeMap::from([(1, ("East", "east")), (2, ("West", "west"))]);
-        output.filter.set_query("error ".into());
+        output.filter.search.set_query("error ".into());
         let shown = output.shown(&snapshot, &hosts);
         assert_eq!(
             shown
@@ -986,7 +1007,7 @@ mod tests {
         let excerpt = format_excerpt("run", 0, shown, false).unwrap();
         assert_eq!(excerpt.matches("between errors").count(), 1);
         assert!(!excerpt.contains("unrelated"));
-        output.filter.configure("(".into(), true, false);
+        output.filter.search.configure("(".into(), true, false);
         assert!(output.shown(&snapshot, &hosts).is_empty());
     }
 
@@ -1023,7 +1044,7 @@ mod tests {
             copy_feedback: None,
         };
         let names = BTreeMap::from([(7, ("East", "east")), (9, ("West", "west"))]);
-        output.filter.set_query("witness".into());
+        output.filter.search.set_query("witness".into());
         assert_eq!(
             format_excerpt(
                 "show",
@@ -1050,7 +1071,7 @@ mod tests {
                 "Submitted · show\r\n+0.050 s · East · first witness\r\n+0.200 s · East · 雪 WITNESS…\r\n[Older lines are outside the retained output.]\r\n"
             ),
         );
-        output.filter.set_query("missing".into());
+        output.filter.search.set_query("missing".into());
         assert!(
             format_excerpt(
                 "show",

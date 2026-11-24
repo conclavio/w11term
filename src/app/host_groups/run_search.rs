@@ -13,6 +13,7 @@ pub enum WindowRunScope {
 impl HostGroup {
     pub(super) fn can_view_run(&self) -> bool {
         !self.saved.is_editing()
+            && !self.alerted_send.is_open()
             && self.live_output.is_none()
             && !self.comparison.is_open()
             && !self.import.is_open()
