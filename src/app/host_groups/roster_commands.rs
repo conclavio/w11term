@@ -7,6 +7,7 @@ pub enum RosterCommand {
     OpenPrompt { pane: u64, prompt: u64 },
     Reconnect(Vec<ExitedPane>),
     StopPending(Vec<reconnect::Attempt>),
+    ReviewCloseEnded(Vec<close_ended::Recipient>),
     ReviewDisconnect(Vec<disconnect::Recipient>),
 }
 
@@ -18,6 +19,7 @@ impl RosterCommand {
             Self::OpenPrompt { .. } => "Open next SSH sign-in or host-key prompt",
             Self::Reconnect(_) => "Reconnect selected SSH hosts",
             Self::StopPending(_) => "Stop pending SSH connections",
+            Self::ReviewCloseEnded(_) => "Review close for ended SSH panes",
             Self::ReviewDisconnect(_) => "Review disconnect for selected SSH hosts",
         }
     }
@@ -31,6 +33,9 @@ impl RosterCommand {
                 Action::Reconnect(group, reconnect::Request::Selection(exits))
             }
             Self::StopPending(attempts) => Action::StopPending(group, attempts),
+            Self::ReviewCloseEnded(recipients) => {
+                Action::CloseEnded(group, close_ended::Action::Review(recipients))
+            }
             Self::ReviewDisconnect(recipients) => {
                 Action::Disconnect(group, disconnect::Action::Review(recipients))
             }
@@ -60,13 +65,18 @@ impl TerminalApp {
         if !pending.is_empty() {
             commands.push(RosterCommand::StopPending(pending));
         }
+        let selected = || {
+            shown
+                .iter()
+                .copied()
+                .filter(|target| page.selected.contains(&target.pane))
+        };
+        let ended = self.close_ended_recipients(selected());
+        if !ended.is_empty() {
+            commands.push(RosterCommand::ReviewCloseEnded(ended));
+        }
         if page.disconnect.can_review() {
-            let recipients = self.disconnect_recipients(
-                shown
-                    .iter()
-                    .copied()
-                    .filter(|target| page.selected.contains(&target.pane)),
-            );
+            let recipients = self.disconnect_recipients(selected());
             if !recipients.is_empty() {
                 commands.push(RosterCommand::ReviewDisconnect(recipients));
             }

@@ -8,6 +8,7 @@ use w11term::events::{
 use w11term::options::{SshRosterDefaults, SshRosterOrder as RosterOrder};
 use w11term::prompts::Question;
 mod address;
+mod close_ended;
 mod compare;
 mod completion;
 mod disconnect;
@@ -70,6 +71,7 @@ pub(super) struct HostGroup {
     import: import::State,
     host_list_export: Box<host_list_export::State>,
     reconnect_feedback: String,
+    close_ended: Box<close_ended::State>,
     disconnect: Box<disconnect::State>,
     retry_feedback: String,
     prompt_setup: prompt_setup::State,
@@ -645,6 +647,7 @@ pub enum Action {
     HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
     StopPending(TabId, Vec<reconnect::Attempt>),
+    CloseEnded(TabId, close_ended::Action),
     Disconnect(TabId, disconnect::Action),
     FilterResults(TabId, u64, progress::Filter),
     OrderResults(TabId, u64, progress::ResultOrder),
@@ -717,6 +720,7 @@ impl TerminalApp {
                     && !page.comparison.is_open()
                     && !page.import.is_open()
                     && !page.host_list_export.is_open()
+                    && !page.close_ended.is_reviewing()
                     && !page.disconnect.is_reviewing()
                     && !page.edit_membership_open()
                     && !page.saved.reuse.is_open()
@@ -1102,6 +1106,7 @@ impl TerminalApp {
             Action::Reuse(id, action) => self.handle_host_group_reuse(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::StopPending(id, attempts) => self.stop_pending_host_group(id, &attempts),
+            Action::CloseEnded(id, action) => self.handle_close_ended(id, action, ctx),
             Action::Disconnect(id, action) => self.handle_group_disconnect(id, action),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
             Action::HostListExport(id, action) => self.handle_host_list_export(id, action, ctx),
@@ -1502,6 +1507,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &mut ViewContext<Self>,
     ) -> View {
+        if let Some(view) = page.close_ended.review(id, ctx) {
+            return view;
+        }
         if let Some(view) = page.disconnect.review(id, ctx) {
             return view;
         }
@@ -1823,6 +1831,8 @@ impl TerminalApp {
                 self.pending_attempts(page, &shown),
                 ctx,
             ),
+            page.close_ended
+                .controls(id, self.close_ended_recipients(selected.iter()), ctx),
             page.disconnect
                 .controls(id, self.disconnect_recipients(selected.iter()), ctx),
             next_prompt,

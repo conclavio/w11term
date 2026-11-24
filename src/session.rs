@@ -291,6 +291,11 @@ impl Session {
         self.events.restart_exited(&self.input, token)
     }
 
+    /// Claim the reviewed exit before immediately removing the SSH pane.
+    pub fn claim_exited_ssh_for_close(&self, token: u64) -> bool {
+        self.is_direct_ssh_shell() && self.events.close_if_exited(token)
+    }
+
     pub fn start(source: Source) -> Self {
         Self::start_sized(source, TerminalSize::default())
     }

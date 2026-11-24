@@ -363,7 +363,18 @@ impl Events {
     }
 
     pub(crate) fn close_restart(&self) {
+        self.disable_restart(None);
+    }
+
+    pub(crate) fn close_if_exited(&self, token: u64) -> bool {
+        self.disable_restart(Some(token))
+    }
+
+    fn disable_restart(&self, expected_exit: Option<u64>) -> bool {
         let mut state = self.state.lock().unwrap();
+        if expected_exit.is_some() && state.restart_token != expected_exit {
+            return false;
+        }
         state.restart_closed = true;
         let changed = state.ssh_connection_phase.is_some()
             && Self::record_ssh_phase(&mut state, SshConnectionPhase::Disconnected);
@@ -376,6 +387,7 @@ impl Events {
         if changed {
             self.changed.notify_waiters();
         }
+        true
     }
 
     /// None while disconnected or on streams that may repaint historical bytes.
@@ -858,6 +870,29 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_an_exited_pane_and_restarting_it_claim_the_same_exit() {
+        use SshConnectionPhase::*;
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let events = Events::default();
+        events.pane_exited(4, Some(Stopped));
+
+        assert!(!events.close_if_exited(3));
+        assert!(events.restart_exited(&commands, 4).is_ok());
+        assert!(!events.close_if_exited(4));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(crate::session::Command::RestartExited(_))
+        ));
+
+        events.pane_exited(5, Some(Stopped));
+        assert!(events.close_if_exited(5));
+        assert!(events.restart_exited(&commands, 5).is_err());
+        assert!(received.try_recv().is_err());
+        events.pane_exited(6, Some(Stopped));
+        assert_eq!(events.exit_snapshot(), (None, Some(Disconnected)));
+    }
 
     #[test]
     fn ssh_lifecycle_records_each_change_and_keeps_the_exit_token_with_the_phase() {

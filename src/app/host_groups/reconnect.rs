@@ -29,7 +29,7 @@ impl Request {
 }
 
 impl TargetState {
-    fn exit(self) -> Option<ExitedPane> {
+    pub(super) fn exit(self) -> Option<ExitedPane> {
         match self {
             Self::Restartable(exit) => Some(exit),
             Self::Failed(exit) | Self::Stopped(exit) => exit,

@@ -106,12 +106,42 @@ try {
     Wait-Stopped $west
     if (!(Find-Element 'Stop requested for 2 hosts.')) { throw 'The palette did not stop both selected attempts' }
 
+    Set-HostQuery 'East'
+    $null = Wait-Until 'West is hidden from the close review' { !(Find-Element "Focus pane $west" $button) }
+    $close = 'Close ended SSH panes' + [char]0x2026
+    Click $close
+    $null = Wait-Until 'the ended pane review' { Find-Element 'Review ended SSH panes' }
+    Click 'Cancel'
+    if (!(Get-ExitToken $east) -or !(Get-ExitToken $west)) { throw 'Cancel closed or restarted a stopped pane' }
+
+    Run-Palette 'Review close for ended SSH panes' -Enter
+    $null = Wait-Until 'the close review opened from the palette' { Find-Element 'Review ended SSH panes' }
+    $staleToken = Get-ExitToken $east
+    $null = Control @('restart','--pane',"$east",'--exit-token',"$staleToken")
+    Click 'Close 1 ended SSH pane'
+    $null = Wait-Until 'the stale close was refused' {
+        Find-Element 'The ended SSH panes changed. Review the current selection.'
+    }
+    $null = Wait-Until 'the restarted pane is still open' {
+        Find-Element "Pane $east${dot}Authentication required"
+    }
+
+    Click $stop
+    Wait-Stopped $east
+    Click $close
+    Click 'Close 1 ended SSH pane'
+    $null = Wait-Until 'the reviewed pane closed' {
+        (Find-Element 'Closed 1 ended SSH pane.') -and
+            !((Control @('list')).sessions | Where-Object id -eq $east)
+    }
+    if (!(Get-ExitToken $west)) { throw 'Closing the shown pane also changed the hidden West pane' }
+
     $null = Control @('send-text','--pane',"$live",'--no-paste','live-witness')
     $null = Control @('wait-for-text','--pane',"$live",'--timeout','10','live-witness')
     $listed = (Control @('list')).sessions | Where-Object id -eq $live
     if ($listed.connection_generation -ne $generation -or $listed.ssh_connection.phase -ne 'connected' -or
         ($listed.PSObject.Properties.Name -notcontains 'restart_token') -or $listed.restart_token) {
-        throw 'The stop action replaced the established shell'
+        throw 'A roster action replaced the established shell'
     }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)

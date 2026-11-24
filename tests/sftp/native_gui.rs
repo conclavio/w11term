@@ -1089,13 +1089,13 @@ async fn native_ssh_host_group_opens_filtered_authentication_prompts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stops selected pending SSH attempts from the Windows roster"]
+#[ignore = "stops and closes selected SSH panes from the Windows roster"]
 async fn native_ssh_host_group_stops_selected_pending_attempts() {
     let state = tempfile::tempdir().unwrap();
     let mut profiles = serde_json::Map::new();
     let mut peers = Vec::new();
     for (name, attempts, pending) in [
-        ("Pending East", 2, true),
+        ("Pending East", 3, true),
         ("Pending West", 1, true),
         ("Live shell", 1, false),
     ] {
