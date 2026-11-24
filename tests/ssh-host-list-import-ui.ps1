@@ -18,7 +18,7 @@ $direct = "test@127.0.0.1:$port"
 $other = "test@127.0.0.2:$port"
 $env:W11TERM_HOST_LIST_SMOKE_DIR = Join-Path $State 'host-lists'
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_HOST_LIST_SMOKE_DIR)
-$fleetText = @('# fleet', 'West', "ssh://$west", $east, 'East', "127.0.0.<1-2>:$port") -join "`n"
+$fleetText = @('# fleet', 'West # saved profile', "ssh://$west", $east, 'East', "127.<0>.<0>.<2-1,2>:$port # inventory") -join "`n"
 [IO.File]::WriteAllText((Join-Path $env:W11TERM_HOST_LIST_SMOKE_DIR 'fleet-hosts'), $fleetText, [Text.UTF8Encoding]::new($true))
 [IO.File]::WriteAllBytes((Join-Path $env:W11TERM_HOST_LIST_SMOKE_DIR 'bad-hosts'), [byte[]]@(0x61, 0, 0x62))
 $label = 'Import host list' + [char]0x2026
@@ -117,7 +117,8 @@ try {
     $null = Wait-Until 'host review and diagnostics' {
         (Find-Element 'Review SSH hosts') -and
             (Find-Element "Line 3${dot}Duplicate $west${dot}first listed on line 2") -and
-            (Find-Element "Line 4${dot}Multiple SSH profiles match${dot}use an exact profile name (East, East alternative)")
+            (Find-Element "Line 4${dot}Multiple SSH profiles match${dot}use an exact profile name (East, East alternative)") -and
+            (Find-Element "Line 6${dot}Duplicate $other${dot}first listed on line 6")
     }
     $eastChoice = "East${dot}$east"
     $westChoice = "West${dot}$west"
