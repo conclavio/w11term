@@ -2535,7 +2535,6 @@ impl TerminalApp {
                         Some(offered),
                     ),
                 ))
-                .into()
         } else {
             View::empty()
         };
