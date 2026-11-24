@@ -1,10 +1,11 @@
 use super::super::address::{Endpoint, display};
+use super::ranges::Expansion;
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, path::Path};
 use w11term::options::{Authentication, Profiles, SshOptions};
 
 pub(super) const MAX_BYTES: usize = 32 * 1024;
-const MAX_TARGETS: usize = 64;
+pub(super) const MAX_TARGETS: usize = 64;
 
 #[derive(Debug, PartialEq)]
 pub(super) struct Row {
@@ -50,51 +51,35 @@ pub(super) fn build(
     }
     let mut rows = Vec::new();
     let mut seen = BTreeMap::<Endpoint, usize>::new();
+    let named = |name| catalog.profiles.contains_key(name) || catalog.local.contains_key(name);
     for (index, input) in input.replace("\r\n", "\n").split(['\n', '\r']).enumerate() {
         let input = input.trim();
         if input.is_empty() || input.starts_with('#') {
             continue;
         }
+        let input = if named(input) {
+            input
+        } else {
+            without_comment(input)
+        };
         let line = index + 1;
         let remaining = MAX_TARGETS - rows.len();
         ensure!(
             remaining > 0,
             "A host list can expand to at most {MAX_TARGETS} entries."
         );
-        if catalog.profiles.contains_key(input) || catalog.local.contains_key(input) {
+        if named(input) {
             push(&mut rows, &mut seen, line, saved(catalog, input));
             continue;
         }
-        let expansion = match expansion(input) {
+        let expansion = match Expansion::parse(input) {
             Ok(expansion) => expansion,
             Err(error) => {
                 push(&mut rows, &mut seen, line, Err(error));
                 continue;
             }
         };
-        if let Some(range) = expansion {
-            ensure!(
-                range.last - range.first < remaining as u32,
-                "A host list can expand to at most {MAX_TARGETS} entries."
-            );
-            for number in range.first..=range.last {
-                let expanded = format!(
-                    "{}{number:0width$}{}",
-                    range.prefix,
-                    range.suffix,
-                    width = range.width
-                );
-                let target = resolve(
-                    &expanded,
-                    default_user,
-                    catalog,
-                    catalog_path,
-                    &profiles,
-                    &authentication,
-                );
-                push(&mut rows, &mut seen, line, target);
-            }
-        } else {
+        let mut append = |input: &str| {
             let target = resolve(
                 input,
                 default_user,
@@ -104,6 +89,13 @@ pub(super) fn build(
                 &authentication,
             );
             push(&mut rows, &mut seen, line, target);
+        };
+        if let Some(expansion) = expansion {
+            for address in expansion.expand(remaining)? {
+                append(&address);
+            }
+        } else {
+            append(input);
         }
     }
     ensure!(
@@ -111,6 +103,19 @@ pub(super) fn build(
         "Enter at least one SSH profile or address."
     );
     Ok(rows)
+}
+
+fn without_comment(input: &str) -> &str {
+    let Some((body, _)) = input.split_once('#') else {
+        return input;
+    };
+    let trimmed = body.trim_end();
+    // An attached hash in an SSH URI is a fragment. With whitespace it starts a comment.
+    if body == trimmed && body.contains("://") {
+        input
+    } else {
+        trimmed
+    }
 }
 
 pub(super) fn check_size(bytes: usize) -> Result<()> {
@@ -219,57 +224,6 @@ fn resolve(
     Ok(Target { profile: None, ssh })
 }
 
-struct Range<'a> {
-    prefix: &'a str,
-    suffix: &'a str,
-    first: u32,
-    last: u32,
-    width: usize,
-}
-
-fn expansion(input: &str) -> Result<Option<Range<'_>>> {
-    let Some((prefix, rest)) = input.split_once('<') else {
-        ensure!(
-            !input.contains('>'),
-            "Use a numeric host range such as web<01-03>"
-        );
-        return Ok(None);
-    };
-    let invalid = "Use one ascending numeric range in the hostname, such as ops@web<01-03>";
-    let (bounds, suffix) = rest.split_once('>').context(invalid)?;
-    let (first, last) = bounds.split_once('-').context(invalid)?;
-    let host_prefix = prefix.rsplit_once('@').map_or_else(
-        || prefix.split_once("://").map_or(prefix, |(_, host)| host),
-        |(_, host)| host,
-    );
-    ensure!(
-        !prefix.contains('>')
-            && !suffix.contains(['<', '>', '@'])
-            && !host_prefix.contains([':', '[', ']', '/'])
-            && first.len() <= 10
-            && last.len() <= 10
-            && first.bytes().all(|digit| digit.is_ascii_digit())
-            && last.bytes().all(|digit| digit.is_ascii_digit()),
-        "{invalid}"
-    );
-    let padded = |number: &str| number.len() > 1 && number.starts_with('0');
-    let width = if padded(first) || padded(last) {
-        first.len().max(last.len())
-    } else {
-        0
-    };
-    let first = first.parse().context(invalid)?;
-    let last = last.parse().context(invalid)?;
-    ensure!(first <= last, "{invalid}");
-    Ok(Some(Range {
-        prefix,
-        suffix,
-        first,
-        last,
-        width,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,7 +326,7 @@ mod tests {
         saved.durable = true;
         catalog.profiles.insert("Durable session".into(), saved);
         let rows = preview(
-            "test@inactive\nDurable session\nunknown\nu@host<3-1>\nu@host:<1-2>\nu:secret@host",
+            "test@inactive\nDurable session\nunknown\nu@host<3--1>\nu@host:<1-2>\nu:secret@host",
             "",
             &catalog,
         )
@@ -398,7 +352,7 @@ mod tests {
                 row.target
                     .as_ref()
                     .unwrap_err()
-                    .contains("ascending numeric range")
+                    .contains("numeric ranges in the hostname")
             );
         }
         assert!(!rows[5].target.as_ref().unwrap_err().contains("secret"));
@@ -406,6 +360,47 @@ mod tests {
         assert!(preview("u@host<1-65>", "", &catalog).is_err());
         assert!(preview("u@host<1-64>\nu@other", "", &catalog).is_err());
         assert_eq!(preview("u@host<1-64>", "", &catalog).unwrap().len(), 64);
+        assert_eq!(
+            preview("u@rack<1-8>-web<8-1> # only hosts\n# comment", "", &catalog)
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(preview("u@first\nu@rack<1-8>-web<8-1>", "", &catalog).is_err());
         assert!(preview(&"x".repeat(MAX_BYTES + 1), "", &catalog).is_err());
+    }
+
+    #[test]
+    fn host_list_keeps_profile_names_and_line_numbers_with_inline_comments() {
+        let mut catalog = Profiles::default();
+        catalog.profiles.insert(
+            "Build #1".into(),
+            SshOptions::from_destination("ops@build").unwrap(),
+        );
+        let rows = preview(
+            "# header\r\nBuild #1\r\nops@web<03-02,3,03>:2222#canaries\rssh://ops@other # comment\nssh://ops@host#fragment",
+            "",
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 7);
+        assert_eq!(
+            rows[0].target.as_ref().unwrap().profile.as_deref(),
+            Some("Build #1")
+        );
+        let hosts: Vec<_> = rows[1..4]
+            .iter()
+            .map(|row| (row.line, row.target.as_ref().unwrap().ssh.host.as_str()))
+            .collect();
+        assert_eq!(hosts, [(3, "web03"), (3, "web02"), (3, "web3")]);
+        assert!(
+            rows[4]
+                .target
+                .as_ref()
+                .unwrap_err()
+                .contains("first listed on line 3")
+        );
+        assert_eq!(rows[5].target.as_ref().unwrap().ssh.host, "other");
+        assert!(rows[6].target.as_ref().unwrap_err().contains("fragment"));
     }
 }

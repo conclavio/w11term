@@ -4,6 +4,7 @@ use std::{cell::OnceCell, path::Path};
 
 mod file;
 mod list;
+mod ranges;
 
 const LABEL: &str = "Import host list…";
 
@@ -207,7 +208,7 @@ impl State {
         Some(ScrollViewer::new().content(StackPanel::new().margin(16.0).spacing(10.0).children((
             TextBlock::new().font_size(24.0).text("Import SSH host list"),
             TextBlock::new()
-                .text("Enter one profile or address per line. Use # for comments and <01-03> for a numeric range.")
+                .text("Enter one profile or address per line. Use # for comments and patterns such as web<01-03,07> for hostnames.")
                 .text_wrapping(TextWrapping::Wrap),
             editor.clone(),
             TextBox::new()
