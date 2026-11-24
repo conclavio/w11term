@@ -112,6 +112,29 @@ function Click([string]$Name) {
     $invoke.Invoke()
 }
 
+function Wait-RecordingStatus([string]$Prefix, [string]$Path) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $last = @{ Status = @() }
+    try {
+        $null = Wait-Until "$Prefix$Path" {
+            $last.Status = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
+                ForEach-Object { $_.Current.Name } |
+                Where-Object { $_ -match 'recording|record live output|live output to|output file' })
+            foreach ($name in $last.Status) {
+                if ($name.StartsWith($Prefix, [StringComparison]::Ordinal) -and
+                    [FixtureDialog]::SameFile($Path, $name.Substring($Prefix.Length))) {
+                    return $true
+                }
+            }
+        }
+    } catch {
+        throw "$($_.Exception.Message). Recording statuses: $($last.Status -join ' | '). Expected file exists: $([IO.File]::Exists($Path))."
+    }
+}
+
 $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -190,7 +213,7 @@ try {
             (Find-Element 'east-accepted both') -and (Find-Element "Focus output pane $east" $button)
     }
     $recordOutput = 'Record output' + [char]0x2026
-    $logFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-output-2.txt'
+    $logFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'live-both.txt'
     Click $recordOutput
     $dialog = Wait-Until 'owned live output save dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'cancel the output recording' { [FixtureDialog]::ClickButton($dialog, 2) }
@@ -198,8 +221,12 @@ try {
     if ([IO.File]::Exists($logFile)) { throw 'Cancelling created an output recording' }
     Click $recordOutput
     $dialog = Wait-Until 'owned output recording dialog reopens' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'enter the exact output recording destination' {
+        [FixtureDialog]::SetFilename($dialog, $logFile, 'ssh-group-output-2.txt')
+    }
     $null = Wait-Until 'accept the output recording file' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'recording is open' { Find-Element "Recording live output to $logFile" }
+    $null = Wait-Until 'output recording picker is dismissed after Save' { !(Find-OwnedDialog 'Record SSH group output') }
+    Wait-RecordingStatus 'Recording live output to ' $logFile
     $logReader = Open-PeerTraceReader $logFile
     [IO.File]::WriteAllText((Join-Path $State 'release-west-preview'), '')
     $null = Wait-Until 'running West output appears above the earlier East output' {
@@ -232,7 +259,7 @@ try {
         (Find-Element 'SSH group live output') -and (Find-Element 'west while paused')
     }
     Click 'Stop recording'
-    $null = Wait-Until 'the recording has been finalized' { Find-Element "Saved live output to $logFile" }
+    Wait-RecordingStatus 'Saved live output to ' $logFile
     $logReader.Dispose()
     $logReader = $null
     $recorded = [IO.File]::ReadAllText($logFile)
