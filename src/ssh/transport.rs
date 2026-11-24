@@ -25,6 +25,8 @@ pub enum Event {
     Status(String),
     SessionListUpdated(String),
     Connected(u64),
+    /// A retry has been scheduled and supersedes the previous transport.
+    Reconnecting(u32),
     /// Ordered after the last bytes from this generation and before any retry.
     Disconnected,
 }
@@ -722,6 +724,7 @@ impl Driver {
                 "reconnecting",
                 serde_json::json!({"attempt":failures,"delay_seconds":delay.as_secs()}),
             );
+            self.output.send(Event::Reconnecting(failures)).await?;
             self.output
                 .send(Event::Status(format!(
                     "Link lost · reconnecting in {} s (attempt {failures}) · {error:#}",

@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::BTreeSet};
 use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
 use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
-    ShellPrompt,
+    ShellPrompt, SshConnectionPhase,
 };
 use w11term::options::{SshRosterDefaults, SshRosterOrder as RosterOrder};
 mod address;
@@ -154,7 +154,7 @@ impl Target {
         if self.connected {
             format!("Connected · {state}").into()
         } else {
-            state.into()
+            state
         }
     }
 }
@@ -162,6 +162,8 @@ impl Target {
 #[derive(Clone, Copy)]
 enum TargetState {
     Offline,
+    Connecting,
+    Reconnecting(Option<u32>),
     Restartable(ExitedPane),
     Authentication,
     ReadOnly,
@@ -179,6 +181,8 @@ pub enum RosterStatus {
     Ready,
     Waiting,
     Unverified,
+    Connecting,
+    Reconnecting,
     Disconnected,
     Authentication,
     ReadOnly,
@@ -186,11 +190,13 @@ pub enum RosterStatus {
 }
 
 impl RosterStatus {
-    const OPTIONS: [Self; 8] = [
+    const OPTIONS: [Self; 10] = [
         Self::All,
         Self::Ready,
         Self::Waiting,
         Self::Unverified,
+        Self::Connecting,
+        Self::Reconnecting,
         Self::Disconnected,
         Self::Authentication,
         Self::ReadOnly,
@@ -203,6 +209,8 @@ impl RosterStatus {
             Self::Ready => "Ready",
             Self::Waiting => "Waiting for a fresh prompt",
             Self::Unverified => "Prompt unverified",
+            Self::Connecting => "Connecting",
+            Self::Reconnecting => "Reconnecting",
             Self::Disconnected => "Disconnected",
             Self::Authentication => "Authentication required",
             Self::ReadOnly => "Read-only",
@@ -227,7 +235,7 @@ fn sort_roster(order: RosterOrder, targets: &mut [&Target], selected: &BTreeSet<
         RosterOrder::CheckedFirst => targets.sort_by_key(|target| !selected.contains(&target.pane)),
         RosterOrder::AttentionFirst => targets.sort_by_key(|target| match target.state {
             TargetState::Ready(_) | TargetState::Matched(_) => 2,
-            TargetState::InUse => 1,
+            TargetState::InUse | TargetState::Connecting | TargetState::Reconnecting(_) => 1,
             _ => 0,
         }),
     }
@@ -248,6 +256,8 @@ impl TargetState {
     fn status(self) -> RosterStatus {
         match self {
             Self::Offline | Self::Restartable(_) => RosterStatus::Disconnected,
+            Self::Connecting => RosterStatus::Connecting,
+            Self::Reconnecting(_) => RosterStatus::Reconnecting,
             Self::Authentication => RosterStatus::Authentication,
             Self::ReadOnly => RosterStatus::ReadOnly,
             Self::Alternate => RosterStatus::Alternate,
@@ -257,11 +267,12 @@ impl TargetState {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self) -> Cow<'static, str> {
         match self {
-            Self::Restartable(_) => "Disconnected · reconnect available",
-            Self::Matched(_) => "Ready · prompt match",
-            _ => self.status().label(),
+            Self::Restartable(_) => "Disconnected · reconnect available".into(),
+            Self::Matched(_) => "Ready · prompt match".into(),
+            Self::Reconnecting(Some(attempt)) => format!("Reconnecting · attempt {attempt}").into(),
+            _ => self.status().label().into(),
         }
     }
 }
@@ -723,10 +734,16 @@ impl TerminalApp {
                 let state = if live.device_busy || live.session.prompts.current().is_some() {
                     TargetState::Authentication
                 } else if !connected {
-                    entry
-                        .value
-                        .exited_pane()
-                        .map_or(TargetState::Offline, TargetState::Restartable)
+                    match live.session.events.ssh_connection_phase() {
+                        Some(SshConnectionPhase::Connecting) => TargetState::Connecting,
+                        Some(SshConnectionPhase::Reconnecting { attempt }) => {
+                            TargetState::Reconnecting(attempt)
+                        }
+                        _ => entry
+                            .value
+                            .exited_pane()
+                            .map_or(TargetState::Offline, TargetState::Restartable),
+                    }
                 } else if live.read_only.get() {
                     TargetState::ReadOnly
                 } else if live.session.frames.load().alternate {

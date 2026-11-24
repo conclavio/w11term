@@ -39,6 +39,14 @@ pub struct CommandLink {
     pub generation: u64,
     pub id: u64,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshConnectionPhase {
+    Connecting,
+    Reconnecting { attempt: Option<u32> },
+    Connected,
+    Disconnected,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Batch {
     pub events: Vec<Event>,
@@ -61,6 +69,7 @@ struct State {
     group_serial: u64,
     next_prompt: u64,
     notify_long_commands: bool,
+    ssh_connection_phase: Option<SshConnectionPhase>,
     restart_token: Option<u64>,
     restart_closed: bool,
 }
@@ -253,6 +262,14 @@ impl Events {
         self.state.lock().unwrap().restart_token
     }
 
+    pub fn ssh_connection_phase(&self) -> Option<SshConnectionPhase> {
+        self.state.lock().unwrap().ssh_connection_phase
+    }
+
+    pub(crate) fn set_ssh_connection_phase(&self, phase: SshConnectionPhase) {
+        self.state.lock().unwrap().ssh_connection_phase = Some(phase);
+    }
+
     pub(crate) fn restart_exited(
         &self,
         input: &tokio::sync::mpsc::UnboundedSender<crate::session::Command>,
@@ -264,14 +281,16 @@ impl Events {
             "Pane is running, unavailable, or the exit token has expired"
         );
         state.restart_token = None;
+        let sent = input.send(crate::session::Command::RestartExited(
+            crate::session::ClaimedRestart(token),
+        ));
+        if sent.is_ok() && state.ssh_connection_phase.is_some() {
+            state.ssh_connection_phase = Some(SshConnectionPhase::Reconnecting { attempt: None });
+        }
         if let Some((_, _, inbox)) = &state.inbox {
             inbox.refresh();
         }
-        input
-            .send(crate::session::Command::RestartExited(
-                crate::session::ClaimedRestart(token),
-            ))
-            .map_err(|_| anyhow::anyhow!("The terminal pane has closed"))
+        sent.map_err(|_| anyhow::anyhow!("The terminal pane has closed"))
     }
 
     pub(crate) fn pane_exited(&self, token: u64) {
@@ -294,6 +313,9 @@ impl Events {
     pub(crate) fn close_restart(&self) {
         let mut state = self.state.lock().unwrap();
         state.restart_closed = true;
+        if state.ssh_connection_phase.is_some() {
+            state.ssh_connection_phase = Some(SshConnectionPhase::Disconnected);
+        }
         if state.restart_token.take().is_some()
             && let Some((_, _, inbox)) = &state.inbox
         {

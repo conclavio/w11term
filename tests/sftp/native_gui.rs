@@ -829,6 +829,15 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         };
         let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
         let peer_trace = trace.clone();
+        if use_633 {
+            let gate = root.path().join("hold-shell-request");
+            fs::write(&gate, b"").unwrap();
+            fs::write(
+                state.path().join("west-shell-gate-path"),
+                gate.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        }
         let release_preview = state.path().join("release-west-preview");
         let release_paused = state.path().join("release-west-paused");
         let release_away = state.path().join("release-west-away");

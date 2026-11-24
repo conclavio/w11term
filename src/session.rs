@@ -489,6 +489,9 @@ impl Session {
             _ => None,
         };
         let events = crate::events::Events::with_group_prompt_pattern(group_prompt_pattern);
+        if matches!(source, Source::Ssh(_)) {
+            events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connecting);
+        }
         let player = Arc::new(std::sync::RwLock::new(match &source {
             Source::Ssh(ssh) => ssh.player.clone(),
             _ => Default::default(),
@@ -826,6 +829,9 @@ async fn run(
         }
         if phase == Phase::PublishingExit {
             phase = Phase::Exited;
+            if is_ssh {
+                events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Disconnected);
+            }
             if restartable {
                 events.pane_exited(launch_id);
             }
@@ -1436,6 +1442,9 @@ async fn run(
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
                         ssh::Event::Disconnected => {
+                            if is_ssh {
+                                events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Disconnected);
+                            }
                             if let Some(matcher) = &mut prompt_matcher { matcher.reset(); }
                             terminal.clear_color_scheme_subscription();
                             terminal.clear_resize_subscription();
@@ -1449,6 +1458,11 @@ async fn run(
                             };
                             events.set_terminal_activity(wezterm_term::Progress::None, program);
                             show_progress = interactive;
+                        }
+                        ssh::Event::Reconnecting(attempt) => {
+                            events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Reconnecting {
+                                attempt: Some(attempt),
+                            });
                         }
                         ssh::Event::Data(bytes) => {
                             if observed.receiver_count() > 0 {
@@ -1505,6 +1519,9 @@ async fn run(
                             connection_generation = generation;
                             phase = Phase::Running;
                             events.command_stream(live_commands.then_some(generation));
+                            if is_ssh {
+                                events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connected);
+                            }
                         }
                     }
                 }

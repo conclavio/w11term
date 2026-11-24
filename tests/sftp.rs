@@ -171,6 +171,13 @@ impl server::Handler for Peer {
         Ok(())
     }
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
+        #[cfg(feature = "ui-smoke")]
+        {
+            let gate = self.root.join("hold-shell-request");
+            while gate.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         s.channel_success(c)?;
         if let Some(wire) = &self.wire {
             let _ = wire.send(in_band_resize::Wire::Shell(c, s.handle()));

@@ -147,6 +147,7 @@ impl Fixture {
                     Some(Event::Status(status)) => self.screen.push_str(&format!("\n[{status}]\n")),
                     Some(Event::Connected(_) | Event::Disconnected) => {}
                     Some(Event::HerdrViewer) => panic!("ConPTY supplied an SSH viewer stream"),
+                    Some(Event::Reconnecting(_)) => panic!("ConPTY supplied an SSH retry"),
                     Some(Event::SessionListUpdated(_)) => {
                         panic!("ConPTY supplied an SSH session list")
                     }

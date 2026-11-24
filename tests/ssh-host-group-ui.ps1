@@ -179,12 +179,21 @@ try {
         throw 'Expected two SSH panes and PowerShell in their own tabs'
     }
     $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','east$')
-    $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west$')
+    $westShellGate = [IO.File]::ReadAllText((Join-Path $State 'west-shell-gate-path'))
     Press-Key 0x77 # F8 selects the East tab in the fixture keymap.
     Wait-Focus $east
     Press-Key 0x10 # An unencoded Shift must not consume the verified prompt.
     Run-Palette 'SSH host group'
     Pane-Status $east "Connected${dot}Ready"
+    Pane-Status $west 'Connecting'
+    $hostStateFilter = 'Filter host state'
+    Select-ComboValue $hostStateFilter 'Connecting'
+    $null = Wait-Until 'the connecting filter isolates West during its shell request' {
+        (Find-Element "Focus pane $west" $button) -and !(Find-Element "Focus pane $east" $button) -and
+            !(Find-Element "Reconnect SSH pane $west" $button)
+    }
+    Remove-Item -LiteralPath $westShellGate
+    Select-ComboValue $hostStateFilter 'All host states'
     Pane-Status $west "Connected${dot}Ready"
     if (Find-Element "Focus pane $local" $button) { throw 'The local shell appeared in the SSH roster' }
     $eastName = Target-Name East $east
@@ -742,7 +751,6 @@ try {
     (Wait-CheckBox $westName Off).Toggle()
     $null = Wait-CheckBox $westName On
     Select-ComboValue $rosterSort 'Needs attention first'
-    $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Ready'
     $null = Wait-Until 'the ready filter scopes the roster and send count to East' {
         $send = Find-Element 'Send to 1 host' $button
@@ -782,7 +790,21 @@ try {
         Find-Element $openWestOutput $button
     }
     $previous = (Control @('inspect','--pane',"$west")).connection_generation
+    [IO.File]::WriteAllText($westShellGate, '')
     Send-Raw $west 'drop'
+    Pane-Status $west "Reconnecting${dot}attempt 1"
+    Select-ComboValue $hostStateFilter 'Reconnecting'
+    $null = Wait-Until 'the retry filter isolates West and shows its attempt' {
+        (Find-Element "Pane $west${dot}Reconnecting${dot}attempt 1") -and
+            !(Find-Element "Focus pane $east" $button) -and !(Find-Element "Reconnect SSH pane $west" $button)
+    }
+    Click $copyRoster
+    $null = Wait-Until 'the roster report carries the automatic retry' {
+        $report = Read-ClipboardFixture
+        $report -and $report.Contains("$westName${dot}Reconnecting${dot}attempt 1") -and !$report.Contains($eastName)
+    }
+    Remove-Item -LiteralPath $westShellGate
+    Select-ComboValue $hostStateFilter 'All host states'
     $null = Wait-Until 'replacement SSH transport' {
         (Control @('inspect','--pane',"$west")).connection_generation -gt $previous
     }
@@ -983,7 +1005,10 @@ try {
         $bulk = Find-Element 'Reconnect selected' $button
         $bulk -and !$bulk.Current.IsEnabled -and !(Find-Element "Reconnect SSH pane $east" $button)
     }
+    [IO.File]::WriteAllText($westShellGate, '')
     Click "Reconnect SSH pane $west"
+    Pane-Status $west 'Reconnecting'
+    Remove-Item -LiteralPath $westShellGate
     Pane-Status $west "Connected${dot}Ready"
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName Off
