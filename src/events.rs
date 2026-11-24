@@ -18,8 +18,8 @@ pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget
 pub use group_transcript::{
     GroupCompletionState, GroupQueueActivity, GroupQueueEvent, GroupQueueEventKind,
     GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
-    GroupTranscript, GroupTranscriptHost, GroupTranscriptLine, GroupTranscriptRecording,
-    GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
+    GroupTranscript, GroupTranscriptHistory, GroupTranscriptHost, GroupTranscriptLine,
+    GroupTranscriptRecording, GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;
 pub use inbox::{Inbox, NoticeTarget, SshLoginResult};

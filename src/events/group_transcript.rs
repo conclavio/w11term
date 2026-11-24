@@ -1,7 +1,8 @@
 use super::{GroupExecution, Inbox};
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    borrow::Cow,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Instant,
 };
@@ -9,6 +10,7 @@ use tokio::sync::{broadcast, oneshot};
 use wezterm_term::LiveOutputBatch;
 
 const TRANSCRIPT_LINES: usize = 128;
+const HOST_TRANSCRIPT_BUDGET: usize = 512;
 const RECORDING_QUEUE: usize = 1024;
 const QUEUE_EVENT_LIMIT: usize = 32;
 
@@ -17,7 +19,7 @@ pub struct GroupTranscript(Arc<Mutex<Transcript>>);
 
 #[derive(Debug, Default)]
 struct Transcript {
-    snapshot: GroupTranscriptSnapshot,
+    history: GroupTranscriptHistory,
     queue_activity: QueueActivity,
     recording: Option<Recording>,
     next_recording: u64,
@@ -186,6 +188,74 @@ pub struct GroupTranscriptSnapshot {
     pub lines: VecDeque<GroupTranscriptLine>,
 }
 
+impl GroupTranscriptSnapshot {
+    fn retain_recent(&mut self, capacity: usize) {
+        let dropped = self.lines.len().saturating_sub(capacity);
+        self.lines.drain(..dropped);
+        self.omitted += dropped as u64;
+    }
+
+    fn push(&mut self, line: GroupTranscriptLine, capacity: usize) {
+        if capacity == 0 {
+            self.omitted += 1;
+        } else {
+            self.retain_recent(capacity - 1);
+            self.lines.push_back(line);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GroupTranscriptHistory {
+    combined: GroupTranscriptSnapshot,
+    hosts: BTreeMap<u64, GroupTranscriptSnapshot>,
+}
+
+impl GroupTranscriptHistory {
+    pub fn scoped(&self, pane: Option<u64>) -> Cow<'_, GroupTranscriptSnapshot> {
+        let Some(pane) = pane else {
+            return Cow::Borrowed(&self.combined);
+        };
+        let Some(host) = self.hosts.get(&pane) else {
+            return Cow::Owned(GroupTranscriptSnapshot::default());
+        };
+        let combined = self.combined.lines.iter().filter(|line| line.pane == pane);
+        let count = combined.clone().count();
+        if count <= host.lines.len() {
+            return Cow::Borrowed(host);
+        }
+        // Both histories hold a suffix of this host's output. A busy host
+        // can have more lines in the shared feed than in its reserved history.
+        Cow::Owned(GroupTranscriptSnapshot {
+            omitted: host.omitted - (count - host.lines.len()) as u64,
+            lines: combined.cloned().collect(),
+        })
+    }
+
+    pub fn retain_panes(&mut self, includes: impl Fn(u64) -> bool) {
+        self.combined.lines.retain(|line| includes(line.pane));
+        self.hosts.retain(|&pane, _| includes(pane));
+    }
+
+    fn push(&mut self, line: GroupTranscriptLine) {
+        let previous_hosts = self.hosts.len();
+        self.hosts.entry(line.pane).or_default();
+        let capacity = (HOST_TRANSCRIPT_BUDGET / self.hosts.len()).min(TRANSCRIPT_LINES);
+        if self.hosts.len() != previous_hosts
+            && capacity < (HOST_TRANSCRIPT_BUDGET / previous_hosts.max(1)).min(TRANSCRIPT_LINES)
+        {
+            for host in self.hosts.values_mut() {
+                host.retain_recent(capacity);
+            }
+        }
+        self.hosts
+            .get_mut(&line.pane)
+            .unwrap()
+            .push(line.clone(), capacity);
+        self.combined.push(line, TRANSCRIPT_LINES);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GroupTranscriptLine {
     pub id: u64,
@@ -347,7 +417,20 @@ impl GroupTranscript {
     }
 
     pub fn snapshot(&self) -> GroupTranscriptSnapshot {
-        self.0.lock().unwrap().snapshot.clone()
+        self.0.lock().unwrap().history.combined.clone()
+    }
+
+    pub fn snapshot_for_pane(&self, pane: u64) -> GroupTranscriptSnapshot {
+        self.0
+            .lock()
+            .unwrap()
+            .history
+            .scoped(Some(pane))
+            .into_owned()
+    }
+
+    pub fn history(&self) -> GroupTranscriptHistory {
+        self.0.lock().unwrap().history.clone()
     }
 
     pub fn start_recording(
@@ -371,7 +454,7 @@ impl GroupTranscript {
             ended: finish,
         });
         let stream = GroupTranscriptStream {
-            history: transcript.snapshot.clone(),
+            history: transcript.history.combined.clone(),
             incoming,
             ended,
         };
@@ -503,12 +586,12 @@ impl Transcript {
     }
 
     fn push(&mut self, pane: u64, text: impl Into<Arc<str>>, shortened: bool) {
-        let snapshot = &mut self.snapshot;
-        let id = snapshot.lines.back().map_or(1, |line| line.id + 1);
-        if snapshot.lines.len() == TRANSCRIPT_LINES {
-            snapshot.lines.pop_front();
-            snapshot.omitted += 1;
-        }
+        let id = self
+            .history
+            .combined
+            .lines
+            .back()
+            .map_or(1, |line| line.id + 1);
         let line = GroupTranscriptLine {
             id,
             pane,
@@ -518,7 +601,7 @@ impl Transcript {
         if let Some(recording) = &self.recording {
             let _ = recording.incoming.send(line.clone());
         }
-        snapshot.lines.push_back(line);
+        self.history.push(line);
     }
 }
 
@@ -699,6 +782,40 @@ mod tests {
         assert_eq!(&*current.lines.back().unwrap().text, "West last");
         assert_eq!(paused.lines.len(), 1);
         assert_eq!(&*paused.lines[0].text, "West first");
+    }
+
+    #[test]
+    fn host_history_recovers_early_lines_after_a_burst_and_stays_bounded() {
+        let mut transcript = Transcript::default();
+        transcript.push(1, "Quiet result", false);
+        let paused = transcript.history.clone();
+        for pane in 2..=6 {
+            for _ in 0..TRANSCRIPT_LINES {
+                transcript.push(pane, "Loud output", false);
+            }
+        }
+        let history = &transcript.history;
+        assert_eq!(history.scoped(None).lines.len(), TRANSCRIPT_LINES);
+        assert!(history.scoped(None).lines.iter().all(|line| line.pane == 6));
+        assert_eq!(&*history.scoped(Some(1)).lines[0].text, "Quiet result");
+        assert_eq!(history.scoped(Some(1)).omitted, 0);
+        let earlier = history.scoped(Some(2));
+        let quota = HOST_TRANSCRIPT_BUDGET / 6;
+        assert_eq!(earlier.lines.len(), quota);
+        assert_eq!(earlier.omitted, (TRANSCRIPT_LINES - quota) as u64);
+        let newest = history.scoped(Some(6));
+        assert_eq!(newest.lines.len(), TRANSCRIPT_LINES);
+        assert_eq!(newest.omitted, 0);
+        assert!(
+            history
+                .hosts
+                .values()
+                .map(|host| host.lines.len())
+                .sum::<usize>()
+                <= HOST_TRANSCRIPT_BUDGET
+        );
+        assert_eq!(paused.scoped(Some(1)).lines[0].id, 1);
+        assert!(paused.scoped(Some(6)).lines.is_empty());
     }
 
     #[test]

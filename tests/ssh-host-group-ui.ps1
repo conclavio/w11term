@@ -355,7 +355,7 @@ try {
     $null = Wait-Until 'the text search also respects the selected output host' {
         $copy = Find-Element 'Copy shown output' $button
         $copy -and !$copy.Current.IsEnabled -and
-            (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'east-accepted both')
+            (Find-Element "Newest first${dot}0 of 1 retained lines") -and !(Find-Element 'east-accepted both')
     }
     $outputRegex = 'Regular expression in live output'
     $outputCase = 'Match case in live output'
@@ -379,23 +379,23 @@ try {
     $until = [DateTime]::UtcNow.AddMilliseconds(650)
     do {
         if ((Find-Element 'west while paused') -or
-            !(Find-Element "Paused${dot}newest first${dot}0 of 2 retained lines")) {
+            !(Find-Element "Paused${dot}newest first${dot}0 of 1 retained lines")) {
             throw 'Filtered output changed while paused'
         }
         Start-Sleep -Milliseconds 120
     } while ([DateTime]::UtcNow -lt $until)
     Click 'Resume output'
     $null = Wait-Until 'matching output received while paused is available on resume' {
-        (Find-Element "Newest first${dot}1 of 3 retained lines") -and
+        (Find-Element "Newest first${dot}1 of 2 retained lines") -and
             (Find-Element 'west while paused') -and !(Find-Element 'west live first')
     }
     (Wait-CheckBox $outputCase Off).Toggle()
     $null = Wait-Until 'matching case excludes the lowercase live output' {
-        (Find-Element "Newest first${dot}0 of 3 retained lines") -and !(Find-Element 'west while paused')
+        (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'west while paused')
     }
     (Wait-CheckBox $outputCase On).Toggle()
     $null = Wait-Until 'disabling match case restores the live output match' {
-        (Find-Element "Newest first${dot}1 of 3 retained lines") -and (Find-Element 'west while paused')
+        (Find-Element "Newest first${dot}1 of 2 retained lines") -and (Find-Element 'west while paused')
     }
     Click "Focus output pane $west"
     Wait-Focus $west
@@ -1500,6 +1500,28 @@ try {
             throw "Unexpected burst from $side ($($actual.Count) of 80 rows): $($actual -join ', ')"
         }
     }
+    Click $liveButton
+    $null = Wait-Until 'open live output for the recorded burst' { Find-Element 'SSH group live output' }
+    (Wait-CheckBox $outputRegex Off).Toggle()
+    $null = Wait-CheckBox $outputRegex On
+    (Command-Editor $outputSearch).SetValue('^east record row (00|79)$')
+    $null = Wait-Until 'the shared tail lost the first East line after the West burst' {
+        (Find-Element 'east record row 79') -and !(Find-Element 'east record row 00')
+    }
+    Click 'Pause output'
+    $null = Wait-Until 'the combined view is paused' { Find-Element 'Resume output' $button }
+    Select-ComboValue $outputHosts $eastName
+    $null = Wait-Until 'selecting East recovers the older line from the same frozen output' {
+        (Find-Element 'east record row 00') -and (Find-Element 'east record row 79') -and
+            (Find-Element 'Resume output' $button)
+    }
+    Click 'Copy shown output'
+    $null = Wait-Until 'the recovered lines are available to clipboard exports' {
+        (Read-ClipboardFixture) -ceq "Submitted${dot}record-fast`r`n$eastName${dot}east record row 79`r`n$eastName${dot}east record row 00`r`n"
+    }
+    Click 'Back to results'
+    $null = Wait-Until 'return to the recorded burst results' { Find-Element "Submitted${dot}record-fast" }
+
     $beforeCollision = [IO.File]::ReadAllText($burstPath)
     (Command-Editor).SetValue('never-send-on-collision')
     Click $sendRecorded

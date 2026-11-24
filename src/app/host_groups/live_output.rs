@@ -2,7 +2,7 @@ use super::*;
 use regex::Regex;
 use std::{collections::BTreeMap, fmt::Write as _, io::Write as _};
 use w11term::{
-    events::{GroupTranscriptLine, GroupTranscriptSnapshot},
+    events::{GroupTranscriptHistory, GroupTranscriptLine, GroupTranscriptSnapshot},
     search::{MAX_QUERY_BYTES, compile_regex},
 };
 
@@ -24,7 +24,7 @@ pub enum Action {
 
 pub(super) struct State {
     pub(super) submission: u64,
-    paused: Option<GroupTranscriptSnapshot>,
+    paused: Option<GroupTranscriptHistory>,
     filter: Filter,
     copy_feedback: Option<String>,
 }
@@ -113,16 +113,33 @@ impl Filter {
 }
 
 impl Submission {
-    fn output_snapshot(&self) -> GroupTranscriptSnapshot {
-        let sent: BTreeSet<_> = self
-            .results
+    fn output_panes(&self) -> BTreeSet<u64> {
+        self.results
             .iter()
             .filter(|delivery| matches!(delivery.status, DeliveryStatus::Sent))
             .map(|delivery| delivery.target.pane)
-            .collect();
+            .collect()
+    }
+
+    fn output_snapshot(&self, pane: Option<u64>) -> GroupTranscriptSnapshot {
+        let sent = self.output_panes();
+        if let Some(pane) = pane {
+            return if sent.contains(&pane) {
+                self.transcript.snapshot_for_pane(pane)
+            } else {
+                GroupTranscriptSnapshot::default()
+            };
+        }
         let mut snapshot = self.transcript.snapshot();
         snapshot.lines.retain(|line| sent.contains(&line.pane));
         snapshot
+    }
+
+    fn output_history(&self) -> GroupTranscriptHistory {
+        let sent = self.output_panes();
+        let mut history = self.transcript.history();
+        history.retain_panes(|pane| sent.contains(&pane));
+        history
     }
 
     fn output_hosts(&self) -> BTreeMap<u64, (&str, &str)> {
@@ -137,10 +154,26 @@ impl Submission {
 }
 
 impl State {
-    fn snapshot(&self, submission: &Submission) -> Cow<'_, GroupTranscriptSnapshot> {
-        self.paused
-            .as_ref()
-            .map_or_else(|| Cow::Owned(submission.output_snapshot()), Cow::Borrowed)
+    fn snapshot(
+        &self,
+        submission: &Submission,
+        hosts: &BTreeMap<u64, (&str, &str)>,
+    ) -> Cow<'_, GroupTranscriptSnapshot> {
+        let pane = match &self.filter.host {
+            None => None,
+            Some(host)
+                if hosts
+                    .get(&host.pane)
+                    .is_some_and(|&(_, address)| host.address == address) =>
+            {
+                Some(host.pane)
+            }
+            Some(_) => return Cow::Owned(GroupTranscriptSnapshot::default()),
+        };
+        self.paused.as_ref().map_or_else(
+            || Cow::Owned(submission.output_snapshot(pane)),
+            |history| history.scoped(pane),
+        )
     }
 
     fn shown<'a>(
@@ -155,8 +188,8 @@ impl State {
     }
 
     fn excerpt(&self, submission: &Submission) -> Option<String> {
-        let snapshot = self.snapshot(submission);
         let hosts = submission.output_hosts();
+        let snapshot = self.snapshot(submission, &hosts);
         format_excerpt(
             submission.content.label(),
             snapshot.omitted,
@@ -236,7 +269,7 @@ impl HostGroup {
             }
             _ => None,
         };
-        let pause = matches!(action, Action::Pause).then(|| submission.output_snapshot());
+        let pause = matches!(action, Action::Pause).then(|| submission.output_history());
         let Some(output) = self
             .live_output
             .as_mut()
@@ -316,8 +349,8 @@ impl TerminalApp {
         submission: &Submission,
         ctx: &ViewContext<Self>,
     ) -> View {
-        let snapshot = output.snapshot(submission);
         let output_hosts = submission.output_hosts();
+        let snapshot = output.snapshot(submission, &output_hosts);
         let lines: Vec<_> = output
             .shown(&snapshot, &output_hosts)
             .map(|(line, name)| {
@@ -615,7 +648,7 @@ mod tests {
         };
         let mut output = State {
             submission: 1,
-            paused: Some(snapshot),
+            paused: None,
             filter: Filter {
                 host: Some(HostFilter {
                     pane: 7,
@@ -626,16 +659,17 @@ mod tests {
             },
             copy_feedback: None,
         };
-        let snapshot = output.paused.as_ref().unwrap();
         let names = BTreeMap::from([(7, ("East", "east")), (9, ("West", "west"))]);
         output.filter.set_query("witness".into());
         assert_eq!(
-            format_excerpt("show", snapshot.omitted, output.shown(snapshot, &names)).as_deref(),
+            format_excerpt("show", snapshot.omitted, output.shown(&snapshot, &names)).as_deref(),
             Some(
                 "Submitted · show\r\nEast · 雪 WITNESS…\r\nEast · first witness\r\n[Older lines are outside the retained output.]\r\n"
             ),
         );
         output.filter.set_query("missing".into());
-        assert!(format_excerpt("show", snapshot.omitted, output.shown(snapshot, &names)).is_none());
+        assert!(
+            format_excerpt("show", snapshot.omitted, output.shown(&snapshot, &names)).is_none()
+        );
     }
 }
