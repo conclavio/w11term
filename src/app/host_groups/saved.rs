@@ -345,13 +345,7 @@ impl TerminalApp {
         }
     }
 
-    fn open_saved_host_group(
-        &mut self,
-        id: Option<TabId>,
-        name: &str,
-        expected: &[String],
-        ctx: &ComponentContext<Self>,
-    ) -> Result<()> {
+    pub(in crate::app) fn check_saved_group_launch(&self) -> Result<()> {
         if let Some(Page::HostGroup(page)) = self.tabs.active().map(|tab| &tab.page) {
             ensure!(
                 !page.saved.is_editing(),
@@ -386,6 +380,17 @@ impl TerminalApp {
                 "Return from the comparison before opening another group."
             );
         }
+        Ok(())
+    }
+
+    fn open_saved_host_group(
+        &mut self,
+        id: Option<TabId>,
+        name: &str,
+        expected: &[String],
+        ctx: &ComponentContext<Self>,
+    ) -> Result<()> {
+        self.check_saved_group_launch()?;
         let catalog = self.load_expected_host_group(name, expected)?;
         let members = catalog
             .resolve_ssh_host_group_members(expected)?

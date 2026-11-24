@@ -29,6 +29,7 @@ mod saved;
 mod transfer;
 
 pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffer};
+pub use reuse::Offer as LaunchReviewOffer;
 
 pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
@@ -432,6 +433,7 @@ pub enum Action {
     Open,
     NewTab,
     OpenNamedGroup { name: String, members: Vec<String> },
+    ReviewNamedGroup(LaunchReviewOffer),
     Saved(TabId, saved::Action),
     Tick,
     Edit(TabId, String),
@@ -849,6 +851,7 @@ impl TerminalApp {
             Action::OpenNamedGroup { name, members } => {
                 self.open_host_group_from_palette(&name, &members, ctx);
             }
+            Action::ReviewNamedGroup(offer) => self.review_host_group_from_palette(offer, ctx),
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Import(id, action) => self.handle_host_import(id, action, ctx),
             Action::Membership(id, action) => self.handle_group_membership(id, action),

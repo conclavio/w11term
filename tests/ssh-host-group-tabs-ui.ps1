@@ -129,6 +129,22 @@ $argsForApp = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','110','--
 $app = Start-Process -FilePath $Gui -ArgumentList $argsForApp -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $origin = @((Control @('list')).sessions | Where-Object active)[0].id
+    if (!$origin) { throw 'Expected an active Demo pane before opening a review' }
+    $groupReview = "Review SSH group${dot}Fleet Mixed"
+    Open-GroupCommandSearch 'review fleet mixed group'
+    Accept-GroupCommandWithEnter $groupReview
+    $null = Wait-Until 'the keyboard opens the group review' {
+        (Find-Element $groupReview) -and (Find-Element "0 to reuse${dot}2 to open")
+    }
+    $null = Wait-CheckBox 'Include profile East' On
+    $null = Wait-CheckBox 'Include profile North' On
+    if (@((Control @('list')).sessions).Count -ne 1) { throw 'Opening the group review started an SSH session' }
+    Click 'Cancel'
+    Wait-Focus $origin
+    if (Find-Element "SSH group${dot}Fleet Mixed" $tabItem) { throw 'Cancelling left a draft group tab' }
+
     $eastTab = "SSH group${dot}Fleet East"
     $westTab = "SSH group${dot}Fleet West"
     Choose-GroupCommand "Open SSH group${dot}Fleet East"
@@ -408,7 +424,7 @@ try {
 
     $null = Wait-CheckBox 'Show all window SSH panes' On
     Select-Tab $westTab
-    Open-GroupCommandSearch 'recipient canaries'
+    Open-GroupCommandSearch 'apply recipient canaries'
     $null = Wait-Until 'the West group does not offer the East group canaries' {
         Find-Element 'No matching commands'
     }
@@ -417,7 +433,7 @@ try {
     Select-Tab $eastTab
     (Field 'Host filter').SetValue('west')
     Expect-Field 'Host filter' 'west'
-    Open-GroupCommandSearch 'canaries recipient'
+    Open-GroupCommandSearch 'apply canaries recipient'
     $applyCanaries = "Apply recipient set${dot}Canaries"
     $null = Wait-Until 'the palette has the reviewed Canaries set' { Find-Element $applyCanaries $button }
     $beforePresetEdit = [IO.File]::ReadAllBytes($profiles)
@@ -431,7 +447,7 @@ try {
     Expect-Field 'Host filter' 'west'
     $null = Wait-CheckBox $westName On
     [IO.File]::WriteAllBytes($profiles, $beforePresetEdit)
-    Open-GroupCommandSearch 'CANARIES recipient'
+    Open-GroupCommandSearch 'apply CANARIES recipient'
     Accept-GroupCommandWithEnter $applyCanaries
     $null = Wait-CheckBox 'Show all window SSH panes' Off
     Expect-Field 'Host filter' ''
@@ -479,6 +495,45 @@ try {
         [Convert]::ToBase64String([IO.File]::ReadAllBytes($profiles)) -cne
             [Convert]::ToBase64String($beforePresetLaunch)) {
         throw 'The canary launch created another connection or edited the saved group'
+    }
+    Select-Tab $westTab
+    Click "Focus pane $west"
+    Wait-Focus $west
+    $canaryReview = "Review SSH recipient set${dot}Fleet East${dot}Canaries"
+    Open-GroupCommandSearch 'review canaries fleet east'
+    $null = Wait-Until 'the terminal command palette offers the saved set' { Find-Element $canaryReview $button }
+    $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $changed.ssh_recipient_sets.'Fleet East'.Canaries = @('West')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Accept-GroupCommandWithEnter $canaryReview
+    $staleError = 'Recipient set Canaries changed. Open the command palette again.  ' + [char]0xb7 + '  Dismiss'
+    Click $staleError
+    Wait-Focus $west
+    $keyboardCanaryTab = "SSH group${dot}Fleet East (3)"
+    if ((Find-Element $keyboardCanaryTab $tabItem) -or @((Control @('list')).sessions).Count -ne 4) {
+        throw 'A stale palette offer opened a review or a connection'
+    }
+
+    [IO.File]::WriteAllBytes($profiles, $beforePresetLaunch)
+    Open-GroupCommandSearch 'review canaries fleet east'
+    Accept-GroupCommandWithEnter $canaryReview
+    Wait-Tab $keyboardCanaryTab
+    Expect-Choice 'Launch recipient set' 'Canaries'
+    $null = Wait-CheckBox 'Include profile East' On
+    $null = Wait-CheckBox 'Include profile West' Off
+    $null = Wait-Until 'keyboard review offers the existing East connection only' {
+        Find-Element "1 to reuse${dot}0 to open${dot}1 skipped"
+    }
+    Click 'Open reviewed group'
+    Wait-Tab $keyboardCanaryTab
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-Until 'the keyboard review became the canary roster' {
+        (Find-Element "Reused 1${dot}Opened 0 for Fleet East${dot}Skipped 1") -and
+            !(Find-Element "Focus pane $west" $button)
+    }
+    if ((Find-Element "SSH group${dot}Fleet East (4)" $tabItem) -or
+            @((Control @('list')).sessions).Count -ne 4) {
+        throw 'Approving the keyboard review created an extra tab or SSH connection'
     }
     Select-Tab $eastTab
     Click $manage
