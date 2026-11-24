@@ -1170,12 +1170,22 @@ async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
         profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
         peers.push((name, root, opens, server, responder, input));
     }
+    let mut lab = Vec::new();
+    for index in 1..=28 {
+        let name = format!("Lab {index:02}");
+        let mut profile = profiles["East"].clone();
+        profile["host"] = json!("catalog-only.test");
+        profile["port"] = json!(2200 + index);
+        profiles.insert(name.clone(), profile);
+        lab.push(name);
+    }
+    lab.extend(["East", "North"].map(str::to_owned));
     fs::write(
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({
             "profiles": profiles,
             "ssh_host_groups": {
-                "Fleet East": ["East"], "Fleet West": ["West"], "Fleet Mixed": ["East", "North"]
+                "Fleet East": ["East"], "Fleet West": ["West"], "Fleet Mixed": ["East", "North"], "Fleet Lab": lab
             }
         }))
         .unwrap(),
