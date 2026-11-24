@@ -40,6 +40,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
             | "wait-ssh-group-run"
+            | "wait-ssh-group-output"
             | "wait-ssh-group-ready"
                 if verb.is_none() =>
             {
@@ -236,6 +237,22 @@ mod tests {
             )
         ));
         assert!(matches!(
+            parse_line("wait-ssh-group-output --window 11 --tab 12 --run 4 --pane 5 --regex --match-case -- --ready").unwrap(),
+            (
+                None,
+                Request::WaitSshGroupOutput {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4,
+                    pane: Some(5),
+                    pattern,
+                    regex: true,
+                    match_case: true,
+                    timeout_seconds: 30,
+                }
+            ) if pattern == "--ready"
+        ));
+        assert!(matches!(
             parse_line("--pid 7 get-ssh-group-run --tab 12 --run 4 --window 11").unwrap(),
             (
                 Some(7),
@@ -262,6 +279,9 @@ mod tests {
             "get-ssh-group-run --window 2 --tab 3 --run 4 --timeout 1",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 0",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 3601",
+            "wait-ssh-group-output --window 2 --tab 3 --run 4",
+            "wait-ssh-group-output --window 2 --tab 3 --run 4 --pane 0 ready",
+            "wait-ssh-group-output --window 2 --tab 3 --run 4 --timeout 3601 ready",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

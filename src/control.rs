@@ -110,6 +110,19 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    WaitSshGroupOutput {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane: Option<u64>,
+        pattern: String,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default)]
+        match_case: bool,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     WorkspaceIdentity,
     WorkspaceWindows {
         key: String,
@@ -180,6 +193,12 @@ pub enum UiRequest {
         wait_for_settlement: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    WatchSshGroupOutput {
+        tab_id: u64,
+        run_id: u64,
+        pane: Option<u64>,
+        reply: oneshot::Sender<Result<SshGroupOutputWatch, String>>,
+    },
     Open {
         profile: String,
         cols: Option<usize>,
@@ -202,10 +221,16 @@ impl UiRequest {
             | Self::ListSshGroups { reply }
             | Self::GetSshGroupRoster { reply, .. }
             | Self::GetSshGroupRun { reply, .. } => reply,
+            Self::WatchSshGroupOutput { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
         };
         let _ = reply.send(Err(message.into()));
     }
 }
+
+pub use ssh_groups::SshGroupOutputWatch;
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -502,6 +527,31 @@ impl Registry {
                     tab_id,
                     run_id,
                     Some(Duration::from_secs(timeout_seconds)),
+                )
+                .await
+            }
+            Request::WaitSshGroupOutput {
+                window_id,
+                tab_id,
+                run_id,
+                pane,
+                pattern,
+                regex,
+                match_case,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "SSH group wait timeout must be 1..=3600 seconds"
+                );
+                let pattern = ssh_groups::output_pattern(&pattern, regex, match_case)?;
+                self.wait_ssh_group_output(
+                    window_id,
+                    tab_id,
+                    run_id,
+                    pane,
+                    pattern,
+                    Duration::from_secs(timeout_seconds),
                 )
                 .await
             }
@@ -846,6 +896,7 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitSshGroupRun { .. }
+                        | Request::WaitSshGroupOutput { .. }
                         | Request::WaitSshGroupReady { .. }
                         | Request::Events {
                             timeout_seconds: 1..,
@@ -1105,6 +1156,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupRun {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshGroupOutput {
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupReady {

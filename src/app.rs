@@ -5406,6 +5406,16 @@ impl Component for TerminalApp {
                     }
                 }
             }
+            Message::Control(w11term::control::UiRequest::WatchSshGroupOutput {
+                tab_id,
+                run_id,
+                pane,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_ssh_group_output(tab_id, run_id, pane));
+                }
+            }
             Message::Control(w11term::control::UiRequest::Open {
                 profile,
                 cols,

@@ -233,6 +233,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 117. **Retain output per host on busy runs.** Reserve bounded history for each emitting pane. Use it for the selected host's live, paused, and exported output while keeping the combined feed in arrival order.
 118. **Show search context from the matching host.** Include nearby retained lines, label context separately, and copy or save the resulting excerpt in the same order.
 119. **Read group output chronologically.** Offer oldest-first order and elapsed capture times in the retained view, clipboard, and file exports.
+120. **Wait for SSH group output from the CLI.** Search retained lines and subscribe to new marked output from a scoped run. Report the host, line, and capture time to automation.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

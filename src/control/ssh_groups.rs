@@ -1,5 +1,34 @@
 use super::*;
-use tokio::time::Instant;
+use crate::events::{GroupTranscriptLine, GroupTranscriptOutputWatch};
+use anyhow::bail;
+use regex::Regex;
+use std::{borrow::Cow, collections::BTreeMap};
+use tokio::{
+    sync::{broadcast::error::RecvError, watch},
+    time::Instant,
+};
+
+#[derive(Debug)]
+pub struct SshGroupOutputWatch {
+    pub stream: GroupTranscriptOutputWatch,
+    pub hosts: BTreeMap<u64, (String, String)>,
+    pub retained: watch::Receiver<()>,
+}
+
+pub(super) fn output_pattern(query: &str, regex: bool, match_case: bool) -> Result<Regex> {
+    ensure!(!query.is_empty(), "search text is empty");
+    ensure!(
+        query.len() <= crate::search::MAX_QUERY_BYTES,
+        "search text exceeds {} UTF-8 bytes",
+        crate::search::MAX_QUERY_BYTES
+    );
+    let pattern = if regex {
+        Cow::Borrowed(query)
+    } else {
+        Cow::Owned(regex::escape(query))
+    };
+    crate::search::compile_regex(&pattern, match_case).map_err(anyhow::Error::msg)
+}
 
 impl Registry {
     pub(super) async fn query_ssh_group_roster(
@@ -82,6 +111,67 @@ impl Registry {
         };
         Ok(json!({ "window_id": window, "tab_id": tab, "run": run }))
     }
+
+    pub(super) async fn wait_ssh_group_output(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        pane: Option<u64>,
+        pattern: Regex,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
+        let (reply, response) = oneshot::channel();
+        self.window_ui(window)?(UiRequest::WatchSshGroupOutput {
+            tab_id: tab,
+            run_id: run,
+            pane,
+            reply,
+        });
+        tokio::time::timeout_at(deadline, async {
+            let SshGroupOutputWatch { stream, hosts, mut retained } = response.await
+                .with_context(|| format!("window {window} closed during SSH group output lookup"))?
+                .map_err(anyhow::Error::msg)?;
+            let matched = |line: &GroupTranscriptLine| {
+                let (label, address) = hosts.get(&line.pane)?;
+                (pane.is_none_or(|pane| pane == line.pane) && pattern.is_match(&line.text)).then(|| json!({
+                    "window_id": window,
+                    "tab_id": tab,
+                    "run_id": run,
+                    "line": {
+                        "line_id": line.id,
+                        "pane_id": line.pane,
+                        "label": label,
+                        "address": address,
+                        "text": &*line.text,
+                        "shortened": line.shortened,
+                        "elapsed_ms": line.elapsed_ms,
+                    }
+                }))
+            };
+            if let Some(result) = stream.history.lines.iter().find_map(matched) {
+                return Ok(result);
+            }
+            if let Some(mut incoming) = stream.incoming {
+                loop {
+                    tokio::select! {
+                        _ = retained.changed() => bail!("SSH group run {run} is no longer retained in tab {tab} of window {window}"),
+                        line = incoming.recv() => match line {
+                            Ok(line) => {
+                                if let Some(result) = matched(&line) {
+                                    return Ok(result);
+                                }
+                            }
+                            Err(RecvError::Closed) => break,
+                            Err(RecvError::Lagged(missed)) => bail!("SSH group output wait fell behind and missed {missed} lines"),
+                        }
+                    }
+                }
+            }
+            bail!("SSH group run settled without a matching output line")
+        }).await.context("wait-ssh-group-output timed out before a match")?
+    }
 }
 
 async fn receive(
@@ -99,6 +189,65 @@ async fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn output_wait_times_out_and_reports_retirement() {
+        use crate::events::GroupTranscript;
+
+        let registry = Registry::window(3, None);
+        let (lifetime, retained) = watch::channel(());
+        let transcript = GroupTranscript::default();
+        registry.set_ui(move |request| {
+            let UiRequest::WatchSshGroupOutput {
+                tab_id,
+                run_id,
+                pane,
+                reply,
+            } = request
+            else {
+                panic!("unexpected output request");
+            };
+            assert_eq!((tab_id, run_id, pane), (9, 2, Some(7)));
+            reply
+                .send(Ok(SshGroupOutputWatch {
+                    stream: transcript.watch_output(pane),
+                    hosts: Default::default(),
+                    retained: retained.clone(),
+                }))
+                .unwrap();
+        });
+        let wait = || {
+            registry.wait_ssh_group_output(
+                3,
+                9,
+                2,
+                Some(7),
+                output_pattern("ready", false, false).unwrap(),
+                Duration::from_secs(1),
+            )
+        };
+        assert!(
+            wait()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("timed out before a match")
+        );
+        drop(lifetime);
+        assert!(
+            wait()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no longer retained")
+        );
+        assert!(output_pattern("(", true, false).is_err());
+        assert!(
+            output_pattern("[READY]", false, false)
+                .unwrap()
+                .is_match("[ready]")
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_wait_drops_its_reply_and_retirement_is_reported() {

@@ -141,6 +141,7 @@ struct Submission {
     dispatch_policy: Option<dispatch_policy::Policy>,
     show_queue_activity: bool,
     control_waiters: Vec<control_api::ControlReply>,
+    output_lifetime: Option<watch::Sender<()>>,
 }
 
 #[derive(Clone)]
@@ -619,6 +620,7 @@ impl HostGroup {
             dispatch_policy: None,
             show_queue_activity: false,
             control_waiters: Vec::new(),
+            output_lifetime: None,
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();

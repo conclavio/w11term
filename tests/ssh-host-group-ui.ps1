@@ -175,6 +175,7 @@ $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $readyJob = $null
+$outputJob = $null
 $logReader = $null
 $explorer = $null
 $priorExplorerWindows = @()
@@ -399,7 +400,38 @@ try {
     }
     Click "Focus output pane $west"
     Wait-Focus $west
+    $outputWait = @('wait-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run','2','--pane',"$west")
+    $timedOut = & $Cli --pid $app.Id @outputWait --timeout 1 'east-accepted both' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before a match*') {
+        throw 'The output wait did not respect its pane scope or timeout'
+    }
+    $earlierMatch = Control @('wait-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run','2','EAST-ACCEPTED')
+    if ($earlierMatch.line.pane_id -ne $east -or $earlierMatch.line.text -cne 'east-accepted both') {
+        throw 'The output wait missed an existing match in retained output'
+    }
+    $settledMiss = & $Cli --pid $app.Id wait-ssh-group-output --window $groupWindow --tab $groupTab --run 1 unreachable-match | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $settledMiss.ok -or $settledMiss.error -notlike '*settled without a matching output line*') {
+        throw 'A settled run with no match did not return a distinct error'
+    }
+    $foregroundBeforeOutputWait = [FixtureMessages]::GetForegroundWindow()
+    $waitPath = Join-Path $State 'wait-group-output.json'
+    $outputJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $outputWait +
+        @('--regex','--match-case','--timeout','15','^west\x20while\x20away$')) -NoNewWindow -PassThru -RedirectStandardOutput $waitPath
+    if ($outputJob.WaitForExit(250)) { throw 'The output wait ended before West produced its matching line' }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-away'), '')
+    if (!$outputJob.WaitForExit(10000)) { throw 'The output wait did not receive the new line' }
+    $outputReply = [IO.File]::ReadAllText($waitPath) | ConvertFrom-Json
+    $match = $outputReply.result.line
+    if (!$outputReply.ok -or $outputReply.result.window_id -ne $groupWindow -or
+        $outputReply.result.tab_id -ne $groupTab -or $outputReply.result.run_id -ne 2 -or
+        $match.pane_id -ne $west -or $match.label -cne 'West' -or
+        $match.address -cne "test@127.0.0.1:$($profileData.West.port)" -or
+        $match.text -cne 'west while away' -or $match.shortened -ne $false -or
+        $match.line_id -le $earlierMatch.line.line_id -or $match.elapsed_ms -lt $earlierMatch.line.elapsed_ms -or
+        [FixtureMessages]::GetForegroundWindow() -ne $foregroundBeforeOutputWait) {
+        throw "The output wait returned the wrong match or changed focus: $($outputReply.error)"
+    }
+    Wait-Focus $west
     $null = Wait-Until 'the recorder keeps writing while the terminal tab is focused' {
         [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains("$westName$($dot)west while away")
     }
@@ -1642,6 +1674,10 @@ try {
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
+    if ($outputJob) {
+        if (!$outputJob.HasExited) { $outputJob.Kill(); $outputJob.WaitForExit() }
+        $outputJob.Dispose()
+    }
     if ($readyJob) {
         if (!$readyJob.HasExited) { $readyJob.Kill(); $readyJob.WaitForExit() }
         $readyJob.Dispose()

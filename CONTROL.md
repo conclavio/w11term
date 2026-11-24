@@ -236,12 +236,29 @@ Check the recipient statuses and exit codes to decide whether the run succeeded.
 Timeout, a closed window or tab, or an evicted run returns an error. A timeout
 leaves the original run in progress.
 
+`wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT`
+returns the first matching line from the selected run. It searches the retained
+combined feed in arrival order, then listens for new output. With `--pane ID`,
+it searches that recipient's retained feed and subsequent lines from that
+pane. It uses case-insensitive literal matching by default. Patterns are
+limited to 4,096 UTF-8 bytes. The timeout defaults to 30 seconds and accepts
+1 through 3600. Use `--` before a pattern beginning with two hyphens.
+
+The result includes `window_id`, `tab_id`, `run_id`, and a `line` with
+`line_id`, `pane_id`, `label`, `address`, `text`, `elapsed_ms`, and
+`shortened`. The line ID identifies its arrival order within the run.
+Elapsed time uses the local run clock. Matching uses the available marked
+output, including any truncation recorded in `shortened`. The view can
+be paused or in a background tab. A timeout, settled run without a match,
+retired run, or overrun of the incoming buffer returns a distinct error.
+
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
+w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
 ```
 
 Direct pipe clients use these JSON requests.
@@ -252,6 +269,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
+{"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}
 ```
 
 ## Waiting, geometry, tabs, and events

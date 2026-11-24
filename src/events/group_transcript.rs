@@ -12,6 +12,7 @@ use wezterm_term::LiveOutputBatch;
 const TRANSCRIPT_LINES: usize = 128;
 const HOST_TRANSCRIPT_BUDGET: usize = 512;
 const RECORDING_QUEUE: usize = 1024;
+const OUTPUT_WATCH_QUEUE: usize = 1024;
 const QUEUE_EVENT_LIMIT: usize = 32;
 
 #[derive(Clone, Debug, Default)]
@@ -22,6 +23,7 @@ struct Transcript {
     history: GroupTranscriptHistory,
     queue_activity: QueueActivity,
     recording: Option<Recording>,
+    output_watch: Option<broadcast::Sender<GroupTranscriptLine>>,
     next_recording: u64,
     hosts: Vec<HostRecord>,
     active_hosts: usize,
@@ -270,6 +272,12 @@ pub struct GroupTranscriptLine {
 }
 
 #[derive(Debug)]
+pub struct GroupTranscriptOutputWatch {
+    pub history: GroupTranscriptSnapshot,
+    pub incoming: Option<broadcast::Receiver<GroupTranscriptLine>>,
+}
+
+#[derive(Debug)]
 pub struct GroupTranscriptHost {
     transcript: GroupTranscript,
     pane: u64,
@@ -438,6 +446,18 @@ impl GroupTranscript {
         self.0.lock().unwrap().history.clone()
     }
 
+    pub fn watch_output(&self, pane: Option<u64>) -> GroupTranscriptOutputWatch {
+        let mut transcript = self.0.lock().unwrap();
+        let history = transcript.history.scoped(pane).into_owned();
+        let incoming = (!transcript.settled()).then(|| {
+            transcript
+                .output_watch
+                .get_or_insert_with(|| broadcast::channel(OUTPUT_WATCH_QUEUE).0)
+                .subscribe()
+        });
+        GroupTranscriptOutputWatch { history, incoming }
+    }
+
     pub fn start_recording(
         &self,
         mode: GroupRecordingMode,
@@ -475,6 +495,7 @@ impl GroupTranscript {
         if !transcript.settled() {
             return;
         }
+        transcript.output_watch = None;
         if transcript
             .recording
             .as_ref()
@@ -608,6 +629,13 @@ impl Transcript {
         };
         if let Some(recording) = &self.recording {
             let _ = recording.incoming.send(line.clone());
+        }
+        if self
+            .output_watch
+            .as_ref()
+            .is_some_and(|send| send.send(line.clone()).is_err())
+        {
+            self.output_watch = None;
         }
         self.history.push(line);
     }
@@ -790,6 +818,40 @@ mod tests {
         assert_eq!(&*current.lines.back().unwrap().text, "West last");
         assert_eq!(paused.lines.len(), 1);
         assert_eq!(&*paused.lines[0].text, "West first");
+    }
+
+    #[test]
+    fn output_watch_connects_scoped_history_to_the_final_live_line() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let transcript = GroupTranscript::default();
+        let east = transcript.host(1);
+        let west = transcript.host(2);
+        let append = |host: &GroupTranscriptHost, text: &str| {
+            host.append(LiveOutputBatch {
+                lines: vec![LiveOutputLine {
+                    text: text.into(),
+                    shortened: false,
+                }],
+                gap: false,
+            })
+        };
+        append(&east, "unselected");
+        append(&west, "retained");
+        transcript.finish_dispatch();
+        let watch = transcript.watch_output(Some(2));
+        assert_eq!(watch.history.lines.len(), 1);
+        assert_eq!(&*watch.history.lines[0].text, "retained");
+        let mut incoming = watch.incoming.unwrap();
+        append(&west, "final");
+        drop(west);
+        drop(east);
+        let line = incoming.try_recv().unwrap();
+        assert_eq!((line.id, line.pane, &*line.text), (3, 2, "final"));
+        assert!(matches!(incoming.try_recv(), Err(TryRecvError::Closed)));
+        let settled = transcript.watch_output(None);
+        assert_eq!(settled.history.lines.len(), 3);
+        assert!(settled.incoming.is_none());
     }
 
     #[test]

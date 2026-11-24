@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
+use w11term::control::SshGroupOutputWatch;
 use w11term::events::GroupCompletionState;
 
 pub(in crate::app) type ControlReply = oneshot::Sender<Result<Value, String>>;
@@ -184,6 +185,55 @@ impl TerminalApp {
                 }
             }
         }
+    }
+
+    pub(in crate::app) fn control_ssh_group_output(
+        &mut self,
+        tab: TabId,
+        run: u64,
+        pane: Option<u64>,
+    ) -> Result<SshGroupOutputWatch, String> {
+        let Some(AppTab {
+            page: Page::HostGroup(page),
+            ..
+        }) = self.tabs.get_mut(tab)
+        else {
+            return Err(format!("unknown SSH group tab {tab} in this window"));
+        };
+        let Some(submission) = page.submissions.iter_mut().find(|item| item.id == run) else {
+            return Err(format!("SSH group run {run} is not retained in tab {tab}"));
+        };
+        let hosts: BTreeMap<_, _> = submission
+            .results
+            .iter()
+            .filter_map(|delivery| {
+                let target = &delivery.target;
+                pane.is_none_or(|pane| pane == target.pane).then(|| {
+                    (
+                        target.pane,
+                        (
+                            target.names.label.clone(),
+                            target.names.address().to_owned(),
+                        ),
+                    )
+                })
+            })
+            .collect();
+        if let Some(pane) = pane
+            && hosts.is_empty()
+        {
+            return Err(format!(
+                "pane {pane} was not a recipient of SSH group run {run}"
+            ));
+        }
+        Ok(SshGroupOutputWatch {
+            stream: submission.transcript.watch_output(pane),
+            hosts,
+            retained: submission
+                .output_lifetime
+                .get_or_insert_with(|| watch::channel(()).0)
+                .subscribe(),
+        })
     }
 
     pub(super) fn poll_ssh_group_ready_waiters(&mut self) {
