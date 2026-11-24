@@ -147,6 +147,13 @@ function Click([string]$Name) {
     $invoke.Invoke()
 }
 
+function Wait-ArmedOutputAlert([string]$Summary, [string]$Query) {
+    $null = Wait-Until "armed output alert for '$Query'" {
+        (Find-Element $Summary) -and (Find-Element 'Cancel output alert' $button) -and
+            (Find-Element "Armed output search${dot}$Query")
+    }
+}
+
 function Wait-RecordingStatus([string]$Prefix, [string]$Path, [switch]$PassThru) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $text = [System.Windows.Automation.PropertyCondition]::new(
@@ -1585,11 +1592,32 @@ try {
         $armAlert -and $armAlert.Current.IsEnabled
     }
     Click 'Notify on next match'
+    $literalRule = "Output alert armed${dot}Literal text${dot}Ignore case${dot}All output hosts"
+    Wait-ArmedOutputAlert $literalRule 'record row'
     $null = Wait-Until 'the alert arms without matching the retained East rows' {
-        (Find-Element 'Cancel output alert' $button) -and (Find-Element 'Attention inbox, 0 unread' $button)
+        Find-Element 'Attention inbox, 0 unread' $button
     }
     Click 'Clear output filters'
+    Wait-ArmedOutputAlert $literalRule 'record row'
     Click 'Back to results'
+    $null = Wait-Until 'return to results with the alert still armed' { Find-Element "Submitted${dot}record-fast" }
+    Wait-ArmedOutputAlert $literalRule 'record row'
+    Click 'Cancel output alert'
+    $null = Wait-Until 'cancelling the alert removes its rule from the run results' {
+        !(Find-Element $literalRule) -and !(Find-Element 'Cancel output alert' $button)
+    }
+    Click $liveButton
+    (Wait-CheckBox $outputRegex Off).Toggle()
+    $null = Wait-CheckBox $outputRegex On
+    (Wait-CheckBox $outputCase Off).Toggle()
+    $null = Wait-CheckBox $outputCase On
+    Select-ComboValue $outputHosts $westName
+    (Command-Editor $outputSearch).SetValue('^west record row')
+    Click 'Notify on next match'
+    $regexRule = "Output alert armed${dot}Regular expression${dot}Match case${dot}$westName"
+    Wait-ArmedOutputAlert $regexRule '^west record row'
+    Click 'Back to results'
+    Wait-ArmedOutputAlert $regexRule '^west record row'
     Click "Focus pane $west"
     Wait-Focus $west
     $followPath = Join-Path $State 'follow-burst.jsonl'
@@ -1652,7 +1680,8 @@ try {
     Click $viewMatch
     Click 'Open run results'
     $null = Wait-Until 'the match view opens its original run' {
-        (Find-Element "Submitted${dot}record-fast") -and (Find-Element 'Attention inbox, 0 unread' $button)
+        (Find-Element "Submitted${dot}record-fast") -and (Find-Element 'Attention inbox, 0 unread' $button) -and
+            !(Find-Element $regexRule) -and !(Find-Element 'Cancel output alert' $button)
     }
     Outcome $westName 'Exit 17'
     Wait-RecordingStatus 'Saved live output to ' $burstPath

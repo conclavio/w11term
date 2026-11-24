@@ -3,8 +3,8 @@ use regex::Regex;
 use std::{collections::BTreeMap, fmt::Write as _, io::Write as _};
 use w11term::{
     events::{
-        GroupCompletionState, GroupOutputAlert, GroupTranscriptHistory, GroupTranscriptLine,
-        GroupTranscriptSnapshot,
+        GroupCompletionState, GroupOutputAlert, GroupOutputAlertRule, GroupTranscriptHistory,
+        GroupTranscriptLine, GroupTranscriptSnapshot,
     },
     search::{MAX_QUERY_BYTES, compile_regex},
 };
@@ -26,7 +26,7 @@ pub enum Action {
     ShowElapsed(bool),
     FilterHost(Option<u64>),
     ClearFilters,
-    OutputAlert(bool),
+    ArmOutputAlert,
     CopyShown,
     SaveShown,
 }
@@ -276,6 +276,48 @@ impl State {
     }
 }
 
+pub(super) fn armed_alert_view(
+    id: TabId,
+    run: u64,
+    rule: &GroupOutputAlertRule,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let mode = if rule.regex {
+        "Regular expression"
+    } else {
+        "Literal text"
+    };
+    let case = if rule.match_case {
+        "Match case"
+    } else {
+        "Ignore case"
+    };
+    let host = rule.host.as_deref().unwrap_or("All output hosts");
+    StackPanel::new().spacing(4.0).children((
+        TextBlock::new()
+            .text(format!("Output alert armed · {mode} · {case} · {host}"))
+            .text_wrapping(TextWrapping::Wrap),
+        Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(8.0)
+            .children((
+                ScrollViewer::new().max_height(64.0).content(
+                    TextBlock::new()
+                        .automation_name(format!("Armed output search · {}", rule.query))
+                        .text(&rule.query)
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true),
+                ),
+                Button::new()
+                    .grid_column(1)
+                    .on_click(ctx.callback(move |_| {
+                        Message::HostGroup(super::Action::CancelOutputAlert(id, run))
+                    }))
+                    .content("Cancel output alert"),
+            )),
+    ))
+}
+
 pub(in crate::app) fn displayed_line(line: &GroupTranscriptLine) -> Cow<'_, str> {
     if line.shortened {
         Cow::Owned(format!("{}…", line.text))
@@ -420,7 +462,7 @@ impl TerminalApp {
         Some((host.clone(), lines))
     }
 
-    pub(super) fn set_group_output_alert(&self, id: TabId, run: u64, armed: bool) {
+    pub(super) fn arm_group_output_alert(&self, id: TabId, run: u64) {
         if self.tabs.active_id() != Some(id) {
             return;
         }
@@ -441,11 +483,8 @@ impl TerminalApp {
         else {
             return;
         };
-        if !armed {
-            submission.transcript.cancel_output_alert();
-            return;
-        }
-        let Some(Ok(pattern)) = &output.filter.matcher else {
+        let filter = &output.filter;
+        let Some(Ok(pattern)) = &filter.matcher else {
             return;
         };
         let hosts = submission
@@ -453,8 +492,7 @@ impl TerminalApp {
             .iter()
             .filter_map(|delivery| {
                 let target = &delivery.target;
-                output
-                    .filter
+                filter
                     .host
                     .as_ref()
                     .is_none_or(|host| host.matches(target.pane, target.names.address()))
@@ -468,6 +506,12 @@ impl TerminalApp {
             source: label.clone(),
             hosts,
             pattern: pattern.clone(),
+            rule: Arc::new(GroupOutputAlertRule {
+                query: filter.query.clone(),
+                regex: filter.regex,
+                match_case: filter.sensitive,
+                host: filter.host.as_ref().map(|host| host.label.clone()),
+            }),
         });
     }
 
@@ -602,21 +646,17 @@ impl TerminalApp {
             host_labels.push(Cow::Borrowed(target.name.as_str()));
         }
         let host_absent = selected_host == 0 && output.filter.host.is_some();
-        let output_alert = if submission.transcript.completion_state()
-            == GroupCompletionState::Settled
+        let alert_rule = submission.transcript.output_alert_rule();
+        let arm_alert = if alert_rule.is_some()
+            || submission.transcript.completion_state() == GroupCompletionState::Settled
         {
             View::empty()
         } else {
-            let armed = submission.transcript.output_alert_armed();
             let can_arm = !host_absent && output.filter.matcher.as_ref().is_some_and(Result::is_ok);
             Button::new()
-                .is_enabled(armed || can_arm)
-                .on_click(ctx.callback(move |_| send(Action::OutputAlert(!armed))))
-                .content(if armed {
-                    "Cancel output alert"
-                } else {
-                    "Notify on next match"
-                })
+                .is_enabled(can_arm)
+                .on_click(ctx.callback(move |_| send(Action::ArmOutputAlert)))
+                .content("Notify on next match")
         };
         if let Some(host) = output.filter.host.as_ref().filter(|_| host_absent) {
             selected_host = host_labels.len();
@@ -773,10 +813,13 @@ impl TerminalApp {
                                 .on_click(ctx.callback(move |_| send(pause_action.clone())))
                                 .content(pause_label),
                             output_recording::button(id, submission, ctx),
-                            output_alert,
+                            arm_alert,
                         )),
                     search,
                     search_options,
+                    alert_rule.as_deref().map_or_else(View::empty, |rule| {
+                        armed_alert_view(id, submission_id, rule, ctx)
+                    }),
                     timeline_options,
                     output.filter.error().map_or_else(View::empty, |error| {
                         TextBlock::new()

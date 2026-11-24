@@ -165,7 +165,7 @@ Choose **Oldest first** to read the output in the order w11term received it. **S
 
 Scripts can use `w11term-cli wait-ssh-group-output` to wait for a matching line and get its host and capture time. Use `get-ssh-group-output` to read available lines in batches or `follow-ssh-group-output` to stream retained and live lines as JSON Lines. Pass a returned cursor or line ID as `--after-line` to continue in the same run. [Control protocol](CONTROL.md#ssh-group-rosters-and-runs)
 
-While a run is active, enter a search and choose **Notify on next match**. The alert uses the search options and host filter selected when you arm it. It watches new output even when the view is paused or another tab is active. The first match adds the host and a short excerpt to the Attention inbox. Open the notice to return to that run's results, or choose **Cancel output alert** before it fires.
+While a run is active, enter a search and choose **Notify on next match**. The alert uses the search options and host filter selected when you arm it. It watches new output even when the view is paused or another tab is active. Live output and the run results both show the armed query, match options, and host scope. Choose **Cancel output alert** from either view before it fires. The first match adds the host and a short excerpt to the Attention inbox. Open the notice to return to that run's results.
 
 Choose **View matching output** in the Attention inbox for the matched line and up to two nearby lines on each side from the same host. If that history has expired, the view shows the saved alert excerpt. From there, return to the inbox or open the original run results while they are retained.
 

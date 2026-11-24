@@ -239,6 +239,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 123. **Follow group output from the CLI.** Stream retained and incoming lines in order over one connection, with a final settlement cursor and explicit history gaps or errors.
 124. **Notify on a live group output match.** Arm a one-shot alert using the current search and host filter. Show the matching host and a short excerpt in the window's Attention inbox, linked to the original run.
 125. **Review the output around an alert.** Open the exact matched line and nearby retained output from its source pane. Keep the saved alert excerpt available after the live history expires.
+126. **Review and cancel armed output alerts from run results.** Show the saved query, match options, and host scope in both live output and results, with a cancel action in each view.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

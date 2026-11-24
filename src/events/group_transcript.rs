@@ -41,6 +41,15 @@ pub struct GroupOutputAlert {
     pub source: String,
     pub hosts: BTreeMap<u64, String>,
     pub pattern: Regex,
+    pub rule: Arc<GroupOutputAlertRule>,
+}
+
+#[derive(Debug)]
+pub struct GroupOutputAlertRule {
+    pub query: String,
+    pub regex: bool,
+    pub match_case: bool,
+    pub host: Option<String>,
 }
 
 #[derive(Debug)]
@@ -475,8 +484,9 @@ impl GroupTranscript {
         }
     }
 
-    pub fn output_alert_armed(&self) -> bool {
-        self.0.lock().unwrap().output_alert.is_some()
+    pub fn output_alert_rule(&self) -> Option<Arc<GroupOutputAlertRule>> {
+        let transcript = self.0.lock().unwrap();
+        Some(transcript.output_alert.as_ref()?.rule.clone())
     }
 
     pub fn arm_output_alert(&self, alert: GroupOutputAlert) {
@@ -813,6 +823,12 @@ mod tests {
                 source: "Fleet".into(),
                 hosts: BTreeMap::from([(2, "West".into())]),
                 pattern: Regex::new("skipped|ready").unwrap(),
+                rule: Arc::new(GroupOutputAlertRule {
+                    query: "skipped|ready".into(),
+                    regex: true,
+                    match_case: true,
+                    host: Some("West".into()),
+                }),
             });
         };
         let append = |host: &GroupTranscriptHost, texts: &[&str], gap| {
@@ -832,7 +848,10 @@ mod tests {
         append(&east, &["ready on another host"], false);
         append(&west, &["still waiting"], true);
         assert!(inbox.rows().is_empty());
-        assert!(group.output_alert_armed());
+        let rule = group.output_alert_rule().unwrap();
+        assert_eq!(rule.query, "skipped|ready");
+        assert!(rule.regex && rule.match_case);
+        assert_eq!(rule.host.as_deref(), Some("West"));
 
         append(&west, &["ready now", "ready again"], false);
         let rows = inbox.rows();
@@ -847,7 +866,7 @@ mod tests {
             }
         );
         assert_eq!(rows[0].message, "Matched output · West · ready now");
-        assert!(!group.output_alert_armed());
+        assert!(group.output_alert_rule().is_none());
 
         arm();
         group.cancel_output_alert();
@@ -857,9 +876,9 @@ mod tests {
         arm();
         drop(west);
         drop(east);
-        assert!(!group.output_alert_armed());
+        assert!(group.output_alert_rule().is_none());
         arm();
-        assert!(!group.output_alert_armed());
+        assert!(group.output_alert_rule().is_none());
     }
 
     #[test]

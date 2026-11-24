@@ -739,6 +739,7 @@ pub enum Action {
     ViewSubmission(TabId, u64),
     OpenRunPicker(TabId),
     NotifyCompletion(TabId, u64, bool),
+    CancelOutputAlert(TabId, u64),
     LiveOutput(TabId, u64, live_output::Action),
     RecordOutput(TabId, u64, output_recording::Action),
     RecordedSend(TabId, recorded_send::Action),
@@ -1475,9 +1476,17 @@ impl TerminalApp {
             Action::NotifyCompletion(id, submission, armed) => {
                 self.set_group_run_completion_notice(id, submission, armed);
             }
+            Action::CancelOutputAlert(id, run) => {
+                if self.tabs.active_id() == Some(id)
+                    && let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page)
+                    && let Some(submission) = page.viewed_submission(run)
+                {
+                    submission.transcript.cancel_output_alert();
+                }
+            }
             Action::LiveOutput(id, submission, action) => {
-                if let live_output::Action::OutputAlert(armed) = action {
-                    self.set_group_output_alert(id, submission, armed);
+                if matches!(action, live_output::Action::ArmOutputAlert) {
+                    self.arm_group_output_alert(id, submission);
                     return;
                 }
                 if matches!(
@@ -2612,7 +2621,16 @@ impl TerminalApp {
                 TextBlock::new()
                     .text(summary.caption())
                     .text_wrapping(TextWrapping::Wrap),
-                output_recording::status_view(id, submission, ctx),
+                StackPanel::new().spacing(4.0).children((
+                    output_recording::status_view(id, submission, ctx),
+                    submission
+                        .transcript
+                        .output_alert_rule()
+                        .as_deref()
+                        .map_or_else(View::empty, |rule| {
+                            live_output::armed_alert_view(id, submission_id, rule, ctx)
+                        }),
+                )),
                 ProgressBar::new()
                     .automation_name("SSH group submission progress")
                     .maximum(summary.total().max(1) as f64)
