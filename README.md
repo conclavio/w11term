@@ -167,6 +167,8 @@ Filter the review by profile name or SSH address to find members in a large grou
 
 Choose **Save as recipient set…** in the launch review to name and save the included profiles before connecting. The saved set becomes the selected set in the review and is available for future launches from the command palette.
 
+Use **Update recipient set…** to apply the current inclusion choices to an existing set. Pick the set and review its additions and removals before confirming the update.
+
 From a terminal, search the command palette for **Review SSH group** and the group name, or **Review SSH recipient set** with the group and set names. Press Enter to open the review with the matching hosts checked. **Open reviewed group** turns that tab into the live roster. **Cancel** returns you to the tab you came from.
 
 In a named tab, check the shown recipients you want to keep and open **Recipient sets…**. Save a name such as *Canaries* or *Full fleet*. From that tab, you can also search the command palette for **Apply recipient set** and the name, then press Enter. Applying a set replaces the checks, clears the filter, and returns to the named roster. Each saved profile must match exactly one pane in that roster. If a profile is missing or ambiguous, adjust the live roster before applying the set. Applying a set leaves the command ready for a separate **Send** action.
