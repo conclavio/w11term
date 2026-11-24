@@ -162,6 +162,7 @@ impl Target {
 #[derive(Clone, Copy)]
 enum TargetState {
     Offline,
+    Failed(Option<ExitedPane>),
     Connecting,
     Reconnecting(Option<u32>),
     Restartable(ExitedPane),
@@ -184,13 +185,14 @@ pub enum RosterStatus {
     Connecting,
     Reconnecting,
     Disconnected,
+    Failed,
     Authentication,
     ReadOnly,
     Alternate,
 }
 
 impl RosterStatus {
-    const OPTIONS: [Self; 10] = [
+    const OPTIONS: [Self; 11] = [
         Self::All,
         Self::Ready,
         Self::Waiting,
@@ -198,6 +200,7 @@ impl RosterStatus {
         Self::Connecting,
         Self::Reconnecting,
         Self::Disconnected,
+        Self::Failed,
         Self::Authentication,
         Self::ReadOnly,
         Self::Alternate,
@@ -212,6 +215,7 @@ impl RosterStatus {
             Self::Connecting => "Connecting",
             Self::Reconnecting => "Reconnecting",
             Self::Disconnected => "Disconnected",
+            Self::Failed => "Connection failed",
             Self::Authentication => "Authentication required",
             Self::ReadOnly => "Read-only",
             Self::Alternate => "Alternate screen",
@@ -256,6 +260,7 @@ impl TargetState {
     fn status(self) -> RosterStatus {
         match self {
             Self::Offline | Self::Restartable(_) => RosterStatus::Disconnected,
+            Self::Failed(_) => RosterStatus::Failed,
             Self::Connecting => RosterStatus::Connecting,
             Self::Reconnecting(_) => RosterStatus::Reconnecting,
             Self::Authentication => RosterStatus::Authentication,
@@ -270,6 +275,7 @@ impl TargetState {
     fn label(self) -> Cow<'static, str> {
         match self {
             Self::Restartable(_) => "Disconnected · reconnect available".into(),
+            Self::Failed(Some(_)) => "Connection failed · reconnect available".into(),
             Self::Matched(_) => "Ready · prompt match".into(),
             Self::Reconnecting(Some(attempt)) => format!("Reconnecting · attempt {attempt}").into(),
             _ => self.status().label().into(),
@@ -738,6 +744,9 @@ impl TerminalApp {
                         Some(SshConnectionPhase::Connecting) => TargetState::Connecting,
                         Some(SshConnectionPhase::Reconnecting { attempt }) => {
                             TargetState::Reconnecting(attempt)
+                        }
+                        Some(SshConnectionPhase::Failed(_)) => {
+                            TargetState::Failed(entry.value.exited_pane())
                         }
                         _ => entry
                             .value
@@ -1304,6 +1313,16 @@ impl TerminalApp {
         }
     }
 
+    fn host_group_failure_reason(&self, pane: u64) -> Option<Arc<str>> {
+        let Page::Terminal(live) = &self.tabs.get(self.tab_for_pane(pane)?)?.page else {
+            return None;
+        };
+        match live.session.events.ssh_connection_phase() {
+            Some(SshConnectionPhase::Failed(reason)) => Some(reason),
+            _ => None,
+        }
+    }
+
     fn host_group_output_preview(
         &self,
         id: TabId,
@@ -1450,6 +1469,11 @@ impl TerminalApp {
             .map(|target| {
                 let pane = target.pane;
                 let state = target.status_caption();
+                let failure = if matches!(target.state, TargetState::Failed(_)) {
+                    self.host_group_failure_reason(pane)
+                } else {
+                    None
+                };
                 KeyedView::new(
                     format!("target-{pane}"),
                     StackPanel::new().spacing(2.0).children((
@@ -1476,6 +1500,14 @@ impl TerminalApp {
                                 reconnect::host_button(id, target.state, ctx),
                                 prompt_setup::button(id, target, ctx),
                             )),
+                        failure.map_or_else(View::empty, |reason| {
+                            TextBlock::new()
+                                .automation_name(format!("Pane {pane} · {reason}"))
+                                .text(reason.as_ref())
+                                .text_wrapping(TextWrapping::Wrap)
+                                .is_text_selection_enabled(true)
+                                .into()
+                        }),
                         if page.roster_preferences.show_last_output {
                             self.host_group_output_preview(id, target, ctx)
                                 .unwrap_or_else(View::empty)

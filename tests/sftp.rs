@@ -177,6 +177,10 @@ impl server::Handler for Peer {
             while gate.is_file() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            if self.root.join("reject-shell-request").is_file() {
+                s.channel_failure(c)?;
+                return Ok(());
+            }
         }
         s.channel_success(c)?;
         if let Some(wire) = &self.wire {

@@ -1005,11 +1005,29 @@ try {
         $bulk = Find-Element 'Reconnect selected' $button
         $bulk -and !$bulk.Current.IsEnabled -and !(Find-Element "Reconnect SSH pane $east" $button)
     }
+    $rejectWest = Join-Path (Split-Path -LiteralPath $westShellGate) 'reject-shell-request'
+    [IO.File]::WriteAllText($rejectWest, '')
     [IO.File]::WriteAllText($westShellGate, '')
     Click "Reconnect SSH pane $west"
     Pane-Status $west 'Reconnecting'
     Remove-Item -LiteralPath $westShellGate
+    Pane-Status $west "Connection failed${dot}reconnect available"
+    Select-ComboValue $hostStateFilter 'Connection failed'
+    $failureReason = "Pane $west${dot}remote server rejected a PTY or shell request (1 outstanding)"
+    $null = Wait-Until 'the failure filter shows only West and its SSH diagnostic' {
+        (Find-Element $failureReason) -and (Find-Element "Reconnect SSH pane $west" $button) -and
+            !(Find-Element "Focus pane $east" $button)
+    }
+    Click $copyRoster
+    $null = Wait-Until 'the copied roster includes the failed connection state' {
+        $report = Read-ClipboardFixture
+        $report -and $report.Contains("$westName${dot}Connection failed${dot}reconnect available")
+    }
+    Remove-Item -LiteralPath $rejectWest
+    Select-ComboValue $hostStateFilter 'All host states'
+    Click "Reconnect SSH pane $west"
     Pane-Status $west "Connected${dot}Ready"
+    if (Find-Element $failureReason) { throw 'The previous SSH error remained after reconnect' }
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName Off
     if ((Command-Editor).Current.Value -cne 'draft before reconnect') {

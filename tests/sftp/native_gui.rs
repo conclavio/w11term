@@ -819,7 +819,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
         let (Source::Ssh(ssh), root, opens, server) = fixture_with_wire(
             false,
-            if use_633 { 3 } else { 2 },
+            if use_633 { 4 } else { 2 },
             Arc::default(),
             Some(wire),
         )
@@ -1028,7 +1028,10 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\ralt",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
-        assert_eq!(opens.load(Ordering::Relaxed), index + 2);
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            if index == 0 { 2 } else { 4 }
+        );
         assert_eq!(
             *trace.lock().unwrap(),
             expected[index],

@@ -40,12 +40,13 @@ pub struct CommandLink {
     pub id: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SshConnectionPhase {
     Connecting,
     Reconnecting { attempt: Option<u32> },
     Connected,
     Disconnected,
+    Failed(Arc<str>),
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Batch {
@@ -263,7 +264,7 @@ impl Events {
     }
 
     pub fn ssh_connection_phase(&self) -> Option<SshConnectionPhase> {
-        self.state.lock().unwrap().ssh_connection_phase
+        self.state.lock().unwrap().ssh_connection_phase.clone()
     }
 
     pub(crate) fn set_ssh_connection_phase(&self, phase: SshConnectionPhase) {

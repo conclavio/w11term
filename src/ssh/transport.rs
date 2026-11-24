@@ -27,6 +27,8 @@ pub enum Event {
     Connected(u64),
     /// A retry has been scheduled and supersedes the previous transport.
     Reconnecting(u32),
+    /// Final SSH failure from the transport launcher.
+    ConnectionFailed(String),
     /// Ordered after the last bytes from this generation and before any retry.
     Disconnected,
 }

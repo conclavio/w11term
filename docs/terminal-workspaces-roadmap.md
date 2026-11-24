@@ -176,6 +176,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 60. **Save roster defaults for a named group.** Remember sort order, output previews, and the all-recipient readiness setting across launches. Move those defaults with a group rename.
 61. **Add saved profiles to a live roster.** Search and check profiles across pages, review fresh or reused connections, and recheck the chosen profiles before adding them. Preserve the group’s draft, filters, and current send selection.
 62. **Show connection progress in the roster.** Display initial connections, automatic retry attempts, and manual reconnects as distinct live states. Include those states in roster filtering and copied reports.
+63. **Show SSH failures in the roster.** Give ended SSH attempts a failure state with a short diagnostic, filter failed panes together, and let operators retry when a pane can reconnect.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

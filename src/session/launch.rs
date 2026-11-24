@@ -95,11 +95,11 @@ impl Launcher {
                             sharing,
                         )
                         .await;
-                        let message = match result {
-                            Ok(()) => "Disconnected".into(),
-                            Err(error) => format!("SSH: {error:#}"),
+                        let event = match result {
+                            Ok(()) => ssh::Event::Status("Disconnected".into()),
+                            Err(error) => ssh::Event::ConnectionFailed(format!("{error:#}")),
                         };
-                        let _ = output.send(ssh::Event::Status(message)).await;
+                        let _ = output.send(event).await;
                     },
                     ssh::NETWORK.handle(),
                 );
