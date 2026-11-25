@@ -161,7 +161,6 @@ impl Panel {
                             .content(StackPanel::new().spacing(4.0).keyed_children(matches)),
                     )),
             )
-            .into()
     }
 }
 
