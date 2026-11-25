@@ -76,24 +76,18 @@ impl Drop for DropPreparation {
     }
 }
 
-#[derive(Default)]
-pub(super) struct UploadQueue {
-    pub(super) remaining: VecDeque<(Operation, TransferFile)>,
-    pub(super) overwrite_files: bool,
-    batch_id: Option<TransferId>,
-    total: usize,
-    completed: usize,
-}
-
-impl UploadQueue {
+impl TransferQueue {
     pub(super) fn files(
         paths: Vec<PathBuf>,
         parent: &str,
         overwrite: bool,
         atomic: bool,
+        id: TransferId,
     ) -> Result<Self> {
         let mut queue = Self {
             overwrite_files: overwrite,
+            batch_id: Some(id),
+            total: paths.len(),
             ..Self::default()
         };
         for local in paths {
@@ -157,22 +151,6 @@ impl UploadQueue {
         }
         Ok(queue)
     }
-
-    pub(super) fn completed_one(&mut self) {
-        self.completed += 1;
-    }
-
-    pub(super) fn finish(&mut self, status: &mut String) {
-        if self.total > 1 {
-            use std::fmt::Write;
-            let _ = write!(
-                status,
-                " {} of {} items completed.",
-                self.completed, self.total
-            );
-        }
-        *self = Self::default();
-    }
 }
 
 fn basename(local: &std::path::Path) -> Result<String> {
@@ -185,10 +163,10 @@ fn basename(local: &std::path::Path) -> Result<String> {
 
 impl FileDrawer {
     pub(super) fn transfer_id(&mut self, pane: u64) -> TransferId {
-        if let Some(batch) = self.uploads.batch_id {
+        if let Some(batch) = self.queue.batch_id {
             return batch;
         }
-        self.transfer_serial = self.transfer_serial.wrapping_add(1);
+        self.transfer_serial = self.transfer_serial.wrapping_add(1).max(1);
         TransferId {
             pane,
             generation: self.generation,
@@ -214,11 +192,13 @@ impl FileDrawer {
         &mut self,
         target: DropTarget,
         paths: Vec<PathBuf>,
+        session: &Session,
         ctx: &ComponentContext<TerminalApp>,
     ) {
         let Some(id) = self.start_drop(&target) else {
             return;
         };
+        session.events.sftp_transfer_started(id);
         let cancel = self.preparing_drop.as_ref().unwrap().cancel.clone();
         let rejected = Message::Files(FileAction::PreparedDrop(
             target.clone(),
@@ -331,10 +311,10 @@ mod tests {
         let items = classify_drop(received, &TransferCancel::default()).unwrap();
         drawer.replace = false;
         assert!(drawer.finish_drop(&captured, token));
-        drawer.uploads = UploadQueue::dropped(&captured, token, items).unwrap();
+        drawer.queue = TransferQueue::dropped(&captured, token, items).unwrap();
         assert!(drawer.transfer_id(captured.pane) == token);
         drawer.close();
-        for ((operation, _), (path, overwrite)) in drawer.uploads.remaining.iter().zip([
+        for ((operation, _), (path, overwrite)) in drawer.queue.remaining.iter().zip([
             ("/logs/one.txt", true),
             ("/logs/logs 雪", false),
             ("/logs/three", true),
@@ -343,13 +323,13 @@ mod tests {
                 matches!(operation, Operation::PutDrop {remote, overwrite: replace, ..} if remote == path && *replace == overwrite)
             );
         }
-        assert_eq!(drawer.uploads.remaining.len(), 3);
-        drawer.uploads.completed_one();
+        assert_eq!(drawer.queue.remaining.len(), 3);
+        drawer.queue.completed_one();
         assert!(drawer.transfer_id(captured.pane) == token);
         let mut status = "Stopped on second item.".to_owned();
-        drawer.uploads.finish(&mut status);
+        drawer.queue.finish(&mut status);
         assert_eq!(status, "Stopped on second item. 1 of 3 items completed.");
-        assert!(drawer.uploads.remaining.is_empty());
+        assert!(drawer.queue.remaining.is_empty());
         assert!(drawer.transfer_id(captured.pane) != token);
     }
 
@@ -360,7 +340,7 @@ mod tests {
         };
         for reply_value in [None, Some(true), Some(false)] {
             let (sender, mut response) = oneshot::channel();
-            let mut queue = UploadQueue {
+            let mut queue = TransferQueue {
                 total: 4,
                 completed: 1,
                 ..Default::default()
@@ -371,7 +351,8 @@ mod tests {
                     "directories":1, "skipped":0, "bytes_transferred":0})))
                     .unwrap();
             }
-            let status = file.reconnect_status(&mut response, 0, &mut queue);
+            let (status, saved, _) = file.reconnect_status(&mut response, 0, &mut queue);
+            assert!(saved.is_none());
             let completed = if reply_value == Some(false) { 2 } else { 1 };
             assert!(
                 status.ends_with(&format!("{completed} of 4 items completed.")),

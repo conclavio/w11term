@@ -29,10 +29,12 @@ mod command_history;
 mod find;
 mod registry;
 pub(crate) mod security;
+mod sftp_transfers;
 mod ssh_groups;
 pub use command_history::CommandStatus;
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
+pub use sftp_transfers::{SftpCancelState, SftpTransferStatus};
 
 pub const VERSION: u32 = 1;
 pub const MAX_BYTES: usize = 1024 * 1024;
@@ -87,6 +89,18 @@ pub enum Request {
         #[serde(default = "sftp_default_timeout")]
         timeout_seconds: u64,
         operation: crate::sftp::Operation,
+    },
+    ListSftpTransfers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+    },
+    CancelSftpTransfer {
+        transfer_id: crate::sftp::TransferId,
+    },
+    WaitSftpTransfer {
+        transfer_id: crate::sftp::TransferId,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
     },
     List,
     ListSshGroups,
@@ -277,6 +291,14 @@ fn default_group_output_limit() -> usize {
 }
 #[derive(Debug)]
 pub enum UiRequest {
+    ListSftpTransfers {
+        pane: Option<u64>,
+        reply: oneshot::Sender<Result<Vec<SftpTransferStatus>, String>>,
+    },
+    CancelSftpTransfer {
+        transfer_id: crate::sftp::TransferId,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     ListSshGroups {
         reply: oneshot::Sender<Result<Value, String>>,
     },
@@ -360,6 +382,7 @@ impl UiRequest {
         let reply = match self {
             Self::Open { reply, .. }
             | Self::Resize { reply, .. }
+            | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
             | Self::ListSavedSshGroups { reply }
             | Self::OpenSshGroup { reply, .. }
@@ -369,6 +392,10 @@ impl UiRequest {
             | Self::GetSshGroupRetryPlan { reply, .. }
             | Self::SshGroupQueue { reply, .. }
             | Self::InterruptSshGroupCommand { reply, .. } => reply,
+            Self::ListSftpTransfers { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
             Self::ReadSshGroupOutput { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
                 return;
@@ -383,6 +410,18 @@ impl UiRequest {
             }
         };
         let _ = reply.send(Err(message.into()));
+    }
+
+    fn routed_pane(&self) -> Option<u64> {
+        match self {
+            Self::Resize { pane, .. } => Some(*pane),
+            Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
+            _ => None,
+        }
+    }
+
+    fn pane_reply_closed(&self) -> bool {
+        matches!(self, Self::Resize { reply, .. } | Self::CancelSftpTransfer { reply, .. } if reply.is_closed())
     }
 }
 
@@ -515,7 +554,7 @@ impl Registry {
             Request::Resize { pane, cols, rows } => {
                 validate_grid(cols, rows)?;
                 let (reply, response) = oneshot::channel();
-                self.resize(
+                self.post_pane_request(
                     pane,
                     UiRequest::Resize {
                         pane,
@@ -643,6 +682,23 @@ impl Registry {
                     .map_err(anyhow::Error::msg)?;
                 Ok(json!({"pane":pane,"sftp":result}))
             }
+            Request::ListSftpTransfers { pane } => self.list_sftp_transfers(pane).await,
+            Request::CancelSftpTransfer { transfer_id } => {
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(
+                    transfer_id.pane,
+                    UiRequest::CancelSftpTransfer { transfer_id, reply },
+                );
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("SFTP cancellation timed out. Check the transfer's current state.")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::WaitSftpTransfer {
+                transfer_id,
+                timeout_seconds,
+            } => self.wait_sftp_transfer(transfer_id, timeout_seconds).await,
             Request::WorkspaceIdentity => Ok(json!(self.legacy_workspace())),
             Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
             Request::ListSshGroups => self.list_ssh_groups().await,
@@ -1177,6 +1233,7 @@ async fn serve(
                 let pool = if matches!(
                     r,
                     Request::WaitForText { .. }
+                        | Request::WaitSftpTransfer { .. }
                         | Request::WaitSshGroupRun { .. }
                         | Request::WaitSshGroupApproval { .. }
                         | Request::WaitSshGroupOutput { .. }
@@ -1522,6 +1579,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,
             Request::WaitForText {
+                timeout_seconds, ..
+            }
+            | Request::WaitSftpTransfer {
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupRun {

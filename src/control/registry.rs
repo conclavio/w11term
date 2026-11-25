@@ -22,7 +22,7 @@ struct State {
     // Each pane has one authoritative owner, including through a live move.
     panes: BTreeMap<u64, (WindowId, Pane)>,
     moving: BTreeMap<u64, bool>, // true once removed from the source's local view
-    pending_resizes: BTreeMap<u64, Vec<UiRequest>>,
+    pending_pane_requests: BTreeMap<u64, Vec<UiRequest>>,
     manifest: Option<PathBuf>,
 }
 
@@ -88,7 +88,7 @@ impl Drop for PaneTransfer {
             if state.moving.remove(id) == Some(true) {
                 state.panes.remove(id);
             }
-            if let Some(requests) = state.pending_resizes.remove(id) {
+            if let Some(requests) = state.pending_pane_requests.remove(id) {
                 let ui = state
                     .panes
                     .get(id)
@@ -100,7 +100,7 @@ impl Drop for PaneTransfer {
         drop(state);
         for (ui, requests) in pending {
             for request in requests {
-                if matches!(&request, UiRequest::Resize { reply, .. } if reply.is_closed()) {
+                if request.pane_reply_closed() {
                     continue;
                 }
                 match &ui {
@@ -296,30 +296,36 @@ impl Registry {
     /// Recheck an already-queued request on the GUI thread. A transfer may
     /// have completed since the control worker first chose this window.
     pub fn for_this_window(&self, request: UiRequest) -> Option<UiRequest> {
-        if let UiRequest::Resize { pane, .. } = &request {
-            self.route_resize(*pane, request, true)
+        if let Some(pane) = request.routed_pane() {
+            self.route_pane_request(pane, request, true)
         } else {
             Some(request)
         }
     }
 
-    pub(super) fn resize(&self, id: u64, request: UiRequest) {
-        let _ = self.route_resize(id, request, false);
+    pub(super) fn post_pane_request(&self, id: u64, request: UiRequest) {
+        let _ = self.route_pane_request(id, request, false);
     }
 
-    fn route_resize(&self, id: u64, request: UiRequest, accept_local: bool) -> Option<UiRequest> {
+    fn route_pane_request(
+        &self,
+        id: u64,
+        request: UiRequest,
+        accept_local: bool,
+    ) -> Option<UiRequest> {
+        if request.pane_reply_closed() {
+            return None;
+        }
         let mut state = self.state.lock().unwrap();
         let Some(owner) = state.panes.get(&id).map(|(owner, _)| *owner) else {
             request.fail(&format!("unknown pane {id}"));
             return None;
         };
         if state.moving.contains_key(&id) {
-            let waiting = state.pending_resizes.entry(id).or_default();
-            waiting.retain(
-                |request| matches!(request, UiRequest::Resize { reply, .. } if !reply.is_closed()),
-            );
+            let waiting = state.pending_pane_requests.entry(id).or_default();
+            waiting.retain(|request| !request.pane_reply_closed());
             if waiting.len() >= 8 {
-                request.fail("Too many resize requests waiting on the pane transfer");
+                request.fail("Too many requests waiting on the pane transfer");
             } else {
                 waiting.push(request);
             }
@@ -592,7 +598,7 @@ mod tests {
         one.unregister().unwrap();
         assert!(two.pane(3).unwrap().input.same_channel(&pane.input));
         let (reply, mut rx) = oneshot::channel();
-        two.resize(
+        two.post_pane_request(
             3,
             UiRequest::Resize {
                 pane: 3,
@@ -639,7 +645,7 @@ mod tests {
         let pane = pane(5);
         one.replace([pane.clone()]);
         let (reply, received) = oneshot::channel();
-        one.resize(
+        one.post_pane_request(
             5,
             UiRequest::Resize {
                 pane: 5,
@@ -655,6 +661,150 @@ mod tests {
         drop(transfer);
         assert!(one.for_this_window(queued).is_none());
         assert_eq!(received.await.unwrap().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sftp_cancellation_follows_the_pane_and_ignores_abandoned_replies() {
+        let source = Registry::default();
+        let target = source.register_window(2, None).unwrap();
+        let (tx, mut source_ui) = mpsc::unbounded_channel();
+        source.set_ui(move |request| tx.send(request).unwrap());
+        let (tx, mut target_ui) = mpsc::unbounded_channel();
+        target.set_ui(move |request| tx.send(request).unwrap());
+        let pane = pane(5);
+        source.replace([pane.clone()]);
+        let id = crate::sftp::TransferId {
+            pane: 5,
+            generation: 2,
+            serial: 7,
+        };
+        let cancel = |reply| UiRequest::CancelSftpTransfer {
+            transfer_id: id,
+            reply,
+        };
+        let (reply, response) = oneshot::channel();
+        source.post_pane_request(5, cancel(reply));
+        let queued = source_ui.try_recv().unwrap();
+        let moving = source.begin_transfer(&[5]).unwrap();
+        assert!(source.for_this_window(queued).is_none());
+        let (reply, abandoned) = oneshot::channel();
+        source.post_pane_request(5, cancel(reply));
+        drop(abandoned);
+        target.replace([pane]);
+        source.replace([]);
+        drop(moving);
+        let request = target
+            .for_this_window(target_ui.try_recv().unwrap())
+            .unwrap();
+        let UiRequest::CancelSftpTransfer { transfer_id, reply } = request else {
+            panic!("expected cancellation");
+        };
+        assert_eq!(transfer_id, id);
+        reply.send(Ok(json!("cancelling"))).unwrap();
+        assert_eq!(response.await.unwrap().unwrap(), "cancelling");
+        assert!(target_ui.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_transfer_distinguishes_pane_closure_from_a_recorded_result() {
+        use crate::events::Events;
+        use crate::sftp::{TransferId, TransferOutcome};
+        for finished in [false, true] {
+            let registry = Registry::default();
+            let (input, mut commands) = mpsc::unbounded_channel();
+            registry.replace([Pane { input, ..pane(7) }]);
+            let id = TransferId {
+                pane: 7,
+                generation: 1,
+                serial: 1,
+            };
+            let journal = Events::default();
+            journal.sftp_transfer_started(id);
+            let waiting = tokio::spawn(async move {
+                registry
+                    .execute(
+                        Request::WaitSftpTransfer {
+                            transfer_id: id,
+                            timeout_seconds: 10,
+                        },
+                        capture(),
+                    )
+                    .await
+            });
+            let Some(crate::session::Command::Events(reply)) = commands.recv().await else {
+                panic!("expected the wait to obtain the pane journal");
+            };
+            if finished {
+                journal.sftp_transfer_finished(id, TransferOutcome::Completed, "done", None, false);
+            }
+            reply.send(journal).unwrap();
+            drop(commands);
+            let response = waiting.await.unwrap();
+            if finished {
+                assert_eq!(response.unwrap()["transfer"]["outcome"], "completed");
+            } else {
+                assert!(
+                    response
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Pane closed before")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_listing_uses_the_current_owners_across_windows() {
+        use crate::control::SftpTransferStatus;
+        use crate::sftp::{TransferId, TransferOperation, TransferPhase};
+        let one = Registry::default();
+        let two = one.register_window(2, None).unwrap();
+        one.replace([pane(7)]);
+        two.replace([pane(9)]);
+        for window in [&one, &two] {
+            let window_id = window.window_id();
+            window.set_ui(move |request| {
+                let UiRequest::ListSftpTransfers { pane, reply } = request else {
+                    panic!("expected a transfer listing");
+                };
+                // Each sample can contain a duplicate when a pane moves.
+                let rows = [7, 9]
+                    .into_iter()
+                    .filter(|id| pane.is_none_or(|pane| pane == *id))
+                    .map(|id| SftpTransferStatus {
+                        transfer_id: TransferId {
+                            pane: id,
+                            generation: 1,
+                            serial: 2,
+                        },
+                        pane: id,
+                        window_id,
+                        tab_id: id + 10,
+                        label: "fixture".into(),
+                        operation: TransferOperation::DownloadFile,
+                        state: TransferPhase::Running,
+                        remote: None,
+                        progress: None,
+                        batch: None,
+                    })
+                    .collect();
+                reply.send(Ok(rows)).unwrap();
+            });
+        }
+        let all = one
+            .execute(Request::ListSftpTransfers { pane: None }, capture())
+            .await
+            .unwrap();
+        let rows = all["transfers"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["window_id"], one.window_id());
+        assert_eq!(rows[1]["window_id"], two.window_id());
+        let filtered = one
+            .execute(Request::ListSftpTransfers { pane: Some(9) }, capture())
+            .await
+            .unwrap();
+        assert_eq!(filtered["transfers"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["transfers"][0]["transfer_id"], "9:1:2");
     }
 
     #[test]

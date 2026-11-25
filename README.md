@@ -389,6 +389,16 @@ Saved workspaces record the local executable, arguments and directory. Opening t
 
 On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files. You can also drag files and folders together from Explorer onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
 
+Choose **Select downloads…**, mark files or folders, and use **Download marked** to select one destination folder. Marks stay selected while you change pages, sort, or filter the listing. Files and folders keep their remote names. An existing destination, transfer error, or cancellation stops the batch and keeps items already saved.
+
+If a drawer transfer finishes while another pane is active or the drawer is closed, the **Attention inbox** gets one result for the transfer or batch. Select the result to open the originating pane’s SFTP drawer.
+
+Open **SFTP transfers** from the caret menu or command palette to see active drawer uploads and downloads across the current window. The tab shows the current item and byte progress for each transfer. Cancel a transfer from the list or use **Open SFTP drawer** to visit its pane.
+
+Scripts can list, cancel, and wait for drawer transfers with `w11term-cli sftp list-transfers`, `cancel-transfer`, and `wait-transfer`. [SFTP control commands](CONTROL.md#control-drawer-transfers)
+
+After a file or folder is saved, choose **Show download in File Explorer** in the drawer or beside its inbox result to select it. Use **Open download folder** for a batch that saved at least one item. Each inbox result keeps its own destination so you can find earlier downloads.
+
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
 Choose **Properties…** on a file, folder or symbolic link to read its current metadata. The dialog shows the remote path, entry type, size in bytes, octal permissions, numeric owner and group, and modification and access times in UTC. Unreported fields are marked **Not reported**. For a symbolic link, the dialog shows the link’s own attributes and asks the server for its target path. This also works for a dangling link.
@@ -400,6 +410,8 @@ Before replacing a file, w11term compares its contents to the version you opened
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
 Choose **Download and verify…** on a file and paste its expected SHA-256 digest from a source you trust. w11term checks the downloaded bytes before saving to the chosen destination. If the digest differs, the temporary download is discarded and any existing destination is kept, even with **Replace existing files** enabled.
+
+Enable **Resume interrupted download** to keep a partial file beside the destination after a disconnect, cancellation, or restart. Repeat the download with the same destination and digest to continue. w11term checks the SHA-256 of the entire file before publishing it. To abandon an interrupted download, delete its `.w11term-download-*.part` file after the transfer stops.
 
 Choose **Download folder…** on a remote directory and select a Windows folder
 to receive it. For example, choosing `Downloads` for `/tmp/diagnostics`

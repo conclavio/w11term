@@ -35,10 +35,16 @@ mod drop_source;
 mod editor;
 mod find;
 pub use find::{FilenameMatch, FilenameSearch, valid_filename_query};
+mod resume_download;
+use resume_download::ResumeDownload;
 mod text_preview;
+mod transfer_status;
+pub use transfer_status::{
+    TransferBatchProgress, TransferId, TransferOperation, TransferOutcome, TransferPhase,
+};
 mod upload_directory;
 pub(crate) use directory::valid_component;
-pub use directory::validate_download_name;
+pub use directory::{validate_download_name, validate_download_names};
 pub use drop_source::{DropSource, classify_drop};
 
 pub const CHUNK: usize = 32 * 1024;
@@ -55,9 +61,49 @@ pub fn normalize_sha256(value: &str) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 
+fn digest_hex(digest: Sha256) -> String {
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 struct DownloadChecks {
     max_bytes: Option<u64>,
     sha256: Option<String>,
+    resume: bool,
+}
+
+enum DownloadStaging {
+    Temporary(tempfile::NamedTempFile),
+    Resumable(ResumeDownload),
+}
+
+impl DownloadStaging {
+    fn cancelled_reply(&self, local: &Path, remote: &str, bytes: u64) -> Value {
+        let mut reply = cancelled_transfer(local, remote, bytes, false);
+        if let Self::Resumable(partial) = self {
+            reply["partial_file"] = json!(partial.path);
+        }
+        reply
+    }
+
+    fn publish(self, file: std::fs::File, destination: PathBuf, overwrite: bool) -> Result<()> {
+        match self {
+            Self::Temporary(temp) => {
+                drop(file);
+                apply_mark_of_the_web(temp.path())?;
+                if overwrite {
+                    temp.persist(destination)
+                } else {
+                    temp.persist_noclobber(destination)
+                }?;
+                Ok(())
+            }
+            Self::Resumable(partial) => partial.publish(file, overwrite),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -105,6 +151,8 @@ pub enum Operation {
         overwrite: bool,
         #[serde(default)]
         expected_sha256: Option<String>,
+        #[serde(default)]
+        resume: bool,
     },
     GetDir {
         remote: String,
@@ -330,7 +378,7 @@ pub fn open_flags(flags: &[String]) -> Result<OpenFlags> {
 
 /// Bytes written to the local file or acknowledged by the remote server.
 /// The total is a metadata estimate. Completion is reported by the job reply.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TransferProgress {
     pub bytes: u64,
     pub total: Option<u64>,
@@ -392,6 +440,7 @@ struct PendingReply {
 
 enum JobStage {
     Ordinary,
+    ResumableDownload,
     DirectoryDownload {
         staging: Option<tempfile::TempDir>,
         deadline: Instant,
@@ -426,6 +475,7 @@ impl JobStage {
     fn interrupted(&self) -> Cow<'static, str> {
         match self {
             Self::Ordinary => "SFTP operation interrupted; outcome may be unknown".into(),
+            Self::ResumableDownload => "Resumable download interrupted. Check the destination, then retry with the same local path and SHA-256 to continue from any partial file".into(),
             Self::DirectoryDownload { .. } => "Folder download interrupted before publication".into(),
             Self::DirectoryUpload(state) => state.interrupted().into(),
             Self::Upload => {
@@ -624,6 +674,7 @@ pub(crate) async fn run(
                     confirmed: 0,
                 },
                 Operation::Put { .. } => JobStage::Upload,
+                Operation::Get { resume: true, .. } => JobStage::ResumableDownload,
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
                 Operation::GetDir { .. } => JobStage::DirectoryDownload {
@@ -683,7 +734,12 @@ pub(crate) async fn run(
                         ))
                 {
                     result.with_context(|| reply.stage.interrupted())
-                } else if lost && matches!(reply.stage, JobStage::DirectoryDownload { .. }) {
+                } else if lost
+                    && matches!(
+                        reply.stage,
+                        JobStage::DirectoryDownload { .. } | JobStage::ResumableDownload
+                    )
+                {
                     result.context(reply.stage.interrupted())
                 } else if lost {
                     result.context("SFTP channel failed; outcome may be unknown; handles invalidated, do not blindly retry")
@@ -696,6 +752,7 @@ pub(crate) async fn run(
                 if matches!(
                     reply.stage,
                     JobStage::DirectoryDownload { .. }
+                        | JobStage::ResumableDownload
                         | JobStage::DirectoryUpload(_)
                         | JobStage::EditorSave { .. }
                         | JobStage::AtomicUpload { .. }
@@ -874,6 +931,7 @@ impl Engine {
                 overwrite,
                 max_bytes,
                 expected_sha256,
+                resume,
             } => {
                 self.get(
                     remote,
@@ -885,6 +943,7 @@ impl Engine {
                             .as_deref()
                             .map(normalize_sha256)
                             .transpose()?,
+                        resume,
                     },
                     progress,
                     cancel,
@@ -1244,11 +1303,14 @@ impl Engine {
         &self,
         h: &str,
         file: &mut (impl tokio::io::AsyncWrite + Unpin),
+        mut offset: u64,
         limit: Option<(u64, &str)>,
         cancel: Option<&TransferCancel>,
         mut advanced: impl FnMut(u64, &[u8]) -> Result<()>,
     ) -> Result<u64> {
-        let mut offset = 0u64;
+        if let Some((max, reason)) = limit {
+            ensure!(offset <= max, "download exceeds {reason} ({max} bytes)");
+        }
         while !cancel.is_some_and(TransferCancel::is_cancelled) {
             // At a byte limit, one additional byte distinguishes an exact fit from truncation.
             let len = limit.map_or(self.read_size as u64, |(max, _)| {
@@ -1300,38 +1362,77 @@ impl Engine {
         if !overwrite {
             ensure!(
                 !local.try_exists()?,
-                "local destination exists; use --overwrite"
+                "The local destination already exists at {}",
+                local.display()
             );
         }
         let parent = local
             .parent()
             .context("local destination has no parent")?
             .to_owned();
+        let resumed_digest = if checks.resume {
+            Some(
+                checks
+                    .sha256
+                    .clone()
+                    .context("--resume requires --sha256")?,
+            )
+        } else {
+            None
+        };
+        let staging_local = local.clone();
         let before_create = cancel.cloned();
-        let Some(temp) = tokio::task::spawn_blocking(move || {
+        let Some((staging, file)) = tokio::task::spawn_blocking(move || -> Result<_> {
             if before_create
                 .as_ref()
                 .is_some_and(TransferCancel::is_cancelled)
             {
-                Ok(None)
-            } else {
-                tempfile::NamedTempFile::new_in(parent).map(Some)
+                return Ok(None);
             }
+            let stage = if let Some(expected) = resumed_digest {
+                let (partial, file) = ResumeDownload::open(&staging_local, &expected)?;
+                (DownloadStaging::Resumable(partial), file)
+            } else {
+                let temp = tempfile::NamedTempFile::new_in(parent)?;
+                let file = temp.reopen()?;
+                (DownloadStaging::Temporary(temp), file)
+            };
+            Ok(Some(stage))
         })
         .await??
         else {
             return Ok(cancelled_transfer(&local, &remote, 0, false));
         };
-        let mut file = tokio::fs::File::from_std(temp.reopen()?);
+        let mut file = tokio::fs::File::from_std(file);
+        let resumed_from = if checks.resume {
+            file.metadata().await?.len()
+        } else {
+            0
+        };
+        let mut digest = checks.sha256.as_ref().map(|_| Sha256::new());
+        if let Some(hash) = digest.as_mut().filter(|_| resumed_from != 0) {
+            if let Some(max) = checks.max_bytes {
+                ensure!(
+                    resumed_from <= max,
+                    "download exceeds --max-bytes limit ({max} bytes)"
+                );
+            }
+            let mut prefix = (&mut file).take(resumed_from);
+            let mut buffer = vec![0; CHUNK];
+            while !cancelled() && prefix.limit() != 0 {
+                let len = prefix.read(&mut buffer).await?;
+                ensure!(len > 0, "Partial download ended before its reported size");
+                hash.update(&buffer[..len]);
+            }
+        }
         if cancelled() {
-            return Ok(cancelled_transfer(&local, &remote, 0, false));
+            return Ok(staging.cancelled_reply(&local, &remote, resumed_from));
         }
         let h = self
             .raw
             .open(&remote, OpenFlags::READ, FileAttributes::empty())
             .await?
             .handle;
-        let mut digest = checks.sha256.as_ref().map(|_| Sha256::new());
         let copied = async {
             // Some servers omit size or disallow FSTAT on readable files.
             let total = if progress.is_some() && !cancelled() {
@@ -1343,11 +1444,12 @@ impl Engine {
             } else {
                 None
             };
-            report(progress, 0, total);
+            report(progress, resumed_from, total);
             let offset = self
                 .read_contents(
                     &h,
                     &mut file,
+                    resumed_from,
                     checks.max_bytes.map(|n| (n, "--max-bytes limit")),
                     cancel,
                     |offset, chunk| {
@@ -1368,47 +1470,47 @@ impl Engine {
         let closed = self.raw.close(h).await;
         let bytes = copied?;
         closed?;
-        drop(file);
         if cancelled() {
-            return Ok(cancelled_transfer(&local, &remote, bytes, false));
+            return Ok(staging.cancelled_reply(&local, &remote, bytes));
         }
-        let verified_sha256 = digest.map(|digest| {
-            digest
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        });
-        if let (Some(expected), Some(actual)) = (&checks.sha256, &verified_sha256) {
-            ensure!(
-                actual == expected,
+        let file = file.into_std().await;
+        let verified_sha256 = digest.map(digest_hex);
+        if let (Some(expected), Some(actual)) = (&checks.sha256, &verified_sha256)
+            && actual != expected
+        {
+            let mismatch = format!(
                 "SHA-256 mismatch. Expected {expected}, received {actual}. The download was not installed."
             );
+            if let DownloadStaging::Resumable(partial) = staging {
+                tokio::task::spawn_blocking(move || partial.discard(file))
+                    .await?
+                    .context(mismatch.clone())?;
+            }
+            bail!(mismatch);
         }
         // This check runs inside the blocking task, so cancellation while the
         // task is queued cannot install the temporary file. Once persist starts,
         // the actual commit result wins even if a cancellation arrives later.
         let destination = local.clone();
         let cancel = cancel.cloned();
+        let cancelled_reply = staging.cancelled_reply(&local, &remote, bytes);
         let committed = tokio::task::spawn_blocking(move || -> Result<bool> {
             if cancel.as_ref().is_some_and(TransferCancel::is_cancelled) {
                 return Ok(false);
             }
-            apply_mark_of_the_web(temp.path())?;
-            if overwrite {
-                temp.persist(destination)
-            } else {
-                temp.persist_noclobber(destination)
-            }?;
+            staging.publish(file, destination, overwrite)?;
             Ok(true)
         })
         .await??;
         if !committed {
-            return Ok(cancelled_transfer(&local, &remote, bytes, false));
+            return Ok(cancelled_reply);
         }
         let mut reply = json!({"local":local,"remote":remote,"bytes_transferred":bytes});
         if let Some(sha256) = verified_sha256 {
             reply["sha256"] = json!(sha256);
+        }
+        if checks.resume {
+            reply["resumed_from"] = json!(resumed_from);
         }
         Ok(reply)
     }

@@ -640,6 +640,11 @@ With **Notify for long commands** on, the same event also includes integer
 `duration_ms` for commands that ran for at least 10 seconds. If the one-shot
 watch is also armed, that completion produces a single event.
 
+When an SFTP drawer transfer or batch ends, the originating pane records one
+`sftp-transfer` event. The data includes `transfer_id`, `outcome`, the
+`message` describing the result, and a `background` flag. Results with `background: true` also appear
+in the Attention inbox.
+
 When a direct SSH shell or local program finishes, a restartable pane emits
 `pane-exited` with `{"exit_token":1}`. The top-level `restart_token` in the
 events result identifies its current exit, even if the event has aged out.
@@ -768,6 +773,48 @@ of the capture.
 
 SFTP is available through a pane's **existing authenticated SSH connection**, on a separate, lazily opened subsystem channel. It never starts a local shell, opens a second SSH login, or changes window/tab focus. A server must offer the `sftp` subsystem; a rejected subsystem leaves the terminal usable. Remote paths are evaluated by the server, independently of the shell's current directory. Use `realpath .` to discover the SFTP working directory, and prefer absolute remote paths in scripts.
 
+### Control drawer transfers
+
+```powershell
+$active = & $ctl --pid 12345 sftp list-transfers | ConvertFrom-Json
+$active.result.transfers
+& $ctl --pid 12345 sftp list-transfers --pane 7
+& $ctl --pid 12345 sftp cancel-transfer $active.result.transfers[0].transfer_id
+& $ctl --pid 12345 sftp wait-transfer $active.result.transfers[0].transfer_id --timeout 30
+```
+
+`list-transfers` samples active drawer transfers across the selected process.
+Each row has `transfer_id`, `pane`, `window_id`, `tab_id`, `label`, `operation`,
+`state`, `remote`, `progress`, and `batch`. Operations are `prepare-upload`,
+`upload-file`, `upload-folder`, `download-file`, and `download-folder`.
+A transfer is `preparing`, `running`, or `cancelling`. When available,
+`progress` has `bytes`, the estimated `total`,
+and the number of completed `files`. A multi-item batch has one-based `item`
+and `total` in `batch`. Progress and batch data can be `null`.
+
+Pass the exact `transfer_id` from the same process to `cancel-transfer`. The ID
+stays with the batch across items and pane moves. An accepted cancellation
+returns `cancelling`, `already-cancelling`, or `cancelled-before-start` in
+`result.state`. An in-flight transfer may still need to close its remote
+handle. A finished transfer or one from an earlier connection on a live pane
+fails with a stale ID error. A closed pane returns an unknown-pane error.
+The commands leave the selected pane and window focus alone.
+
+`wait-transfer` takes the same ID and waits for that transfer's final journal
+result, or returns it immediately if retained. The reply's `result` contains
+`pane`, `sequence`, `timestamp_ms`, and `transfer` with the same fields as the
+`sftp-transfer` event data. Inspect `outcome` for `completed`, `cancelled`,
+`failed`, or `interrupted`. Any recorded outcome is a successful wait.
+The default timeout is 30 seconds. The transfer keeps running if the wait times
+out. A closed pane or an unknown or evicted ID returns an error.
+
+Direct pipe clients send
+`{"verb":"list-sftp-transfers","pane":7}` or
+`{"verb":"cancel-sftp-transfer","transfer_id":"7:2:11"}`. To wait, send
+`{"verb":"wait-sftp-transfer","transfer_id":"7:2:11","timeout_seconds":30}`.
+
+### Run SFTP operations
+
 ```powershell
 & $ctl --pid 12345 sftp --pane $pane info
 & $ctl --pid 12345 sftp --pane $pane ls /var/log
@@ -823,6 +870,7 @@ The command surface covers SFTP v3:
 | --- | --- |
 | `info` | Negotiated version, advertised extensions, open-handle count, read/write chunk limits |
 | `get REMOTE LOCAL --sha256 HEX` | Verify a single-file download against 64 hexadecimal digits before publishing the local file. A mismatch preserves any existing destination. Success adds `sha256` to `result.sftp`. Direct pipe clients set `expected_sha256` on the `get` operation. |
+| `get REMOTE LOCAL --sha256 HEX --resume` | Keep an interrupted download in a `.w11term-download-*.part` file beside `LOCAL`. Repeat with the same local path and digest on any live connection to continue. Success includes `resumed_from`, the byte offset used for the first remote read. The whole file is verified before publication. A digest mismatch discards the partial file. Direct pipe clients set `resume: true` alongside `expected_sha256`. |
 | `put LOCAL REMOTE --atomic [--overwrite]` | Stage a single file next to its destination before publishing it. Replacing a regular file requires both `--overwrite` and `posix-rename@openssh.com`. Success returns `atomic: true`. Direct pipe clients set `atomic: true` on the `put` operation. |
 | `get-dir REMOTE NEW_LOCAL_DIRECTORY` | Recursively download a directory into the exact local path. Its parent must exist. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
 | `put-dir LOCAL NEW_REMOTE_DIRECTORY` | Recursively upload to the exact remote path. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |

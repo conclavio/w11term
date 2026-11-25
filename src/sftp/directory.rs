@@ -23,6 +23,18 @@ pub fn validate_download_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_download_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    for name in names {
+        validate_download_name(name)?;
+        ensure!(
+            unique.insert(WindowsName(name.encode_utf16().collect())),
+            "Selected names conflict on Windows: {name:?}"
+        );
+    }
+    Ok(())
+}
+
 // Use Windows' filename comparison even in an explicitly case-sensitive directory.
 #[derive(Eq)]
 struct WindowsName(Vec<u16>);
@@ -296,6 +308,7 @@ impl Download<'_> {
                 .read_contents(
                     &h,
                     &mut file,
+                    0,
                     expected.map(|n| (n, "reported file size")),
                     self.cancel,
                     |n, _| {

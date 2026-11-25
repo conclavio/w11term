@@ -91,6 +91,7 @@ mod quick_connect;
 mod recordings;
 mod scrollback_bar;
 mod session_browser;
+mod sftp_transfers;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
 mod tab_colors;
@@ -386,6 +387,7 @@ enum Page {
     LocalForwards(local_forwards::Panel),
     SharedFolders(folder_shares::Panel),
     Attention(attention::AttentionPage),
+    SftpTransfers,
     CommandHistory(command_history::HistoryPage),
     HostGroup(Box<host_groups::HostGroup>),
     Terminal(LiveTab),
@@ -780,6 +782,7 @@ fn tab_menu_message(label: String) -> Message {
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         "Attention inbox" => Message::Attention(attention::Action::Open),
+        sftp_transfers::LABEL => Message::SftpTransfers(sftp_transfers::Action::Open),
         host_groups::LABEL => Message::HostGroup(host_groups::Action::Open),
         host_groups::NEW_TAB_LABEL => Message::HostGroup(host_groups::Action::NewTab),
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
@@ -1072,6 +1075,7 @@ pub enum Message {
     PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
+    SftpTransfers(sftp_transfers::Action),
     AttentionChanged,
     VisualBellTick,
     ToggleInspector,
@@ -1367,6 +1371,7 @@ impl TerminalApp {
         ));
     }
     fn connection_ui(&mut self, id: TabId) {
+        let active = self.tabs.active_id() == Some(id);
         let Some(AppTab {
             page: Page::Terminal(tab),
             ..
@@ -1375,7 +1380,7 @@ impl TerminalApp {
             return;
         };
         let frame = tab.session.frames.load();
-        tab.files.observe_connection(frame.connection_generation);
+        tab.observe_file_connection(frame.connection_generation, active);
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
         if self.hints.borrow().as_ref().is_some_and(|h| {
             h.pane == id
@@ -3884,6 +3889,7 @@ impl TerminalApp {
                 KeyAction::FindAllPanes,
             ),
             MenuItem::item("inbox", "Attention inbox"),
+            MenuItem::item("sftp-transfers", sftp_transfers::LABEL),
             MenuItem::item("ssh-host-group", host_groups::LABEL),
             MenuItem::item("new-ssh-group-tab", host_groups::NEW_TAB_LABEL),
             recordings.menu(),
@@ -5221,6 +5227,7 @@ impl Component for TerminalApp {
             Message::TransferCanceled(id) => self.cancel_transfer(id, context),
             Message::TabTitle(action) => self.edit_tab_title(action, context),
             Message::Attention(action) => self.handle_attention(action, context),
+            Message::SftpTransfers(action) => self.handle_sftp_transfers(action, context),
             Message::AttentionChanged | Message::FolderAuthority => {}
             Message::VisualBellTick => self.expire_visual_bells(),
             Message::ToggleInspector => {
@@ -5534,6 +5541,20 @@ impl Component for TerminalApp {
             Message::Control(w11term::control::UiRequest::ListSshGroups { reply }) => {
                 if !reply.is_closed() {
                     let _ = reply.send(Ok(self.control_ssh_groups()));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::ListSftpTransfers { pane, reply }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(Ok(self.control_sftp_transfers(pane)));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::CancelSftpTransfer {
+                transfer_id,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = self.control_cancel_sftp_transfer(transfer_id);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
             Message::Control(w11term::control::UiRequest::OpenSshGroup { name, reply }) => {
@@ -5988,7 +6009,7 @@ impl Component for TerminalApp {
                             );
                         }
                         tab.error = None;
-                        tab.files.observe_connection(frame.connection_generation);
+                        tab.observe_file_connection(frame.connection_generation, active);
                         if active {
                             tab.follow_shell_directory(&frame, context);
                         }
@@ -6237,7 +6258,7 @@ impl Component for TerminalApp {
                 self.finish_directory_copy(request, result)
             }
             Message::ExplorerOpened(Err(error)) => {
-                self.window_error = Some(format!("Couldn’t open the current folder. {error}"));
+                self.window_error = Some(format!("Couldn’t open File Explorer. {error}"));
             }
             Message::ExplorerOpened(Ok(())) => {}
             Message::SyncSelection(epoch) => {
@@ -7143,6 +7164,7 @@ impl Component for TerminalApp {
                     word_delimiters::view(editor, context)
                 }
                 Page::Attention(page) => self.attention_view(page, context),
+                Page::SftpTransfers => self.sftp_transfers_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::HostGroup(page) => self.host_group_view(id, page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),

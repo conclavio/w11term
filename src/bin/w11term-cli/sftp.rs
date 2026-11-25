@@ -6,9 +6,12 @@ use w11term::{
     sftp::{Attributes, DEFAULT_TIMEOUT, Operation, normalize_sha256},
 };
 
-pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
+pub const HELP: &str = "w11term-cli [--pid PID] sftp list-transfers [--pane ID]\n\
+w11term-cli [--pid PID] sftp cancel-transfer TRANSFER_ID\n\
+w11term-cli [--pid PID] sftp wait-transfer TRANSFER_ID [--timeout SECONDS]\n\
+w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
-  get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX]\n\
+  get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX [--resume]]\n\
   put LOCAL REMOTE [--overwrite] [--atomic]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
@@ -39,6 +42,7 @@ pub fn parse(
     let mut opts = BTreeMap::new();
     let mut overwrite = false;
     let mut atomic = false;
+    let mut resume = false;
     let mut spec_order = false;
     while let Some(arg) = args.next() {
         let value = |args: &mut std::iter::Peekable<_>| {
@@ -55,6 +59,10 @@ pub fn parse(
             "--atomic" => {
                 ensure!(!atomic, "duplicate --atomic");
                 atomic = true;
+            }
+            "--resume" => {
+                ensure!(!resume, "duplicate --resume");
+                resume = true;
             }
             "--spec-order" => {
                 ensure!(!spec_order, "duplicate --spec-order");
@@ -76,7 +84,59 @@ pub fn parse(
         }
     }
     let command = command.context(HELP)?;
+    if matches!(
+        command.as_str(),
+        "list-transfers" | "cancel-transfer" | "wait-transfer"
+    ) {
+        let wait_timeout = if command == "wait-transfer" {
+            let timeout = opts
+                .remove("--timeout")
+                .map(|value| value.parse::<u64>())
+                .transpose()?
+                .unwrap_or(30);
+            ensure!(
+                (1..=3600).contains(&timeout),
+                "timeout must be 1..=3600 seconds"
+            );
+            Some(timeout)
+        } else {
+            None
+        };
+        ensure!(
+            opts.is_empty() && !overwrite && !atomic && !resume && !spec_order,
+            "Unexpected options for {command}"
+        );
+        let request = if command == "list-transfers" {
+            ensure!(
+                positional.is_empty(),
+                "list-transfers takes only an optional --pane"
+            );
+            ensure!(pane != Some(0), "--pane must be positive");
+            Request::ListSftpTransfers { pane }
+        } else {
+            ensure!(
+                pane.is_none(),
+                "The transfer ID already identifies its pane"
+            );
+            let [id] = positional.as_slice() else {
+                bail!("{command} requires one transfer ID from list-transfers");
+            };
+            let transfer_id = id.parse().context("Invalid SFTP transfer ID")?;
+            match wait_timeout {
+                Some(timeout_seconds) => Request::WaitSftpTransfer {
+                    transfer_id,
+                    timeout_seconds,
+                },
+                None => Request::CancelSftpTransfer { transfer_id },
+            }
+        };
+        return Ok((pid, request));
+    }
     ensure!(!atomic || command == "put", "--atomic requires put");
+    ensure!(
+        !resume || (command == "get" && opts.contains_key("--sha256")),
+        "--resume requires get with --sha256"
+    );
     let timeout = opts
         .remove("--timeout")
         .map(|s| s.parse::<u64>())
@@ -117,6 +177,7 @@ pub fn parse(
                 && let Some(sha256) = opts.remove("--sha256")
             {
                 fields.insert("expected_sha256".into(), json!(normalize_sha256(&sha256)?));
+                fields.insert("resume".into(), json!(resume));
             }
         }
         "rename" | "hardlink" => {
@@ -246,6 +307,49 @@ mod tests {
     }
 
     #[test]
+    fn transfer_commands_accept_only_a_pane_filter_or_an_exact_transfer_id() {
+        let (pid, list) = p(&["list-transfers", "--pid", "42", "--pane", "9"]).unwrap();
+        assert_eq!(pid, Some(42));
+        assert!(matches!(list, Request::ListSftpTransfers { pane: Some(9) }));
+        assert!(matches!(
+            p(&["list-transfers"]).unwrap().1,
+            Request::ListSftpTransfers { pane: None }
+        ));
+        let (_, cancel) = p(&["cancel-transfer", "9:2:11"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(cancel).unwrap(),
+            json!({"verb":"cancel-sftp-transfer", "transfer_id":"9:2:11"})
+        );
+        let (_, wait) = p(&["wait-transfer", "9:2:11", "--timeout", "42"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(wait).unwrap(),
+            json!({"verb":"wait-sftp-transfer", "transfer_id":"9:2:11", "timeout_seconds":42})
+        );
+        assert!(matches!(
+            p(&["wait-transfer", "9:2:11"]).unwrap().1,
+            Request::WaitSftpTransfer {
+                timeout_seconds: 30,
+                ..
+            }
+        ));
+        for invalid in [
+            &["list-transfers", "extra"][..],
+            &["list-transfers", "--pane", "0"],
+            &["list-transfers", "--timeout", "5"],
+            &["cancel-transfer", "9:2"],
+            &["cancel-transfer", "9:2:0"],
+            &["cancel-transfer", "9:2:11:3"],
+            &["cancel-transfer", "9:2:+1"],
+            &["cancel-transfer", "--pane", "9", "9:2:11"],
+            &["wait-transfer", "9:2:11", "--timeout", "0"],
+            &["wait-transfer", "9:2:11", "--timeout", "3601"],
+            &["wait-transfer", "9:2:11", "extra"],
+        ] {
+            assert!(p(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn folder_upload_resolves_the_local_source_and_requires_a_new_remote_name() {
         for command in ["put-dir", "put_dir"] {
             let (
@@ -317,18 +421,23 @@ mod tests {
             Request::Sftp {
                 operation:
                     Operation::Get {
-                        expected_sha256, ..
+                        expected_sha256,
+                        resume,
+                        ..
                     },
                 ..
             },
         ) = p(&[
-            "get", "--pane", "2", "/remote", "local", "--sha256", &digest,
+            "get", "--pane", "2", "/remote", "local", "--sha256", &digest, "--resume",
         ])
         .unwrap()
         else {
             panic!("expected a single file download")
         };
         assert_eq!(expected_sha256, Some(digest.to_ascii_lowercase()));
+        assert!(resume);
+        assert!(p(&["get", "--pane", "2", "/remote", "local", "--resume"]).is_err());
+        assert!(p(&["put", "--pane", "2", "local", "/remote", "--resume"]).is_err());
         assert!(p(&["get", "--pane", "2", "/remote", "local", "--sha256", "abcd"]).is_err());
         assert!(
             p(&[

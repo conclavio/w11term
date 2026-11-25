@@ -1,4 +1,6 @@
-use super::{CommandLink, Event, GroupTranscriptLine, PendingSshAttempt, SshAttemptOutcome};
+use super::{
+    CommandLink, Event, GroupTranscriptLine, PendingSshAttempt, SavedDownload, SshAttemptOutcome,
+};
 use std::{
     collections::VecDeque,
     fmt,
@@ -13,6 +15,10 @@ const CAPACITY: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeTarget {
     Pane {
+        pane: u64,
+        sequence: u64,
+    },
+    SftpTransfer {
         pane: u64,
         sequence: u64,
     },
@@ -59,6 +65,14 @@ pub struct Notice {
     pub unread: bool,
     pub command: Option<CommandLink>,
     pub login_results: Option<Arc<[SshLoginResult]>>,
+    pub saved_download: Option<SavedDownload>,
+}
+
+#[derive(Default)]
+struct NoticeDetails {
+    command: Option<CommandLink>,
+    login_results: Option<Arc<[SshLoginResult]>>,
+    saved_download: Option<SavedDownload>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -95,7 +109,15 @@ impl fmt::Debug for Inbox {
 }
 
 pub(crate) fn display_field(field: &str) -> String {
-    let prefix: String = field.chars().take(200).collect();
+    display_field_with_limit(field, 200)
+}
+
+pub(super) fn sftp_transfer_text(field: &str) -> String {
+    display_field_with_limit(field, 640)
+}
+
+fn display_field_with_limit(field: &str, limit: usize) -> String {
+    let prefix: String = field.chars().take(limit).collect();
     prefix
         .split(|c: char| {
             c.is_whitespace()
@@ -146,6 +168,12 @@ impl Inbox {
                         .collect()
                 }
             }
+            "sftp-transfer" if event.data["background"] == true => {
+                let Some(message) = event.data["message"].as_str() else {
+                    return;
+                };
+                format!("SFTP transfer · {}", sftp_transfer_text(message))
+            }
             "command-finished" => event.data["exit_code"].as_i64().map_or_else(
                 || "Command finished · exit status unavailable".into(),
                 |code| format!("Command finished · exit code {code}"),
@@ -155,15 +183,26 @@ impl Inbox {
                 .map_or_else(|| notification_text(&event.data), str::to_owned),
             _ => return,
         };
-        self.push(
+        let target = if event.kind == "sftp-transfer" {
+            NoticeTarget::SftpTransfer {
+                pane,
+                sequence: event.sequence,
+            }
+        } else {
             NoticeTarget::Pane {
                 pane,
                 sequence: event.sequence,
-            },
+            }
+        };
+        self.push(
+            target,
             source.clone(),
             message,
-            event.command,
-            None,
+            NoticeDetails {
+                command: event.command,
+                saved_download: event.saved_download.clone(),
+                ..NoticeDetails::default()
+            },
             (
                 match (live, event.kind.as_str()) {
                     (true, "command-finished") => Effect::FlashTaskbar,
@@ -198,8 +237,7 @@ impl Inbox {
             NoticeTarget::GroupRun { tab, submission },
             display_field(source).into(),
             message,
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -221,8 +259,7 @@ impl Inbox {
             NoticeTarget::GroupCanary { tab, submission },
             display_field(source).into(),
             format!("{result} · {}", display_field(host)),
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -247,8 +284,10 @@ impl Inbox {
             NoticeTarget::GroupLogins { tab, sequence },
             display_field(source).into(),
             format!("SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"),
-            None,
-            Some(results.into()),
+            NoticeDetails {
+                login_results: Some(results.into()),
+                ..NoticeDetails::default()
+            },
             (Effect::FlashTaskbar, None),
         );
     }
@@ -276,8 +315,7 @@ impl Inbox {
             },
             display_field(source).into(),
             message,
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -342,8 +380,7 @@ impl Inbox {
             NoticeTarget::GroupOutputMissing { tab, submission },
             display_field(source).into(),
             message,
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -353,8 +390,7 @@ impl Inbox {
         target: NoticeTarget,
         source: Arc<str>,
         message: String,
-        command: Option<CommandLink>,
-        login_results: Option<Arc<[SshLoginResult]>>,
+        details: NoticeDetails,
         (effect, eviction): (Effect, Option<Arc<Notify>>),
     ) {
         let mut state = self.state.lock().unwrap();
@@ -374,8 +410,9 @@ impl Inbox {
             source,
             message,
             unread: true,
-            command,
-            login_results,
+            command: details.command,
+            login_results: details.login_results,
+            saved_download: details.saved_download,
         });
         self.wake_ui(state);
     }
@@ -429,7 +466,9 @@ impl Inbox {
     pub(super) fn move_pane_to(&self, pane: u64, target: &Self) {
         let mut moved = Vec::new();
         self.state.lock().unwrap().rows.retain(|notice| {
-            if matches!(notice.target, NoticeTarget::Pane { pane: from, .. } if from == pane) {
+            if matches!(notice.target, NoticeTarget::Pane { pane: from, .. }
+                | NoticeTarget::SftpTransfer { pane: from, .. } if from == pane)
+            {
                 let mut notice = notice.clone();
                 if matches!(notice.effect, Effect::VisualBell(_)) {
                     notice.effect = Effect::None;
@@ -543,6 +582,17 @@ impl Inbox {
             return true;
         }
         false
+    }
+
+    pub fn read_saved_download(&self, target: NoticeTarget) -> Option<SavedDownload> {
+        let NoticeTarget::SftpTransfer { .. } = target else {
+            return None;
+        };
+        let mut state = self.state.lock().unwrap();
+        let row = state.rows.iter_mut().find(|row| row.target == target)?;
+        let location = row.saved_download.clone()?;
+        row.unread = false;
+        Some(location)
     }
 
     pub fn mark_all_read(&self) {
@@ -662,6 +712,67 @@ mod tests {
             [(2, 2), (1, 2), (2, 1), (1, 1)]
                 .map(|(pane, sequence)| NoticeTarget::Pane { pane, sequence })
         );
+    }
+
+    #[test]
+    fn transfer_results_are_quiet_and_follow_the_owning_pane() {
+        let events = Events::default();
+        let first = Inbox::new(|| {});
+        let second = Inbox::new(|| {});
+        events.connect_inbox(12, "SSH", &first);
+        let location = SavedDownload::BatchFolder(Arc::from(std::path::Path::new(r"C:\download")));
+        let id = crate::sftp::TransferId {
+            pane: 12,
+            generation: 1,
+            serial: 1,
+        };
+        events.sftp_transfer_finished(
+            id,
+            crate::sftp::TransferOutcome::Completed,
+            "Downloaded\nreport \u{202e} 2 of 2 items completed.",
+            Some(location.clone()),
+            true,
+        );
+        let target = NoticeTarget::SftpTransfer {
+            pane: 12,
+            sequence: 1,
+        };
+        let row = &first.rows()[0];
+        assert_eq!(row.target, target);
+        assert_eq!(
+            row.message,
+            "SFTP transfer · Downloaded report 2 of 2 items completed."
+        );
+        assert!(row.unread);
+        assert!(!first.mark_read(12, 1));
+        let wake = first.acknowledge_wake();
+        assert!(!wake.flash_taskbar && wake.bells.is_empty());
+
+        events.connect_inbox(12, "SSH", &second);
+        assert!(first.rows().is_empty());
+        assert_eq!(second.unread_count(), 1);
+        assert_eq!(second.read_saved_download(target), Some(location));
+        assert_eq!(second.unread_count(), 0);
+        let batch = events.since(0);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "sftp-transfer");
+        assert_eq!(
+            batch.events[0].data["message"],
+            "Downloaded report 2 of 2 items completed."
+        );
+        let event = serde_json::to_value(&batch.events[0]).unwrap();
+        assert!(event.get("saved_download").is_none());
+        assert!(event["data"].get("local").is_none());
+        assert_eq!(event["data"]["transfer_id"], "12:1:1");
+        events.sftp_transfer_finished(
+            crate::sftp::TransferId { serial: 2, ..id },
+            crate::sftp::TransferOutcome::Completed,
+            "Foreground result",
+            None,
+            false,
+        );
+        assert_eq!(second.rows().len(), 1);
+        assert_eq!(events.since(1).events[0].data["background"], false);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Bounded per-pane event journal with monotonic cursors and loss detection.
 use crate::options::GroupPromptPattern;
+use crate::sftp::{TransferId, TransferOutcome};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -41,7 +43,22 @@ pub struct Event {
     #[serde(skip)]
     pub(crate) command: Option<CommandLink>,
     #[serde(skip)]
+    saved_download: Option<SavedDownload>,
+    #[serde(skip)]
     eviction: Option<Arc<Notify>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavedDownload {
+    File(Arc<Path>),
+    Folder(Arc<Path>),
+    BatchFolder(Arc<Path>),
+}
+
+#[derive(Default)]
+struct EventLinks {
+    command: Option<CommandLink>,
+    saved_download: Option<SavedDownload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +105,7 @@ pub struct Batch {
 struct State {
     next: u64,
     events: VecDeque<Event>,
+    active_sftp_transfer: Option<TransferId>,
     progress: wezterm_term::Progress,
     program_status: Option<Arc<wezterm_term::ProgramStatus>>,
     recording: Option<(u64, Arc<Path>)>,
@@ -318,7 +336,7 @@ impl Events {
         }
         let data = phase.as_json();
         state.ssh_connection_phase = Some(phase);
-        Self::append_locked(state, "ssh-connection", data, None);
+        Self::append_locked(state, "ssh-connection", data, EventLinks::default());
         true
     }
 
@@ -812,6 +830,82 @@ impl Events {
         self.append(self.state.lock().unwrap(), kind, data, None);
     }
 
+    pub fn sftp_transfer_finished(
+        &self,
+        transfer_id: TransferId,
+        outcome: TransferOutcome,
+        message: &str,
+        saved_download: Option<SavedDownload>,
+        background: bool,
+    ) {
+        let message = inbox::sftp_transfer_text(message);
+        let mut state = self.state.lock().unwrap();
+        if state.active_sftp_transfer == Some(transfer_id) {
+            state.active_sftp_transfer = None;
+        }
+        Self::append_locked(
+            &mut state,
+            "sftp-transfer",
+            serde_json::json!({ "transfer_id": transfer_id, "outcome": outcome, "message": message, "background": background }),
+            EventLinks {
+                saved_download,
+                ..EventLinks::default()
+            },
+        );
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    pub fn sftp_transfer_started(&self, transfer_id: TransferId) {
+        let mut state = self.state.lock().unwrap();
+        if state.active_sftp_transfer != Some(transfer_id) {
+            state.active_sftp_transfer = Some(transfer_id);
+            drop(state);
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(crate) fn sftp_transfer_result(&self, id: TransferId) -> Option<Event> {
+        Self::settled_sftp_transfer(&self.state.lock().unwrap(), id)
+    }
+
+    fn settled_sftp_transfer(state: &State, id: TransferId) -> Option<Event> {
+        let token = id.to_string();
+        state
+            .events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.kind == "sftp-transfer"
+                    && event.data["transfer_id"].as_str() == Some(token.as_str())
+            })
+            .cloned()
+    }
+
+    pub(crate) async fn wait_sftp_transfer(
+        &self,
+        id: TransferId,
+        deadline: tokio::time::Instant,
+    ) -> Result<Event> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                if state.active_sftp_transfer != Some(id) {
+                    return Self::settled_sftp_transfer(&state, id)
+                        .context("SFTP transfer ID is unknown or its result has expired");
+                }
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "SFTP transfer is still active after the wait timeout"
+            );
+            let _ = tokio::time::timeout_at(deadline, changed).await;
+        }
+    }
+
     fn bounded_data(kind: &str, data: Value) -> Value {
         let serialized = serde_json::to_string(&data).unwrap_or_default();
         if serialized.len() > 4096 {
@@ -840,12 +934,20 @@ impl Events {
         data: Value,
         command: Option<CommandLink>,
     ) {
-        Self::append_locked(&mut state, kind, data, command);
+        Self::append_locked(
+            &mut state,
+            kind,
+            data,
+            EventLinks {
+                command,
+                ..EventLinks::default()
+            },
+        );
         drop(state);
         self.changed.notify_waiters();
     }
 
-    fn append_locked(state: &mut State, kind: &str, data: Value, command: Option<CommandLink>) {
+    fn append_locked(state: &mut State, kind: &str, data: Value, links: EventLinks) {
         state.next += 1;
         let sequence = state.next;
         let timestamp_ms = SystemTime::now()
@@ -859,7 +961,8 @@ impl Events {
             timestamp_ms,
             kind: kind.into(),
             data,
-            command,
+            command: links.command,
+            saved_download: links.saved_download,
             eviction,
         };
         if let Some((pane, label, inbox)) = &state.inbox {
@@ -904,6 +1007,93 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_wait_returns_the_exact_retained_result_and_reports_eviction() {
+        use tokio::time::Instant;
+        let events = Events::default();
+        let id = TransferId {
+            pane: 5,
+            generation: 2,
+            serial: 1,
+        };
+        let other = TransferId { serial: 2, ..id };
+        events.sftp_transfer_started(id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let waiting = events.wait_sftp_transfer(id, deadline);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::ZERO, waiting.as_mut())
+                .await
+                .is_err()
+        );
+        events.sftp_transfer_finished(other, TransferOutcome::Completed, "other", None, false);
+        assert!(
+            tokio::time::timeout(Duration::ZERO, waiting.as_mut())
+                .await
+                .is_err()
+        );
+        events.sftp_transfer_finished(id, TransferOutcome::Cancelled, "cancelled", None, false);
+        let result = waiting.await.unwrap();
+        assert_eq!(result.data["outcome"], "cancelled");
+        assert_eq!(
+            events
+                .wait_sftp_transfer(id, deadline)
+                .await
+                .unwrap()
+                .sequence,
+            result.sequence
+        );
+        for _ in 0..CAPACITY {
+            events.push("title", Value::Null);
+        }
+        assert!(
+            events
+                .wait_sftp_transfer(id, deadline)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_wait_timeout_leaves_the_transfer_active() {
+        use tokio::time::Instant;
+        let events = Events::default();
+        let id = TransferId {
+            pane: 5,
+            generation: 2,
+            serial: 1,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(
+            events
+                .wait_sftp_transfer(id, deadline)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown")
+        );
+        events.sftp_transfer_started(id);
+        assert!(
+            events
+                .wait_sftp_transfer(id, deadline)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("still active")
+        );
+        events.sftp_transfer_finished(id, TransferOutcome::Completed, "verified", None, false);
+        assert_eq!(
+            events
+                .wait_sftp_transfer(id, Instant::now())
+                .await
+                .unwrap()
+                .data["outcome"],
+            "completed"
+        );
+    }
 
     #[test]
     fn closing_an_exited_pane_and_restarting_it_claim_the_same_exit() {

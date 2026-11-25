@@ -91,6 +91,7 @@ impl Prepared {
                     overwrite: false,
                     max_bytes: None,
                     expected_sha256: None,
+                    resume: false,
                 }
             }
         }

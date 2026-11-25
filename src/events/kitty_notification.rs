@@ -362,7 +362,7 @@ impl State {
                 "protocol": "kitty", "id": draft.id, "title": title, "body": body, "buttons": buttons.as_ref(),
             }),
         );
-        Events::append_locked(self, "notification", data, None);
+        Events::append_locked(self, "notification", data, super::EventLinks::default());
         true
     }
 

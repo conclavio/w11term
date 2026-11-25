@@ -1,8 +1,10 @@
+use super::{ComponentContext, Message, TerminalApp};
 use anyhow::{Context, Result, anyhow, ensure};
 use std::{
     os::windows::ffi::OsStrExt,
     path::{Component, Path, PathBuf, Prefix},
 };
+use w11term::events::SavedDownload;
 use windows::{
     Win32::{
         Storage::FileSystem::GetDriveTypeW,
@@ -103,7 +105,7 @@ impl Location {
     }
 }
 
-pub(super) fn reveal_saved_file(path: &Path) -> Result<()> {
+fn check_saved_path(path: &Path) -> Result<()> {
     // This path comes from the user's save picker. Unlike a path taken
     // from terminal output, it can name a network filesystem.
     ensure!(
@@ -117,6 +119,11 @@ pub(super) fn reveal_saved_file(path: &Path) -> Result<()> {
             ),
         "Expected an absolute filesystem path"
     );
+    Ok(())
+}
+
+pub(super) fn reveal_saved_file(path: &Path) -> Result<()> {
+    check_saved_path(path)?;
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("Cannot find {}", path.display()))?;
     ensure!(
@@ -124,6 +131,46 @@ pub(super) fn reveal_saved_file(path: &Path) -> Result<()> {
         "The saved path no longer identifies a file"
     );
     shell_item(path, ShellAction::Select)
+}
+
+pub(super) fn download_label(saved: &SavedDownload) -> &'static str {
+    match saved {
+        SavedDownload::BatchFolder(_) => "Open download folder",
+        SavedDownload::File(_) | SavedDownload::Folder(_) => "Show download in File Explorer",
+    }
+}
+
+pub(super) fn show_download(saved: SavedDownload, context: &ComponentContext<TerminalApp>) {
+    context.spawn_background_with_rejection(
+        move |cancel| {
+            let result = if cancel.is_cancelled() {
+                Err("The Explorer request was cancelled.".into())
+            } else {
+                show_saved_download(&saved).map_err(|error| format!("{error:#}"))
+            };
+            Message::ExplorerOpened(result)
+        },
+        Message::ExplorerOpened(Err("The Explorer request could not start.".into())),
+    );
+}
+
+fn show_saved_download(saved: &SavedDownload) -> Result<()> {
+    let (path, action) = match saved {
+        SavedDownload::File(path) => return reveal_saved_file(path),
+        SavedDownload::Folder(path) => (path, ShellAction::Select),
+        SavedDownload::BatchFolder(path) => (path, ShellAction::Explore),
+    };
+    check_saved_path(path)?;
+    let info = match action {
+        ShellAction::Select => std::fs::symlink_metadata(path),
+        ShellAction::Explore => std::fs::metadata(path),
+    }
+    .with_context(|| format!("Cannot find {}", path.display()))?;
+    ensure!(
+        info.is_dir(),
+        "The saved path no longer identifies a folder"
+    );
+    shell_item(path, action)
 }
 
 fn wsl_root(distribution: &str) -> Option<PathBuf> {

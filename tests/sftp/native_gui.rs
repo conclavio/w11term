@@ -2575,8 +2575,20 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let picker = state.path().join("picker");
     let received = picker.join("receive here");
     let conflict = picker.join("already exists");
+    let batch_received = picker.join("batch received");
+    let batch_conflict = picker.join("batch conflict");
+    let batch_cancelled = picker.join("batch cancelled");
+    let batch_background = picker.join("batch background");
+    let batch_background_conflict = picker.join("batch background conflict");
     fs::create_dir_all(&received).unwrap();
     fs::create_dir_all(conflict.join("snapshot")).unwrap();
+    fs::create_dir_all(&batch_received).unwrap();
+    fs::create_dir_all(&batch_conflict).unwrap();
+    fs::create_dir_all(&batch_cancelled).unwrap();
+    fs::create_dir_all(&batch_background).unwrap();
+    fs::create_dir_all(&batch_background_conflict).unwrap();
+    fs::write(batch_background_conflict.join("verified.bin"), b"user data").unwrap();
+    fs::write(batch_conflict.join("verified.bin"), b"user data").unwrap();
     fs::write(received.join("neighbor.bin"), b"untouched sibling").unwrap();
     fs::write(conflict.join("snapshot/.manifest"), b"local manifest").unwrap();
 
@@ -2588,6 +2600,7 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     fs::write(source.join(".manifest"), b"remote manifest\n").unwrap();
     let verified = b"verify the downloaded bytes\x00\xff";
     fs::write(parent.join("verified.bin"), verified).unwrap();
+    fs::write(parent.join("z-later.bin"), b"later item").unwrap();
     {
         use sha2::{Digest, Sha256};
         fs::write(
@@ -2621,6 +2634,36 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
         verified
     );
     assert!(!state.path().join("rejected.bin").exists());
+    assert_eq!(
+        fs::read(batch_received.join("verified.bin")).unwrap(),
+        verified
+    );
+    for folder in [&batch_received, &batch_conflict] {
+        assert_eq!(
+            fs::read(folder.join("snapshot/data 雪/trace 例.bin")).unwrap(),
+            data
+        );
+    }
+    assert_eq!(
+        fs::read(batch_conflict.join("verified.bin")).unwrap(),
+        b"user data"
+    );
+    assert!(!batch_conflict.join("z-later.bin").exists());
+    assert_eq!(fs::read_dir(batch_cancelled).unwrap().count(), 0);
+    for folder in [&batch_background, &batch_background_conflict] {
+        assert_eq!(
+            fs::read(folder.join("interrupted/nested/payload.bin")).unwrap(),
+            vec![42; 3 * w11term::sftp::CHUNK]
+        );
+    }
+    assert_eq!(
+        fs::read(batch_background.join("verified.bin")).unwrap(),
+        verified
+    );
+    assert_eq!(
+        fs::read(batch_background_conflict.join("verified.bin")).unwrap(),
+        b"user data"
+    );
 
     let downloaded = received.join("snapshot");
     assert_eq!(
@@ -2668,6 +2711,59 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
         "one SSH shell and one SFTP channel"
     );
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "monitors and cancels simultaneous SFTP transfers across two native SSH panes"]
+async fn native_sftp_transfers_tab_routes_cancellation_and_drawer_focus() {
+    let (Source::Ssh(alpha_ssh), alpha, alpha_channels, alpha_server) = fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(beta_ssh), beta, beta_channels, beta_server) = fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let alpha_target = picker.join("alpha");
+    let beta_target = picker.join("beta");
+    fs::create_dir_all(&alpha_target).unwrap();
+    fs::create_dir_all(&beta_target).unwrap();
+    let alpha_source = alpha.path().join("shell directory");
+    let beta_source = beta.path().join("shell directory/beta folder");
+    fs::create_dir_all(&alpha_source).unwrap();
+    fs::create_dir_all(&beta_source).unwrap();
+    let size = w11term::sftp::CHUNK * 3 + 7;
+    let bytes = vec![2; size];
+    fs::write(alpha_source.join("bulk-alpha"), vec![1; size]).unwrap();
+    fs::write(alpha_source.join("queued-alpha"), b"queued").unwrap();
+    fs::write(beta_source.join("payload"), &bytes).unwrap();
+    for (name, root) in [("alpha-root", alpha.path()), ("beta-root", beta.path())] {
+        fs::write(state.path().join(name), root.to_str().unwrap()).unwrap();
+        for marker in ["transfer-trace", "hold-transfer-read"] {
+            fs::write(root.join(marker), []).unwrap();
+        }
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":{"first-ssh":alpha_ssh,"second-ssh":beta_ssh}}))
+            .unwrap(),
+    )
+    .unwrap();
+    drive_gui("sftp-transfers-tab-ui.ps1", state.path());
+    assert_eq!(fs::read_dir(alpha_target).unwrap().count(), 0);
+    assert_eq!(
+        fs::read(beta_target.join("beta folder/payload")).unwrap(),
+        bytes
+    );
+    let alpha_trace = fs::read_to_string(alpha.path().join("transfer-trace")).unwrap();
+    assert!(alpha_trace.contains("OPEN /shell directory/bulk-alpha"));
+    assert!(!alpha_trace.contains("OPEN /shell directory/queued-alpha"));
+    assert_eq!(alpha_channels.load(Ordering::Relaxed), 2);
+    assert_eq!(beta_channels.load(Ordering::Relaxed), 2);
+    alpha_server.abort();
+    beta_server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

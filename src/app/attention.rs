@@ -28,6 +28,11 @@ pub enum Action {
         pane: u64,
         sequence: u64,
     },
+    VisitTransfer {
+        pane: u64,
+        sequence: u64,
+    },
+    ShowSavedDownload(NoticeTarget),
     Notification {
         pane: u64,
         sequence: u64,
@@ -133,6 +138,25 @@ impl TerminalApp {
                 {
                     self.find(true, None, ctx);
                 }
+            }
+            Action::VisitTransfer { pane, sequence } => {
+                let Some(id) = self.tab_for_pane(pane) else {
+                    return;
+                };
+                if !self
+                    .inbox
+                    .mark_target_read(NoticeTarget::SftpTransfer { pane, sequence })
+                {
+                    return;
+                }
+                self.tabs.select(id);
+                self.file_action(FileAction::ShowTransfer(pane), ctx);
+            }
+            Action::ShowSavedDownload(target) => {
+                if let Some(saved) = self.inbox.read_saved_download(target) {
+                    explorer::show_download(saved, ctx);
+                }
+                return;
             }
             Action::Notification {
                 pane,
@@ -302,8 +326,9 @@ impl TerminalApp {
             ScrollViewer::new().content(StackPanel::new().spacing(4.0).keyed_children(
                 rows.iter().map(|row| {
                     let status = if row.unread { "Unread" } else { "Read" };
-                    let (pane, sequence) = match row.target {
-                        NoticeTarget::Pane { pane, sequence } => (pane, sequence),
+                    let (pane, sequence, transfer) = match row.target {
+                        NoticeTarget::Pane { pane, sequence } => (pane, sequence, false),
+                        NoticeTarget::SftpTransfer { pane, sequence } => (pane, sequence, true),
                         target @ (NoticeTarget::GroupRun { tab, .. }
                         | NoticeTarget::GroupCanary { tab, .. }
                         | NoticeTarget::GroupOutput { tab, .. }
@@ -346,7 +371,7 @@ impl TerminalApp {
                                         format!("group-logins-{tab}/{sequence}"),
                                     )
                                 }
-                                NoticeTarget::Pane { .. } => unreachable!(),
+                                NoticeTarget::Pane { .. } | NoticeTarget::SftpTransfer { .. } => unreachable!(),
                             };
                             let source = self
                                 .tabs
@@ -403,7 +428,7 @@ impl TerminalApp {
                     );
                     let label = format!("{status} · {source} · Pane {pane} · {}", row.message);
                     let buttons = tab.and_then(|tab| match &tab.page {
-                        Page::Terminal(live) => live.session.events.notification_buttons(sequence),
+                        Page::Terminal(live) if !transfer => live.session.events.notification_buttons(sequence),
                         _ => None,
                     });
                     let kitty = buttons.is_some();
@@ -411,7 +436,9 @@ impl TerminalApp {
                         .automation_name(label.clone())
                         .is_enabled(tab.is_some())
                         .on_click(ctx.callback(move |_| {
-                            Message::Attention(if kitty {
+                            Message::Attention(if transfer {
+                                Action::VisitTransfer { pane, sequence }
+                            } else if kitty {
                                 Action::Notification { pane, sequence, choice: NotificationChoice::Activate(None) }
                             } else {
                                 Action::Visit { pane, sequence }
@@ -450,6 +477,23 @@ impl TerminalApp {
                             visit,
                             StackPanel::new().spacing(4.0).keyed_children(controls),
                         ))
+                    } else if let Some(saved) = &row.saved_download {
+                        let action = explorer::download_label(saved);
+                        let target = row.target;
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .column_spacing(8.0)
+                            .children((
+                                visit,
+                                Button::new()
+                                    .grid_column(1)
+                                    .style(ButtonStyle::Subtle)
+                                    .automation_name(format!("{action} for {source}, notice {sequence}"))
+                                    .on_click(ctx.callback(move |_| {
+                                        Message::Attention(Action::ShowSavedDownload(target))
+                                    }))
+                                    .content(action),
+                            ))
                     } else if let Some(command) = command {
                         Grid::new()
                             .columns([GridLength::STAR, GridLength::Auto])
