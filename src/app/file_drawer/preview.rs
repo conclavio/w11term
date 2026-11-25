@@ -1,12 +1,37 @@
 use super::*;
 use std::cell::OnceCell;
-use w11term::sftp::FileTextMatch;
+use w11term::sftp::{FileTextMatch, PermissionReview};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewKind {
     Text,
     Properties,
     Checksum(u64),
+}
+
+#[derive(Clone)]
+pub enum PermissionsAction {
+    Edit,
+    Input(String),
+    Apply,
+    Back,
+}
+
+#[derive(Default)]
+enum Permissions {
+    #[default]
+    Unavailable,
+    Ready(PermissionReview),
+    Editing(PermissionReview, String),
+    Applying,
+}
+
+fn parse_mode(input: &str) -> Option<u32> {
+    let input = input.trim();
+    if !(3..=4).contains(&input.len()) || !input.bytes().all(|c| (b'0'..=b'7').contains(&c)) {
+        return None;
+    }
+    u32::from_str_radix(input, 8).ok()
 }
 
 pub(super) struct EntryPreview {
@@ -17,7 +42,10 @@ pub(super) struct EntryPreview {
     text_match: Option<MatchPreview>,
     full_text: bool,
     checksum_available: bool,
-    copy_status: Option<String>,
+    permissions: Permissions,
+    link_target: Option<String>,
+    opening_link: bool,
+    status: Option<String>,
     pub(super) cancel: TransferCancel,
     // Terminal output can re-render the window while the user selects text.
     view: OnceCell<View>,
@@ -249,7 +277,12 @@ impl EntryPreview {
                             .content("Edit"),
                     ));
                 }
-                if self.checksum_available {
+                if self.checksum_available
+                    && !matches!(
+                        self.permissions,
+                        Permissions::Editing(..) | Permissions::Applying
+                    )
+                {
                     let target = self.target.clone();
                     fields.push(KeyedView::new(
                         "checksum",
@@ -286,10 +319,29 @@ impl EntryPreview {
                             .content("Use for verified download"),
                     ));
                 }
-                if let Some(status) = &self.copy_status {
+                if let Some(controls) = self.permissions_controls(pane, generation, context) {
+                    fields.push(KeyedView::new("permissions", controls));
+                }
+                if self.link_target.is_some() {
                     fields.push(KeyedView::new(
-                        "copy-status",
+                        "open-link-target",
+                        Button::new()
+                            .is_enabled(!self.opening_link)
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::OpenLinkTarget(pane, generation, serial))
+                            }))
+                            .content(if self.opening_link {
+                                "Opening link target…"
+                            } else {
+                                "Open link target"
+                            }),
+                    ));
+                }
+                if let Some(status) = &self.status {
+                    fields.push(KeyedView::new(
+                        "preview-status",
                         TextBlock::new()
+                            .automation_id("sftp-preview-status")
                             .text(status)
                             .text_wrapping(TextWrapping::Wrap),
                     ));
@@ -316,6 +368,59 @@ impl EntryPreview {
                     )
             })
             .clone()
+    }
+
+    fn permissions_controls(
+        &self,
+        pane: u64,
+        generation: u64,
+        context: &ViewContext<TerminalApp>,
+    ) -> Option<View> {
+        let serial = self.serial;
+        let action =
+            move |action| Message::Files(FileAction::Permissions(pane, generation, serial, action));
+        let button = |label, enabled, event: PermissionsAction| {
+            Button::new()
+                .automation_name(label)
+                .is_enabled(enabled)
+                .on_click(context.callback(move |_| action(event.clone())))
+                .content(label)
+        };
+        match &self.permissions {
+            Permissions::Unavailable => None,
+            Permissions::Ready(_) => {
+                Some(button("Edit permissions…", true, PermissionsAction::Edit))
+            }
+            Permissions::Editing(review, input) => {
+                let input_field = TextBox::new()
+                    .automation_name("Permission mode (octal)")
+                    .placeholder_text("Permission mode (octal)")
+                    .text(input)
+                    .on_text_changed(
+                        context.callback(move |mode| action(PermissionsAction::Input(mode))),
+                    );
+                let help = TextBlock::new()
+                    .text("Enter three or four octal digits. The leading digit sets special bits in a four-digit mode.")
+                    .text_wrapping(TextWrapping::Wrap);
+                let actions = StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .children((
+                        button(
+                            "Apply permissions",
+                            parse_mode(input).is_some_and(|mode| mode != review.mode()),
+                            PermissionsAction::Apply,
+                        ),
+                        button("Cancel edit", true, PermissionsAction::Back),
+                    ));
+                Some(
+                    StackPanel::new()
+                        .spacing(6.0)
+                        .children((input_field, help, actions)),
+                )
+            }
+            Permissions::Applying => Some(TextBlock::new().text("Applying permissions…").into()),
+        }
     }
 
     fn full_text_view(&self, text: &str) -> View {
@@ -408,7 +513,10 @@ impl FileDrawer {
             text_match: None,
             full_text: false,
             checksum_available: false,
-            copy_status: None,
+            permissions: Permissions::Unavailable,
+            link_target: None,
+            opening_link: false,
+            status: None,
             cancel: TransferCancel::default(),
             view: OnceCell::new(),
         });
@@ -434,14 +542,26 @@ impl FileDrawer {
                 _ => Err("Missing text in the SFTP preview reply".into()),
             },
             PreviewKind::Properties => {
-                let mode = value["attrs"]["permissions"]
-                    .as_u64()
-                    .and_then(|mode| u32::try_from(mode).ok());
-                let text = super::properties::display_text(&path, value)
-                    .map_err(|error| format!("{error:#}"));
-                preview.checksum_available =
-                    text.is_ok() && EntryKind::from_permissions(mode) == Some(EntryKind::File);
-                text
+                let target = value
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                super::properties::display(&path, value)
+                    .map(|(attrs, text)| {
+                        let kind = EntryKind::from_permissions(attrs.permissions);
+                        preview.checksum_available = kind == Some(EntryKind::File);
+                        if entry_path(preview.target.parent(), preview.target.name()).is_ok() {
+                            if let Some(review) = PermissionReview::from_attributes(&attrs) {
+                                preview.permissions = Permissions::Ready(review);
+                            }
+                            if kind == Some(EntryKind::Symlink) {
+                                preview.link_target =
+                                    target.filter(|path| !path.is_empty() && !path.contains('\0'));
+                            }
+                        }
+                        text
+                    })
+                    .map_err(|error| format!("{error:#}"))
             }
             PreviewKind::Checksum(_) => value["sha256"]
                 .as_str()
@@ -465,6 +585,122 @@ impl FileDrawer {
             Err(error) => Contents::Error(error),
         };
         preview.view.take();
+    }
+
+    pub(super) fn begin_link_target(&mut self, serial: u64) -> Option<Operation> {
+        let preview = self.preview.as_ref()?;
+        if !self.open || preview.serial != serial || preview.opening_link || self.pending.is_some()
+        {
+            return None;
+        }
+        let expected_target = preview.link_target.clone()?;
+        let path = self.checked_target_path(&preview.target).ok()?;
+        let preview = self.preview.as_mut()?;
+        preview.opening_link = true;
+        preview.status = None;
+        preview.view.take();
+        Some(Operation::OpenLinkTarget {
+            path,
+            expected_target,
+        })
+    }
+
+    pub(super) fn opening_link_target(&self, serial: u64) -> bool {
+        self.open
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.serial == serial && preview.opening_link)
+    }
+
+    pub(super) fn link_target_error(&mut self, serial: u64, error: String) {
+        if let Some(preview) = self
+            .preview
+            .as_mut()
+            .filter(|p| p.serial == serial && p.opening_link)
+        {
+            preview.opening_link = false;
+            preview.status = Some(format!("Could not open link target. {error}"));
+            preview.view.take();
+        }
+    }
+
+    pub(super) fn permissions_action(
+        &mut self,
+        serial: u64,
+        action: PermissionsAction,
+    ) -> Option<(u32, Operation)> {
+        let current = self.preview.as_ref()?;
+        if !self.open || current.serial != serial || self.pending.is_some() {
+            return None;
+        }
+        let path = self.checked_target_path(&current.target).ok()?;
+        let preview = self.preview.as_mut()?;
+        match (&mut preview.permissions, action) {
+            (Permissions::Ready(review), PermissionsAction::Edit) => {
+                preview.permissions =
+                    Permissions::Editing(*review, format!("{:04o}", review.mode()));
+                preview.status = None;
+            }
+            (Permissions::Editing(_, input), PermissionsAction::Input(value)) => *input = value,
+            (Permissions::Editing(review, _), PermissionsAction::Back) => {
+                preview.permissions = Permissions::Ready(*review);
+            }
+            (Permissions::Editing(review, input), PermissionsAction::Apply) => {
+                let mode = parse_mode(input).filter(|&mode| mode != review.mode())?;
+                let operation = Operation::SetEntryPermissions {
+                    path,
+                    review: *review,
+                    mode,
+                };
+                preview.permissions = Permissions::Applying;
+                preview.view.take();
+                return Some((mode, operation));
+            }
+            _ => return None,
+        }
+        preview.view.take();
+        None
+    }
+
+    pub(super) fn finish_permissions(
+        &mut self,
+        serial: u64,
+        requested: u32,
+        reply: Result<Value, String>,
+    ) {
+        let notice = match reply {
+            Ok(value) => {
+                let notice = match value["attrs"]["permissions"]
+                    .as_u64()
+                    .map(|mode| mode & 0o7777)
+                {
+                    Some(mode) if mode == u64::from(requested) => {
+                        format!("Permissions updated to {mode:04o}")
+                    }
+                    Some(mode) => {
+                        format!("Server reports mode {mode:04o} after applying {requested:04o}")
+                    }
+                    None => "Server acknowledged the change and did not report a mode".into(),
+                };
+                self.finish_preview(serial, Ok(value));
+                notice
+            }
+            Err(error) => format!("Could not verify the requested mode. {error}"),
+        };
+        if let Some(preview) = self
+            .preview
+            .as_mut()
+            .filter(|preview| preview.serial == serial)
+        {
+            if matches!(preview.permissions, Permissions::Applying) {
+                preview.permissions = Permissions::Unavailable;
+            }
+            preview.status = Some(notice);
+            preview.view.take();
+        } else {
+            self.status = notice;
+        }
     }
 
     pub(super) fn show_full_preview(&mut self, serial: u64, full: bool) {
@@ -521,7 +757,7 @@ impl FileDrawer {
             Err(error) => format!("Could not copy SHA-256. {error}"),
         };
         let preview = self.preview.as_mut().unwrap();
-        preview.copy_status = Some(status);
+        preview.status = Some(status);
         preview.view.take();
     }
 
@@ -544,7 +780,7 @@ impl FileDrawer {
         if self.preview.take().is_some() {
             if matches!(
                 self.pending.as_ref().map(|p| &p.step),
-                Some(Step::Preview(_))
+                Some(Step::Preview(_) | Step::OpenLinkTarget(_))
             ) {
                 self.pending.take();
             }
@@ -784,6 +1020,94 @@ mod tests {
         files.finish_preview(serial, Ok(json!({"text":"old peer"})));
         assert!(cancellation.is_cancelled());
         assert!(files.preview.is_none());
+    }
+
+    #[test]
+    fn permission_edits_require_the_reviewed_entry_and_show_the_reported_mode() {
+        let (mut drawer, entry) = selected(ListedKind::Known(EntryKind::File));
+        let (serial, _) = drawer
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Properties)
+            .unwrap();
+        drawer.finish_preview(
+            serial,
+            Ok(json!({"attrs":{"permissions":0o100640,"uid":1701,"gid":2048}})),
+        );
+        assert!(
+            drawer
+                .permissions_action(serial + 1, PermissionsAction::Edit)
+                .is_none()
+        );
+        assert!(matches!(
+            drawer.preview.as_ref().unwrap().permissions,
+            Permissions::Ready(_)
+        ));
+        drawer.permissions_action(serial, PermissionsAction::Edit);
+        for invalid in ["8", "0999", "0o700", "00000", "640"] {
+            drawer.permissions_action(serial, PermissionsAction::Input(invalid.into()));
+            assert!(
+                drawer
+                    .permissions_action(serial, PermissionsAction::Apply)
+                    .is_none(),
+                "{invalid}"
+            );
+        }
+        drawer.permissions_action(serial, PermissionsAction::Input("4750".into()));
+        let (mode, operation) = drawer
+            .permissions_action(serial, PermissionsAction::Apply)
+            .unwrap();
+        assert_eq!(mode, 0o4750);
+        assert!(
+            matches!(operation, Operation::SetEntryPermissions { mode: 0o4750, review, .. } if review.mode() == 0o640)
+        );
+        assert!(
+            drawer
+                .permissions_action(serial, PermissionsAction::Apply)
+                .is_none()
+        );
+        drawer.finish_permissions(
+            serial,
+            mode,
+            Ok(json!({"attrs":{"permissions":0o100750,"uid":1701,"gid":2048}})),
+        );
+        let preview = drawer.preview.as_ref().unwrap();
+        assert!(
+            matches!(preview.permissions, Permissions::Ready(review) if review.mode() == 0o750)
+        );
+        assert_eq!(
+            preview.status.as_deref(),
+            Some("Server reports mode 0750 after applying 4750")
+        );
+    }
+
+    #[test]
+    fn opening_a_link_uses_the_current_properties_and_keeps_them_on_error() {
+        let (mut drawer, entry) = selected(ListedKind::Known(EntryKind::Symlink));
+        let (serial, _) = drawer
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Properties)
+            .unwrap();
+        drawer.finish_preview(
+            serial,
+            Ok(json!({"attrs":{"permissions":0o120777},"target":"../payload $now.txt"})),
+        );
+        assert!(drawer.begin_link_target(serial + 1).is_none());
+        assert!(matches!(
+            drawer.begin_link_target(serial),
+            Some(Operation::OpenLinkTarget { expected_target, .. }) if expected_target == "../payload $now.txt"
+        ));
+        assert!(drawer.opening_link_target(serial));
+        assert!(drawer.begin_link_target(serial).is_none());
+        drawer.link_target_error(serial, "Missing target".into());
+        let preview = drawer.preview.as_ref().unwrap();
+        assert!(!preview.opening_link);
+        assert!(
+            matches!(&preview.content, Contents::Ready(text) if text.contains("../payload $now.txt"))
+        );
+        assert_eq!(
+            preview.status.as_deref(),
+            Some("Could not open link target. Missing target")
+        );
+        drawer.close_preview(serial);
+        assert!(!drawer.opening_link_target(serial));
     }
 
     #[test]

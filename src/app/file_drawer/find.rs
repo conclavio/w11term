@@ -687,6 +687,14 @@ impl Panel {
                             }),
                     ),
                 ));
+                actions.push(KeyedView::new(
+                    "rename-marked",
+                    button(
+                        "Rename marked entries…",
+                        Action::StartFolderBatch(serial, FolderBatchKind::Rename),
+                        ready && !marked.is_empty(),
+                    ),
+                ));
             }
             rows.push(KeyedView::new(
                 "marking",
@@ -1033,23 +1041,29 @@ impl Panel {
                     }
                 }
                 if hit.kind == Some(EntryKind::File) && entry_path(&hit.parent, &hit.name).is_ok() {
-                    actions.push(KeyedView::new(
-                        "copy-file",
-                        Button::new()
-                            .automation_name(format!("Copy to folder {path}"))
-                            .is_enabled(ready)
-                            .on_click({
-                                let hit = hit.clone();
-                                ctx.callback(move |_| {
-                                    Message::Files(FileAction::CopyEntry(
-                                        pane,
-                                        generation,
-                                        FileTarget::Search(serial, hit.clone()),
-                                    ))
+                    for (key, label, mode) in [
+                        ("copy-file", "Copy to folder", CopyFileMode::ToFolder),
+                        ("duplicate-file", "Duplicate as", CopyFileMode::Duplicate),
+                    ] {
+                        actions.push(KeyedView::new(
+                            key,
+                            Button::new()
+                                .automation_name(format!("{label} {path}"))
+                                .is_enabled(ready)
+                                .on_click({
+                                    let hit = hit.clone();
+                                    ctx.callback(move |_| {
+                                        Message::Files(FileAction::CopyEntry(
+                                            pane,
+                                            generation,
+                                            FileTarget::Search(serial, hit.clone()),
+                                            mode,
+                                        ))
+                                    })
                                 })
-                            })
-                            .content("Copy to folder…"),
-                    ));
+                                .content(format!("{label}…")),
+                        ));
+                    }
                 }
                 KeyedView::new(
                     index,
@@ -1342,18 +1356,7 @@ impl FileDrawer {
             size,
         } = change
         {
-            if self.directory.as_ref() == Some(directory) {
-                self.entries.retain(|entry| entry.name != *name);
-                self.entries.push(Entry {
-                    name: name.clone(),
-                    kind: ListedKind::Known(EntryKind::File),
-                    mtime: None,
-                    size: *size,
-                });
-                self.sort_order.sort(&mut self.entries);
-                self.update_matches();
-                self.listing_revision = self.listing_revision.wrapping_add(1);
-            }
+            self.accept_copied_entry(directory, name, *size);
             return Ok(());
         }
         let old_path = entry_path(&hit.parent, &hit.name)?;

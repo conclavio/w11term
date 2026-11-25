@@ -1,12 +1,14 @@
 use super::guarded_job as run;
 use super::*;
-use w11term::sftp::Operation;
+use w11term::sftp::{CopyDestination, Operation};
 
 fn copy() -> Operation {
     Operation::CopyEntry {
         from: "/original.bin".into(),
-        directory: "/archive".into(),
-        destination_is_canonical: false,
+        destination: CopyDestination::Folder {
+            directory: "/archive".into(),
+            is_canonical: false,
+        },
     }
 }
 
@@ -15,6 +17,61 @@ fn archive_names(root: &std::path::Path) -> Vec<String> {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_accepts_a_literal_sibling_name_and_keeps_existing_files() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    let generation = Some(pane.frames.load().connection_generation);
+    fs::write(root.join("original.bin"), b"source\0bytes").unwrap();
+    fs::write(root.join("existing.bin"), b"keep").unwrap();
+    fs::write(root.join("rename-trace.jsonl"), []).unwrap();
+
+    let duplicate = |name: &str| Operation::CopyEntry {
+        from: "/original.bin".into(),
+        destination: CopyDestination::Sibling { name: name.into() },
+    };
+    for name in [
+        "",
+        " ",
+        ".",
+        "..",
+        "/outside",
+        "../outside",
+        "sub\\file.bin",
+        "line\nfeed",
+        "nul\0byte",
+        "original.bin",
+        "existing.bin",
+    ] {
+        let error = run(&pane, generation, duplicate(name)).await.unwrap_err();
+        assert!(error.contains("Copy was not started"), "{name:?}: {error}");
+    }
+    assert!(mutation_trace(root, "rename-trace.jsonl").is_empty());
+    let new_name = "a $literal 雪.bin";
+    assert_eq!(
+        run(&pane, generation, duplicate(new_name)).await.unwrap(),
+        json!({"directory":"/","bytes_copied":12})
+    );
+    let renames = mutation_trace(root, "rename-trace.jsonl");
+    assert_eq!(renames.len(), 1);
+    assert!(renames[0][0].starts_with("/.w11term-copy-"));
+    assert_eq!(renames[0][1], format!("/{new_name}"));
+    assert_eq!(fs::read(root.join(new_name)).unwrap(), b"source\0bytes");
+    assert_eq!(
+        fs::read(root.join("original.bin")).unwrap(),
+        b"source\0bytes"
+    );
+    assert_eq!(fs::read(root.join("existing.bin")).unwrap(), b"keep");
+    assert!(!fs::read_dir(root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".w11term-copy-")
+    }));
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

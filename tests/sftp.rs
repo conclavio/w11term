@@ -521,6 +521,19 @@ impl russh_sftp::server::Handler for Files {
         if self.root.join("fixture-copy-data").is_file() {
             version.extensions.insert("copy-data".into(), "1".into());
         }
+        if let Ok(request) = fs::read_to_string(self.root.join("fixture-permissions")) {
+            self.posix.get_or_insert_with(Default::default);
+            if request == "lsetstat" {
+                version
+                    .extensions
+                    .insert("lsetstat@openssh.com".into(), "1".into());
+            }
+        }
+        if self.root.join("fixture-space.json").is_file() {
+            version
+                .extensions
+                .insert("statvfs@openssh.com".into(), "2".into());
+        }
         Ok(version)
     }
     async fn extended(
@@ -531,6 +544,19 @@ impl russh_sftp::server::Handler for Files {
     ) -> Result<Packet, StatusCode> {
         if request == "posix-rename@openssh.com" && self.posix.is_some() {
             return self.posix_rename(id, data);
+        }
+        if request == "lsetstat@openssh.com" {
+            let mut payload = data.into();
+            let (path, attrs): (String, FileAttributes) =
+                russh_sftp::de::from_bytes(&mut payload).map_err(|_| StatusCode::BadMessage)?;
+            if !payload.is_empty() {
+                return Err(StatusCode::BadMessage);
+            }
+            self.set_permissions("LSETSTAT", path, &attrs)?;
+            return Ok(Packet::Status(status(id)));
+        }
+        if request == "statvfs@openssh.com" {
+            return self.fixture_statvfs(id, data);
         }
         if request == "copy-data" && self.root.join("fixture-copy-data").is_file() {
             self.trace_transfer("COPY-DATA")?;
@@ -763,6 +789,10 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        if attrs.permissions.is_some() && self.root.join("fixture-permissions").is_file() {
+            self.set_permissions("SETSTAT", path, &attrs)?;
+            return Ok(status(id));
+        }
         self.trace_properties("SETSTAT", &path)?;
         if let Some(size) = attrs.size {
             fs::OpenOptions::new()
@@ -943,6 +973,12 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        if let Some((_, resolved)) = self.fixture_link(&path) {
+            return Ok(Name {
+                id,
+                files: vec![russh_sftp::protocol::File::dummy(resolved)],
+            });
+        }
         if path == "/tree/data" && self.root.join("tree-redirect").is_file() {
             return Ok(Name {
                 id,
@@ -1129,8 +1165,12 @@ mod cancellation;
 mod checksum;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
+#[path = "sftp/filesystem_space.rs"]
+mod filesystem_space;
 #[path = "sftp/find.rs"]
 mod find;
+#[path = "sftp/folder_contents.rs"]
+mod folder_contents;
 #[path = "sftp/in_band_resize.rs"]
 mod in_band_resize;
 #[cfg(feature = "ui-smoke")]

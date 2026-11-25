@@ -6,7 +6,7 @@ pub(super) struct Editor {
     generation: u64,
     parent: String,
     name: String,
-    original: String,
+    original: Option<String>,
     draft: TextDraft,
     open: bool,
     // Each opening gets new callbacks; a delayed Closed from the old dialog is inert.
@@ -69,14 +69,27 @@ impl Editor {
         self.input.take();
     }
 
+    fn changed_connection_message(&self) -> &'static str {
+        match self.original {
+            Some(_) => {
+                "The SSH connection changed. Copy this draft or reopen the remote file to edit it."
+            }
+            None => {
+                "The SSH connection changed. Copy this draft and start a new text file on the current connection."
+            }
+        }
+    }
+
     fn prepare_save(&mut self, generation: u64, new_file: bool) -> Result<(Save, Operation)> {
         ensure!(
             self.generation == generation,
-            "The SSH connection changed. Copy this draft or reopen the remote file to edit it."
+            "{}",
+            self.changed_connection_message()
         );
-        let name = match (&self.mode, new_file) {
-            (Mode::Edit, false) => &self.name,
-            (Mode::SaveAs(name), true) => name,
+        let (name, original) = match (&self.mode, new_file, self.original.as_ref()) {
+            (Mode::Edit, false, Some(original)) => (&self.name, Some(original)),
+            (Mode::Edit, true, None) => (&self.name, None),
+            (Mode::SaveAs(name), true, Some(_)) => (name, None),
             _ => bail!("Choose a save action first"),
         };
         let path = entry_path(&self.parent, name)?;
@@ -87,7 +100,7 @@ impl Editor {
         );
         let operation = Operation::SaveText {
             path,
-            original: (!new_file).then(|| self.original.clone()),
+            original: original.cloned(),
             text,
         };
         self.saving = true;
@@ -170,14 +183,15 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        let controls = match &self.mode {
-            Mode::Edit => vec![
-                button("Save", writable, Action::Save),
-                button("Save as…", writable, Action::SaveAs),
-                button("Discard draft…", !self.saving, Action::ConfirmDiscard),
-            ],
-            Mode::SaveAs(name) => {
-                fields.push(KeyedView::new(
+        let filename = match &self.mode {
+            Mode::Edit if self.original.is_none() => Some((&self.name, 1)),
+            Mode::SaveAs(name) => Some((name, fields.len())),
+            _ => None,
+        };
+        if let Some((name, index)) = filename {
+            fields.insert(
+                index,
+                KeyedView::new(
                     "name",
                     TextBox::new()
                         .automation_name("New filename")
@@ -186,16 +200,28 @@ impl Editor {
                         .is_enabled(!self.saving)
                         .text(name)
                         .on_text_changed(context.callback(move |name| message(Action::Name(name)))),
-                ));
-                vec![
-                    button(
-                        "Create file",
-                        writable && entry_path(&self.parent, name).is_ok(),
-                        Action::Create,
-                    ),
-                    button("Back to editor", !self.saving, Action::Back),
-                ]
-            }
+                ),
+            );
+        }
+        let create = |name| {
+            button(
+                "Create file",
+                writable && entry_path(&self.parent, name).is_ok(),
+                Action::Create,
+            )
+        };
+        let discard = || button("Discard draft…", !self.saving, Action::ConfirmDiscard);
+        let controls = match &self.mode {
+            Mode::Edit if self.original.is_none() => vec![create(&self.name), discard()],
+            Mode::Edit => vec![
+                button("Save", writable, Action::Save),
+                button("Save as…", writable, Action::SaveAs),
+                discard(),
+            ],
+            Mode::SaveAs(name) => vec![
+                create(name),
+                button("Back to editor", !self.saving, Action::Back),
+            ],
             Mode::ConfirmDiscard => {
                 fields.push(KeyedView::new(
                     "confirm",
@@ -220,7 +246,11 @@ impl Editor {
                 ),
         ));
         ContentDialog::new()
-            .title(&self.name)
+            .title(if self.original.is_some() {
+                &self.name
+            } else {
+                "New text file"
+            })
             .close_button_text("Close editor")
             .is_open(true)
             .on_closed(context.callback(move |_| message(Action::Close)))
@@ -261,6 +291,30 @@ impl FileDrawer {
             return;
         };
         let (parent, name) = target.into_location();
+        self.open_editor(parent, name, Some(original));
+    }
+
+    pub(super) fn can_start_new_editor(&self, revision: u64) -> bool {
+        self.open
+            && self.generation != 0
+            && self.listing_revision == revision
+            && self.directory.is_some()
+            && self.search.is_none()
+            && self.bookmarks.is_none()
+            && self.editor.is_none()
+            && !self.busy()
+    }
+
+    pub(super) fn start_new_editor(&mut self, revision: u64) {
+        if self.can_start_new_editor(revision)
+            && let Some(parent) = self.directory.clone()
+        {
+            self.end_filter_edit();
+            self.open_editor(parent, String::new(), None);
+        }
+    }
+
+    fn open_editor(&mut self, parent: String, name: String, original: Option<String>) {
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.editor = Some(Editor {
             id: self.dialog_serial,
@@ -268,7 +322,7 @@ impl FileDrawer {
             generation: self.generation,
             parent,
             name,
-            draft: TextDraft::new(&original),
+            draft: TextDraft::new(original.as_deref().unwrap_or_default()),
             original,
             open: true,
             mode: Mode::Edit,
@@ -316,14 +370,14 @@ impl FileDrawer {
                 editor.input.take();
             }
             Action::Text(_) => {}
-            Action::SaveAs if editor.generation == self.generation => {
+            Action::SaveAs if editor.original.is_some() && editor.generation == self.generation => {
                 editor.mode = Mode::SaveAs(String::new())
             }
-            Action::Name(value) => {
-                if let Mode::SaveAs(name) = &mut editor.mode {
-                    *name = value;
-                }
-            }
+            Action::Name(value) => match &mut editor.mode {
+                Mode::Edit if editor.original.is_none() => editor.name = value,
+                Mode::SaveAs(name) => *name = value,
+                _ => {}
+            },
             Action::Back => editor.mode = Mode::Edit,
             Action::ConfirmDiscard => editor.mode = Mode::ConfirmDiscard,
             Action::Discard if matches!(editor.mode, Mode::ConfirmDiscard) => self.editor = None,
@@ -366,8 +420,7 @@ impl FileDrawer {
 
     pub(super) fn detach_editor(&mut self) -> Option<Editor> {
         let mut editor = self.editor.take()?;
-        let tail =
-            "The SSH connection changed. Copy this draft or reopen the remote file to edit it.";
+        let tail = editor.changed_connection_message();
         editor.status = match &mut self.pending {
             Some(Pending {
                 step: Step::SaveText(save),
@@ -429,6 +482,61 @@ mod tests {
     }
 
     #[test]
+    fn new_document_requires_a_leaf_name_and_keeps_the_unsaved_draft() {
+        let mut files = FileDrawer {
+            generation: 7,
+            open: true,
+            ..Default::default()
+        };
+        files.accept_listing(None, "/var/test".into(), Vec::new());
+        let revision = files.listing_revision;
+        files.start_new_editor(revision.wrapping_sub(1));
+        assert!(files.editor.is_none());
+
+        files.start_new_editor(revision);
+        let serial = files.editor.as_ref().unwrap().serial;
+        files.editor_action(serial, Action::Mounted);
+        assert!(files.editor_action(serial, Action::Create).is_none());
+        files.editor_action(serial, Action::Name("../outside".into()));
+        assert!(files.editor_action(serial, Action::Create).is_none());
+        files.editor_action(serial, Action::Name("draft 雪.txt".into()));
+        files.editor_action(serial, Action::Text("first\rsecond 雪".into()));
+        assert!(files.editor_action(serial, Action::Save).is_none());
+        let (save, operation) = files.editor_action(serial, Action::Create).unwrap();
+        assert!(
+            matches!(operation, Operation::SaveText { path, original: None, text }
+                if path == "/var/test/draft 雪.txt" && text == "first\nsecond 雪")
+        );
+        files.finish_save(save, Err("An entry already exists".into()));
+        assert!(
+            files
+                .editor
+                .as_ref()
+                .unwrap()
+                .status
+                .contains("already exists")
+        );
+        files.editor_action(serial, Action::Close);
+        files.start_new_editor(revision);
+        assert!(!files.entry_dialog_open());
+        files.resume_editor(serial);
+        let editor = files.editor.as_ref().unwrap();
+        assert_ne!(editor.serial, serial);
+        let resumed = editor.serial;
+        assert_eq!(editor.name, "draft 雪.txt");
+        assert_eq!(editor.draft.contents(), "first\nsecond 雪");
+        files.editor_action(resumed, Action::Mounted);
+        files.editor_action(resumed, Action::Name("new 雪.txt".into()));
+        let (save, _) = files.editor_action(resumed, Action::Create).unwrap();
+        assert_eq!(
+            files.finish_save(save, Ok(json!({}))),
+            Some(("/var/test".into(), "new 雪.txt".into()))
+        );
+        assert_eq!(files.status, "Created new 雪.txt");
+        assert!(files.editor.is_none());
+    }
+
+    #[test]
     fn mounting_the_multiline_input_preserves_the_recovered_document() {
         let (mut files, previous) = opened();
         files.editor_action(previous, Action::Close);
@@ -460,7 +568,7 @@ mod tests {
         let editor = files.editor.as_ref().unwrap();
         assert!(editor.open && !editor.saving);
         assert_eq!(editor.draft.contents(), changed);
-        assert_eq!(editor.original, ORIGINAL);
+        assert_eq!(editor.original.as_deref(), Some(ORIGINAL));
         files.editor_action(serial, Action::SaveAs);
         files.editor_action(serial, Action::Name("../other".into()));
         assert!(files.editor_action(serial, Action::Create).is_none());
