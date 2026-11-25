@@ -5,14 +5,30 @@ use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_SHARE_READ};
 
 /// Hash a selected file through one read-only handle that denies writes and deletes.
 pub fn local_sha256(path: &Path, cancel: &TransferCancel) -> Result<String> {
+    ensure!(!cancel.is_cancelled(), "SHA-256 comparison cancelled");
+    let Source::File(file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
+        bail!("Choose a regular file for SHA-256 comparison");
+    };
+    hash_local_handle(file, size, None, cancel)
+}
+
+pub(super) fn hash_local_handle(
+    mut file: std::fs::File,
+    size: u64,
+    max_bytes: Option<u64>,
+    cancel: &TransferCancel,
+) -> Result<String> {
     let check_cancel = || {
         ensure!(!cancel.is_cancelled(), "SHA-256 comparison cancelled");
         Ok::<_, anyhow::Error>(())
     };
     check_cancel()?;
-    let Source::File(mut file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
-        bail!("Choose a regular file for SHA-256 comparison");
-    };
+    if let Some(limit) = max_bytes {
+        ensure!(
+            size <= limit,
+            "The Windows file exceeds the SHA-256 byte limit ({limit} bytes)"
+        );
+    }
     let mut digest = Sha256::new();
     let mut buffer = [0; CHUNK];
     let mut bytes = 0u64;
@@ -43,6 +59,7 @@ impl Engine {
         path: &str,
         max_bytes: Option<u64>,
         cancel: Option<&TransferCancel>,
+        require_canonical_parent: bool,
     ) -> Result<Value> {
         ensure!(
             !path.contains('\0')
@@ -57,7 +74,7 @@ impl Engine {
             Ok::<_, anyhow::Error>(())
         };
         check_cancel()?;
-        let initial = self.checksum_entry(path).await?;
+        let initial = self.checksum_entry(path, require_canonical_parent).await?;
         let limit = max_bytes.map(|bytes| (bytes, "the SHA-256 byte limit"));
         if let Some((max, reason)) = limit {
             ensure!(
@@ -75,7 +92,7 @@ impl Engine {
             check_cancel()?;
             // SFTP v3 does not expose a no-follow OPEN. Confirm the path again
             // before reading and use handle metadata when the server supplies it.
-            let opened_path = self.checksum_entry(path).await?;
+            let opened_path = self.checksum_entry(path, require_canonical_parent).await?;
             check_unchanged(&initial, &opened_path)?;
             let opened_handle = match self.raw.fstat(&handle).await {
                 Ok(reply) => {
@@ -120,7 +137,7 @@ impl Engine {
                 )
                 .await?;
             check_cancel()?;
-            let final_attrs = self.checksum_entry(path).await?;
+            let final_attrs = self.checksum_entry(path, require_canonical_parent).await?;
             check_unchanged(&initial, &final_attrs)?;
             check_unchanged(&opened_path, &final_attrs)?;
             check_unchanged(&opened_handle, &final_attrs)?;
@@ -137,7 +154,14 @@ impl Engine {
         result
     }
 
-    async fn checksum_entry(&self, path: &str) -> Result<FileAttributes> {
+    async fn checksum_entry(
+        &self,
+        path: &str,
+        require_canonical_parent: bool,
+    ) -> Result<FileAttributes> {
+        if require_canonical_parent {
+            self.checked_source_folder(path).await?;
+        }
         let attrs = self.raw.lstat(path).await?.attrs;
         ensure!(
             EntryKind::from_permissions(attrs.permissions) == Some(EntryKind::File),

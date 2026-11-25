@@ -6,11 +6,11 @@ use std::{
     ops::RangeInclusive,
 };
 
-const MAX_DIRECTORIES: usize = 128;
-const MAX_ENTRIES: usize = 16_384;
+pub(super) const MAX_DIRECTORIES: usize = 128;
+pub(super) const MAX_ENTRIES: usize = 16_384;
 const MAX_RESULTS: usize = 200;
 const MAX_CONTENT_READS: usize = 256;
-const MAX_DEPTH: usize = 24;
+pub(super) const MAX_DEPTH: usize = 24;
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
 
 pub fn valid_filename_query(query: &str) -> bool {
@@ -903,6 +903,9 @@ impl Engine {
             scan.result.skipped_directories == 0,
             "Some folders could not be listed. A complete inventory is required"
         );
-        Ok(scan.inventory.unwrap().finish(scan.result.root))
+        Ok(scan
+            .inventory
+            .unwrap()
+            .finish(scan.result.root, FolderOrigin::Remote))
     }
 }
