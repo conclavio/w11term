@@ -142,6 +142,13 @@ fn within<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
 }
 
 impl Panel {
+    pub(super) fn match_file_text(
+        &self,
+        text: &str,
+    ) -> Result<Option<w11term::sftp::ContentMatch>> {
+        self.filter.match_file_text(text)
+    }
+
     fn advanced_summary(&self) -> Option<String> {
         let parts: Vec<_> = [
             (
@@ -796,10 +803,15 @@ impl Panel {
                 }
                 if hit.kind == Some(EntryKind::File) {
                     let hit = hit.clone();
+                    let label = if hit.content_match.is_some() {
+                        "Preview match"
+                    } else {
+                        "Preview text"
+                    };
                     entry_actions.push(KeyedView::new(
                         "preview",
                         Button::new()
-                            .automation_name(format!("Preview text {path}"))
+                            .automation_name(format!("{label} {path}"))
                             .is_enabled(ready)
                             .on_click(ctx.callback(move |_| {
                                 Message::Files(FileAction::Preview(
@@ -809,7 +821,7 @@ impl Panel {
                                     PreviewKind::Text,
                                 ))
                             }))
-                            .content("Preview text…"),
+                            .content(format!("{label}…")),
                     ));
                 }
                 if shell_ready

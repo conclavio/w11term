@@ -277,7 +277,9 @@ try {
     Set-SearchChoice 'Search result type' 'All types'
     $contentLabel = 'File text contains'
     $fixtureText = Join-Path $peerRoot 'shell directory/nested/nested-content.txt'
-    [IO.File]::WriteAllText($fixtureText, "header`r`nFixture needle value`r`n")
+    $fixtureContents = "header`r`n" + ("unrelated line`r`n" * 40) +
+        "Context before`r`nFixture needle value`r`nContext after`r`nlast line`r`n"
+    [IO.File]::WriteAllText($fixtureText, $fixtureContents)
     $contentField = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
     $contentField.GetCurrentPattern($value).SetValue('FIXTURE NEEDLE')
     $null = Wait-Until 'a content query enables search without a filename' {
@@ -287,12 +289,43 @@ try {
     $contentField.SetFocus()
     $null = Wait-Until 'file text field has keyboard focus' { $contentField.Current.HasKeyboardFocus }
     $null = Press-FocusedKey 13
-    $excerpt = 'Line 2 ' + [char]0xb7 + ' Fixture needle value'
+    $excerpt = 'Line 43 ' + [char]0xb7 + ' Fixture needle value'
     $null = Wait-Until 'content search displays the matching line and scan totals' {
         (Find-Element '1 matches in 2 folders. 42 text files inspected') -and
             (Find-Element $excerpt) -and (Button "Reveal $parent/nested/nested-content.txt")
     }
-    $contentField = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
+    $previewMatch = "Preview match $parent/nested/nested-content.txt"
+    [IO.File]::WriteAllText($fixtureText, "new first line`r`n$fixtureContents")
+    Click $previewMatch
+    $null = Wait-Until 'preview starts at the current matching line with context' {
+        (Find-Element 'Match on line 44' -Visible) -and
+            (Find-Element 'Fixture needle value' -Visible) -and
+            (Find-Element 'Context before' -Visible) -and
+            (Find-Element 'Context after' -Visible) -and !(Find-Element 'File contents')
+    }
+    Click 'Show full file'
+    $fullText = Wait-Until 'the full file is available without a second search' {
+        Find-Element 'File contents'
+    }
+    $actualText = $fullText.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+    if (!$actualText.StartsWith('new first line') -or !$actualText.Contains('last line')) {
+        throw 'The full preview omitted text outside the match context'
+    }
+    Click 'Back to match'
+    $null = Wait-Until 'the match context is visible again' { Find-Element 'Match on line 44' -Visible }
+    Click 'Close preview'
+    $null = Wait-Until 'the match preview closes' { !(Button 'Close preview') }
+    [IO.File]::WriteAllText($fixtureText, 'The file was changed.')
+    Click $previewMatch
+    $null = Wait-Until 'the stale search hit opens the current file with an explanation' {
+        (Find-Element 'The current file no longer matches the search.' -Visible) -and
+            (Find-Element 'File contents') -and !(Button 'Show full file')
+    }
+    Click 'Close preview'
+    $contentField = Wait-Until 'the changed file preview closes and restores the search field' {
+        $field = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
+        if (!(Button 'Close preview') -and $field -and $field.Current.IsEnabled) { $field }
+    }
     $contentField.GetCurrentPattern($value).SetValue('')
     $null = Wait-Until 'clearing the content query disables the empty search' {
         $run = Button 'Search'
@@ -712,6 +745,8 @@ try {
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','filter-ssh-ready')
+} catch {
+    throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
     [IO.File]::Delete($readGate)
     [IO.File]::Delete($refreshGate)

@@ -1,5 +1,6 @@
 use super::*;
 use std::cell::OnceCell;
+use w11term::sftp::ContentMatch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewKind {
@@ -13,6 +14,8 @@ pub(super) struct EntryPreview {
     target: FileTarget,
     kind: PreviewKind,
     content: Contents,
+    text_match: Option<MatchPreview>,
+    full_text: bool,
     checksum_available: bool,
     copy_status: Option<String>,
     pub(super) cancel: TransferCancel,
@@ -24,6 +27,87 @@ enum Contents {
     Loading,
     Ready(String),
     Error(String),
+}
+
+enum MatchPreview {
+    Found {
+        line: usize,
+        excerpt: String,
+        before: Vec<String>,
+        after: Vec<String>,
+    },
+    Missing,
+}
+
+impl MatchPreview {
+    fn from_file(text: &str, hit: ContentMatch) -> Self {
+        const CONTEXT_LINES: usize = 2;
+        let index = hit.line - 1;
+        let first = index.saturating_sub(CONTEXT_LINES);
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let mut lines = text.lines().skip(first);
+        let before = lines
+            .by_ref()
+            .take(index - first)
+            .map(context_line)
+            .collect();
+        lines.next();
+        let after = lines.take(CONTEXT_LINES).map(context_line).collect();
+        Self::Found {
+            line: hit.line,
+            excerpt: hit.excerpt,
+            before,
+            after,
+        }
+    }
+
+    fn view(&self) -> Option<View> {
+        let Self::Found {
+            line,
+            excerpt,
+            before,
+            after,
+        } = self
+        else {
+            return None;
+        };
+        let mut fields = vec![KeyedView::new(
+            "line",
+            TextBlock::new().text(format!("Match on line {line}")),
+        )];
+        for (index, text) in before.iter().chain([excerpt]).chain(after).enumerate() {
+            let mut block = TextBlock::new()
+                .text(text)
+                .text_wrapping(TextWrapping::Wrap)
+                .min_height(18.0)
+                .is_text_selection_enabled(true);
+            if index == before.len() {
+                block = block
+                    .automation_id("sftp-preview-match-line")
+                    .font_weight(windows_reactor::FontWeight::SEMI_BOLD);
+            }
+            fields.push(KeyedView::new(format!("context-{index}"), block));
+        }
+        Some(
+            ScrollViewer::new()
+                .max_height(420.0)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .content(StackPanel::new().keyed_children(fields)),
+        )
+    }
+}
+
+fn context_line(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut context: String = chars
+        .by_ref()
+        .take(160)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if chars.next().is_some() {
+        context.push('…');
+    }
+    context
 }
 
 impl Drop for EntryPreview {
@@ -73,32 +157,48 @@ impl EntryPreview {
                             .into()
                     }
                     Contents::Ready(text) => {
-                        let (name, id) = match self.kind {
-                            PreviewKind::Text => ("File contents", "sftp-preview-text"),
-                            PreviewKind::Properties => ("File properties", "sftp-properties-text"),
-                            PreviewKind::Checksum(_) => ("SHA-256 digest", "sftp-checksum-text"),
-                        };
-                        let mut fields = vec![KeyedView::new(
-                            "contents",
-                            TextBlock::new()
-                                .automation_name(name)
-                                .automation_id(id)
-                                .is_text_selection_enabled(true)
-                                .text(text),
-                        )];
-                        if self.kind == PreviewKind::Text && text.is_empty() {
-                            fields
-                                .push(KeyedView::new("empty", TextBlock::new().text("Empty file")));
-                        }
-                        ScrollViewer::new()
-                            .max_height(420.0)
-                            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                            .content(StackPanel::new().keyed_children(fields))
+                        let context = self
+                            .text_match
+                            .as_ref()
+                            .filter(|_| !self.full_text)
+                            .and_then(MatchPreview::view);
+                        context.unwrap_or_else(|| self.full_text_view(text))
                     }
                 };
                 let serial = self.serial;
-                let mut fields = vec![KeyedView::new("document", body)];
+                let body_key = if self.full_text {
+                    "full-document"
+                } else {
+                    "document"
+                };
+                let mut fields = vec![KeyedView::new(body_key, body)];
+                if matches!(self.text_match, Some(MatchPreview::Found { .. })) {
+                    let full = !self.full_text;
+                    fields.push(KeyedView::new(
+                        "toggle-match",
+                        Button::new()
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::ShowFullPreview(
+                                    pane, generation, serial, full,
+                                ))
+                            }))
+                            .content(if full {
+                                "Show full file"
+                            } else {
+                                "Back to match"
+                            }),
+                    ));
+                } else if matches!(self.text_match, Some(MatchPreview::Missing)) {
+                    fields.insert(
+                        0,
+                        KeyedView::new(
+                            "match-missing",
+                            TextBlock::new()
+                                .text("The current file no longer matches the search.")
+                                .text_wrapping(TextWrapping::Wrap),
+                        ),
+                    );
+                }
                 if self.editable() && can_edit {
                     fields.push(KeyedView::new(
                         "edit",
@@ -180,6 +280,30 @@ impl EntryPreview {
             })
             .clone()
     }
+
+    fn full_text_view(&self, text: &str) -> View {
+        let (name, id) = match self.kind {
+            PreviewKind::Text => ("File contents", "sftp-preview-text"),
+            PreviewKind::Properties => ("File properties", "sftp-properties-text"),
+            PreviewKind::Checksum(_) => ("SHA-256 digest", "sftp-checksum-text"),
+        };
+        let mut fields = vec![KeyedView::new(
+            "contents",
+            TextBlock::new()
+                .automation_name(name)
+                .automation_id(id)
+                .is_text_selection_enabled(true)
+                .text(text),
+        )];
+        if self.kind == PreviewKind::Text && text.is_empty() {
+            fields.push(KeyedView::new("empty", TextBlock::new().text("Empty file")));
+        }
+        ScrollViewer::new()
+            .max_height(420.0)
+            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .content(StackPanel::new().keyed_children(fields))
+    }
 }
 
 impl FileDrawer {
@@ -244,6 +368,8 @@ impl FileDrawer {
             target,
             kind,
             content: Contents::Loading,
+            text_match: None,
+            full_text: false,
             checksum_available: false,
             copy_status: None,
             cancel: TransferCancel::default(),
@@ -286,10 +412,32 @@ impl FileDrawer {
                 .and_then(|sha256| normalize_sha256(sha256).map_err(|error| error.to_string())),
         });
         preview.content = match text {
-            Ok(text) => Contents::Ready(text),
+            Ok(text) => {
+                if preview.kind == PreviewKind::Text
+                    && let FileTarget::Search(_, hit) = &preview.target
+                    && hit.content_match.is_some()
+                    && let Some(panel) = &self.search
+                {
+                    preview.text_match = Some(match panel.match_file_text(&text) {
+                        Ok(Some(hit)) => MatchPreview::from_file(&text, hit),
+                        _ => MatchPreview::Missing,
+                    });
+                }
+                Contents::Ready(text)
+            }
             Err(error) => Contents::Error(error),
         };
         preview.view.take();
+    }
+
+    pub(super) fn show_full_preview(&mut self, serial: u64, full: bool) {
+        if let Some(preview) = self.preview.as_mut().filter(|p| p.serial == serial)
+            && matches!(preview.text_match, Some(MatchPreview::Found { .. }))
+            && preview.full_text != full
+        {
+            preview.full_text = full;
+            preview.view.take();
+        }
     }
 
     fn ready_checksum(&self, serial: u64) -> Option<(&FileTarget, &str)> {
@@ -350,6 +498,34 @@ impl FileDrawer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn match_preview_keeps_nearby_lines_and_caps_long_context() {
+        let text = format!(
+            "\u{feff}outside\r\n{}\r\n\r\n\tÉcho\r\nfollowing\r\nlast nearby\r\noutside",
+            "雪".repeat(170),
+        );
+        let filter = w11term::sftp::FilenameFilter {
+            content_query: "^\\s*écho$".into(),
+            regex: true,
+            ..Default::default()
+        };
+        let hit = filter.match_file_text(&text).unwrap().unwrap();
+        let MatchPreview::Found {
+            line,
+            excerpt,
+            before,
+            after,
+        } = MatchPreview::from_file(&text, hit)
+        else {
+            unreachable!()
+        };
+        assert_eq!(line, 4);
+        assert_eq!(excerpt, " Écho");
+        assert_eq!(before, [format!("{}…", "雪".repeat(160)), String::new()]);
+        assert_eq!(after, ["following", "last nearby"]);
+        assert!(filter.match_file_text("outside").unwrap().is_none());
+    }
 
     #[test]
     fn verified_download_reuses_only_the_current_checksum_and_selection() {

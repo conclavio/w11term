@@ -197,6 +197,14 @@ impl FilenameFilter {
                     || !self.content_query.is_empty()))
     }
 
+    /// Match freshly read file text using the same rules as a recursive scan.
+    pub fn match_file_text(&self, text: &str) -> Result<Option<ContentMatch>> {
+        Ok(self
+            .compile_content_pattern()?
+            .as_ref()
+            .and_then(|pattern| first_content_match(text, pattern)))
+    }
+
     pub(crate) fn compile_content_pattern(&self) -> Result<Option<regex::Regex>> {
         if self.content_query.is_empty() {
             return Ok(None);
