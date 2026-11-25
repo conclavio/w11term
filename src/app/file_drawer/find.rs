@@ -76,6 +76,31 @@ impl Panel {
         self.marked_downloads = None;
     }
 
+    fn install_result(&mut self, result: FilenameSearch) -> usize {
+        let previous = self.result.as_ref().filter(|old| old.root == result.root);
+        if previous.is_none() {
+            self.page = 0;
+        }
+        let mut cleared = 0;
+        if let Some(marked) = &mut self.marked_downloads {
+            let old_count = marked.len();
+            let wanted: Vec<_> = previous
+                .into_iter()
+                .flat_map(|old| marked.iter().filter_map(|&index| old.matches.get(index)))
+                .collect();
+            *marked = result
+                .matches
+                .iter()
+                .enumerate()
+                .filter_map(|(index, hit)| wanted.contains(&hit).then_some(index))
+                .collect();
+            cleared = old_count.saturating_sub(marked.len());
+        }
+        self.result = Some(result);
+        self.page = self.page.min(self.page_count().saturating_sub(1));
+        cleared
+    }
+
     fn search_download_selection(&self, serial: u64) -> Result<SearchDownload> {
         let result = self
             .result
@@ -266,7 +291,11 @@ impl Panel {
             )
         } else {
             button(
-                "Search",
+                if self.result.is_some() {
+                    "Refresh results"
+                } else {
+                    "Search"
+                },
                 Action::Run(serial),
                 ready && self.filter.valid_query(&self.query),
             )
@@ -620,13 +649,29 @@ impl FileDrawer {
         };
         panel.cancel = None;
         panel.copy_status = None;
+        // The old rows are visible but disabled during a refresh. Give the
+        // completed scan a new serial so callbacks from those rows cannot act
+        // on indices in the replacement results.
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        panel.serial = self.dialog_serial;
         self.status = match result.and_then(|value| {
             serde_json::from_value::<FilenameSearch>(value).map_err(|error| error.to_string())
         }) {
+            Ok(result) if result.cancelled && panel.result.is_some() => {
+                "Refresh cancelled. Showing previous results.".into()
+            }
             Ok(result) => {
-                let status = result_status(&result);
-                panel.result = Some(result);
+                let mut status = result_status(&result);
+                let cleared = panel.install_result(result);
+                if cleared > 0 {
+                    use std::fmt::Write;
+                    let ending = if cleared == 1 { "" } else { "s" };
+                    let _ = write!(status, ". {cleared} download mark{ending} cleared");
+                }
                 status
+            }
+            Err(error) if panel.result.is_some() => {
+                format!("Refresh failed. Showing previous results. {error}")
             }
             Err(error) => error,
         };
@@ -724,9 +769,13 @@ impl FileDrawer {
                 self.dialog_serial = self.dialog_serial.wrapping_add(1);
                 panel.serial = self.dialog_serial;
                 let serial = panel.serial;
-                panel.clear_results();
+                panel.copy_status = None;
                 panel.cancel = Some(TransferCancel::default());
-                self.status = "Searching folders…".into();
+                self.status = if panel.result.is_some() {
+                    "Refreshing search results…".into()
+                } else {
+                    "Searching folders…".into()
+                };
                 if let Err(error) = self.job(pane, session, op, Step::Search(serial), ctx) {
                     self.finish_search(serial, Err(format!("{error:#}")));
                 }
@@ -786,6 +835,83 @@ impl FileDrawer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn search_result(root: &str, entries: &[(&str, EntryKind)]) -> FilenameSearch {
+        FilenameSearch {
+            root: root.into(),
+            matches: entries
+                .iter()
+                .map(|(name, kind)| FilenameMatch {
+                    parent: "/project/nested".into(),
+                    name: (*name).into(),
+                    kind: Some(*kind),
+                })
+                .collect(),
+            scanned_directories: 2,
+            scanned_entries: entries.len(),
+            skipped_directories: 0,
+            truncated: false,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn refresh_remaps_marks_by_root_path_and_type_then_expires_old_callbacks() {
+        use EntryKind::{Directory, File};
+        let before = search_result(
+            "/project",
+            &[("keep", File), ("removed", File), ("changed", File)],
+        );
+        let mut drawer = FileDrawer {
+            open: true,
+            dialog_serial: 3,
+            search: Some(Panel {
+                serial: 3,
+                root: "/project".into(),
+                query: "test".into(),
+                input: ElementRef::new(),
+                filter: FilenameFilter::default(),
+                result: Some(before),
+                page: 1,
+                cancel: Some(TransferCancel::default()),
+                copy_status: None,
+                marked_downloads: Some(BTreeSet::from([0, 1, 2])),
+            }),
+            ..FileDrawer::default()
+        };
+        let after = search_result(
+            "/project",
+            &[("added", File), ("changed", Directory), ("keep", File)],
+        );
+        drawer.finish_search(3, Ok(json!(after)));
+        let panel = drawer.search.as_ref().unwrap();
+        assert_eq!(panel.serial, 4);
+        assert_eq!(panel.page, 0);
+        assert_eq!(panel.marked_downloads, Some(BTreeSet::from([2])));
+        assert!(panel.search_download_selection(3).is_err());
+        assert!(panel.search_download_selection(4).is_ok());
+        assert!(drawer.status.ends_with("2 download marks cleared"));
+
+        let mut cancelled = search_result("/project", &[]);
+        cancelled.cancelled = true;
+        drawer.finish_search(4, Ok(json!(cancelled)));
+        assert_eq!(
+            drawer.search.as_ref().unwrap().marked_downloads,
+            Some(BTreeSet::from([2]))
+        );
+        assert!(drawer.status.contains("Refresh cancelled"));
+        drawer.finish_search(5, Err("SSH request timed out".into()));
+        assert_eq!(
+            drawer.search.as_ref().unwrap().marked_downloads,
+            Some(BTreeSet::from([2]))
+        );
+        assert!(drawer.status.contains("Refresh failed"));
+
+        let moved_root = search_result("/project/nested", &[("keep", File)]);
+        drawer.finish_search(6, Ok(json!(moved_root)));
+        assert!(drawer.search_download_selection(7).is_err());
+        assert!(drawer.status.ends_with("1 download mark cleared"));
+    }
 
     #[test]
     fn restoring_search_keeps_the_query_and_page_and_rejects_old_actions() {

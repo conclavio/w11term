@@ -15,7 +15,9 @@ $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $picker = Join-Path $State 'picker'
 $env:W11TERM_SFTP_PICKER_SMOKE_DIR = $picker
 $null = New-Item -ItemType Directory -Path (Join-Path $picker 'received')
-$readGate = Join-Path ([IO.File]::ReadAllText((Join-Path $State 'fixture-root'))) 'hold-transfer-read'
+$peerRoot = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
+$readGate = Join-Path $peerRoot 'hold-transfer-read'
+$refreshGate = Join-Path $peerRoot 'hold-opendir'
 $profiles = Join-Path $State 'profiles.json'
 $parent = '/shell directory'
 # Windows PowerShell 5.1 also reads this fixture on non-UTF-8 code pages.
@@ -247,7 +249,7 @@ try {
         $status = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $searchStatus)
         $status -and $status.Current.Name.Contains('Invalid filename regex')
     }
-    $pattern = '^nested(?:-content\.txt)?$|^BUILD-00\.log$'
+    $pattern = '^nested(?:-(?:added|content)\.txt)?$|^BUILD-00\.log$'
     $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     $field.GetCurrentPattern($value).SetValue($pattern)
     Click 'Search'
@@ -336,6 +338,34 @@ try {
     $null = Wait-Until 'result summary and copy confirmation share the panel' {
         (Find-Element '2 matches in 2 folders') -and (Find-Element 'Copied 2 paths')
     }
+    [IO.File]::WriteAllText((Join-Path $peerRoot 'shell directory/nested-added.txt'), 'added after search')
+    [IO.File]::WriteAllText($refreshGate, $parent)
+    Click 'Refresh results'
+    $null = Wait-Until 'previous search results visible with actions disabled during refresh' {
+        $downloadMarked = Button 'Download marked results'
+        (Test-Path -LiteralPath (Join-Path $peerRoot 'opendir-paused')) -and
+            (Button "Reveal $parent/nested/nested-content.txt") -and
+            $downloadMarked -and !$downloadMarked.Current.IsEnabled
+    }
+    Click 'Cancel search'
+    $null = Wait-Until 'refresh cancellation requested' {
+        $cancel = Button 'Cancel search'
+        $cancel -and !$cancel.Current.IsEnabled
+    }
+    [IO.File]::Delete($refreshGate)
+    $null = Wait-Until 'cancelled refresh keeps the original results' {
+        (Find-Element 'Refresh cancelled. Showing previous results.') -and
+            (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled -and
+            !(Button "Reveal $parent/nested-added.txt")
+    }
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    Click 'Refresh results'
+    $null = Wait-Until 'refresh includes the new unmarked result' {
+        (Find-Element '3 matches in 2 folders') -and (Button "Reveal $parent/nested-added.txt")
+    }
+    $null = Wait-CheckBox "Mark $parent/nested-added.txt" $off
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    $null = Wait-CheckBox "Mark $parent/nested" $on
     $cancelled = Join-Path $picker 'cancelled search batch'
     [IO.File]::WriteAllBytes($readGate, [byte[]]@())
     Save-MarkedResults $cancelled
@@ -375,6 +405,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','filter-ssh-ready')
 } finally {
     [IO.File]::Delete($readGate)
+    [IO.File]::Delete($refreshGate)
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
