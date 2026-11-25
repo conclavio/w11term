@@ -28,19 +28,17 @@ function Invoke-Control([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0 -or -not $result.ok) { throw "Control failed: $raw" }
     return $result.result
 }
-function Wait-ControlManifest {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    $manifest = if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Join-Path $env:ProgramData "w11term\elevated\$($identity.User.Value)\instances\$($terminal.Id).json"
-    } else {
-        Join-Path $env:LOCALAPPDATA "w11term\instances\$($terminal.Id).json"
-    }
+function Wait-ControlPipe {
+    # A discovery file from a previous fixture may survive a forced stop.
+    # Poll the actual pipe for this PID before sending the first assertion.
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    while (-not (Test-Path -LiteralPath $manifest)) {
-        if ($terminal.HasExited -or [DateTime]::UtcNow -gt $deadline) { throw "GUI did not publish its control manifest. See $state" }
+    do {
+        if ($terminal.HasExited) { break }
+        $raw = & $ctl --pid $terminal.Id list
+        if ($LASTEXITCODE -eq 0 -and ($raw | ConvertFrom-Json).ok) { return }
         Start-Sleep -Milliseconds 50
-    }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "GUI control pipe did not become ready. See $state. Last response: $raw"
 }
 function Stop-TestWindow([Diagnostics.Process]$Process) {
     if ($Process -and -not $Process.HasExited) {
@@ -67,7 +65,7 @@ try {
     @{profiles=@{first=$sshProfile; second=$sshProfile; 'restart-local'=$localProfile}} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $profiles
     # Keep every native window within a small CI desktop, including the restored grid.
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'first', '--tab', 'second', '--cols', '80', '--rows', '24') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'gui.log') -RedirectStandardError (Join-Path $state 'gui.err')
-    Wait-ControlManifest
+    Wait-ControlPipe
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         $listing = Invoke-Control @('list')
@@ -195,7 +193,7 @@ try {
     $null = $terminal.CloseMainWindow()
     if (-not $terminal.WaitForExit(5000)) { throw 'GUI failed to close' }
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'second') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'restored.log') -RedirectStandardError (Join-Path $state 'restored.err')
-    Wait-ControlManifest
+    Wait-ControlPipe
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         $listing = Invoke-Control @('list')
@@ -206,7 +204,7 @@ try {
     $null = $terminal.CloseMainWindow()
     if (-not $terminal.WaitForExit(5000)) { throw 'Restored GUI failed to close' }
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--replay', ('"' + $capture + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $state 'replay.err')
-    Wait-ControlManifest
+    Wait-ControlPipe
     $null = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '5', 'TAPE')
     $replayed = Invoke-Control @('get-text', '--pane', '1')
     if ($replayed.cols -ne $live.cols -or $replayed.rows -ne $live.rows -or $replayed.text -cne $live.text) { throw 'Replay did not reproduce the recorded grid and screen contents' }
@@ -219,7 +217,7 @@ try {
     $wire = "${esc}[?25l${esc}[2;4H${esc}_Ga=T,i=49,f=24,s=8,v=8,c=1,r=1,C=1,q=2;$red${esc}\${esc}[3;1HRAW-IMAGE-READY"
     [IO.File]::WriteAllText($rawCapture, $wire, [Text.Encoding]::ASCII)
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--replay', ('"' + $rawCapture + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $state 'raw-replay.err')
-    Wait-ControlManifest
+    Wait-ControlPipe
     $matched = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '8', 'RAW-IMAGE-READY')
     if (-not $matched.matched) { throw 'Raw image replay did not reach its marker' }
     $grid = Invoke-Control @('get-text', '--pane', '1')
