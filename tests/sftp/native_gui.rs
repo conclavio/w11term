@@ -2986,12 +2986,14 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     for index in 0..fillers {
         fs::write(parent.join(format!("build-{index:02}.log")), []).unwrap();
     }
+    set_fixture_modified(&parent.join("build-37.log"), 2_114_380_800);
     fs::write(parent.join("zz-[Ångström].txt"), []).unwrap();
     fs::write(parent.join("zz-Ångström.txt"), []).unwrap();
     let keyboard = remote.path().join("keyboard-input.bin");
     let wire = remote.path().join("listing-trace");
     fs::write(&keyboard, []).unwrap();
     fs::write(&wire, []).unwrap();
+    fs::write(remote.path().join("delete-trace.jsonl"), []).unwrap();
 
     let state = tempfile::tempdir().unwrap();
     fs::write(
@@ -3024,18 +3026,35 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory", fillers + 5),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // Exclusion skips opening the nested directory.
+            ("/shell directory", fillers + 5), // File size alone can select files from subfolders.
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // A date can be the only search filter.
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // One scan for the paginated sort fixture.
+            ("/shell directory/nested", 2),
+            ("/shell directory/nested", 2), // Enter another folder before using the saved search.
+            ("/shell directory", fillers + 5), // A saved search reruns from its original root.
+            ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
-            ("/shell directory", 0), // Cancelled in OPENDIR before reading a page.
+            ("/shell directory", fillers + 6), // Progress includes the completed root.
+            ("/shell directory/nested", 0),    // Refresh cancelled before reading the subfolder.
             ("/shell directory", fillers + 6), // The refresh sees a newly added file.
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 6), // Rename refreshes the same search.
             ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // Delete refreshes after acknowledgement.
+            ("/shell directory/nested", 2),
             ("/shell directory/nested", 1), // Cancelled during the first page.
             ("/shell directory/nested", 2),
         ]
+    );
+    assert_eq!(
+        super::remove::trace(remote.path()),
+        [["REMOVE", "/shell directory/nested-renamed.txt"]]
     );
     assert_eq!(
         fs::read(keyboard).unwrap(),

@@ -1,5 +1,10 @@
 use super::*;
-use w11term::sftp::{FilenameFilter, FilenameSearch, SearchDownload};
+use w11term::sftp::{
+    FileSizeRange, FilenameFilter, FilenameSearch, FilenameSort as ResultSort, SearchDownload,
+    valid_filename_query,
+};
+
+pub mod saved;
 
 const RESULTS_PER_PAGE: usize = 25;
 const RESULT_TYPES: [(Option<EntryKind>, &str); 4] = [
@@ -7,6 +12,12 @@ const RESULT_TYPES: [(Option<EntryKind>, &str); 4] = [
     (Some(EntryKind::File), "Files"),
     (Some(EntryKind::Directory), "Folders"),
     (Some(EntryKind::Symlink), "Symbolic links"),
+];
+const RESULT_SORTS: [(ResultSort, &str); 4] = [
+    (ResultSort::Folder, "Sort by folder"),
+    (ResultSort::Name, "Sort by filename"),
+    (ResultSort::Newest, "Newest first"),
+    (ResultSort::Largest, "Largest first"),
 ];
 
 #[derive(Clone)]
@@ -16,14 +27,18 @@ pub enum Action {
     FocusQuery(u64, u8),
     Query(u64, String),
     SetOption(u64, MatchOption),
+    ShowAdvanced(u64, bool),
     Run(u64),
     Cancel(u64),
+    Sort(u64, ResultSort),
     Page(u64, usize),
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
     Reveal(u64, FilenameMatch),
     Rename(u64, FilenameMatch),
+    Delete(u64, FilenameMatch),
     CopyPaths(u64, Option<FilenameMatch>),
+    Saved(u64, saved::Action),
     Back(u64),
 }
 
@@ -31,7 +46,38 @@ pub enum Action {
 pub enum MatchOption {
     Regex(bool),
     MatchCase(bool),
+    MatchPath(bool),
     Kind(Option<EntryKind>),
+    ExcludeDirs(String),
+    MinimumSize(String),
+    MaximumSize(String),
+    ModifiedFrom(String),
+    ModifiedThrough(String),
+}
+
+#[derive(Default)]
+struct SizeFields {
+    minimum: String,
+    maximum: String,
+}
+
+impl SizeFields {
+    fn apply(&self, filter: &FilenameFilter) -> Result<FilenameFilter> {
+        let mut filter = filter.clone();
+        filter.file_size = FileSizeRange::parse(&self.minimum, &self.maximum)?;
+        filter.file_size.validate(filter.kind)?;
+        Ok(filter)
+    }
+}
+
+impl From<FileSizeRange> for SizeFields {
+    fn from(range: FileSizeRange) -> Self {
+        let text = |bound: Option<u64>| bound.map_or_else(String::new, |bytes| bytes.to_string());
+        Self {
+            minimum: text(range.minimum),
+            maximum: text(range.maximum),
+        }
+    }
 }
 
 pub(super) struct Panel {
@@ -40,6 +86,10 @@ pub(super) struct Panel {
     query: String,
     input: ElementRef<TextBox>,
     filter: FilenameFilter,
+    size: SizeFields,
+    advanced_open: bool,
+    sort: ResultSort,
+    saved: Option<saved::List>,
     result: Option<FilenameSearch>,
     page: usize,
     pub(super) cancel: Option<TransferCancel>,
@@ -66,6 +116,14 @@ fn result_status(result: &FilenameSearch) -> String {
             result.skipped_directories
         );
     }
+    match result.excluded_directories {
+        0 => {}
+        1 => status.push_str(". 1 folder excluded"),
+        count => {
+            use std::fmt::Write;
+            let _ = write!(status, ". {count} folders excluded");
+        }
+    }
     status
 }
 
@@ -75,6 +133,45 @@ fn within<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
 }
 
 impl Panel {
+    fn advanced_summary(&self) -> Option<String> {
+        let parts: Vec<_> = [
+            (
+                "Exclude folders",
+                self.filter.exclude_dir_regex.as_str(),
+                "",
+            ),
+            ("Min size", self.size.minimum.trim(), ""),
+            ("Max size", self.size.maximum.trim(), ""),
+            (
+                "Modified from",
+                self.filter.modified_dates.from.trim(),
+                " UTC",
+            ),
+            (
+                "Modified through",
+                self.filter.modified_dates.through.trim(),
+                " UTC",
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, value, _)| !value.is_empty())
+        .map(|(label, value, suffix)| format!("{label} {value}{suffix}"))
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    fn query_optional(&self) -> bool {
+        self.filter.kind.is_some()
+            || !self.filter.exclude_dir_regex.is_empty()
+            || !self.size.minimum.trim().is_empty()
+            || !self.size.maximum.trim().is_empty()
+            || !self.filter.modified_dates.is_unrestricted()
+    }
+
+    fn can_search(&self) -> bool {
+        valid_filename_query(&self.query) || (self.query.is_empty() && self.query_optional())
+    }
+
     fn clear_results(&mut self) {
         self.result = None;
         self.page = 0;
@@ -82,7 +179,8 @@ impl Panel {
         self.marked_downloads = None;
     }
 
-    fn install_result(&mut self, result: FilenameSearch) -> usize {
+    fn install_result(&mut self, mut result: FilenameSearch) -> usize {
+        self.sort.apply(&mut result.matches);
         let previous = self.result.as_ref().filter(|old| old.root == result.root);
         if previous.is_none() {
             self.page = 0;
@@ -98,7 +196,14 @@ impl Panel {
                 .matches
                 .iter()
                 .enumerate()
-                .filter_map(|(index, hit)| wanted.contains(&hit).then_some(index))
+                .filter_map(|(index, hit)| {
+                    wanted
+                        .iter()
+                        .any(|old| {
+                            old.parent == hit.parent && old.name == hit.name && old.kind == hit.kind
+                        })
+                        .then_some(index)
+                })
                 .collect();
             cleared = old_count.saturating_sub(marked.len());
         }
@@ -184,6 +289,8 @@ impl Panel {
         files: &FileDrawer,
         pane: u64,
         shell_ready: bool,
+        layout: DrawerLayout,
+        profile: Option<&str>,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let generation = files.generation;
@@ -201,7 +308,7 @@ impl Panel {
         };
         let running = self.cancel.as_ref();
         let type_filter = ComboBox::new()
-            .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Top)
             .automation_name("Search result type")
             .is_enabled(ready)
             .items_source(RESULT_TYPES.map(|(_, label)| label))
@@ -222,16 +329,24 @@ impl Panel {
                     },
                 )
             }));
+        let input_label = if self.filter.match_path {
+            "Relative path contains"
+        } else {
+            "Filename contains"
+        };
+        let prompt = match (self.filter.match_path, self.filter.regex) {
+            (true, true) => "Relative path regex",
+            (false, true) => "Filename regex",
+            (_, false) => input_label,
+        };
         let query = TextBox::new()
             .min_width(0.0)
-            .automation_name("Filename contains")
-            .automation_id(crate::input::file_search_tag(pane))
+            .automation_name(input_label)
             .element_ref(&self.input)
-            .placeholder_text(match (self.filter.regex, self.filter.kind.is_some()) {
-                (true, true) => "Filename regex (optional)",
-                (true, false) => "Filename regex",
-                (false, true) => "Filename contains (optional)",
-                (false, false) => "Filename contains",
+            .placeholder_text(if self.query_optional() {
+                format!("{prompt} (optional)")
+            } else {
+                prompt.into()
             })
             .is_enabled(ready)
             .text(&self.query)
@@ -242,6 +357,83 @@ impl Panel {
                     Action::Query(serial, text),
                 ))
             }));
+        let mut fields = vec![KeyedView::new("pattern", query)];
+        if self.advanced_open {
+            let bound_field =
+                |label: &str, placeholder: &str, text: &str, option: fn(String) -> MatchOption| {
+                    TextBox::new()
+                        .min_width(0.0)
+                        .automation_name(label)
+                        .placeholder_text(placeholder)
+                        .is_enabled(ready)
+                        .text(text)
+                        .on_text_changed(ctx.callback(move |text| {
+                            Message::Files(FileAction::Search(
+                                pane,
+                                generation,
+                                Action::SetOption(serial, option(text)),
+                            ))
+                        }))
+                };
+            let sizes = Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+                .column_spacing(6.0)
+                .children((
+                    bound_field(
+                        "Minimum file size",
+                        "Min size",
+                        &self.size.minimum,
+                        MatchOption::MinimumSize,
+                    ),
+                    bound_field(
+                        "Maximum file size",
+                        "Max size",
+                        &self.size.maximum,
+                        MatchOption::MaximumSize,
+                    )
+                    .grid_column(1),
+                ));
+            let dates = Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+                .column_spacing(6.0)
+                .children((
+                    bound_field(
+                        "Modified from (UTC)",
+                        "Modified from",
+                        &self.filter.modified_dates.from,
+                        MatchOption::ModifiedFrom,
+                    ),
+                    bound_field(
+                        "Modified through (UTC)",
+                        "Modified through",
+                        &self.filter.modified_dates.through,
+                        MatchOption::ModifiedThrough,
+                    )
+                    .grid_column(1),
+                ));
+            fields.extend([
+                KeyedView::new(
+                    "exclude",
+                    bound_field(
+                        "Exclude folder paths (regex)",
+                        "Exclude folder paths (regex)",
+                        &self.filter.exclude_dir_regex,
+                        MatchOption::ExcludeDirs,
+                    ),
+                ),
+                KeyedView::new("sizes", sizes),
+                KeyedView::new("dates", dates),
+            ]);
+        }
+        let advanced_toggle = button(
+            if self.advanced_open {
+                "Hide filters"
+            } else {
+                "More filters"
+            },
+            Action::ShowAdvanced(serial, !self.advanced_open),
+            true,
+        );
         let mut rows = vec![
             KeyedView::new(
                 "back",
@@ -262,7 +454,16 @@ impl Panel {
                 Grid::new()
                     .columns([GridLength::Star(1.0), GridLength::Auto])
                     .column_spacing(8.0)
-                    .children((query, type_filter)),
+                    .children((
+                        StackPanel::new()
+                            .automation_id(crate::input::file_search_tag(pane))
+                            .spacing(6.0)
+                            .keyed_children(fields),
+                        StackPanel::new()
+                            .grid_column(1)
+                            .spacing(6.0)
+                            .children((type_filter, advanced_toggle)),
+                    )),
             ),
         ];
         let check = |label, checked, option: fn(bool) -> MatchOption| {
@@ -282,13 +483,29 @@ impl Panel {
         rows.push(KeyedView::new(
             "options",
             StackPanel::new()
-                .orientation(Orientation::Horizontal)
+                .orientation(if layout.content_width() >= 280.0 {
+                    Orientation::Horizontal
+                } else {
+                    Orientation::Vertical
+                })
                 .spacing(8.0)
                 .children((
                     check("Regex", self.filter.regex, MatchOption::Regex),
                     check("Match case", self.filter.match_case, MatchOption::MatchCase),
+                    check("Match path", self.filter.match_path, MatchOption::MatchPath),
                 )),
         ));
+        if !self.advanced_open
+            && let Some(summary) = self.advanced_summary()
+        {
+            rows.push(KeyedView::new(
+                "advanced-summary",
+                TextBlock::new()
+                    .automation_id("sftp-search-filters-summary")
+                    .text(summary)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         let run = if let Some(cancel) = running {
             button(
                 "Cancel search",
@@ -303,7 +520,7 @@ impl Panel {
                     "Search"
                 },
                 Action::Run(serial),
-                ready && self.filter.valid_query(&self.query),
+                ready && self.can_search(),
             )
         };
         let search_actions = if self
@@ -322,6 +539,23 @@ impl Panel {
             run
         };
         rows.push(KeyedView::new("run", search_actions));
+        if let Some(profile) = profile.filter(|_| generation != 0) {
+            if let Some(list) = self.saved.as_ref().filter(|list| list.profile == profile) {
+                rows.push(KeyedView::new(
+                    "saved",
+                    list.view(self, pane, generation, ready, ctx),
+                ));
+            } else {
+                rows.push(KeyedView::new(
+                    "saved-toggle",
+                    button(
+                        "Saved searches…",
+                        Action::Saved(serial, saved::Action::Show),
+                        ready,
+                    ),
+                ));
+            }
+        }
         if self.result.as_ref().is_some_and(|result| {
             result
                 .matches
@@ -360,6 +594,36 @@ impl Panel {
                     .keyed_children(actions),
             ));
         }
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|result| result.matches.len() > 1)
+        {
+            rows.push(KeyedView::new(
+                "sort",
+                ComboBox::new()
+                    .automation_name("Sort search results")
+                    .is_enabled(ready)
+                    .items_source(RESULT_SORTS.map(|(_, label)| label))
+                    .selected_index(
+                        RESULT_SORTS
+                            .iter()
+                            .position(|(order, _)| *order == self.sort),
+                    )
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index.and_then(|i| RESULT_SORTS.get(i)).map_or(
+                            Message::ControlIdle,
+                            |&(sort, _)| {
+                                Message::Files(FileAction::Search(
+                                    pane,
+                                    generation,
+                                    Action::Sort(serial, sort),
+                                ))
+                            },
+                        )
+                    })),
+            ));
+        }
         if let Some(resume) = files.resume_draft_button(pane, ctx) {
             rows.push(KeyedView::new("resume-draft", resume));
         }
@@ -369,6 +633,34 @@ impl Panel {
                 TextBlock::new()
                     .automation_id("sftp-search-status")
                     .text(&files.status)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        if let Some(progress) = files.search_progress(serial) {
+            let entries = if progress.scanned_entries == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            let folders = if progress.scanned_directories == 1 {
+                "folder"
+            } else {
+                "folders"
+            };
+            let matches = if progress.matches == 1 {
+                "match"
+            } else {
+                "matches"
+            };
+            let counts = format!(
+                "{} {entries} scanned · {} {folders} complete · {} {matches}",
+                progress.scanned_entries, progress.scanned_directories, progress.matches
+            );
+            rows.push(KeyedView::new(
+                "search-progress",
+                TextBlock::new()
+                    .automation_id("sftp-search-progress")
+                    .text(format!("Scanning {}\n{counts}", progress.folder))
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -399,6 +691,9 @@ impl Panel {
                             Action::Page(serial, self.page.saturating_sub(1)),
                             self.page > 0,
                         ),
+                        TextBlock::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text(format!("{} / {}", self.page + 1, self.page_count())),
                         button(
                             "Next results",
                             Action::Page(serial, self.page + 1),
@@ -436,6 +731,19 @@ impl Panel {
                             .text_wrapping(TextWrapping::Wrap),
                     );
                 let mut entry_actions = vec![KeyedView::new("reveal", reveal)];
+                let sort_detail = match self.sort {
+                    ResultSort::Newest => hit.mtime.map(|time| properties::timestamp(Some(time))),
+                    ResultSort::Largest => hit.size.map(listing_size_label),
+                    ResultSort::Folder | ResultSort::Name => None,
+                };
+                if let Some(detail) = sort_detail {
+                    entry_actions.push(KeyedView::new(
+                        "sort-detail",
+                        TextBlock::new()
+                            .text(detail)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
                 if let Some(marked) = &self.marked_downloads
                     && matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory))
                 {
@@ -568,6 +876,25 @@ impl Panel {
                             })
                             .content("Rename…"),
                     ));
+                    if delete_path(&hit.parent, &hit.name).is_ok() {
+                        actions.push(KeyedView::new(
+                            "delete",
+                            Button::new()
+                                .automation_name(format!("Delete {path}"))
+                                .is_enabled(ready)
+                                .on_click({
+                                    let hit = hit.clone();
+                                    ctx.callback(move |_| {
+                                        Message::Files(FileAction::Search(
+                                            pane,
+                                            generation,
+                                            Action::Delete(serial, hit.clone()),
+                                        ))
+                                    })
+                                })
+                                .content("Delete…"),
+                        ));
+                    }
                 }
                 KeyedView::new(
                     index,
@@ -590,7 +917,11 @@ impl Panel {
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Star(1.0)])
                     .children((
-                        StackPanel::new().spacing(6.0).keyed_children(rows),
+                        ScrollViewer::new()
+                            .automation_name("SFTP search actions")
+                            .max_height(layout.actions_max_height)
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            .content(StackPanel::new().spacing(6.0).keyed_children(rows)),
                         ScrollViewer::new()
                             .grid_row(1)
                             .automation_name("SFTP search results")
@@ -601,6 +932,15 @@ impl Panel {
 }
 
 impl FileDrawer {
+    fn search_progress(&self, serial: u64) -> Option<SearchProgress> {
+        let pending = self.pending.as_ref()?;
+        if !matches!(pending.step, Step::Search(current, _) if current == serial) {
+            return None;
+        }
+        let progress = pending.search_progress.as_ref()?.borrow();
+        (!progress.folder.is_empty()).then(|| progress.clone())
+    }
+
     pub(super) fn search_serial(&self) -> Option<u64> {
         self.search.as_ref().map(|panel| panel.serial)
     }
@@ -710,6 +1050,30 @@ impl FileDrawer {
         }
     }
 
+    fn sort_search_results(&mut self, serial: u64, sort: ResultSort) {
+        let Some(panel) = self
+            .search
+            .as_mut()
+            .filter(|panel| panel.serial == serial && panel.sort != sort)
+        else {
+            return;
+        };
+        let Some(result) = panel
+            .result
+            .as_ref()
+            .filter(|result| result.matches.len() > 1)
+        else {
+            return;
+        };
+        panel.sort = sort;
+        panel.page = 0;
+        panel.copy_status = None;
+        panel.install_result(result.clone());
+        // Rows are indexed within the current order. Expire their callbacks.
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        panel.serial = self.dialog_serial;
+    }
+
     fn start_filename_search(
         &mut self,
         pane: u64,
@@ -718,12 +1082,23 @@ impl FileDrawer {
         note: Option<String>,
     ) {
         let panel = self.search.as_mut().unwrap();
+        let filter = match panel.size.apply(&panel.filter) {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.status = format!("{error:#}");
+                return;
+            }
+        };
         let op = Operation::Find {
             path: panel.root.clone(),
             query: panel.query.clone(),
-            regex: panel.filter.regex,
-            match_case: panel.filter.match_case,
-            kind: panel.filter.kind,
+            regex: filter.regex,
+            match_case: filter.match_case,
+            match_path: filter.match_path,
+            kind: filter.kind,
+            exclude_dir_regex: filter.exclude_dir_regex,
+            file_size: filter.file_size,
+            modified_dates: filter.modified_dates,
         };
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
@@ -754,7 +1129,24 @@ impl FileDrawer {
         Ok(())
     }
 
-    pub(super) fn search_rename_completed(
+    fn begin_search_delete(&mut self, serial: u64, hit: FilenameMatch) -> Result<()> {
+        ensure!(
+            self.open && !self.busy(),
+            "Select a file, folder or link in the current search"
+        );
+        self.search_hit_path(serial, &hit)?;
+        let kind = hit
+            .kind
+            .context("The search result has no supported entry type")?;
+        delete_path(&hit.parent, &hit.name)?;
+        self.show_entry_dialog(
+            Some(hit.parent.clone()),
+            EditAction::Delete(FileTarget::Search(serial, hit), kind),
+        );
+        Ok(())
+    }
+
+    pub(super) fn search_change_completed(
         &mut self,
         pane: u64,
         session: &Session,
@@ -765,26 +1157,38 @@ impl FileDrawer {
     ) -> Result<()> {
         let status = change.completed();
         let old_path = entry_path(&hit.parent, &hit.name)?;
-        let new_path = entry_path(&hit.parent, change.name())?;
         if let Some(directory) = self.directory.clone() {
             if directory == hit.parent {
                 let mut entries = std::mem::take(&mut self.entries);
-                entries.retain(|entry| entry.name != change.name());
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.name == hit.name) {
-                    entry.name = change.name().into();
-                } else if let Some(kind) = hit.kind {
-                    entries.push(Entry {
-                        name: change.name().into(),
-                        kind: ListedKind::Known(kind),
-                        mtime: None,
-                        size: None,
-                    });
+                match &change {
+                    EntryChange::Rename { to, .. } => {
+                        entries.retain(|entry| &entry.name != to);
+                        if let Some(entry) = entries.iter_mut().find(|entry| entry.name == hit.name)
+                        {
+                            entry.name = to.clone();
+                        } else if let Some(kind) = hit.kind {
+                            entries.push(Entry {
+                                name: to.clone(),
+                                kind: ListedKind::Known(kind),
+                                mtime: None,
+                                size: None,
+                            });
+                        }
+                        self.sort_order.sort(&mut entries);
+                    }
+                    _ => entries.retain(|entry| entry.name != hit.name),
                 }
-                self.sort_order.sort(&mut entries);
                 self.accept_listing(None, directory, entries);
             } else if let Some(suffix) = within(&directory, &old_path) {
-                let entries = std::mem::take(&mut self.entries);
-                self.accept_listing(None, format!("{new_path}{suffix}"), entries);
+                if let EntryChange::Rename { to, .. } = &change {
+                    let new_path = entry_path(&hit.parent, to)?;
+                    let entries = std::mem::take(&mut self.entries);
+                    self.accept_listing(None, format!("{new_path}{suffix}"), entries);
+                } else {
+                    // The cached listing was inside the removed path.
+                    self.accept_listing(None, directory, Vec::new());
+                    self.directory = None;
+                }
             }
         }
         self.status = status.clone();
@@ -794,9 +1198,10 @@ impl FileDrawer {
         // Remove obsolete rows before refreshing, so an interrupted scan
         // cannot leave the old path (or old descendants) actionable.
         if let Some(mut previous) = panel.result.clone() {
-            previous
-                .matches
-                .retain(|entry| entry != &hit && within(&entry.parent, &old_path).is_none());
+            previous.matches.retain(|entry| {
+                (entry.parent != hit.parent || entry.name != hit.name)
+                    && within(&entry.parent, &old_path).is_none()
+            });
             panel.install_result(previous);
         }
         self.start_filename_search(pane, session, ctx, Some(status));
@@ -808,6 +1213,7 @@ impl FileDrawer {
         pane: u64,
         session: &Session,
         action: Action,
+        profile: Option<(&str, &ProfileStore)>,
         ctx: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         if let Action::Show(revision) = action {
@@ -827,6 +1233,10 @@ impl FileDrawer {
                 query: String::new(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
+                advanced_open: false,
+                sort: ResultSort::default(),
+                saved: None,
                 result: None,
                 page: 0,
                 cancel: None,
@@ -850,6 +1260,9 @@ impl FileDrawer {
             }
             return Ok(());
         }
+        if let Action::Saved(serial, action) = action {
+            return self.saved_search_action(pane, session, serial, action, profile, ctx);
+        }
         let busy = self.busy();
         let Some(panel) = self.search.as_mut() else {
             return Ok(());
@@ -871,20 +1284,35 @@ impl FileDrawer {
                 }
             }
             Action::SetOption(serial, option) if serial == panel.serial && !busy => {
-                let previous = panel.filter;
+                let previous = (
+                    panel.filter.clone(),
+                    panel.size.minimum.clone(),
+                    panel.size.maximum.clone(),
+                );
                 match option {
                     MatchOption::Regex(enabled) => panel.filter.regex = enabled,
                     MatchOption::MatchCase(enabled) => panel.filter.match_case = enabled,
+                    MatchOption::MatchPath(enabled) => panel.filter.match_path = enabled,
                     MatchOption::Kind(kind) => panel.filter.kind = kind,
+                    MatchOption::ExcludeDirs(regex) => panel.filter.exclude_dir_regex = regex,
+                    MatchOption::MinimumSize(value) => panel.size.minimum = value,
+                    MatchOption::MaximumSize(value) => panel.size.maximum = value,
+                    MatchOption::ModifiedFrom(value) => panel.filter.modified_dates.from = value,
+                    MatchOption::ModifiedThrough(value) => {
+                        panel.filter.modified_dates.through = value
+                    }
                 }
-                if panel.filter != previous {
+                if (&panel.filter, &panel.size.minimum, &panel.size.maximum)
+                    != (&previous.0, &previous.1, &previous.2)
+                {
                     panel.clear_results();
                     self.status.clear();
                 }
             }
-            Action::Run(serial)
-                if serial == panel.serial && !busy && panel.filter.valid_query(&panel.query) =>
-            {
+            Action::ShowAdvanced(serial, expanded) if serial == panel.serial => {
+                panel.advanced_open = expanded;
+            }
+            Action::Run(serial) if serial == panel.serial && !busy && panel.can_search() => {
                 self.start_filename_search(pane, session, ctx, None);
             }
             Action::Cancel(serial) if serial == panel.serial => {
@@ -893,6 +1321,7 @@ impl FileDrawer {
                     self.status = "Cancelling search…".into();
                 }
             }
+            Action::Sort(serial, sort) if !busy => self.sort_search_results(serial, sort),
             Action::Page(serial, page) if serial == panel.serial && page < panel.page_count() => {
                 panel.page = page;
             }
@@ -903,6 +1332,7 @@ impl FileDrawer {
                 panel.mark_download(index, checked);
             }
             Action::Rename(serial, hit) if !busy => self.begin_search_rename(serial, hit)?,
+            Action::Delete(serial, hit) if !busy => self.begin_search_delete(serial, hit)?,
             Action::CopyPaths(serial, hit) if !busy => {
                 panel.copy_status = match panel.paths_to_copy(serial, hit.as_ref()) {
                     Ok(Some((paths, count))) => Some(match w11term::clipboard::write(&paths) {
@@ -953,31 +1383,35 @@ mod tests {
                     parent: "/project/nested".into(),
                     name: (*name).into(),
                     kind: Some(*kind),
+                    mtime: None,
+                    size: None,
                 })
                 .collect(),
             scanned_directories: 2,
             scanned_entries: entries.len(),
             skipped_directories: 0,
+            excluded_directories: 0,
             truncated: false,
             cancelled: false,
         }
     }
 
-    #[test]
-    fn search_rename_uses_the_hit_parent_and_rejects_an_expired_result() {
-        let result = search_result("/project", &[("old name", EntryKind::File)]);
-        let hit = result.matches[0].clone();
-        let mut drawer = FileDrawer {
+    fn search_drawer(result: FilenameSearch) -> FileDrawer {
+        FileDrawer {
             open: true,
             generation: 1,
             directory: Some("/project".into()),
             dialog_serial: 5,
             search: Some(Panel {
                 serial: 5,
-                root: "/project".into(),
+                root: result.root.clone(),
                 query: "name".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
+                advanced_open: false,
+                sort: ResultSort::default(),
+                saved: None,
                 result: Some(result),
                 page: 0,
                 cancel: None,
@@ -985,7 +1419,33 @@ mod tests {
                 marked_downloads: None,
             }),
             ..FileDrawer::default()
-        };
+        }
+    }
+
+    #[test]
+    fn collapsed_advanced_summary_reflects_the_current_search_criteria() {
+        let mut drawer = search_drawer(search_result("/project", &[]));
+        let panel = drawer.search.as_mut().unwrap();
+        assert!(!panel.advanced_open);
+        assert_eq!(panel.advanced_summary(), None);
+        panel.filter.exclude_dir_regex = "^generated/".into();
+        panel.size.minimum = " 1 KiB ".into();
+        panel.size.maximum = "0".into();
+        panel.filter.modified_dates.from = "2025-01-01".into();
+        panel.filter.modified_dates.through = "2025-01-31".into();
+        assert_eq!(
+            panel.advanced_summary().as_deref(),
+            Some(
+                "Exclude folders ^generated/ · Min size 1 KiB · Max size 0 · Modified from 2025-01-01 UTC · Modified through 2025-01-31 UTC"
+            )
+        );
+    }
+
+    #[test]
+    fn search_rename_uses_the_hit_parent_and_rejects_an_expired_result() {
+        let result = search_result("/project", &[("old name", EntryKind::File)]);
+        let hit = result.matches[0].clone();
+        let mut drawer = search_drawer(result);
         drawer.begin_search_rename(5, hit.clone()).unwrap();
         let dialog = drawer.dialog.as_mut().unwrap();
         assert_eq!(dialog.name, "old name");
@@ -1010,6 +1470,95 @@ mod tests {
     }
 
     #[test]
+    fn search_delete_confirms_the_exact_entry_and_rejects_a_changed_result() {
+        let result = search_result("/project", &[("link name", EntryKind::Symlink)]);
+        let hit = result.matches[0].clone();
+        let mut drawer = search_drawer(result);
+        drawer.begin_search_delete(5, hit.clone()).unwrap();
+        let (dialog, path) = drawer
+            .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/project/nested/link name");
+        assert!(matches!(
+            dialog.action,
+            EditAction::Delete(FileTarget::Search(5, matched), EntryKind::Symlink) if matched == hit
+        ));
+
+        drawer.begin_search_delete(5, hit).unwrap();
+        drawer
+            .search
+            .as_mut()
+            .unwrap()
+            .result
+            .as_mut()
+            .unwrap()
+            .matches[0]
+            .kind = Some(EntryKind::Directory);
+        assert!(
+            drawer
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn result_sort_changes_all_pages_and_remaps_marks_by_path_and_type() {
+        use EntryKind::File;
+        let mut result = search_result(
+            "/project",
+            &[
+                ("a.log", File),
+                ("z.log", File),
+                ("b.log", File),
+                ("a.log", File),
+            ],
+        );
+        result.matches[0].parent = "/project/a".into();
+        result.matches[0].mtime = Some(20);
+        result.matches[0].size = Some(42);
+        result.matches[1].parent = "/project/a".into();
+        result.matches[2].parent = "/project/b".into();
+        result.matches[2].mtime = Some(50);
+        result.matches[2].size = Some(42);
+        result.matches[3].parent = "/project/z".into();
+        result.matches[3].mtime = Some(50);
+        result.matches[3].size = Some(0);
+        let mut drawer = search_drawer(result);
+        drawer.search.as_mut().unwrap().marked_downloads = Some(BTreeSet::from([3]));
+
+        for (sort, order) in [
+            (ResultSort::Name, [0, 3, 2, 1]),
+            (ResultSort::Newest, [2, 3, 0, 1]),
+            (ResultSort::Largest, [0, 2, 3, 1]),
+            (ResultSort::Folder, [0, 1, 2, 3]),
+        ] {
+            let serial = drawer.search_serial().unwrap();
+            drawer.sort_search_results(serial, sort);
+            let panel = drawer.search.as_ref().unwrap();
+            let hits = panel.result.as_ref().unwrap();
+            let paths = [
+                "/project/a/a.log",
+                "/project/a/z.log",
+                "/project/b/b.log",
+                "/project/z/a.log",
+            ];
+            assert_eq!(
+                hits.matches
+                    .iter()
+                    .map(|hit| format!("{}/{}", hit.parent, hit.name))
+                    .collect::<Vec<_>>(),
+                order.map(|index| paths[index]),
+            );
+            assert_eq!(panel.serial, serial + 1);
+            assert!(panel.search_download_selection(serial).is_err());
+            let marked = panel.marked_downloads.as_ref().unwrap();
+            assert_eq!(marked.len(), 1);
+            assert_eq!(hits.matches[*marked.first().unwrap()].parent, "/project/z");
+        }
+    }
+
+    #[test]
     fn refresh_remaps_marks_by_root_path_and_type_then_expires_old_callbacks() {
         use EntryKind::{Directory, File};
         let before = search_result(
@@ -1025,6 +1574,10 @@ mod tests {
                 query: "test".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
+                advanced_open: false,
+                sort: ResultSort::default(),
+                saved: None,
                 result: Some(before),
                 page: 1,
                 cancel: Some(TransferCancel::default()),
@@ -1033,10 +1586,12 @@ mod tests {
             }),
             ..FileDrawer::default()
         };
-        let after = search_result(
+        let mut after = search_result(
             "/project",
             &[("added", File), ("changed", Directory), ("keep", File)],
         );
+        after.matches[2].mtime = Some(1);
+        after.matches[2].size = Some(12);
         drawer.finish_search(3, Ok(json!(after)), None);
         let panel = drawer.search.as_ref().unwrap();
         assert_eq!(panel.serial, 4);
@@ -1074,6 +1629,8 @@ mod tests {
                 parent: "/project".into(),
                 name: format!("log-{index}.txt"),
                 kind: Some(EntryKind::File),
+                mtime: None,
+                size: None,
             })
             .collect();
         let mut drawer = FileDrawer {
@@ -1087,14 +1644,23 @@ mod tests {
                 filter: FilenameFilter {
                     regex: true,
                     match_case: true,
+                    match_path: false,
                     kind: Some(EntryKind::File),
+                    exclude_dir_regex: String::new(),
+                    file_size: FileSizeRange::default(),
+                    modified_dates: Default::default(),
                 },
+                size: SizeFields::default(),
+                advanced_open: false,
+                sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches,
                     scanned_directories: 1,
                     scanned_entries: 30,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: true,
                     cancelled: false,
                 }),
@@ -1141,6 +1707,8 @@ mod tests {
             parent: "/project/logs".into(),
             name: "build log.txt".into(),
             kind: Some(EntryKind::File),
+            mtime: None,
+            size: None,
         };
         let folder = FilenameMatch {
             name: "logs archive".into(),
@@ -1159,12 +1727,17 @@ mod tests {
                 query: "log".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
+                advanced_open: false,
+                sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![file.clone(), folder.clone(), link.clone()],
                     scanned_directories: 2,
                     scanned_entries: 4,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1205,6 +1778,8 @@ mod tests {
             parent: "/project/logs".into(),
             name: "settings.txt".into(),
             kind: Some(EntryKind::File),
+            mtime: None,
+            size: None,
         };
         let other = FilenameMatch {
             parent: "/project".into(),
@@ -1220,12 +1795,17 @@ mod tests {
                 query: "settings".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
+                advanced_open: false,
+                sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![other, hit.clone()],
                     scanned_directories: 2,
                     scanned_entries: 2,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1271,6 +1851,8 @@ mod tests {
             parent: "/project/logs".into(),
             name: "build log.txt".into(),
             kind: None,
+            mtime: None,
+            size: None,
         };
         let path = "/project/logs/build log.txt";
         let target = FileTarget::Search(2, hit.clone());
@@ -1284,12 +1866,17 @@ mod tests {
                 query: "log".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
+                advanced_open: false,
+                sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![hit.clone()],
                     scanned_directories: 2,
                     scanned_entries: 3,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1356,11 +1943,15 @@ mod tests {
             parent: "/project/雪 files".into(),
             name: "Résumé [draft] $1.txt".into(),
             kind: Some(EntryKind::File),
+            mtime: None,
+            size: None,
         };
         let link = FilenameMatch {
             parent: "/".into(),
             name: "snap link".into(),
             kind: Some(EntryKind::Symlink),
+            mtime: None,
+            size: None,
         };
         let mut panel = Panel {
             serial: 4,
@@ -1368,12 +1959,17 @@ mod tests {
             query: "snap".into(),
             input: ElementRef::new(),
             filter: FilenameFilter::default(),
+            size: SizeFields::default(),
+            advanced_open: false,
+            sort: ResultSort::default(),
+            saved: None,
             result: Some(FilenameSearch {
                 root: "/".into(),
                 matches: vec![link, file.clone()],
                 scanned_directories: 2,
                 scanned_entries: 2,
                 skipped_directories: 0,
+                excluded_directories: 0,
                 truncated: false,
                 cancelled: true,
             }),

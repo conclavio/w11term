@@ -19,7 +19,7 @@ fn entry_type(mode: Option<u32>) -> &'static str {
     }
 }
 
-fn timestamp(seconds: Option<u32>) -> String {
+pub(super) fn timestamp(seconds: Option<u32>) -> String {
     seconds
         .and_then(|s| DateTime::from_timestamp(i64::from(s), 0))
         .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())

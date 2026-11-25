@@ -5,7 +5,47 @@ fn remove(path: &str, kind: EntryKind) -> Operation {
     Operation::RemoveEntry {
         path: path.into(),
         kind,
+        check_parent: false,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_delete_checks_the_canonical_parent_and_entry_kind_before_mutation() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    let generation = Some(pane.frames.load().connection_generation);
+    fs::write(root.join("delete-trace.jsonl"), []).unwrap();
+    fs::create_dir_all(root.join("tree/data")).unwrap();
+    fs::write(root.join("tree/data/item"), b"file contents").unwrap();
+    fs::write(root.join("tree-redirect"), []).unwrap();
+    let delete = |kind| Operation::RemoveEntry {
+        path: "/tree/data/item".into(),
+        kind,
+        check_parent: true,
+    };
+    let changed_parent = guarded_job(&pane, generation, delete(EntryKind::File))
+        .await
+        .unwrap_err();
+    assert!(
+        changed_parent.contains("containing folder changed"),
+        "{changed_parent}"
+    );
+    fs::remove_file(root.join("tree-redirect")).unwrap();
+    let changed_type = guarded_job(&pane, generation, delete(EntryKind::Directory))
+        .await
+        .unwrap_err();
+    assert!(changed_type.contains("type changed"), "{changed_type}");
+    assert!(trace(root).is_empty());
+    assert_eq!(
+        fs::read(root.join("tree/data/item")).unwrap(),
+        b"file contents"
+    );
+    guarded_job(&pane, generation, delete(EntryKind::File))
+        .await
+        .unwrap();
+    assert_eq!(trace(root), [["REMOVE", "/tree/data/item"]]);
+    assert!(!root.join("tree/data/item").exists());
+    server.abort();
 }
 
 pub(super) fn trace(root: &std::path::Path) -> Vec<[String; 2]> {
