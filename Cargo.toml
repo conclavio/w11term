@@ -59,6 +59,7 @@ codegen-units = 1
 vtparse = { path = "vendor/vtparse" }
 wezterm-cell = { path = "vendor/wezterm-cell" }
 wezterm-escape-parser = { path = "vendor/wezterm-escape-parser" }
+wezterm-surface = { path = "vendor/wezterm-surface" }
 
 [patch.crates-io]
 windows-reactor = { path = "vendor/windows-reactor" }
