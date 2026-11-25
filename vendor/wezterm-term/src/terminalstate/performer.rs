@@ -1326,11 +1326,10 @@ impl Performer<'_> {
                     let scale = if screen.dpi == 0 {
                         1.0
                     } else {
-                        // Since iTerm2 is a macOS specific piece
-                        // of software, it uses the macOS default dpi
-                        // if 72 for the basis of its scale, regardless
-                        // of the host base dpi.
-                        screen.dpi as f32 / 72.
+                        // w11term measures its Windows text grid in device-
+                        // independent pixels. The wire scale converts those
+                        // logical units back to physical pixels.
+                        screen.dpi as f32 / 96.0
                     };
                     let width = (self.pixel_width as f32 / width as f32) / scale;
                     let height = (self.pixel_height as f32 / height as f32) / scale;

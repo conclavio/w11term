@@ -1520,14 +1520,23 @@ impl Display for ITermProprietary {
                 height_pixels,
                 width_pixels,
                 scale: None,
-            } => write!(f, "ReportCellSize={height_pixels:.1};{width_pixels:.1}")?,
+            } => write!(
+                f,
+                "ReportCellSize={:?};{:?}",
+                height_pixels.into_inner(),
+                width_pixels.into_inner(),
+            )?,
             ReportCellSize {
                 height_pixels,
                 width_pixels,
                 scale: Some(scale),
             } => write!(
                 f,
-                "ReportCellSize={height_pixels:.1};{width_pixels:.1};{scale:.1}",
+                // Round-trip the floats so 125% desktop scale stays 1.25.
+                "ReportCellSize={:?};{:?};{:?}",
+                height_pixels.into_inner(),
+                width_pixels.into_inner(),
+                scale.into_inner(),
             )?,
             Copy(s) => write!(f, "Copy=;{}", base64_encode(s))?,
             ReportVariable(s) => write!(f, "ReportVariable={}", base64_encode(s))?,

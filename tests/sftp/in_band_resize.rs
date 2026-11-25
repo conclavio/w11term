@@ -68,6 +68,65 @@ fn size(cols: usize, rows: usize, pixel_width: usize, pixel_height: usize) -> Te
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cell_size_queries_report_logical_and_physical_geometry_at_fractional_dpi() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (source, _temp, _, server) = fixture_with_wire(false, 1, Arc::default(), Some(tx)).await;
+    let session = Session::start_sized(
+        source,
+        TerminalSize {
+            dpi: 120,
+            ..size(80, 24, 880, 552)
+        },
+    );
+    let mut wire = WireReader(rx);
+    let (channel, peer) = wire.shell().await;
+    for (request, reply) in [
+        (
+            b"\x1b]1337;ReportCellSize\x07\x1b[16t\x1b[14t".as_slice(),
+            b"\x1b]1337;ReportCellSize=18.4;8.8;1.25\x1b\\\x1b[6;23;11t\x1b[4;552;880t".as_slice(),
+        ),
+        (
+            b"\x1b[H\x1b]1337;ReportCellSize=18.4;8.8;1.25\x1b\\\x1b[6n".as_slice(),
+            b"\x1b[1;1R".as_slice(),
+        ),
+    ] {
+        peer.data(channel, request).await.unwrap();
+        wire.input(channel, reply).await;
+    }
+
+    session
+        .input
+        .send(Command::Resize(TerminalSize {
+            dpi: 144,
+            ..size(80, 24, 960, 576)
+        }))
+        .unwrap();
+    wire.window(channel, [80, 24, 960, 576]).await;
+    peer.data(
+        channel,
+        b"\x1b]1337;ReportCellSize\x1b\\\x1b[16t".as_slice(),
+    )
+    .await
+    .unwrap();
+    wire.input(
+        channel,
+        b"\x1b]1337;ReportCellSize=16.0;8.0;1.5\x1b\\\x1b[6;24;12t",
+    )
+    .await;
+    session
+        .input
+        .send(Command::Resize(size(80, 24, 800, 480)))
+        .unwrap();
+    wire.window(channel, [80, 24, 800, 480]).await;
+    peer.data(channel, b"\x1b]1337;ReportCellSize\x07".as_slice())
+        .await
+        .unwrap();
+    wire.input(channel, b"\x1b]1337;ReportCellSize=20.0;10.0;1.0\x1b\\")
+        .await;
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn negotiated_resize_reports_follow_each_ssh_window_change_on_the_correct_channel() {
     let accepted = Arc::new(AtomicUsize::new(0));
