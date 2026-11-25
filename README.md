@@ -453,6 +453,8 @@ Choose **Filter filenames…** and type part of a name to search the entire dire
 
 Choose **Find files…** to search the displayed directory and its subdirectories by filename. Matching is case-insensitive and literal. Select a result to open its containing folder with the entry selected, or use **Download…** or **Download folder…** beside a regular file or folder. Direct downloads use the drawer’s destination and overwrite rules, show cancellable progress, and keep the search results in place. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. **Cancel search** keeps the matches already collected.
 
+After revealing a match, choose **Back to search results** to return to the same query and results page without rescanning. **Find files…** starts a new search from the current folder. Closing the drawer or reconnecting ends the saved search.
+
 Under **Sort by**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
 
 The list shows reported regular-file sizes beside their names in bytes or binary units such as KiB and MiB. An empty file shows **0 B**. Rows without a regular-file size have a blank size column. Use **Refresh** to update the listing after a transfer or a change on the server.

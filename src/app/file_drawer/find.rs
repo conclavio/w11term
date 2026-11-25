@@ -6,6 +6,7 @@ const RESULTS_PER_PAGE: usize = 25;
 #[derive(Clone)]
 pub enum Action {
     Show(u64),
+    Restore(u64),
     Query(u64, String),
     Run(u64),
     Cancel(u64),
@@ -15,12 +16,34 @@ pub enum Action {
 }
 
 pub(super) struct Panel {
-    serial: u64,
+    pub(super) serial: u64,
     root: String,
     query: String,
     result: Option<FilenameSearch>,
     page: usize,
     pub(super) cancel: Option<TransferCancel>,
+}
+
+fn result_status(result: &FilenameSearch) -> String {
+    let mut status = format!(
+        "{} matches in {} folders",
+        result.matches.len(),
+        result.scanned_directories,
+    );
+    if result.cancelled {
+        status.push_str(". Search cancelled");
+    } else if result.truncated {
+        status.push_str(". Search limit reached");
+    }
+    if result.skipped_directories > 0 {
+        use std::fmt::Write;
+        let _ = write!(
+            status,
+            ". {} unavailable folders skipped",
+            result.skipped_directories
+        );
+    }
+    status
 }
 
 impl Panel {
@@ -245,6 +268,23 @@ impl FileDrawer {
         }
     }
 
+    fn restore_search(&mut self, serial: u64) {
+        if self.busy() || !self.open || self.search.is_some() || self.bookmarks.is_some() {
+            return;
+        }
+        let Some(mut panel) = self.saved_search.take_if(|panel| panel.serial == serial) else {
+            return;
+        };
+        self.end_filter_edit();
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        panel.serial = self.dialog_serial;
+        self.status = panel
+            .result
+            .as_ref()
+            .map_or_else(String::new, result_status);
+        self.search = Some(panel);
+    }
+
     pub(super) fn finish_search(&mut self, serial: u64, result: Result<Value, String>) {
         let Some(panel) = self.search.as_mut().filter(|panel| panel.serial == serial) else {
             return;
@@ -254,24 +294,7 @@ impl FileDrawer {
             serde_json::from_value::<FilenameSearch>(value).map_err(|error| error.to_string())
         }) {
             Ok(result) => {
-                let mut status = format!(
-                    "{} matches in {} folders",
-                    result.matches.len(),
-                    result.scanned_directories,
-                );
-                if result.cancelled {
-                    status.push_str(". Search cancelled");
-                } else if result.truncated {
-                    status.push_str(". Search limit reached");
-                }
-                if result.skipped_directories > 0 {
-                    use std::fmt::Write;
-                    let _ = write!(
-                        status,
-                        ". {} unavailable folders skipped",
-                        result.skipped_directories
-                    );
-                }
+                let status = result_status(&result);
                 panel.result = Some(result);
                 status
             }
@@ -296,6 +319,7 @@ impl FileDrawer {
             self.end_filter_edit();
             self.dialog_serial = self.dialog_serial.wrapping_add(1);
             self.status.clear();
+            self.saved_search = None;
             self.search = Some(Panel {
                 serial: self.dialog_serial,
                 root,
@@ -304,6 +328,10 @@ impl FileDrawer {
                 page: 0,
                 cancel: None,
             });
+            return Ok(());
+        }
+        if let Action::Restore(serial) = action {
+            self.restore_search(serial);
             return Ok(());
         }
         let busy = self.busy();
@@ -353,6 +381,7 @@ impl FileDrawer {
                     }) =>
             {
                 self.following = false;
+                self.saved_search = self.search.take();
                 self.browse(pane, session, hit.parent, None, ctx)?;
                 self.reveal = Some(RevealTarget::Existing(hit.name));
             }
@@ -369,6 +398,50 @@ impl FileDrawer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restoring_search_keeps_the_query_and_page_and_rejects_old_actions() {
+        let matches = (0..=RESULTS_PER_PAGE)
+            .map(|index| FilenameMatch {
+                parent: "/project".into(),
+                name: format!("log-{index}.txt"),
+                kind: Some(EntryKind::File),
+            })
+            .collect();
+        let mut drawer = FileDrawer {
+            open: true,
+            dialog_serial: 7,
+            saved_search: Some(Panel {
+                serial: 7,
+                root: "/project".into(),
+                query: "log".into(),
+                result: Some(FilenameSearch {
+                    root: "/project".into(),
+                    matches,
+                    scanned_directories: 1,
+                    scanned_entries: 30,
+                    skipped_directories: 0,
+                    truncated: true,
+                    cancelled: false,
+                }),
+                page: 1,
+                cancel: None,
+            }),
+            ..FileDrawer::default()
+        };
+        drawer.restore_search(6);
+        assert!(drawer.search.is_none());
+        drawer.restore_search(7);
+        let panel = drawer.search.take().unwrap();
+        assert_eq!(panel.page, 1);
+        assert_eq!(panel.query, "log");
+        assert_eq!(panel.serial, 8);
+        assert!(drawer.status.contains("Search limit reached"));
+        assert!(drawer.saved_search.is_none());
+        drawer.saved_search = Some(panel);
+        drawer.close();
+        assert!(drawer.saved_search.is_none());
+    }
 
     #[test]
     fn search_download_requires_the_current_result_and_downloadable_type() {

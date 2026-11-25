@@ -134,6 +134,7 @@ pub(super) struct FileDrawer {
     history: FolderHistory,
     bookmarks: Option<bookmarks::List>,
     search: Option<find::Panel>,
+    saved_search: Option<find::Panel>,
     /// Describes an explicit navigation request if either REALPATH or listing fails.
     opening_target: Option<String>,
     following: bool,
@@ -1268,6 +1269,7 @@ impl FileDrawer {
         self.open = false;
         self.marked_downloads = None;
         self.close_search();
+        self.saved_search = None;
         if self.preparing_drop.take().is_some() {
             self.status = "Cancelled before uploading any dropped items.".into();
         }
@@ -1560,6 +1562,23 @@ impl FileDrawer {
             name: entry.map_or_else(String::new, |e| e.name.clone()),
             kind: entry.map_or(ListedKind::Missing, |e| e.kind),
         };
+        let find_files = button(
+            "Find files…",
+            writable && generation != 0,
+            Search(pane, generation, find::Action::Show(revision)),
+        );
+        let search_actions = if let Some(saved) = &self.saved_search {
+            StackPanel::new().spacing(6.0).children((
+                button(
+                    "Back to search results",
+                    writable && generation != 0,
+                    Search(pane, generation, find::Action::Restore(saved.serial)),
+                ),
+                find_files,
+            ))
+        } else {
+            find_files
+        };
         let mut controls: Vec<View> = vec![
             Grid::new()
                 .width(layout.content_width())
@@ -1587,11 +1606,7 @@ impl FileDrawer {
                         GoToFolder(pane, generation, revision),
                     )),
                 )),
-            button(
-                "Find files…",
-                writable && generation != 0,
-                Search(pane, generation, find::Action::Show(revision)),
-            ),
+            search_actions,
             StackPanel::new()
                 .orientation(if layout.content_width() >= 300.0 {
                     Orientation::Horizontal

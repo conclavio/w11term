@@ -197,6 +197,20 @@ try {
     $null = Wait-Until 'search result shown and selected in its containing folder' {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
+    Click 'Back to search results'
+    $field = Wait-Until 'original search restored with both matches' {
+        $edit = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+        if ($edit -and (Button "Reveal $parent/nested") -and (Button "Reveal $parent/nested/nested-content.txt")) {
+            $edit
+        }
+    }
+    if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'NESTED') {
+        throw 'Returning to results changed the search query'
+    }
+    Click 'Back to files'
+    $null = Wait-Until 'listing remains at the revealed file after leaving the results' {
+        (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
+    }
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
