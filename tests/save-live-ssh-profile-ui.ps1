@@ -26,7 +26,7 @@ function Profile-Name {
 $app = Start-Process -FilePath $Gui -ArgumentList @('ssh', $endpoint, '--auth', 'none', '--host-key', $peer.host_key, '--profiles', ('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $first = Wait-Until 'one-off SSH pane' { Sessions | Where-Object { $_.active -and $_.label -ceq $endpoint } }
     Wait-Text $first.id 'ready'
     $first = Sessions | Where-Object id -eq $first.id

@@ -128,7 +128,7 @@ foreach ($recipe in @('original','swapped')) {
     $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--workspace',$recipe,'--cols','154','--rows','38') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
     try {
         $window = Wait-InputWindow
-        $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
         $layout = if ($recipe -eq 'original') {
             Wait-Layout 'palette-ssh' 'Upper PowerShell' 'Lower PowerShell'
         } else {

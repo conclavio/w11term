@@ -46,51 +46,136 @@ struct Identity {
 }
 pub(crate) const HIGH_INTEGRITY_RID: u32 = 0x3000;
 
+struct PinnedElevatedDir {
+    path: std::path::PathBuf,
+    // Hold open handles without FILE_SHARE_DELETE so Windows refuses to rename
+    // or delete the elevated directory or any ancestor for the process lifetime.
+    _handles: Vec<std::fs::File>,
+}
+
+static ELEVATED_DIR: std::sync::OnceLock<PinnedElevatedDir> = std::sync::OnceLock::new();
+
 pub(crate) fn is_elevated() -> Result<bool> {
     Ok(Identity::current()?.integrity >= HIGH_INTEGRITY_RID)
 }
 
-/// Create or verify a directory isolated to High-integrity (elevated) processes
-/// so Medium-integrity processes of the same user cannot tamper with elevated
-/// configs, discovery manifests, or logs, nor plant NTFS junctions.
-pub(crate) fn ensure_elevated_directory(path: &std::path::Path) -> Result<()> {
-    use std::os::windows::{
-        ffi::OsStrExt,
-        fs::OpenOptionsExt,
-        io::AsRawHandle,
-    };
-    use windows::Win32::{
-        Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS},
-        Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
-        Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, GetFileInformationByHandle, READ_CONTROL,
-        },
-    };
-
+/// Return a verified, kernel-pinned directory under `%ProgramData%\w11term\elevated\<sid>`
+/// isolated to High-integrity processes. Every directory component is created with
+/// a protected DACL and High-integrity `NWNR` mandatory label, verified for non-reparse
+/// identity and ownership, and kept open without `FILE_SHARE_DELETE` so no ancestor
+/// or component can be renamed or swapped with a junction while the process runs.
+pub(crate) fn elevated_data_dir() -> Result<std::path::PathBuf> {
     let identity = Identity::current()?;
     ensure!(
         identity.integrity >= HIGH_INTEGRITY_RID,
         "elevated directory requires High integrity"
     );
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+    if let Some(pinned) = ELEVATED_DIR.get() {
+        return Ok(pinned.path.clone());
     }
 
-    let sddl: Vec<u16> = format!(
+    let program_data = std::path::PathBuf::from(
+        std::env::var_os("ProgramData").context("ProgramData is unavailable")?,
+    );
+    let mut parent_final = verify_non_reparse_root(&program_data)?;
+
+    let admin_sddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)S:(ML;OICI;NWNR;;;HI)".to_string();
+    let user_sddl = format!(
         "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})S:(ML;OICI;NWNR;;;S-1-16-{})",
         identity.sid, identity.integrity
-    )
-    .encode_utf16()
-    .chain(Some(0))
-    .collect();
+    );
+
+    let mut current = program_data;
+    let mut handles = Vec::with_capacity(3);
+    for (component, sddl, allow_user_owner) in [
+        ("w11term", admin_sddl.as_str(), false),
+        ("elevated", admin_sddl.as_str(), false),
+        (identity.sid.as_str(), user_sddl.as_str(), true),
+    ] {
+        current = current.join(component);
+        let (handle, final_path) = ensure_pinned_elevated_component(
+            &current,
+            &parent_final,
+            component,
+            sddl,
+            &identity.sid,
+            allow_user_owner,
+        )?;
+        parent_final = final_path;
+        handles.push(handle);
+    }
+
+    let pinned = ELEVATED_DIR.get_or_init(|| PinnedElevatedDir {
+        path: current,
+        _handles: handles,
+    });
+    Ok(pinned.path.clone())
+}
+
+fn volume_path(file: &std::fs::File) -> Result<Vec<u16>> {
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_GUID};
+    let mut buf = vec![0u16; 32_768];
+    let len = unsafe {
+        GetFinalPathNameByHandleW(HANDLE(file.as_raw_handle()), &mut buf, VOLUME_NAME_GUID)
+    } as usize;
+    ensure!(len > 0, "GetFinalPathNameByHandleW failed");
+    ensure!(len < buf.len(), "Windows path exceeds the supported length");
+    buf.truncate(len);
+    Ok(buf)
+}
+
+fn verify_non_reparse_root(path: &std::path::Path) -> Result<Vec<u16>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        GetFileInformationByHandle,
+    };
+
+    let dir = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)
+        .with_context(|| format!("opening elevated base directory {}", path.display()))?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(dir.as_raw_handle()), &mut info)?;
+    }
+    ensure!(
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0
+            && (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) == 0,
+        "elevated base directory {} must be a real directory, not a reparse point",
+        path.display()
+    );
+    volume_path(&dir)
+}
+
+fn ensure_pinned_elevated_component(
+    path: &std::path::Path,
+    parent_final: &[u16],
+    component: &str,
+    sddl: &str,
+    user_sid: &str,
+    allow_user_owner: bool,
+) -> Result<(std::fs::File, Vec<u16>)> {
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use windows::Win32::{
+        Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS},
+        Globalization::{CSTR_EQUAL, CompareStringOrdinal},
+        Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+            READ_CONTROL,
+        },
+    };
+
+    let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
+            PCWSTR(sddl_wide.as_ptr()),
             1,
             &mut descriptor,
             None,
@@ -111,10 +196,11 @@ pub(crate) fn ensure_elevated_directory(path: &std::path::Path) -> Result<()> {
         );
     }
 
-    // Open the leaf without following reparse points and verify both ownership
-    // and an unforgeable High-integrity mandatory label on the actual handle.
+    // Open without FILE_SHARE_DELETE and without following reparse points so
+    // the verified handle locks this directory and its ancestors against rename.
     let dir = std::fs::OpenOptions::new()
         .access_mode((FILE_READ_ATTRIBUTES | READ_CONTROL).0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)
         .with_context(|| format!("opening elevated directory {}", path.display()))?;
@@ -127,6 +213,18 @@ pub(crate) fn ensure_elevated_directory(path: &std::path::Path) -> Result<()> {
         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0
             && (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) == 0,
         "elevated directory {} must be a real directory, not a reparse point",
+        path.display()
+    );
+
+    let actual_final = volume_path(&dir)?;
+    let mut expected_final = parent_final.to_vec();
+    if expected_final.last() != Some(&u16::from(b'\\')) {
+        expected_final.push(u16::from(b'\\'));
+    }
+    expected_final.extend(component.encode_utf16());
+    ensure!(
+        unsafe { CompareStringOrdinal(&actual_final, &expected_final, true) } == CSTR_EQUAL,
+        "elevated directory {} resolved outside its verified parent",
         path.display()
     );
 
@@ -152,14 +250,22 @@ pub(crate) fn ensure_elevated_directory(path: &std::path::Path) -> Result<()> {
     );
     let _sd = LocalMemory(sd.0);
 
+    ensure!(
+        !owner_sid.0.is_null() && unsafe { IsValidSid(owner_sid).as_bool() },
+        "elevated directory {} has invalid owner SID",
+        path.display()
+    );
     let owner_text = unsafe {
         let mut text = PWSTR::null();
         ConvertSidToStringSidW(owner_sid, &mut text)?;
         let _text = LocalMemory(text.0.cast());
         text.to_string()?
     };
+    let trusted_owner = owner_text == "S-1-5-18"
+        || owner_text == "S-1-5-32-544"
+        || (allow_user_owner && owner_text == user_sid);
     ensure!(
-        owner_text == identity.sid || owner_text == "S-1-5-18" || owner_text == "S-1-5-32-544",
+        trusted_owner,
         "elevated directory {} has unexpected owner {owner_text}",
         path.display()
     );
@@ -170,7 +276,7 @@ pub(crate) fn ensure_elevated_directory(path: &std::path::Path) -> Result<()> {
         "elevated directory {} lacks a High-integrity mandatory label (found {label_rid})",
         path.display()
     );
-    Ok(())
+    Ok((dir, actual_final))
 }
 
 unsafe fn mandatory_label_rid(sacl: *const ACL) -> Result<u32> {
@@ -187,19 +293,34 @@ unsafe fn mandatory_label_rid(sacl: *const ACL) -> Result<u32> {
         )?;
     }
     for index in 0..size_info.AceCount {
-        let mut ace_ptr = std::ptr::null_mut();
+        let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
         unsafe {
             GetAce(sacl, index, &mut ace_ptr)?;
-            let header = &*(ace_ptr as *const ACE_HEADER);
-            if header.AceType
-                == windows::Win32::System::SystemServices::SYSTEM_MANDATORY_LABEL_ACE_TYPE as u8
-            {
-                let ace = &*(ace_ptr as *const SYSTEM_MANDATORY_LABEL_ACE);
-                let sid = PSID((&ace.SidStart as *const u32).cast_mut().cast());
-                let count = *GetSidSubAuthorityCount(sid);
-                ensure!(count > 0, "invalid mandatory label SID");
-                return Ok(*GetSidSubAuthority(sid, u32::from(count - 1)));
-            }
+        }
+        if ace_ptr.is_null() {
+            continue;
+        }
+        let header = unsafe { std::ptr::read_unaligned(ace_ptr as *const ACE_HEADER) };
+        if header.AceType
+            == windows::Win32::System::SystemServices::SYSTEM_MANDATORY_LABEL_ACE_TYPE as u8
+            && usize::from(header.AceSize) >= std::mem::size_of::<SYSTEM_MANDATORY_LABEL_ACE>()
+        {
+            let sid_offset = std::mem::offset_of!(SYSTEM_MANDATORY_LABEL_ACE, SidStart);
+            let sid = PSID(unsafe { (ace_ptr as *mut u8).add(sid_offset).cast() });
+            ensure!(
+                !sid.0.is_null() && unsafe { IsValidSid(sid).as_bool() },
+                "invalid mandatory label SID"
+            );
+            let count_ptr = unsafe { GetSidSubAuthorityCount(sid) };
+            ensure!(
+                !count_ptr.is_null(),
+                "missing mandatory label subauthority count"
+            );
+            let count = unsafe { *count_ptr };
+            ensure!(count > 0, "empty mandatory label SID");
+            let rid_ptr = unsafe { GetSidSubAuthority(sid, u32::from(count - 1)) };
+            ensure!(!rid_ptr.is_null(), "missing mandatory label RID");
+            return Ok(unsafe { *rid_ptr });
         }
     }
     Ok(0)

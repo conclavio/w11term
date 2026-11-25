@@ -164,7 +164,7 @@ public static class WslFixture {
 
     $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--cols','132','--profiles',$quotedProfiles) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
     $window = Wait-InputWindow
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     Click 'New tab'
     Click ($leftLabel + ' ' + [char]0xb7 + ' Local') $menu
     $left = Wait-Until 'WSL pane opened from the new-tab menu' {

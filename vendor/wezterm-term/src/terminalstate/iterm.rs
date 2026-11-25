@@ -249,11 +249,8 @@ impl TerminalState {
                     });
                 match decoded {
                     Some(im) => {
-                        let im = im.resize_exact(
-                            display_width,
-                            display_height,
-                            FilterType::CatmullRom,
-                        );
+                        let im =
+                            im.resize_exact(display_width, display_height, FilterType::CatmullRom);
                         let data = im.into_rgba8().into_vec();
                         ImageDataType::new_single_frame(display_width, display_height, data)
                     }

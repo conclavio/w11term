@@ -45,7 +45,7 @@ $log = Join-Path $State 'gui.log'
 $app = Start-Process -FilePath $Gui -WorkingDirectory $State -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','guest-ssh') -WindowStyle Hidden -RedirectStandardError $log -PassThru
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $session = Wait-Until 'verified connected SSH pane' {
         (Control @('list')).sessions | Where-Object { $_.label -eq 'guest-ssh' -and $_.connection_generation -gt 0 }
     }

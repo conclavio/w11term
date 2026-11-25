@@ -164,7 +164,7 @@ try {
         $handles = [TabFixtureWindows]::OwnedBy($app.Id)
         if ($handles.Count -eq 1) { $handles[0] }
     }
-    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json"
+    $manifest = Get-ControlManifestPath $app.Id
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath $manifest }
     $initial = Wait-Until 'three initial pane registrations' {
         $panes = @((Control @('list')).sessions)

@@ -1164,10 +1164,7 @@ async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
     .await
     .expect("directory-only shell should reconnect after the first exec loses its reply");
     assert_eq!(opens.load(Ordering::Relaxed), 2);
-    assert_eq!(
-        fs::read_to_string(trace).unwrap(),
-        expected_exec.repeat(2)
-    );
+    assert_eq!(fs::read_to_string(trace).unwrap(), expected_exec.repeat(2));
     // The first connection failed before publishing a usable shell. Folder
     // actions and SFTP must still identify the same second SSH generation.
     let shares = session.profile_folders(FolderScope::new(

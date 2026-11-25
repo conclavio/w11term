@@ -90,7 +90,7 @@ $reader = $null
 try {
     $reader = Open-PeerTraceReader (Join-Path $peer 'transfer-trace')
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $ssh = (Control @('list')).sessions | Where-Object label -eq 'palette-ssh'
     $remote = $ssh.id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','src/trace.rs')

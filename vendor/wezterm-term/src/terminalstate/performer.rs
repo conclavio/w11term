@@ -1174,6 +1174,13 @@ impl Performer<'_> {
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Push(label)) => {
                     const MAX_UNICODE_VERSION_STACK: usize = 128;
+                    const MAX_UNICODE_VERSION_LABEL_BYTES: usize = 256;
+                    if label
+                        .as_ref()
+                        .map_or(false, |l| l.len() > MAX_UNICODE_VERSION_LABEL_BYTES)
+                    {
+                        return;
+                    }
                     let vers = self.unicode_version.clone();
                     self.unicode_version_stack
                         .push(UnicodeVersionStackEntry { vers, label });

@@ -85,7 +85,7 @@ function Shell-Pid([string]$Tag) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','64','--rows','12') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $remote = (Control @('list')).sessions[0].id
     $localPane = (Control @('open','--profile','Palette PowerShell','--activate')).pane
     Wait-Focus $localPane

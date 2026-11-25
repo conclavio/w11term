@@ -44,11 +44,7 @@ impl Appearance {
         if let Some(path) = std::env::var_os("W11TERM_SETTINGS_PATH") {
             return std::path::absolute(path).context("Resolving settings path");
         }
-        Ok(
-            PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?)
-                .join("w11term")
-                .join("settings.json"),
-        )
+        Ok(crate::keys::data_dir()?.join("settings.json"))
     }
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read(path) {

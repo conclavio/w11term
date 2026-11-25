@@ -76,7 +76,7 @@ function Shell-Pid([string]$Tag) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $remote = (Control @('list')).sessions[0].id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','src/trace.rs')
     $ssh = (Control @('list')).sessions | Where-Object id -eq $remote

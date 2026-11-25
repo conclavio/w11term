@@ -57,7 +57,7 @@ try {
         # The first canvas paint replaces provisional startup dimensions with the measured DPI.
         $null = [InspectDpi]::ShowWindowAsync($window, 4) # SW_SHOWNOACTIVATE
     }
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
     $null = Wait-Until 'default SSH parser modes' { Is-Default (Inspect) }

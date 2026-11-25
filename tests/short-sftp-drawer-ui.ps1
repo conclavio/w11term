@@ -123,7 +123,7 @@ try {
     $tallWidth = [Math]::Round(900 * $scale)
     $tallWindowHeight = [Math]::Round(940 * $scale)
     $resize.Resize($tallWidth,$tallWindowHeight)
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $pane = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
     Run-Palette 'SFTP files'

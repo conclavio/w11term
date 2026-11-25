@@ -88,12 +88,12 @@ pub(super) fn check(root: &FolderRoot, scope: &FolderScope) -> Result<()> {
             protected_path(parent).context("Checking the w11term profile catalog directory")
         })
         .transpose()?;
-    if overlaps(&selected, &data)?
-        || overlaps(&selected, &catalog)?
-        || catalog_parent
-            .as_deref()
-            .is_some_and(|parent| overlaps(&selected, parent).unwrap_or(true))
-    {
+    let exposes_catalog_parent = catalog_parent
+        .as_deref()
+        .map(|parent| contains(&selected, parent))
+        .transpose()?
+        .unwrap_or(false);
+    if overlaps(&selected, &data)? || contains(&selected, &catalog)? || exposes_catalog_parent {
         bail!(
             "Write access would expose w11term's data directory or profile catalog. Choose a different folder or share it read-only."
         );
@@ -191,7 +191,7 @@ mod tests {
         std::fs::hard_link(&real_catalog, &linked_catalog)?;
 
         let scope = FolderScope::new(linked_catalog, "pilot".into(), data);
-        for blocked in [&work_dir, &work_sub] {
+        for blocked in [temp.path(), &work_dir] {
             let root = FolderRoot::open(blocked)?;
             assert!(
                 check(&root, &scope)
@@ -201,6 +201,9 @@ mod tests {
                 "{blocked:?}"
             );
         }
+        // A subdirectory strictly below the catalog's parent does not expose
+        // profiles.json or its sibling lock/temp files and remains shareable.
+        check(&FolderRoot::open(&work_sub)?, &scope)?;
 
         if let Ok(exe) = std::env::current_exe()
             && let Some(exe_dir) = exe.parent()

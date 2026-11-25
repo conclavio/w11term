@@ -396,8 +396,7 @@ impl SshOptions {
                 !hop.host.trim().is_empty() && !hop.user.trim().is_empty() && hop.port != 0,
                 "an SSH jump host requires a host, user and port"
             );
-            validate_ssh_host(&hop.host)
-                .with_context(|| format!("jump host {}", hop.host))?;
+            validate_ssh_host(&hop.host).with_context(|| format!("jump host {}", hop.host))?;
         }
         Ok(())
     }

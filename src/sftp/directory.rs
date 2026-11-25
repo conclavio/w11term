@@ -330,7 +330,8 @@ impl Download<'_> {
                 file.sync_all().await?;
                 drop(file);
                 let staged = local.to_path_buf();
-                tokio::task::spawn_blocking(move || super::apply_mark_of_the_web(&staged)).await??;
+                tokio::task::spawn_blocking(move || super::apply_mark_of_the_web(&staged))
+                    .await??;
                 self.count.files += 1;
             }
             Ok::<(), anyhow::Error>(())

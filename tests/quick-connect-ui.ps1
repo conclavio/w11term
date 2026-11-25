@@ -45,7 +45,7 @@ function Stop-Fixture {
     $app.Dispose()
 }
 function Wait-Control {
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
 }
 function Wait-Connected {
     $id = Wait-Until 'one-off SSH tab becomes the active pane' {

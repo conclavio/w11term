@@ -3436,10 +3436,9 @@ async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_t
     let users = fs::read_to_string(remote.path().join("authenticated-users")).unwrap();
     assert_eq!(users.lines().collect::<Vec<_>>(), ["test"]);
     let exec = fs::read_to_string(remote.path().join("workspace-exec.bin")).unwrap();
-    let expected =
-        w11term::workspace::SshStartup::new(&ssh, "/Pilot's Work".into(), String::new())
-            .unwrap()
-            .exec_request();
+    let expected = w11term::workspace::SshStartup::new(&ssh, "/Pilot's Work".into(), String::new())
+        .unwrap()
+        .exec_request();
     assert_eq!(exec, expected);
     let trace = fs::read_to_string(remote.path().join("pty-trace")).unwrap();
     let ptys: Vec<_> = trace.lines().collect();

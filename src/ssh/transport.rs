@@ -467,11 +467,25 @@ pub(super) async fn handshake(
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 ) -> Result<(client::Handle<Handler>, String)> {
-    let known_hosts = prompts
-        .and_then(Prompts::known_hosts)
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
-        .ok_or_else(|| stop("cannot locate known_hosts"))?;
+    let known_hosts = match prompts.and_then(Prompts::known_hosts) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let elevated = crate::control::security::is_elevated()
+                .map_err(|error| stop(format!("checking process integrity: {error:#}")))?;
+            if elevated {
+                // Do not trust Medium-integrity %USERPROFILE%\.ssh\known_hosts when elevated.
+                crate::control::security::elevated_data_dir()
+                    .map_err(|error| {
+                        stop(format!("cannot locate elevated known_hosts: {error:#}"))
+                    })?
+                    .join("known_hosts")
+            } else {
+                std::env::home_dir()
+                    .map(|home| home.join(".ssh/known_hosts"))
+                    .ok_or_else(|| stop("cannot locate known_hosts"))?
+            }
+        }
+    };
     let (name, port) = host_key_target(options);
     let trust_host_ca = super::known_hosts::has_authority(&known_hosts, name, port)
         .map_err(|error| stop(format!("reading host certificate authorities: {error:#}")))?;

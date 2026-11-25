@@ -128,8 +128,9 @@ impl TerminalState {
                     cols > 0 && cols <= MAX_PLACEMENT_COLS,
                     "refusing to display image with invalid column span {cols}"
                 );
-                let divisor = (cols as f64) * (cell_pixel_width as f64) * (params.image_width as f64)
-                    / (draw_width as f64);
+                let divisor =
+                    (cols as f64) * (cell_pixel_width as f64) * (params.image_width as f64)
+                        / (draw_width as f64);
                 (cols, 0, divisor)
             }
             None => (
@@ -144,8 +145,9 @@ impl TerminalState {
                     rows > 0 && rows <= MAX_PLACEMENT_ROWS,
                     "refusing to display image with invalid row span {rows}"
                 );
-                let divisor = (rows as f64) * (cell_pixel_height as f64) * (params.image_height as f64)
-                    / (draw_height as f64);
+                let divisor =
+                    (rows as f64) * (cell_pixel_height as f64) * (params.image_height as f64)
+                        / (draw_height as f64);
                 (rows, 0, divisor)
             }
             None => (
@@ -170,7 +172,10 @@ impl TerminalState {
             .checked_add(one_or_zero::<usize>(remainder_height_cell > 0))
             .context("image height in cells overflows")?;
         let height_in_cells = if params.do_not_move_cursor {
-            let remaining_rows = self.screen().physical_rows.saturating_sub(self.cursor.y.max(0) as usize);
+            let remaining_rows = self
+                .screen()
+                .physical_rows
+                .saturating_sub(self.cursor.y.max(0) as usize);
             height_in_cells.min(remaining_rows)
         } else {
             height_in_cells
@@ -221,8 +226,8 @@ impl TerminalState {
         for y in 0..height_in_cells {
             let padding_bottom = cell_pixel_height.saturating_sub(remain_y) as u16;
             let y_delta = ((remain_y.min(cell_pixel_height) as f64) / y_delta_divisor) as f32;
-            let next_ypos = NotNan::new(ypos.into_inner() + y_delta)
-                .context("computing next ypos")?;
+            let next_ypos =
+                NotNan::new(ypos.into_inner() + y_delta).context("computing next ypos")?;
             remain_y = remain_y.saturating_sub(cell_pixel_height);
 
             let mut xpos = start_xpos;
@@ -241,8 +246,8 @@ impl TerminalState {
             for x in 0..width_in_cells {
                 let padding_right = cell_pixel_width.saturating_sub(remain_x) as u16;
                 let x_delta = ((remain_x.min(cell_pixel_width) as f64) / x_delta_divisor) as f32;
-                let next_xpos = NotNan::new(xpos.into_inner() + x_delta)
-                    .context("computing next xpos")?;
+                let next_xpos =
+                    NotNan::new(xpos.into_inner() + x_delta).context("computing next xpos")?;
                 remain_x = remain_x.saturating_sub(cell_pixel_width);
                 log::debug!(
                     "x_delta {} ({} px), y_delta {} ({} px), padding_right={}, padding_bottom={}",

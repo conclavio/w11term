@@ -187,6 +187,7 @@ pub(in crate::ssh::folder_share) struct PendingWrite {
     original: File,
     id: u64,
     grant: Arc<AtomicBool>,
+    known_vdl: u64,
 }
 impl PendingWrite {
     pub(in crate::ssh::folder_share) fn len(&self) -> io::Result<u64> {
@@ -205,7 +206,7 @@ impl PendingWrite {
     fn modify(
         &mut self,
         root: &Root,
-        change: impl FnOnce(&File, u64) -> io::Result<()>,
+        change: impl FnOnce(&File, u64, u64) -> io::Result<u64>,
     ) -> io::Result<()> {
         if !Arc::ptr_eq(&self.grant, &root.revoked) {
             return Err(excluded());
@@ -217,9 +218,12 @@ impl PendingWrite {
         if info.is_dir || self.path.verify_leaf(&file)? != self.id {
             return Err(excluded());
         }
-        change(&file, info.len)?;
+        let vdl = proven_valid_data_length(&file, info.len, self.known_vdl);
+        let new_vdl = change(&file, info.len, vdl)?;
         drop(file);
-        tx.commit(root)
+        tx.commit(root)?;
+        self.known_vdl = new_vdl;
+        Ok(())
     }
     pub(in crate::ssh::folder_share) fn write_at(
         &mut self,
@@ -227,13 +231,18 @@ impl PendingWrite {
         bytes: &[u8],
         offset: u64,
     ) -> io::Result<()> {
-        self.modify(root, |file, current_len| {
+        self.modify(root, |file, current_len, known_vdl| {
             let end = offset.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
-            check_extension(current_len, end)?;
-            if offset > current_len {
-                zero_fill_gap(file, root, current_len, offset)?;
+            let vdl = probe_vdl_near(file, current_len, offset, known_vdl);
+            check_extension(vdl, end)?;
+            if offset > vdl && offset > current_len {
+                zero_fill_gap(file, root, current_len.max(vdl), offset)?;
+            } else if offset > vdl {
+                // Target is within current_len, but VDL was not proven near offset;
+                // offset - vdl <= MAX_VDL_EXTENSION holds so any kernel zero-fill is bounded.
             }
-            put(file, bytes, offset)
+            put(file, bytes, offset)?;
+            Ok(vdl.max(end))
         })
     }
     pub(in crate::ssh::folder_share) fn append(
@@ -241,7 +250,15 @@ impl PendingWrite {
         root: &Root,
         bytes: &[u8],
     ) -> io::Result<()> {
-        self.modify(root, |file, len| put(file, bytes, len))
+        self.modify(root, |file, current_len, known_vdl| {
+            let end = current_len
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(invalid)?;
+            let vdl = probe_vdl_near(file, current_len, current_len, known_vdl);
+            check_extension(vdl, end)?;
+            put(file, bytes, current_len)?;
+            Ok(vdl.max(end))
+        })
     }
     pub(in crate::ssh::folder_share) fn set_len(
         &mut self,
@@ -249,19 +266,63 @@ impl PendingWrite {
         len: u64,
     ) -> io::Result<()> {
         check_length(len)?;
-        self.modify(root, |file, current_len| {
-            check_extension(current_len, len)?;
+        self.modify(root, |file, current_len, known_vdl| {
+            let vdl = probe_vdl_near(file, current_len, len, known_vdl);
+            check_extension(vdl, len)?;
             if len > current_len {
                 // Zero-fill in revocation-checked chunks so NTFS Valid Data Length
                 // advances incrementally without stalling Forget/Revoke locks or
                 // accumulating a deferred zero-fill bomb across SETSTAT calls.
                 zero_fill_gap(file, root, current_len, len)?;
-            } else {
+            }
+            if len < current_len {
                 file.set_len(len)?;
             }
-            Ok(())
+            Ok(len)
         })
     }
+}
+/// NTFS keeps a single Valid Data Length (VDL) high-water mark per stream; all
+/// bytes at or past VDL read as zero. Because user-mode Win32 does not expose
+/// VDL directly without `SeManageVolumePrivilege`, we prove a conservative lower
+/// bound on VDL by checking whether any byte near EOF or near the target offset
+/// is non-zero. Pre-existing files created with `SetEndOfFile` (`VDL == 0`,
+/// `EOF >> MAX_VDL_EXTENSION`) read as all zeros and therefore keep `vdl == 0`,
+/// blocking unbounded synchronous kernel zero-fills while allowing edits on
+/// genuinely populated large files.
+fn proven_valid_data_length(file: &File, eof: u64, known_vdl: u64) -> u64 {
+    let base = known_vdl.min(eof);
+    if eof == 0 || eof.saturating_sub(base) <= MAX_VDL_EXTENSION {
+        return base;
+    }
+    base.max(highest_nonzero_in_window(file, eof))
+}
+fn probe_vdl_near(file: &File, eof: u64, target: u64, known_vdl: u64) -> u64 {
+    let mut vdl = known_vdl.min(eof);
+    if target.saturating_sub(vdl) <= MAX_VDL_EXTENSION {
+        return vdl;
+    }
+    let window_end = target.min(eof);
+    vdl = vdl.max(highest_nonzero_in_window(file, window_end));
+    if target.saturating_sub(vdl) > MAX_VDL_EXTENSION && eof > window_end {
+        vdl = vdl.max(highest_nonzero_in_window(file, eof));
+    }
+    vdl
+}
+fn highest_nonzero_in_window(file: &File, window_end: u64) -> u64 {
+    if window_end == 0 {
+        return 0;
+    }
+    let start = window_end.saturating_sub(4096);
+    let len = (window_end - start) as usize;
+    let mut buf = [0u8; 4096];
+    let Ok(read) = file.seek_read(&mut buf[..len], start) else {
+        return 0;
+    };
+    buf[..read]
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |index| start + index as u64 + 1)
 }
 /// Maximum bytes a single SFTP WRITE or SETSTAT/FSETSTAT request may extend a
 /// non-sparse NTFS file beyond its current Valid Data Length. Bounding each
@@ -407,6 +468,7 @@ impl Root {
             original,
             id,
             grant: self.revoked.clone(),
+            known_vdl: 0,
         })
     }
 
@@ -739,7 +801,10 @@ mod tests {
         // Extending far past EOF in a single WRITE or SETSTAT must fail cleanly.
         let huge_offset = MAX_VDL_EXTENSION + 1;
         assert_eq!(
-            handle.write_at(&root, b"x", huge_offset).unwrap_err().kind(),
+            handle
+                .write_at(&root, b"x", huge_offset)
+                .unwrap_err()
+                .kind(),
             ErrorKind::InvalidInput
         );
         assert_eq!(
@@ -752,6 +817,41 @@ mod tests {
         assert_eq!(fs::metadata(temp.path().join("bounded.bin"))?.len(), 4096);
         handle.write_at(&root, b"ok", 4096)?;
         assert_eq!(fs::metadata(temp.path().join("bounded.bin"))?.len(), 4098);
+
+        // A pre-existing file with EndOfFile > MAX_VDL_EXTENSION but ValidDataLength == 0
+        // must still reject high-offset writes and appends so NTFS cannot stall zero-filling.
+        let preallocated_path = temp.path().join("preallocated.bin");
+        {
+            let f = File::create(&preallocated_path)?;
+            f.set_len(MAX_VDL_EXTENSION + 4096)?;
+        }
+        let mut existing = root.open_write("preallocated.bin", false, false, false)?;
+        assert_eq!(
+            existing
+                .write_at(&root, b"x", MAX_VDL_EXTENSION + 1024)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            existing.append(&root, b"x").unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        existing.write_at(&root, b"head", 0)?;
+        assert_eq!(fs::read(&preallocated_path)?[..4], *b"head");
+
+        // A genuinely populated large file (non-zero bytes near EOF) remains editable at the tail.
+        let populated_path = temp.path().join("populated.bin");
+        {
+            let f = File::create(&populated_path)?;
+            f.seek_write(b"real", MAX_VDL_EXTENSION + 4096)?;
+        }
+        let mut populated = root.open_write("populated.bin", false, false, false)?;
+        populated.append(&root, b"!")?;
+        assert_eq!(
+            fs::metadata(&populated_path)?.len(),
+            MAX_VDL_EXTENSION + 4101
+        );
         Ok(())
     }
 }

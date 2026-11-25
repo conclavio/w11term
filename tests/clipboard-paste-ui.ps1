@@ -136,7 +136,7 @@ $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profile
 try {
     $traceReader = Open-PeerTraceReader $trace
     $window = Wait-InputWindow
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $remote = (Control @('list')).sessions[0].id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
     Set-FixtureClipboard 'first/'

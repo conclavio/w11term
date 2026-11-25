@@ -67,7 +67,7 @@ function Assert-Transcript([int]$Pane, [string[]]$Expected, [string]$Excluded) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json"
+    $manifest = Get-ControlManifestPath $app.Id
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath $manifest }
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     Wait-Text $remote 'ready'

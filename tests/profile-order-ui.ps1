@@ -87,7 +87,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
     $app = Start-Process -FilePath $Gui -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
     try {
         $window = Wait-InputWindow
-        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
         if ($launch -eq 1) {
             Launch-FromMenu $sshLabel $localLabel $localLabel
             $local = Active-Pane $localName

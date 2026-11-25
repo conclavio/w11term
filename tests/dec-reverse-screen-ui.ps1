@@ -42,7 +42,7 @@ function Mode-Change([string]$Sequence) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','108','--rows','26') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $source = ((Control @('list')).sessions | Where-Object active).id
     $null = Control @('wait-for-text','--pane',"$source",'--timeout','15','ready')
     Press-Key 0x77

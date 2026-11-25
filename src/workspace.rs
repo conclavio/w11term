@@ -665,7 +665,10 @@ mod tests {
         ] {
             let exec = recipe(dir, "").unwrap().exec_request();
             let (prefix, arg) = exec.rsplit_once(" w11term ").unwrap();
-            assert!(!prefix.contains(r"\\"), "script must not rely on \\\\ in single quotes");
+            assert!(
+                !prefix.contains(r"\\"),
+                "script must not rely on \\\\ in single quotes"
+            );
             assert!(prefix.contains(r#"cd -- "$a""#));
             assert_eq!(decode_octal(arg), dir);
         }

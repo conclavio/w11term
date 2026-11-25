@@ -53,7 +53,7 @@ $app = Start-Process -FilePath $Gui -ArgumentList $argsForApp -WindowStyle Hidde
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'the control pipe' {
-        Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json")
+        Test-Path -LiteralPath (Get-ControlManifestPath $app.Id)
     }
     $demo = (Control @('list')).sessions | Where-Object label -ceq 'Terminal lab'
     if (($demo.PSObject.Properties.Name -contains 'ssh_connection') -or

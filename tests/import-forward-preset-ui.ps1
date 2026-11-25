@@ -88,7 +88,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
     $app = Start-Process -FilePath $Gui -ArgumentList $argsForGui -WindowStyle Hidden -PassThru -RedirectStandardError $log
     try {
         $window = Wait-InputWindow
-        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
         if ($launch -eq 1) {
             Run-Palette 'Settings'
             Click ('Import OpenSSH config' + [char]0x2026)

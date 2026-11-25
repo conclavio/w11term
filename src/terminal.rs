@@ -4779,7 +4779,9 @@ mod tests {
                 !inner.contains("\x1b[200~")
                     && !inner.contains("\x1b[201~")
                     && !inner.contains('\x1b')
-                    && !inner.chars().any(|c| ('\u{0080}'..='\u{009f}').contains(&c)),
+                    && !inner
+                        .chars()
+                        .any(|c| ('\u{0080}'..='\u{009f}').contains(&c)),
                 "escaped control leaked into paste body: {inner:?} from {payload:?}"
             );
         }
@@ -4838,9 +4840,21 @@ mod tests {
         t.advance_bytes(&title);
 
         for i in 0..200 {
-            let seq = format!("\x1b]1337;SetUserVar=k{i}=dg==\x07\x1b]1337;UnicodeVersion=push l{i}\x07");
+            let seq =
+                format!("\x1b]1337;SetUserVar=k{i}=dg==\x07\x1b]1337;UnicodeVersion=push l{i}\x07");
             t.advance_bytes(seq.as_bytes());
         }
+        // Oversized UnicodeVersion stack label (> 256 bytes) is rejected cleanly.
+        let huge_label = format!("\x1b]1337;UnicodeVersion=push {}\x07", "L".repeat(8192));
+        t.advance_bytes(huge_label.as_bytes());
+
+        // Repeated Sixel Repeat + CarriageReturn overpaints hit the total work budget cleanly.
+        let mut sixel_loop = Vec::from(b"\x1bPq\"1;1;4096;1".as_slice());
+        for _ in 0..500 {
+            sixel_loop.extend_from_slice(b"!4096~$");
+        }
+        sixel_loop.extend_from_slice(b"\x1b\\");
+        t.advance_bytes(&sixel_loop);
 
         // Oversized OSC (> 4 MiB) is discarded cleanly and parser recovers on ST.
         let mut big_osc = Vec::from(b"\x1b]2;".as_slice());

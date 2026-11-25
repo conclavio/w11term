@@ -790,15 +790,14 @@ pub fn desktop_scope() -> Result<(String, u32, u32)> {
 }
 
 pub fn discovery_dir() -> Result<PathBuf> {
-    let base =
-        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?)
-            .join("w11term");
     if security::is_elevated()? {
-        let elevated = base.join("elevated");
-        security::ensure_elevated_directory(&elevated)?;
-        return Ok(elevated.join("instances"));
+        return Ok(security::elevated_data_dir()?.join("instances"));
     }
-    Ok(base.join("instances"))
+    Ok(
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?)
+            .join("w11term")
+            .join("instances"),
+    )
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Instance {

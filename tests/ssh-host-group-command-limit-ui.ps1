@@ -74,7 +74,7 @@ $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -P
 $waitJob = $null
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     Run-Palette "Open SSH group${dot}Fleet" -Enter
     $listing = Control @('list-ssh-groups')
     $owner = $listing.windows | Where-Object { $_.groups.label -ccontains $group }

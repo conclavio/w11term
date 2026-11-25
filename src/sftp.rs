@@ -1419,7 +1419,9 @@ pub(crate) fn apply_mark_of_the_web(path: &Path) -> Result<()> {
             Ok(())
         }
         Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 87 | 123)) => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("writing Zone.Identifier for {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("writing Zone.Identifier for {}", path.display()))
+        }
     }
 }
 

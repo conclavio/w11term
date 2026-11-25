@@ -50,7 +50,7 @@ function Replay-Menu([string]$Label) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--replay-timed',('"' + $capture + '"'),'--paused') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $pane = (Control @('list')).sessions[0].id
     $initial = Wait-Until 'verified capture ready at time zero' {
         $s = Playback
