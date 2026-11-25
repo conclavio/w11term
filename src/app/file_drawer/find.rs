@@ -1,4 +1,5 @@
 use super::*;
+use std::cmp::Ordering;
 use w11term::sftp::{FilenameFilter, FilenameSearch, SearchDownload};
 
 const RESULTS_PER_PAGE: usize = 25;
@@ -18,6 +19,7 @@ pub enum Action {
     SetOption(u64, MatchOption),
     Run(u64),
     Cancel(u64),
+    Sort(u64, ResultSort),
     Page(u64, usize),
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
@@ -35,12 +37,43 @@ pub enum MatchOption {
     Kind(Option<EntryKind>),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ResultSort {
+    #[default]
+    Folder,
+    Name,
+    Newest,
+    Largest,
+}
+
+impl ResultSort {
+    const OPTIONS: [(Self, &str); 4] = [
+        (Self::Folder, "Sort by folder"),
+        (Self::Name, "Sort by filename"),
+        (Self::Newest, "Newest first"),
+        (Self::Largest, "Largest first"),
+    ];
+
+    fn apply(self, matches: &mut [FilenameMatch]) {
+        matches.sort_unstable_by(|a, b| {
+            match self {
+                Self::Folder => Ordering::Equal,
+                Self::Name => a.name.cmp(&b.name),
+                Self::Newest => b.mtime.cmp(&a.mtime),
+                Self::Largest => b.size.cmp(&a.size),
+            }
+            .then_with(|| (&a.parent, &a.name).cmp(&(&b.parent, &b.name)))
+        });
+    }
+}
+
 pub(super) struct Panel {
     pub(super) serial: u64,
     root: String,
     query: String,
     input: ElementRef<TextBox>,
     filter: FilenameFilter,
+    sort: ResultSort,
     result: Option<FilenameSearch>,
     page: usize,
     pub(super) cancel: Option<TransferCancel>,
@@ -83,7 +116,8 @@ impl Panel {
         self.marked_downloads = None;
     }
 
-    fn install_result(&mut self, result: FilenameSearch) -> usize {
+    fn install_result(&mut self, mut result: FilenameSearch) -> usize {
+        self.sort.apply(&mut result.matches);
         let previous = self.result.as_ref().filter(|old| old.root == result.root);
         if previous.is_none() {
             self.page = 0;
@@ -99,7 +133,14 @@ impl Panel {
                 .matches
                 .iter()
                 .enumerate()
-                .filter_map(|(index, hit)| wanted.contains(&hit).then_some(index))
+                .filter_map(|(index, hit)| {
+                    wanted
+                        .iter()
+                        .any(|old| {
+                            old.parent == hit.parent && old.name == hit.name && old.kind == hit.kind
+                        })
+                        .then_some(index)
+                })
                 .collect();
             cleared = old_count.saturating_sub(marked.len());
         }
@@ -185,6 +226,7 @@ impl Panel {
         files: &FileDrawer,
         pane: u64,
         shell_ready: bool,
+        layout: DrawerLayout,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let generation = files.generation;
@@ -361,6 +403,36 @@ impl Panel {
                     .keyed_children(actions),
             ));
         }
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|result| result.matches.len() > 1)
+        {
+            rows.push(KeyedView::new(
+                "sort",
+                ComboBox::new()
+                    .automation_name("Sort search results")
+                    .is_enabled(ready)
+                    .items_source(ResultSort::OPTIONS.map(|(_, label)| label))
+                    .selected_index(
+                        ResultSort::OPTIONS
+                            .iter()
+                            .position(|(order, _)| *order == self.sort),
+                    )
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index.and_then(|i| ResultSort::OPTIONS.get(i)).map_or(
+                            Message::ControlIdle,
+                            |&(sort, _)| {
+                                Message::Files(FileAction::Search(
+                                    pane,
+                                    generation,
+                                    Action::Sort(serial, sort),
+                                ))
+                            },
+                        )
+                    })),
+            ));
+        }
         if let Some(resume) = files.resume_draft_button(pane, ctx) {
             rows.push(KeyedView::new("resume-draft", resume));
         }
@@ -400,6 +472,9 @@ impl Panel {
                             Action::Page(serial, self.page.saturating_sub(1)),
                             self.page > 0,
                         ),
+                        TextBlock::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text(format!("{} / {}", self.page + 1, self.page_count())),
                         button(
                             "Next results",
                             Action::Page(serial, self.page + 1),
@@ -437,6 +512,19 @@ impl Panel {
                             .text_wrapping(TextWrapping::Wrap),
                     );
                 let mut entry_actions = vec![KeyedView::new("reveal", reveal)];
+                let sort_detail = match self.sort {
+                    ResultSort::Newest => hit.mtime.map(|time| properties::timestamp(Some(time))),
+                    ResultSort::Largest => hit.size.map(listing_size_label),
+                    ResultSort::Folder | ResultSort::Name => None,
+                };
+                if let Some(detail) = sort_detail {
+                    entry_actions.push(KeyedView::new(
+                        "sort-detail",
+                        TextBlock::new()
+                            .text(detail)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
                 if let Some(marked) = &self.marked_downloads
                     && matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory))
                 {
@@ -610,7 +698,11 @@ impl Panel {
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Star(1.0)])
                     .children((
-                        StackPanel::new().spacing(6.0).keyed_children(rows),
+                        ScrollViewer::new()
+                            .automation_name("SFTP search actions")
+                            .max_height(layout.actions_max_height)
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            .content(StackPanel::new().spacing(6.0).keyed_children(rows)),
                         ScrollViewer::new()
                             .grid_row(1)
                             .automation_name("SFTP search results")
@@ -728,6 +820,30 @@ impl FileDrawer {
         if let Some(note) = note {
             self.status = format!("{note}. {}", self.status);
         }
+    }
+
+    fn sort_search_results(&mut self, serial: u64, sort: ResultSort) {
+        let Some(panel) = self
+            .search
+            .as_mut()
+            .filter(|panel| panel.serial == serial && panel.sort != sort)
+        else {
+            return;
+        };
+        let Some(result) = panel
+            .result
+            .as_ref()
+            .filter(|result| result.matches.len() > 1)
+        else {
+            return;
+        };
+        panel.sort = sort;
+        panel.page = 0;
+        panel.copy_status = None;
+        panel.install_result(result.clone());
+        // Rows are indexed within the current order. Expire their callbacks.
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        panel.serial = self.dialog_serial;
     }
 
     fn start_filename_search(
@@ -877,6 +993,7 @@ impl FileDrawer {
                 query: String::new(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                sort: ResultSort::default(),
                 result: None,
                 page: 0,
                 cancel: None,
@@ -943,6 +1060,7 @@ impl FileDrawer {
                     self.status = "Cancelling search…".into();
                 }
             }
+            Action::Sort(serial, sort) if !busy => self.sort_search_results(serial, sort),
             Action::Page(serial, page) if serial == panel.serial && page < panel.page_count() => {
                 panel.page = page;
             }
@@ -1004,6 +1122,8 @@ mod tests {
                     parent: "/project/nested".into(),
                     name: (*name).into(),
                     kind: Some(*kind),
+                    mtime: None,
+                    size: None,
                 })
                 .collect(),
             scanned_directories: 2,
@@ -1026,6 +1146,7 @@ mod tests {
                 query: "name".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                sort: ResultSort::default(),
                 result: Some(result),
                 page: 0,
                 cancel: None,
@@ -1098,6 +1219,62 @@ mod tests {
     }
 
     #[test]
+    fn result_sort_changes_all_pages_and_remaps_marks_by_path_and_type() {
+        use EntryKind::File;
+        let mut result = search_result(
+            "/project",
+            &[
+                ("a.log", File),
+                ("z.log", File),
+                ("b.log", File),
+                ("a.log", File),
+            ],
+        );
+        result.matches[0].parent = "/project/a".into();
+        result.matches[0].mtime = Some(20);
+        result.matches[0].size = Some(42);
+        result.matches[1].parent = "/project/a".into();
+        result.matches[2].parent = "/project/b".into();
+        result.matches[2].mtime = Some(50);
+        result.matches[2].size = Some(42);
+        result.matches[3].parent = "/project/z".into();
+        result.matches[3].mtime = Some(50);
+        result.matches[3].size = Some(0);
+        let mut drawer = search_drawer(result);
+        drawer.search.as_mut().unwrap().marked_downloads = Some(BTreeSet::from([3]));
+
+        for (sort, order) in [
+            (ResultSort::Name, [0, 3, 2, 1]),
+            (ResultSort::Newest, [2, 3, 0, 1]),
+            (ResultSort::Largest, [0, 2, 3, 1]),
+            (ResultSort::Folder, [0, 1, 2, 3]),
+        ] {
+            let serial = drawer.search_serial().unwrap();
+            drawer.sort_search_results(serial, sort);
+            let panel = drawer.search.as_ref().unwrap();
+            let hits = panel.result.as_ref().unwrap();
+            let paths = [
+                "/project/a/a.log",
+                "/project/a/z.log",
+                "/project/b/b.log",
+                "/project/z/a.log",
+            ];
+            assert_eq!(
+                hits.matches
+                    .iter()
+                    .map(|hit| format!("{}/{}", hit.parent, hit.name))
+                    .collect::<Vec<_>>(),
+                order.map(|index| paths[index]),
+            );
+            assert_eq!(panel.serial, serial + 1);
+            assert!(panel.search_download_selection(serial).is_err());
+            let marked = panel.marked_downloads.as_ref().unwrap();
+            assert_eq!(marked.len(), 1);
+            assert_eq!(hits.matches[*marked.first().unwrap()].parent, "/project/z");
+        }
+    }
+
+    #[test]
     fn refresh_remaps_marks_by_root_path_and_type_then_expires_old_callbacks() {
         use EntryKind::{Directory, File};
         let before = search_result(
@@ -1113,6 +1290,7 @@ mod tests {
                 query: "test".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                sort: ResultSort::default(),
                 result: Some(before),
                 page: 1,
                 cancel: Some(TransferCancel::default()),
@@ -1121,10 +1299,12 @@ mod tests {
             }),
             ..FileDrawer::default()
         };
-        let after = search_result(
+        let mut after = search_result(
             "/project",
             &[("added", File), ("changed", Directory), ("keep", File)],
         );
+        after.matches[2].mtime = Some(1);
+        after.matches[2].size = Some(12);
         drawer.finish_search(3, Ok(json!(after)), None);
         let panel = drawer.search.as_ref().unwrap();
         assert_eq!(panel.serial, 4);
@@ -1162,6 +1342,8 @@ mod tests {
                 parent: "/project".into(),
                 name: format!("log-{index}.txt"),
                 kind: Some(EntryKind::File),
+                mtime: None,
+                size: None,
             })
             .collect();
         let mut drawer = FileDrawer {
@@ -1177,6 +1359,7 @@ mod tests {
                     match_case: true,
                     kind: Some(EntryKind::File),
                 },
+                sort: ResultSort::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches,
@@ -1229,6 +1412,8 @@ mod tests {
             parent: "/project/logs".into(),
             name: "build log.txt".into(),
             kind: Some(EntryKind::File),
+            mtime: None,
+            size: None,
         };
         let folder = FilenameMatch {
             name: "logs archive".into(),
@@ -1247,6 +1432,7 @@ mod tests {
                 query: "log".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                sort: ResultSort::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![file.clone(), folder.clone(), link.clone()],
@@ -1293,6 +1479,8 @@ mod tests {
             parent: "/project/logs".into(),
             name: "settings.txt".into(),
             kind: Some(EntryKind::File),
+            mtime: None,
+            size: None,
         };
         let other = FilenameMatch {
             parent: "/project".into(),
@@ -1308,6 +1496,7 @@ mod tests {
                 query: "settings".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                sort: ResultSort::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![other, hit.clone()],
@@ -1359,6 +1548,8 @@ mod tests {
             parent: "/project/logs".into(),
             name: "build log.txt".into(),
             kind: None,
+            mtime: None,
+            size: None,
         };
         let path = "/project/logs/build log.txt";
         let target = FileTarget::Search(2, hit.clone());
@@ -1372,6 +1563,7 @@ mod tests {
                 query: "log".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                sort: ResultSort::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![hit.clone()],
@@ -1444,11 +1636,15 @@ mod tests {
             parent: "/project/雪 files".into(),
             name: "Résumé [draft] $1.txt".into(),
             kind: Some(EntryKind::File),
+            mtime: None,
+            size: None,
         };
         let link = FilenameMatch {
             parent: "/".into(),
             name: "snap link".into(),
             kind: Some(EntryKind::Symlink),
+            mtime: None,
+            size: None,
         };
         let mut panel = Panel {
             serial: 4,
@@ -1456,6 +1652,7 @@ mod tests {
             query: "snap".into(),
             input: ElementRef::new(),
             filter: FilenameFilter::default(),
+            sort: ResultSort::default(),
             result: Some(FilenameSearch {
                 root: "/".into(),
                 matches: vec![link, file.clone()],

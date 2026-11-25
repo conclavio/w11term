@@ -68,6 +68,10 @@ pub struct FilenameMatch {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<EntryKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -154,15 +158,19 @@ impl Search<'_> {
                     }
                     let child = format!("{prefix}/{name}");
                     // READDIR may omit the type. Resolve it without following links.
-                    let mode = match entry.attrs.permissions {
-                        Some(mode) if mode & 0o170000 != 0 => Some(mode),
-                        _ => match self.engine.raw.lstat(&child).await {
-                            Ok(reply) => reply.attrs.permissions,
+                    let mut attrs = entry.attrs;
+                    if !attrs.permissions.is_some_and(|mode| mode & 0o170000 != 0) {
+                        match self.engine.raw.lstat(&child).await {
+                            Ok(reply) => {
+                                attrs.permissions = reply.attrs.permissions;
+                                attrs.mtime = reply.attrs.mtime.or(attrs.mtime);
+                                attrs.size = reply.attrs.size.or(attrs.size);
+                            }
                             Err(error) if transport_error(&error) => return Err(error.into()),
-                            Err(_) => None,
-                        },
-                    };
-                    let kind = EntryKind::from_permissions(mode);
+                            Err(_) => {}
+                        }
+                    }
+                    let kind = EntryKind::from_permissions(attrs.permissions);
                     if self.kind.is_none_or(|want| Some(want) == kind)
                         && self.pattern.matches(&name)
                         && self.matched.insert(child.clone())
@@ -171,6 +179,8 @@ impl Search<'_> {
                             parent: path.to_owned(),
                             name,
                             kind,
+                            mtime: attrs.mtime,
+                            size: attrs.size.filter(|_| kind == Some(EntryKind::File)),
                         });
                     }
                     if kind == Some(EntryKind::Directory) && !self.directories.contains(&child) {

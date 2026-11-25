@@ -18,6 +18,8 @@ fn hit(parent: &str, name: &str, kind: EntryKind) -> FilenameMatch {
         parent: parent.into(),
         name: name.into(),
         kind: Some(kind),
+        mtime: None,
+        size: None,
     }
 }
 
@@ -37,6 +39,53 @@ fn search_download_rejects_unsafe_components_and_collisions_between_folders() {
             "{bad:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filename_search_returns_reported_metadata_and_keeps_zero_distinct_from_unknown() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    let tree = root.join("tree");
+    fs::create_dir_all(tree.join("folder.log")).unwrap();
+    fs::write(tree.join("big.log"), b"12345").unwrap();
+    fs::write(tree.join("empty.log"), []).unwrap();
+    set_fixture_modified(&tree.join("big.log"), 1_690_000_000);
+    set_fixture_modified(&tree.join("empty.log"), 1_690_000_001);
+    fs::write(root.join("omit-listed-mode"), "big.log").unwrap();
+
+    let found: FilenameSearch = serde_json::from_value(
+        guarded_job(&pane, None, search("/tree", ".log"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        found
+            .matches
+            .iter()
+            .map(|hit| (hit.name.as_str(), hit.size))
+            .collect::<Vec<_>>(),
+        [
+            ("big.log", Some(5)),
+            ("empty.log", Some(0)),
+            ("folder.log", None)
+        ]
+    );
+    assert_eq!(found.matches[0].mtime, Some(1_690_000_000));
+    assert_eq!(found.matches[1].mtime, Some(1_690_000_001));
+
+    fs::write(root.join("tree-unknown-size"), []).unwrap();
+    let missing = guarded_job(&pane, None, search("/tree", "big.log"))
+        .await
+        .unwrap();
+    assert!(missing["matches"][0].get("size").is_none());
+    assert_eq!(missing["matches"][0]["mtime"], 1_690_000_000);
+    let legacy: FilenameMatch = serde_json::from_value(json!({
+        "parent": "/tree", "name": "old.log", "kind": "file"
+    }))
+    .unwrap();
+    assert_eq!((legacy.mtime, legacy.size), (None, None));
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2986,6 +2986,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     for index in 0..fillers {
         fs::write(parent.join(format!("build-{index:02}.log")), []).unwrap();
     }
+    set_fixture_modified(&parent.join("build-37.log"), 2_114_380_800);
     fs::write(parent.join("zz-[Ångström].txt"), []).unwrap();
     fs::write(parent.join("zz-Ångström.txt"), []).unwrap();
     let keyboard = remote.path().join("keyboard-input.bin");
@@ -3024,6 +3025,8 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
             ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // One scan for the paginated sort fixture.
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),

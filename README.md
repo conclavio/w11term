@@ -459,6 +459,8 @@ Choose **Filter filenames…** and type part of a name to search the entire dire
 
 Choose **Find files…** to search the displayed directory and its subdirectories by filename. The default is a case-insensitive literal search. Use **Regex** for a regular expression or **Match case** to distinguish uppercase and lowercase. Select a result to open its containing folder with the entry selected, or use **Download…** or **Download folder…** beside a regular file or folder. Direct downloads use the drawer’s destination and overwrite rules, show cancellable progress, and keep the search results in place. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. Cancelling the first scan keeps the matches already collected.
 
+Sort retained results by containing folder, filename, modification time, or file size. Sorting starts on page one, keeps marked downloads, and uses the scan’s existing metadata. Results without a reported modification time or regular file size sort last for that column. **Copy all paths** follows the displayed order across pages.
+
 Choose **Refresh results** to scan again with the same settings. The previous results stay visible during the scan. A successful refresh keeps download marks for paths that still match with the same entry type. Cancelling a refresh or encountering a scan error keeps the previous results and marks.
 
 After revealing a match, choose **Back to search results** to return to the same query and results page without rescanning. **Find files…** starts a new search from the current folder. Closing the drawer or reconnecting ends the saved search.

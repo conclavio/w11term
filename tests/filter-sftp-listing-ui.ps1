@@ -54,20 +54,20 @@ function Focus-FilenameSearch {
     $query.SetFocus()
     $null = Wait-FilenameSearchFocus
 }
-function Set-ResultType([string]$Name) {
+function Set-SearchChoice([string]$Control, [string]$Name) {
     $controlType = [System.Windows.Automation.ControlType]::ComboBox
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $selector = Wait-Until 'enabled search result type selector' {
-        $box = Find-Element 'Search result type' $controlType
+    $selector = Wait-Until "enabled '$Control' selector" {
+        $box = Find-Element $Control $controlType
         if ($box -and $box.Current.IsEnabled) { $box }
     }
     $selector.GetCurrentPattern($expand).Expand()
-    $choice = Wait-Until "search result type '$Name'" {
+    $choice = Wait-Until "'$Control' option '$Name'" {
         Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem) -Visible
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    $popup = Wait-Until "selected search result type '$Name'" {
-        $box = Find-Element 'Search result type' $controlType
+    $popup = Wait-Until "'$Control' with '$Name' selected" {
+        $box = Find-Element $Control $controlType
         if ($box) {
             $selected = $box.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
             if ($selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Name) {
@@ -221,7 +221,7 @@ try {
     $null = Wait-Until 'parent directory restored' { Find-Element $parent }
     Click ('Find files' + [char]0x2026)
     $field = Wait-FilenameSearchFocus
-    Set-ResultType 'Folders'
+    Set-SearchChoice 'Search result type' 'Folders'
     $null = Wait-Until 'type-only search enabled' {
         $run = Button 'Search'
         $run -and $run.Current.IsEnabled
@@ -232,7 +232,7 @@ try {
         (Find-Element '1 matches in 2 folders') -and (Button "Reveal $parent/nested") -and
             !(Button "Reveal $parent/nested/nested-content.txt")
     }
-    Set-ResultType 'All types'
+    Set-SearchChoice 'Search result type' 'All types'
     $on = [System.Windows.Automation.ToggleState]::On
     $off = [System.Windows.Automation.ToggleState]::Off
     (Wait-CheckBox 'Regex' $off).Toggle()
@@ -240,6 +240,38 @@ try {
     $null = Wait-CheckBox 'Regex' $on
     $null = Wait-CheckBox 'Match case' $on
     $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $fileOnPageTwo = "$parent/nested/nested-content.txt"
+    $newest = "$parent/build-37.log"
+    $field.GetCurrentPattern($value).SetValue('^build-[0-9]+\.log$|^nested-content\.txt$')
+    Click 'Search'
+    $null = Wait-Until 'folder-sorted recursive results span two pages' {
+        (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
+            !(Button "Reveal $fileOnPageTwo") -and !(Button "Reveal $newest")
+    }
+    Click ('Select downloads' + [char]0x2026)
+    Click 'Next results'
+    $null = Wait-Until 'recursive results page two' {
+        (Find-Element '2 / 2') -and (Button "Reveal $fileOnPageTwo")
+    }
+    (Wait-CheckBox "Mark $fileOnPageTwo" $off).Toggle()
+    $null = Wait-CheckBox "Mark $fileOnPageTwo" $on
+    Set-SearchChoice 'Sort search results' 'Largest first'
+    $null = Wait-Until 'largest file moves to the first page with its reported size' {
+        (Find-Element '1 / 2') -and (Button "Reveal $fileOnPageTwo") -and
+            (Find-Element '68.4 KiB') -and !(Button "Reveal $newest")
+    }
+    $null = Wait-CheckBox "Mark $fileOnPageTwo" $on
+    Set-SearchChoice 'Sort search results' 'Newest first'
+    $null = Wait-Until 'newest file moves onto the first page' {
+        (Find-Element '1 / 2') -and (Button "Reveal $newest") -and
+            (Find-Element '2037-01-01 00:00:00 UTC')
+    }
+    Set-SearchChoice 'Sort search results' 'Sort by folder'
+    $null = Wait-Until 'original first page restored without rescanning' {
+        (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
+            !(Button "Reveal $fileOnPageTwo")
+    }
     $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     $field.GetCurrentPattern($value).SetValue('(')
     Click 'Search'
