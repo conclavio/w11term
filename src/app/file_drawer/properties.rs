@@ -26,7 +26,7 @@ pub(super) fn timestamp(seconds: Option<u32>) -> String {
         .unwrap_or_else(|| UNREPORTED.into())
 }
 
-pub(super) fn display_text(path: &str, mut reply: Value) -> Result<String> {
+pub(super) fn display(path: &str, mut reply: Value) -> Result<(Attributes, String)> {
     let data = reply
         .get_mut("attrs")
         .context("Missing SFTP file attributes")?
@@ -63,7 +63,7 @@ pub(super) fn display_text(path: &str, mut reply: Value) -> Result<String> {
     } else if let Some(reason) = reply["target_error"].as_str() {
         lines.push(format!("Link target unavailable. {reason}"));
     }
-    Ok(lines.join("\r\n"))
+    Ok((attrs, lines.join("\r\n")))
 }
 
 #[cfg(test)]
@@ -72,6 +72,10 @@ mod tests {
     use serde_json::json;
 
     const PATH: &str = "/srv/雪/latest.log";
+
+    fn display_text(path: &str, reply: Value) -> Result<String> {
+        display(path, reply).map(|(_, text)| text)
+    }
 
     #[test]
     fn properties_preserve_zero_ids_and_epoch_special_mode_bits_and_wide_sizes() {
