@@ -45,6 +45,7 @@ pub(super) struct EntryPreview {
     permissions: Permissions,
     link_target: Option<String>,
     opening_link: bool,
+    comparison: Option<LocalComparison>,
     status: Option<String>,
     pub(super) cancel: TransferCancel,
     // Terminal output can re-render the window while the user selects text.
@@ -55,6 +56,24 @@ enum Contents {
     Loading,
     Ready(String),
     Error(String),
+}
+
+struct LocalComparison {
+    name: String,
+    result: Option<Result<String, String>>,
+    cancel: TransferCancel,
+}
+
+impl LocalComparison {
+    fn summary(&self, remote: &str) -> String {
+        let name = &self.name;
+        match &self.result {
+            None => format!("Calculating local SHA-256 for {name}…"),
+            Some(Ok(local)) if local == remote => format!("Match · {name}"),
+            Some(Ok(_)) => format!("Different · {name}"),
+            Some(Err(error)) => format!("Could not compare {name}. {error}"),
+        }
+    }
 }
 
 struct MatchPreview {
@@ -137,6 +156,9 @@ fn context_line(text: &str) -> String {
 impl Drop for EntryPreview {
     fn drop(&mut self) {
         self.cancel.cancel();
+        if let Some(comparison) = &self.comparison {
+            comparison.cancel.cancel();
+        }
     }
 }
 
@@ -145,11 +167,19 @@ impl EntryPreview {
         self.kind == PreviewKind::Text && matches!(self.content, Contents::Ready(_))
     }
 
+    fn comparing(&self) -> bool {
+        self.comparison
+            .as_ref()
+            .is_some_and(|task| task.result.is_none())
+    }
+
     pub(super) fn dialog(
         &self,
         pane: u64,
         generation: u64,
+        revision: u64,
         can_edit: bool,
+        picking: bool,
         context: &ViewContext<TerminalApp>,
     ) -> View {
         self.view
@@ -313,11 +343,48 @@ impl EntryPreview {
                     fields.push(KeyedView::new(
                         "verified-download",
                         Button::new()
+                            .is_enabled(!picking)
                             .on_click(context.callback(move |_| {
                                 Message::Files(FileAction::VerifyChecksum(pane, generation, serial))
                             }))
                             .content("Use for verified download"),
                     ));
+                    fields.push(KeyedView::new(
+                        "compare-local",
+                        Button::new()
+                            .is_enabled(!picking && !self.comparing())
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::Pick(
+                                    pane,
+                                    generation,
+                                    revision,
+                                    TransferPicker::CompareChecksum(serial),
+                                ))
+                            }))
+                            .content("Compare with local file…"),
+                    ));
+                    if let (Some(comparison), Contents::Ready(remote)) =
+                        (&self.comparison, &self.content)
+                    {
+                        fields.push(KeyedView::new(
+                            "comparison-summary",
+                            TextBlock::new()
+                                .automation_id("sftp-local-checksum-status")
+                                .text(comparison.summary(remote))
+                                .text_wrapping(TextWrapping::Wrap),
+                        ));
+                        if let Some(Ok(local)) = &comparison.result {
+                            fields.push(KeyedView::new(
+                                "local-digest",
+                                TextBlock::new()
+                                    .automation_id("sftp-local-checksum")
+                                    .automation_name("Local SHA-256 digest")
+                                    .text(format!("Local SHA-256  {local}"))
+                                    .text_wrapping(TextWrapping::Wrap)
+                                    .is_text_selection_enabled(true),
+                            ));
+                        }
+                    }
                 }
                 if let Some(controls) = self.permissions_controls(pane, generation, context) {
                     fields.push(KeyedView::new("permissions", controls));
@@ -516,6 +583,7 @@ impl FileDrawer {
             permissions: Permissions::Unavailable,
             link_target: None,
             opening_link: false,
+            comparison: None,
             status: None,
             cancel: TransferCancel::default(),
             view: OnceCell::new(),
@@ -748,6 +816,83 @@ impl FileDrawer {
         Some((&preview.target, sha256))
     }
 
+    pub(super) fn can_compare_checksum(&self, serial: u64) -> bool {
+        self.ready_checksum(serial).is_some()
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| !preview.comparing())
+    }
+
+    pub(super) fn compare_checksum(
+        &mut self,
+        pane: u64,
+        serial: u64,
+        path: PathBuf,
+        context: &ComponentContext<TerminalApp>,
+    ) {
+        if !self.can_compare_checksum(serial) {
+            return;
+        }
+        let generation = self.generation;
+        let preview = self.preview.as_mut().unwrap();
+        let cancel = TransferCancel::default();
+        preview.comparison = Some(LocalComparison {
+            name: path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            result: None,
+            cancel: cancel.clone(),
+        });
+        preview.status = None;
+        preview.view.take();
+        context.spawn_background_with_rejection(
+            move |_| {
+                let result = w11term::sftp::local_sha256(&path, &cancel)
+                    .map_err(|error| format!("{error:#}"));
+                Message::Files(FileAction::LocalChecksum(pane, generation, serial, result))
+            },
+            Message::Files(FileAction::LocalChecksum(
+                pane,
+                generation,
+                serial,
+                Err("Local checksum worker unavailable. Try again.".into()),
+            )),
+        );
+    }
+
+    pub(super) fn finish_local_checksum(&mut self, serial: u64, result: Result<String, String>) {
+        if self.ready_checksum(serial).is_some()
+            && let Some(preview) = self.preview.as_mut()
+            && let Some(comparison) = &mut preview.comparison
+            && comparison.result.is_none()
+        {
+            comparison.result = Some(result);
+            preview.view.take();
+        }
+    }
+
+    pub(super) fn checksum_picker_failed(&mut self, serial: u64, error: &str) {
+        if self.ready_checksum(serial).is_some()
+            && let Some(preview) = self.preview.as_mut()
+        {
+            preview.status = Some(format!("Could not select a local file. {error}"));
+            preview.view.take();
+        }
+    }
+
+    pub(super) fn checksum_picker_changed(&mut self, serial: u64) {
+        if let Some(preview) = self
+            .preview
+            .as_mut()
+            .filter(|preview| preview.serial == serial)
+        {
+            preview.view.take();
+        }
+    }
+
     pub(super) fn copy_checksum(&mut self, serial: u64) {
         let Some((_, sha256)) = self.ready_checksum(serial) else {
             return;
@@ -762,6 +907,9 @@ impl FileDrawer {
     }
 
     pub(super) fn verify_checksum(&mut self, serial: u64) -> Result<()> {
+        if self.picking.is_some() {
+            return Ok(());
+        }
         let Some((target, digest)) = self.ready_checksum(serial) else {
             return Ok(());
         };
@@ -895,6 +1043,39 @@ mod tests {
             matches!(&dialog.action, EditAction::VerifyDownload(FileTarget::Listed(entry))
             if entry.name == "résumé 100% [pilot].txt")
         );
+    }
+
+    #[test]
+    fn local_comparison_accepts_only_the_current_preview_and_cancels_on_close() {
+        let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
+        let (properties, _) = files
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Properties)
+            .unwrap();
+        files.finish_preview(properties, Ok(json!({"attrs": {"permissions": 0o100644}})));
+        let (checksum, _) = files
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Checksum(properties))
+            .unwrap();
+        let digest = "f".repeat(64);
+        files.finish_preview(checksum, Ok(json!({"sha256": digest})));
+        assert!(files.can_compare_checksum(checksum));
+        let cancel = TransferCancel::default();
+        files.preview.as_mut().unwrap().comparison = Some(LocalComparison {
+            name: "local.bin".into(),
+            result: None,
+            cancel: cancel.clone(),
+        });
+
+        files.finish_local_checksum(properties, Ok(digest.clone()));
+        assert!(!files.can_compare_checksum(checksum));
+        files.finish_local_checksum(checksum, Ok("0".repeat(64)));
+        files.finish_local_checksum(checksum, Ok(digest.clone()));
+        let comparison = files.preview.as_ref().unwrap().comparison.as_ref().unwrap();
+        assert_eq!(comparison.summary(&digest), "Different · local.bin");
+        assert!(files.can_compare_checksum(checksum));
+        files.close_preview(checksum);
+        assert!(cancel.is_cancelled());
+        files.finish_local_checksum(checksum, Ok(digest));
+        assert!(!files.can_compare_checksum(checksum));
     }
 
     fn selected(kind: ListedKind) -> (FileDrawer, ListedEntry) {

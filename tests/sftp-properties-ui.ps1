@@ -69,6 +69,36 @@ function Download-WithChecksum([string]$Destination, [string]$Expected) {
     }
     $null = Wait-Until 'accept verified download destination' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
+function Select-ComparisonFile([string]$Path) {
+    $title = 'Choose a local file to compare'
+    Click ('Compare with local file' + [char]0x2026)
+    $dialog = Wait-Until 'owned checksum comparison picker' { Find-OwnedDialog $title }
+    if ($Path) {
+        $null = Wait-Until 'enter local comparison file' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
+    }
+    $id = if ($Path) { 1 } else { 2 }
+    $null = Wait-Until 'dismiss comparison picker' { [FixtureDialog]::ClickButton($dialog, $id) }
+    $null = Wait-Until 'comparison picker closed' { !(Find-OwnedDialog $title) }
+}
+function Get-Digest([string]$Path) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { -join ($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $hasher.Dispose() }
+}
+function Assert-Comparison([string]$Result, [string]$Path) {
+    $summary = "$Result " + [char]0x00b7 + " " + [IO.Path]::GetFileName($Path)
+    $null = Wait-Until $summary {
+        $status = Find-Element $summary
+        if ($status -and $status.Current.AutomationId -eq 'sftp-local-checksum-status') { $status }
+    }
+    $field = Wait-Until 'selectable local SHA-256 digest' {
+        $element = Find-Element 'Local SHA-256 digest'
+        if ($element -and $element.Current.AutomationId -eq 'sftp-local-checksum') { $element }
+    }
+    $expected = Get-Digest $Path
+    $actual = $field.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1).Trim()
+    if ($actual -cne "Local SHA-256  $expected") { throw 'The dialog displayed the wrong local digest' }
+}
 function Wait-TransferOutcome([string]$Outcome, [string]$Message) {
     $null = Wait-Until "transfer result $Outcome" {
         $events = (Control @('events','--pane',"$remote",'--since','0','--timeout','0')).journal.events
@@ -118,9 +148,7 @@ try {
     if ([IO.File]::ReadAllText((Join-Path $fixture 'transfer-trace')).Length -ne 0) {
         throw 'Viewing properties opened a file before requesting its checksum'
     }
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try { $expectedDigest = -join ($hasher.ComputeHash([IO.File]::ReadAllBytes($disk)) | ForEach-Object { $_.ToString('x2') }) }
-    finally { $hasher.Dispose() }
+    $expectedDigest = Get-Digest $disk
     Click $filename
     Click $properties
     Click 'Calculate SHA-256'
@@ -139,6 +167,16 @@ try {
     } elseif (!(Find-Element 'Copy SHA-256' $button)) {
         throw 'The checksum dialog lacked a copy action'
     }
+    $matching = Join-Path $picker "local $snow [match].bin"
+    $different = Join-Path $picker 'different.bin'
+    [IO.File]::Copy($disk, $matching)
+    [IO.File]::WriteAllBytes($different, [byte[]](1..57))
+    Select-ComparisonFile $matching
+    Assert-Comparison 'Match' $matching
+    Select-ComparisonFile $different
+    Assert-Comparison 'Different' $different
+    Select-ComparisonFile ''
+    Assert-Comparison 'Different' $different
     $downloaded = Join-Path $picker 'verified.bin'
     Download-WithChecksum $downloaded $expectedDigest
     Wait-TransferOutcome 'completed' 'SHA-256 verified'
@@ -176,9 +214,10 @@ try {
     Wait-Focus $localPane
     if ((Shell-Pid 'properties-after') -ne $pidBefore) { throw 'Properties interrupted the neighboring PowerShell' }
 } catch {
-    $packets = [IO.File]::ReadAllText((Join-Path $fixture 'transfer-trace'))
-    $metadata = [IO.File]::ReadAllText((Join-Path $fixture 'properties-trace'))
-    throw "$($_.Exception.Message) at $($_.ScriptStackTrace). Transfer packets: $packets Metadata packets: $metadata"
+    $failure = $_
+    $packets = Get-Content -LiteralPath (Join-Path $fixture 'transfer-trace') -Raw -ErrorAction SilentlyContinue
+    $metadata = Get-Content -LiteralPath (Join-Path $fixture 'properties-trace') -Raw -ErrorAction SilentlyContinue
+    throw "$($failure.Exception.Message) at $($failure.ScriptStackTrace). Transfer packets: $packets Metadata packets: $metadata"
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

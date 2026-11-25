@@ -43,6 +43,7 @@ pub use find::{
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
+pub use checksum::local_sha256;
 mod permissions;
 mod remote_copy;
 mod symbolic_link;

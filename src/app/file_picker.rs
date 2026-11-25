@@ -19,6 +19,7 @@ use windows::{
 pub(super) enum Purpose {
     UploadFiles,
     UploadFolder,
+    CompareLocalFile,
     SshConfig(PathBuf),
     OpenSshHostList,
     OpenSshGroupDefinition,
@@ -174,6 +175,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             purpose,
             Purpose::UploadFiles
                 | Purpose::UploadFolder
+                | Purpose::CompareLocalFile
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
                 | Purpose::OpenSshHostList
@@ -228,6 +230,13 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 if fixture_picker_folder(&dialog, "W11TERM_SFTP_PICKER_SMOKE_DIR")? {
                     options |= FOS_DONTADDTORECENT;
                 }
+                None
+            }
+            Purpose::CompareLocalFile => {
+                dialog.SetTitle(w!("Choose a local file to compare"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                #[cfg(feature = "ui-smoke")]
+                fixture_picker_folder(&dialog, "W11TERM_SFTP_PICKER_SMOKE_DIR")?;
                 None
             }
             Purpose::SshConfig(current) => {

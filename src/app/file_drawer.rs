@@ -133,6 +133,7 @@ pub enum FileAction {
     MovePreviewMatch(u64, u64, u64, bool),
     CopyChecksum(u64, u64, u64),
     VerifyChecksum(u64, u64, u64),
+    LocalChecksum(u64, u64, u64, Result<String, String>),
     Permissions(u64, u64, u64, preview::PermissionsAction),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
@@ -312,6 +313,7 @@ pub enum TransferPicker {
     Download(FileTarget, Option<DownloadVerification>),
     DownloadMarked,
     DownloadSearch(u64),
+    CompareChecksum(u64),
 }
 
 #[derive(Clone)]
@@ -346,6 +348,7 @@ impl TransferPicker {
                 files.search_download_selection(*serial)?;
                 Ok(Purpose::SaveSearchResults)
             }
+            Self::CompareChecksum(_) => Ok(Purpose::CompareLocalFile),
         }
     }
 }
@@ -1601,7 +1604,14 @@ impl FileDrawer {
             return Some(editor.dialog(pane, self.generation, context));
         }
         if let Some(preview) = &self.preview {
-            return Some(preview.dialog(pane, self.generation, self.editor.is_none(), context));
+            return Some(preview.dialog(
+                pane,
+                self.generation,
+                self.listing_revision,
+                self.editor.is_none(),
+                self.picking.is_some(),
+                context,
+            ));
         }
         if let Some(space) = &self.folder_report {
             let progress = self
@@ -3526,6 +3536,7 @@ impl TerminalApp {
             | MovePreviewMatch(id, ..)
             | CopyChecksum(id, ..)
             | VerifyChecksum(id, ..)
+            | LocalChecksum(id, ..)
             | Permissions(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
@@ -3600,6 +3611,7 @@ impl TerminalApp {
             action,
             Tick(_)
                 | Picked(..)
+                | LocalChecksum(..)
                 | Listed(..)
                 | LinkTargetListed(..)
                 | Drop(..)
@@ -3609,7 +3621,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | OpenLinkTarget(_, g, ..) | LinkTargetListed(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | RenameMarkedText(_, g, ..) | ConfirmRenameMarked(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | ShowFolderReport(_, g, ..) | FolderReport(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | OpenLinkTarget(_, g, ..) | LinkTargetListed(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | LocalChecksum(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | RenameMarkedText(_, g, ..) | ConfirmRenameMarked(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | ShowFolderReport(_, g, ..) | FolderReport(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3854,6 +3866,7 @@ impl TerminalApp {
                     outcome = TransferOutcome::Cancelled;
                 }
                 LinkTargetListed(_, _, serial, result) => files.accept_link_target(serial, result),
+                LocalChecksum(_, _, serial, result) => files.finish_local_checksum(serial, result),
                 Listed(_, _, path, direction, result) if files.parsing => {
                     files.parsing = false;
                     files.accept_listing(direction, path, result.map_err(|e| anyhow!("{e}"))?);
@@ -3874,7 +3887,17 @@ impl TerminalApp {
                     }
                 }
                 Picked(_, _, serial, picker, result) => {
-                    if !files.finish_picker(serial) || !may_open_dialog {
+                    let accepted = files.finish_picker(serial);
+                    if let TransferPicker::CompareChecksum(preview) = &picker {
+                        files.checksum_picker_changed(*preview);
+                    }
+                    if !accepted || !may_open_dialog {
+                        return Ok(());
+                    }
+                    if let (TransferPicker::CompareChecksum(preview), Err(error)) =
+                        (&picker, &result)
+                    {
+                        files.checksum_picker_failed(*preview, error);
                         return Ok(());
                     }
                     let paths = result.map_err(|e| anyhow!("{e}"))?;
@@ -3963,6 +3986,12 @@ impl TerminalApp {
                                 }),
                                 context,
                             )?;
+                        }
+                        TransferPicker::CompareChecksum(preview) => {
+                            let [local] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one local file to compare"))?;
+                            files.compare_checksum(pane, preview, local, context);
                         }
                     }
                 }
@@ -4181,7 +4210,12 @@ impl TerminalApp {
                         }
                     }
                 }
-                _ if files.busy() || !files.open => {}
+                _ if !files.open
+                    || (files.busy()
+                        && !matches!(
+                            action,
+                            Pick(_, _, _, TransferPicker::CompareChecksum(_))
+                        )) => {}
                 EditFilter(_, _, revision, enabled) => {
                     if enabled && files.directory.is_some() && may_open_dialog {
                         if !files.filter_editing() {
@@ -4357,6 +4391,12 @@ impl TerminalApp {
                 }
                 Pick(_, _, revision, picker) => {
                     if !may_open_dialog
+                        || files.picking.is_some()
+                        || matches!(
+                            picker,
+                            TransferPicker::CompareChecksum(serial)
+                                if !files.can_compare_checksum(serial)
+                        )
                         || (matches!(
                             picker,
                             TransferPicker::DownloadMarked
@@ -4372,6 +4412,9 @@ impl TerminalApp {
                     let owner = crate::input::window().context("Window is not ready")?.0 as usize;
                     files.end_filter_edit();
                     let serial = files.start_picker();
+                    if let TransferPicker::CompareChecksum(preview) = &picker {
+                        files.checksum_picker_changed(*preview);
+                    }
                     let generation = files.generation;
                     let reject = Message::Files(Picked(
                         pane,
