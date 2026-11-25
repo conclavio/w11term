@@ -52,7 +52,7 @@ pub(super) struct EntryPreview {
     permissions: Permissions,
     link_target: Option<String>,
     opening_link: bool,
-    comparison: Option<LocalComparison>,
+    comparison: Option<Comparison>,
     tail: Option<TailView>,
     status: Option<String>,
     pub(super) cancel: TransferCancel,
@@ -134,9 +134,28 @@ impl ImagePreview {
     }
 }
 
-struct LocalComparison {
+#[derive(Clone)]
+pub enum ReferenceAction {
+    Set(u64),
+    Clear(u64),
+    Open(FileTarget, u64),
+    Compare(u64, u64),
+}
+
+pub(super) struct TextReference {
     id: u64,
-    name: String,
+    path: String,
+    text: Arc<str>,
+}
+
+enum ComparisonFiles {
+    Local(String),
+    Remote { reference: String, current: String },
+}
+
+struct Comparison {
+    id: u64,
+    files: ComparisonFiles,
     result: Option<Result<ComparisonOutput, String>>,
     cancel: TransferCancel,
 }
@@ -147,15 +166,17 @@ pub enum ComparisonOutput {
     Text(Arc<Difference>),
 }
 
-impl Drop for LocalComparison {
+impl Drop for Comparison {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
 }
 
-impl LocalComparison {
+impl Comparison {
     fn summary(&self, remote: &str) -> String {
-        let name = &self.name;
+        let ComparisonFiles::Local(name) = &self.files else {
+            return String::new();
+        };
         match &self.result {
             None => format!("Calculating local SHA-256 for {name}…"),
             Some(Ok(ComparisonOutput::Checksum(local))) if local == remote => {
@@ -173,20 +194,36 @@ impl LocalComparison {
                 .text(text)
                 .text_wrapping(TextWrapping::Wrap)
         };
+        let (before, after, before_line, after_line, identical) = match &self.files {
+            ComparisonFiles::Local(name) => (
+                format!("Remote preview  {remote}"),
+                format!("Local file  {name}"),
+                "− Remote",
+                "+ Local",
+                "The local file matches the remote preview.",
+            ),
+            ComparisonFiles::Remote { reference, current } => (
+                format!("Reference  {reference}"),
+                format!("Current preview  {current}"),
+                "− Reference",
+                "+ Current",
+                "The current preview matches the reference.",
+            ),
+        };
         let content = match &self.result {
             None => summary("Comparing text…").into(),
             Some(Err(error)) => {
                 summary(&format!("Could not compare the selected file. {error}")).into()
             }
             Some(Ok(ComparisonOutput::Text(diff))) if diff.changes.is_empty() => {
-                summary("The local file matches the remote preview.").into()
+                summary(identical).into()
             }
             Some(Ok(ComparisonOutput::Text(diff))) => {
                 let mut text = String::new();
                 for change in &diff.changes {
                     let side = match change.edit {
-                        Edit::Removed => "− Remote",
-                        Edit::Added => "+ Local",
+                        Edit::Removed => before_line,
+                        Edit::Added => after_line,
                     };
                     let _ = writeln!(text, "{side} line {} · {}", change.line, change.text);
                 }
@@ -221,10 +258,10 @@ impl LocalComparison {
         };
         StackPanel::new().spacing(6.0).children((
             TextBlock::new()
-                .text(format!("Remote preview  {remote}"))
+                .text(before)
                 .text_wrapping(TextWrapping::Wrap),
             TextBlock::new()
-                .text(format!("Local file  {}", self.name))
+                .text(after)
                 .text_wrapping(TextWrapping::Wrap),
             content,
         ))
@@ -330,12 +367,12 @@ impl EntryPreview {
     pub(super) fn dialog(
         &self,
         pane: u64,
-        generation: u64,
-        revision: u64,
-        can_edit: bool,
-        picking: bool,
+        files: &FileDrawer,
         context: &ViewContext<TerminalApp>,
     ) -> View {
+        let generation = files.generation;
+        let revision = files.listing_revision;
+        let picking = files.picking.is_some();
         self.view
             .get_or_init(|| {
                 let text_compare = self
@@ -546,7 +583,7 @@ impl EntryPreview {
                         ),
                     );
                 }
-                if self.editable() && can_edit {
+                if self.editable() && files.editor.is_none() {
                     fields.push(KeyedView::new(
                         "edit",
                         Button::new()
@@ -559,6 +596,36 @@ impl EntryPreview {
                             }))
                             .content("Edit"),
                     ));
+                }
+                if self.editable() {
+                    fields.push(KeyedView::new(
+                        "set-reference",
+                        Button::new()
+                            .is_enabled(!picking)
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::TextReference(
+                                    pane,
+                                    generation,
+                                    ReferenceAction::Set(serial),
+                                ))
+                            }))
+                            .content("Set as comparison reference"),
+                    ));
+                    if let Some(id) = files.reference_id() {
+                        fields.push(KeyedView::new(
+                            "compare-reference",
+                            Button::new()
+                                .is_enabled(!picking)
+                                .on_click(context.callback(move |_| {
+                                    Message::Files(FileAction::TextReference(
+                                        pane,
+                                        generation,
+                                        ReferenceAction::Compare(serial, id),
+                                    ))
+                                }))
+                                .content("Compare with reference"),
+                        ));
+                    }
                 }
                 if self.checksum_available
                     && !matches!(
@@ -1217,6 +1284,140 @@ impl FileDrawer {
             .is_some_and(|(preview, _)| !preview.comparing())
     }
 
+    pub(super) fn reference_id(&self) -> Option<u64> {
+        self.text_reference.as_ref().map(|reference| reference.id)
+    }
+
+    pub(super) fn reference_controls(
+        &self,
+        pane: u64,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> Option<View> {
+        let reference = self.text_reference.as_ref()?;
+        let id = reference.id;
+        let generation = self.generation;
+        Some(
+            StackPanel::new().spacing(4.0).children((
+                TextBlock::new()
+                    .automation_id("sftp-comparison-reference")
+                    .text(format!("Comparison reference  {}", reference.path))
+                    .text_wrapping(TextWrapping::Wrap),
+                Button::new()
+                    .is_enabled(!self.busy())
+                    .on_click(ctx.callback(move |_| {
+                        Message::Files(FileAction::TextReference(
+                            pane,
+                            generation,
+                            ReferenceAction::Clear(id),
+                        ))
+                    }))
+                    .content("Clear comparison reference"),
+            )),
+        )
+    }
+
+    fn set_reference(&mut self, serial: u64) {
+        let Some((preview, text)) = self
+            .ready_preview(serial)
+            .filter(|(preview, _)| self.picking.is_none() && preview.editable())
+        else {
+            return;
+        };
+        let Ok(path) = self.checked_target_path(&preview.target) else {
+            return;
+        };
+        let text = Arc::from(text);
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        self.text_reference = Some(TextReference {
+            id: self.dialog_serial,
+            path,
+            text,
+        });
+        self.cancel_preview();
+    }
+
+    fn clear_reference(&mut self, id: u64) {
+        if self.open && !self.busy() && self.reference_id() == Some(id) {
+            self.text_reference = None;
+            self.cached.get_mut().take();
+        }
+    }
+
+    pub(super) fn reference_action(
+        &mut self,
+        pane: u64,
+        action: ReferenceAction,
+        session: &Session,
+        context: &ComponentContext<TerminalApp>,
+    ) -> Result<()> {
+        match action {
+            ReferenceAction::Set(serial) => self.set_reference(serial),
+            ReferenceAction::Clear(id) => self.clear_reference(id),
+            ReferenceAction::Compare(serial, id) => {
+                self.compare_reference(pane, serial, id, context);
+            }
+            ReferenceAction::Open(target, id) if self.reference_id() == Some(id) => {
+                let (serial, operation) = self.begin_preview(target, PreviewKind::Text)?;
+                if let Err(error) = self.job(
+                    pane,
+                    session,
+                    operation,
+                    Step::CompareReference(serial, id),
+                    context,
+                ) {
+                    self.finish_preview(serial, Err(format!("{error:#}")));
+                }
+            }
+            ReferenceAction::Open(..) => {}
+        }
+        Ok(())
+    }
+
+    pub(super) fn compare_reference(
+        &mut self,
+        pane: u64,
+        serial: u64,
+        reference_id: u64,
+        context: &ComponentContext<TerminalApp>,
+    ) {
+        let Some(reference) = self
+            .text_reference
+            .as_ref()
+            .filter(|r| r.id == reference_id)
+        else {
+            return;
+        };
+        let Some((preview, current)) = self
+            .ready_preview(serial)
+            .filter(|(preview, _)| self.picking.is_none() && preview.editable())
+        else {
+            return;
+        };
+        let Ok(path) = self.checked_target_path(&preview.target) else {
+            return;
+        };
+        let files = ComparisonFiles::Remote {
+            reference: reference.path.clone(),
+            current: path,
+        };
+        let before = reference.text.clone();
+        let after = current.to_owned();
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        self.start_comparison(
+            pane,
+            serial,
+            self.dialog_serial,
+            files,
+            context,
+            move |cancel| {
+                ensure!(!cancel.is_cancelled(), "Text comparison cancelled");
+                Ok(ComparisonOutput::Text(Arc::new(Difference::compare_files(
+                    &before, &after,
+                ))))
+            },
+        );
+    }
+
     pub(super) fn compare_local(
         &mut self,
         pane: u64,
@@ -1232,16 +1433,41 @@ impl FileDrawer {
             return;
         };
         let remote = (preview.kind == PreviewKind::Text).then(|| content.to_owned());
-        let generation = self.generation;
-        let preview = self.preview.as_mut().unwrap();
-        let cancel = TransferCancel::default();
-        preview.comparison = Some(LocalComparison {
-            id,
-            name: path
-                .file_name()
+        let files = ComparisonFiles::Local(
+            path.file_name()
                 .unwrap_or(path.as_os_str())
                 .to_string_lossy()
                 .into_owned(),
+        );
+        self.start_comparison(pane, serial, id, files, context, move |cancel| {
+            if let Some(remote) = remote {
+                w11term::sftp::local_preview_text(&path, cancel).and_then(|local| {
+                    ensure!(!cancel.is_cancelled(), "Text comparison cancelled");
+                    Ok(ComparisonOutput::Text(Arc::new(Difference::compare_files(
+                        &remote, &local,
+                    ))))
+                })
+            } else {
+                w11term::sftp::local_sha256(&path, cancel).map(ComparisonOutput::Checksum)
+            }
+        });
+    }
+
+    fn start_comparison(
+        &mut self,
+        pane: u64,
+        serial: u64,
+        id: u64,
+        files: ComparisonFiles,
+        context: &ComponentContext<TerminalApp>,
+        read: impl FnOnce(&TransferCancel) -> Result<ComparisonOutput> + Send + 'static,
+    ) {
+        let generation = self.generation;
+        let preview = self.preview.as_mut().unwrap();
+        let cancel = TransferCancel::default();
+        preview.comparison = Some(Comparison {
+            id,
+            files,
             result: None,
             cancel: cancel.clone(),
         });
@@ -1249,35 +1475,25 @@ impl FileDrawer {
         preview.view.take();
         context.spawn_background_with_rejection(
             move |_| {
-                let result = if let Some(remote) = remote {
-                    w11term::sftp::local_preview_text(&path, &cancel).and_then(|local| {
-                        ensure!(!cancel.is_cancelled(), "Text comparison cancelled");
-                        Ok(ComparisonOutput::Text(Arc::new(Difference::compare_files(
-                            &remote, &local,
-                        ))))
-                    })
-                } else {
-                    w11term::sftp::local_sha256(&path, &cancel).map(ComparisonOutput::Checksum)
-                };
-                Message::Files(FileAction::LocalComparisonReady(
+                Message::Files(FileAction::ComparisonReady(
                     pane,
                     generation,
                     serial,
                     id,
-                    result.map_err(|error| format!("{error:#}")),
+                    read(&cancel).map_err(|error| format!("{error:#}")),
                 ))
             },
-            Message::Files(FileAction::LocalComparisonReady(
+            Message::Files(FileAction::ComparisonReady(
                 pane,
                 generation,
                 serial,
                 id,
-                Err("Local comparison worker unavailable. Try again.".into()),
+                Err("Comparison worker unavailable. Try again.".into()),
             )),
         );
     }
 
-    pub(super) fn finish_local_comparison(
+    pub(super) fn finish_comparison(
         &mut self,
         serial: u64,
         id: u64,
@@ -1361,7 +1577,7 @@ impl FileDrawer {
         if self.preview.take().is_some() {
             if matches!(
                 self.pending.as_ref().map(|p| &p.step),
-                Some(Step::Preview(_) | Step::OpenLinkTarget(_))
+                Some(Step::Preview(_) | Step::CompareReference(..) | Step::OpenLinkTarget(_))
             ) {
                 self.pending.take();
             }
@@ -1492,28 +1708,28 @@ mod tests {
         files.finish_preview(checksum, Ok(json!({"sha256": digest})));
         assert!(files.can_compare_local(checksum));
         let cancel = TransferCancel::default();
-        files.preview.as_mut().unwrap().comparison = Some(LocalComparison {
+        files.preview.as_mut().unwrap().comparison = Some(Comparison {
             id: 17,
-            name: "local.bin".into(),
+            files: ComparisonFiles::Local("local.bin".into()),
             result: None,
             cancel: cancel.clone(),
         });
 
-        files.finish_local_comparison(
+        files.finish_comparison(
             properties,
             17,
             Ok(ComparisonOutput::Checksum(digest.clone())),
         );
-        files.finish_local_comparison(checksum, 16, Ok(ComparisonOutput::Checksum(digest.clone())));
+        files.finish_comparison(checksum, 16, Ok(ComparisonOutput::Checksum(digest.clone())));
         assert!(!files.can_compare_local(checksum));
-        files.finish_local_comparison(checksum, 17, Ok(ComparisonOutput::Checksum("0".repeat(64))));
-        files.finish_local_comparison(checksum, 17, Ok(ComparisonOutput::Checksum(digest.clone())));
+        files.finish_comparison(checksum, 17, Ok(ComparisonOutput::Checksum("0".repeat(64))));
+        files.finish_comparison(checksum, 17, Ok(ComparisonOutput::Checksum(digest.clone())));
         let comparison = files.preview.as_ref().unwrap().comparison.as_ref().unwrap();
         assert_eq!(comparison.summary(&digest), "Different · local.bin");
         assert!(files.can_compare_local(checksum));
         files.close_preview(checksum);
         assert!(cancel.is_cancelled());
-        files.finish_local_comparison(checksum, 17, Ok(ComparisonOutput::Checksum(digest)));
+        files.finish_comparison(checksum, 17, Ok(ComparisonOutput::Checksum(digest)));
         assert!(!files.can_compare_local(checksum));
     }
 
@@ -1525,9 +1741,9 @@ mod tests {
             .unwrap();
         files.finish_preview(serial, Ok(json!({"text":"remote text\n"})));
         assert!(files.can_compare_local(serial));
-        let task = |id| LocalComparison {
+        let task = |id| Comparison {
             id,
-            name: "local.txt".into(),
+            files: ComparisonFiles::Local("local.txt".into()),
             result: None,
             cancel: TransferCancel::default(),
         };
@@ -1539,9 +1755,9 @@ mod tests {
         assert!(cancel.is_cancelled());
         assert!(files.preview.as_ref().unwrap().editable());
         files.preview.as_mut().unwrap().comparison = Some(task(21));
-        files.finish_local_comparison(serial, 20, Err("old reply".into()));
+        files.finish_comparison(serial, 20, Err("old reply".into()));
         assert!(files.preview.as_ref().unwrap().comparing());
-        files.finish_local_comparison(
+        files.finish_comparison(
             serial,
             21,
             Ok(ComparisonOutput::Text(Arc::new(Difference::compare_files(
@@ -1552,6 +1768,42 @@ mod tests {
         assert!(!files.preview.as_ref().unwrap().comparing());
         files.dismiss_comparison(serial);
         assert_eq!(files.ready_preview(serial).unwrap().1, "remote text\n");
+    }
+
+    #[test]
+    fn pinned_reference_outlives_navigation_and_is_cleared_by_reconnect() {
+        let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
+        let (serial, _) = files
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Text)
+            .unwrap();
+        files.finish_preview(serial, Ok(json!({"text":"before\r\n"})));
+        files.set_reference(serial + 1);
+        assert!(files.reference_id().is_none());
+        files.set_reference(serial);
+        let id = files.reference_id().unwrap();
+        assert!(!files.entry_dialog_open());
+        assert_eq!(&*files.text_reference.as_ref().unwrap().text, "before\r\n");
+        assert_eq!(
+            files.text_reference.as_ref().unwrap().path,
+            "/srv/雪/résumé 100% [pilot].txt",
+        );
+
+        files.accept_listing(None, "/elsewhere".into(), Vec::new());
+        files.clear_reference(id + 1);
+        assert_eq!(files.reference_id(), Some(id));
+        files.close();
+        assert_eq!(files.reference_id(), Some(id));
+        files.open = true;
+        files.clear_reference(id);
+        assert!(files.reference_id().is_none());
+
+        files.text_reference = Some(TextReference {
+            id,
+            path: "/old".into(),
+            text: "stale".into(),
+        });
+        files.observe_connection(files.generation + 1);
+        assert!(files.reference_id().is_none());
     }
 
     #[test]

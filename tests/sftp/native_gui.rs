@@ -2685,6 +2685,58 @@ async fn native_sftp_compares_local_text_against_the_captured_remote_preview() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "pins a remote text snapshot and compares other remote files across listings and search"]
+async fn native_sftp_compares_two_remote_text_files_across_folders_and_search() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    let archive = folder.join("archive");
+    let live = folder.join("live");
+    fs::create_dir_all(&archive).unwrap();
+    fs::create_dir_all(&live).unwrap();
+    let baseline = "header\r\npinned\r\nfooter\r\n";
+    let changed = "header\r\nlive\nfooter\r\n";
+    fs::write(archive.join("config.txt"), baseline).unwrap();
+    fs::write(live.join("config.txt"), changed).unwrap();
+    fs::write(live.join("matching.txt"), baseline).unwrap();
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-compare-reference-ui.ps1", &ssh, state.path());
+    let requests = fs::read_to_string(trace).unwrap();
+    let opened: Vec<_> = requests
+        .lines()
+        .filter(|line| line.starts_with("OPEN "))
+        .collect();
+    assert_eq!(
+        opened,
+        [
+            "OPEN /shell directory/archive/config.txt",
+            "OPEN /shell directory/live/config.txt",
+            "OPEN /shell directory/live/matching.txt",
+        ]
+    );
+    assert_eq!(
+        requests.lines().filter(|line| *line == "CLOSE").count(),
+        opened.len()
+    );
+    assert!(!requests.contains("WRITE"));
+    assert_eq!(
+        fs::read(archive.join("config.txt")).unwrap(),
+        b"archive changed"
+    );
+    assert_eq!(
+        fs::read(live.join("config.txt")).unwrap(),
+        changed.as_bytes()
+    );
+    assert_eq!(channels.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
 async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
