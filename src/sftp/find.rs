@@ -1,3 +1,4 @@
+use super::folder_comparison::InventoryBuilder;
 use super::*;
 use std::{
     cmp::Ordering,
@@ -389,6 +390,7 @@ struct Search<'a> {
     matched: HashSet<String>,
     result: FilenameSearch,
     measurement: Option<Measurement>,
+    inventory: Option<InventoryBuilder>,
 }
 
 fn unavailable(error: &anyhow::Error) -> bool {
@@ -490,6 +492,7 @@ impl<'a> Search<'a> {
                 cancelled: false,
             },
             measurement: None,
+            inventory: None,
         }
     }
 
@@ -666,13 +669,18 @@ impl<'a> Search<'a> {
                     }
                     self.result.scanned_entries += 1;
                     let name = entry.filename;
-                    if matches!(name.as_str(), "" | "." | "..")
+                    if matches!(name.as_str(), "." | "..") {
+                        continue;
+                    }
+                    if name.is_empty()
                         || name.contains(['/', '\\'])
                         || name.chars().any(char::is_control)
                     {
-                        if let Some(measurement) = &mut self.measurement
-                            && !matches!(name.as_str(), "." | "..")
-                        {
+                        ensure!(
+                            self.inventory.is_none(),
+                            "The server returned an invalid entry name"
+                        );
+                        if let Some(measurement) = &mut self.measurement {
                             measurement.unclassified_entries += 1;
                         }
                         continue;
@@ -722,7 +730,9 @@ impl<'a> Search<'a> {
                     } else {
                         &name
                     };
-                    if self.measurement.is_some() {
+                    if let Some(inventory) = &mut self.inventory {
+                        inventory.insert(relative_path, &attrs)?;
+                    } else if self.measurement.is_some() {
                         if !directory && self.matched.insert(child.clone()) {
                             self.measure_entry(&child, &attrs, missing_type).await?;
                         }
@@ -864,5 +874,35 @@ impl Engine {
             truncated: scan.result.truncated,
             cancelled: scan.result.cancelled,
         })
+    }
+
+    pub(super) async fn inventory_folder(
+        &self,
+        path: &str,
+        cancel: Option<&TransferCancel>,
+        progress: Option<&watch::Sender<SearchProgress>>,
+    ) -> Result<FolderInventory> {
+        let root = self.canonical_remote_path(path).await?;
+        ensure!(
+            root == path,
+            "The comparison folder changed. Refresh the drawer"
+        );
+        ensure!(root.len() <= MAX_PATH_BYTES, "The folder path is too long");
+        let mut scan = Search {
+            inventory: Some(InventoryBuilder::default()),
+            match_path: true,
+            ..Search::new(self, root, cancel, progress)
+        };
+        scan.run().await?;
+        ensure!(!scan.result.cancelled, "Folder comparison scan stopped");
+        ensure!(
+            !scan.result.truncated,
+            "The folder exceeded the scan limits"
+        );
+        ensure!(
+            scan.result.skipped_directories == 0,
+            "Some folders could not be listed. A complete inventory is required"
+        );
+        Ok(scan.inventory.unwrap().finish(scan.result.root))
     }
 }

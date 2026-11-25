@@ -3602,6 +3602,45 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "compares two remote folders using a captured inventory in the native SFTP drawer"]
+async fn native_sftp_compares_two_folders_against_captured_metadata() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let archive = root.join("shell directory/archive");
+    let live = root.join("shell directory/live");
+    for folder in [&archive, &live] {
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        directory_junction(folder, "link", "nested");
+    }
+    fs::write(archive.join("nested/data.txt"), b"old").unwrap();
+    fs::write(live.join("nested/data.txt"), b"current!").unwrap();
+    fs::write(archive.join("removed.txt"), []).unwrap();
+    fs::write(live.join("added.txt"), []).unwrap();
+    let trace = root.join("transfer-trace");
+    let listing = root.join("listing-trace");
+    fs::write(&trace, []).unwrap();
+    fs::write(&listing, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-compare-folders-ui.ps1", &ssh, state.path());
+    assert!(
+        fs::read(trace).unwrap().is_empty(),
+        "comparison read file data"
+    );
+    assert!(
+        !fs::read_to_string(listing)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("OPENDIR ") && line.ends_with("/link")),
+        "comparison traversed a symbolic link"
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measures folder contents and retains a stopped scan in the native SFTP drawer"]
 async fn native_sftp_folder_contents_reports_and_stops_a_recursive_scan() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

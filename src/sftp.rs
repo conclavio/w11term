@@ -36,6 +36,8 @@ mod editor;
 mod file_tail;
 pub use file_tail::FileTail;
 mod find;
+mod folder_comparison;
+pub use folder_comparison::{FolderChange, FolderComparison, FolderEntry, FolderInventory};
 mod image_preview;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
@@ -288,6 +290,11 @@ pub enum Operation {
     #[serde(skip)]
     MeasureFolder {
         path: String,
+    },
+    #[serde(skip)]
+    InventoryFolder {
+        path: String,
+        reference: Option<Arc<FolderInventory>>,
     },
     /// List folder choices for the drawer's move dialog on its existing connection.
     #[serde(skip)]
@@ -763,6 +770,9 @@ pub(crate) async fn run(
                 Operation::MeasureFolder { .. } => {
                     Some("Missing SSH connection for folder contents")
                 }
+                Operation::InventoryFolder { .. } => {
+                    Some("Missing SSH connection for folder comparison")
+                }
                 Operation::OpenLinkTarget { .. } => {
                     Some("Missing SSH connection for opening the link target")
                 }
@@ -904,6 +914,9 @@ pub(crate) async fn run(
                 }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
                 Operation::MeasureFolder { .. } => JobStage::Checking("Folder scan did not finish"),
+                Operation::InventoryFolder { .. } => {
+                    JobStage::Checking("Folder comparison scan did not finish")
+                }
                 Operation::GetDir { .. } | Operation::GetSearch { .. } => {
                     JobStage::DirectoryDownload {
                         staging: None,
@@ -1573,6 +1586,18 @@ impl Engine {
                 )
                 .await?,
             )?,
+            InventoryFolder { path, reference } => {
+                let progress = match job_progress {
+                    Some(JobProgress::Search(sender)) => Some(sender),
+                    _ => None,
+                };
+                let current = self.inventory_folder(&path, cancel, progress).await?;
+                if let Some(reference) = reference {
+                    serde_json::to_value(folder_comparison::compare(&reference, current))?
+                } else {
+                    serde_json::to_value(current)?
+                }
+            }
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
                 let mut result = json!({ "attrs": attrs });

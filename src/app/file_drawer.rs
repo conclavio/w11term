@@ -11,9 +11,10 @@ use w11term::events::SavedDownload;
 use w11term::folder_grants::Authority;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
-    CopyDestination, DEFAULT_TIMEOUT, EntryKind, FilenameMatch, Job, JobProgress, Operation,
-    SearchProgress, TransferBatchProgress, TransferCancel, TransferOperation, TransferOutcome,
-    TransferPhase, TransferProgress, image_preview_name, normalize_sha256, validate_download_name,
+    CopyDestination, DEFAULT_TIMEOUT, EntryKind, FilenameMatch, FolderInventory, Job, JobProgress,
+    Operation, SearchProgress, TransferBatchProgress, TransferCancel, TransferOperation,
+    TransferOutcome, TransferPhase, TransferProgress, image_preview_name, normalize_sha256,
+    validate_download_name,
 };
 
 mod bookmarks;
@@ -114,6 +115,7 @@ pub enum FileAction {
     GoToFolder(u64, u64, u64),
     ShowFolderReport(u64, u64, u64, folder_report::Kind),
     FolderReport(u64, u64, u64, folder_report::Action),
+    ClearFolderReference(u64, u64, u64),
     OpenEntry(u64, u64, ListedEntry),
     EditFilter(u64, u64, u64, bool),
     FocusFilter(u64, u64, u64, u8),
@@ -220,6 +222,7 @@ pub(super) struct FileDrawer {
     preview: Option<preview::EntryPreview>,
     text_reference: Option<preview::TextReference>,
     folder_report: Option<folder_report::Panel>,
+    folder_reference: Option<Arc<FolderInventory>>,
     editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
@@ -2303,6 +2306,39 @@ impl FileDrawer {
                 writable && generation != 0,
                 ShowFolderReport(pane, generation, revision, folder_report::Kind::Contents),
             ),
+            StackPanel::new().spacing(6.0).children((
+                button(
+                    "Set folder as comparison reference…",
+                    writable && generation != 0,
+                    ShowFolderReport(pane, generation, revision, folder_report::Kind::Reference),
+                ),
+                self.folder_reference
+                    .as_ref()
+                    .map(|reference| {
+                        StackPanel::new().spacing(6.0).children((
+                            TextBlock::new()
+                                .automation_id("sftp-folder-reference")
+                                .text(format!("Folder reference  {}", reference.root))
+                                .text_wrapping(TextWrapping::Wrap),
+                            button(
+                                "Compare folder with reference…",
+                                writable,
+                                ShowFolderReport(
+                                    pane,
+                                    generation,
+                                    revision,
+                                    folder_report::Kind::Comparison,
+                                ),
+                            ),
+                            button(
+                                "Clear folder reference",
+                                ready,
+                                ClearFolderReference(pane, generation, revision),
+                            ),
+                        ))
+                    })
+                    .unwrap_or_else(View::empty),
+            )),
             StackPanel::new()
                 .orientation(if layout.content_width() >= 320.0 {
                     Orientation::Horizontal
@@ -2913,7 +2949,9 @@ impl FileDrawer {
             Step::Search(..) | Step::FolderReport(_)
                 if matches!(
                     &operation,
-                    Operation::Find { .. } | Operation::MeasureFolder { .. }
+                    Operation::Find { .. }
+                        | Operation::MeasureFolder { .. }
+                        | Operation::InventoryFolder { .. }
                 ) =>
             {
                 let (tx, progress) = watch::channel(SearchProgress::default());
@@ -3564,6 +3602,7 @@ impl TerminalApp {
             | GoToFolder(id, ..)
             | ShowFolderReport(id, ..)
             | FolderReport(id, ..)
+            | ClearFolderReference(id, ..)
             | OpenEntry(id, ..)
             | EditFilter(id, ..)
             | FocusFilter(id, ..)
@@ -3852,6 +3891,11 @@ impl TerminalApp {
                 }
                 FolderReport(_, _, serial, folder_report::Action::Close) => {
                     files.close_folder_report(serial);
+                }
+                ClearFolderReference(_, generation, revision) => {
+                    if generation == files.generation && may_open_dialog {
+                        files.clear_folder_reference(revision);
+                    }
                 }
                 OpenLinkTarget(_, _, serial) => {
                     if may_open_dialog
