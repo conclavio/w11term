@@ -691,6 +691,10 @@ impl russh_sftp::server::Handler for Files {
         if self.root.join("tree-unknown-size").is_file() {
             attrs.size = None;
         }
+        if self.root.join("tree-unknown-mtime").is_file() {
+            attrs.atime = None;
+            attrs.mtime = None;
+        }
         if path == "/tree/socket" {
             attrs.permissions = Some(0o140600);
         }
@@ -782,6 +786,8 @@ impl russh_sftp::server::Handler for Files {
             }
         }
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
+        let omit_size = fs::read_to_string(self.root.join("omit-listed-size")).ok();
+        let omit_mtime = fs::read_to_string(self.root.join("omit-listed-mtime")).ok();
         if path == "/tree"
             && let Ok(names) = fs::read_to_string(self.root.join("tree-test-names"))
         {
@@ -802,8 +808,16 @@ impl russh_sftp::server::Handler for Files {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
                 let mut attrs = entry_attrs(&e.path())?;
-                if self.root.join("tree-unknown-size").is_file() {
+                if Some(name.as_ref()) == omit_size.as_deref()
+                    || self.root.join("tree-unknown-size").is_file()
+                {
                     attrs.size = None;
+                }
+                if Some(name.as_ref()) == omit_mtime.as_deref()
+                    || self.root.join("tree-unknown-mtime").is_file()
+                {
+                    attrs.atime = None;
+                    attrs.mtime = None;
                 }
                 if Some(name.as_ref()) == omit_mode.as_deref() || name == "socket" {
                     attrs.permissions = None;
@@ -822,6 +836,10 @@ impl russh_sftp::server::Handler for Files {
         }
         #[cfg(feature = "ui-smoke")]
         self.trace_listing("READDIR")?;
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("slow-search-page").is_file() {
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
         match self.handles.get_mut(&h) {
             Some(Opened::Dir(entries)) if !entries.is_empty() => Ok(Name {
                 id,
@@ -1769,7 +1787,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
                 operation,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 reply,
-                progress: Some(sender),
+                progress: Some(w11term::sftp::JobProgress::Transfer(sender)),
                 cancel: None,
             }))
             .unwrap();
