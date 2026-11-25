@@ -965,6 +965,12 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        if let Some((_, resolved)) = self.fixture_link(&path) {
+            return Ok(Name {
+                id,
+                files: vec![russh_sftp::protocol::File::dummy(resolved)],
+            });
+        }
         if path == "/tree/data" && self.root.join("tree-redirect").is_file() {
             return Ok(Name {
                 id,

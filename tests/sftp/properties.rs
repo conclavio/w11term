@@ -2,6 +2,13 @@ use super::*;
 use w11term::sftp::{Attributes, Operation, PermissionReview};
 
 impl Files {
+    pub(super) fn fixture_link(&self, path: &str) -> Option<(String, String)> {
+        let data = fs::read(self.root.join("fixture-links.json")).ok()?;
+        serde_json::from_slice::<HashMap<String, (String, String)>>(&data)
+            .ok()?
+            .remove(path)
+    }
+
     pub(super) fn set_permissions(
         &mut self,
         opcode: &str,
@@ -55,16 +62,89 @@ impl Files {
         if self.root.join("deny-readlink").is_file() {
             return Err(StatusCode::PermissionDenied);
         }
-        let target = fs::read_link(self.path(path)).map_err(io)?;
         // The marker represents the literal POSIX target carried by SSH_FXP_NAME.
         // A real junction supplies the link's LSTAT type on unprivileged Windows.
-        let target = fs::read_to_string(self.root.join("properties-link-target"))
-            .unwrap_or_else(|_| target.to_string_lossy().into_owned());
+        let target = if let Some((literal, _)) = self.fixture_link(path) {
+            literal
+        } else {
+            let target = fs::read_link(self.path(path)).map_err(io)?;
+            fs::read_to_string(self.root.join("properties-link-target"))
+                .unwrap_or_else(|_| target.to_string_lossy().into_owned())
+        };
         Ok(Name {
             id,
             files: vec![russh_sftp::protocol::File::dummy(target)],
         })
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_link_target_rechecks_the_link_and_lists_the_resolved_folder() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    fs::create_dir(root.join("files")).unwrap();
+    fs::write(root.join("files/payload.txt"), b"unchanged").unwrap();
+    for name in ["folder-link", "file-link", "broken", "loop"] {
+        directory_junction(root, name, "files");
+    }
+    fs::write(
+        root.join("fixture-links.json"),
+        json!({
+            "/folder-link":["files","/files"],
+            "/file-link":["files/payload.txt","/files/payload.txt"],
+            "/broken":["missing","/missing"],
+            "/loop":["loop","/loop"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let generation = pane.frames.load().connection_generation;
+    let open = |path: &str, expected_target: &str| Operation::OpenLinkTarget {
+        path: path.into(),
+        expected_target: expected_target.into(),
+    };
+    for expected in [None, Some(generation + 1)] {
+        assert!(
+            guarded_job(&pane, expected, open("/file-link", "files/payload.txt"))
+                .await
+                .is_err()
+        );
+    }
+    let generation = Some(generation);
+    let error = guarded_job(&pane, generation, open("/file-link", "previous name"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("symbolic link changed"), "{error}");
+    let error = guarded_job(&pane, generation, open("/files/payload.txt", "payload.txt"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("symbolic link changed"), "{error}");
+    assert!(
+        guarded_job(&pane, generation, open("/broken", "missing"))
+            .await
+            .is_err()
+    );
+    assert!(
+        guarded_job(&pane, generation, open("/loop", "loop"))
+            .await
+            .is_err()
+    );
+    for (path, target, selected) in [
+        ("/file-link", "files/payload.txt", json!("payload.txt")),
+        ("/folder-link", "files", Value::Null),
+    ] {
+        let reply = guarded_job(&pane, generation, open(path, target))
+            .await
+            .unwrap();
+        assert_eq!(reply["directory"], "/files");
+        assert_eq!(reply["selected"], selected);
+        assert_eq!(reply["entries"][0]["filename"], "payload.txt");
+    }
+    assert_eq!(
+        fs::read(root.join("files/payload.txt")).unwrap(),
+        b"unchanged"
+    );
+    server.abort();
 }
 
 fn properties(path: &str) -> Operation {

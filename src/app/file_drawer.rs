@@ -23,6 +23,7 @@ mod editor;
 pub(super) mod find;
 mod folder_batch;
 mod history;
+mod link_target;
 mod preview;
 mod properties;
 mod sort;
@@ -122,6 +123,8 @@ pub enum FileAction {
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     Preview(u64, u64, FileTarget, PreviewKind),
     ClosePreview(u64, u64, u64),
+    OpenLinkTarget(u64, u64, u64),
+    LinkTargetListed(u64, u64, u64, Result<link_target::Listing, String>),
     ShowFullPreview(u64, u64, u64, bool),
     MovePreviewMatch(u64, u64, u64, bool),
     CopyChecksum(u64, u64, u64),
@@ -574,6 +577,7 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    OpenLinkTarget(u64),
     Permissions(u64, u32),
     MoveDestination(u64, u64),
     FolderBatch(folder_batch::Batch),
@@ -2824,7 +2828,7 @@ impl FileDrawer {
                 expected_generation: request_generation(&operation, self.generation),
                 operation,
                 progress: tx_progress,
-                cancel: if matches!(step, Step::Preview(_)) {
+                cancel: if matches!(step, Step::Preview(_) | Step::OpenLinkTarget(_)) {
                     self.preview.as_ref().map(|p| p.cancel.clone())
                 } else if matches!(step, Step::Search(..)) {
                     self.search.as_ref().and_then(|p| p.cancel.clone())
@@ -2973,6 +2977,9 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::OpenLinkTarget(serial), reply) => {
+                self.finish_link_target(id, serial, reply, context)
+            }
             (Step::Permissions(serial, mode), reply) => {
                 self.finish_permissions(serial, mode, reply)
             }
@@ -3441,6 +3448,8 @@ impl TerminalApp {
             | CopyPath(id, ..)
             | Preview(id, ..)
             | ClosePreview(id, ..)
+            | OpenLinkTarget(id, ..)
+            | LinkTargetListed(id, ..)
             | ShowFullPreview(id, ..)
             | MovePreviewMatch(id, ..)
             | CopyChecksum(id, ..)
@@ -3515,12 +3524,18 @@ impl TerminalApp {
         files.observe_transfer_connection(session, frame.connection_generation, visible);
         if !matches!(
             action,
-            Tick(_) | Picked(..) | Listed(..) | Drop(..) | PreparedDrop(..) | CancelTransfer(_)
+            Tick(_)
+                | Picked(..)
+                | Listed(..)
+                | LinkTargetListed(..)
+                | Drop(..)
+                | PreparedDrop(..)
+                | CancelTransfer(_)
         ) && !visible
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | OpenLinkTarget(_, g, ..) | LinkTargetListed(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3660,6 +3675,20 @@ impl TerminalApp {
                         files.verify_checksum(serial)?;
                     }
                 }
+                OpenLinkTarget(_, _, serial) => {
+                    if may_open_dialog
+                        && let Some(operation) = files.begin_link_target(serial)
+                        && let Err(error) = files.job(
+                            pane,
+                            session,
+                            operation,
+                            Step::OpenLinkTarget(serial),
+                            context,
+                        )
+                    {
+                        files.link_target_error(serial, format!("{error:#}"));
+                    }
+                }
                 Permissions(_, _, serial, action) => {
                     if may_open_dialog
                         && let Some((mode, operation)) = files.permissions_action(serial, action)
@@ -3716,6 +3745,7 @@ impl TerminalApp {
                     files.cancel_transfer(target);
                     outcome = TransferOutcome::Cancelled;
                 }
+                LinkTargetListed(_, _, serial, result) => files.accept_link_target(serial, result),
                 Listed(_, _, path, direction, result) if files.parsing => {
                     files.parsing = false;
                     files.accept_listing(direction, path, result.map_err(|e| anyhow!("{e}"))?);

@@ -44,6 +44,7 @@ use resume_download::ResumeDownload;
 mod checksum;
 mod permissions;
 mod remote_copy;
+mod symbolic_link;
 mod text_preview;
 mod transfer_status;
 pub use transfer_status::{
@@ -302,6 +303,11 @@ pub enum Operation {
     #[serde(skip)]
     EntryProperties {
         path: String,
+    },
+    #[serde(skip)]
+    OpenLinkTarget {
+        path: String,
+        expected_target: String,
     },
     #[serde(skip)]
     SetEntryPermissions {
@@ -721,6 +727,9 @@ pub(crate) async fn run(
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
                 }
+                Operation::OpenLinkTarget { .. } => {
+                    Some("Missing SSH connection for opening the link target")
+                }
                 Operation::SetEntryPermissions { .. } => {
                     Some("Missing SSH connection approval; permission change was not started")
                 }
@@ -745,6 +754,7 @@ pub(crate) async fn run(
             && let Some(message) = match operation {
                 Operation::PreviewText { .. } => Some("Text preview cancelled"),
                 Operation::EntryProperties { .. } => Some("File properties cancelled"),
+                Operation::OpenLinkTarget { .. } => Some("Opening the link target was cancelled"),
                 Operation::Sha256 { .. } => Some("SHA-256 calculation cancelled"),
                 _ => None,
             }
@@ -838,6 +848,9 @@ pub(crate) async fn run(
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::Get { resume: true, .. } => JobStage::ResumableDownload,
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
+                Operation::OpenLinkTarget { .. } => {
+                    JobStage::Checking("Link target lookup did not finish")
+                }
                 Operation::Sha256 { .. } => {
                     JobStage::Checking("SHA-256 calculation did not finish")
                 }
@@ -1487,21 +1500,24 @@ impl Engine {
                         !cancel.is_some_and(TransferCancel::is_cancelled),
                         "File properties cancelled"
                     );
-                    match self.raw.readlink(&path).await {
-                        Ok(names) => match names.files.as_slice() {
-                            [name] if !name.filename.is_empty() => {
-                                result["target"] = json!(name.filename)
-                            }
-                            _ => {
-                                result["target_error"] =
-                                    json!("The server returned no single link target")
-                            }
-                        },
-                        Err(e) if transport_error(&e) => return Err(e.into()),
-                        Err(e) => result["target_error"] = json!(e.to_string()),
+                    match self.read_link_target(&path).await {
+                        Ok(target) => result["target"] = json!(target),
+                        Err(error)
+                            if error.downcast_ref::<Error>().is_some_and(transport_error) =>
+                        {
+                            return Err(error);
+                        }
+                        Err(error) => result["target_error"] = json!(error.to_string()),
                     }
                 }
                 result
+            }
+            OpenLinkTarget {
+                path,
+                expected_target,
+            } => {
+                self.open_link_target(&path, &expected_target, cancel)
+                    .await?
             }
             SetEntryPermissions { path, review, mode } => {
                 self.set_entry_permissions(&path, review, mode, stage)

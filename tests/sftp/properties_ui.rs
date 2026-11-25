@@ -1,6 +1,34 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens file and folder link targets in the native SFTP drawer"]
+async fn native_sftp_properties_opens_link_targets_and_keeps_the_search() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("objects/subfolder")).unwrap();
+    fs::write(folder.join("objects/payload [file].txt"), b"payload").unwrap();
+    fs::write(folder.join("objects/subfolder/marker.txt"), b"child").unwrap();
+    for link in ["file-link", "directory-link", "broken-link"] {
+        directory_junction(&folder, link, "objects");
+    }
+    fs::write(
+        root.join("fixture-links.json"),
+        serde_json::json!({
+            "/shell directory/file-link": ["objects/payload [file].txt", "/shell directory/objects/payload [file].txt"],
+            "/shell directory/directory-link": ["/shell directory/objects/subfolder", "/shell directory/objects/subfolder"],
+            "/shell directory/broken-link": ["missing", "/shell directory/missing"]
+        }).to_string(),
+    ).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("sftp-open-link-ui.ps1", &ssh, state.path());
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "changes a file and folder mode from native SFTP Properties over loopback"]
 async fn native_sftp_properties_changes_the_reviewed_file_and_directory_modes() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
