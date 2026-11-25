@@ -110,7 +110,7 @@ try {
     Click 'Open folder'
     Click ('Set folder as comparison reference' + [char]0x2026)
     $null = Wait-Until 'the reference inventory is captured' {
-        Find-Element "Captured folder reference $dot 4 entries"
+        Find-Element "Captured folder reference $dot 5 entries"
     }
     Click 'Close folder reference'
     $null = Wait-Until 'the folder reference is visible in the drawer' {
@@ -152,6 +152,15 @@ try {
     Set-Query ''
     Wait-Range 1 1 1
     Test-ComparisonExport
+    Wait-Range 1 1 1
+    Click ('Verify file contents' + [char]0x2026)
+    $relative = Wait-Until 'relative file path for SHA-256' { Find-Element 'Relative file path' $edit }
+    $relative.GetCurrentPattern($value).SetValue('same-metadata.txt')
+    Click 'Compare SHA-256'
+    $null = Wait-Until 'SHA-256 finds different content despite matching metadata' {
+        Find-Element 'File contents differ'
+    }
+    Click 'Back to comparison'
     Wait-Range 1 1 1
     $hold = Join-Path $fixture 'hold-opendir'
     [IO.File]::WriteAllText($hold, "$current/nested")

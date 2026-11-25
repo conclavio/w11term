@@ -63,6 +63,7 @@ impl FileDrawer {
             || panel.serial != serial
             || panel.revision != revision
             || panel.reveal.checking()
+            || panel.verification.open
         {
             return None;
         }
@@ -74,11 +75,7 @@ impl FileDrawer {
         }
         let item = report.differences.get(index)?;
         let expected = item.current?;
-        if item.path.split('/').any(|name| {
-            matches!(name, "" | "." | "..")
-                || name.contains('\\')
-                || name.chars().any(char::is_control)
-        }) {
+        if !w11term::sftp::valid_comparison_file_path(&item.path) {
             return None;
         }
         let path = format!(

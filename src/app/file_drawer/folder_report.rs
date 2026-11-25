@@ -5,6 +5,7 @@ use w11term::sftp::{FolderComparison, FolderContents, FolderOrigin, capture_loca
 mod comparison;
 mod export;
 mod reveal;
+mod verify;
 pub(super) use reveal::Listing as ComparedListing;
 
 const READ_ONLY: u64 = 1;
@@ -16,6 +17,7 @@ pub enum Action {
     Close,
     Browse(comparison::Action),
     Reveal { revision: u64, index: usize },
+    Verify(verify::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,7 @@ pub(super) struct Panel {
     state: State,
     comparison: comparison::Browser,
     reveal: reveal::State,
+    verification: verify::Verification,
     pub(super) cancel: TransferCancel,
 }
 
@@ -187,6 +190,9 @@ impl Panel {
         let message = move |action| {
             Message::Files(FileAction::FolderReport(pane, generation, serial, action))
         };
+        if self.verification.open {
+            return self.verification.dialog(context, message);
+        }
         let mut rows = vec![KeyedView::new(
             "folder",
             TextBlock::new()
@@ -315,6 +321,16 @@ impl Panel {
                     revision: self.revision,
                 };
                 rows.extend(export::controls(target, export, context));
+                rows.push(KeyedView::new(
+                    "verify-contents",
+                    Button::new()
+                        .is_enabled(!self.reveal.checking())
+                        .on_click(
+                            context
+                                .callback(move |_| message(Action::Verify(verify::Action::Open))),
+                        )
+                        .content("Verify file contents…"),
+                ));
             }
         }
         if let Some(refresh) = refresh {
@@ -457,6 +473,7 @@ impl FileDrawer {
             state: State::Loading,
             comparison: comparison::Browser::default(),
             reveal: reveal::State::default(),
+            verification: verify::Verification::default(),
             cancel: TransferCancel::default(),
         });
         serial
@@ -525,6 +542,7 @@ impl FileDrawer {
             || self.pending.is_some()
             || matches!(panel.state, State::Loading)
             || panel.reveal.checking()
+            || panel.verification.open
         {
             return None;
         }
@@ -594,6 +612,7 @@ impl FileDrawer {
             if matches!(
                 self.pending.as_ref().map(|pending| &pending.step),
                 Some(Step::FolderReport(_) | Step::RevealCompared(..))
+                    | Some(Step::VerifyCompared(_))
             ) {
                 self.pending.take();
             }

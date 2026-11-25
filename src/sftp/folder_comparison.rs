@@ -9,7 +9,9 @@ const WINDOWS_REPARSE: u32 = 1 << 31;
 const WINDOWS_SPECIAL: u32 = 1 << 30;
 
 mod local;
+mod verify;
 pub use local::capture_local_folder;
+pub use verify::{FILE_VERIFICATION_LIMIT, VerifiedFolderFile, valid_comparison_file_path};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FolderOrigin {
