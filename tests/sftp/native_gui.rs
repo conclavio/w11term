@@ -3380,6 +3380,44 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "shows and refreshes remote filesystem capacity through the native SFTP drawer"]
+async fn native_sftp_filesystem_space_refreshes_the_current_folder() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("child")).unwrap();
+    fs::write(folder.join("keep.txt"), b"original file").unwrap();
+    fs::write(
+        root.join("fixture-space.json"),
+        crate::filesystem_space::fixture_stats(262144, 0).to_string(),
+    )
+    .unwrap();
+    let trace = root.join("properties-trace");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-filesystem-space-ui.ps1", &ssh, state.path());
+    let requests = fs::read_to_string(trace).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| line.starts_with("STATVFS "))
+            .collect::<Vec<_>>(),
+        [
+            "STATVFS /shell directory",
+            "STATVFS /shell directory",
+            "STATVFS /shell directory/child",
+            "STATVFS /shell directory/child",
+        ]
+    );
+    assert_eq!(fs::read(folder.join("keep.txt")).unwrap(), b"original file");
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "selects visible SFTP entries and reaches drawer actions at the minimum native window size"]
 async fn native_short_sftp_drawer_keeps_entries_and_actions_reachable() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

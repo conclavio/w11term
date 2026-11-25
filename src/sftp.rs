@@ -851,6 +851,9 @@ pub(crate) async fn run(
                 Operation::OpenLinkTarget { .. } => {
                     JobStage::Checking("Link target lookup did not finish")
                 }
+                Operation::Statvfs { .. } => {
+                    JobStage::Checking("Filesystem space lookup did not finish")
+                }
                 Operation::Sha256 { .. } => {
                     JobStage::Checking("SHA-256 calculation did not finish")
                 }
