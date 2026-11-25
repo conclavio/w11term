@@ -18,16 +18,28 @@ function Click([string]$Label) {
         if ($item -and $item.Current.IsEnabled) { $item }
     })
 }
-function Sort-Radio([string]$Label) {
-    $item = Wait-Until "sort radio $Label" {
-        $radio = Find-Element $Label ([System.Windows.Automation.ControlType]::RadioButton)
-        if ($radio -and $radio.Current.IsEnabled) { $radio }
+function Sort-Combo {
+    Wait-Until 'enabled Sort files combo box' {
+        $combo = Find-Element 'Sort files' ([System.Windows.Automation.ControlType]::ComboBox)
+        if ($combo -and $combo.Current.IsEnabled) { $combo }
     }
-    return $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+}
+function Selected-Sort {
+    $combo = Sort-Combo
+    $selection = @($combo.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection())
+    if ($selection.Count -eq 1) { $selection[0].Current.Name }
 }
 function Set-Sort([string]$Label) {
-    (Sort-Radio $Label).Select()
-    $null = Wait-Until "$Label selected" { (Sort-Radio $Label).Current.IsSelected }
+    $combo = Sort-Combo
+    $dropdown = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $dropdown.Expand()
+    $item = Wait-Until "visible sort choice $Label" {
+        Find-Element $Label ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until "$Label selected" { (Selected-Sort) -ceq $Label }
+    $dropdown = (Sort-Combo).GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($dropdown.Current.ExpandCollapseState -eq 'Expanded') { $dropdown.Collapse() }
 }
 function Size-Cell($Row) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
@@ -90,8 +102,7 @@ try {
     Wait-Focus $remote
     Run-Palette 'Open files here'
     $null = Wait-Until 'initial listing' { (Find-Element '/shell directory') -and (Find-Element '1 / 2') }
-    if (!(Sort-Radio 'Sort by name').Current.IsSelected -or (Sort-Radio 'Sort newest first').Current.IsSelected -or
-        (Sort-Radio 'Sort largest first').Current.IsSelected) {
+    if ((Selected-Sort) -cne 'Sort by name') {
         throw 'The default sort is not visibly set to Name'
     }
     Wait-Order @($folder,'aa-review.log','batch-00.log','batch-01.log')
@@ -108,10 +119,9 @@ try {
     # this existing listing must still use its original READDIR attributes.
     $fixtureDirectory = [IO.File]::ReadAllText((Join-Path $State 'fixture-directory'))
     [IO.File]::SetLastWriteTimeUtc((Join-Path $fixtureDirectory $target),[datetime]::new(2000,1,1,0,0,0,[DateTimeKind]::Utc))
-    Set-Sort 'Sort newest first'
+    Set-Sort 'Newest first'
     $null = Wait-Until 'page follows selected file' { Find-Element '1 / 2' }
     Wait-Order @($folder,$target,'yy-review.log','batch-34.log','batch-33.log')
-    if ((Sort-Radio 'Sort by name').Current.IsSelected) { throw 'Both sort orders remained selected' }
     Invoke-SftpEntryAction $preview # No row reselected after the reorder.
     $null = Wait-Until 'preview for the same selected Unicode file' {
         $body = Find-Element 'File contents'
@@ -126,12 +136,9 @@ try {
     Wait-Order @($folder,$target,'yy-review.log','aa-review.log')
     # Grow a different file after listing. Largest first must still use cached sizes.
     [IO.File]::WriteAllText((Join-Path $fixtureDirectory 'aa-review.log'), ('z' * 8192))
-    Set-Sort 'Sort largest first'
+    Set-Sort 'Largest first'
     Wait-Order @($folder,$target,'aa-review.log','yy-review.log')
     Expect-Size 'aa-review.log' 18
-    if ((Sort-Radio 'Sort by name').Current.IsSelected -or (Sort-Radio 'Sort newest first').Current.IsSelected) {
-        throw 'Largest first left another sort order selected'
-    }
     if (!(Find-Element '4 matches') -or !(Find-Element 'Selected entry actions' $button).Current.IsEnabled) {
         throw 'Largest first discarded the filter or selected file'
     }

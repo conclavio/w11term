@@ -59,14 +59,12 @@ try {
     Click 'Cancel'
     $null = Wait-Until 'cancel kept the originating file' { !(Name-Field) -and (Button 'before.bin') }
 
-    $replace = Wait-Until 'transfer checkbox to re-enable after cancel' {
-        $box = Find-Element 'Replace existing files' ([System.Windows.Automation.ControlType]::CheckBox)
-        if ($box -and $box.Current.IsEnabled) { $box }
+    $options = Wait-Until 'File options becomes available after cancel' { Get-SftpOptionsExpander }
+    if ($options.Current.ExpandCollapseState -ne 'Collapsed') {
+        throw 'File options should start collapsed'
     }
-    $replace.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
-    $null = Wait-Until 'replace transfers enabled' {
-        (Find-Element 'Replace existing files').GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On'
-    }
+    Enable-SftpFileOption 'Replace existing files'
+    $null = Wait-Until 'collapsed options show overwrite status' { Find-Element 'Overwrite on' }
     Open-Rename 'before.bin'
     Set-Name 'raced.bin'
     $null = Control @('sftp','--pane',"$remote",'put',(Join-Path $State 'collision.bin'),"$parent/raced.bin")

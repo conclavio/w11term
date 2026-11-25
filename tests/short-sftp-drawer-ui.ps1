@@ -99,8 +99,8 @@ function Check-Actions {
     $actionsScroll = $actions.GetCurrentPattern($scroll)
     $remaining = [Collections.Generic.HashSet[string]]::new()
     $ellipsis = [char]0x2026
-    foreach ($label in 'Open shell here','Follow shell directory',
-        'Replace existing files','Sort by name','Sort newest first','Sort largest first',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
+    foreach ($label in 'Open shell here','File options','Sort files',
+        "Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
     $horizontal = if ($actionsScroll.Current.HorizontallyScrollable) { 0,100 } else { -1 }
     $step = [Math]::Max(1, [Math]::Min(20, [Math]::Floor($actionsScroll.Current.VerticalViewSize / 2)))
     for ($percent = 0; $percent -le 100; $percent += $step) {

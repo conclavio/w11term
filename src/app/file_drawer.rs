@@ -27,6 +27,7 @@ mod folder_batch;
 mod folder_report;
 mod history;
 mod link_target;
+mod options;
 mod preview;
 mod properties;
 mod rename_batch;
@@ -177,6 +178,7 @@ pub enum FileAction {
     ResumeDownload(u64, u64, u64, bool),
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
+    OptionsExpanded(u64, u64, bool),
     Replace(u64, u64, bool),
     PreserveMtime(u64, u64, bool),
     AtomicUploads(u64, u64, bool),
@@ -235,6 +237,7 @@ pub(super) struct FileDrawer {
     folder_reference: Option<Arc<FolderInventory>>,
     editor: Option<editor::Editor>,
     dialog_serial: u64,
+    options_expanded: bool,
     replace: bool,
     preserve_mtime: bool,
     atomic_uploads: bool,
@@ -1910,6 +1913,7 @@ impl FileDrawer {
 
     fn close(&mut self) {
         self.open = false;
+        self.options_expanded = false;
         self.marked_downloads = None;
         self.close_search();
         self.saved_search = None;
@@ -2257,92 +2261,28 @@ impl FileDrawer {
                 Search(pane, generation, find::Action::Restore(saved.serial)),
             ));
         }
-        controls.extend([
-            title_tools::button("Open shell here")
-                .is_enabled(shell.is_some())
-                .on_click(context.callback(move |_| {
-                    directory_split::message(
-                        directory_split::Destination::Split(Axis::Columns),
-                        shell.as_ref(),
-                    )
-                }))
-                .content(FontIcon::new().glyph("\u{e756}"))
-                .tooltip_with(title_tools::below("Open shell in this folder")),
-            CheckBox::new()
-                .is_checked(self.following)
-                .on_is_checked_changed(
-                    context.callback(move |v| Message::Files(Follow(pane, generation, v))),
-                )
-                .content(TextBlock::new().text("Follow shell directory")),
-            CheckBox::new()
-                .is_enabled(ready)
-                .is_checked(self.replace)
-                .on_is_checked_changed(
-                    context.callback(move |v| Message::Files(Replace(pane, generation, v))),
-                )
-                .content(TextBlock::new().text("Replace existing files")),
-            CheckBox::new()
-                .automation_name("Preserve modification times")
-                .is_enabled(ready)
-                .is_checked(self.preserve_mtime)
-                .on_is_checked_changed(context.callback(move |enabled| {
-                    Message::Files(PreserveMtime(pane, generation, enabled))
-                }))
-                .content(TextBlock::new().text("Preserve modification times")),
-            CheckBox::new()
-                .is_enabled(ready)
-                .is_checked(self.atomic_uploads)
-                .on_is_checked_changed(
-                    context.callback(move |v| Message::Files(AtomicUploads(pane, generation, v))),
-                )
-                .content(TextBlock::new().text("Upload files atomically")),
-            CheckBox::new()
-                .automation_name("Preserve upload timestamps")
-                .is_enabled(ready)
-                .is_checked(self.preserve_upload_times)
-                .on_is_checked_changed(context.callback(move |enabled| {
-                    Message::Files(PreserveUploadTimes(pane, generation, enabled))
-                }))
-                .content(TextBlock::new().text("Preserve upload timestamps")),
-        ]);
-        controls.extend(self.resume_draft_button(pane, context));
-        let sort_button = |order, label: &str, name: &str| {
-            RadioButton::new()
-                .group_name(format!("sftp-sort-{pane}"))
-                .automation_name(name)
-                .min_width(0.0)
-                .is_enabled(writable)
-                .is_checked(self.sort_order == order)
-                .on_checked(context.callback(move |checked| {
-                    if checked {
-                        Message::Files(Sort(pane, generation, revision, order))
-                    } else {
-                        Message::ControlIdle
-                    }
-                }))
-                .content(label)
-        };
         controls.push(
-            StackPanel::new()
-                .orientation(if layout.content_width() >= 320.0 {
-                    Orientation::Horizontal
-                } else {
-                    Orientation::Vertical
-                })
-                .spacing(6.0)
+            Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Auto])
+                .column_spacing(6.0)
                 .children((
-                    TextBlock::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .text("Sort by"),
-                    sort_button(SortOrder::Name, "Name", "Sort by name"),
-                    sort_button(SortOrder::NewestFirst, "Newest first", "Sort newest first"),
-                    sort_button(
-                        SortOrder::LargestFirst,
-                        "Largest first",
-                        "Sort largest first",
+                    self.sorting_control(pane, context),
+                    Border::new().grid_column(1).content(
+                        title_tools::button("Open shell here")
+                            .is_enabled(shell.is_some())
+                            .on_click(context.callback(move |_| {
+                                directory_split::message(
+                                    directory_split::Destination::Split(Axis::Columns),
+                                    shell.as_ref(),
+                                )
+                            }))
+                            .content(FontIcon::new().glyph("\u{e756}"))
+                            .tooltip_with(title_tools::below("Open shell in this folder")),
                     ),
                 )),
         );
+        controls.push(self.listing_options(pane, context));
+        controls.extend(self.resume_draft_button(pane, context));
         let filter: View = if let Some(input) = &self.filter_input {
             Grid::new()
                 .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -3403,6 +3343,7 @@ impl TerminalApp {
             | ResumeDownload(id, ..)
             | FinishEdit(id, ..)
             | Page(id, ..)
+            | OptionsExpanded(id, ..)
             | Replace(id, ..)
             | PreserveMtime(id, ..)
             | AtomicUploads(id, ..)
@@ -3492,6 +3433,13 @@ impl TerminalApp {
         {
             return;
         }
+        if let OptionsExpanded(_, generation, expanded) = &action
+            && (!files.open
+                || *generation != files.generation
+                || *expanded == files.options_expanded)
+        {
+            return;
+        }
         let editor_typing = matches!(
             &action,
             TextEditor(_, _, editor::Action::Text(_) | editor::Action::Name(_))
@@ -3507,7 +3455,12 @@ impl TerminalApp {
         let keep_directory = editor_typing
             || matches!(
                 &action,
-                Filter(..) | ClearFilter(..) | FocusFilter(..) | Sort(..) | ShowTransfer(..)
+                Filter(..)
+                    | ClearFilter(..)
+                    | FocusFilter(..)
+                    | Sort(..)
+                    | OptionsExpanded(..)
+                    | ShowTransfer(..)
             );
         if !editor_typing
             && !matches!(
@@ -4295,6 +4248,7 @@ impl TerminalApp {
                     files.end_filter_edit();
                     files.set_page(page);
                 }
+                OptionsExpanded(_, _, expanded) => files.options_expanded = expanded,
                 Replace(_, _, replace) => files.replace = replace,
                 PreserveMtime(_, _, enabled) => files.preserve_mtime = enabled,
                 AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,

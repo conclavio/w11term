@@ -393,6 +393,8 @@ On an SSH pane, open **SFTP files** from the title bar or **More → Panes**. Th
 
 Select a row and open **Selected entry actions** beside Download for commands such as Properties, Preview, Rename, and Delete. File type and the current selection determine which commands are available. The Open folder button sits beside the path.
 
+The **Sort files** dropdown below the list shows the current sort. Expand **File options** for shell-directory following, overwrite, and timestamp or atomic upload preferences. The collapsed header shows when following or overwriting is on.
+
 Choose **More folder actions → Filesystem space…** to check the filesystem containing the displayed remote folder. The report shows total and used capacity, space available to unprivileged users, any reserved free space, and the server’s read-only flag when set. **Refresh space** reads a new snapshot over the same SSH connection. The server must support the OpenSSH `statvfs` extension. [OpenSSH filesystem statistics](https://github.com/openssh/openssh-portable/blob/V_10_2_P1/PROTOCOL#L2206-L2262)
 
 Choose **More folder actions → Folder contents…** to total the reported lengths of regular files in the displayed folder and its subfolders. The scan reads SFTP metadata and skips symbolic links. Sparse files count by their logical length, and each hard-linked name counts separately. The scan reports missing sizes and unreadable folders, and labels the total partial if it skips unmeasurable entries or reaches the existing scan bounds of 128 folders, 16,384 entries, or 24 nested levels. **Stop scan** keeps the partial totals, and **Measure again** starts a fresh scan.
@@ -545,7 +547,7 @@ Choose **Select results…** to mark files and folders from any results page. **
 
 **Move marked results…** reviews the selected paths and moves them to one folder on the same SSH connection. All entries keep their names. Unmark descendants of a marked folder and move entries with the same name in separate batches. While moves are queued, choose **Stop after current move** to let the active request finish and skip the rest. The batch also stops after the first failure. It reports the number of confirmed moves and refreshes the search. Confirmed entries stay moved. Entries still at their original paths keep their marks after a successful refresh.
 
-Under **Sort by**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
+In **Sort files**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Sort by name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
 
 The list shows reported regular-file sizes beside their names in bytes or binary units such as KiB and MiB. An empty file shows **0 B**. Rows without a regular-file size have a blank size column. Use **Refresh** to update the listing after a transfer or a change on the server.
 
@@ -605,7 +607,7 @@ To keep a remote directory for another session, open it in the SFTP drawer and c
 
 On a direct SSH shell, **Open shell here** opens a right-hand split in the directory displayed by the SFTP drawer. You can browse to a folder or reopen a bookmark even when the running shell does not report its working directory. The new shell reuses the authenticated SSH connection, and the original pane keeps its running program and file selection. The server must allow SSH exec and expose the selected path to the shell.
 
-Check **Follow shell directory** in the drawer to track later directory changes from that shell. The drawer waits for active transfers and file pickers to finish, then reads the latest reported directory when visible. It ignores invalid and foreign-host reports. Opening a folder manually or revealing a file turns following off for that pane.
+Check **Follow shell directory** under **File options** to track later directory changes from that shell. The drawer waits for active transfers and file pickers to finish, then reads the latest reported directory when visible. It ignores invalid and foreign-host reports. Opening a folder manually or revealing a file turns following off for that pane.
 
 **Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.
 

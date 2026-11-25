@@ -165,14 +165,12 @@ try {
     [IO.File]::Delete($readGate)
     Wait-Status '^Cancelled download of /shell directory/interrupted\b'
 
-    (Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Preserve modification times'
     Download-To 'snapshot' 'receive here'
     Wait-Status '^Downloaded /shell directory/snapshot\b.*2 files, 23 bytes'
     Assert-Explorer 'Show download in File Explorer' 'select' (Join-Path $State 'picker/receive here/snapshot')
     # Even when single-file replacement is enabled, an existing directory cannot be merged or replaced.
-    (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Replace existing files'
     Download-To 'snapshot' 'already exists'
     Wait-Status 'destination.*exists'
     if (Find-Element 'Show download in File Explorer' $button) { throw 'An unsuccessful download offered an Explorer action' }

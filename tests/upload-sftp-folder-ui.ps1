@@ -48,13 +48,11 @@ try {
     [IO.File]::Delete($writeGate)
     Wait-Status "^Cancelled upload of /shell directory/interrupted \(0 files completed, $($offset * 2) bytes acknowledged\)\. The remote folder may be incomplete\.$"
 
-    (Wait-CheckBox 'Preserve upload timestamps' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Preserve upload timestamps' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Preserve upload timestamps'
     Pick-Folder $release
     Wait-Status "^Uploaded folder /shell directory/$release \(2 files, 3 folders, 6 bytes, 1 skipped\)\.$"
     $null = Wait-Until 'refreshed directory lists uploaded root' { Find-Element "$release/" $button }
-    (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Replace existing files'
     Pick-Folder $release
     Wait-Status "^Could not upload folder /shell directory/$release.*already exists"
 

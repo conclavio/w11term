@@ -51,8 +51,7 @@ try {
     if ([IO.File]::ReadAllText($existing) -cne 'old remote file') {
         throw 'The drop replaced a file while replacement was off'
     }
-    (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Replace existing files'
     [IO.File]::WriteAllText((Join-Path $source "$release/only on second drop"), 'must not merge')
     Drop-Items @('replace.bin', $release, 'after-collision')
     Wait-Status "$release.*already exists.*1 of 3 items completed"

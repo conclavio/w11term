@@ -123,8 +123,7 @@ try {
         Find-Element "Cancelled upload of /shell directory/01-first-upload ($($offset * 2) bytes acknowledged). The remote file may be incomplete. 0 of 2 items completed."
     }
 
-    (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Replace existing files'
     Start-Download 'retained-download' -Replace
     $offset = Cancel-AtSecondPacket 'READ' $readGate
     $null = Wait-Until 'cancelled download reports its temporary byte count' {
@@ -134,8 +133,7 @@ try {
     $null = Wait-Until 'next native download completes on that pane' {
         Find-Element 'Downloaded /shell directory/verified-download (17 bytes)'
     }
-    (Wait-CheckBox 'Upload files atomically' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Upload files atomically' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Upload files atomically'
     Click ('Upload' + [char]0x2026)
     $open = Wait-Until 'owned atomic upload picker' { Find-OwnedDialog 'Choose files to upload' }
     Select-DialogItem $open 'atomic-note'
