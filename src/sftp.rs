@@ -36,8 +36,8 @@ mod editor;
 mod find;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
-    ContentMatch, ContentScan, FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch,
-    FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
+    ContentMatch, ContentScan, FileSizeRange, FileTextMatch, FilenameFilter, FilenameMatch,
+    FilenameSearch, FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
 };
 mod resume_download;
 use resume_download::ResumeDownload;
@@ -55,6 +55,7 @@ pub use drop_source::{DropSource, classify_drop};
 pub const CHUNK: usize = 32 * 1024;
 pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
+pub const MOVE_OUTCOME_UNKNOWN: &str = "Move outcome unknown; refresh both folders to check";
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 pub fn normalize_sha256(value: &str) -> Result<String> {
@@ -253,6 +254,11 @@ pub enum Operation {
     Ls {
         path: String,
     },
+    /// List folder choices for the drawer's move dialog on its existing connection.
+    #[serde(skip)]
+    BrowseMoveFolders {
+        path: String,
+    },
     Find {
         path: String,
         query: String,
@@ -344,6 +350,14 @@ pub enum Operation {
         from: String,
         to: String,
         search_kind: Option<EntryKind>,
+    },
+    /// Move an approved drawer entry into a folder on the same SSH connection.
+    #[serde(skip)]
+    MoveEntry {
+        from: String,
+        directory: String,
+        kind: Option<EntryKind>,
+        destination_is_canonical: bool,
     },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
@@ -645,6 +659,12 @@ pub(crate) async fn run(
                 Operation::RenameEntry { .. } => {
                     Some("Missing SSH connection approval; rename was not started")
                 }
+                Operation::MoveEntry { .. } => {
+                    Some("Missing SSH connection approval; move was not started")
+                }
+                Operation::BrowseMoveFolders { .. } => {
+                    Some("Missing SSH connection for the destination picker")
+                }
                 Operation::RemoveEntry { .. } => {
                     Some("Missing SSH connection approval; delete was not started")
                 }
@@ -787,6 +807,10 @@ pub(crate) async fn run(
                     }
                 }
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
+                Operation::MoveEntry { .. } => JobStage::Checking("Move was not started"),
+                Operation::BrowseMoveFolders { .. } => {
+                    JobStage::Checking("Destination folders did not load")
+                }
                 Operation::SaveText { .. } => JobStage::Checking("Save was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
@@ -1014,6 +1038,181 @@ impl Engine {
             "The search result's containing folder changed"
         );
         Ok(())
+    }
+
+    async fn read_directory(
+        &self,
+        path: &str,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<Vec<russh_sftp::protocol::File>> {
+        let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
+        ensure!(!cancelled(), "Directory listing cancelled");
+        let handle = self.raw.opendir(path).await?.handle;
+        let result = async {
+            let mut entries = Vec::new();
+            let mut bytes = 0;
+            loop {
+                ensure!(!cancelled(), "Directory listing cancelled");
+                match self.raw.readdir(&handle).await {
+                    Ok(names) => {
+                        bytes += serde_json::to_vec(&names.files)?.len();
+                        ensure!(
+                            bytes <= 8 * 1024 * 1024,
+                            "directory listing exceeds 8 MiB; use opendir/readdir/close"
+                        );
+                        entries.extend(names.files);
+                    }
+                    Err(error) if eof(&error) => return Ok(entries),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        .await;
+        let closed = self.raw.close(handle).await;
+        let entries = result?;
+        closed?;
+        Ok(entries)
+    }
+
+    async fn browse_move_folders(
+        &self,
+        path: &str,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<Value> {
+        ensure!(
+            !cancel.is_some_and(TransferCancel::is_cancelled),
+            "Directory listing cancelled"
+        );
+        let directory = self.canonical_remote_path(path).await?;
+        ensure!(
+            !directory.chars().any(char::is_control),
+            "SFTP returned control characters in the directory path"
+        );
+        let mut folders = Vec::new();
+        for entry in self.read_directory(&directory, cancel).await? {
+            ensure!(
+                !cancel.is_some_and(TransferCancel::is_cancelled),
+                "Directory listing cancelled"
+            );
+            let name = entry.filename;
+            if matches!(name.as_str(), "" | "." | "..")
+                || name.contains(['/', '\\'])
+                || name.chars().any(char::is_control)
+            {
+                continue;
+            }
+            let mut mode = entry.attrs.permissions;
+            if mode.is_none_or(|mode| mode & 0o170000 == 0) {
+                let child = format!("{}/{name}", directory.trim_end_matches('/'));
+                match self.raw.lstat(child).await {
+                    Ok(reply) => mode = reply.attrs.permissions,
+                    Err(error) if transport_error(&error) => return Err(error.into()),
+                    Err(_) => continue,
+                }
+            }
+            if EntryKind::from_permissions(mode) == Some(EntryKind::Directory) {
+                folders.push(name);
+            }
+        }
+        folders.sort_unstable();
+        folders.dedup();
+        Ok(json!({"directory":directory,"folders":folders}))
+    }
+
+    async fn rename_without_replacement(
+        &self,
+        from: String,
+        to: String,
+        unknown_outcome: &'static str,
+        stage: &mut JobStage,
+    ) -> Result<()> {
+        // LSTAT sees the directory entry even if it is a dangling link.
+        // A concurrent creator after this check is the v3 server's responsibility.
+        match self.raw.lstat(&to).await {
+            Ok(_) => bail!("An entry with that name already exists"),
+            Err(Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => {}
+            Err(error) => {
+                return Err(
+                    anyhow::Error::from(error).context("Could not check the destination name")
+                );
+            }
+        }
+        *stage = JobStage::AwaitingStatus(unknown_outcome);
+        self.raw.rename(from, to).await?;
+        Ok(())
+    }
+
+    async fn move_entry(
+        &self,
+        from: String,
+        directory: String,
+        expected_kind: Option<EntryKind>,
+        destination_is_canonical: bool,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        let (parent, name) = from.rsplit_once('/').context("Missing source folder")?;
+        let parent = if parent.is_empty() { "/" } else { parent };
+        ensure!(
+            from.starts_with('/')
+                && directory.starts_with('/')
+                && !matches!(name, "" | "." | "..")
+                && !from.contains('\\')
+                && !directory.contains('\\')
+                && !from.chars().chain(directory.chars()).any(char::is_control),
+            "Choose a remote entry and destination folder"
+        );
+        ensure!(
+            self.canonical_remote_path(parent).await? == parent,
+            "The source folder changed. Refresh the drawer."
+        );
+        let destination = self
+            .canonical_remote_path(&directory)
+            .await
+            .context("Could not resolve the destination folder")?;
+        ensure!(
+            !destination_is_canonical || destination == directory,
+            "The destination folder changed. Refresh the drawer."
+        );
+        ensure!(
+            parent != destination,
+            "Choose a different destination folder"
+        );
+        let attributes = self
+            .raw
+            .lstat(&from)
+            .await
+            .context("Could not check the selected entry")?
+            .attrs;
+        let kind = EntryKind::from_permissions(attributes.permissions)
+            .context("The server did not identify the entry as a file, folder or link")?;
+        ensure!(
+            expected_kind.is_none_or(|expected| kind == expected),
+            "The selected entry type changed. Refresh the drawer."
+        );
+        ensure!(
+            kind != EntryKind::Directory
+                || !(destination == from
+                    || destination
+                        .strip_prefix(&from)
+                        .is_some_and(|suffix| suffix.starts_with('/'))),
+            "A folder cannot be moved into itself or one of its descendants"
+        );
+        let attrs = self
+            .raw
+            .stat(&destination)
+            .await
+            .context("Could not check the destination folder")?
+            .attrs;
+        ensure!(
+            attrs.permissions.is_none_or(|mode| {
+                EntryKind::from_permissions(Some(mode)) == Some(EntryKind::Directory)
+            }),
+            "The destination is not a folder"
+        );
+        let to = format!("{}/{name}", destination.trim_end_matches('/'));
+        self.rename_without_replacement(from, to, MOVE_OUTCOME_UNKNOWN, stage)
+            .await?;
+        Ok(json!({"directory":destination}))
     }
 
     async fn execute(
@@ -1289,32 +1488,9 @@ impl Engine {
                         "SFTP resolves this mount to a different path"
                     );
                 }
-                let h = self.raw.opendir(path).await?.handle;
-                let result = async {
-                    let mut entries = Vec::new();
-                    let mut bytes = 0;
-                    loop {
-                        match self.raw.readdir(&h).await {
-                            Ok(names) => {
-                                bytes += serde_json::to_vec(&names.files)?.len();
-                                ensure!(
-                                    bytes <= 8 * 1024 * 1024,
-                                    "directory listing exceeds 8 MiB; use opendir/readdir/close"
-                                );
-                                entries.extend(names.files);
-                            }
-                            Err(e) if eof(&e) => break,
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    Ok(json!({"entries":entries}))
-                }
-                .await;
-                let closed = self.raw.close(h).await;
-                let value: Value = result?;
-                closed?;
-                value
+                json!({"entries":self.read_directory(&path, None).await?})
             }
+            BrowseMoveFolders { path } => self.browse_move_folders(&path, cancel).await?,
             Read {
                 handle,
                 offset,
@@ -1415,19 +1591,23 @@ impl Engine {
                         "The search result's entry type changed. Refresh the results."
                     );
                 }
-                // LSTAT sees the directory entry even if it is a dangling link.
-                // A concurrent creator after this check is the v3 server's responsibility.
-                match self.raw.lstat(&to).await {
-                    Ok(_) => bail!("An entry with that name already exists"),
-                    Err(Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => {}
-                    Err(error) => {
-                        return Err(anyhow::Error::from(error)
-                            .context("Could not check the destination name"));
-                    }
-                }
-                *stage = JobStage::AwaitingStatus("Rename outcome unknown; refresh to check");
-                self.raw.rename(from, to).await?;
+                self.rename_without_replacement(
+                    from,
+                    to,
+                    "Rename outcome unknown; refresh to check",
+                    stage,
+                )
+                .await?;
                 ok
+            }
+            MoveEntry {
+                from,
+                directory,
+                kind,
+                destination_is_canonical,
+            } => {
+                self.move_entry(from, directory, kind, destination_is_canonical, stage)
+                    .await?
             }
             RemoveEntry {
                 path,

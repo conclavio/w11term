@@ -63,6 +63,45 @@ fn supports_batch_download(kind: ListedKind) -> bool {
 }
 
 impl FileDrawer {
+    pub(super) fn listing_mark_summary(&self, marked: &BTreeSet<String>) -> (bool, usize) {
+        let mut can_add = false;
+        let mut marked_matches = 0;
+        for entry in self
+            .matching_entries()
+            .filter(|entry| entry.can_mark_for_download())
+        {
+            if marked.contains(&entry.name) {
+                marked_matches += 1;
+            } else {
+                can_add = true;
+            }
+        }
+        (can_add, marked.len().saturating_sub(marked_matches))
+    }
+
+    pub(super) fn bulk_listing_marks(&mut self, change: SelectionChange) {
+        if !self.open || self.busy() || self.directory.is_none() {
+            return;
+        }
+        let Some(mut marked) = self.marked_downloads.take() else {
+            return;
+        };
+        match change {
+            SelectionChange::MarkAll => {
+                for entry in self
+                    .matching_entries()
+                    .filter(|entry| entry.can_mark_for_download())
+                {
+                    if !marked.contains(&entry.name) {
+                        marked.insert(entry.name.clone());
+                    }
+                }
+            }
+            SelectionChange::Clear => marked.clear(),
+        }
+        self.marked_downloads = Some(marked);
+    }
+
     pub(super) fn set_download_mark(&mut self, entry: ListedEntry, checked: bool) {
         if !self.open
             || self.busy()
@@ -81,6 +120,12 @@ impl FileDrawer {
     }
 
     pub(super) fn marked_entries(&self) -> Result<Vec<&Entry>> {
+        let entries = self.marked_listing_entries()?;
+        validate_download_names(entries.iter().map(|entry| entry.name.as_str()))?;
+        Ok(entries)
+    }
+
+    pub(super) fn marked_listing_entries(&self) -> Result<Vec<&Entry>> {
         let marks = self
             .marked_downloads
             .as_ref()
@@ -95,7 +140,6 @@ impl FileDrawer {
             entries.len() == marks.len(),
             "The remote listing changed. Mark the files again."
         );
-        validate_download_names(entries.iter().map(|entry| entry.name.as_str()))?;
         Ok(entries)
     }
 
@@ -190,6 +234,45 @@ mod tests {
             name: row.name.clone(),
             kind: row.kind,
         }
+    }
+
+    #[test]
+    fn mark_all_respects_the_filter_and_keeps_marks_outside_it() {
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 1,
+            ..FileDrawer::default()
+        };
+        let mut entries: Vec<_> = (0..PAGE_SIZE + 2)
+            .map(|i| entry(format!("match-{i:02}.log"), EntryKind::File))
+            .collect();
+        entries.extend([
+            entry("match-folder", EntryKind::Directory),
+            entry("match-link", EntryKind::Symlink),
+            entry("outside", EntryKind::File),
+            entry("also-outside", EntryKind::File),
+        ]);
+        drawer.accept_listing(None, "/logs".into(), entries);
+        drawer.bulk_listing_marks(SelectionChange::MarkAll);
+        assert!(drawer.marked_downloads.is_none());
+        drawer.set_filter("match-".into());
+        drawer.marked_downloads = Some(BTreeSet::from(["outside".into()]));
+        assert_eq!(
+            drawer.listing_mark_summary(drawer.marked_downloads.as_ref().unwrap()),
+            (true, 1)
+        );
+        drawer.bulk_listing_marks(SelectionChange::MarkAll);
+        let marked = drawer.marked_downloads.as_ref().unwrap();
+        assert_eq!(marked.len(), PAGE_SIZE + 4);
+        assert!(marked.contains(&format!("match-{}.log", PAGE_SIZE + 1)));
+        assert!(marked.contains("match-folder"));
+        assert!(marked.contains("outside"));
+        assert!(!marked.contains("match-link"));
+        assert!(!marked.contains("also-outside"));
+        assert_eq!(drawer.listing_mark_summary(marked), (false, 1));
+        drawer.bulk_listing_marks(SelectionChange::Clear);
+        assert_eq!(drawer.marked_downloads, Some(BTreeSet::new()));
+        assert_eq!(drawer.filter, "match-");
     }
 
     #[test]

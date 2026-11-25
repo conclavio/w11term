@@ -90,8 +90,8 @@ function Download-Verified([string]$Digest, [string]$Destination, [switch]$Resum
 }
 
 function Mark-Download([string]$Label) {
-    (Wait-CheckBox "Mark $Label for download" ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox "Mark $Label for download" ([System.Windows.Automation.ToggleState]::On)
+    (Wait-CheckBox "Mark $Label" ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox "Mark $Label" ([System.Windows.Automation.ToggleState]::On)
 }
 
 function Download-Marked([string]$Parent) {
@@ -102,7 +102,7 @@ function Download-Marked([string]$Parent) {
 function Start-BlockedBatch([string]$Parent) {
     [IO.File]::WriteAllBytes($readGate, [byte[]]@())
     $start = (Read-PeerTrace $reader).Length
-    Click ('Select downloads' + [char]0x2026)
+    Click ('Select entries' + [char]0x2026)
     Mark-Download 'interrupted/'
     Mark-Download 'verified.bin'
     Download-Marked $Parent
@@ -184,7 +184,7 @@ try {
     Wait-Status 'SHA-256 verified'
     Assert-Explorer 'Show download in File Explorer' 'select' (Join-Path $State 'accepted.bin')
 
-    Click ('Select downloads' + [char]0x2026)
+    Click ('Select entries' + [char]0x2026)
     Mark-Download 'snapshot/'
     Click ('Filter filenames' + [char]0x2026)
     $edit = [System.Windows.Automation.ControlType]::Edit
@@ -197,7 +197,7 @@ try {
     Wait-Status '^Downloaded /shell directory/verified\.bin.*2 of 2 items completed'
 
     Click 'Clear filter'
-    Click ('Select downloads' + [char]0x2026)
+    Click ('Select entries' + [char]0x2026)
     Mark-Download 'snapshot/'
     Mark-Download 'verified.bin'
     Mark-Download 'z-later.bin'

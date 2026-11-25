@@ -899,6 +899,7 @@ impl russh_sftp::server::Handler for Files {
             )
         }
         .map_err(|_| StatusCode::Failure)?;
+        self.hold_response("hold-rename-reply").await;
         if self.root.join("disconnect-after-rename").exists() {
             let _ = self
                 .ssh

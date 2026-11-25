@@ -17,10 +17,12 @@ use w11term::sftp::{
 };
 
 mod bookmarks;
+mod destination;
 mod downloads;
 mod editor;
 pub(super) mod find;
 mod history;
+mod move_batch;
 mod preview;
 mod properties;
 mod sort;
@@ -29,6 +31,7 @@ mod transfer_queue;
 mod uploads;
 
 use history::{FolderHistory, HistoryDirection};
+use move_batch::Origin as MoveOrigin;
 pub use preview::PreviewKind;
 pub use sort::SortOrder;
 use transfer_queue::TransferQueue;
@@ -115,15 +118,22 @@ pub enum FileAction {
     Choose(u64, u64, ListedEntry),
     SelectDownloads(u64, u64, u64, bool),
     MarkDownload(u64, u64, ListedEntry, bool),
+    BulkListingMarks(u64, u64, u64, SelectionChange),
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     Preview(u64, u64, FileTarget, PreviewKind),
     ClosePreview(u64, u64, u64),
+    ShowFullPreview(u64, u64, u64, bool),
+    MovePreviewMatch(u64, u64, u64, bool),
     CopyChecksum(u64, u64, u64),
     VerifyChecksum(u64, u64, u64),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
     Rename(u64, u64, ListedEntry),
+    MoveEntry(u64, u64, FileTarget),
+    MoveMarked(u64, u64, u64),
+    StopMoves(u64, u64, u64),
+    MoveDestination(u64, u64, u64, destination::Action),
     VerifyDownload(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
@@ -151,6 +161,12 @@ pub enum FileAction {
     Tick(u64),
 }
 
+#[derive(Clone, Copy)]
+pub enum SelectionChange {
+    MarkAll,
+    Clear,
+}
+
 #[derive(Default)]
 pub(super) struct FileDrawer {
     pub(super) open: bool,
@@ -174,6 +190,7 @@ pub(super) struct FileDrawer {
     page: usize,
     selected: Option<String>,
     marked_downloads: Option<BTreeSet<String>>,
+    move_listing_refresh: Option<move_batch::ListingRefresh>,
     reveal: Option<RevealTarget>,
     dialog: Option<EntryDialog>,
     preview: Option<preview::EntryPreview>,
@@ -246,6 +263,13 @@ pub enum FileTarget {
 }
 
 impl FileTarget {
+    fn parent(&self) -> &str {
+        match self {
+            Self::Listed(entry) => &entry.parent,
+            Self::Search(_, hit) => &hit.parent,
+        }
+    }
+
     fn name(&self) -> &str {
         match self {
             Self::Listed(entry) => &entry.name,
@@ -331,6 +355,7 @@ struct EntryDialog {
     parent: Option<String>,
     name: String,
     resume_download: bool,
+    destination_picker: Option<destination::Picker>,
     action: EditAction,
 }
 
@@ -339,6 +364,8 @@ enum EditAction {
     Create,
     Rename(ListedEntry),
     RenameSearch(u64, FilenameMatch),
+    Move(FileTarget, Option<EntryKind>),
+    MoveBatch(MoveOrigin, Vec<FilenameMatch>),
     VerifyDownload(FileTarget),
     Delete(FileTarget, EntryKind),
 }
@@ -350,22 +377,56 @@ impl EditAction {
             | Self::Create
             | Self::VerifyDownload(_)
             | Self::RenameSearch(..)
+            | Self::MoveBatch(..)
+            | Self::Move(FileTarget::Search(..), _)
             | Self::Delete(FileTarget::Search(..), _) => None,
-            Self::Rename(entry) | Self::Delete(FileTarget::Listed(entry), _) => Some(entry),
+            Self::Rename(entry)
+            | Self::Move(FileTarget::Listed(entry), _)
+            | Self::Delete(FileTarget::Listed(entry), _) => Some(entry),
         }
     }
 
     fn search_hit(&self) -> Option<(u64, &FilenameMatch)> {
         match self {
-            Self::RenameSearch(serial, hit) | Self::Delete(FileTarget::Search(serial, hit), _) => {
-                Some((*serial, hit))
-            }
+            Self::RenameSearch(serial, hit)
+            | Self::Move(FileTarget::Search(serial, hit), _)
+            | Self::Delete(FileTarget::Search(serial, hit), _) => Some((*serial, hit)),
             _ => None,
         }
     }
 }
 
 impl EntryDialog {
+    fn check_move_folder(&self, folder: &str) -> Result<()> {
+        let check = |parent: &str, name: &str, kind| {
+            ensure!(
+                folder.trim_end_matches('/') != parent.trim_end_matches('/'),
+                "Choose a destination different from the containing folder of {name}"
+            );
+            if kind == Some(EntryKind::Directory) {
+                let path = entry_path(parent, name)?;
+                ensure!(
+                    folder != path
+                        && !folder
+                            .strip_prefix(&path)
+                            .is_some_and(|suffix| suffix.starts_with('/')),
+                    "A folder cannot be moved into itself or one of its descendants"
+                );
+            }
+            Ok(())
+        };
+        match &self.action {
+            EditAction::Move(target, kind) => check(target.parent(), target.name(), *kind),
+            EditAction::MoveBatch(_, hits) => {
+                for hit in hits {
+                    check(&hit.parent, &hit.name, hit.kind)?;
+                }
+                Ok(())
+            }
+            _ => bail!("Open a move dialog before choosing its destination"),
+        }
+    }
+
     fn destination(&self) -> Result<String> {
         let parent = || self.parent.as_deref().context("Missing remote directory");
         match &self.action {
@@ -390,6 +451,24 @@ impl EntryDialog {
             EditAction::RenameSearch(_, hit) if self.name == hit.name => {
                 bail!("Enter a different name")
             }
+            EditAction::Move(..) | EditAction::MoveBatch(..) => {
+                ensure!(
+                    !self.name.trim().is_empty()
+                        && !self.name.contains('\\')
+                        && !self.name.chars().any(char::is_control),
+                    "Enter a remote folder path without backslashes or control characters"
+                );
+                let source = parent()?;
+                let folder = if self.name.starts_with('/') {
+                    self.name.clone()
+                } else {
+                    format!("{}/{}", source.trim_end_matches('/'), self.name)
+                };
+                let trimmed = folder.trim_end_matches('/');
+                let folder = if trimmed.is_empty() { "/" } else { trimmed };
+                self.check_move_folder(folder)?;
+                Ok(folder.to_owned())
+            }
             EditAction::Delete(target, _) => delete_path(parent()?, target.name()),
             EditAction::VerifyDownload(_) => normalize_sha256(&self.name),
             EditAction::Rename(_) | EditAction::RenameSearch(..) | EditAction::Create => {
@@ -402,12 +481,13 @@ impl EntryDialog {
 enum EntryChange {
     CreateFolder(String),
     Rename { from: String, to: String },
+    Move { name: String, directory: String },
     Delete(String),
 }
 impl EntryChange {
     fn name(&self) -> &str {
         match self {
-            Self::CreateFolder(name) | Self::Delete(name) => name,
+            Self::CreateFolder(name) | Self::Move { name, .. } | Self::Delete(name) => name,
             Self::Rename { to, .. } => to,
         }
     }
@@ -416,6 +496,7 @@ impl EntryChange {
             Self::CreateFolder(name) => format!("creation of {name}"),
             Self::Delete(name) => format!("deletion of {name}"),
             Self::Rename { from, to } => format!("rename of {from} to {to}"),
+            Self::Move { name, directory } => format!("move of {name} to {directory}"),
         }
     }
     fn completed(&self) -> String {
@@ -423,6 +504,7 @@ impl EntryChange {
             Self::CreateFolder(name) => format!("Created folder {name}"),
             Self::Delete(name) => format!("Deleted {name}"),
             Self::Rename { from, to } => format!("Renamed {from} to {to}"),
+            Self::Move { name, directory } => format!("Moved {name} to {directory}"),
         }
     }
     fn error(&self, error: &str) -> String {
@@ -430,6 +512,7 @@ impl EntryChange {
             Self::CreateFolder(name) => format!("Could not create folder {name}: {error}"),
             Self::Delete(name) => format!("Could not delete {name}: {error}"),
             Self::Rename { from, to } => format!("Rename {from} to {to}: {error}"),
+            Self::Move { name, directory } => format!("Move {name} to {directory}: {error}"),
         }
     }
 }
@@ -439,6 +522,8 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    MoveDestination(u64, u64),
+    MoveBatch(move_batch::Batch),
     Search(u64, Option<String>),
     SaveText(editor::Save),
     Transfer(TransferFile),
@@ -992,6 +1077,7 @@ impl FileDrawer {
             self.cached.get_mut().take();
         }
         if self.dialog.take().is_some() {
+            self.stop_destination_listing();
             self.cached.get_mut().take();
         }
     }
@@ -1158,6 +1244,15 @@ impl FileDrawer {
         path: String,
         entries: Vec<Entry>,
     ) {
+        let move_refresh = self
+            .move_listing_refresh
+            .take()
+            .filter(|refresh| refresh.directory == path && self.directory.as_ref() == Some(&path));
+        let marks = if move_refresh.is_some() && self.open {
+            self.retained_move_marks(&entries)
+        } else {
+            None
+        };
         self.cancel_preview();
         self.history.listed(&path, direction);
         self.opening_target = None;
@@ -1170,16 +1265,24 @@ impl FileDrawer {
         self.listing_revision = self.listing_revision.wrapping_add(1);
         self.directory = Some(path);
         self.selected = None;
-        self.marked_downloads = None;
-        self.page = 0;
+        self.marked_downloads = marks;
+        if let Some(refresh) = move_refresh {
+            self.set_page(self.page);
+            self.status = refresh.note;
+        } else {
+            self.page = 0;
+        }
         if self.status == "Reading directory…" {
             self.status.clear();
         }
         let Some(target) = self.reveal.take() else {
             return;
         };
-        // A newly listed file can appear at the path just deleted.
-        if matches!(target, RevealTarget::Changed(EntryChange::Delete(_))) {
+        // A newly listed file can reuse the old name after a removal.
+        if matches!(
+            target,
+            RevealTarget::Changed(EntryChange::Delete(_) | EntryChange::Move { .. })
+        ) {
             return;
         }
         let name = target.name();
@@ -1243,6 +1346,29 @@ impl FileDrawer {
         }
     }
 
+    fn begin_move_entry(&mut self, target: FileTarget) -> Result<()> {
+        ensure!(
+            self.open && self.generation != 0 && !self.busy(),
+            "Open the file drawer and select an entry to move"
+        );
+        self.checked_target_path(&target)?;
+        let kind = match &target {
+            FileTarget::Listed(entry) => match entry.kind {
+                ListedKind::Known(kind) => Some(kind),
+                ListedKind::Missing => None,
+                ListedKind::Unsupported => bail!("Select a file, folder or link to move"),
+            },
+            FileTarget::Search(_, hit) => {
+                Some(hit.kind.context("Select a file, folder or link to move")?)
+            }
+        };
+        let parent = target.parent().to_owned();
+        entry_path(&parent, target.name())?;
+        self.end_filter_edit();
+        self.show_entry_dialog(Some(parent), EditAction::Move(target, kind));
+        Ok(())
+    }
+
     fn begin_verified_download(&mut self, target: FileTarget, digest: String) -> Result<()> {
         ensure!(
             !matches!(&target, FileTarget::Listed(entry)
@@ -1266,13 +1392,16 @@ impl FileDrawer {
             serial: self.dialog_serial,
             parent,
             name: match &action {
-                EditAction::VerifyDownload(_) => String::new(),
+                EditAction::VerifyDownload(_)
+                | EditAction::Move(..)
+                | EditAction::MoveBatch(..) => String::new(),
                 EditAction::RenameSearch(_, hit) => hit.name.clone(),
                 action => action
                     .original()
                     .map_or_else(String::new, |entry| entry.name.clone()),
             },
             resume_download: false,
+            destination_picker: None,
             action,
         });
     }
@@ -1285,13 +1414,29 @@ impl FileDrawer {
         if !self.dialog.as_ref().is_some_and(|e| e.serial == serial) {
             return Ok(None);
         }
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|e| e.destination_picker.is_some())
+        {
+            if result != ContentDialogResult::Primary {
+                self.dialog.take();
+                self.stop_destination_listing();
+            }
+            return Ok(None);
+        }
         let dialog = self.dialog.take().unwrap();
         if result != ContentDialogResult::Primary {
             return Ok(None);
         }
         ensure!(
             self.open
-                && (dialog.action.search_hit().is_some() || self.directory == dialog.parent)
+                && (dialog.action.search_hit().is_some()
+                    || matches!(
+                        dialog.action,
+                        EditAction::MoveBatch(MoveOrigin::Search(_), _)
+                    )
+                    || self.directory == dialog.parent)
                 && !matches!(dialog.action, EditAction::GoToFolder { revision } if revision != self.listing_revision),
             "The directory changed. Open the file action again."
         );
@@ -1307,6 +1452,17 @@ impl FileDrawer {
                 "Wait for the current file operation to finish"
             );
             self.search_hit_path(serial, hit)?;
+        }
+        if let EditAction::MoveBatch(origin, hits) = &dialog.action {
+            ensure!(
+                !self.busy(),
+                "Wait for the current file operation to finish"
+            );
+            let (root, current) = self.marked_moves(*origin)?;
+            ensure!(
+                dialog.parent.as_deref() == Some(root.as_str()) && *hits == current,
+                "The marked results changed. Review the move again."
+            );
         }
         let path = dialog.destination()?;
         Ok(Some((dialog, path)))
@@ -1327,6 +1483,9 @@ impl FileDrawer {
         let dialog = self.dialog.as_ref()?;
         let serial = dialog.serial;
         let generation = self.generation;
+        if let Some(picker) = &dialog.destination_picker {
+            return Some(picker.dialog(dialog, pane, generation, context));
+        }
         let valid = dialog.destination();
         if let EditAction::Delete(_, kind) = &dialog.action {
             let title = match kind {
@@ -1361,6 +1520,8 @@ impl FileDrawer {
             EditAction::Rename(_) | EditAction::RenameSearch(..) => {
                 ("Rename entry", "New name", "Rename")
             }
+            EditAction::Move(..) => ("Move remote entry", "Destination folder", "Move"),
+            EditAction::MoveBatch(..) => ("Move marked entries", "Destination folder", "Move"),
             EditAction::VerifyDownload(_) => (
                 "Download and verify",
                 "Expected SHA-256",
@@ -1397,6 +1558,93 @@ impl FileDrawer {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             );
+        }
+        if let EditAction::Move(target, _) = &dialog.action {
+            fields.insert(
+                0,
+                KeyedView::new(
+                    "move-source",
+                    TextBlock::new()
+                        .automation_name("Remote move source")
+                        .text(format!(
+                            "{}@{}:{} · {}/{}",
+                            ssh.user,
+                            ssh.host,
+                            ssh.port,
+                            target.parent().trim_end_matches('/'),
+                            target.name(),
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
+                ),
+            );
+        } else if let EditAction::MoveBatch(origin, hits) = &dialog.action {
+            let subject = if hits.len() == 1 { "entry" } else { "entries" };
+            let source = match origin {
+                MoveOrigin::Listing(_) => format!(" · {}", dialog.parent.as_deref().unwrap_or("/")),
+                MoveOrigin::Search(_) => String::new(),
+            };
+            let paths = hits
+                .iter()
+                .map(|hit| match origin {
+                    MoveOrigin::Listing(_) => hit.name.clone(),
+                    MoveOrigin::Search(_) => {
+                        format!("{}/{}", hit.parent.trim_end_matches('/'), hit.name)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fields.insert(
+                0,
+                KeyedView::new(
+                    "move-sources",
+                    StackPanel::new().spacing(4.0).children((
+                        TextBlock::new()
+                            .text(format!(
+                                "{} {subject} on {}@{}:{}{source}",
+                                hits.len(),
+                                ssh.user,
+                                ssh.host,
+                                ssh.port
+                            ))
+                            .text_wrapping(TextWrapping::Wrap),
+                        ScrollViewer::new()
+                            .max_height(145.0)
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            .content(
+                                TextBlock::new()
+                                    .text(paths)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            ),
+                    )),
+                ),
+            );
+        }
+        if matches!(
+            dialog.action,
+            EditAction::Move(..) | EditAction::MoveBatch(..)
+        ) {
+            fields.push(KeyedView::new(
+                "browse-destination",
+                Button::new()
+                    .on_click(context.callback(move |_| {
+                        Message::Files(FileAction::MoveDestination(
+                            pane,
+                            generation,
+                            serial,
+                            destination::Action::Show,
+                        ))
+                    }))
+                    .content("Browse folders…"),
+            ));
+            fields.push(KeyedView::new(
+                "move-relative",
+                TextBlock::new()
+                    .text(format!(
+                        "Relative paths start in {}.",
+                        dialog.parent.as_deref().unwrap_or("/")
+                    ))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
         }
         if let EditAction::VerifyDownload(target) = &dialog.action {
             fields.insert(
@@ -1633,6 +1881,11 @@ impl FileDrawer {
                 ..
             }) => change_reconnect_status(change, reply),
             Some(Pending {
+                step: Step::MoveBatch(batch),
+                reply,
+                ..
+            }) => batch.reconnect_status(reply),
+            Some(Pending {
                 step: Step::Transfer(file),
                 reply,
                 transfer: Some(transfer),
@@ -1646,6 +1899,10 @@ impl FileDrawer {
                 }
                 status
             }
+            _ if self.move_listing_refresh.is_some() => format!(
+                "{} before SSH reconnected. Refresh to browse.",
+                self.move_listing_refresh.as_ref().unwrap().note,
+            ),
             _ => match &self.reveal {
                 Some(RevealTarget::Changed(change)) => format!(
                     "{} before SSH reconnected. Refresh to browse.",
@@ -1881,15 +2138,25 @@ impl FileDrawer {
                         ),
                     ),
                 )),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(6.0)
-                .children((
+            StackPanel::new().spacing(6.0).children((
+                button_pair(
                     button(
                         "New folder",
                         writable,
                         NewFolder(pane, generation, folder.into()),
                     ),
+                    button(
+                        "Move to folder…",
+                        writable
+                            && generation != 0
+                            && selected.is_some_and(|entry| {
+                                entry.kind != ListedKind::Unsupported
+                                    && entry_path(folder, &entry.name).is_ok()
+                            }),
+                        MoveEntry(pane, generation, FileTarget::Listed(listed(selected))),
+                    ),
+                ),
+                button_pair(
                     button(
                         "Rename…",
                         writable && selected.is_some_and(|e| entry_path(folder, &e.name).is_ok()),
@@ -1904,7 +2171,8 @@ impl FileDrawer {
                             }),
                         Delete(pane, generation, listed(selected)),
                     ),
-                )),
+                ),
+            )),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
@@ -2108,42 +2376,69 @@ impl FileDrawer {
                 )),
         );
         if let Some(marked) = &self.marked_downloads {
+            let (can_add, hidden) = self.listing_mark_summary(marked);
+            if hidden != 0 {
+                let noun = if hidden == 1 { "mark" } else { "marks" };
+                controls.push(
+                    TextBlock::new()
+                        .text(format!("{hidden} {noun} outside this filter"))
+                        .into(),
+                );
+            }
             controls.push(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(6.0)
-                    .children((
-                        Button::new()
-                            .automation_name("Download marked items")
-                            .is_enabled(writable && !marked.is_empty())
-                            .on_click(context.callback(move |_| {
-                                Message::Files(Pick(
-                                    pane,
-                                    generation,
-                                    revision,
-                                    TransferPicker::DownloadMarked,
-                                ))
-                            }))
-                            .content(
-                                TextBlock::new()
-                                    .text(format!("Download marked ({})…", marked.len())),
-                            ),
+                StackPanel::new().spacing(6.0).children((
+                    button_pair(
                         button(
-                            "Exit download selection",
-                            writable,
-                            SelectDownloads(pane, generation, revision, false),
+                            "Mark all matches",
+                            writable && can_add,
+                            BulkListingMarks(pane, generation, revision, SelectionChange::MarkAll),
                         ),
-                    )),
+                        button(
+                            "Clear marks",
+                            writable && !marked.is_empty(),
+                            BulkListingMarks(pane, generation, revision, SelectionChange::Clear),
+                        ),
+                    ),
+                    Button::new()
+                        .automation_name("Download marked items")
+                        .is_enabled(writable && !marked.is_empty())
+                        .on_click(context.callback(move |_| {
+                            Message::Files(Pick(
+                                pane,
+                                generation,
+                                revision,
+                                TransferPicker::DownloadMarked,
+                            ))
+                        }))
+                        .content(
+                            TextBlock::new().text(format!("Download marked ({})…", marked.len())),
+                        ),
+                    button(
+                        "Move marked entries…",
+                        writable && !marked.is_empty(),
+                        MoveMarked(pane, generation, revision),
+                    ),
+                    button(
+                        "Exit selection",
+                        writable,
+                        SelectDownloads(pane, generation, revision, false),
+                    ),
+                )),
             );
         } else {
             controls.push(button(
-                "Select downloads…",
+                "Select entries…",
                 writable,
                 SelectDownloads(pane, generation, revision, true),
             ));
         }
         if let Some(transfer) = self.transfer_controls(context) {
             controls.extend(transfer);
+        }
+        if let Some(stop) =
+            self.stop_move_batch_button(pane, MoveOrigin::Listing(revision), context)
+        {
+            controls.push(stop);
         }
         if let Some(preparation) = &self.preparing_drop {
             controls.push(button(
@@ -2247,7 +2542,7 @@ impl FileDrawer {
                     return KeyedView::new(
                         entry.name.as_str(),
                         CheckBox::new()
-                            .automation_name(format!("Mark {label} for download"))
+                            .automation_name(format!("Mark {label}"))
                             .is_enabled(ready && entry.can_mark_for_download())
                             .is_checked(marked.contains(&name))
                             .horizontal_alignment(HorizontalAlignment::Stretch)
@@ -2351,6 +2646,7 @@ impl FileDrawer {
         let timer = crate::ui_timer::RetryTimer::new(move || {
             tick.borrow().send(Message::Files(FileAction::Tick(id)));
         })?;
+        let move_picker = matches!(step, Step::MoveDestination(..));
         session
             .input
             .send(Command::Sftp(Job {
@@ -2361,10 +2657,16 @@ impl FileDrawer {
                     self.preview.as_ref().map(|p| p.cancel.clone())
                 } else if matches!(step, Step::Search(..)) {
                     self.search.as_ref().and_then(|p| p.cancel.clone())
+                } else if move_picker {
+                    self.dialog
+                        .as_ref()
+                        .and_then(|d| d.destination_picker.as_ref())
+                        .map(|p| p.cancel.clone())
                 } else {
                     transfer.as_ref().map(|active| active.cancel.clone())
                 },
-                deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
+                deadline: tokio::time::Instant::now()
+                    + Duration::from_secs(if move_picker { 30 } else { DEFAULT_TIMEOUT }),
                 reply: tx,
             }))
             .map_err(|_| anyhow!("SSH session has closed"))?;
@@ -2500,6 +2802,12 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::MoveDestination(serial, revision), reply) => {
+                self.finish_destination_listing(serial, revision, reply)
+            }
+            (Step::MoveBatch(batch), reply) => {
+                self.finish_move_batch(id, session, batch, reply, context)?
+            }
             (Step::Search(serial, note), reply) => {
                 self.finish_search(serial, reply, note.as_deref())
             }
@@ -2647,26 +2955,27 @@ impl FileDrawer {
             }
             (
                 Step::Change {
-                    change,
-                    search_origin: Some((serial, hit)),
-                    ..
-                },
-                Ok(_),
-            ) => {
-                self.search_change_completed(id, session, serial, hit, change, context)?;
-            }
-            (
-                Step::Change {
                     parent,
-                    change,
-                    search_origin: None,
+                    mut change,
+                    search_origin,
                 },
-                Ok(_),
+                Ok(reply),
             ) => {
+                if let EntryChange::Move { directory, .. } = &mut change
+                    && let Some(resolved) = reply["directory"].as_str()
+                {
+                    *directory = resolved.to_owned();
+                }
+                if let Some((serial, hit)) = search_origin {
+                    return self.search_change_completed(id, session, serial, hit, change, context);
+                }
                 self.status = change.completed();
                 // The old name no longer identifies the entry the user selected.
                 // If the follow-up listing fails, do not leave stale rows actionable.
-                if matches!(change, EntryChange::Rename { .. } | EntryChange::Delete(_)) {
+                if matches!(
+                    change,
+                    EntryChange::Rename { .. } | EntryChange::Move { .. } | EntryChange::Delete(_)
+                ) {
                     self.entries.clear();
                     self.matches.clear();
                     self.selected = None;
@@ -2941,15 +3250,22 @@ impl TerminalApp {
             | Choose(id, ..)
             | SelectDownloads(id, ..)
             | MarkDownload(id, ..)
+            | BulkListingMarks(id, ..)
             | CopyPath(id, ..)
             | Preview(id, ..)
             | ClosePreview(id, ..)
+            | ShowFullPreview(id, ..)
+            | MovePreviewMatch(id, ..)
             | CopyChecksum(id, ..)
             | VerifyChecksum(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
             | Rename(id, ..)
+            | MoveEntry(id, ..)
+            | MoveMarked(id, ..)
+            | StopMoves(id, ..)
+            | MoveDestination(id, ..)
             | VerifyDownload(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
@@ -3014,7 +3330,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | MoveMarked(_, g, ..) | StopMoves(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3025,7 +3341,7 @@ impl TerminalApp {
             }
             return;
         }
-        if matches!(&action, Filter(_, _, r, _) | ClearFilter(_, _, r) | FocusFilter(_, _, r, _) | EditFilter(_, _, r, _) | Page(_, _, r, _) | Sort(_, _, r, _) | SelectDownloads(_, _, r, _) if *r != files.listing_revision)
+        if matches!(&action, Filter(_, _, r, _) | ClearFilter(_, _, r) | FocusFilter(_, _, r, _) | EditFilter(_, _, r, _) | Page(_, _, r, _) | Sort(_, _, r, _) | SelectDownloads(_, _, r, _) | BulkListingMarks(_, _, r, _) if *r != files.listing_revision)
         {
             return;
         }
@@ -3140,6 +3456,10 @@ impl TerminalApp {
                     outcome = TransferOutcome::Cancelled;
                 }
                 ClosePreview(_, _, serial) => files.close_preview(serial),
+                ShowFullPreview(_, _, serial, full) => files.show_full_preview(serial, full),
+                MovePreviewMatch(_, _, serial, forward) => {
+                    files.move_preview_match(serial, forward)
+                }
                 CopyChecksum(_, _, serial) => {
                     if may_open_dialog {
                         files.copy_checksum(serial);
@@ -3306,7 +3626,9 @@ impl TerminalApp {
                 }
                 EditName(_, _, serial, name) => {
                     if let Some(dialog) = files.dialog.as_mut().filter(|e| {
-                        e.serial == serial && !matches!(e.action, EditAction::Delete(..))
+                        e.serial == serial
+                            && e.destination_picker.is_none()
+                            && !matches!(e.action, EditAction::Delete(..))
                     }) {
                         dialog.name = name;
                     }
@@ -3318,6 +3640,12 @@ impl TerminalApp {
                         dialog.resume_download = checked;
                     }
                 }
+                MoveDestination(_, _, serial, action) => {
+                    if may_open_dialog {
+                        files.move_destination(pane, serial, action, session, context)?;
+                    }
+                }
+                StopMoves(_, _, id) => files.stop_move_batch(id),
                 FinishEdit(_, _, serial, result) => {
                     if !may_open_dialog {
                         files.cancel_entry_dialog();
@@ -3325,6 +3653,7 @@ impl TerminalApp {
                     }
                     if let Some((
                         EntryDialog {
+                            serial: review_id,
                             parent,
                             name,
                             action,
@@ -3405,6 +3734,26 @@ impl TerminalApp {
                                     },
                                 )
                             }
+                            EditAction::Move(target, kind) => {
+                                let from = entry_path(target.parent(), target.name())?;
+                                files.status = format!("Moving {from} to {path}…");
+                                (
+                                    EntryChange::Move {
+                                        name: target.name().to_owned(),
+                                        directory: path.clone(),
+                                    },
+                                    Operation::MoveEntry {
+                                        from,
+                                        directory: path,
+                                        kind,
+                                        destination_is_canonical: false,
+                                    },
+                                )
+                            }
+                            EditAction::MoveBatch(origin, hits) => {
+                                let batch = move_batch::Batch::new(review_id, origin, hits, path)?;
+                                return files.start_move_batch(pane, session, batch, context);
+                            }
                             EditAction::Create => {
                                 files.status = format!("Creating folder {name}…");
                                 (
@@ -3417,8 +3766,8 @@ impl TerminalApp {
                             }
                         };
                         let parent = parent.context("Missing remote directory")?;
-                        let deleting_listed =
-                            search_origin.is_none() && matches!(change, EntryChange::Delete(_));
+                        let removing_listed = search_origin.is_none()
+                            && matches!(change, EntryChange::Delete(_) | EntryChange::Move { .. });
                         files.job(
                             pane,
                             session,
@@ -3430,7 +3779,7 @@ impl TerminalApp {
                             },
                             context,
                         )?;
-                        if deleting_listed {
+                        if removing_listed {
                             files.listing_revision = files.listing_revision.wrapping_add(1);
                             files.selected = None;
                         }
@@ -3510,6 +3859,10 @@ impl TerminalApp {
                     files.end_filter_edit();
                     files.begin_edit(entry.parent.clone(), EditAction::Rename(entry))?;
                 }
+                MoveEntry(_, _, target) if may_open_dialog => files.begin_move_entry(target)?,
+                MoveMarked(_, _, revision) if may_open_dialog => {
+                    files.begin_marked_move(MoveOrigin::Listing(revision))?;
+                }
                 VerifyDownload(_, _, entry) => {
                     if !may_open_dialog {
                         return Ok(());
@@ -3540,7 +3893,7 @@ impl TerminalApp {
                         }
                     }
                 }
-                NewFolder(..) | Rename(..) | Delete(..) => {}
+                NewFolder(..) | Rename(..) | MoveEntry(..) | MoveMarked(..) | Delete(..) => {}
                 Browse(_, _, path) => {
                     if files.directory.as_ref() != Some(&path) {
                         files.following = false;
@@ -3570,6 +3923,7 @@ impl TerminalApp {
                         files.set_download_mark(entry, checked);
                     }
                 }
+                BulkListingMarks(_, _, _, change) => files.bulk_listing_marks(change),
                 CopyPath(_, generation, revision, entry) => {
                     if generation == files.generation
                         && may_open_dialog
@@ -3656,7 +4010,12 @@ impl TerminalApp {
                         change.completed()
                     )
                 }
-                _ => format!("{error:#}"),
+                _ => match files.move_listing_refresh.take() {
+                    Some(refresh) => {
+                        format!("{}. Directory refresh failed: {error:#}", refresh.note)
+                    }
+                    None => format!("{error:#}"),
+                },
             };
             files.finish_transfer_queue();
             files.cached.borrow_mut().take();
@@ -4525,6 +4884,54 @@ mod tests {
                 .is_none()
         );
         assert!(drawer.directory.is_none());
+    }
+
+    #[test]
+    fn move_dialog_resolves_relative_paths_and_expires_with_the_source_listing() {
+        let source = ListedEntry {
+            parent: "/work".into(),
+            revision: 1,
+            name: "file".into(),
+            kind: ListedKind::Missing,
+        };
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 1,
+            directory: Some(source.parent.clone()),
+            listing_revision: source.revision,
+            entries: vec![Entry {
+                name: source.name.clone(),
+                kind: source.kind,
+                mtime: None,
+                size: None,
+            }],
+            selected: Some(source.name.clone()),
+            ..Default::default()
+        };
+        let target = FileTarget::Listed(source);
+        drawer.begin_move_entry(target.clone()).unwrap();
+        let dialog = drawer.dialog.as_mut().unwrap();
+        for bad in ["", "/work/", "bad\\name", "line\nfeed"] {
+            dialog.name = bad.into();
+            assert!(dialog.destination().is_err(), "{bad:?}");
+        }
+        dialog.name = "/".into();
+        assert_eq!(dialog.destination().unwrap(), "/");
+        dialog.name = "another folder/".into();
+        let (dialog, path) = drawer
+            .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/work/another folder");
+        assert!(matches!(dialog.action, EditAction::Move(_, None)));
+        drawer.begin_move_entry(target).unwrap();
+        drawer.dialog.as_mut().unwrap().name = "/archive".into();
+        drawer.listing_revision += 1;
+        assert!(
+            drawer
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+                .is_err()
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ $null = New-Item -ItemType Directory -Path (Join-Path $picker 'received')
 $peerRoot = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $readGate = Join-Path $peerRoot 'hold-transfer-read'
 $refreshGate = Join-Path $peerRoot 'hold-opendir'
+$renameGate = Join-Path $peerRoot 'hold-rename-reply'
 $profiles = Join-Path $State 'profiles.json'
 $account = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'
 $parent = '/shell directory'
@@ -277,7 +278,11 @@ try {
     Set-SearchChoice 'Search result type' 'All types'
     $contentLabel = 'File text contains'
     $fixtureText = Join-Path $peerRoot 'shell directory/nested/nested-content.txt'
-    [IO.File]::WriteAllText($fixtureText, "header`r`nFixture needle value`r`n")
+    $fixtureContents = "header`r`n" + ("unrelated line`r`n" * 40) +
+        "Context before`r`nFixture needle value`r`nContext after`r`n" +
+        ("later unrelated line`r`n" * 31) +
+        "second fixture needle`r`ncontext in between`r`nthird fixture needle`r`nlast line`r`n"
+    [IO.File]::WriteAllText($fixtureText, $fixtureContents)
     $contentField = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
     $contentField.GetCurrentPattern($value).SetValue('FIXTURE NEEDLE')
     $null = Wait-Until 'a content query enables search without a filename' {
@@ -287,12 +292,58 @@ try {
     $contentField.SetFocus()
     $null = Wait-Until 'file text field has keyboard focus' { $contentField.Current.HasKeyboardFocus }
     $null = Press-FocusedKey 13
-    $excerpt = 'Line 2 ' + [char]0xb7 + ' Fixture needle value'
+    $excerpt = 'Line 43 ' + [char]0xb7 + ' Fixture needle value'
     $null = Wait-Until 'content search displays the matching line and scan totals' {
         (Find-Element '1 matches in 2 folders. 42 text files inspected') -and
             (Find-Element $excerpt) -and (Button "Reveal $parent/nested/nested-content.txt")
     }
-    $contentField = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
+    $previewMatch = "Preview match $parent/nested/nested-content.txt"
+    [IO.File]::WriteAllText($fixtureText, "new first line`r`n$fixtureContents")
+    Click $previewMatch
+    $matchOne = 'Match 1 of 3 ' + [char]0xb7 + ' Line 44'
+    $matchTwo = 'Match 2 of 3 ' + [char]0xb7 + ' Line 77'
+    $matchThree = 'Match 3 of 3 ' + [char]0xb7 + ' Line 79'
+    $null = Wait-Until 'preview starts at the current matching line with context' {
+        $previous = Button 'Previous match'
+        $next = Button 'Next match'
+        (Find-Element $matchOne -Visible) -and
+            (Find-Element 'Fixture needle value' -Visible) -and
+            (Find-Element 'Context before' -Visible) -and
+            (Find-Element 'Context after' -Visible) -and !(Find-Element 'File contents') -and
+            $previous -and !$previous.Current.IsEnabled -and $next -and $next.Current.IsEnabled
+    }
+    Click 'Next match'
+    $null = Wait-Until 'the second matching line is visible' { Find-Element $matchTwo -Visible }
+    Click 'Next match'
+    $null = Wait-Until 'the last matching line disables Next match' {
+        $next = Button 'Next match'
+        (Find-Element $matchThree -Visible) -and $next -and !$next.Current.IsEnabled
+    }
+    Click 'Previous match'
+    $null = Wait-Until 'Previous match returns to the second line' { Find-Element $matchTwo -Visible }
+    Click 'Show full file'
+    $fullText = Wait-Until 'the full file is available without a second search' {
+        Find-Element 'File contents'
+    }
+    $actualText = $fullText.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+    if (!$actualText.StartsWith('new first line') -or !$actualText.Contains('last line')) {
+        throw 'The full preview omitted text outside the match context'
+    }
+    Click 'Back to match'
+    $null = Wait-Until 'the selected match is visible again' { Find-Element $matchTwo -Visible }
+    Click 'Close preview'
+    $null = Wait-Until 'the match preview closes' { !(Button 'Close preview') }
+    [IO.File]::WriteAllText($fixtureText, 'The file was changed.')
+    Click $previewMatch
+    $null = Wait-Until 'the stale search hit opens the current file with an explanation' {
+        (Find-Element 'The current file no longer matches the search.' -Visible) -and
+            (Find-Element 'File contents') -and !(Button 'Show full file')
+    }
+    Click 'Close preview'
+    $contentField = Wait-Until 'the changed file preview closes and restores the search field' {
+        $field = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
+        if (!(Button 'Close preview') -and $field -and $field.Current.IsEnabled) { $field }
+    }
     $contentField.GetCurrentPattern($value).SetValue('')
     $null = Wait-Until 'clearing the content query disables the empty search' {
         $run = Button 'Search'
@@ -378,7 +429,7 @@ try {
         (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
             !(Button "Reveal $fileOnPageTwo") -and !(Button "Reveal $newest")
     }
-    Click ('Select downloads' + [char]0x2026)
+    Click ('Select results' + [char]0x2026)
     Click 'Next results'
     $null = Wait-Until 'recursive results page two' {
         (Find-Element '2 / 2') -and (Button "Reveal $fileOnPageTwo")
@@ -567,7 +618,7 @@ try {
             [IO.File]::ReadAllText($folderItem) -ceq $contents -and
             (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled
     }
-    Click ('Select downloads' + [char]0x2026)
+    Click ('Select results' + [char]0x2026)
     (Wait-CheckBox "Mark $parent/nested/nested-content.txt" $off).Toggle()
     (Wait-CheckBox "Mark $parent/nested" $off).Toggle()
     Click "Reveal $parent/nested/nested-content.txt"
@@ -708,13 +759,295 @@ try {
     $null = Wait-Until 'listing remains at the revealed file after leaving the results' {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
+    $move = 'Move to folder' + [char]0x2026
+    $browseDestination = 'Browse folders' + [char]0x2026
+    $movedFile = Join-Path $peerRoot 'shell directory/nested-content.txt'
+    Click $move
+    $destination = Wait-Until 'the listed move shows the source and destination editor' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($field -and (Find-Element 'Remote move source')) { $field }
+    }
+    Click $browseDestination
+    $null = Wait-Until 'the picker starts in the containing folder without a move command' {
+        $use = Button 'Use this folder'
+        (Find-Element "$parent/nested" -Visible) -and (Find-Element 'No subfolders' -Visible) -and
+            $use -and !$use.Current.IsEnabled -and !(Button 'Move')
+    }
+    Click 'Parent folder'
+    $null = Wait-Until 'only folders appear in the parent destination listing' {
+        (Button 'Browse folder nested') -and !(Button 'Browse folder build-00.log') -and
+            (Button 'Use this folder').Current.IsEnabled
+    }
+    Click 'Use this folder'
+    $destination = Wait-Until 'the picked parent path can be reviewed before moving' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($field -and $field.GetCurrentPattern($value).Current.Value -ceq $parent) { $field }
+    }
+    if (![IO.File]::Exists($fixtureText) -or [IO.File]::Exists($movedFile)) {
+        throw 'Selecting the destination started a move before confirmation'
+    }
+    Click 'Move'
+    $null = Wait-Until 'the source listing refreshes without the moved entry' {
+        (Find-Element "Moved nested-content.txt to $parent") -and !(Button 'nested-content.txt') -and
+            [IO.File]::Exists($movedFile) -and ![IO.File]::Exists($fixtureText) -and
+            (Button 'Up').Current.IsEnabled
+    }
+    Click ('Go to folder' + [char]0x2026)
+    $folderPath = Wait-Until 'the folder navigation dialog accepts a path' {
+        Find-Element 'Remote folder path' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $folderPath.GetCurrentPattern($value).SetValue($parent)
+    Click 'Open'
+    $null = Wait-Until 'the destination listing is ready' {
+        (Find-Element $parent) -and (Button $filterAction).Current.IsEnabled
+    }
+    Click $filterAction
+    $listingFilter = Wait-Until 'the destination filename filter is available' { Filter-Edit }
+    $listingFilter.GetCurrentPattern($value).SetValue('nested-content.txt')
+    $null = Wait-Until 'the destination listing contains the moved entry on a later page' { Button 'nested-content.txt' }
+    Click 'Clear filter'
+    Click ('Find files' + [char]0x2026)
+    $field = Wait-FilenameSearchFocus
+    $field.GetCurrentPattern($value).SetValue('nested-content.txt')
+    Click 'Search'
+    Click "Move to folder $parent/nested-content.txt"
+    $destination = Wait-Until 'the search result offers its own destination editor' {
+        Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $destination.GetCurrentPattern($value).SetValue('missing destination')
+    Click $browseDestination
+    $null = Wait-Until 'a missing typed path keeps a way back to the move form' {
+        (Find-Element 'Destination browsing error' -Visible) -and
+            (Button 'Server root').Current.IsEnabled -and (Button 'Back to destination').Current.IsEnabled
+    }
+    Click 'Back to destination'
+    $destination = Wait-Until 'back preserves the typed path' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($field -and $field.GetCurrentPattern($value).Current.Value -ceq 'missing destination') { $field }
+    }
+    $destination.GetCurrentPattern($value).SetValue('')
+    $null = Wait-Until 'clearing the typed path takes effect' { !(Button 'Move').Current.IsEnabled }
+    Click $browseDestination
+    Click 'Browse folder nested'
+    Click 'Use this folder'
+    $null = Wait-Until 'the picked child path is filled in for review' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        $field -and $field.GetCurrentPattern($value).Current.Value -ceq "$parent/nested"
+    }
+    Click 'Move'
+    $null = Wait-Until 'the running search follows the entry to its new path' {
+        (Find-Element "Moved nested-content.txt to $parent/nested. 1 matches in 2 folders") -and
+            (Button "Reveal $parent/nested/nested-content.txt") -and !(Button "Reveal $parent/nested-content.txt") -and
+            [IO.File]::Exists($fixtureText) -and ![IO.File]::Exists($movedFile)
+    }
+    if ([IO.File]::ReadAllText($fixtureText) -cne $contents) {
+        throw 'Moving the entry changed its contents'
+    }
+    $archive = Join-Path $peerRoot 'move archive'
+    $null = New-Item -ItemType Directory -Path $archive
+    $movedFirst = Join-Path $archive 'build-00.log'
+    $collision = Join-Path $archive 'build-36.log'
+    $movedLast = Join-Path $archive 'build-37.log'
+    [IO.File]::WriteAllText($collision, 'keep the existing destination')
+    $sourceFirst = Join-Path $peerRoot 'shell directory/build-00.log'
+    $sourceSecond = Join-Path $peerRoot 'shell directory/build-36.log'
+    $sourceLast = Join-Path $peerRoot 'shell directory/build-37.log'
+    [IO.File]::WriteAllText($sourceFirst, 'first marked entry')
+    [IO.File]::WriteAllText($sourceSecond, 'second marked entry')
+    [IO.File]::WriteAllText($sourceLast, 'last marked entry')
+    Focus-FilenameSearch
+    $field = Wait-FilenameSearchFocus
+    $field.GetCurrentPattern($value).SetValue('build-')
+    Click 'Search'
+    $null = Wait-Until 'the marked move starts with paginated results' {
+        (Find-Element '38 matches in 2 folders') -and (Button "Reveal $parent/build-00.log")
+    }
+    Click ('Select results' + [char]0x2026)
+    Click 'Mark all results'
+    $null = Wait-CheckBox "Mark $parent/build-00.log" $on
+    Click 'Next results'
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $on
+    Click 'Clear marks'
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $off
+    Click 'Previous results'
+    (Wait-CheckBox "Mark $parent/build-00.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-00.log" $on
+    Click 'Next results'
+    (Wait-CheckBox "Mark $parent/build-36.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-36.log" $on
+    (Wait-CheckBox "Mark $parent/build-37.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $on
+    $moveMarked = 'Move marked results' + [char]0x2026
+    Click $moveMarked
+    $destination = Wait-Until 'the reviewed batch contains all three marked files' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "3 entries on $($account.user)@$($account.host):$($account.port)")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click $browseDestination
+    $null = Wait-Until 'the batch picker opens the typed destination' { Find-Element '/move archive' -Visible }
+    Click 'Use this folder'
+    Click 'Move'
+    $partialStatus = "Moved 1 of 3 marked entries to /move archive. Stopped at $parent/build-36.log. SFTP: Move was not started: An entry with that name already exists. 37 matches in 2 folders"
+    $null = Wait-Until 'a partial move reports its confirmed count and stops at the collision' {
+        (Find-Element $partialStatus) -and [IO.File]::Exists($movedFirst) -and
+            ![IO.File]::Exists($sourceFirst) -and [IO.File]::Exists($sourceSecond) -and
+            [IO.File]::Exists($sourceLast) -and ![IO.File]::Exists($movedLast)
+    }
+    if ([IO.File]::ReadAllText($collision) -cne 'keep the existing destination' -or
+        [IO.File]::ReadAllText($movedFirst) -cne 'first marked entry') {
+        throw 'The batch changed an existing destination or failed to preserve the first file'
+    }
+    $null = Wait-CheckBox "Mark $parent/build-36.log" $on
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $on
+    [IO.File]::Delete($collision)
+    Click $moveMarked
+    $destination = Wait-Until 'only the remaining files are included in a fresh review' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "2 entries on $($account.user)@$($account.host):$($account.port)")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click 'Move'
+    $null = Wait-Until 'the second batch completes using the remaining marks' {
+        (Find-Element 'Moved 2 of 2 marked entries to /move archive. 35 matches in 2 folders') -and
+            ![IO.File]::Exists($sourceSecond) -and ![IO.File]::Exists($sourceLast) -and
+            [IO.File]::Exists($collision) -and [IO.File]::Exists($movedLast)
+    }
+    if ([IO.File]::ReadAllText($collision) -cne 'second marked entry' -or
+        [IO.File]::ReadAllText($movedLast) -cne 'last marked entry') {
+        throw 'Retrying the remaining marks changed their contents'
+    }
+    Click 'Previous results'
+    (Wait-CheckBox "Mark $parent/build-01.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-01.log" $on
+    (Wait-CheckBox "Mark $parent/build-02.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-02.log" $on
+    $stoppedFirst = Join-Path $archive 'build-01.log'
+    $stoppedSecond = Join-Path $archive 'build-02.log'
+    $remainingSource = Join-Path $peerRoot 'shell directory/build-02.log'
+    [IO.File]::WriteAllBytes($renameGate, [byte[]]@())
+    Click $moveMarked
+    $destination = Wait-Until 'the stop fixture reviews its two marked moves' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "2 entries on $($account.user)@$($account.host):$($account.port)")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click 'Move'
+    $stop = 'Stop after current move'
+    $null = Wait-Until 'first rename applied on the server with its acknowledgement withheld' {
+        [IO.File]::Exists($stoppedFirst) -and (Button $stop).Current.IsEnabled -and
+            (Find-Element ('Moving marked entry 1 of 2' + [char]0x2026))
+    }
+    Click $stop
+    $null = Wait-Until 'the current move is still pending and cannot be stopped twice' {
+        $stopping = Button ('Stopping after current move' + [char]0x2026)
+        $stopping -and !$stopping.Current.IsEnabled -and [IO.File]::Exists($remainingSource) -and
+            ![IO.File]::Exists($stoppedSecond)
+    }
+    [IO.File]::Delete($renameGate)
+    $null = Wait-Until 'the confirmed move remains and the second entry stays at its source' {
+        (Find-Element 'Moved 1 of 2 marked entries to /move archive. Stopped after the current move. 34 matches in 2 folders') -and
+            (Button "Reveal $parent/build-02.log") -and !(Button "Reveal $parent/build-01.log") -and
+            [IO.File]::Exists($stoppedFirst) -and [IO.File]::Exists($remainingSource) -and
+            ![IO.File]::Exists($stoppedSecond)
+    }
+    $null = Wait-CheckBox "Mark $parent/build-02.log" $on
+    Click 'Back to files'
+    Click ('Select entries' + [char]0x2026)
+    (Wait-CheckBox 'Mark nested/' $off).Toggle()
+    $null = Wait-CheckBox 'Mark nested/' $on
+    Click $filterAction
+    $field = Wait-Until 'the listing filter is ready for bulk marking' {
+        $inputField = Filter-Edit
+        if ($inputField -and $inputField.Current.HasKeyboardFocus) { $inputField }
+    }
+    $field.GetCurrentPattern($value).SetValue('build-')
+    $null = Wait-Until 'the listing reports the mark hidden by the filter' {
+        (Find-Element '1 mark outside this filter') -and !(Find-Element 'Mark nested/')
+    }
+    Click 'Mark all matches'
+    $null = Wait-CheckBox 'Mark build-04.log' $on
+    Click 'Next'
+    $null = Wait-CheckBox 'Mark build-35.log' $on
+    $null = Wait-Until 'mark all is disabled after marking every filtered entry' {
+        $markAll = Button 'Mark all matches'
+        $markAll -and !$markAll.Current.IsEnabled -and (Find-Element '1 mark outside this filter')
+    }
+    Click 'Clear marks'
+    $null = Wait-CheckBox 'Mark build-35.log' $off
+    Click 'Clear filter'
+    $null = Wait-CheckBox 'Mark nested/' $off
+    $null = Wait-Until 'clearing marks leaves selection mode open with no hidden marks' {
+        (Button 'Exit selection').Current.IsEnabled -and !(Find-Element '1 mark outside this filter')
+    }
+    (Wait-CheckBox 'Mark build-03.log' $off).Toggle()
+    $null = Wait-CheckBox 'Mark build-03.log' $on
+    Click 'Next'
+    (Wait-CheckBox 'Mark build-34.log' $off).Toggle()
+    $null = Wait-CheckBox 'Mark build-34.log' $on
+    $listedMove = 'Move marked entries' + [char]0x2026
+    $listedReview = "$($account.user)@$($account.host):$($account.port) " + [char]0xb7 + " $parent"
+    $listedFirst = Join-Path $archive 'build-03.log'
+    $listedLast = Join-Path $archive 'build-34.log'
+    $listedRemaining = Join-Path $peerRoot 'shell directory/build-34.log'
+    Click $listedMove
+    $destination = Wait-Until 'the listed batch reviews both pages of marks' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "2 entries on $listedReview")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click $browseDestination
+    $null = Wait-Until 'the listed batch can browse the typed destination' { Find-Element '/move archive' -Visible }
+    Click 'Use this folder'
+    [IO.File]::WriteAllBytes($renameGate, [byte[]]@())
+    Click 'Move'
+    $null = Wait-Until 'the listed batch exposes Stop during the held rename' {
+        [IO.File]::Exists($listedFirst) -and (Button $stop).Current.IsEnabled
+    }
+    Click $stop
+    $null = Wait-Until 'the listed batch is stopping' {
+        $stopping = Button ('Stopping after current move' + [char]0x2026)
+        $stopping -and !$stopping.Current.IsEnabled
+    }
+    [IO.File]::Delete($renameGate)
+    $null = Wait-Until 'the refreshed listing reports a stopped batch' {
+        (Find-Element 'Moved 1 of 2 marked entries to /move archive. Stopped after the current move') -and
+            (Button $listedMove).Current.IsEnabled -and [IO.File]::Exists($listedRemaining) -and
+            ![IO.File]::Exists($listedLast)
+    }
+    $null = Wait-CheckBox 'Mark build-34.log' $on
+    Click $listedMove
+    $destination = Wait-Until 'the listed batch reviews just the untouched entry' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "1 entry on $listedReview")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click 'Move'
+    $null = Wait-Until 'retrying the remaining listed mark completes and clears it' {
+        (Find-Element 'Moved 1 of 1 marked entries to /move archive') -and
+            !(Button $listedMove).Current.IsEnabled -and [IO.File]::Exists($listedLast) -and
+            ![IO.File]::Exists($listedRemaining)
+    }
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','filter-ssh-ready')
+} catch {
+    throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
     [IO.File]::Delete($readGate)
     [IO.File]::Delete($refreshGate)
+    [IO.File]::Delete($renameGate)
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

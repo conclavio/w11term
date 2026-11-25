@@ -2994,6 +2994,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     fs::write(&keyboard, []).unwrap();
     fs::write(&wire, []).unwrap();
     fs::write(remote.path().join("delete-trace.jsonl"), []).unwrap();
+    fs::write(remote.path().join("rename-trace.jsonl"), []).unwrap();
 
     let state = tempfile::tempdir().unwrap();
     fs::write(
@@ -3052,11 +3053,75 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 1), // Cancelled during the first page.
             ("/shell directory/nested", 2),
+            ("/shell directory/nested", 2), // Browse from the listed entry's containing folder.
+            ("/shell directory", fillers + 5), // The picker visits the parent.
+            ("/shell directory/nested", 1), // The listed file moved up one folder.
+            ("/shell directory", fillers + 6), // Browse to the destination.
+            ("/shell directory", fillers + 6), // Find the moved file at its new path.
+            ("/shell directory/nested", 1),
+            ("/shell directory/missing destination", 0), // The typed path is unavailable.
+            ("/shell directory", fillers + 6), // Reopen the picker at the search hit's parent.
+            ("/shell directory/nested", 1),    // The picker visits the child folder.
+            ("/shell directory", fillers + 5), // Moving from search rescans the same root.
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // Find entries on both results pages before a batch move.
+            ("/shell directory/nested", 2),
+            ("/move archive", 2), // Inspect the destination containing a colliding file.
+            ("/shell directory", fillers + 4), // One confirmed move before the collision.
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 2), // The remaining two confirmed moves.
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 1), // Stop after the current move refreshes once.
+            ("/shell directory/nested", 2),
+            ("/move archive", 5), // Choose a destination from the regular listing.
+            ("/shell directory", fillers), // Stopping preserves the remaining listing mark.
+            ("/shell directory", fillers - 1), // Finish by moving the remaining mark.
         ]
     );
     assert_eq!(
         super::remove::trace(remote.path()),
         [["REMOVE", "/shell directory/nested-renamed.txt"]]
+    );
+    assert_eq!(
+        mutation_trace(remote.path(), "rename-trace.jsonl"),
+        [
+            [
+                "/shell directory/nested-added.txt",
+                "/shell directory/nested-renamed.txt"
+            ],
+            [
+                "/shell directory/nested/nested-content.txt",
+                "/shell directory/nested-content.txt"
+            ],
+            [
+                "/shell directory/nested-content.txt",
+                "/shell directory/nested/nested-content.txt"
+            ],
+            [
+                "/shell directory/build-00.log",
+                "/move archive/build-00.log"
+            ],
+            [
+                "/shell directory/build-36.log",
+                "/move archive/build-36.log"
+            ],
+            [
+                "/shell directory/build-37.log",
+                "/move archive/build-37.log"
+            ],
+            [
+                "/shell directory/build-01.log",
+                "/move archive/build-01.log"
+            ],
+            [
+                "/shell directory/build-03.log",
+                "/move archive/build-03.log"
+            ],
+            [
+                "/shell directory/build-34.log",
+                "/move archive/build-34.log"
+            ],
+        ]
     );
     assert_eq!(
         fs::read(keyboard).unwrap(),
