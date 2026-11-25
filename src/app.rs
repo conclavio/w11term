@@ -3511,6 +3511,9 @@ impl TerminalApp {
             text_export::SCROLLBACK_LABEL => {
                 Message::Export(text_export::Action::StartScrollback(pane))
             }
+            label if let Some(destination) = text_export::ImageDestination::from_label(label) => {
+                Message::Export(text_export::Action::StartPaneImage(pane, destination))
+            }
             value if recordings::is_command(value) => recordings::invoke(recordings.target(value)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
             "Paste" => Message::Clipboard(clipboard_paste::Action::Start(paste, false)),
@@ -4159,6 +4162,18 @@ impl TerminalApp {
                 "save-scrollback",
                 text_export::SCROLLBACK_LABEL,
                 self.export.pending.is_none(),
+            ));
+            let can_capture =
+                self.export.pending.is_none() && !live.browsing_sessions() && !live.device_busy;
+            items.push(command_menu_item(
+                "copy-pane-image",
+                text_export::COPY_PANE_IMAGE_LABEL,
+                can_capture,
+            ));
+            items.push(command_menu_item(
+                "save-pane-image",
+                text_export::SAVE_PANE_IMAGE_LABEL,
+                can_capture,
             ));
             let clear = KeyAction::ClearScrollback.binding();
             items.push(self.binding_menu_enabled(

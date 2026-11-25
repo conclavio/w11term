@@ -27,6 +27,7 @@ pub(super) enum Purpose {
     DownloadFolder,
     Save(String),
     Scrollback,
+    PaneImage,
     CommandOutput(String),
     GroupReport(String),
     SshLoginReport(String),
@@ -305,6 +306,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 None
             }
             Purpose::Scrollback
+            | Purpose::PaneImage
             | Purpose::CommandOutput(_)
             | Purpose::GroupReport(_)
             | Purpose::SshLoginReport(_)
@@ -319,6 +321,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                     options |= FOS_DONTADDTORECENT;
                 }
                 let (title, suggestion, extension) = match &purpose {
+                    Purpose::PaneImage => (w!("Save pane image"), "terminal.png", w!("png")),
                     Purpose::CommandOutput(suggestion) => (
                         w!("Save command output as text"),
                         suggestion.as_str(),

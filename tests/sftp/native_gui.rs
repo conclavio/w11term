@@ -2445,7 +2445,7 @@ async fn native_terminal_progress_updates_background_tab_and_resets_on_reconnect
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "exports a live SSH pane through the native Save dialog beside a PowerShell split"]
+#[ignore = "exports SSH scrollback and a pane image with the native Save dialog beside PowerShell"]
 async fn native_scrollback_export_saves_the_selected_pane_and_respects_cancel_and_replace() {
     let (Source::Ssh(ssh), _remote, opens, server) = fixture_connections(false, 1).await else {
         unreachable!()
@@ -2477,6 +2477,16 @@ async fn native_scrollback_export_saves_the_selected_pane_and_respects_cancel_an
     assert_eq!(fs::read(directory.join("cancel.txt")).unwrap(), sentinel);
     let replaced = fs::read_to_string(directory.join("replace.txt")).unwrap();
     assert_eq!(replaced, format!("{expected}arrived-after-picker"));
+    let before_picker = image::open(directory.join("reference.png"))
+        .unwrap()
+        .into_rgba8();
+    let saved_image = image::open(directory.join("captured.png"))
+        .unwrap()
+        .into_rgba8();
+    assert!(
+        before_picker == saved_image,
+        "the saved image must match the grid captured before the file picker opened"
+    );
     assert_eq!(opens.load(Ordering::Relaxed), 1, "one live SSH shell");
     server.abort();
 }

@@ -27,35 +27,36 @@ function Dialog-Control($Dialog, $Type, [string]$AutomationId) {
     return $Dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
         [System.Windows.Automation.AndCondition]::new($byType, $byId))
 }
-function Open-Export([switch]$Menu) {
+function Open-Export([switch]$Menu, [string]$ActionLabel = $label, [string]$Title = 'Save scrollback as text') {
     if ($Menu) {
         Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
         $sub = Wait-Until 'Panes submenu' { Find-Element 'Panes' ([System.Windows.Automation.ControlType]::MenuItem) }
         $sub.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-        Invoke-Button (Wait-Until 'export action in Panes' { Find-Element $label })
+        Invoke-Button (Wait-Until 'export action in Panes' { Find-Element $ActionLabel })
     } else {
-        $field = Open-Palette $label
-        $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($label)
-        $entry = Wait-Until 'enabled export action in palette' {
-            $button = Find-Element $label ([System.Windows.Automation.ControlType]::Button)
-            if ($button -and $button.Current.IsEnabled) { return $button }
-        }
-        Invoke-Button $entry
+        Run-Palette $ActionLabel -Enter
     }
     try {
-        return Wait-Until 'native save dialog on the fixture window' { Owned-Dialog $window 'Save scrollback as text' }
+        return Wait-Until 'native save dialog on the fixture window' { Owned-Dialog $window $Title }
     } catch {
         $visible = foreach ($h in [FixtureDialog]::Windows($app.Id)) {
             $el = [System.Windows.Automation.AutomationElement]::FromHandle($h)
             "$h '$($el.Current.Name)' $($el.Current.ClassName) owned by $([FixtureDialog]::GetWindow($h,4))"
         }
-        throw "$_ Fixture HWND $window. Visible fixture windows: $($visible -join ', ')"
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $status = foreach ($node in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition)) {
+            if ($node.Current.Name -match '^Could not save |^The image of pane |^Search commands$') {
+                $node.Current.Name
+            }
+        }
+        throw "$_ Fixture HWND $window. Visible fixture windows: $($visible -join ', '). Status: $($status -join '; ')"
     }
 }
-function Set-Filename($Dialog, [string]$Path) {
+function Set-Filename($Dialog, [string]$Path, [string]$Suggestion = 'terminal.txt') {
     $handle = [IntPtr]::new($Dialog.Current.NativeWindowHandle)
-    $null = Wait-Until 'editable suggested filename terminal.txt' {
-        [FixtureDialog]::SetFilename($handle, $Path)
+    $null = Wait-Until 'editable suggested filename' {
+        [FixtureDialog]::SetFilename($handle, $Path, $Suggestion)
     }
 }
 function Click-DialogButton($Dialog, [string]$Id) {
@@ -78,8 +79,8 @@ function Click-DialogButton($Dialog, [string]$Id) {
         }
     }
 }
-function Wait-Saved([string]$Path) {
-    $prefix = "Saved scrollback for pane $remote to "
+function Wait-Saved([string]$Path, [string]$Subject = 'scrollback for pane') {
+    $prefix = "Saved $Subject $remote to "
     $buttons = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -94,7 +95,7 @@ function Wait-Saved([string]$Path) {
                     # in casing, DOS aliases, or the spelling of the user's profile path.
                     return [FixtureDialog]::SameFile($Path, $name.Substring($prefix.Length))
                 }
-                if ($name.StartsWith('Could not save scrollback')) { $exportEvidence.Status = $name }
+                if ($name.StartsWith("Could not save $Subject")) { $exportEvidence.Status = $name }
             }
         }
     } catch {
@@ -168,6 +169,17 @@ try {
     Wait-Saved $replacement
     foreach ($c in 'remote-resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','remote-resumed')
+
+    $reference = Join-Path $State 'reference.png'
+    $savedImage = Join-Path $State 'captured.png'
+    $null = Control @('screenshot','--pane',"$remote",$reference)
+    $dialog = Open-Export -ActionLabel ('Save pane image' + [char]0x2026) -Title 'Save pane image'
+    $late = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("`r`nimage-arrived-after-picker`r`n"))
+    $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64',$late)
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','image-arrived-after-picker')
+    Set-Filename $dialog $savedImage 'terminal.png'
+    Click-DialogButton $dialog '1'
+    Wait-Saved $savedImage 'image of pane'
     Picker-Query 'Palette PowerShell'
     Press-Key 13
     Wait-Focus $local

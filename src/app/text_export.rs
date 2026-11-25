@@ -3,6 +3,8 @@ use std::{fs::File, io, io::Write, path::PathBuf};
 use tokio::sync::oneshot;
 
 pub(super) const SCROLLBACK_LABEL: &str = "Save scrollback as text…";
+pub(super) const COPY_PANE_IMAGE_LABEL: &str = "Copy pane as image";
+pub(super) const SAVE_PANE_IMAGE_LABEL: &str = "Save pane image…";
 pub(super) const COMMAND_OUTPUT_LABEL: &str = "Save output as text…";
 pub(super) const GROUP_REPORT_LABEL: &str = "Save results…";
 pub(super) const GROUP_JSON_LABEL: &str = "Save results as JSON…";
@@ -14,6 +16,7 @@ pub use w11term::control::SshGroupReportFormat as GroupReportFormat;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {
     Scrollback(u64),
+    PaneImage(u64),
     CommandOutput {
         pane: u64,
         command: u64,
@@ -47,6 +50,7 @@ impl Subject {
     fn label(self) -> String {
         match self {
             Self::Scrollback(pane) => format!("scrollback for pane {pane}"),
+            Self::PaneImage(pane) => format!("image of pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
             Self::HostGroupResults { format, shown, .. } => {
                 let scope = if shown { "shown " } else { "" };
@@ -70,6 +74,7 @@ impl Subject {
     fn picker(self) -> file_picker::Purpose {
         match self {
             Self::Scrollback(_) => file_picker::Purpose::Scrollback,
+            Self::PaneImage(_) => file_picker::Purpose::PaneImage,
             Self::CommandOutput { pane, command } => {
                 file_picker::Purpose::CommandOutput(format!("pane-{pane}-command-{command}.txt"))
             }
@@ -128,14 +133,43 @@ pub(super) struct Export {
 
 pub enum Action {
     StartScrollback(Option<u64>),
+    StartPaneImage(Option<u64>, ImageDestination),
+    CopiedPaneImage(Subject, Result<bool, String>),
     Captured(u64, Result<String, String>),
     Finished(Subject, Result<Option<PathBuf>, String>),
     Dismiss,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageDestination {
+    Clipboard,
+    File,
+}
+
+impl ImageDestination {
+    pub(super) fn from_label(label: &str) -> Option<Self> {
+        match label {
+            COPY_PANE_IMAGE_LABEL => Some(Self::Clipboard),
+            SAVE_PANE_IMAGE_LABEL => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
 impl TerminalApp {
     pub(super) fn handle_text_export(&mut self, action: Action, context: &ComponentContext<Self>) {
         match action {
+            Action::StartPaneImage(Some(pane), destination) if self.export.pending.is_none() => {
+                self.export_pane_image(pane, destination, context);
+            }
+            Action::CopiedPaneImage(subject, result) if self.export.pending == Some(subject) => {
+                self.export.pending = None;
+                self.export.status = Some(match result {
+                    Ok(true) => format!("Copied {} to the clipboard", subject.label()),
+                    Ok(false) => "Clipboard changed while capturing the pane image".into(),
+                    Err(error) => format!("Could not copy {}. {error}", subject.label()),
+                });
+            }
             Action::StartScrollback(Some(pane)) if self.export.pending.is_none() => {
                 // Use the pane named by the rendered action. Never resolve the active pane again.
                 let live = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id));
@@ -189,6 +223,66 @@ impl TerminalApp {
             }
             Action::Dismiss => self.export.status = None,
             _ => {}
+        }
+    }
+
+    fn export_pane_image(
+        &mut self,
+        pane: u64,
+        destination: ImageDestination,
+        context: &ComponentContext<Self>,
+    ) {
+        let subject = Subject::PaneImage(pane);
+        let frame = self
+            .tab_for_pane(pane)
+            .and_then(|id| match &self.tabs.get(id)?.page {
+                Page::Terminal(tab) if !tab.browsing_sessions() && !tab.device_busy => {
+                    Some(tab.session.frames.load())
+                }
+                _ => None,
+            });
+        let Some(frame) = frame else {
+            self.export.status = Some(format!("The image of pane {pane} is unavailable"));
+            return;
+        };
+        // Freeze the displayed viewport and appearance before showing the Save dialog.
+        let appearance = self.appearance.read().unwrap().clone();
+        let render = move || crate::renderer::render_grid(&frame, frame.size, &appearance);
+        match destination {
+            ImageDestination::File => self.begin_text_export(
+                subject,
+                move |file| {
+                    crate::renderer::write_grid_png(file, render().map_err(io::Error::other)?)
+                },
+                context,
+            ),
+            ImageDestination::Clipboard => {
+                self.export.pending = Some(subject);
+                self.export.status = None;
+                let sequence = w11term::clipboard::sequence();
+                context.spawn_background_with_rejection(
+                    move |cancel| {
+                        let copy = || -> anyhow::Result<bool> {
+                            if cancel.is_cancelled() {
+                                return Ok(false);
+                            }
+                            let grid = render()?;
+                            if cancel.is_cancelled() {
+                                return Ok(false);
+                            }
+                            w11term::clipboard::write_image_if_sequence(grid, sequence)
+                        };
+                        Message::Export(Action::CopiedPaneImage(
+                            subject,
+                            copy().map_err(|error| format!("{error:#}")),
+                        ))
+                    },
+                    Message::Export(Action::CopiedPaneImage(
+                        subject,
+                        Err("Pane image capture is unavailable".into()),
+                    )),
+                );
+            }
         }
     }
 
