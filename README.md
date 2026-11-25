@@ -395,6 +395,8 @@ If a drawer transfer finishes while another pane is active or the drawer is clos
 
 Open **SFTP transfers** from the caret menu or command palette to see active drawer uploads and downloads across the current window. The tab shows the current item and byte progress for each transfer. Cancel a transfer from the list or use **Open SFTP drawer** to visit its pane.
 
+**Recent transfers** keeps the last 20 results from open panes in that window, newest first. Each result shows its outcome and the original transfer message. Downloads with saved items offer an Explorer action for the saved file or folder.
+
 Scripts can list, cancel, and wait for drawer transfers with `w11term-cli sftp list-transfers`, `cancel-transfer`, and `wait-transfer`. [SFTP control commands](CONTROL.md#control-drawer-transfers)
 
 After a file or folder is saved, choose **Show download in File Explorer** in the drawer or beside its inbox result to select it. Use **Open download folder** for a batch that saved at least one item. Each inbox result keeps its own destination so you can find earlier downloads.

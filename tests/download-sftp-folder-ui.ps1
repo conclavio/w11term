@@ -252,6 +252,8 @@ try {
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','folder-download-live')
     Click 'Attention inbox, 0 unread'
     Assert-Explorer "Open download folder for palette-ssh, notice $($events[0].sequence)" 'explore' (Join-Path $State 'picker/batch background')
+    Run-Palette 'SFTP transfers'
+    Assert-Explorer "Open download folder for transfer $($results[1].data.transfer_id)" 'explore' (Join-Path $State 'picker/batch background conflict')
 } catch {
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
     throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"

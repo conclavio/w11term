@@ -1408,11 +1408,7 @@ impl FileDrawer {
                 .transfer_stamp()
                 .is_none_or(|(current, _)| current != id)
         {
-            let saved = self
-                .last_download
-                .as_ref()
-                .filter(|_| download && background)
-                .cloned();
+            let saved = self.last_download.as_ref().filter(|_| download).cloned();
             session
                 .events
                 .sftp_transfer_finished(id, outcome, &self.status, saved, background);

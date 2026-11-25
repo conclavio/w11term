@@ -34,6 +34,7 @@ pub use ssh_attempt::{PendingSshAttempt, SshAttemptCompletion, SshAttemptOutcome
 
 const CAPACITY: usize = 4096;
 const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);
+pub const RECENT_SFTP_TRANSFER_LIMIT: usize = 20;
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
     pub sequence: u64,
@@ -53,6 +54,15 @@ pub enum SavedDownload {
     File(Arc<Path>),
     Folder(Arc<Path>),
     BatchFolder(Arc<Path>),
+}
+
+#[derive(Clone, Debug)]
+pub struct RecentSftpTransfer {
+    pub id: TransferId,
+    pub finished_at: Instant,
+    pub outcome: TransferOutcome,
+    pub message: Arc<str>,
+    pub saved_download: Option<SavedDownload>,
 }
 
 #[derive(Default)]
@@ -106,6 +116,7 @@ struct State {
     next: u64,
     events: VecDeque<Event>,
     active_sftp_transfer: Option<TransferId>,
+    recent_sftp_transfers: VecDeque<RecentSftpTransfer>,
     progress: wezterm_term::Progress,
     program_status: Option<Arc<wezterm_term::ProgramStatus>>,
     recording: Option<(u64, Arc<Path>)>,
@@ -843,6 +854,16 @@ impl Events {
         if state.active_sftp_transfer == Some(transfer_id) {
             state.active_sftp_transfer = None;
         }
+        if state.recent_sftp_transfers.len() == RECENT_SFTP_TRANSFER_LIMIT {
+            state.recent_sftp_transfers.pop_front();
+        }
+        state.recent_sftp_transfers.push_back(RecentSftpTransfer {
+            id: transfer_id,
+            finished_at: Instant::now(),
+            outcome,
+            message: Arc::from(message.as_str()),
+            saved_download: saved_download.clone(),
+        });
         Self::append_locked(
             &mut state,
             "sftp-transfer",
@@ -854,6 +875,17 @@ impl Events {
         );
         drop(state);
         self.changed.notify_waiters();
+    }
+
+    pub fn recent_sftp_transfers(&self) -> Vec<RecentSftpTransfer> {
+        self.state
+            .lock()
+            .unwrap()
+            .recent_sftp_transfers
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
     }
 
     pub fn sftp_transfer_started(&self, transfer_id: TransferId) {
@@ -1007,6 +1039,45 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_sftp_results_keep_the_latest_transfers_independently_of_other_events() {
+        let events = Events::default();
+        let last = RECENT_SFTP_TRANSFER_LIMIT as u64 + 1;
+        let saved = SavedDownload::File(Arc::from(Path::new("download.txt")));
+        for serial in 1..=last {
+            let id = TransferId {
+                pane: 5,
+                generation: 2,
+                serial,
+            };
+            events.sftp_transfer_started(id);
+            if serial == last {
+                assert_eq!(events.recent_sftp_transfers()[0].id.serial, last - 1);
+            }
+            events.sftp_transfer_finished(
+                id,
+                TransferOutcome::Completed,
+                "downloaded",
+                Some(saved.clone()),
+                serial % 2 == 0,
+            );
+        }
+        for _ in 0..CAPACITY {
+            events.push("title", Value::Null);
+        }
+        let results = events.recent_sftp_transfers();
+        assert_eq!(results.len(), RECENT_SFTP_TRANSFER_LIMIT);
+        assert!(
+            results
+                .iter()
+                .map(|result| result.id.serial)
+                .eq((2..=last).rev())
+        );
+        assert_eq!(results[0].outcome, TransferOutcome::Completed);
+        assert_eq!(&*results[0].message, "downloaded");
+        assert_eq!(results[0].saved_download.as_ref(), Some(&saved));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn transfer_wait_returns_the_exact_retained_result_and_reports_eviction() {
