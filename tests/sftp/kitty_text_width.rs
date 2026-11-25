@@ -2,7 +2,7 @@ use super::{in_band_resize::WireReader, *};
 use tokio::sync::mpsc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kitty_text_sizing_probe_fraction_and_payload_limit_over_ssh() {
+async fn kitty_text_sizing_probe_multicell_fraction_and_payload_limit_over_ssh() {
     let (tx, rx) = mpsc::unbounded_channel();
     let (source, _root, _, server) = fixture_with_wire(false, 1, Arc::default(), Some(tx)).await;
     let session = Session::start_sized(
@@ -22,7 +22,10 @@ async fn kitty_text_sizing_probe_fraction_and_payload_limit_over_ssh() {
     ] {
         peer.data(channel, part).await.unwrap();
     }
-    wire.input(channel, b"\x1b[1;1R\x1b[1;3R\x1b[1;3R").await;
+    wire.input(channel, b"\x1b[1;1R\x1b[1;3R\x1b[1;5R").await;
+    peer.data(channel, b"\x1b[2J\x1b[H\x1b]66;w=2; \x07".as_slice())
+        .await
+        .unwrap();
     let exact = format!("\x1b]66;w=7;{}\x07\x1b[6n", "é;".repeat(1365) + "!");
     let too_long = format!("\x1b]66;w=7;{}\x07Z\x1b[6n", "é".repeat(2049));
     peer.data(channel, exact.into_bytes()).await.unwrap();
@@ -31,16 +34,16 @@ async fn kitty_text_sizing_probe_fraction_and_payload_limit_over_ssh() {
     wire.input(channel, b"\x1b[1;11R").await;
     peer.data(
         channel,
-        b"\x1b[2;1H\x1b]66;w=3:n=1:d=2:h=1:v=1;SUP\x07!\x1b[6n".as_slice(),
+        b"\x1b[2;1H\x1b]66;s=2:w=3:n=1:d=2:h=1:v=1;SUP\x07!\x1b[6n".as_slice(),
     )
     .await
     .unwrap();
-    wire.input(channel, b"\x1b[2;5R").await;
+    wire.input(channel, b"\x1b[2;8R").await;
     let frame = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
             let frame = session.frames.load();
             if frame.rows[1]
-                .get_cell(3)
+                .get_cell(6)
                 .is_some_and(|cell| cell.str() == "!")
             {
                 break frame;
@@ -60,10 +63,14 @@ async fn kitty_text_sizing_probe_fraction_and_payload_limit_over_ssh() {
     let tail = cells.next().unwrap();
     assert_eq!((tail.cell_index(), tail.str()), (9, "Z"));
     let cell = frame.rows[1].get_cell(0).unwrap();
-    assert_eq!((cell.str(), cell.width()), ("SUP", 3));
+    assert_eq!((cell.str(), cell.width()), ("SUP", 6));
     assert_eq!(
         cell.attrs().fractional_text_scale(),
         wezterm_term::FractionalTextScale::new(1, 2, 1, 1)
     );
+    let continuation = frame.rows[2].get_cell(0).unwrap();
+    assert_eq!(continuation.str(), " ");
+    let slice = continuation.attrs().multicell_row().unwrap();
+    assert_eq!((slice.offset(), slice.run().text()), (1, "SUP"));
     server.abort();
 }

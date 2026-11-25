@@ -25,7 +25,8 @@ impl CellMap {
             width_scale,
             ..Self::default()
         };
-        if !enabled || cols == 0 {
+        // Every slice of a text rectangle must use the same physical columns.
+        if !enabled || cols == 0 || line.contains_multicell_text() {
             return identity;
         }
         if hint == ParagraphDirectionHint::LeftToRight

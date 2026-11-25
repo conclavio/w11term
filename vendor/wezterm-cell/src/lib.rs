@@ -18,7 +18,7 @@ use wezterm_dynamic::{FromDynamic, ToDynamic};
 pub use wezterm_escape_parser::osc::Hyperlink;
 
 extern crate alloc;
-use crate::alloc::string::ToString;
+use crate::alloc::string::{String, ToString};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -101,6 +101,8 @@ struct FatAttributes {
     underline_color: ColorAttribute,
     foreground: ColorAttribute,
     background: ColorAttribute,
+    #[cfg_attr(feature = "use_serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    multicell_row: Option<Box<MulticellRow>>,
 }
 
 impl FatAttributes {
@@ -116,6 +118,9 @@ impl FatAttributes {
         self.underline_color.hash(hasher);
         self.foreground.hash(hasher);
         self.background.hash(hasher);
+        if let Some(row) = &self.multicell_row {
+            row.hash(hasher);
+        }
     }
 }
 
@@ -194,6 +199,64 @@ impl Default for SemanticType {
 }
 
 pub use wezterm_escape_parser::csi::{Blink, Intensity, Underline, VerticalAlign};
+
+/// A row of a Kitty OSC 66 text rectangle. All rows share the text and
+/// dimensions so a viewport can draw a lower row even when its origin is offscreen.
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct MulticellRow {
+    run: Arc<MulticellText>,
+    row: u8,
+}
+
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct MulticellText {
+    text: String,
+    width: u8,
+    scale: u8,
+}
+
+impl MulticellText {
+    pub const MAX_COLUMNS: usize = 49;
+
+    pub fn new(text: &str, width: usize, scale: u8) -> Option<Arc<Self>> {
+        ((2..=7).contains(&scale) && (1..=7).contains(&width)).then(|| {
+            Arc::new(Self {
+                text: text.into(),
+                width: (width * usize::from(scale)) as u8,
+                scale,
+            })
+        })
+    }
+
+    pub fn columns(&self) -> usize {
+        usize::from(self.width)
+    }
+
+    pub fn scale(&self) -> u8 {
+        self.scale
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn row(self: &Arc<Self>, row: u8) -> MulticellRow {
+        assert!(row < self.scale);
+        MulticellRow { run: self.clone(), row }
+    }
+}
+
+impl MulticellRow {
+    pub fn run(&self) -> &Arc<MulticellText> {
+        &self.run
+    }
+
+    pub fn offset(&self) -> u8 {
+        self.row
+    }
+}
 
 /// Placement of a reduced text run inside its original cell area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,7 +347,24 @@ impl CellAttributes {
     }
 
     pub fn clear_text_sizing(&mut self) -> &mut Self {
-        self.set_explicit_width(false).set_fractional_text_scale(None)
+        self.set_explicit_width(false)
+            .set_fractional_text_scale(None)
+            .set_multicell_row(None)
+    }
+
+    pub fn multicell_row(&self) -> Option<&MulticellRow> {
+        self.fat.as_ref()?.multicell_row.as_deref()
+    }
+
+    pub fn set_multicell_row(&mut self, row: Option<MulticellRow>) -> &mut Self {
+        if row.is_some() {
+            self.allocate_fat_attributes();
+        }
+        if let Some(fat) = &mut self.fat {
+            fat.multicell_row = row.map(Box::new);
+        }
+        self.deallocate_fat_attributes_if_none();
+        self
     }
 
     pub const fn blank() -> Self {
@@ -400,6 +480,7 @@ impl CellAttributes {
                 underline_color: ColorAttribute::Default,
                 foreground: ColorAttribute::Default,
                 background: ColorAttribute::Default,
+                multicell_row: None,
             }));
         }
     }
@@ -416,6 +497,7 @@ impl CellAttributes {
                     }
                 }
                 fat.hyperlink.is_none()
+                    && fat.multicell_row.is_none()
                     && fat.underline_color == ColorAttribute::Default
                     && fat.foreground == ColorAttribute::Default
                     && fat.background == ColorAttribute::Default

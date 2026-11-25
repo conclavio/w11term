@@ -38,6 +38,7 @@ impl TerminalState {
         if columns.start >= end {
             return;
         }
+        screen.selectively_erase_multicell_text(row, &(columns.start..end), seqno);
         let physical = screen.phys_row(row);
         let line = screen.line_mut(physical);
 

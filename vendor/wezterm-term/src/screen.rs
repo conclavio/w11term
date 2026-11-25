@@ -10,6 +10,7 @@ use termwiz::input::KeyboardEncoding;
 use wezterm_surface::SequenceNo;
 
 mod live_command_output;
+mod multicell_text;
 pub use live_command_output::{
     LiveCommandOutput, LiveOutputBatch, LiveOutputCursor, LiveOutputLine,
 };
@@ -388,6 +389,7 @@ impl Screen {
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
             let sized = line_width_scale(&line) == 2;
+            let multicell = line.contains_multicell_text();
             if let Some((row, col)) = marker {
                 if phys_idx == row {
                     logical_marker = Some(logical_line.as_ref().map_or(0, Line::len) + col);
@@ -422,18 +424,19 @@ impl Screen {
 
             if was_wrapped
                 && !sized
-                && lines
-                    .peek()
-                    .is_some_and(|(_, next)| line_width_scale(next) == 1)
+                && !multicell
+                && lines.peek().is_some_and(|(_, next)| {
+                    line_width_scale(next) == 1 && !next.contains_multicell_text()
+                })
             {
                 logical_line.replace(line);
                 continue;
             }
 
             if let Some(x) = logical_cursor_x.take() {
-                if sized {
+                if sized || multicell {
                     adjusted_cursor = (
-                        x.min((physical_cols / 2).max(1) - 1),
+                        x.min((physical_cols / if sized { 2 } else { 1 }).max(1) - 1),
                         discarded + rewrapped.len(),
                     );
                 } else {
@@ -464,7 +467,7 @@ impl Screen {
             }
 
             let first_rewrapped = rewrapped.len();
-            if sized {
+            if sized || multicell {
                 let mut line = line;
                 clip_sized_line(&mut line, physical_cols, seqno);
                 rewrapped.push_back(line);
@@ -563,6 +566,9 @@ impl Screen {
         self.dpi = size.dpi;
         if physical_cols != self.physical_cols || physical_rows != self.physical_rows {
             self.invalidate_row_coordinates();
+            if physical_cols < self.physical_cols || physical_rows < self.physical_rows {
+                self.clip_multicell_text(physical_cols, physical_rows, seqno);
+            }
         }
 
         // pre-prune blank lines that range from the cursor position to the end of the display;
@@ -763,6 +769,7 @@ impl Screen {
         right_margin: usize,
         seqno: SequenceNo,
     ) {
+        self.erase_multicell_text(y..y + 1, x..right_margin, seqno);
         let phys_cols = self.physical_cols;
 
         let line_idx = self.phys_row(y);
@@ -794,6 +801,7 @@ impl Screen {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
+        self.erase_multicell_text(y..y + 1, x..right_margin, seqno);
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         line.erase_cell_with_margin(x, right_margin, seqno, blank_attr);
@@ -803,6 +811,7 @@ impl Screen {
     /// origin.  0,0 is the top left.
     pub fn set_cell(&mut self, x: usize, y: VisibleRowIndex, cell: &Cell, seqno: SequenceNo) {
         let line_idx = self.phys_row(y);
+        self.erase_multicell_text_in_row(line_idx, x..x + cell.width().max(1), seqno);
         //debug!("set_cell x={} y={} phys={} {:?}", x, y, line_idx, cell);
 
         let line = self.line_mut(line_idx);
@@ -831,6 +840,7 @@ impl Screen {
         seqno: SequenceNo,
     ) {
         let line_idx = self.phys_row(y);
+        self.erase_multicell_text_in_row(line_idx, x..x + width, seqno);
         let line = self.line_mut(line_idx);
         line.set_cell_grapheme(x, text, width, attr, seqno);
     }
@@ -855,6 +865,7 @@ impl Screen {
         seqno: SequenceNo,
         bidi_mode: BidiMode,
     ) {
+        self.erase_multicell_text(y..y + 1, cols.clone(), seqno);
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         if cols.start == 0 {
@@ -989,6 +1000,14 @@ impl Screen {
         let region_height = phys_scroll.end - phys_scroll.start;
         let num_rows = num_rows.min(region_height);
         let rows_to_copy = region_height - num_rows;
+        if num_rows != 0 {
+            self.prepare_multicell_partial_scroll(
+                phys_scroll.clone(),
+                left_and_right_margins,
+                phys_scroll.start + num_rows..phys_scroll.end,
+                seqno,
+            );
+        }
 
         if rows_to_copy > 0 {
             for dest_row in phys_scroll.start..phys_scroll.start + rows_to_copy {
@@ -1007,6 +1026,12 @@ impl Screen {
 
                 // and place them into the dest
                 let dest_row = self.line_mut(dest_row);
+                if cells
+                    .iter()
+                    .any(|cell| cell.attrs().multicell_row().is_some())
+                {
+                    dest_row.mark_multicell_text();
+                }
                 dest_row.update_last_change_seqno(seqno);
                 let dest_range =
                     left_and_right_margins.start..left_and_right_margins.start + cells.len();
@@ -1072,6 +1097,13 @@ impl Screen {
         self.placement_rows_changed();
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
         let insert_at_end = scroll_region.end as usize == self.physical_rows;
+        if num_rows != 0 {
+            self.split_multicell_text_at(phys_scroll.end, seqno);
+            if !scrollback_ok {
+                self.split_multicell_text_at(phys_scroll.start, seqno);
+                self.split_multicell_text_at(phys_scroll.start + num_rows, seqno);
+            }
+        }
         if num_rows != 0 && (!scrollback_ok || !insert_at_end) {
             let end = if scrollback_ok {
                 self.lines.len()
@@ -1201,11 +1233,18 @@ impl Screen {
     }
 
     /// Draw the newest history rows into a full-width region starting at row 0.
-    pub(crate) fn restore_scrollback_rows(&mut self, bottom: VisibleRowIndex, count: usize) {
+    pub(crate) fn restore_scrollback_rows(
+        &mut self,
+        bottom: VisibleRowIndex,
+        count: usize,
+        seqno: SequenceNo,
+    ) {
         // History and the live display share one buffer. Removing rows at the
         // region's bottom shifts the live boundary back by the same amount.
         let end = self.phys_row(bottom);
         let removed = end - count..end;
+        self.split_multicell_text_at(removed.start, seqno);
+        self.split_multicell_text_at(removed.end, seqno);
         let start_row = self.phys_to_stable_row_index(removed.start);
         let end_row = self.phys_to_stable_row_index(removed.end);
         let surviving_row = |row: StableRowIndex| {
@@ -1268,6 +1307,11 @@ impl Screen {
         }
 
         let middle = phys_scroll.end - num_rows;
+        if num_rows != 0 {
+            for boundary in [phys_scroll.start, middle, phys_scroll.end] {
+                self.split_multicell_text_at(boundary, seqno);
+            }
+        }
 
         // dirty the rows in the region
         for y in phys_scroll.start..middle {
@@ -1319,6 +1363,14 @@ impl Screen {
             self.discard_output_rows(phys_scroll.clone());
         }
         let rows_to_copy = region_height - num_rows;
+        if num_rows != 0 {
+            self.prepare_multicell_partial_scroll(
+                phys_scroll.clone(),
+                left_and_right_margins,
+                phys_scroll.start..phys_scroll.end - num_rows,
+                seqno,
+            );
+        }
 
         if rows_to_copy > 0 {
             for src_row in (phys_scroll.start..phys_scroll.start + rows_to_copy).rev() {
@@ -1337,6 +1389,12 @@ impl Screen {
 
                 // and place them into the dest
                 let dest_row = self.line_mut(dest_row);
+                if cells
+                    .iter()
+                    .any(|cell| cell.attrs().multicell_row().is_some())
+                {
+                    dest_row.mark_multicell_text();
+                }
                 dest_row.update_last_change_seqno(seqno);
                 let dest_range =
                     left_and_right_margins.start..left_and_right_margins.start + cells.len();

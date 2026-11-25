@@ -2345,7 +2345,7 @@ mod tests {
             "\x1b]66;w=5:n=2:d=2;invalid\x07",
             "\x1b]66;w=5:n=1:d=16;invalid\x07",
             "\x1b]66;w=5:n=1:d=2:h=3;invalid\x07",
-            "\x1b]66;s=2:n=1:d=2;unsupported\x07",
+            "\x1b]66;s=8:n=1:d=2;invalid\x07",
             "Z\x1b[6n"
         ));
         assert_eq!(receive(&mut wire), b"\x1b[1;6R");
@@ -2408,7 +2408,7 @@ mod tests {
         for bytes in [
             b"\r\x1b[6n".as_slice(),
             b"\x1b]66;w=2; \x07\x1b[6n",
-            b"\x1b]66;s=2; \x07\x1b[6n",
+            b"\x1b]66;s=8; \x07\x1b[6n",
         ] {
             terminal.advance_bytes(bytes);
         }
@@ -2488,6 +2488,96 @@ mod tests {
             (last.cell_index(), last.width(), last.str()),
             (75, 5, "end")
         );
+    }
+
+    #[test]
+    fn kitty_multicell_text_keeps_rows_linked_during_print_and_edit() {
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes("\x1b]66;s=3:w=2:n=1:d=2;W\x07\u{0301}!\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[1;8R");
+        terminal.advance_bytes(b"\x1b[2;3H?\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[2;8R");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        for (offset, line) in frame.rows[..3].iter().enumerate() {
+            let cell = line.get_cell(0).unwrap();
+            let slice = cell.attrs().multicell_row().unwrap();
+            assert_eq!((cell.width(), slice.offset()), (6, offset as u8));
+            assert_eq!(slice.run().text(), "W\u{0301}");
+            assert_eq!(cell.str(), if offset == 0 { "W\u{0301}" } else { " " });
+        }
+        assert_eq!(frame.rows[1].get_cell(6).unwrap().str(), "?");
+        terminal.advance_bytes(b"\x1b[3;3H\x1b[X");
+        let frame = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+        assert!(
+            frame.rows[..3]
+                .iter()
+                .all(|line| !line.contains_multicell_text())
+        );
+        assert_eq!(frame.rows[0].get_cell(6).unwrap().str(), "!");
+        assert_eq!(frame.rows[1].get_cell(6).unwrap().str(), "?");
+    }
+
+    #[test]
+    fn kitty_multicell_text_wraps_past_its_lower_slice_with_autowrap_off() {
+        let (mut terminal, mut wire) = engine();
+        terminal.resize(TerminalSize {
+            cols: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        });
+        terminal.advance_bytes(b"\x1b[?7l\x1b[1;3H\x1b]66;s=2:w=3;W\x07\x1b[2;8Hq\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[3;2R");
+        terminal.advance_bytes(b"\x1b[4;2H\x1b]66;s=7;Q\x07\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[4;2R");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert!(
+            frame.rows[0]
+                .get_cell(2)
+                .unwrap()
+                .attrs()
+                .multicell_row()
+                .is_some()
+        );
+        assert_eq!(frame.rows[2].get_cell(0).unwrap().str(), "q");
+    }
+
+    #[test]
+    fn kitty_multicell_text_survives_scrollback_and_clears_if_it_no_longer_fits() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 10,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b[3;5H\x1b]66;s=3:w=2;W\x07\x1b[4;1H\r\n");
+        let slices = |terminal: &Terminal| {
+            terminal
+                .screen()
+                .physical_lines()
+                .filter_map(|line| {
+                    let cell = line.get_cell(4)?;
+                    cell.attrs().multicell_row().map(|slice| slice.offset())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slices(&terminal), [0, 1, 2]);
+        terminal.resize(TerminalSize { cols: 14, ..size });
+        assert_eq!(slices(&terminal), [0, 1, 2]);
+        terminal.resize(TerminalSize { cols: 8, ..size });
+        assert!(slices(&terminal).is_empty());
+
+        for edit in [
+            "\x1b[2;1H\x1b[L",
+            "\x1b[2;1H\x1b[M",
+            "\x1b[2;6H\x1b[P",
+            "\x1b[1;1H\x1b[2M",
+        ] {
+            terminal.advance_bytes(b"\x1b[2J\x1b[1;5H\x1b]66;s=2:w=2;A\x07");
+            assert_eq!(slices(&terminal), [0, 1]);
+            terminal.advance_bytes(edit);
+            assert!(slices(&terminal).is_empty(), "{edit:?}");
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use w11term::{
     terminal::{Rgba, Snapshot, colors, rgba},
 };
 use wezterm_term::{
-    FractionalTextScale, Intensity, Underline,
+    CellAttributes, FractionalTextScale, Intensity, Underline,
     image::{ImageCell, ImageDataType},
 };
 use windows_canvas::{
@@ -118,6 +118,7 @@ struct TextRun<'a> {
     shape: bool,
     explicit_width: bool,
     fraction: Option<FractionalTextScale>,
+    text_scale: f32,
     scale: (f32, f32),
 }
 
@@ -310,18 +311,25 @@ fn glyph_row(line: &wezterm_term::Line, top: f32, cell_height: f32) -> (f32, f32
     }
 }
 
-fn fractional_glyph_row(
-    fraction: Option<FractionalTextScale>,
-    top: f32,
-    height: f32,
+fn text_glyph_geometry(
+    attrs: &CellAttributes,
+    mut top: f32,
+    mut height: f32,
+    ch: f32,
 ) -> (f32, f32) {
-    fraction.map_or((top, height), |fraction| {
-        let reduced_height = height * fraction.factor();
-        (
-            top + fraction.vertical_offset(height - reduced_height),
-            reduced_height,
-        )
-    })
+    if let Some(slice) = attrs.multicell_row() {
+        top -= f32::from(slice.offset()) * ch;
+        height = f32::from(slice.run().scale()) * ch;
+    }
+    attrs
+        .fractional_text_scale()
+        .map_or((top, height), |fraction| {
+            let reduced_height = height * fraction.factor();
+            (
+                top + fraction.vertical_offset(height - reduced_height),
+                reduced_height,
+            )
+        })
 }
 
 fn draw_ink_lines(
@@ -462,6 +470,7 @@ impl Renderer {
             shape,
             explicit_width,
             fraction,
+            text_scale,
             mut scale,
         } = run;
         if text.trim_end_matches(' ').is_empty() {
@@ -491,7 +500,7 @@ impl Renderer {
         let cached = &self.layouts[&key];
         // Anchor each shaped run to its occupied grid columns even when DirectWrite
         // chose a proportional fallback font or the grid was snapped to physical pixels.
-        let factor = fraction.map_or(1.0, FractionalTextScale::factor);
+        let factor = text_scale * fraction.map_or(1.0, FractionalTextScale::factor);
         if (shape || explicit_width || fraction.is_some()) && cached.natural_width > 0.0 {
             let fit = cols as f32 * self.metrics.cell_width / cached.natural_width;
             scale.0 *= if explicit_width || fraction.is_some() {
@@ -870,6 +879,25 @@ impl Renderer {
         let selection_bg = frame.selection_colors.background.map_or(SELECTION_BG, rgba);
         let selection_fg = frame.selection_colors.foreground.map(rgba);
         let cursor = self.visible_cursor(frame, display);
+        let cursor_slice = cursor.and_then(|cursor| {
+            let map = frame.cell_map(cursor.row)?;
+            let col = map.logical_at_grid(cursor.col);
+            let line = frame.rows.get(cursor.row)?;
+            if !line.has_multicell_text() {
+                return None;
+            }
+            let cell = line
+                .visible_cells()
+                .take_while(|cell| cell.cell_index() <= col)
+                .find(|cell| col < cell.cell_index() + cell.width())?;
+            let slice = cell.attrs().multicell_row()?;
+            Some((
+                map.visual_grid(cell.cell_index()),
+                cell.width(),
+                cursor.row as isize - isize::from(slice.offset()),
+                usize::from(slice.run().scale()),
+            ))
+        });
         let block = cursor.filter(|cursor| {
             self.copy_cursor.is_none()
                 && display == CursorDisplay::Live
@@ -883,7 +911,7 @@ impl Renderer {
                 )
         });
         let mut block_extent = None;
-        let mut block_decorations = (Underline::None, false, false, None);
+        let mut block_decorations = (Underline::None, false, false, 0.0, 0.0);
         let mut cursor_ink = None;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
@@ -935,11 +963,13 @@ impl Renderer {
                     ));
                     if !cell.attrs().invisible() {
                         let attrs = cell.attrs();
+                        let (top, height) = text_glyph_geometry(attrs, glyph_top, glyph_height, ch);
                         block_decorations = (
                             attrs.underline(),
                             attrs.overline(),
                             attrs.strikethrough(),
-                            attrs.fractional_text_scale(),
+                            top,
+                            height,
                         );
                     }
                 }
@@ -954,8 +984,10 @@ impl Renderer {
                         continue;
                     }
                     let fraction = attrs.fractional_text_scale();
+                    let slice = attrs.multicell_row();
+                    let text_scale = slice.map_or(1.0, |slice| f32::from(slice.run().scale()));
                     let (glyph_top, glyph_height) =
-                        fractional_glyph_row(fraction, glyph_top, glyph_height);
+                        text_glyph_geometry(attrs, glyph_top, glyph_height, ch);
                     let visual = map.visual(col);
                     let x = PADDING + visual as f32 * row_cw;
                     let (fg, _) = colors(attrs, &frame.palette);
@@ -969,7 +1001,7 @@ impl Renderer {
                         let run_cells = &cells[index..next_run];
                         let mut joined = String::new();
                         let text = if run_cells.len() == 1 {
-                            cell.str()
+                            slice.map_or(cell.str(), |slice| slice.run().text())
                         } else {
                             for member in run_cells {
                                 joined.push_str(member.str());
@@ -997,6 +1029,7 @@ impl Renderer {
                             shape: kind.is_some(),
                             explicit_width: attrs.explicit_width(),
                             fraction,
+                            text_scale,
                             scale: (width_scale as f32, height_scale),
                         })?;
                         if let Some((cached, scale)) = layout {
@@ -1027,43 +1060,53 @@ impl Renderer {
                             }
                         }
                     }
-                    if attrs.underline() != Underline::None {
-                        let underline = if attrs.underline_color()
-                            == wezterm_term::color::ColorAttribute::Default
-                        {
-                            fg
-                        } else {
-                            rgba(frame.palette.resolve_fg(attrs.underline_color()))
+                    if attrs.underline() != Underline::None
+                        || attrs.overline()
+                        || attrs.strikethrough()
+                    {
+                        let glyph_rect = Rect::from_xywh(
+                            x,
+                            glyph_top,
+                            cell.width() as f32 * row_cw,
+                            glyph_height,
+                        );
+                        let draw = || {
+                            if attrs.underline() != Underline::None {
+                                let underline = if attrs.underline_color()
+                                    == wezterm_term::color::ColorAttribute::Default
+                                {
+                                    fg
+                                } else {
+                                    rgba(frame.palette.resolve_fg(attrs.underline_color()))
+                                };
+                                brush.set_color(color(decoration_ink.unwrap_or(underline)));
+                                draw_underline(
+                                    ctx,
+                                    &brush,
+                                    attrs.underline(),
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                );
+                            }
+                            if attrs.overline() || attrs.strikethrough() {
+                                brush.set_color(color(decoration_ink.unwrap_or(fg)));
+                                draw_ink_lines(
+                                    ctx,
+                                    &brush,
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                    attrs.overline(),
+                                    attrs.strikethrough(),
+                                );
+                            }
                         };
-                        brush.set_color(color(decoration_ink.unwrap_or(underline)));
-                        draw_underline(
-                            ctx,
-                            &brush,
-                            attrs.underline(),
-                            Rect::from_xywh(
-                                x,
-                                glyph_top,
-                                cell.width() as f32 * row_cw,
-                                glyph_height,
-                            ),
-                            self.metrics.scale,
-                        );
-                    }
-                    if attrs.overline() || attrs.strikethrough() {
-                        brush.set_color(color(decoration_ink.unwrap_or(fg)));
-                        draw_ink_lines(
-                            ctx,
-                            &brush,
-                            Rect::from_xywh(
-                                x,
-                                glyph_top,
-                                row_cw * cell.width() as f32,
-                                glyph_height,
-                            ),
-                            self.metrics.scale,
-                            attrs.overline(),
-                            attrs.strikethrough(),
-                        );
+                        if slice.is_some() {
+                            let left = map.visual_grid(col);
+                            native
+                                .with_clip(row.rect(left..left + cell.width() * width_scale), draw);
+                        } else {
+                            draw();
+                        }
                     }
                 }
                 Ok(())
@@ -1077,57 +1120,73 @@ impl Renderer {
         }
         self.draw_images(&native, frame, &tiles[under_text..])?;
         if let Some(cursor) = cursor {
-            let x = PADDING + cursor.col as f32 * cw;
-            let y = PADDING + cursor.row as f32 * ch;
             let width_scale = frame
                 .cell_map(cursor.row)
                 .map_or(1, |map| map.width_scale());
-            let cursor_width = cw * width_scale.min(self.metrics.cols - cursor.col) as f32;
+            let (left, cols, top, rows) = cursor_slice.unwrap_or_else(|| {
+                let (left, cols) = block_extent.unwrap_or((cursor.col, width_scale));
+                (left, cols, cursor.row as isize, 1)
+            });
+            let cols = cols.min(self.metrics.cols - left);
+            let x = PADDING + left as f32 * cw;
+            let y = PADDING + top as f32 * ch;
+            let w = cols as f32 * cw;
+            let h = rows as f32 * ch;
+            let rect = Rect::from_xywh(x, y, w, h);
+            let viewport = Rect::from_xywh(
+                PADDING,
+                PADDING,
+                self.metrics.cols as f32 * cw,
+                self.metrics.rows as f32 * ch,
+            );
             brush.set_color(color(rgba(frame.palette.cursor_bg)));
-            match cursor.shape {
-                CursorShape::SteadyBar | CursorShape::BlinkingBar => {
-                    ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, ch), &brush)
-                }
-                CursorShape::SteadyUnderline | CursorShape::BlinkingUnderline => {
-                    ctx.fill_rect(&Rect::from_xywh(x, y + ch - 2.0, cursor_width, 2.0), &brush)
-                }
-                _ if let Some((left, cols)) = block_extent => {
-                    let cols = cols.min(self.metrics.cols - left);
-                    let rect = Rect::from_xywh(PADDING + left as f32 * cw, y, cols as f32 * cw, ch);
-                    ctx.fill_rect(&rect, &brush);
-                    let ink = block_ink(frame);
-                    native.with_clip(rect, || -> windows_canvas::Result<()> {
-                        if let Some((layout, origin, scale)) = cursor_ink {
-                            native.cursor_text(&layout, origin, ink, scale)?;
-                        }
-                        let (underline, overline, strike, fraction) = block_decorations;
-                        if underline != Underline::None || overline || strike {
-                            brush.set_color(color(ink));
-                            let (glyph_top, height_scale) =
-                                glyph_row(&frame.rows[cursor.row], y, ch);
-                            let (glyph_top, glyph_height) =
-                                fractional_glyph_row(fraction, glyph_top, ch * height_scale);
-                            let glyph_rect = Rect::from_xywh(
-                                PADDING + left as f32 * cw,
-                                glyph_top,
-                                cols as f32 * cw,
-                                glyph_height,
-                            );
-                            draw_underline(ctx, &brush, underline, glyph_rect, self.metrics.scale);
-                            draw_ink_lines(
-                                ctx,
-                                &brush,
-                                glyph_rect,
-                                self.metrics.scale,
-                                overline,
-                                strike,
-                            );
-                        }
+            native.with_clip(viewport, || -> windows_canvas::Result<()> {
+                match cursor.shape {
+                    CursorShape::SteadyBar | CursorShape::BlinkingBar => {
+                        ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, h), &brush);
                         Ok(())
-                    })?;
+                    }
+                    CursorShape::SteadyUnderline | CursorShape::BlinkingUnderline => {
+                        ctx.fill_rect(&Rect::from_xywh(x, y + h - 2.0, w, 2.0), &brush);
+                        Ok(())
+                    }
+                    _ if block_extent.is_some() => {
+                        ctx.fill_rect(&rect, &brush);
+                        let ink = block_ink(frame);
+                        native.with_clip(rect, || -> windows_canvas::Result<()> {
+                            if let Some((layout, origin, scale)) = cursor_ink {
+                                native.cursor_text(&layout, origin, ink, scale)?;
+                            }
+                            let (underline, overline, strike, glyph_top, glyph_height) =
+                                block_decorations;
+                            if underline != Underline::None || overline || strike {
+                                brush.set_color(color(ink));
+                                let glyph_rect = Rect::from_xywh(x, glyph_top, w, glyph_height);
+                                draw_underline(
+                                    ctx,
+                                    &brush,
+                                    underline,
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                );
+                                draw_ink_lines(
+                                    ctx,
+                                    &brush,
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                    overline,
+                                    strike,
+                                );
+                            }
+                            Ok(())
+                        })
+                    }
+                    _ => {
+                        ctx.draw_rect(&rect, &brush, 1.0);
+                        Ok(())
+                    }
                 }
-                _ => ctx.draw_rect(&Rect::from_xywh(x, y, cursor_width, ch), &brush, 1.0),
-            }
+            })?;
         }
         brush.set_color(ColorF::new(0.09, 0.10, 0.12, 1.0));
         ctx.fill_rect(
@@ -2401,6 +2460,83 @@ mod tests {
         );
         assert!(top.1 - top.0 < full.1 - full.0);
         assert!(top.3 - top.2 < full.3 - full.2);
+    }
+
+    #[test]
+    fn offscreen_kitty_multicell_text_renders_a_continuation_without_its_top_row() {
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 3,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b[1;3H\x1b]66;s=2:w=2;W\x07",
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let capture = |terminal: &wezterm_term::Terminal, name: &str| {
+            let frame = Snapshot::capture(terminal, None, 1, 0, String::new(), 0);
+            let path = directory.path().join(name);
+            screenshot(&frame, size, &path).unwrap();
+            image::open(path).unwrap().into_rgb8()
+        };
+        let before = capture(&terminal, "kitty-multicell-before.png");
+        let cw = before.width() / 8;
+        let ch = before.height() / 3;
+        for row in 0..3 {
+            let mut ink = 0;
+            for y in row * ch..(row + 1) * ch {
+                for x in 0..before.width() {
+                    if before.get_pixel(x, y).0 != [0, 0, 0] {
+                        assert!((2 * cw..6 * cw).contains(&x));
+                        ink += 1;
+                    }
+                }
+            }
+            assert_eq!(ink > 0, row < 2, "row {row}");
+        }
+        terminal.advance_bytes(b"\x1b[3;1H\r\n");
+        let after = capture(&terminal, "kitty-multicell-after.png");
+        for y in 0..ch {
+            for x in 0..before.width() {
+                assert_eq!(after.get_pixel(x, y), before.get_pixel(x, y + ch));
+            }
+        }
+    }
+
+    #[test]
+    fn offscreen_kitty_multicell_bar_and_underline_follow_the_rectangle() {
+        let size = wezterm_term::TerminalSize {
+            cols: 6,
+            rows: 3,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b]11;#000000\x07\x1b]12;#ff0000\x07",
+            "\x1b[1;2H\x1b]66;s=2:w=2; \x07\x1b[2;4H",
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        for (shape, bar) in [("\x1b[6 q", true), ("\x1b[4 q", false)] {
+            terminal.advance_bytes(shape);
+            let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+            let path = directory
+                .path()
+                .join(if bar { "bar.png" } else { "underline.png" });
+            let (width, height) = screenshot(&frame, size, &path).unwrap();
+            let pixels = image::open(path).unwrap().into_rgb8();
+            let (cw, ch) = (width / 6, height / 3);
+            let red = |x, y| pixels.get_pixel(x, y).0 == [255, 0, 0];
+            assert_eq!(red(cw, 0), bar);
+            assert!(red(cw, 2 * ch - 1));
+            assert_eq!(red(5 * cw - 1, 2 * ch - 1), !bar);
+            assert!(!red(cw, 2 * ch));
+        }
     }
 
     #[test]

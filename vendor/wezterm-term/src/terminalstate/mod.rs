@@ -1796,7 +1796,9 @@ impl TerminalState {
         let restored = count.min(history);
         if restored != 0 {
             let bottom = self.top_and_bottom_margins.end;
-            self.screen_mut().restore_scrollback_rows(bottom, restored);
+            let seqno = self.seqno;
+            self.screen_mut()
+                .restore_scrollback_rows(bottom, restored, seqno);
             self.unscrolled_rows = self.unscrolled_rows.wrapping_add(restored);
         }
         if count > restored {
@@ -3125,6 +3127,14 @@ impl TerminalState {
                         &left_and_right_margins,
                         true,
                     );
+                    let margin_rows = top_and_bottom_margins.end - top_and_bottom_margins.start;
+                    let count = (n as usize).min(margin_rows as usize);
+                    let removed = self.cursor.y..self.cursor.y + count as VisibleRowIndex;
+                    self.screen_mut().erase_multicell_text(
+                        removed,
+                        left_and_right_margins.clone(),
+                        seqno,
+                    );
                     self.screen_mut().scroll_up_within_margins(
                         &top_and_bottom_margins,
                         &left_and_right_margins,
@@ -3247,6 +3257,9 @@ impl TerminalState {
                     }
                 };
 
+                if cell.attrs().multicell_row().is_some() {
+                    return;
+                }
                 for _ in 0..n {
                     let right = left_and_right_margins
                         .end
@@ -3255,9 +3268,7 @@ impl TerminalState {
                     let sized = self.screen().line_width_scale(y) > 1;
                     let width = if sized { cell.width() } else { 1 };
                     if !sized || x.saturating_add(width) <= right {
-                        let screen = self.screen_mut();
-                        let line_idx = screen.phys_row(y);
-                        screen.line_mut(line_idx).set_cell(x, cell.clone(), seqno);
+                        self.screen_mut().set_cell(x, y, &cell, seqno);
                     }
                     x += width;
                     if x >= right {

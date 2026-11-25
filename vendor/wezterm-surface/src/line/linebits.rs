@@ -52,5 +52,6 @@ bitflags! {
 
         /// The line uses individually stored cells to preserve width overrides.
         const EXPLICIT_WIDTH = 1<<9;
+        const MULTICELL_TEXT = 1<<10;
     }
 }

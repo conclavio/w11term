@@ -20,7 +20,7 @@ use siphasher::sip128::{Hasher128, SipHasher};
 #[cfg(feature = "appdata")]
 use std::sync::Mutex;
 use wezterm_bidi::{Direction, ParagraphDirectionHint};
-use wezterm_cell::{Cell, CellAttributes, SemanticType, UnicodeVersion};
+use wezterm_cell::{Cell, CellAttributes, MulticellText, SemanticType, UnicodeVersion};
 
 extern crate alloc;
 use crate::alloc::string::ToString;
@@ -88,11 +88,16 @@ impl Line {
     }
 
     pub fn from_cells(cells: Vec<Cell>, seqno: SequenceNo) -> Self {
-        let bits = if cells.iter().any(|cell| cell.attrs().explicit_width()) {
+        let mut bits = if cells.iter().any(|cell| cell.attrs().explicit_width()) {
             LineBits::EXPLICIT_WIDTH
         } else {
             LineBits::NONE
         };
+        if bits.contains(LineBits::EXPLICIT_WIDTH)
+            && cells.iter().any(|cell| cell.attrs().multicell_row().is_some())
+        {
+            bits.insert(LineBits::MULTICELL_TEXT);
+        }
         Self {
             bits,
             cells: CellStorage::V(VecStorage::new(cells)),
@@ -838,6 +843,9 @@ impl Line {
         if cell.attrs().explicit_width() {
             self.make_cells();
             self.bits.insert(LineBits::EXPLICIT_WIDTH);
+            if cell.attrs().multicell_row().is_some() {
+                self.bits.insert(LineBits::MULTICELL_TEXT);
+            }
         }
 
         self.invalidate_implicit_hyperlinks(seqno);
@@ -933,11 +941,17 @@ impl Line {
     }
 
     fn clear_explicit_width_overlaps(&mut self, range: Range<usize>) {
-        self.clear_explicit_width_spans(range.start.saturating_sub(6)..range.end, range.start);
+        let start = range.start.saturating_sub(self.explicit_width_lookback());
+        self.clear_explicit_width_spans(start..range.end, range.start);
     }
 
     fn clear_explicit_width_crossing(&mut self, col: usize) {
-        self.clear_explicit_width_spans(col.saturating_sub(6)..col, col);
+        let start = col.saturating_sub(self.explicit_width_lookback());
+        self.clear_explicit_width_spans(start..col, col);
+    }
+
+    fn explicit_width_lookback(&self) -> usize {
+        if self.has_multicell_text() { MulticellText::MAX_COLUMNS - 1 } else { 6 }
     }
 
     fn clear_explicit_width_spans(&mut self, range: Range<usize>, cutoff: usize) {
@@ -945,8 +959,7 @@ impl Line {
             return;
         }
         let cells = self.coerce_vec_storage();
-        // OSC 66 width overrides up to seven columns. The anchor can be
-        // before the first column being edited.
+        // The anchor can be before the first column being edited.
         for start in range.start..range.end.min(cells.len()) {
             let end = start + cells[start].width();
             if end > cutoff && cells[start].attrs().explicit_width() {
@@ -1182,7 +1195,22 @@ impl Line {
 
     /// Return true if the line consists solely of whitespace cells
     pub fn is_whitespace(&self) -> bool {
-        self.visible_cells().all(|c| c.str() == " ")
+        self.visible_cells()
+            .all(|c| c.str() == " " && c.attrs().multicell_row().is_none())
+    }
+
+    /// An inexpensive indication that a row may contain multi-row text.
+    pub fn has_multicell_text(&self) -> bool {
+        self.bits.contains(LineBits::MULTICELL_TEXT)
+    }
+
+    pub fn mark_multicell_text(&mut self) {
+        self.bits.insert(LineBits::MULTICELL_TEXT | LineBits::EXPLICIT_WIDTH);
+    }
+
+    pub fn contains_multicell_text(&self) -> bool {
+        self.has_multicell_text()
+            && self.visible_cells().any(|cell| cell.attrs().multicell_row().is_some())
     }
 
     /// Return true if the last cell in the line has the wrapped attribute,
@@ -1226,6 +1254,7 @@ impl Line {
         if other.bits.contains(LineBits::EXPLICIT_WIDTH) {
             self.make_cells();
             self.bits.insert(LineBits::EXPLICIT_WIDTH);
+            self.bits |= other.bits & LineBits::MULTICELL_TEXT;
         }
         match &mut self.cells {
             CellStorage::V(cells) => {
