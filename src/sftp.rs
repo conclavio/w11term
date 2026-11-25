@@ -36,8 +36,8 @@ mod editor;
 mod find;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
-    ContentMatch, ContentScan, FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch,
-    FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
+    ContentMatch, ContentScan, FileSizeRange, FileTextMatch, FilenameFilter, FilenameMatch,
+    FilenameSearch, FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
 };
 mod resume_download;
 use resume_download::ResumeDownload;

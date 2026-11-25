@@ -278,7 +278,9 @@ try {
     $contentLabel = 'File text contains'
     $fixtureText = Join-Path $peerRoot 'shell directory/nested/nested-content.txt'
     $fixtureContents = "header`r`n" + ("unrelated line`r`n" * 40) +
-        "Context before`r`nFixture needle value`r`nContext after`r`nlast line`r`n"
+        "Context before`r`nFixture needle value`r`nContext after`r`n" +
+        ("later unrelated line`r`n" * 31) +
+        "second fixture needle`r`ncontext in between`r`nthird fixture needle`r`nlast line`r`n"
     [IO.File]::WriteAllText($fixtureText, $fixtureContents)
     $contentField = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
     $contentField.GetCurrentPattern($value).SetValue('FIXTURE NEEDLE')
@@ -297,12 +299,27 @@ try {
     $previewMatch = "Preview match $parent/nested/nested-content.txt"
     [IO.File]::WriteAllText($fixtureText, "new first line`r`n$fixtureContents")
     Click $previewMatch
+    $matchOne = 'Match 1 of 3 ' + [char]0xb7 + ' Line 44'
+    $matchTwo = 'Match 2 of 3 ' + [char]0xb7 + ' Line 77'
+    $matchThree = 'Match 3 of 3 ' + [char]0xb7 + ' Line 79'
     $null = Wait-Until 'preview starts at the current matching line with context' {
-        (Find-Element 'Match on line 44' -Visible) -and
+        $previous = Button 'Previous match'
+        $next = Button 'Next match'
+        (Find-Element $matchOne -Visible) -and
             (Find-Element 'Fixture needle value' -Visible) -and
             (Find-Element 'Context before' -Visible) -and
-            (Find-Element 'Context after' -Visible) -and !(Find-Element 'File contents')
+            (Find-Element 'Context after' -Visible) -and !(Find-Element 'File contents') -and
+            $previous -and !$previous.Current.IsEnabled -and $next -and $next.Current.IsEnabled
     }
+    Click 'Next match'
+    $null = Wait-Until 'the second matching line is visible' { Find-Element $matchTwo -Visible }
+    Click 'Next match'
+    $null = Wait-Until 'the last matching line disables Next match' {
+        $next = Button 'Next match'
+        (Find-Element $matchThree -Visible) -and $next -and !$next.Current.IsEnabled
+    }
+    Click 'Previous match'
+    $null = Wait-Until 'Previous match returns to the second line' { Find-Element $matchTwo -Visible }
     Click 'Show full file'
     $fullText = Wait-Until 'the full file is available without a second search' {
         Find-Element 'File contents'
@@ -312,7 +329,7 @@ try {
         throw 'The full preview omitted text outside the match context'
     }
     Click 'Back to match'
-    $null = Wait-Until 'the match context is visible again' { Find-Element 'Match on line 44' -Visible }
+    $null = Wait-Until 'the selected match is visible again' { Find-Element $matchTwo -Visible }
     Click 'Close preview'
     $null = Wait-Until 'the match preview closes' { !(Button 'Close preview') }
     [IO.File]::WriteAllText($fixtureText, 'The file was changed.')
