@@ -165,6 +165,8 @@ try {
     [IO.File]::Delete($readGate)
     Wait-Status '^Cancelled download of /shell directory/interrupted\b'
 
+    (Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::On)
     Download-To 'snapshot' 'receive here'
     Wait-Status '^Downloaded /shell directory/snapshot\b.*2 files, 23 bytes'
     Assert-Explorer 'Show download in File Explorer' 'select' (Join-Path $State 'picker/receive here/snapshot')

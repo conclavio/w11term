@@ -391,6 +391,8 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 Choose **Select downloads…**, mark files or folders, and use **Download marked** to select one destination folder. Marks stay selected while you change pages, sort, or filter the listing. Files and folders keep their remote names. An existing destination, transfer error, or cancellation stops the batch and keeps items already saved.
 
+Enable **Preserve modification times** in the SFTP drawer to keep the server’s reported modification times on downloaded files and folders. This covers search results, batches, and verified or resumed downloads. Entries without a reported time keep their local write time. Scripts can select the same behavior with `--preserve-mtime`. [SFTP control commands](CONTROL.md#run-sftp-operations)
+
 If a drawer transfer finishes while another pane is active or the drawer is closed, the **Attention inbox** gets one result for the transfer or batch. Select the result to open the originating pane’s SFTP drawer.
 
 Open **SFTP transfers** from the caret menu or command palette to see active drawer uploads and downloads across the current window. The tab shows the current item and byte progress for each transfer. Cancel a transfer from the list or use **Open SFTP drawer** to visit its pane.

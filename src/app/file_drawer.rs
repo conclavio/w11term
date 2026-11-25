@@ -111,6 +111,7 @@ pub enum FileAction {
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
     Replace(u64, u64, bool),
+    PreserveMtime(u64, u64, bool),
     AtomicUploads(u64, u64, bool),
     Pick(u64, u64, u64, TransferPicker),
     Picked(u64, u64, u64, TransferPicker, Result<Vec<PathBuf>, String>),
@@ -157,6 +158,7 @@ pub(super) struct FileDrawer {
     editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
+    preserve_mtime: bool,
     atomic_uploads: bool,
     picking: Option<u64>,
     parsing: bool,
@@ -940,8 +942,12 @@ impl FileDrawer {
         destination: PathBuf,
         verification: Option<DownloadVerification>,
     ) -> Result<(Operation, TransferFile)> {
-        self.selected_download_target(entry)?
-            .operation(destination, self.replace, verification)
+        self.selected_download_target(entry)?.operation(
+            destination,
+            self.replace,
+            self.preserve_mtime,
+            verification,
+        )
     }
 
     fn prepare_folder_upload(
@@ -1473,6 +1479,7 @@ impl FileDrawer {
             open: self.open,
             following: self.following,
             sort_order: self.sort_order,
+            preserve_mtime: self.preserve_mtime,
             dialog_serial: self.dialog_serial,
             editor,
             last_download,
@@ -1797,6 +1804,14 @@ impl FileDrawer {
                     context.callback(move |v| Message::Files(Replace(pane, generation, v))),
                 )
                 .content(TextBlock::new().text("Replace existing files")),
+            CheckBox::new()
+                .automation_name("Preserve modification times")
+                .is_enabled(ready)
+                .is_checked(self.preserve_mtime)
+                .on_is_checked_changed(context.callback(move |enabled| {
+                    Message::Files(PreserveMtime(pane, generation, enabled))
+                }))
+                .content(TextBlock::new().text("Preserve modification times")),
             CheckBox::new()
                 .is_enabled(ready)
                 .is_checked(self.atomic_uploads)
@@ -2705,6 +2720,7 @@ impl TerminalApp {
             | FinishEdit(id, ..)
             | Page(id, ..)
             | Replace(id, ..)
+            | PreserveMtime(id, ..)
             | AtomicUploads(id, ..)
             | Pick(id, ..)
             | Picked(id, ..)
@@ -2758,7 +2774,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3008,8 +3024,12 @@ impl TerminalApp {
                                 .try_into()
                                 .map_err(|_| anyhow!("Choose one download destination"))?;
                             let target = files.search_download_target(search, &hit)?;
-                            let (operation, transfer) =
-                                target.operation(local, files.replace, None)?;
+                            let (operation, transfer) = target.operation(
+                                local,
+                                files.replace,
+                                files.preserve_mtime,
+                                None,
+                            )?;
                             files.status = format!("Downloading {}…", hit.name);
                             files.job(
                                 pane,
@@ -3287,6 +3307,7 @@ impl TerminalApp {
                     files.set_page(page);
                 }
                 Replace(_, _, replace) => files.replace = replace,
+                PreserveMtime(_, _, enabled) => files.preserve_mtime = enabled,
                 AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,
                 Drop(target, paths) => {
                     if drop_allowed {
@@ -4745,7 +4766,7 @@ mod tests {
         let (op, status) = drawer
             .download_operation(&entry, destination.clone(), None)
             .unwrap();
-        assert!(matches!(op, Operation::GetDir {remote, local}
+        assert!(matches!(op, Operation::GetDir {remote, local, ..}
             if remote == "/srv/report files" && local == destination.join("report files")));
         assert_eq!(
             status.outcome(&json!({"bytes_transferred":6,"files":2,"skipped":3})),

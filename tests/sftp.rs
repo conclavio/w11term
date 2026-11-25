@@ -29,6 +29,22 @@ struct Peer {
     opens: Arc<AtomicUsize>,
     reject: bool,
 }
+
+fn set_fixture_modified(path: &std::path::Path, seconds: u64) -> std::time::SystemTime {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
+
+    let time = std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+    fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+    time
+}
+
 impl server::Handler for Peer {
     type Error = anyhow::Error;
     async fn auth_none(&mut self, _user: &str) -> anyhow::Result<server::Auth> {
@@ -1687,6 +1703,7 @@ async fn verified_download_checks_every_chunk_before_replacing_the_destination()
                     max_bytes: Some(data.len() as u64),
                     expected_sha256: Some(expected_sha256),
                     resume: false,
+                    preserve_mtime: false,
                 },
                 expected_generation: None,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(10),
@@ -1763,6 +1780,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         max_bytes: None,
         expected_sha256: None,
         resume: false,
+        preserve_mtime: false,
     };
     let hold = remote.path().join("hold-next-chunk");
     fs::write(&hold, []).unwrap();

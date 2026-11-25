@@ -11,9 +11,9 @@ w11term-cli [--pid PID] sftp cancel-transfer TRANSFER_ID\n\
 w11term-cli [--pid PID] sftp wait-transfer TRANSFER_ID [--timeout SECONDS]\n\
 w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
-  get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX [--resume]]\n\
+  get REMOTE LOCAL [--overwrite] [--preserve-mtime] [--max-bytes N] [--sha256 HEX [--resume]]\n\
   put LOCAL REMOTE [--overwrite] [--atomic]\n\
-  get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
+  get-dir REMOTE NEW_LOCAL_DIRECTORY [--preserve-mtime] | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   find ROOT QUERY\n\
   sha256 PATH [--max-bytes N]\n\
@@ -44,6 +44,7 @@ pub fn parse(
     let mut overwrite = false;
     let mut atomic = false;
     let mut resume = false;
+    let mut preserve_mtime = false;
     let mut spec_order = false;
     while let Some(arg) = args.next() {
         let value = |args: &mut std::iter::Peekable<_>| {
@@ -64,6 +65,10 @@ pub fn parse(
             "--resume" => {
                 ensure!(!resume, "duplicate --resume");
                 resume = true;
+            }
+            "--preserve-mtime" => {
+                ensure!(!preserve_mtime, "duplicate --preserve-mtime");
+                preserve_mtime = true;
             }
             "--spec-order" => {
                 ensure!(!spec_order, "duplicate --spec-order");
@@ -104,7 +109,7 @@ pub fn parse(
             None
         };
         ensure!(
-            opts.is_empty() && !overwrite && !atomic && !resume && !spec_order,
+            opts.is_empty() && !overwrite && !atomic && !resume && !spec_order && !preserve_mtime,
             "Unexpected options for {command}"
         );
         let request = if command == "list-transfers" {
@@ -135,6 +140,10 @@ pub fn parse(
     }
     ensure!(!atomic || command == "put", "--atomic requires put");
     ensure!(
+        !preserve_mtime || matches!(command.as_str(), "get" | "get-dir"),
+        "--preserve-mtime requires get or get-dir"
+    );
+    ensure!(
         !resume || (command == "get" && opts.contains_key("--sha256")),
         "--resume requires get with --sha256"
     );
@@ -162,6 +171,9 @@ pub fn parse(
             };
             fields.insert("remote".into(), json!(remote));
             fields.insert("local".into(), json!(std::path::absolute(local)?));
+            if preserve_mtime {
+                fields.insert("preserve_mtime".into(), json!(true));
+            }
             if matches!(command.as_str(), "get" | "put") {
                 fields.insert("overwrite".into(), json!(overwrite));
                 overwrite = false;
@@ -455,6 +467,43 @@ mod tests {
     }
 
     #[test]
+    fn preserve_mtime_is_available_only_for_downloads() {
+        let operation = |command| {
+            p(&[
+                command,
+                "--pane",
+                "2",
+                "/remote",
+                "local",
+                "--preserve-mtime",
+            ])
+            .unwrap()
+            .1
+        };
+        assert!(matches!(
+            operation("get"),
+            Request::Sftp {
+                operation: Operation::Get {
+                    preserve_mtime: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            operation("get-dir"),
+            Request::Sftp {
+                operation: Operation::GetDir {
+                    preserve_mtime: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(p(&["put", "--pane", "2", "local", "/remote", "--preserve-mtime"]).is_err());
+    }
+
+    #[test]
     fn transfers_handles_attributes_and_validation() {
         let (
             _,
@@ -490,7 +539,12 @@ mod tests {
             _,
             Request::Sftp {
                 pane,
-                operation: Operation::GetDir { local, remote },
+                operation:
+                    Operation::GetDir {
+                        local,
+                        remote,
+                        preserve_mtime: false,
+                    },
                 ..
             },
         ) = p(&["get_dir", "--pane", "7", "/var/log", "saved logs"]).unwrap()

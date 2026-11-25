@@ -485,10 +485,12 @@ mod tests {
         );
         let target = drawer.search_download_target(2, &folder).unwrap();
         let (operation, _) = target
-            .operation(r"C:\Downloads".into(), false, None)
+            .operation(r"C:\Downloads".into(), false, true, None)
             .unwrap();
-        assert!(matches!(operation, Operation::GetDir { remote, local }
-            if remote == "/project/logs/logs archive" && local == std::path::Path::new(r"C:\Downloads\logs archive")));
+        assert!(
+            matches!(operation, Operation::GetDir { remote, local, preserve_mtime: true }
+            if remote == "/project/logs/logs archive" && local == std::path::Path::new(r"C:\Downloads\logs archive"))
+        );
         assert!(drawer.search_download_target(1, &file).is_err());
         assert!(drawer.search_download_target(2, &link).is_err());
         let forged = FilenameMatch {

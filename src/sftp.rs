@@ -17,7 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -74,6 +74,15 @@ struct DownloadChecks {
     max_bytes: Option<u64>,
     sha256: Option<String>,
     resume: bool,
+    preserve_mtime: bool,
+}
+
+fn set_download_mtime(file: &std::fs::File, mtime: Option<u32>) -> Result<()> {
+    if let Some(seconds) = mtime {
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(u64::from(seconds)))
+            .context("preserving the remote modification time")?;
+    }
+    Ok(())
 }
 
 enum DownloadStaging {
@@ -90,11 +99,18 @@ impl DownloadStaging {
         reply
     }
 
-    fn publish(self, file: std::fs::File, destination: PathBuf, overwrite: bool) -> Result<()> {
+    fn publish(
+        self,
+        file: std::fs::File,
+        destination: PathBuf,
+        overwrite: bool,
+        mtime: Option<u32>,
+    ) -> Result<()> {
         match self {
             Self::Temporary(temp) => {
                 drop(file);
                 apply_mark_of_the_web(temp.path())?;
+                set_download_mtime(temp.as_file(), mtime)?;
                 if overwrite {
                     temp.persist(destination)
                 } else {
@@ -102,7 +118,10 @@ impl DownloadStaging {
                 }?;
                 Ok(())
             }
-            Self::Resumable(partial) => partial.publish(file, overwrite),
+            Self::Resumable(partial) => {
+                set_download_mtime(&file, mtime)?;
+                partial.publish(file, overwrite)
+            }
         }
     }
 }
@@ -155,6 +174,8 @@ pub enum Operation {
         expected_sha256: Option<String>,
         #[serde(default)]
         resume: bool,
+        #[serde(default)]
+        preserve_mtime: bool,
     },
     Sha256 {
         path: String,
@@ -164,6 +185,8 @@ pub enum Operation {
     GetDir {
         remote: String,
         local: PathBuf,
+        #[serde(default)]
+        preserve_mtime: bool,
     },
     PutDir {
         local: PathBuf,
@@ -631,7 +654,7 @@ pub(crate) async fn run(
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
             && let Operation::Put { local, remote, .. }
             | Operation::Get { local, remote, .. }
-            | Operation::GetDir { local, remote } = &operation
+            | Operation::GetDir { local, remote, .. } = &operation
         {
             let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
             continue;
@@ -941,6 +964,7 @@ impl Engine {
                 max_bytes,
                 expected_sha256,
                 resume,
+                preserve_mtime,
             } => {
                 self.get(
                     remote,
@@ -953,17 +977,19 @@ impl Engine {
                             .map(normalize_sha256)
                             .transpose()?,
                         resume,
+                        preserve_mtime,
                     },
                     progress,
                     cancel,
                 )
                 .await?
             }
-            GetDir { remote, local } => {
-                let JobStage::DirectoryDownload { staging, deadline } = stage else {
-                    unreachable!("directory job stage")
-                };
-                self.get_dir(remote, local, progress, cancel, staging, *deadline)
+            GetDir {
+                remote,
+                local,
+                preserve_mtime,
+            } => {
+                self.get_dir(remote, local, preserve_mtime, progress, cancel, stage)
                     .await?
             }
             PutDir { local, .. } => {
@@ -1445,15 +1471,16 @@ impl Engine {
             .handle;
         let copied = async {
             // Some servers omit size or disallow FSTAT on readable files.
-            let total = if progress.is_some() && !cancelled() {
+            let attrs = if (progress.is_some() || checks.preserve_mtime) && !cancelled() {
                 match self.raw.fstat(&h).await {
-                    Ok(reply) => reply.attrs.size,
+                    Ok(reply) => reply.attrs,
                     Err(error) if transport_error(&error) => return Err(error.into()),
-                    Err(_) => None,
+                    Err(_) => FileAttributes::empty(),
                 }
             } else {
-                None
+                FileAttributes::empty()
             };
+            let total = attrs.size;
             report(progress, resumed_from, total);
             let offset = self
                 .read_contents(
@@ -1474,11 +1501,11 @@ impl Engine {
             if !cancelled() {
                 file.sync_all().await?;
             }
-            Ok::<u64, anyhow::Error>(offset)
+            Ok::<_, anyhow::Error>((offset, attrs.mtime.filter(|_| checks.preserve_mtime)))
         }
         .await;
         let closed = self.raw.close(h).await;
-        let bytes = copied?;
+        let (bytes, mtime) = copied?;
         closed?;
         if cancelled() {
             return Ok(staging.cancelled_reply(&local, &remote, bytes));
@@ -1508,7 +1535,7 @@ impl Engine {
             if cancel.as_ref().is_some_and(TransferCancel::is_cancelled) {
                 return Ok(false);
             }
-            staging.publish(file, destination, overwrite)?;
+            staging.publish(file, destination, overwrite, mtime)?;
             Ok(true)
         })
         .await??;

@@ -2601,6 +2601,10 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let verified = b"verify the downloaded bytes\x00\xff";
     fs::write(parent.join("verified.bin"), verified).unwrap();
     fs::write(parent.join("z-later.bin"), b"later item").unwrap();
+    let verified_time = set_fixture_modified(&parent.join("verified.bin"), 1_000_000_010);
+    let snapshot_file_time =
+        set_fixture_modified(&source.join("data 雪/trace 例.bin"), 1_000_000_008);
+    let snapshot_root_time = set_fixture_modified(&source, 1_000_000_004);
     {
         use sha2::{Digest, Sha256};
         fs::write(
@@ -2632,6 +2636,13 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     assert_eq!(
         fs::read(state.path().join("accepted.bin")).unwrap(),
         verified
+    );
+    assert_eq!(
+        fs::metadata(state.path().join("accepted.bin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        verified_time
     );
     assert!(!state.path().join("rejected.bin").exists());
     assert_eq!(
@@ -2666,6 +2677,24 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     );
 
     let downloaded = received.join("snapshot");
+    assert_eq!(
+        fs::metadata(&downloaded).unwrap().modified().unwrap(),
+        snapshot_root_time
+    );
+    assert_eq!(
+        fs::metadata(downloaded.join("data 雪/trace 例.bin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        snapshot_file_time
+    );
+    assert_eq!(
+        fs::metadata(batch_received.join("verified.bin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        verified_time
+    );
     assert_eq!(
         fs::read(downloaded.join(".manifest")).unwrap(),
         b"remote manifest\n"
