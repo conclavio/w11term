@@ -12,6 +12,7 @@ pub enum Action {
     Cancel(u64),
     Page(u64, usize),
     Reveal(u64, FilenameMatch),
+    CopyPaths(u64, Option<FilenameMatch>),
     Back(u64),
 }
 
@@ -22,6 +23,7 @@ pub(super) struct Panel {
     result: Option<FilenameSearch>,
     page: usize,
     pub(super) cancel: Option<TransferCancel>,
+    copy_status: Option<String>,
 }
 
 fn result_status(result: &FilenameSearch) -> String {
@@ -51,6 +53,38 @@ impl Panel {
         self.result
             .as_ref()
             .map_or(0, |r| r.matches.len().div_ceil(RESULTS_PER_PAGE))
+    }
+
+    fn paths_to_copy(
+        &self,
+        serial: u64,
+        hit: Option<&FilenameMatch>,
+    ) -> Result<Option<(String, usize)>> {
+        let Some(result) = self.result.as_ref().filter(|_| serial == self.serial) else {
+            return Ok(None);
+        };
+        if let Some(hit) = hit {
+            if !result.matches.contains(hit) {
+                return Ok(None);
+            }
+            return Ok(Some((remote_child(&hit.parent, &hit.name)?, 1)));
+        }
+        if result.matches.is_empty() {
+            return Ok(None);
+        }
+        let paths = result
+            .matches
+            .iter()
+            .map(|hit| {
+                let path = remote_child(&hit.parent, &hit.name)?;
+                ensure!(
+                    !path.contains(['\r', '\n']),
+                    "Some paths contain line breaks. Copy those paths individually."
+                );
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((paths.join("\r\n"), paths.len())))
     }
 
     pub(super) fn view(
@@ -104,27 +138,48 @@ impl Panel {
                     })),
             ),
         ];
-        rows.push(KeyedView::new(
-            "run",
-            if let Some(cancel) = running {
-                button(
-                    "Cancel search",
-                    Action::Cancel(serial),
-                    !cancel.is_cancelled(),
-                )
-            } else {
-                button(
-                    "Search",
-                    Action::Run(serial),
-                    ready && valid_filename_query(&self.query),
-                )
-            },
-        ));
+        let run = if let Some(cancel) = running {
+            button(
+                "Cancel search",
+                Action::Cancel(serial),
+                !cancel.is_cancelled(),
+            )
+        } else {
+            button(
+                "Search",
+                Action::Run(serial),
+                ready && valid_filename_query(&self.query),
+            )
+        };
+        let search_actions = if self
+            .result
+            .as_ref()
+            .is_some_and(|result| !result.matches.is_empty())
+        {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .children((
+                    run,
+                    button("Copy all paths", Action::CopyPaths(serial, None), ready),
+                ))
+        } else {
+            run
+        };
+        rows.push(KeyedView::new("run", search_actions));
         if !files.status.is_empty() {
             rows.push(KeyedView::new(
                 "status",
                 TextBlock::new()
                     .text(&files.status)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        if let Some(status) = &self.copy_status {
+            rows.push(KeyedView::new(
+                "copy-status",
+                TextBlock::new()
+                    .text(status)
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -164,28 +219,26 @@ impl Panel {
             .take(RESULTS_PER_PAGE)
             .map(|(index, hit)| {
                 let path = format!("{}/{}", hit.parent.trim_end_matches('/'), hit.name);
-                let mut actions = vec![KeyedView::new(
-                    "reveal",
-                    Button::new()
-                        .automation_name(format!("Reveal {path}"))
-                        .is_enabled(ready)
-                        .horizontal_alignment(HorizontalAlignment::Stretch)
-                        .on_click({
-                            let hit = hit.clone();
-                            ctx.callback(move |_| {
-                                Message::Files(FileAction::Search(
-                                    pane,
-                                    generation,
-                                    Action::Reveal(serial, hit.clone()),
-                                ))
-                            })
+                let reveal = Button::new()
+                    .automation_name(format!("Reveal {path}"))
+                    .is_enabled(ready)
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .on_click({
+                        let hit = hit.clone();
+                        ctx.callback(move |_| {
+                            Message::Files(FileAction::Search(
+                                pane,
+                                generation,
+                                Action::Reveal(serial, hit.clone()),
+                            ))
                         })
-                        .content(
-                            TextBlock::new()
-                                .text(&path)
-                                .text_wrapping(TextWrapping::Wrap),
-                        ),
-                )];
+                    })
+                    .content(
+                        TextBlock::new()
+                            .text(&path)
+                            .text_wrapping(TextWrapping::Wrap),
+                    );
+                let mut actions = Vec::new();
                 if let Some(label) = match hit.kind {
                     Some(EntryKind::File) => Some("Download…"),
                     Some(EntryKind::Directory) => Some("Download folder…"),
@@ -195,7 +248,6 @@ impl Panel {
                     actions.push(KeyedView::new(
                         "download",
                         Button::new()
-                            .grid_column(1)
                             .automation_name(format!("Download {path}"))
                             .is_enabled(ready)
                             .on_click(ctx.callback(move |_| {
@@ -209,12 +261,35 @@ impl Panel {
                             .content(label),
                     ));
                 }
+                actions.push(KeyedView::new(
+                    "copy",
+                    Button::new()
+                        .automation_name(format!("Copy path {path}"))
+                        .is_enabled(ready)
+                        .on_click({
+                            let hit = hit.clone();
+                            ctx.callback(move |_| {
+                                Message::Files(FileAction::Search(
+                                    pane,
+                                    generation,
+                                    Action::CopyPaths(serial, Some(hit.clone())),
+                                ))
+                            })
+                        })
+                        .content("Copy path"),
+                ));
                 KeyedView::new(
                     index,
                     Grid::new()
                         .columns([GridLength::Star(1.0), GridLength::Auto])
                         .column_spacing(6.0)
-                        .keyed_children(actions),
+                        .children((
+                            reveal,
+                            StackPanel::new()
+                                .grid_column(1)
+                                .spacing(4.0)
+                                .keyed_children(actions),
+                        )),
                 )
             });
         Border::new()
@@ -290,6 +365,7 @@ impl FileDrawer {
             return;
         };
         panel.cancel = None;
+        panel.copy_status = None;
         self.status = match result.and_then(|value| {
             serde_json::from_value::<FilenameSearch>(value).map_err(|error| error.to_string())
         }) {
@@ -327,6 +403,7 @@ impl FileDrawer {
                 result: None,
                 page: 0,
                 cancel: None,
+                copy_status: None,
             });
             return Ok(());
         }
@@ -343,6 +420,7 @@ impl FileDrawer {
                 if panel.query != query {
                     panel.query = query;
                     panel.result = None;
+                    panel.copy_status = None;
                     self.status.clear();
                 }
             }
@@ -353,7 +431,11 @@ impl FileDrawer {
                     path: panel.root.clone(),
                     query: panel.query.clone(),
                 };
+                self.dialog_serial = self.dialog_serial.wrapping_add(1);
+                panel.serial = self.dialog_serial;
+                let serial = panel.serial;
                 panel.result = None;
+                panel.copy_status = None;
                 panel.page = 0;
                 panel.cancel = Some(TransferCancel::default());
                 self.status = "Searching folders…".into();
@@ -369,6 +451,17 @@ impl FileDrawer {
             }
             Action::Page(serial, page) if serial == panel.serial && page < panel.page_count() => {
                 panel.page = page;
+            }
+            Action::CopyPaths(serial, hit) if !busy => {
+                panel.copy_status = match panel.paths_to_copy(serial, hit.as_ref()) {
+                    Ok(Some((paths, count))) => Some(match w11term::clipboard::write(&paths) {
+                        Ok(()) if count == 1 => "Copied path".to_owned(),
+                        Ok(()) => format!("Copied {count} paths"),
+                        Err(error) => format!("Could not copy paths. {error}"),
+                    }),
+                    Ok(None) => return Ok(()),
+                    Err(error) => Some(error.to_string()),
+                };
             }
             Action::Reveal(serial, hit)
                 if serial == panel.serial
@@ -426,6 +519,7 @@ mod tests {
                 }),
                 page: 1,
                 cancel: None,
+                copy_status: None,
             }),
             ..FileDrawer::default()
         };
@@ -436,6 +530,10 @@ mod tests {
         assert_eq!(panel.page, 1);
         assert_eq!(panel.query, "log");
         assert_eq!(panel.serial, 8);
+        let (paths, count) = panel.paths_to_copy(8, None).unwrap().unwrap();
+        assert_eq!(count, RESULTS_PER_PAGE + 1);
+        assert_eq!(paths.lines().next(), Some("/project/log-0.txt"));
+        assert_eq!(paths.lines().last(), Some("/project/log-25.txt"));
         assert!(drawer.status.contains("Search limit reached"));
         assert!(drawer.saved_search.is_none());
         drawer.saved_search = Some(panel);
@@ -476,6 +574,7 @@ mod tests {
                 }),
                 page: 0,
                 cancel: None,
+                copy_status: None,
             }),
             ..FileDrawer::default()
         };
@@ -498,5 +597,59 @@ mod tests {
             ..file
         };
         assert!(drawer.search_download_target(2, &forged).is_err());
+    }
+
+    #[test]
+    fn search_copy_keeps_literal_paths_and_rejects_stale_or_ambiguous_lists() {
+        let file = FilenameMatch {
+            parent: "/project/雪 files".into(),
+            name: "Résumé [draft] $1.txt".into(),
+            kind: Some(EntryKind::File),
+        };
+        let link = FilenameMatch {
+            parent: "/".into(),
+            name: "snap link".into(),
+            kind: Some(EntryKind::Symlink),
+        };
+        let mut panel = Panel {
+            serial: 4,
+            root: "/".into(),
+            query: "snap".into(),
+            result: Some(FilenameSearch {
+                root: "/".into(),
+                matches: vec![link, file.clone()],
+                scanned_directories: 2,
+                scanned_entries: 2,
+                skipped_directories: 0,
+                truncated: false,
+                cancelled: true,
+            }),
+            page: 0,
+            cancel: None,
+            copy_status: None,
+        };
+        let path = "/project/雪 files/Résumé [draft] $1.txt";
+        assert_eq!(
+            panel.paths_to_copy(4, Some(&file)).unwrap(),
+            Some((path.into(), 1))
+        );
+        assert_eq!(
+            panel.paths_to_copy(4, None).unwrap(),
+            Some((format!("/snap link\r\n{path}"), 2))
+        );
+        assert!(panel.paths_to_copy(3, None).unwrap().is_none());
+        let updated = &mut panel.result.as_mut().unwrap().matches[1];
+        updated.parent = "/line\nfeed".into();
+        let updated = updated.clone();
+        assert!(panel.paths_to_copy(4, Some(&file)).unwrap().is_none());
+        assert!(panel.paths_to_copy(4, None).is_err());
+        assert!(
+            panel
+                .paths_to_copy(4, Some(&updated))
+                .unwrap()
+                .unwrap()
+                .0
+                .contains('\n')
+        );
     }
 }

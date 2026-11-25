@@ -5,7 +5,11 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $verifyClipboard = $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted'
-if ($verifyClipboard) { . (Join-Path $PSScriptRoot 'support/clipboard.ps1') }
+if ($verifyClipboard) {
+    . (Join-Path $PSScriptRoot 'support/clipboard.ps1')
+} else {
+    $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'copied-path.txt'
+}
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $picker = Join-Path $State 'picker'
@@ -46,6 +50,12 @@ function Check-PathCopy([string]$ButtonName, [string]$Expected) {
         Invoke-Button $control
         $null = Wait-Until "exact clipboard path from '$ButtonName'" {
             [FixtureClipboard]::ContainsNewText($before, $Expected)
+        }
+    } else {
+        [IO.File]::Delete($env:W11TERM_TEST_COPY_FILE)
+        Invoke-Button $control
+        $null = Wait-Until "exact fixture clipboard text from '$ButtonName'" {
+            (Read-ClipboardFixture) -ceq $Expected
         }
     }
 }
@@ -206,6 +216,11 @@ try {
     }
     if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'NESTED') {
         throw 'Returning to results changed the search query'
+    }
+    Check-PathCopy "Copy path $parent/nested/nested-content.txt" "$parent/nested/nested-content.txt"
+    Check-PathCopy 'Copy all paths' "$parent/nested`r`n$parent/nested/nested-content.txt"
+    $null = Wait-Until 'result summary and copy confirmation share the panel' {
+        (Find-Element '2 matches in 2 folders') -and (Find-Element 'Copied 2 paths')
     }
     Click 'Back to files'
     $null = Wait-Until 'listing remains at the revealed file after leaving the results' {
