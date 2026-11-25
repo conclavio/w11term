@@ -40,6 +40,19 @@ function Wait-Status([string]$Pattern) {
     }
 }
 
+function Download-Verified([string]$Digest, [string]$Destination) {
+    Click 'verified.bin'
+    Click ('Download and verify' + [char]0x2026)
+    $field = Wait-Until 'expected SHA-256 field' { Find-Element 'Expected SHA-256' }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Digest)
+    Click 'Choose destination'
+    $dialog = Wait-Until 'owned verified download save picker' { Find-OwnedDialog 'Save As' }
+    $null = Wait-Until 'enter verified file destination' {
+        [FixtureDialog]::SetFilename($dialog, $Destination, 'verified.bin')
+    }
+    $null = Wait-Until 'accept verified file destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
 $reader = $null
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -71,6 +84,12 @@ try {
     $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
     Download-To 'snapshot' 'already exists'
     Wait-Status 'destination.*exists'
+
+    $digest = [IO.File]::ReadAllText((Join-Path $State 'verified.sha256'))
+    Download-Verified ('0' * 64) (Join-Path $State 'rejected.bin')
+    Wait-Status 'SHA-256 mismatch'
+    Download-Verified $digest (Join-Path $State 'accepted.bin')
+    Wait-Status 'SHA-256 verified'
     Run-Palette 'SFTP files'
     foreach ($c in 'folder-download-live'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','folder-download-live')

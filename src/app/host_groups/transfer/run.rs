@@ -90,6 +90,7 @@ impl Prepared {
                     local: folder.destination(pane, &file.remote, file.number),
                     overwrite: false,
                     max_bytes: None,
+                    expected_sha256: None,
                 }
             }
         }

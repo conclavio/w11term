@@ -313,7 +313,7 @@ impl Download<'_> {
                     &mut file,
                     expected.map(|n| (n, "reported file size")),
                     self.cancel,
-                    |n| {
+                    |n, _| {
                         self.count.bytes = base.checked_add(n).context("folder size overflow")?;
                         report(self.progress, self.count.bytes, None);
                         Ok(())

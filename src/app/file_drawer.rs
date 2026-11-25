@@ -5,7 +5,7 @@ use std::{collections::VecDeque, path::PathBuf};
 use tokio::sync::{oneshot, watch};
 use w11term::folder_grants::Authority;
 use w11term::sftp::{
-    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, TransferProgress,
+    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, TransferProgress, normalize_sha256,
     validate_download_name,
 };
 
@@ -85,6 +85,7 @@ pub enum FileAction {
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
     Rename(u64, u64, ListedEntry),
+    VerifyDownload(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
     EditName(u64, u64, u64, String),
@@ -192,7 +193,7 @@ pub struct ListedEntry {
 pub enum TransferPicker {
     UploadFiles(String),
     UploadFolder(String),
-    Download(ListedEntry),
+    Download(ListedEntry, Option<String>),
 }
 
 impl TransferPicker {
@@ -210,7 +211,7 @@ impl TransferPicker {
                     Purpose::UploadFiles
                 })
             }
-            Self::Download(entry) => {
+            Self::Download(entry, _) => {
                 let remote = files.selected_path(entry)?;
                 if entry.kind == ListedKind::Known(EntryKind::Directory) {
                     validate_download_name(&entry.name)?;
@@ -247,6 +248,7 @@ enum EditAction {
     GoToFolder { revision: u64 },
     Create,
     Rename(ListedEntry),
+    VerifyDownload(ListedEntry),
     Delete(ListedEntry, EntryKind),
 }
 
@@ -254,7 +256,9 @@ impl EditAction {
     fn original(&self) -> Option<&ListedEntry> {
         match self {
             Self::GoToFolder { .. } | Self::Create => None,
-            Self::Rename(entry) | Self::Delete(entry, _) => Some(entry),
+            Self::Rename(entry) | Self::VerifyDownload(entry) | Self::Delete(entry, _) => {
+                Some(entry)
+            }
         }
     }
 }
@@ -282,6 +286,7 @@ impl EntryDialog {
                 bail!("Enter a different name")
             }
             EditAction::Delete(original, _) => delete_path(parent()?, &original.name),
+            EditAction::VerifyDownload(_) => normalize_sha256(&self.name),
             EditAction::Rename(_) | EditAction::Create => entry_path(parent()?, &self.name),
         }
     }
@@ -390,6 +395,9 @@ impl TransferFile {
                 reply["skipped"],
             ),
             (Self::Upload { name, .. }, false) => format!("Uploaded {name} ({bytes} bytes)"),
+            (Self::Download(name), false) if reply["sha256"].is_string() => {
+                format!("Downloaded {name} ({bytes} bytes). SHA-256 verified.")
+            }
             (Self::Download(name), false) => format!("Downloaded {name} ({bytes} bytes)"),
             (Self::DownloadFolder { remote, local }, false) => format!(
                 "Downloaded {remote} to {} ({} files, {bytes} bytes, {} links or special files skipped).",
@@ -785,6 +793,7 @@ impl FileDrawer {
         &self,
         entry: &ListedEntry,
         destination: PathBuf,
+        expected_sha256: Option<String>,
     ) -> Result<(Operation, TransferFile)> {
         let remote = self.selected_path(entry)?;
         ensure!(
@@ -792,6 +801,7 @@ impl FileDrawer {
             "Choose an absolute download destination"
         );
         if entry.kind == ListedKind::Known(EntryKind::Directory) {
+            ensure!(expected_sha256.is_none(), "Choose a file to verify");
             validate_download_name(&entry.name)?;
             let local = destination.join(&entry.name);
             Ok((
@@ -808,6 +818,7 @@ impl FileDrawer {
                     remote: remote.clone(),
                     overwrite: self.replace,
                     max_bytes: None,
+                    expected_sha256,
                 },
                 TransferFile::Download(remote),
             ))
@@ -968,9 +979,12 @@ impl FileDrawer {
         self.dialog = Some(EntryDialog {
             serial: self.dialog_serial,
             parent,
-            name: action
-                .original()
-                .map_or_else(String::new, |entry| entry.name.clone()),
+            name: match &action {
+                EditAction::VerifyDownload(_) => String::new(),
+                action => action
+                    .original()
+                    .map_or_else(String::new, |entry| entry.name.clone()),
+            },
             action,
         });
     }
@@ -1047,6 +1061,11 @@ impl FileDrawer {
         let (title, label, confirm) = match dialog.action {
             EditAction::GoToFolder { .. } => ("Go to folder", "Remote folder path", "Open"),
             EditAction::Rename(_) => ("Rename entry", "New name", "Rename"),
+            EditAction::VerifyDownload(_) => (
+                "Download and verify",
+                "Expected SHA-256",
+                "Choose destination",
+            ),
             EditAction::Create => ("New folder", "Folder name", "Create"),
             EditAction::Delete(..) => unreachable!(),
         };
@@ -1060,6 +1079,20 @@ impl FileDrawer {
                     Message::Files(FileAction::EditName(pane, generation, serial, name))
                 })),
         )];
+        if let EditAction::VerifyDownload(entry) = &dialog.action {
+            fields.insert(
+                0,
+                KeyedView::new(
+                    "download-source",
+                    TextBlock::new()
+                        .text(format!(
+                            "{}@{}:{} · {}",
+                            ssh.user, ssh.host, ssh.port, entry.name
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
+                ),
+            );
+        }
         if !dialog.name.is_empty()
             && let Err(error) = &valid
         {
@@ -1383,20 +1416,6 @@ impl FileDrawer {
                                 .is_some_and(|e| e.kind != ListedKind::Known(EntryKind::File)),
                         OpenEntry(pane, generation, listed(selected)),
                     ),
-                    button(
-                        if download_folder {
-                            "Download folder…"
-                        } else {
-                            "Download…"
-                        },
-                        ready && selected.is_some(),
-                        Pick(
-                            pane,
-                            generation,
-                            revision,
-                            TransferPicker::Download(listed(selected)),
-                        ),
-                    ),
                     Button::new()
                         .automation_name("Open shell here")
                         .is_enabled(shell.is_some())
@@ -1408,6 +1427,27 @@ impl FileDrawer {
                         }))
                         .content("Open shell here"),
                 )),
+            button_pair(
+                button(
+                    if download_folder {
+                        "Download folder…"
+                    } else {
+                        "Download…"
+                    },
+                    ready && selected.is_some(),
+                    Pick(
+                        pane,
+                        generation,
+                        revision,
+                        TransferPicker::Download(listed(selected), None),
+                    ),
+                ),
+                button(
+                    "Download and verify…",
+                    ready && selected.is_some() && !download_folder,
+                    VerifyDownload(pane, generation, listed(selected)),
+                ),
+            ),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
@@ -2228,6 +2268,7 @@ impl TerminalApp {
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
             | Rename(id, ..)
+            | VerifyDownload(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
             | EditName(id, ..)
@@ -2286,7 +2327,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2460,11 +2501,12 @@ impl TerminalApp {
                                 context,
                             )?;
                         }
-                        TransferPicker::Download(entry) => {
+                        TransferPicker::Download(entry, expected_sha256) => {
                             let [local] = paths
                                 .try_into()
                                 .map_err(|_| anyhow!("Choose one download destination"))?;
-                            let (operation, transfer) = files.download_operation(&entry, local)?;
+                            let (operation, transfer) =
+                                files.download_operation(&entry, local, expected_sha256)?;
                             files.status = format!("Downloading {}…", entry.name);
                             files.job(
                                 pane,
@@ -2515,6 +2557,15 @@ impl TerminalApp {
                                     EntryChange::Delete(entry.name),
                                     Operation::RemoveEntry { path, kind },
                                 )
+                            }
+                            EditAction::VerifyDownload(entry) => {
+                                context.sender().send(Message::Files(Pick(
+                                    pane,
+                                    files.generation,
+                                    files.listing_revision,
+                                    TransferPicker::Download(entry, Some(path)),
+                                )));
+                                return Ok(());
                             }
                             EditAction::Rename(entry) => {
                                 files.status = format!("Renaming {} to {name}…", entry.name);
@@ -2635,6 +2686,17 @@ impl TerminalApp {
                 Rename(_, _, entry) if frame.prompt.is_none() && self.title_editor.is_none() => {
                     files.end_filter_edit();
                     files.begin_edit(entry.parent.clone(), EditAction::Rename(entry))?;
+                }
+                VerifyDownload(_, _, entry) => {
+                    if !may_open_dialog {
+                        return Ok(());
+                    }
+                    ensure!(
+                        entry.kind != ListedKind::Known(EntryKind::Directory),
+                        "Choose a file to verify"
+                    );
+                    files.end_filter_edit();
+                    files.begin_edit(entry.parent.clone(), EditAction::VerifyDownload(entry))?;
                 }
                 Delete(_, _, entry) if may_open_dialog => {
                     files.check_selected(&entry)?;
@@ -2880,7 +2942,7 @@ impl TerminalApp {
                         pane,
                         generation,
                         serial,
-                        TransferPicker::Download(entry),
+                        TransferPicker::Download(entry, None),
                         Ok(vec![local.join("download.bin")]),
                     ),
                     context,
@@ -4123,7 +4185,7 @@ mod tests {
         };
         let entry = list(&mut drawer, "report files", directory);
         let (op, status) = drawer
-            .download_operation(&entry, destination.clone())
+            .download_operation(&entry, destination.clone(), None)
             .unwrap();
         assert!(matches!(op, Operation::GetDir {remote, local}
             if remote == "/srv/report files" && local == destination.join("report files")));
@@ -4149,11 +4211,11 @@ mod tests {
         );
         assert!(
             drawer
-                .download_operation(&entry, destination.clone())
+                .download_operation(&entry, destination.clone(), None)
                 .is_err()
         );
         let (op, _) = drawer
-            .download_operation(&file, destination.clone())
+            .download_operation(&file, destination.clone(), None)
             .unwrap();
         assert!(
             matches!(op, Operation::Get { overwrite: true, local, .. } if local == destination)
@@ -4162,7 +4224,7 @@ mod tests {
             let entry = list(&mut drawer, name, directory);
             assert!(
                 drawer
-                    .download_operation(&entry, destination.clone())
+                    .download_operation(&entry, destination.clone(), None)
                     .is_err()
             );
         }

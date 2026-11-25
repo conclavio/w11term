@@ -8,6 +8,7 @@ use russh_sftp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -41,6 +42,20 @@ pub const CHUNK: usize = 32 * 1024;
 pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+pub fn normalize_sha256(value: &str) -> Result<String> {
+    let value = value.trim();
+    ensure!(
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Enter a SHA-256 digest of 64 hexadecimal digits"
+    );
+    Ok(value.to_ascii_lowercase())
+}
+
+struct DownloadChecks {
+    max_bytes: Option<u64>,
+    sha256: Option<String>,
+}
 
 /// Directory entry types the drawer can delete with the SFTP v3 primitives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +94,8 @@ pub enum Operation {
         max_bytes: Option<u64>,
         #[serde(default)]
         overwrite: bool,
+        #[serde(default)]
+        expected_sha256: Option<String>,
     },
     GetDir {
         remote: String,
@@ -822,9 +839,23 @@ impl Engine {
                 local,
                 overwrite,
                 max_bytes,
+                expected_sha256,
             } => {
-                self.get(remote, local, overwrite, max_bytes, progress, cancel)
-                    .await?
+                self.get(
+                    remote,
+                    local,
+                    overwrite,
+                    DownloadChecks {
+                        max_bytes,
+                        sha256: expected_sha256
+                            .as_deref()
+                            .map(normalize_sha256)
+                            .transpose()?,
+                    },
+                    progress,
+                    cancel,
+                )
+                .await?
             }
             GetDir { remote, local } => {
                 let JobStage::DirectoryDownload { staging, deadline } = stage else {
@@ -1169,7 +1200,7 @@ impl Engine {
         file: &mut (impl tokio::io::AsyncWrite + Unpin),
         limit: Option<(u64, &str)>,
         cancel: Option<&TransferCancel>,
-        mut advanced: impl FnMut(u64) -> Result<()>,
+        mut advanced: impl FnMut(u64, &[u8]) -> Result<()>,
     ) -> Result<u64> {
         let mut offset = 0u64;
         while !cancel.is_some_and(TransferCancel::is_cancelled) {
@@ -1198,7 +1229,7 @@ impl Engine {
                     }
                     file.write_all(&data.data).await?;
                     offset = next;
-                    advanced(offset)?;
+                    advanced(offset, &data.data)?;
                 }
                 Err(e) if eof(&e) => break,
                 Err(e) => return Err(e.into()),
@@ -1211,7 +1242,7 @@ impl Engine {
         remote: String,
         local: PathBuf,
         overwrite: bool,
-        max_bytes: Option<u64>,
+        checks: DownloadChecks,
         progress: Option<&watch::Sender<TransferProgress>>,
         cancel: Option<&TransferCancel>,
     ) -> Result<Value> {
@@ -1254,6 +1285,7 @@ impl Engine {
             .open(&remote, OpenFlags::READ, FileAttributes::empty())
             .await?
             .handle;
+        let mut digest = checks.sha256.as_ref().map(|_| Sha256::new());
         let copied = async {
             // Some servers omit size or disallow FSTAT on readable files.
             let total = if progress.is_some() && !cancelled() {
@@ -1270,9 +1302,12 @@ impl Engine {
                 .read_contents(
                     &h,
                     &mut file,
-                    max_bytes.map(|n| (n, "--max-bytes limit")),
+                    checks.max_bytes.map(|n| (n, "--max-bytes limit")),
                     cancel,
-                    |offset| {
+                    |offset, chunk| {
+                        if let Some(digest) = &mut digest {
+                            digest.update(chunk);
+                        }
                         report(progress, offset, total);
                         Ok(())
                     },
@@ -1290,6 +1325,19 @@ impl Engine {
         drop(file);
         if cancelled() {
             return Ok(cancelled_transfer(&local, &remote, bytes, false));
+        }
+        let verified_sha256 = digest.map(|digest| {
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+        if let (Some(expected), Some(actual)) = (&checks.sha256, &verified_sha256) {
+            ensure!(
+                actual == expected,
+                "SHA-256 mismatch. Expected {expected}, received {actual}. The download was not installed."
+            );
         }
         // This check runs inside the blocking task, so cancellation while the
         // task is queued cannot install the temporary file. Once persist starts,
@@ -1312,7 +1360,11 @@ impl Engine {
         if !committed {
             return Ok(cancelled_transfer(&local, &remote, bytes, false));
         }
-        Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
+        let mut reply = json!({"local":local,"remote":remote,"bytes_transferred":bytes});
+        if let Some(sha256) = verified_sha256 {
+            reply["sha256"] = json!(sha256);
+        }
+        Ok(reply)
     }
     async fn put(
         &self,

@@ -60,7 +60,7 @@ impl Engine {
                     "the 256 KiB text preview limit",
                 )),
                 cancel,
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .await?;
             check_cancel()?;

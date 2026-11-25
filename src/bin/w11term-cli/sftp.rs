@@ -3,12 +3,13 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use w11term::{
     control::Request,
-    sftp::{Attributes, DEFAULT_TIMEOUT, Operation},
+    sftp::{Attributes, DEFAULT_TIMEOUT, Operation, normalize_sha256},
 };
 
 pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
-  get REMOTE LOCAL [--overwrite] [--max-bytes N] | put LOCAL REMOTE [--overwrite]\n\
+  get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX]\n\
+  put LOCAL REMOTE [--overwrite]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
@@ -101,6 +102,11 @@ pub fn parse(
                 && let Some(limit) = opts.remove("--max-bytes")
             {
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
+            }
+            if command == "get"
+                && let Some(sha256) = opts.remove("--sha256")
+            {
+                fields.insert("expected_sha256".into(), json!(normalize_sha256(&sha256)?));
             }
         }
         "rename" | "hardlink" => {
@@ -266,6 +272,35 @@ mod tests {
             assert!(p(args).is_err(), "{args:?}");
         }
     }
+    #[test]
+    fn expected_sha256_is_only_accepted_for_single_file_downloads() {
+        let digest = "AB".repeat(32);
+        let (
+            _,
+            Request::Sftp {
+                operation:
+                    Operation::Get {
+                        expected_sha256, ..
+                    },
+                ..
+            },
+        ) = p(&[
+            "get", "--pane", "2", "/remote", "local", "--sha256", &digest,
+        ])
+        .unwrap()
+        else {
+            panic!("expected a single file download")
+        };
+        assert_eq!(expected_sha256, Some(digest.to_ascii_lowercase()));
+        assert!(p(&["get", "--pane", "2", "/remote", "local", "--sha256", "abcd"]).is_err());
+        assert!(
+            p(&[
+                "get-dir", "--pane", "2", "/remote", "local", "--sha256", &digest
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn transfers_handles_attributes_and_validation() {
         let (

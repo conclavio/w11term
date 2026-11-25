@@ -28,6 +28,7 @@ fn download(local: &Path) -> Operation {
         remote: "/source".into(),
         overwrite: true,
         max_bytes: None,
+        expected_sha256: None,
     }
 }
 

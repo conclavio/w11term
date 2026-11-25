@@ -2586,6 +2586,19 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let data = [0, 255, 10, 13, 128, 42, 0];
     fs::write(source.join("data 雪/trace 例.bin"), data).unwrap();
     fs::write(source.join(".manifest"), b"remote manifest\n").unwrap();
+    let verified = b"verify the downloaded bytes\x00\xff";
+    fs::write(parent.join("verified.bin"), verified).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        fs::write(
+            state.path().join("verified.sha256"),
+            Sha256::digest(verified)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
     let interrupted = parent.join("interrupted/nested");
     fs::create_dir_all(&interrupted).unwrap();
     fs::write(
@@ -2603,6 +2616,11 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     .unwrap();
 
     drive_mixed_gui("download-sftp-folder-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        fs::read(state.path().join("accepted.bin")).unwrap(),
+        verified
+    );
+    assert!(!state.path().join("rejected.bin").exists());
 
     let downloaded = received.join("snapshot");
     assert_eq!(

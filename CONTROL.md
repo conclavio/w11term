@@ -772,6 +772,7 @@ SFTP is available through a pane's **existing authenticated SSH connection**, on
 & $ctl --pid 12345 sftp --pane $pane info
 & $ctl --pid 12345 sftp --pane $pane ls /var/log
 & $ctl --pid 12345 sftp --pane $pane get /tmp/output.bin .\output.bin
+& $ctl --pid 12345 sftp --pane $pane get /tmp/output.bin .\output.bin --sha256 $expectedDigest
 & $ctl --pid 12345 sftp --pane $pane get-dir /tmp/diagnostics .\incident-042
 & $ctl --pid 12345 sftp --pane $pane put .\input.bin /tmp/input.bin
 & $ctl --pid 12345 sftp --pane $pane put-dir .\cockpit /tmp/cockpit-v2
@@ -821,6 +822,7 @@ The command surface covers SFTP v3:
 | Commands | Arguments / result |
 | --- | --- |
 | `info` | Negotiated version, advertised extensions, open-handle count, read/write chunk limits |
+| `get REMOTE LOCAL --sha256 HEX` | Verify a single-file download against 64 hexadecimal digits before publishing the local file. A mismatch preserves any existing destination. Success adds `sha256` to `result.sftp`. Direct pipe clients set `expected_sha256` on the `get` operation. |
 | `get-dir REMOTE NEW_LOCAL_DIRECTORY` | Recursively download a directory into the exact local path. Its parent must exist. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
 | `put-dir LOCAL NEW_REMOTE_DIRECTORY` | Recursively upload to the exact remote path. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
 | `ls [PATH]` | Collect directory entries (default `.`); maximum 8 MiB JSON, then use paged reads |
