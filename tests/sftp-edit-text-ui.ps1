@@ -13,6 +13,7 @@ $copy = "draft $snow.ini"
 $file = Join-Path $folder $name
 $preview = 'Preview text' + [char]0x2026
 $saveAs = 'Save as' + [char]0x2026
+$newTextFile = 'New text file' + [char]0x2026
 $button = [System.Windows.Automation.ControlType]::Button
 $getValue = [System.Windows.Automation.ValuePattern]::Pattern
 
@@ -170,6 +171,53 @@ try {
     Check-File $matched $savedBytes
     Check-File $file $externalBytes
     Click 'Back to files'
+
+    Click $newTextFile
+    $newDraft = Wait-Draft '' 'blank new file'
+    $field = Wait-Until 'new file name editor' { By-Id 'sftp-editor-filename' }
+    $field.GetCurrentPattern($getValue).SetValue($name)
+    $newText = "new=first`nlabel=$snow"
+    $newDraft.SetValue($newText)
+    $null = Wait-Draft $newText 'new multiline text'
+    Click 'Create file'
+    $null = Wait-Until 'an existing name keeps the new draft open' {
+        $status = By-Id 'sftp-editor-status'
+        $status -and $status.Current.Name.Contains('already exists')
+    }
+    Check-File $file $externalBytes
+    $null = Wait-Draft $newText 'new file collision'
+
+    $newName = "new $snow.txt"
+    $newPath = Join-Path $folder $newName
+    $field = Wait-Until 'rename the new draft' { By-Id 'sftp-editor-filename' }
+    $field.GetCurrentPattern($getValue).SetValue($newName)
+    Click 'Close editor'
+    $null = Wait-Until 'new file draft is stashed' {
+        (Find-Element 'Resume draft' $button) -and !(By-Id 'sftp-editor-text')
+    }
+    if ([IO.File]::Exists($newPath)) { throw 'Closing the draft created the remote file' }
+    Click 'Resume draft'
+    $null = Wait-Draft $newText 'resumed new file draft'
+    $null = Wait-Until 'the resumed draft keeps its filename' {
+        $field = By-Id 'sftp-editor-filename'
+        $field -and $field.GetCurrentPattern($getValue).Current.Value -ceq $newName
+    }
+    Click 'Create file'
+    $null = Wait-Until 'new text file is visible in the drawer' {
+        (Find-Element "Created $newName") -and (Find-Element $newName $button)
+    }
+    Check-File $newPath $newText
+
+    Click $newTextFile
+    $null = Wait-Draft '' 'empty new file'
+    $emptyName = 'empty.txt'
+    $field = Wait-Until 'empty file name editor' { By-Id 'sftp-editor-filename' }
+    $field.GetCurrentPattern($getValue).SetValue($emptyName)
+    Click 'Create file'
+    $null = Wait-Until 'the empty file appears in the refreshed drawer' {
+        (Find-Element "Created $emptyName") -and (Find-Element $emptyName $button)
+    }
+    Check-File (Join-Path $folder $emptyName) ''
 
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Find-Element $preview $button) }
