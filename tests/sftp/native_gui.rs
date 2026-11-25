@@ -3073,6 +3073,9 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 1), // Stop after the current move refreshes once.
             ("/shell directory/nested", 2),
+            ("/move archive", 5), // Choose a destination from the regular listing.
+            ("/shell directory", fillers), // Stopping preserves the remaining listing mark.
+            ("/shell directory", fillers - 1), // Finish by moving the remaining mark.
         ]
     );
     assert_eq!(
@@ -3109,6 +3112,14 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             [
                 "/shell directory/build-01.log",
                 "/move archive/build-01.log"
+            ],
+            [
+                "/shell directory/build-03.log",
+                "/move archive/build-03.log"
+            ],
+            [
+                "/shell directory/build-34.log",
+                "/move archive/build-34.log"
             ],
         ]
     );

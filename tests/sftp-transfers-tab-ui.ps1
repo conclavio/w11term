@@ -71,9 +71,9 @@ try {
     Wait-Focus $alpha
     Run-Palette 'Open files here'
     $null = Wait-Until 'first SSH directory' { Find-Element 'bulk-alpha' $button }
-    Click "Select downloads$ellipsis"
+    Click "Select entries$ellipsis"
     foreach ($name in 'bulk-alpha','queued-alpha') {
-        $mark = "Mark $name for download"
+        $mark = "Mark $name"
         (Wait-CheckBox $mark ([System.Windows.Automation.ToggleState]::Off)).Toggle()
         $null = Wait-CheckBox $mark ([System.Windows.Automation.ToggleState]::On)
     }

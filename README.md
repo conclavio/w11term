@@ -389,7 +389,7 @@ Saved workspaces record the local executable, arguments and directory. Opening t
 
 On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files. You can also drag files and folders together from Explorer onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
 
-Choose **Select downloads…**, mark files or folders, and use **Download marked** to select one destination folder. Marks stay selected while you change pages, sort, or filter the listing. Files and folders keep their remote names. An existing destination, transfer error, or cancellation stops the batch and keeps items already saved.
+Choose **Select entries…** to mark files or folders across pages, sorts, and filters. **Download marked** saves them to a local folder. An existing destination, transfer error, or cancellation stops the batch and keeps items already saved. **Move marked entries…** moves them to another folder on the same SSH connection. The drawer refreshes the source listing and keeps untouched entries marked. Use **Stop after current move** to skip the remaining queued moves.
 
 Enable **Preserve modification times** in the SFTP drawer to keep the server’s reported modification times on downloaded files and folders. This covers search results, batches, and verified or resumed downloads. Entries without a reported time keep their local write time. Scripts can select the same behavior with `--preserve-mtime`. [SFTP control commands](CONTROL.md#run-sftp-operations)
 
