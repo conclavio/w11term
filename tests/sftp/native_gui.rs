@@ -2549,6 +2549,12 @@ async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live()
     fs::write(parent.join(name), outer.as_bytes()).unwrap();
     fs::write(child.join(name), inner.as_bytes()).unwrap();
     fs::write(child.join("binary.dat"), binary).unwrap();
+    image::RgbaImage::from_pixel(64, 32, image::Rgba([35, 150, 190, 255]))
+        .save_with_format(child.join("map 雪.PNG"), image::ImageFormat::Png)
+        .unwrap();
+    fs::write(child.join("broken.jpeg"), b"not an encoded image").unwrap();
+    let trace = remote.path().join("transfer-trace");
+    fs::write(&trace, []).unwrap();
     let keys = remote.path().join("keyboard-input.bin");
     fs::write(&keys, []).unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -2556,6 +2562,20 @@ async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live()
     assert_eq!(fs::read(parent.join(name)).unwrap(), outer.as_bytes());
     assert_eq!(fs::read(child.join(name)).unwrap(), inner.as_bytes());
     assert_eq!(fs::read(child.join("binary.dat")).unwrap(), binary);
+    let transfers = fs::read_to_string(trace).unwrap();
+    assert_eq!(
+        transfers
+            .matches("OPEN /shell directory/nested/map 雪.PNG")
+            .count(),
+        2
+    );
+    assert_eq!(
+        transfers
+            .matches("OPEN /shell directory/nested/broken.jpeg")
+            .count(),
+        1
+    );
+    assert!(!transfers.contains("WRITE"));
     assert_eq!(fs::read(keys).unwrap(), b"after-preview");
     assert_eq!(
         channels.load(Ordering::Relaxed),

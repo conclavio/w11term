@@ -34,12 +34,14 @@ pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_pa
 mod drop_source;
 mod editor;
 mod find;
+mod image_preview;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
     ContentMatch, ContentScan, FileSizeRange, FileTextMatch, FilenameFilter, FilenameMatch,
     FilenameSearch, FilenameSort, FolderContents, ModifiedDateRange, SearchProgress,
     valid_filename_query,
 };
+pub use image_preview::image_preview_name;
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
@@ -312,6 +314,10 @@ pub enum Operation {
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
     PreviewText {
+        path: String,
+    },
+    #[serde(skip)]
+    PreviewImage {
         path: String,
     },
     #[serde(skip)]
@@ -738,6 +744,7 @@ pub(crate) async fn run(
                     Some("Missing SSH connection for this mounted folder")
                 }
                 Operation::PreviewText { .. } => Some("Missing SSH connection for text preview"),
+                Operation::PreviewImage { .. } => Some("Missing SSH connection for image preview"),
                 Operation::PutDrop { .. } => Some("Missing SSH connection for this dropped upload"),
                 Operation::PutGroupFile { .. } => {
                     Some("Missing SSH connection for this group upload")
@@ -774,6 +781,7 @@ pub(crate) async fn run(
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
             && let Some(message) = match operation {
                 Operation::PreviewText { .. } => Some("Text preview cancelled"),
+                Operation::PreviewImage { .. } => Some("Image preview cancelled"),
                 Operation::EntryProperties { .. } => Some("File properties cancelled"),
                 Operation::OpenLinkTarget { .. } => Some("Opening the link target was cancelled"),
                 Operation::Sha256 { .. } => Some("SHA-256 calculation cancelled"),
@@ -869,6 +877,9 @@ pub(crate) async fn run(
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::Get { resume: true, .. } => JobStage::ResumableDownload,
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
+                Operation::PreviewImage { .. } => {
+                    JobStage::Checking("Image preview did not finish")
+                }
                 Operation::OpenLinkTarget { .. } => {
                     JobStage::Checking("Link target lookup did not finish")
                 }
@@ -1503,6 +1514,7 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            PreviewImage { path } => self.read_preview_image(&path, cancel).await?,
             Sha256 { path, max_bytes } => self.remote_sha256(&path, max_bytes, cancel).await?,
             Find {
                 path,

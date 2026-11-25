@@ -1,10 +1,12 @@
 use super::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::cell::OnceCell;
 use w11term::sftp::{FileTextMatch, PermissionReview};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewKind {
     Text,
+    Image,
     Properties,
     Checksum(u64),
 }
@@ -55,7 +57,48 @@ pub(super) struct EntryPreview {
 enum Contents {
     Loading,
     Ready(String),
+    Image(ImagePreview),
     Error(String),
+}
+
+struct ImagePreview {
+    png: EncodedImage,
+    width: u32,
+    height: u32,
+}
+
+impl ImagePreview {
+    fn from_reply(value: &Value) -> Result<Self, String> {
+        let dimension = |key| {
+            value[key]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n != 0)
+                .ok_or_else(|| format!("Missing image {key} in the SFTP reply"))
+        };
+        let png = value["png"]
+            .as_str()
+            .ok_or_else(|| "Missing image in the SFTP reply".to_owned())
+            .and_then(|data| STANDARD.decode(data).map_err(|error| error.to_string()))?;
+        Ok(Self {
+            png: EncodedImage::new(png),
+            width: dimension("width")?,
+            height: dimension("height")?,
+        })
+    }
+
+    fn view(&self, name: &str) -> View {
+        StackPanel::new().spacing(8.0).children((
+            Image::new()
+                .source_data(self.png.clone())
+                .stretch(Stretch::Uniform)
+                .max_width(440.0)
+                .max_height(320.0)
+                .automation_id("sftp-preview-image")
+                .automation_name(format!("Image preview of {name}")),
+            TextBlock::new().text(format!("{} × {} pixels", self.width, self.height)),
+        ))
+    }
 }
 
 struct LocalComparison {
@@ -192,6 +235,7 @@ impl EntryPreview {
                     Contents::Loading => TextBlock::new()
                         .text(match self.kind {
                             PreviewKind::Text => "Loading preview…",
+                            PreviewKind::Image => "Loading image preview…",
                             PreviewKind::Properties => "Loading properties…",
                             PreviewKind::Checksum(_) => "Calculating SHA-256 over SFTP…",
                         })
@@ -200,6 +244,9 @@ impl EntryPreview {
                         let (id, message) = match self.kind {
                             PreviewKind::Text => {
                                 ("sftp-preview-error", "Could not preview this file.")
+                            }
+                            PreviewKind::Image => {
+                                ("sftp-image-error", "Could not preview this image.")
                             }
                             PreviewKind::Properties => {
                                 ("sftp-properties-error", "Could not read properties.")
@@ -231,6 +278,7 @@ impl EntryPreview {
                         });
                         match_view.unwrap_or_else(|| self.full_text_view(text))
                     }
+                    Contents::Image(image) => image.view(self.target.name()),
                 };
                 let serial = self.serial;
                 let body_key = if self.full_text {
@@ -416,7 +464,7 @@ impl EntryPreview {
                 ContentDialog::new()
                     .title(self.target.name())
                     .close_button_text(match self.kind {
-                        PreviewKind::Text => "Close preview",
+                        PreviewKind::Text | PreviewKind::Image => "Close preview",
                         PreviewKind::Properties => "Close properties",
                         PreviewKind::Checksum(_) if matches!(self.content, Contents::Loading) => {
                             "Cancel calculation"
@@ -492,7 +540,7 @@ impl EntryPreview {
 
     fn full_text_view(&self, text: &str) -> View {
         let (name, id) = match self.kind {
-            PreviewKind::Text => ("File contents", "sftp-preview-text"),
+            PreviewKind::Text | PreviewKind::Image => ("File contents", "sftp-preview-text"),
             PreviewKind::Properties => ("File properties", "sftp-properties-text"),
             PreviewKind::Checksum(_) => ("SHA-256 digest", "sftp-checksum-text"),
         };
@@ -554,6 +602,10 @@ impl FileDrawer {
                 ensure!(target.is_regular_file(), "Select a regular file to preview");
                 Operation::PreviewText { path }
             }
+            PreviewKind::Image => {
+                ensure!(target.is_regular_file(), "Select a regular file to preview");
+                Operation::PreviewImage { path }
+            }
             PreviewKind::Properties => Operation::EntryProperties { path },
             PreviewKind::Checksum(properties) => {
                 ensure!(
@@ -604,11 +656,12 @@ impl FileDrawer {
             return;
         }
         let preview = self.preview.as_mut().unwrap();
-        let text = reply.and_then(|mut value| match preview.kind {
+        let content = reply.and_then(|mut value| match preview.kind {
             PreviewKind::Text => match value.get_mut("text").map(Value::take) {
-                Some(Value::String(text)) => Ok(text),
+                Some(Value::String(text)) => Ok(Contents::Ready(text)),
                 _ => Err("Missing text in the SFTP preview reply".into()),
             },
+            PreviewKind::Image => ImagePreview::from_reply(&value).map(Contents::Image),
             PreviewKind::Properties => {
                 let target = value
                     .get("target")
@@ -627,28 +680,30 @@ impl FileDrawer {
                                     target.filter(|path| !path.is_empty() && !path.contains('\0'));
                             }
                         }
-                        text
+                        Contents::Ready(text)
                     })
                     .map_err(|error| format!("{error:#}"))
             }
             PreviewKind::Checksum(_) => value["sha256"]
                 .as_str()
                 .ok_or_else(|| "Missing SHA-256 in the SFTP reply".to_owned())
-                .and_then(|sha256| normalize_sha256(sha256).map_err(|error| error.to_string())),
+                .and_then(|sha256| normalize_sha256(sha256).map_err(|error| error.to_string()))
+                .map(Contents::Ready),
         });
-        preview.content = match text {
-            Ok(text) => {
+        preview.content = match content {
+            Ok(content) => {
                 if preview.kind == PreviewKind::Text
+                    && let Contents::Ready(text) = &content
                     && let FileTarget::Search(_, hit) = &preview.target
                     && hit.content_match.is_some()
                     && let Some(panel) = &self.search
                 {
                     preview.text_match = Some(MatchPreview {
-                        lines: panel.match_file_text_lines(&text).unwrap_or_default(),
+                        lines: panel.match_file_text_lines(text).unwrap_or_default(),
                         selected: 0,
                     });
                 }
-                Contents::Ready(text)
+                content
             }
             Err(error) => Contents::Error(error),
         };

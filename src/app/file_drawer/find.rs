@@ -884,27 +884,33 @@ impl Panel {
                     ));
                 }
                 if hit.kind == Some(EntryKind::File) {
-                    let hit = hit.clone();
+                    let preview = |key, label, kind| {
+                        let hit = hit.clone();
+                        KeyedView::new(
+                            key,
+                            Button::new()
+                                .automation_name(format!("{label} {path}"))
+                                .is_enabled(ready)
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Files(FileAction::Preview(
+                                        pane,
+                                        generation,
+                                        FileTarget::Search(serial, hit.clone()),
+                                        kind,
+                                    ))
+                                }))
+                                .content(format!("{label}…")),
+                        )
+                    };
+                    if image_preview_name(&hit.name) {
+                        entry_actions.push(preview("image", "Preview image", PreviewKind::Image));
+                    }
                     let label = if hit.content_match.is_some() {
                         "Preview match"
                     } else {
                         "Preview text"
                     };
-                    entry_actions.push(KeyedView::new(
-                        "preview",
-                        Button::new()
-                            .automation_name(format!("{label} {path}"))
-                            .is_enabled(ready)
-                            .on_click(ctx.callback(move |_| {
-                                Message::Files(FileAction::Preview(
-                                    pane,
-                                    generation,
-                                    FileTarget::Search(serial, hit.clone()),
-                                    PreviewKind::Text,
-                                ))
-                            }))
-                            .content(format!("{label}…")),
-                    ));
+                    entry_actions.push(preview("preview", label, PreviewKind::Text));
                 }
                 if shell_ready
                     && let Some(origin) =

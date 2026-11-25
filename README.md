@@ -409,6 +409,8 @@ After a file or folder is saved, choose **Show download in File Explorer** in th
 
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
+Choose **Preview image…** on a PNG, JPEG or GIF in the SFTP listing or search results to see the image and its original dimensions. The preview reads a regular file over the pane’s existing connection and displays a scaled still image, including the first frame of an animated GIF. It accepts files up to 8 MiB with dimensions up to 4096 pixels per side and up to 8,388,608 pixels in total.
+
 Choose **Properties…** on a file, folder or symbolic link to read its current metadata. The dialog shows the remote path, entry type, size in bytes, octal permissions, numeric owner and group, and modification and access times in UTC. Unreported fields are marked **Not reported**. For a symbolic link, the dialog shows the link’s own attributes and asks the server for its target path. This also works for a dangling link.
 
 Choose **Open link target** in a symbolic link’s Properties to let the SFTP server resolve it. A directory opens in the drawer. A regular file is selected in its containing folder. If the server cannot resolve the link or list the destination, the drawer keeps the link’s Properties open and shows the error. If opening the target changes folders, **Back** returns to the source folder. **Back to search results** restores the search if you opened Properties from a result. [SFTP path resolution](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.11)

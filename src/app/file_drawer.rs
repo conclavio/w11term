@@ -13,7 +13,7 @@ pub use w11term::sftp::TransferId;
 use w11term::sftp::{
     CopyDestination, DEFAULT_TIMEOUT, EntryKind, FilenameMatch, Job, JobProgress, Operation,
     SearchProgress, TransferBatchProgress, TransferCancel, TransferOperation, TransferOutcome,
-    TransferPhase, TransferProgress, normalize_sha256, validate_download_name,
+    TransferPhase, TransferProgress, image_preview_name, normalize_sha256, validate_download_name,
 };
 
 mod bookmarks;
@@ -2451,29 +2451,32 @@ impl FileDrawer {
                         CopyPath(pane, generation, revision, Some(listed(selected))),
                     ),
                 )),
-            button_pair(
-                button(
-                    "Preview text…",
-                    writable
-                        && selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File)),
-                    Preview(
-                        pane,
-                        generation,
-                        FileTarget::Listed(listed(selected)),
-                        PreviewKind::Text,
+            {
+                let regular =
+                    selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File));
+                let preview =
+                    |kind| Preview(pane, generation, FileTarget::Listed(listed(selected)), kind);
+                let actions = button_pair(
+                    button(
+                        "Preview text…",
+                        writable && regular,
+                        preview(PreviewKind::Text),
                     ),
-                ),
-                button(
-                    "Properties…",
-                    writable && selected.is_some(),
-                    Preview(
-                        pane,
-                        generation,
-                        FileTarget::Listed(listed(selected)),
-                        PreviewKind::Properties,
+                    button(
+                        "Properties…",
+                        writable && selected.is_some(),
+                        preview(PreviewKind::Properties),
                     ),
-                ),
-            ),
+                );
+                if regular && selected.is_some_and(|e| image_preview_name(&e.name)) {
+                    StackPanel::new().spacing(6.0).children((
+                        button("Preview image…", writable, preview(PreviewKind::Image)),
+                        actions,
+                    ))
+                } else {
+                    actions
+                }
+            },
             CheckBox::new()
                 .is_checked(self.following)
                 .on_is_checked_changed(
