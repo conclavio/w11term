@@ -13,6 +13,9 @@ use windows::{
     core::HSTRING,
 };
 
+mod selection;
+pub use selection::SearchDownload;
+
 pub(super) const MAX_DEPTH: usize = 32;
 pub(super) const MAX_ENTRIES: usize = 65_536;
 pub(super) const MAX_NAME_BYTES: usize = 8 * 1024 * 1024;
@@ -38,7 +41,7 @@ pub fn validate_download_names<'a>(names: impl IntoIterator<Item = &'a str>) -> 
 }
 
 // Use Windows' filename comparison even in an explicitly case-sensitive directory.
-#[derive(Eq)]
+#[derive(Debug, Eq)]
 struct WindowsName(Vec<u16>);
 
 impl Ord for WindowsName {
@@ -399,7 +402,7 @@ impl Engine {
     }
     pub(super) async fn get_dir(
         &self,
-        remote: String,
+        source: DownloadSource,
         local: PathBuf,
         preserve_mtime: bool,
         progress: Option<&watch::Sender<TransferProgress>>,
@@ -431,28 +434,14 @@ impl Engine {
             Ok(_) => bail!("local destination already exists"),
             Err(e) => return Err(e.into()),
         }
+        let remote = source.remote();
         ensure!(
             !remote.is_empty() && !remote.contains(['\0', '\\']),
             "invalid remote folder path"
         );
-        let mut source = remote.trim_end_matches('/');
-        while let Some(base) = source.strip_suffix("/.") {
-            source = base.trim_end_matches('/')
-        }
-        let source = if source.is_empty() { "/" } else { source };
-        // Resolve the containing directory, not a possibly substituted final link.
-        let (parent_remote, name) = source.rsplit_once('/').unwrap_or((".", source));
-        let root = if matches!(name, "" | "." | "..") {
-            self.canonical_remote_path(source).await?
-        } else {
-            let parent = self
-                .canonical_remote_path(if parent_remote.is_empty() {
-                    "/"
-                } else {
-                    parent_remote
-                })
-                .await?;
-            format!("{}/{name}", parent.trim_end_matches('/'))
+        let root = match &source {
+            DownloadSource::Entire(_) => self.download_root(remote).await?,
+            DownloadSource::Selection(selection) => selection.root().to_owned(),
         };
         report(progress, 0, None);
         let stage = staging.insert(
@@ -461,10 +450,15 @@ impl Engine {
                 .tempdir_in(&parent)?,
         );
         download.count.directories = 1;
-        download.directory(&root, stage.path(), 0).await?;
+        match &source {
+            DownloadSource::Entire(_) => download.directory(&root, stage.path(), 0).await?,
+            DownloadSource::Selection(selection) => {
+                download.selected(&root, stage.path(), selection, 0).await?
+            }
+        }
         let count = download.count;
         if cancel.is_some_and(TransferCancel::is_cancelled) {
-            return Ok(cancelled_transfer(&local, &remote, count.bytes, false));
+            return Ok(cancelled_transfer(&local, remote, count.bytes, false));
         }
         // Keep the no-replace commit in this future; an expired/disconnected job
         // must never leave a detached blocking task that publishes it later.
@@ -478,6 +472,41 @@ impl Engine {
             json!({"local":local,"remote":remote,"files":count.files,"directories":count.directories,
             "skipped":count.skipped,"bytes_transferred":count.bytes}),
         )
+    }
+
+    async fn download_root(&self, remote: &str) -> Result<String> {
+        let mut source = remote.trim_end_matches('/');
+        while let Some(base) = source.strip_suffix("/.") {
+            source = base.trim_end_matches('/')
+        }
+        let source = if source.is_empty() { "/" } else { source };
+        // Resolve the containing directory, not a possibly substituted final link.
+        let (parent_remote, name) = source.rsplit_once('/').unwrap_or((".", source));
+        if matches!(name, "" | "." | "..") {
+            return self.canonical_remote_path(source).await;
+        }
+        let parent = self
+            .canonical_remote_path(if parent_remote.is_empty() {
+                "/"
+            } else {
+                parent_remote
+            })
+            .await?;
+        Ok(format!("{}/{name}", parent.trim_end_matches('/')))
+    }
+}
+
+pub(super) enum DownloadSource {
+    Entire(String),
+    Selection(SearchDownload),
+}
+
+impl DownloadSource {
+    fn remote(&self) -> &str {
+        match self {
+            Self::Entire(path) => path,
+            Self::Selection(selection) => selection.root(),
+        }
     }
 }
 

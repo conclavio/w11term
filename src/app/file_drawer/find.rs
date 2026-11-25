@@ -1,5 +1,5 @@
 use super::*;
-use w11term::sftp::{FilenameSearch, valid_filename_query};
+use w11term::sftp::{FilenameSearch, SearchDownload, valid_filename_query};
 
 const RESULTS_PER_PAGE: usize = 25;
 
@@ -12,6 +12,8 @@ pub enum Action {
     Run(u64),
     Cancel(u64),
     Page(u64, usize),
+    SelectDownloads(u64),
+    MarkDownload(u64, usize, bool),
     Reveal(u64, FilenameMatch),
     CopyPaths(u64, Option<FilenameMatch>),
     Back(u64),
@@ -33,6 +35,7 @@ pub(super) struct Panel {
     page: usize,
     pub(super) cancel: Option<TransferCancel>,
     copy_status: Option<String>,
+    marked_downloads: Option<BTreeSet<usize>>,
 }
 
 fn result_status(result: &FilenameSearch) -> String {
@@ -62,6 +65,41 @@ impl Panel {
         self.result = None;
         self.page = 0;
         self.copy_status = None;
+        self.marked_downloads = None;
+    }
+
+    fn search_download_selection(&self, serial: u64) -> Result<SearchDownload> {
+        let result = self
+            .result
+            .as_ref()
+            .filter(|_| serial == self.serial)
+            .context("The search results changed. Mark the files again.")?;
+        let marked = self
+            .marked_downloads
+            .as_ref()
+            .context("Mark at least one search result")?;
+        let hits = marked
+            .iter()
+            .map(|&index| result.matches.get(index))
+            .collect::<Option<Vec<_>>>()
+            .context("The search results changed. Mark the files again.")?;
+        SearchDownload::new(&result.root, hits)
+    }
+
+    fn mark_download(&mut self, index: usize, checked: bool) {
+        let hit = self
+            .result
+            .as_ref()
+            .and_then(|result| result.matches.get(index));
+        if hit.is_some_and(|hit| matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)))
+            && let Some(marked) = &mut self.marked_downloads
+        {
+            if checked {
+                marked.insert(index);
+            } else {
+                marked.remove(&index);
+            }
+        }
     }
 
     fn page_count(&self) -> usize {
@@ -211,6 +249,44 @@ impl Panel {
             run
         };
         rows.push(KeyedView::new("run", search_actions));
+        if self.result.as_ref().is_some_and(|result| {
+            result
+                .matches
+                .iter()
+                .any(|hit| matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)))
+        }) {
+            let mode = if self.marked_downloads.is_some() {
+                "Exit download selection"
+            } else {
+                "Select downloads…"
+            };
+            let select = button(mode, Action::SelectDownloads(serial), ready);
+            let mut actions = vec![KeyedView::new("select", select)];
+            if let Some(marked) = &self.marked_downloads {
+                actions.push(KeyedView::new(
+                    "download",
+                    Button::new()
+                        .automation_name("Download marked results")
+                        .is_enabled(ready && !marked.is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            Message::Files(FileAction::Pick(
+                                pane,
+                                generation,
+                                revision,
+                                TransferPicker::DownloadSearch(serial),
+                            ))
+                        }))
+                        .content(format!("Download marked ({})…", marked.len())),
+                ));
+            }
+            rows.push(KeyedView::new(
+                "marking",
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .keyed_children(actions),
+            ));
+        }
         if let Some(resume) = files.resume_draft_button(pane, ctx) {
             rows.push(KeyedView::new("resume-draft", resume));
         }
@@ -287,6 +363,25 @@ impl Panel {
                             .text_wrapping(TextWrapping::Wrap),
                     );
                 let mut entry_actions = vec![KeyedView::new("reveal", reveal)];
+                if let Some(marked) = &self.marked_downloads
+                    && matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory))
+                {
+                    entry_actions.push(KeyedView::new(
+                        "mark",
+                        CheckBox::new()
+                            .automation_name(format!("Mark {path}"))
+                            .is_checked(marked.contains(&index))
+                            .is_enabled(ready)
+                            .on_is_checked_changed(ctx.callback(move |checked| {
+                                Message::Files(FileAction::Search(
+                                    pane,
+                                    generation,
+                                    Action::MarkDownload(serial, index, checked),
+                                ))
+                            }))
+                            .content("Mark for download"),
+                    ));
+                }
                 if hit.kind == Some(EntryKind::File) {
                     let hit = hit.clone();
                     entry_actions.push(KeyedView::new(
@@ -414,6 +509,14 @@ impl Panel {
 }
 
 impl FileDrawer {
+    pub(super) fn search_download_selection(&self, serial: u64) -> Result<SearchDownload> {
+        ensure!(self.open, "Open the file drawer");
+        self.search
+            .as_ref()
+            .context("The search results closed")?
+            .search_download_selection(serial)
+    }
+
     pub(super) fn search_hit_path(&self, serial: u64, hit: &FilenameMatch) -> Result<String> {
         ensure!(
             self.search
@@ -516,6 +619,7 @@ impl FileDrawer {
                 page: 0,
                 cancel: None,
                 copy_status: None,
+                marked_downloads: None,
             });
             return Ok(());
         }
@@ -573,6 +677,12 @@ impl FileDrawer {
             }
             Action::Page(serial, page) if serial == panel.serial && page < panel.page_count() => {
                 panel.page = page;
+            }
+            Action::SelectDownloads(serial) if serial == panel.serial && !busy => {
+                panel.marked_downloads = panel.marked_downloads.is_none().then(BTreeSet::new);
+            }
+            Action::MarkDownload(serial, index, checked) if serial == panel.serial && !busy => {
+                panel.mark_download(index, checked);
             }
             Action::CopyPaths(serial, hit) if !busy => {
                 panel.copy_status = match panel.paths_to_copy(serial, hit.as_ref()) {
@@ -645,17 +755,28 @@ mod tests {
                 page: 1,
                 cancel: None,
                 copy_status: None,
+                marked_downloads: Some(BTreeSet::from([0])),
             }),
             ..FileDrawer::default()
         };
         drawer.restore_search(6);
         assert!(drawer.search.is_none());
         drawer.restore_search(7);
-        let panel = drawer.search.take().unwrap();
+        let mut panel = drawer.search.take().unwrap();
         assert_eq!(panel.page, 1);
         assert_eq!(panel.query, "log");
         assert_eq!(panel.serial, 8);
         assert!(panel.regex && panel.match_case);
+        panel.mark_download(RESULTS_PER_PAGE, true);
+        assert_eq!(
+            panel.marked_downloads,
+            Some(BTreeSet::from([0, RESULTS_PER_PAGE]))
+        );
+        assert!(panel.search_download_selection(7).is_err());
+        assert_eq!(
+            panel.search_download_selection(8).unwrap().root(),
+            "/project"
+        );
         let (paths, count) = panel.paths_to_copy(8, None).unwrap().unwrap();
         assert_eq!(count, RESULTS_PER_PAGE + 1);
         assert_eq!(paths.lines().next(), Some("/project/log-0.txt"));
@@ -703,6 +824,7 @@ mod tests {
                 page: 0,
                 cancel: None,
                 copy_status: None,
+                marked_downloads: None,
             }),
             ..FileDrawer::default()
         };
@@ -763,6 +885,7 @@ mod tests {
                 page: 0,
                 cancel: None,
                 copy_status: None,
+                marked_downloads: None,
             }),
             ..FileDrawer::default()
         };
@@ -826,6 +949,7 @@ mod tests {
                 page: 0,
                 cancel: None,
                 copy_status: None,
+                marked_downloads: None,
             }),
             ..FileDrawer::default()
         };
@@ -909,6 +1033,7 @@ mod tests {
             page: 0,
             cancel: None,
             copy_status: None,
+            marked_downloads: None,
         };
         let path = "/project/雪 files/Résumé [draft] $1.txt";
         assert_eq!(

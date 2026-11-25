@@ -85,6 +85,16 @@ function Set-DownloadDestination([string]$Destination) {
     }
     $null = Wait-Until 'accept download destination' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
+function Save-MarkedResults([string]$Destination) {
+    Click 'Download marked results'
+    $dialog = Wait-Until 'destination picker for marked search results' {
+        Find-OwnedDialog 'Download marked search results'
+    }
+    $null = Wait-Until 'choose the new download folder name' {
+        [FixtureDialog]::SetFilename($dialog, $Destination, 'Search results')
+    }
+    $null = Wait-Until 'start marked search download' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
 function Read-SearchProperties([string]$Path, [string]$Type) {
     Click "Properties $Path"
     $field = Wait-Until 'fresh Properties from the search result' { Find-Element 'File properties' }
@@ -255,6 +265,9 @@ try {
             [IO.File]::ReadAllText($folderItem) -ceq $contents -and
             (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled
     }
+    Click ('Select downloads' + [char]0x2026)
+    (Wait-CheckBox "Mark $parent/nested/nested-content.txt" $off).Toggle()
+    (Wait-CheckBox "Mark $parent/nested" $off).Toggle()
     Click "Reveal $parent/nested/nested-content.txt"
     $null = Wait-Until 'search result shown and selected in its containing folder' {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
@@ -271,10 +284,40 @@ try {
     }
     $null = Wait-CheckBox 'Regex' $on
     $null = Wait-CheckBox 'Match case' $on
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    $null = Wait-CheckBox "Mark $parent/nested" $on
     Check-PathCopy "Copy path $parent/nested/nested-content.txt" "$parent/nested/nested-content.txt"
     Check-PathCopy 'Copy all paths' "$parent/nested`r`n$parent/nested/nested-content.txt"
     $null = Wait-Until 'result summary and copy confirmation share the panel' {
         (Find-Element '2 matches in 2 folders') -and (Find-Element 'Copied 2 paths')
+    }
+    $cancelled = Join-Path $picker 'cancelled search batch'
+    [IO.File]::WriteAllBytes($readGate, [byte[]]@())
+    Save-MarkedResults $cancelled
+    $null = Wait-Until 'marked search download stages bytes before publication' {
+        (Find-Element '32768 bytes') -and (Button 'Cancel transfer').Current.IsEnabled
+    }
+    if ([IO.Directory]::Exists($cancelled)) { throw 'Batch published before its transfer finished' }
+    Click 'Cancel transfer'
+    $null = Wait-Until 'marked search download is cancelling' {
+        $cancel = Button 'Cancel transfer'
+        $cancel -and !$cancel.Current.IsEnabled
+    }
+    [IO.File]::Delete($readGate)
+    $null = Wait-Until 'cancelled search batch cleans up its own staging directory' {
+        !(Button 'Cancel transfer') -and ![IO.Directory]::Exists($cancelled) -and
+            [IO.Directory]::GetDirectories($picker, '.w11term-download-*').Count -eq 0
+    }
+    $null = Wait-CheckBox "Mark $parent/nested" $on
+    $batch = Join-Path $picker 'marked search batch'
+    Save-MarkedResults $batch
+    $batchFile = Join-Path $batch 'nested/nested-content.txt'
+    $null = Wait-Until 'marked search download publishes the selected tree' {
+        [IO.File]::Exists($batchFile) -and [IO.File]::ReadAllText($batchFile) -ceq $contents -and
+            (Button 'Download marked results').Current.IsEnabled
+    }
+    if ([IO.Directory]::GetFileSystemEntries($batch).Count -ne 1) {
+        throw 'Batch downloaded something outside the marked folder'
     }
     Click 'Back to files'
     $null = Wait-Until 'listing remains at the revealed file after leaving the results' {

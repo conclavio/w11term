@@ -253,6 +253,7 @@ pub enum TransferPicker {
     UploadFolder(String),
     Download(FileTarget, Option<DownloadVerification>),
     DownloadMarked,
+    DownloadSearch(u64),
 }
 
 #[derive(Clone)]
@@ -282,6 +283,10 @@ impl TransferPicker {
             Self::DownloadMarked => {
                 files.marked_entries()?;
                 Ok(Purpose::DownloadFolder)
+            }
+            Self::DownloadSearch(serial) => {
+                files.search_download_selection(*serial)?;
+                Ok(Purpose::SaveSearchResults)
             }
         }
     }
@@ -417,12 +422,21 @@ enum TransferFile {
     DownloadFolder {
         remote: String,
         local: PathBuf,
+        selected: bool,
     },
 }
 
 fn counted(amount: u64, singular: &str) -> String {
     let ending = if amount == 1 { "" } else { "s" };
     format!("{amount} {singular}{ending}")
+}
+
+fn download_folder_subject(remote: &str, selected: bool) -> String {
+    if selected {
+        format!("marked results from {remote}")
+    } else {
+        remote.to_owned()
+    }
 }
 
 impl TransferFile {
@@ -469,8 +483,14 @@ impl TransferFile {
                     "Cancelled download of {remote} ({bytes} bytes written to the temporary file)."
                 )
             }
-            (Self::DownloadFolder { remote, .. }, true) => format!(
-                "Cancelled download of {remote} ({bytes} bytes written to the temporary folder)."
+            (
+                Self::DownloadFolder {
+                    remote, selected, ..
+                },
+                true,
+            ) => format!(
+                "Cancelled download of {} ({bytes} bytes written to the temporary folder).",
+                download_folder_subject(remote, *selected),
             ),
             (Self::UploadFolder { remote }, true) => {
                 let destination = reply["resolved_remote"].as_str().unwrap_or(remote);
@@ -506,12 +526,22 @@ impl TransferFile {
             (Self::Download { remote, .. }, false) => {
                 format!("Downloaded {remote} ({bytes} bytes)")
             }
-            (Self::DownloadFolder { remote, local }, false) => format!(
-                "Downloaded {remote} to {} ({} files, {bytes} bytes, {} links or special files skipped).",
-                local.display(),
-                reply["files"],
-                reply["skipped"]
-            ),
+            (
+                Self::DownloadFolder {
+                    remote,
+                    local,
+                    selected,
+                },
+                false,
+            ) => {
+                format!(
+                    "Downloaded {} to {} ({} files, {bytes} bytes, {} links or special files skipped).",
+                    download_folder_subject(remote, *selected),
+                    local.display(),
+                    reply["files"],
+                    reply["skipped"]
+                )
+            }
         }
     }
 
@@ -544,8 +574,13 @@ impl TransferFile {
             } => format!(
                 "Download of {remote} was interrupted with at least {bytes} bytes written to the temporary file. The outcome is unknown. Check the local destination."
             ),
-            Self::DownloadFolder { remote, local } => format!(
-                "Download of {remote} was interrupted with at least {bytes} bytes written to the temporary folder. The outcome is unknown. Check {}.",
+            Self::DownloadFolder {
+                remote,
+                local,
+                selected,
+            } => format!(
+                "Download of {} was interrupted with at least {bytes} bytes written to the temporary folder. The outcome is unknown. Check {}.",
+                download_folder_subject(remote, *selected),
                 local.display()
             ),
         }
@@ -2407,9 +2442,15 @@ impl FileDrawer {
                     }
                     bail!("Upload of {name} failed: {error}");
                 }
-                if let Step::Transfer(TransferFile::DownloadFolder { remote, local }) = &step {
+                if let Step::Transfer(TransferFile::DownloadFolder {
+                    remote,
+                    local,
+                    selected,
+                }) = &step
+                {
                     bail!(
-                        "Could not download {remote} to {}: {error}",
+                        "Could not download {} to {}: {error}",
+                        download_folder_subject(remote, *selected),
                         local.display()
                     );
                 }
@@ -3106,6 +3147,31 @@ impl TerminalApp {
                             files.marked_downloads = None;
                             files.transfer_next(pane, session, context)?;
                         }
+                        TransferPicker::DownloadSearch(serial) => {
+                            ensure!(!files.busy(), "Another SFTP operation is active");
+                            let [local] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one new download folder"))?;
+                            let selection = files.search_download_selection(serial)?;
+                            let remote = selection.root().to_owned();
+                            files.status = format!("Downloading marked results from {remote}…");
+                            let operation = Operation::GetSearch {
+                                selection,
+                                local: local.clone(),
+                                preserve_mtime: files.preserve_mtime,
+                            };
+                            files.job(
+                                pane,
+                                session,
+                                operation,
+                                Step::Transfer(TransferFile::DownloadFolder {
+                                    remote,
+                                    local,
+                                    selected: true,
+                                }),
+                                context,
+                            )?;
+                        }
                     }
                 }
                 EditName(_, _, serial, name) => {
@@ -3396,6 +3462,7 @@ impl TerminalApp {
                         || (matches!(
                             picker,
                             TransferPicker::DownloadMarked
+                                | TransferPicker::DownloadSearch(_)
                                 | TransferPicker::Download(FileTarget::Search(..), _)
                         ) && files.busy())
                         || revision != files.listing_revision

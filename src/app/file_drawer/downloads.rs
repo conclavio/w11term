@@ -143,7 +143,11 @@ pub(super) fn download_to(
                 local: local.clone(),
                 preserve_mtime,
             },
-            TransferFile::DownloadFolder { remote, local },
+            TransferFile::DownloadFolder {
+                remote,
+                local,
+                selected: false,
+            },
         )
     } else {
         let resume = verification.as_ref().is_some_and(|options| options.resume);
