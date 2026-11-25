@@ -18,6 +18,7 @@ $null = New-Item -ItemType Directory -Path (Join-Path $picker 'received')
 $peerRoot = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $readGate = Join-Path $peerRoot 'hold-transfer-read'
 $refreshGate = Join-Path $peerRoot 'hold-opendir'
+$renameGate = Join-Path $peerRoot 'hold-rename-reply'
 $profiles = Join-Path $State 'profiles.json'
 $account = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'
 $parent = '/shell directory'
@@ -913,6 +914,43 @@ try {
         [IO.File]::ReadAllText($movedLast) -cne 'last marked entry') {
         throw 'Retrying the remaining marks changed their contents'
     }
+    Click 'Previous results'
+    (Wait-CheckBox "Mark $parent/build-01.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-01.log" $on
+    (Wait-CheckBox "Mark $parent/build-02.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-02.log" $on
+    $stoppedFirst = Join-Path $archive 'build-01.log'
+    $stoppedSecond = Join-Path $archive 'build-02.log'
+    $remainingSource = Join-Path $peerRoot 'shell directory/build-02.log'
+    [IO.File]::WriteAllBytes($renameGate, [byte[]]@())
+    Click $moveMarked
+    $destination = Wait-Until 'the stop fixture reviews its two marked moves' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "2 entries on $($account.user)@$($account.host):$($account.port)")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click 'Move'
+    $stop = 'Stop after current move'
+    $null = Wait-Until 'first rename applied on the server with its acknowledgement withheld' {
+        [IO.File]::Exists($stoppedFirst) -and (Button $stop).Current.IsEnabled -and
+            (Find-Element ('Moving marked entry 1 of 2' + [char]0x2026))
+    }
+    Click $stop
+    $null = Wait-Until 'the current move is still pending and cannot be stopped twice' {
+        $stopping = Button ('Stopping after current move' + [char]0x2026)
+        $stopping -and !$stopping.Current.IsEnabled -and [IO.File]::Exists($remainingSource) -and
+            ![IO.File]::Exists($stoppedSecond)
+    }
+    [IO.File]::Delete($renameGate)
+    $null = Wait-Until 'the confirmed move remains and the second entry stays at its source' {
+        (Find-Element 'Moved 1 of 2 marked entries to /move archive. Stopped after the current move. 34 matches in 2 folders') -and
+            (Button "Reveal $parent/build-02.log") -and !(Button "Reveal $parent/build-01.log") -and
+            [IO.File]::Exists($stoppedFirst) -and [IO.File]::Exists($remainingSource) -and
+            ![IO.File]::Exists($stoppedSecond)
+    }
+    $null = Wait-CheckBox "Mark $parent/build-02.log" $on
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
@@ -922,6 +960,7 @@ try {
 } finally {
     [IO.File]::Delete($readGate)
     [IO.File]::Delete($refreshGate)
+    [IO.File]::Delete($renameGate)
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

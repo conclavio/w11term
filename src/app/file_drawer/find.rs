@@ -35,6 +35,7 @@ pub enum Action {
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
     MoveMarked(u64),
+    StopMoves(u64),
     Reveal(u64, FilenameMatch),
     Rename(u64, FilenameMatch),
     Delete(u64, FilenameMatch),
@@ -674,6 +675,9 @@ impl Panel {
                     .text(&files.status)
                     .text_wrapping(TextWrapping::Wrap),
             ));
+        }
+        if let Some(button) = files.stop_move_batch_button(pane, serial, ctx) {
+            rows.push(KeyedView::new("stop-moves", button));
         }
         if let Some(progress) = files.search_progress(serial) {
             let entries = if progress.scanned_entries == 1 {
@@ -1469,6 +1473,7 @@ impl FileDrawer {
                 panel.mark_download(index, checked);
             }
             Action::MoveMarked(serial) if !busy => self.begin_marked_move(serial)?,
+            Action::StopMoves(serial) if serial == panel.serial => self.stop_move_batch(serial),
             Action::Rename(serial, hit) if !busy => self.begin_search_rename(serial, hit)?,
             Action::Delete(serial, hit) if !busy => self.begin_search_delete(serial, hit)?,
             Action::CopyPaths(serial, hit) if !busy => {
