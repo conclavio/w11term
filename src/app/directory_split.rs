@@ -3,7 +3,9 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-use w11term::{options::PlayerOptions, ssh::ConnectionShare, workspace::SshStartup};
+use w11term::{
+    options::PlayerOptions, sftp::FilenameMatch, ssh::ConnectionShare, workspace::SshStartup,
+};
 
 pub(super) const OPEN_EXPLORER: &str = "Open current folder in File Explorer";
 
@@ -19,7 +21,13 @@ pub struct Origin {
     pane: u64,
     generation: u64,
     directory: Directory,
-    listing_revision: Option<u64>,
+    drawer: Option<DrawerOrigin>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DrawerOrigin {
+    Listing(u64),
+    Search(u64, FilenameMatch),
 }
 
 pub(super) struct PendingCopy {
@@ -35,8 +43,23 @@ impl Origin {
             pane,
             generation,
             directory: Directory::Ssh(directory.into()),
-            listing_revision: Some(revision),
+            drawer: Some(DrawerOrigin::Listing(revision)),
         }
+    }
+
+    pub(super) fn search(
+        pane: u64,
+        generation: u64,
+        serial: u64,
+        hit: &FilenameMatch,
+    ) -> Option<Self> {
+        let directory = w11term::profiles::bookmark_directory(&hit.parent)?;
+        Some(Self {
+            pane,
+            generation,
+            directory: Directory::Ssh(directory.into()),
+            drawer: Some(DrawerOrigin::Search(serial, hit.clone())),
+        })
     }
 }
 
@@ -175,7 +198,7 @@ impl LiveTab {
                 pane: self.session.pane_id,
                 generation,
                 directory: Directory::Ssh(directory),
-                listing_revision: None,
+                drawer: None,
             },
             connection,
         ))
@@ -201,7 +224,7 @@ impl LiveTab {
             pane: self.session.pane_id,
             generation: frame.connection_generation,
             directory,
-            listing_revision: None,
+            drawer: None,
         })
     }
 
@@ -403,13 +426,18 @@ impl TerminalApp {
             .with_profile(tab.profile_name.clone());
             return Some(child);
         }
-        let resolved = if target.listing_revision.is_some() {
+        let resolved = if let Some(origin) = &target.drawer {
             if !self.drawer_shell_eligible(tab, target.generation) {
                 return None;
             }
-            tab.files
-                .shell_origin(tab.session.pane_id)
-                .zip(tab.session.ssh_connection_at(target.generation))
+            let pane = tab.session.pane_id;
+            let current = match origin {
+                DrawerOrigin::Listing(_) => tab.files.shell_origin(pane),
+                DrawerOrigin::Search(serial, hit) => {
+                    tab.files.search_shell_origin(pane, *serial, hit)
+                }
+            };
+            current.zip(tab.session.ssh_connection_at(target.generation))
         } else {
             tab.ssh_directory_split()
         };
@@ -595,12 +623,32 @@ mod tests {
     }
 
     #[test]
+    fn search_split_keeps_the_containing_directory_and_exact_match() {
+        let hit = FilenameMatch {
+            parent: "/Pilot's Work/deeper".into(),
+            name: "child-witness.txt".into(),
+            kind: None,
+        };
+        let origin = Origin::search(14, 3, 8, &hit).unwrap();
+        assert_eq!(origin.pane, 14);
+        assert_eq!(origin.generation, 3);
+        assert_eq!(origin.directory, Directory::Ssh(hit.parent.clone()));
+        assert_eq!(origin.drawer, Some(DrawerOrigin::Search(8, hit.clone())));
+        assert_ne!(Some(origin), Origin::search(14, 4, 8, &hit));
+        let invalid = FilenameMatch {
+            parent: "/reports/../private".into(),
+            ..hit
+        };
+        assert!(Origin::search(14, 3, 8, &invalid).is_none());
+    }
+
+    #[test]
     fn queued_directory_actions_keep_the_parent_and_the_directory_that_was_offered() {
         let origin = Origin {
             pane: 14,
             generation: 3,
             directory: Directory::Ssh("/srv/client v2".into()),
-            listing_revision: None,
+            drawer: None,
         };
         for (label, expected) in [
             ("New tab in current directory    F9", Destination::Tab),

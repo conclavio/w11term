@@ -4,7 +4,8 @@ use std::cell::OnceCell;
 pub(super) struct Editor {
     id: u64,
     generation: u64,
-    entry: ListedEntry,
+    parent: String,
+    name: String,
     original: String,
     draft: TextDraft,
     open: bool,
@@ -60,10 +61,6 @@ impl Editor {
         self.open
     }
 
-    pub(super) fn serial(&self) -> u64 {
-        self.serial
-    }
-
     pub(super) fn stash(&mut self) {
         self.open = false;
         self.mode = Mode::Edit;
@@ -78,11 +75,11 @@ impl Editor {
             "The SSH connection changed. Copy this draft or reopen the remote file to edit it."
         );
         let name = match (&self.mode, new_file) {
-            (Mode::Edit, false) => &self.entry.name,
+            (Mode::Edit, false) => &self.name,
             (Mode::SaveAs(name), true) => name,
             _ => bail!("Choose a save action first"),
         };
-        let path = entry_path(&self.entry.parent, name)?;
+        let path = entry_path(&self.parent, name)?;
         let text = self.draft.contents();
         ensure!(
             text.len() <= w11term::sftp::TEXT_PREVIEW_MAX_BYTES && !text.contains('\0'),
@@ -99,7 +96,7 @@ impl Editor {
         Ok((
             Save {
                 id: self.id,
-                parent: self.entry.parent.clone(),
+                parent: self.parent.clone(),
                 name: name.clone(),
                 new_file,
             },
@@ -159,7 +156,7 @@ impl Editor {
             KeyedView::new(
                 "path",
                 TextBlock::new()
-                    .text(&self.entry.parent)
+                    .text(&self.parent)
                     .text_wrapping(TextWrapping::Wrap),
             ),
             KeyedView::new("document", input.clone()),
@@ -193,7 +190,7 @@ impl Editor {
                 vec![
                     button(
                         "Create file",
-                        writable && entry_path(&self.entry.parent, name).is_ok(),
+                        writable && entry_path(&self.parent, name).is_ok(),
                         Action::Create,
                     ),
                     button("Back to editor", !self.saving, Action::Back),
@@ -223,7 +220,7 @@ impl Editor {
                 ),
         ));
         ContentDialog::new()
-            .title(&self.entry.name)
+            .title(&self.name)
             .close_button_text("Close editor")
             .is_open(true)
             .on_closed(context.callback(move |_| message(Action::Close)))
@@ -237,19 +234,40 @@ impl Editor {
 }
 
 impl FileDrawer {
+    pub(super) fn resume_draft_button(
+        &self,
+        pane: u64,
+        context: &ViewContext<TerminalApp>,
+    ) -> Option<View> {
+        let serial = self.editor.as_ref()?.serial;
+        Some(
+            Button::new()
+                .automation_name("Resume draft")
+                .is_enabled(!self.entry_dialog_open())
+                .on_click(
+                    context.callback(move |_| {
+                        Message::Files(FileAction::ResumeTextEditor(pane, serial))
+                    }),
+                )
+                .content("Resume draft"),
+        )
+    }
+
     pub(super) fn start_editor(&mut self, serial: u64) {
         if self.editor.is_some() {
             return;
         }
-        let Some((entry, original)) = self.take_preview_for_edit(serial) else {
+        let Some((target, original)) = self.take_preview_for_edit(serial) else {
             return;
         };
+        let (parent, name) = target.into_location();
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.editor = Some(Editor {
             id: self.dialog_serial,
             serial: self.dialog_serial,
             generation: self.generation,
-            entry,
+            parent,
+            name,
             draft: TextDraft::new(&original),
             original,
             open: true,
@@ -400,7 +418,9 @@ mod tests {
             kind,
             revision: files.listing_revision,
         };
-        let (preview, _) = files.begin_preview(entry, PreviewKind::Text).unwrap();
+        let (preview, _) = files
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Text)
+            .unwrap();
         files.finish_preview(preview, Ok(json!({"text":ORIGINAL})));
         files.start_editor(preview);
         let serial = files.editor.as_ref().unwrap().serial;

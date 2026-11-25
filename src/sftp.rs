@@ -34,7 +34,7 @@ pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_pa
 mod drop_source;
 mod editor;
 mod find;
-pub use find::{FilenameMatch, FilenameSearch, valid_filename_query};
+pub use find::{FilenameFilter, FilenameMatch, FilenameSearch, valid_filename_query};
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
@@ -45,7 +45,7 @@ pub use transfer_status::{
 };
 mod upload_directory;
 pub(crate) use directory::valid_component;
-pub use directory::{validate_download_name, validate_download_names};
+pub use directory::{SearchDownload, validate_download_name, validate_download_names};
 pub use drop_source::{DropSource, classify_drop};
 
 pub const CHUNK: usize = 32 * 1024;
@@ -209,6 +209,12 @@ pub enum Operation {
         #[serde(default)]
         preserve_mtime: bool,
     },
+    #[serde(skip)]
+    GetSearch {
+        selection: SearchDownload,
+        local: PathBuf,
+        preserve_mtime: bool,
+    },
     PutDir {
         local: PathBuf,
         remote: String,
@@ -246,6 +252,12 @@ pub enum Operation {
     Find {
         path: String,
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        regex: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        match_case: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<EntryKind>,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -625,6 +637,7 @@ pub(crate) async fn run(
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
                 }
+                Operation::GetSearch { .. } => Some("Missing SSH connection for search results"),
                 _ => None,
             };
             if let Some(message) = missing {
@@ -677,13 +690,20 @@ pub(crate) async fn run(
             let _ = reply.send(Ok(state.cancelled(local)));
             continue;
         }
-        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
-            && let Operation::Put { local, remote, .. }
-            | Operation::Get { local, remote, .. }
-            | Operation::GetDir { local, remote, .. } = &operation
-        {
-            let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
-            continue;
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled) {
+            let paths = match &operation {
+                Operation::Put { local, remote, .. }
+                | Operation::Get { local, remote, .. }
+                | Operation::GetDir { local, remote, .. } => Some((local, remote.as_str())),
+                Operation::GetSearch {
+                    selection, local, ..
+                } => Some((local, selection.root())),
+                _ => None,
+            };
+            if let Some((local, remote)) = paths {
+                let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
+                continue;
+            }
         }
         let detached_close = reply.is_closed() && matches!(operation, Operation::Close { .. });
         let deadline = if detached_close {
@@ -735,10 +755,12 @@ pub(crate) async fn run(
                     JobStage::Checking("SHA-256 calculation did not finish")
                 }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
-                Operation::GetDir { .. } => JobStage::DirectoryDownload {
-                    staging: None,
-                    deadline,
-                },
+                Operation::GetDir { .. } | Operation::GetSearch { .. } => {
+                    JobStage::DirectoryDownload {
+                        staging: None,
+                        deadline,
+                    }
+                }
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
                 Operation::SaveText { .. } => JobStage::Checking("Save was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
@@ -1015,8 +1037,30 @@ impl Engine {
                 local,
                 preserve_mtime,
             } => {
-                self.get_dir(remote, local, preserve_mtime, progress, cancel, stage)
-                    .await?
+                self.get_dir(
+                    directory::DownloadSource::Entire(remote),
+                    local,
+                    preserve_mtime,
+                    progress,
+                    cancel,
+                    stage,
+                )
+                .await?
+            }
+            GetSearch {
+                selection,
+                local,
+                preserve_mtime,
+            } => {
+                self.get_dir(
+                    directory::DownloadSource::Selection(selection),
+                    local,
+                    preserve_mtime,
+                    progress,
+                    cancel,
+                    stage,
+                )
+                .await?
             }
             PutDir {
                 local,
@@ -1088,9 +1132,25 @@ impl Engine {
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
             Sha256 { path, max_bytes } => self.remote_sha256(&path, max_bytes, cancel).await?,
-            Find { path, query } => {
-                serde_json::to_value(self.find_filenames(&path, &query, cancel).await?)?
-            }
+            Find {
+                path,
+                query,
+                regex,
+                match_case,
+                kind,
+            } => serde_json::to_value(
+                self.find_filenames(
+                    &path,
+                    &query,
+                    FilenameFilter {
+                        regex,
+                        match_case,
+                        kind,
+                    },
+                    cancel,
+                )
+                .await?,
+            )?,
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
                 let mut result = json!({ "attrs": attrs });

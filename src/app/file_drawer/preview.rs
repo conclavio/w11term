@@ -10,7 +10,7 @@ pub enum PreviewKind {
 
 pub(super) struct EntryPreview {
     serial: u64,
-    entry: ListedEntry,
+    target: FileTarget,
     kind: PreviewKind,
     content: Contents,
     checksum_available: bool,
@@ -113,7 +113,7 @@ impl EntryPreview {
                     ));
                 }
                 if self.checksum_available {
-                    let entry = self.entry.clone();
+                    let target = self.target.clone();
                     fields.push(KeyedView::new(
                         "checksum",
                         Button::new()
@@ -122,7 +122,7 @@ impl EntryPreview {
                                 Message::Files(FileAction::Preview(
                                     pane,
                                     generation,
-                                    entry.clone(),
+                                    target.clone(),
                                     PreviewKind::Checksum(serial),
                                 ))
                             }))
@@ -158,7 +158,7 @@ impl EntryPreview {
                     ));
                 }
                 ContentDialog::new()
-                    .title(&self.entry.name)
+                    .title(self.target.name())
                     .close_button_text(match self.kind {
                         PreviewKind::Text => "Close preview",
                         PreviewKind::Properties => "Close properties",
@@ -183,25 +183,26 @@ impl EntryPreview {
 }
 
 impl FileDrawer {
-    pub(super) fn take_preview_for_edit(&mut self, serial: u64) -> Option<(ListedEntry, String)> {
+    pub(super) fn take_preview_for_edit(&mut self, serial: u64) -> Option<(FileTarget, String)> {
         let preview = self.preview.as_ref()?;
         if !self.open
             || preview.serial != serial
-            || self.check_selected(&preview.entry).is_err()
             || !preview.editable()
+            || self.checked_target_path(&preview.target).is_err()
         {
             return None;
         }
+        let target = preview.target.clone();
         let mut preview = self.preview.take()?;
         let Contents::Ready(text) = std::mem::replace(&mut preview.content, Contents::Loading)
         else {
             unreachable!()
         };
-        Some((preview.entry.clone(), text))
+        Some((target, text))
     }
     pub(super) fn begin_preview(
         &mut self,
-        entry: ListedEntry,
+        target: FileTarget,
         kind: PreviewKind,
     ) -> Result<(u64, Operation)> {
         let idle = if matches!(kind, PreviewKind::Checksum(_)) {
@@ -214,14 +215,10 @@ impl FileDrawer {
             self.open && self.generation != 0 && idle && self.bookmarks.is_none(),
             "Open the file listing before starting a preview"
         );
-        self.check_selected(&entry)?;
-        let path = entry_path(&entry.parent, &entry.name)?;
+        let path = self.checked_target_path(&target)?;
         let operation = match kind {
             PreviewKind::Text => {
-                ensure!(
-                    entry.kind == ListedKind::Known(EntryKind::File),
-                    "Select a regular file to preview"
-                );
+                ensure!(target.is_regular_file(), "Select a regular file to preview");
                 Operation::PreviewText { path }
             }
             PreviewKind::Properties => Operation::EntryProperties { path },
@@ -231,9 +228,7 @@ impl FileDrawer {
                         .as_ref()
                         .is_some_and(|preview| preview.serial == properties
                             && preview.checksum_available
-                            && preview.entry.revision == entry.revision
-                            && preview.entry.parent == entry.parent
-                            && preview.entry.name == entry.name),
+                            && preview.target == target),
                     "Reopen the selected file's properties to calculate SHA-256"
                 );
                 Operation::Sha256 {
@@ -246,7 +241,7 @@ impl FileDrawer {
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.preview = Some(EntryPreview {
             serial: self.dialog_serial,
-            entry,
+            target,
             kind,
             content: Contents::Loading,
             checksum_available: false,
@@ -261,7 +256,11 @@ impl FileDrawer {
         let Some(current) = self.preview.as_ref().filter(|p| p.serial == serial) else {
             return;
         };
-        if !self.open || self.check_selected(&current.entry).is_err() {
+        let Ok(path) = self.checked_target_path(&current.target) else {
+            self.cancel_preview();
+            return;
+        };
+        if !self.open {
             self.cancel_preview();
             return;
         }
@@ -275,7 +274,7 @@ impl FileDrawer {
                 let mode = value["attrs"]["permissions"]
                     .as_u64()
                     .and_then(|mode| u32::try_from(mode).ok());
-                let text = super::properties::display_text(&preview.entry, value)
+                let text = super::properties::display_text(&path, value)
                     .map_err(|error| format!("{error:#}"));
                 preview.checksum_available =
                     text.is_ok() && EntryKind::from_permissions(mode) == Some(EntryKind::File);
@@ -293,17 +292,17 @@ impl FileDrawer {
         preview.view.take();
     }
 
-    fn ready_checksum(&self, serial: u64) -> Option<(&ListedEntry, &str)> {
+    fn ready_checksum(&self, serial: u64) -> Option<(&FileTarget, &str)> {
         let preview = self.preview.as_ref().filter(|p| {
             p.serial == serial
                 && matches!(p.kind, PreviewKind::Checksum(_))
                 && self.open
-                && self.check_selected(&p.entry).is_ok()
+                && self.checked_target_path(&p.target).is_ok()
         })?;
         let Contents::Ready(sha256) = &preview.content else {
             return None;
         };
-        Some((&preview.entry, sha256))
+        Some((&preview.target, sha256))
     }
 
     pub(super) fn copy_checksum(&mut self, serial: u64) {
@@ -320,12 +319,12 @@ impl FileDrawer {
     }
 
     pub(super) fn verify_checksum(&mut self, serial: u64) -> Result<()> {
-        let Some((entry, digest)) = self.ready_checksum(serial) else {
+        let Some((target, digest)) = self.ready_checksum(serial) else {
             return Ok(());
         };
-        let (entry, digest) = (entry.clone(), digest.to_owned());
+        let (target, digest) = (target.clone(), digest.to_owned());
         self.cancel_preview();
-        self.begin_verified_download(entry, digest)
+        self.begin_verified_download(target, digest)
     }
 
     pub(super) fn close_preview(&mut self, serial: u64) {
@@ -356,11 +355,11 @@ mod tests {
     fn verified_download_reuses_only_the_current_checksum_and_selection() {
         let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
         let (properties, _) = files
-            .begin_preview(entry.clone(), PreviewKind::Properties)
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Properties)
             .unwrap();
         files.finish_preview(properties, Ok(json!({"attrs": {"permissions": 0o100644}})));
         let (checksum, _) = files
-            .begin_preview(entry, PreviewKind::Checksum(properties))
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Checksum(properties))
             .unwrap();
         let digest = "f".repeat(64);
         files.finish_preview(checksum, Ok(json!({"sha256": digest})));
@@ -377,8 +376,10 @@ mod tests {
         let dialog = files.dialog.as_ref().unwrap();
         assert!(!dialog.resume_download);
         assert_eq!(dialog.destination().unwrap(), digest);
-        assert!(matches!(&dialog.action, EditAction::VerifyDownload(entry)
-            if entry.name == "résumé 100% [pilot].txt"));
+        assert!(
+            matches!(&dialog.action, EditAction::VerifyDownload(FileTarget::Listed(entry))
+            if entry.name == "résumé 100% [pilot].txt")
+        );
     }
 
     fn selected(kind: ListedKind) -> (FileDrawer, ListedEntry) {
@@ -414,7 +415,7 @@ mod tests {
     fn preview_keeps_exact_text_and_existing_listing_selection() {
         let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
         let (serial, request) = files
-            .begin_preview(entry.clone(), PreviewKind::Text)
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Text)
             .unwrap();
         assert!(
             matches!(request, Operation::PreviewText { path } if path == "/srv/雪/résumé 100% [pilot].txt")
@@ -445,32 +446,40 @@ mod tests {
             ListedKind::Unsupported,
         ] {
             let (mut files, entry) = selected(kind);
-            assert!(files.begin_preview(entry, PreviewKind::Text).is_err());
+            assert!(
+                files
+                    .begin_preview(FileTarget::Listed(entry), PreviewKind::Text)
+                    .is_err()
+            );
             assert!(!files.entry_dialog_open());
         }
         let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
         files.listing_revision += 1;
         assert!(
             files
-                .begin_preview(entry.clone(), PreviewKind::Text)
+                .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Text)
                 .is_err()
         );
         files.listing_revision = entry.revision;
         files.selected = None;
-        assert!(files.begin_preview(entry, PreviewKind::Text).is_err());
+        assert!(
+            files
+                .begin_preview(FileTarget::Listed(entry), PreviewKind::Text)
+                .is_err()
+        );
     }
 
     #[test]
     fn discarded_reads_cannot_reopen_or_replace_another_preview() {
         let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
         let (first, _) = files
-            .begin_preview(entry.clone(), PreviewKind::Text)
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Text)
             .unwrap();
         let cancellation = files.preview.as_ref().unwrap().cancel.clone();
         files.close_preview(first);
         assert!(cancellation.is_cancelled());
         let (second, _) = files
-            .begin_preview(entry.clone(), PreviewKind::Text)
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Text)
             .unwrap();
         files.close_preview(first);
         files.finish_preview(first, Ok(json!({"text":"wrong file"})));
@@ -488,7 +497,9 @@ mod tests {
         assert_eq!(files.directory.as_deref(), Some("/elsewhere"));
 
         let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
-        let (serial, _) = files.begin_preview(entry, PreviewKind::Text).unwrap();
+        let (serial, _) = files
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Text)
+            .unwrap();
         let cancellation = files.preview.as_ref().unwrap().cancel.clone();
         files.observe_connection(3);
         files.finish_preview(serial, Ok(json!({"text":"old peer"})));
@@ -507,7 +518,7 @@ mod tests {
         ] {
             let (mut files, entry) = selected(kind);
             let (serial, request) = files
-                .begin_preview(entry.clone(), PreviewKind::Properties)
+                .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Properties)
                 .unwrap();
             assert!(
                 matches!(request, Operation::EntryProperties { path } if path == "/srv/雪/résumé 100% [pilot].txt")
@@ -529,13 +540,13 @@ mod tests {
     fn stale_properties_callbacks_cannot_replace_or_close_a_text_preview() {
         let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
         let (details, _) = files
-            .begin_preview(entry.clone(), PreviewKind::Properties)
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Properties)
             .unwrap();
         let cancel = files.preview.as_ref().unwrap().cancel.clone();
         files.close_preview(details);
         assert!(cancel.is_cancelled());
         let (text, _) = files
-            .begin_preview(entry.clone(), PreviewKind::Text)
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Text)
             .unwrap();
         files.finish_preview(details, Ok(json!({"attrs":{"size":0}})));
         files.close_preview(details);
@@ -548,13 +559,17 @@ mod tests {
         files.close_preview(text);
 
         let (details, _) = files
-            .begin_preview(entry.clone(), PreviewKind::Properties)
+            .begin_preview(FileTarget::Listed(entry.clone()), PreviewKind::Properties)
             .unwrap();
         let cancel = files.preview.as_ref().unwrap().cancel.clone();
         files.listing_revision += 1;
         files.finish_preview(details, Ok(json!({"attrs":{}})));
         assert!(cancel.is_cancelled());
         assert!(files.preview.is_none());
-        assert!(files.begin_preview(entry, PreviewKind::Properties).is_err());
+        assert!(
+            files
+                .begin_preview(FileTarget::Listed(entry), PreviewKind::Properties)
+                .is_err()
+        );
     }
 }

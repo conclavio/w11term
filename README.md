@@ -457,11 +457,25 @@ Enable **Upload files atomically** before selecting or dropping regular files to
 
 Choose **Filter filenames…** and type part of a name to search the entire directory listing, including later pages. Matching ignores case and treats punctuation literally. Filtering uses the listing already in memory. **Done** returns keyboard input to the terminal and keeps the results visible. **Clear filter** brings back all entries. Refresh keeps your filter in the current directory, and opening another directory starts with its full listing.
 
-Choose **Find files…** to search the displayed directory and its subdirectories by filename. Matching is case-insensitive and literal. Select a result to open its containing folder with the entry selected, or use **Download…** or **Download folder…** beside a regular file or folder. Direct downloads use the drawer’s destination and overwrite rules, show cancellable progress, and keep the search results in place. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. **Cancel search** keeps the matches already collected.
+Choose **Find files…** to search the displayed directory and its subdirectories by filename. The default is a case-insensitive literal search. Use **Regex** for a regular expression or **Match case** to distinguish uppercase and lowercase. Select a result to open its containing folder with the entry selected, or use **Download…** or **Download folder…** beside a regular file or folder. Direct downloads use the drawer’s destination and overwrite rules, show cancellable progress, and keep the search results in place. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. Cancelling the first scan keeps the matches already collected.
+
+Choose **Refresh results** to scan again with the same settings. The previous results stay visible during the scan. A successful refresh keeps download marks for paths that still match with the same entry type. Cancelling a refresh or encountering a scan error keeps the previous results and marks.
 
 After revealing a match, choose **Back to search results** to return to the same query and results page without rescanning. **Find files…** starts a new search from the current folder. Closing the drawer or reconnecting ends the saved search.
 
+The filename field takes keyboard focus when search opens or you return to the results. With that field focused, **Enter** starts the search and **Escape** returns to the file listing.
+
+Use **Search result type** to find only files, folders, or symbolic links. Choose a type and leave the filename field empty to match any name of that type. Only matching entries count toward the 200-result limit. A file search still descends into real subfolders.
+
+Choose **Properties…** beside a search result to inspect its current metadata without leaving the results. For regular files, you can also calculate or copy the SHA-256 digest and use it for a verified download.
+
+Choose **Preview text…** on a regular file to read its UTF-8 contents, or choose **Edit** in the preview to make an explicit save. **Resume draft** is available from the results if you close the editor with a draft.
+
+Choose **Shell in containing folder** to open a right split on the same authenticated SSH connection with that folder as its working directory. The search stays open in the source pane.
+
 Choose **Copy path** beside a search result for its absolute remote path, or **Copy all paths** for one path per line from every retained results page. Paths are plain text and keep their spaces, Unicode, and literal names. Copy paths containing line breaks individually.
+
+Choose **Select downloads…** to mark files and folders from any results page. **Download marked** asks for a new local folder name and keeps the paths relative to the search root. A marked folder includes its subtree, including any separately marked descendants. The new folder appears after the download completes. Cancellation or a transfer error discards the staged download.
 
 Under **Sort by**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
 

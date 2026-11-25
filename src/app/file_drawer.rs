@@ -19,7 +19,7 @@ use w11term::sftp::{
 mod bookmarks;
 mod downloads;
 mod editor;
-mod find;
+pub(super) mod find;
 mod history;
 mod preview;
 mod properties;
@@ -70,6 +70,27 @@ fn request_generation(operation: &Operation, generation: u64) -> Option<u64> {
     }
 }
 
+fn focus_file_input(
+    input: &ElementRef<TextBox>,
+    attempt: u8,
+    next: FileAction,
+    context: &ComponentContext<TerminalApp>,
+) {
+    let sender = context.sender();
+    let retry = next.clone();
+    let queued = input.request_focus_result(move |result| {
+        if attempt < 4 && !result.unwrap_or(false) {
+            sender.send(Message::Files(retry.clone()));
+        }
+    });
+    if !queued && attempt < 4 {
+        context.spawn_background(move |_| {
+            std::thread::sleep(Duration::from_millis(20));
+            Message::Files(next)
+        });
+    }
+}
+
 #[derive(Clone)]
 pub enum FileAction {
     Toggle,
@@ -95,7 +116,7 @@ pub enum FileAction {
     SelectDownloads(u64, u64, u64, bool),
     MarkDownload(u64, u64, ListedEntry, bool),
     CopyPath(u64, u64, u64, Option<ListedEntry>),
-    Preview(u64, u64, ListedEntry, PreviewKind),
+    Preview(u64, u64, FileTarget, PreviewKind),
     ClosePreview(u64, u64, u64),
     CopyChecksum(u64, u64, u64),
     VerifyChecksum(u64, u64, u64),
@@ -210,7 +231,7 @@ impl ListedKind {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ListedEntry {
     parent: String,
     revision: u64,
@@ -218,13 +239,42 @@ pub struct ListedEntry {
     kind: ListedKind,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum FileTarget {
+    Listed(ListedEntry),
+    Search(u64, FilenameMatch),
+}
+
+impl FileTarget {
+    fn name(&self) -> &str {
+        match self {
+            Self::Listed(entry) => &entry.name,
+            Self::Search(_, hit) => &hit.name,
+        }
+    }
+
+    fn is_regular_file(&self) -> bool {
+        match self {
+            Self::Listed(entry) => entry.kind == ListedKind::Known(EntryKind::File),
+            Self::Search(_, hit) => hit.kind == Some(EntryKind::File),
+        }
+    }
+
+    fn into_location(self) -> (String, String) {
+        match self {
+            Self::Listed(entry) => (entry.parent, entry.name),
+            Self::Search(_, hit) => (hit.parent, hit.name),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum TransferPicker {
     UploadFiles(String),
     UploadFolder(String),
-    Download(ListedEntry, Option<DownloadVerification>),
+    Download(FileTarget, Option<DownloadVerification>),
     DownloadMarked,
-    DownloadSearch(u64, FilenameMatch),
+    DownloadSearch(u64),
 }
 
 #[derive(Clone)]
@@ -248,13 +298,16 @@ impl TransferPicker {
                     Purpose::UploadFiles
                 })
             }
-            Self::Download(entry, _) => files.selected_download_target(entry)?.purpose(),
-            Self::DownloadSearch(serial, hit) => {
-                files.search_download_target(*serial, hit)?.purpose()
-            }
+            Self::Download(target, verification) => files
+                .download_target(target, verification.is_some())?
+                .purpose(),
             Self::DownloadMarked => {
                 files.marked_entries()?;
                 Ok(Purpose::DownloadFolder)
+            }
+            Self::DownloadSearch(serial) => {
+                files.search_download_selection(*serial)?;
+                Ok(Purpose::SaveSearchResults)
             }
         }
     }
@@ -285,17 +338,15 @@ enum EditAction {
     GoToFolder { revision: u64 },
     Create,
     Rename(ListedEntry),
-    VerifyDownload(ListedEntry),
+    VerifyDownload(FileTarget),
     Delete(ListedEntry, EntryKind),
 }
 
 impl EditAction {
     fn original(&self) -> Option<&ListedEntry> {
         match self {
-            Self::GoToFolder { .. } | Self::Create => None,
-            Self::Rename(entry) | Self::VerifyDownload(entry) | Self::Delete(entry, _) => {
-                Some(entry)
-            }
+            Self::GoToFolder { .. } | Self::Create | Self::VerifyDownload(_) => None,
+            Self::Rename(entry) | Self::Delete(entry, _) => Some(entry),
         }
     }
 }
@@ -392,12 +443,21 @@ enum TransferFile {
     DownloadFolder {
         remote: String,
         local: PathBuf,
+        selected: bool,
     },
 }
 
 fn counted(amount: u64, singular: &str) -> String {
     let ending = if amount == 1 { "" } else { "s" };
     format!("{amount} {singular}{ending}")
+}
+
+fn download_folder_subject(remote: &str, selected: bool) -> String {
+    if selected {
+        format!("marked results from {remote}")
+    } else {
+        remote.to_owned()
+    }
 }
 
 impl TransferFile {
@@ -444,8 +504,14 @@ impl TransferFile {
                     "Cancelled download of {remote} ({bytes} bytes written to the temporary file)."
                 )
             }
-            (Self::DownloadFolder { remote, .. }, true) => format!(
-                "Cancelled download of {remote} ({bytes} bytes written to the temporary folder)."
+            (
+                Self::DownloadFolder {
+                    remote, selected, ..
+                },
+                true,
+            ) => format!(
+                "Cancelled download of {} ({bytes} bytes written to the temporary folder).",
+                download_folder_subject(remote, *selected),
             ),
             (Self::UploadFolder { remote }, true) => {
                 let destination = reply["resolved_remote"].as_str().unwrap_or(remote);
@@ -481,12 +547,22 @@ impl TransferFile {
             (Self::Download { remote, .. }, false) => {
                 format!("Downloaded {remote} ({bytes} bytes)")
             }
-            (Self::DownloadFolder { remote, local }, false) => format!(
-                "Downloaded {remote} to {} ({} files, {bytes} bytes, {} links or special files skipped).",
-                local.display(),
-                reply["files"],
-                reply["skipped"]
-            ),
+            (
+                Self::DownloadFolder {
+                    remote,
+                    local,
+                    selected,
+                },
+                false,
+            ) => {
+                format!(
+                    "Downloaded {} to {} ({} files, {bytes} bytes, {} links or special files skipped).",
+                    download_folder_subject(remote, *selected),
+                    local.display(),
+                    reply["files"],
+                    reply["skipped"]
+                )
+            }
         }
     }
 
@@ -519,8 +595,13 @@ impl TransferFile {
             } => format!(
                 "Download of {remote} was interrupted with at least {bytes} bytes written to the temporary file. The outcome is unknown. Check the local destination."
             ),
-            Self::DownloadFolder { remote, local } => format!(
-                "Download of {remote} was interrupted with at least {bytes} bytes written to the temporary folder. The outcome is unknown. Check {}.",
+            Self::DownloadFolder {
+                remote,
+                local,
+                selected,
+            } => format!(
+                "Download of {} was interrupted with at least {bytes} bytes written to the temporary folder. The outcome is unknown. Check {}.",
+                download_folder_subject(remote, *selected),
                 local.display()
             ),
         }
@@ -804,6 +885,11 @@ fn dialog_filename(remote: &str) -> &str {
 }
 
 impl FileDrawer {
+    pub(super) fn keyboard_search(&self, pane: u64) -> Option<SearchField> {
+        self.search_serial()
+            .map(|serial| SearchField::Files(pane, self.generation, serial))
+    }
+
     pub(super) fn filter_editing(&self) -> bool {
         self.filter_input.is_some()
     }
@@ -914,6 +1000,19 @@ impl FileDrawer {
         ))
     }
 
+    pub(super) fn search_shell_origin(
+        &self,
+        pane: u64,
+        serial: u64,
+        hit: &FilenameMatch,
+    ) -> Option<directory_split::Origin> {
+        if !self.open || self.busy() || self.entry_dialog_open() {
+            return None;
+        }
+        self.search_hit_path(serial, hit).ok()?;
+        directory_split::Origin::search(pane, self.generation, serial, hit)
+    }
+
     fn check_selected(&self, entry: &ListedEntry) -> Result<()> {
         ensure!(
             self.selected.as_ref() == Some(&entry.name) && self.has_entry(entry),
@@ -927,6 +1026,16 @@ impl FileDrawer {
         remote_child(&entry.parent, &entry.name)
     }
 
+    fn checked_target_path(&self, target: &FileTarget) -> Result<String> {
+        match target {
+            FileTarget::Listed(entry) => {
+                self.check_selected(entry)?;
+                entry_path(&entry.parent, &entry.name)
+            }
+            FileTarget::Search(serial, hit) => self.search_hit_path(*serial, hit),
+        }
+    }
+
     fn selected_download_target<'a>(
         &self,
         entry: &'a ListedEntry,
@@ -938,18 +1047,25 @@ impl FileDrawer {
         })
     }
 
+    fn download_target<'a>(
+        &self,
+        target: &'a FileTarget,
+        verify: bool,
+    ) -> Result<downloads::DownloadTarget<'a>> {
+        match target {
+            FileTarget::Listed(entry) => self.selected_download_target(entry),
+            FileTarget::Search(serial, hit) => self.search_download_target(*serial, hit, verify),
+        }
+    }
+
     fn download_operation(
         &self,
-        entry: &ListedEntry,
+        target: &FileTarget,
         destination: PathBuf,
         verification: Option<DownloadVerification>,
     ) -> Result<(Operation, TransferFile)> {
-        self.selected_download_target(entry)?.operation(
-            destination,
-            self.replace,
-            self.preserve_mtime,
-            verification,
-        )
+        self.download_target(target, verification.is_some())?
+            .operation(destination, self.replace, self.preserve_mtime, verification)
     }
 
     fn prepare_folder_upload(
@@ -1103,13 +1219,19 @@ impl FileDrawer {
         }
     }
 
-    fn begin_verified_download(&mut self, entry: ListedEntry, digest: String) -> Result<()> {
+    fn begin_verified_download(&mut self, target: FileTarget, digest: String) -> Result<()> {
         ensure!(
-            entry.kind != ListedKind::Known(EntryKind::Directory),
+            !matches!(&target, FileTarget::Listed(entry)
+                if entry.kind == ListedKind::Known(EntryKind::Directory)),
             "Choose a file to verify"
         );
+        self.checked_target_path(&target)?;
+        let parent = self
+            .directory
+            .clone()
+            .context("Open a remote folder first")?;
         self.end_filter_edit();
-        self.begin_edit(entry.parent.clone(), EditAction::VerifyDownload(entry))?;
+        self.begin_edit(parent, EditAction::VerifyDownload(target))?;
         self.dialog.as_mut().unwrap().name = digest;
         Ok(())
     }
@@ -1150,6 +1272,9 @@ impl FileDrawer {
         );
         if let Some(entry) = dialog.action.original() {
             self.check_selected(entry)?;
+        }
+        if let EditAction::VerifyDownload(target) = &dialog.action {
+            self.checked_target_path(target)?;
         }
         let path = dialog.destination()?;
         Ok(Some((dialog, path)))
@@ -1220,7 +1345,7 @@ impl FileDrawer {
                     Message::Files(FileAction::EditName(pane, generation, serial, name))
                 })),
         )];
-        if let EditAction::VerifyDownload(entry) = &dialog.action {
+        if let EditAction::VerifyDownload(target) = &dialog.action {
             fields.insert(
                 0,
                 KeyedView::new(
@@ -1228,7 +1353,10 @@ impl FileDrawer {
                     TextBlock::new()
                         .text(format!(
                             "{}@{}:{} · {}",
-                            ssh.user, ssh.host, ssh.port, entry.name
+                            ssh.user,
+                            ssh.host,
+                            ssh.port,
+                            target.name()
                         ))
                         .text_wrapping(TextWrapping::Wrap),
                 ),
@@ -1544,7 +1672,7 @@ impl FileDrawer {
             view
         };
         if let Some(search) = &self.search {
-            return cache(search.view(self, pane, context));
+            return cache(search.view(self, pane, shell_ready, context));
         }
         if let Some(list) = &self.bookmarks
             && Some(list.profile.as_str()) == profile
@@ -1758,7 +1886,7 @@ impl FileDrawer {
                         pane,
                         generation,
                         revision,
-                        TransferPicker::Download(listed(selected), None),
+                        TransferPicker::Download(FileTarget::Listed(listed(selected)), None),
                     ),
                 ),
                 button(
@@ -1787,12 +1915,22 @@ impl FileDrawer {
                     "Preview text…",
                     writable
                         && selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File)),
-                    Preview(pane, generation, listed(selected), PreviewKind::Text),
+                    Preview(
+                        pane,
+                        generation,
+                        FileTarget::Listed(listed(selected)),
+                        PreviewKind::Text,
+                    ),
                 ),
                 button(
                     "Properties…",
                     writable && selected.is_some(),
-                    Preview(pane, generation, listed(selected), PreviewKind::Properties),
+                    Preview(
+                        pane,
+                        generation,
+                        FileTarget::Listed(listed(selected)),
+                        PreviewKind::Properties,
+                    ),
                 ),
             ),
             CheckBox::new()
@@ -1832,13 +1970,7 @@ impl FileDrawer {
                 }))
                 .content(TextBlock::new().text("Preserve upload timestamps")),
         ];
-        if let Some(editor) = &self.editor {
-            controls.push(button(
-                "Resume draft",
-                !self.entry_dialog_open(),
-                ResumeTextEditor(pane, editor.serial()),
-            ));
-        }
+        controls.extend(self.resume_draft_button(pane, context));
         let sort_button = |order, label: &str, name: &str| {
             RadioButton::new()
                 .group_name(format!("sftp-sort-{pane}"))
@@ -2336,9 +2468,15 @@ impl FileDrawer {
                     }
                     bail!("Upload of {name} failed: {error}");
                 }
-                if let Step::Transfer(TransferFile::DownloadFolder { remote, local }) = &step {
+                if let Step::Transfer(TransferFile::DownloadFolder {
+                    remote,
+                    local,
+                    selected,
+                }) = &step
+                {
                     bail!(
-                        "Could not download {remote} to {}: {error}",
+                        "Could not download {} to {}: {error}",
+                        download_folder_subject(remote, *selected),
                         local.display()
                     );
                 }
@@ -2777,6 +2915,7 @@ impl TerminalApp {
                 && frame.prompt.is_none()
                 && session.prompts.current().is_none());
         let was_editing = files.filter_editing();
+        let search_before = files.search_serial();
         let finish_filter =
             may_open_dialog && was_editing && matches!(action, EditFilter(_, _, _, false));
         files.observe_transfer_connection(session, frame.connection_generation, visible);
@@ -2791,7 +2930,8 @@ impl TerminalApp {
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
-                    || was_editing != files.filter_editing())
+                    || was_editing != files.filter_editing()
+                    || search_before != files.search_serial())
             {
                 self.connection_ui(id);
             }
@@ -2828,7 +2968,15 @@ impl TerminalApp {
                 &action,
                 Filter(..) | ClearFilter(..) | FocusFilter(..) | Sort(..) | ShowTransfer(..)
             );
-        if !editor_typing && !matches!(action, Tick(_) | EditName(..) | FocusFilter(..)) {
+        if !editor_typing
+            && !matches!(
+                action,
+                Tick(_)
+                    | EditName(..)
+                    | FocusFilter(..)
+                    | Search(_, _, find::Action::FocusQuery(..))
+            )
+        {
             files.cached.borrow_mut().take();
         }
         let mut outcome = TransferOutcome::Failed;
@@ -3008,13 +3156,16 @@ impl TerminalApp {
                                 context,
                             )?;
                         }
-                        TransferPicker::Download(entry, verification) => {
+                        TransferPicker::Download(target, verification) => {
+                            if matches!(target, FileTarget::Search(..)) {
+                                ensure!(!files.busy(), "Another SFTP operation is active");
+                            }
                             let [local] = paths
                                 .try_into()
                                 .map_err(|_| anyhow!("Choose one download destination"))?;
                             let (operation, transfer) =
-                                files.download_operation(&entry, local, verification)?;
-                            files.status = format!("Downloading {}…", entry.name);
+                                files.download_operation(&target, local, verification)?;
+                            files.status = format!("Downloading {}…", target.name());
                             files.job(
                                 pane,
                                 session,
@@ -3032,24 +3183,28 @@ impl TerminalApp {
                             files.marked_downloads = None;
                             files.transfer_next(pane, session, context)?;
                         }
-                        TransferPicker::DownloadSearch(search, hit) => {
+                        TransferPicker::DownloadSearch(serial) => {
                             ensure!(!files.busy(), "Another SFTP operation is active");
                             let [local] = paths
                                 .try_into()
-                                .map_err(|_| anyhow!("Choose one download destination"))?;
-                            let target = files.search_download_target(search, &hit)?;
-                            let (operation, transfer) = target.operation(
-                                local,
-                                files.replace,
-                                files.preserve_mtime,
-                                None,
-                            )?;
-                            files.status = format!("Downloading {}…", hit.name);
+                                .map_err(|_| anyhow!("Choose one new download folder"))?;
+                            let selection = files.search_download_selection(serial)?;
+                            let remote = selection.root().to_owned();
+                            files.status = format!("Downloading marked results from {remote}…");
+                            let operation = Operation::GetSearch {
+                                selection,
+                                local: local.clone(),
+                                preserve_mtime: files.preserve_mtime,
+                            };
                             files.job(
                                 pane,
                                 session,
                                 operation,
-                                Step::Transfer(transfer),
+                                Step::Transfer(TransferFile::DownloadFolder {
+                                    remote,
+                                    local,
+                                    selected: true,
+                                }),
                                 context,
                             )?;
                         }
@@ -3103,13 +3258,13 @@ impl TerminalApp {
                                     Operation::RemoveEntry { path, kind },
                                 )
                             }
-                            EditAction::VerifyDownload(entry) => {
+                            EditAction::VerifyDownload(target) => {
                                 context.sender().send(Message::Files(Pick(
                                     pane,
                                     files.generation,
                                     files.listing_revision,
                                     TransferPicker::Download(
-                                        entry,
+                                        target,
                                         Some(DownloadVerification {
                                             sha256: path,
                                             resume: resume_download,
@@ -3155,12 +3310,12 @@ impl TerminalApp {
                         }
                     }
                 }
-                Preview(_, _, entry, kind) => {
+                Preview(_, _, target, kind) => {
                     if may_open_dialog
                         && files.open
                         && (!files.busy() || matches!(kind, PreviewKind::Checksum(_)))
                     {
-                        let (serial, operation) = files.begin_preview(entry, kind)?;
+                        let (serial, operation) = files.begin_preview(target, kind)?;
                         if let Err(error) =
                             files.job(pane, session, operation, Step::Preview(serial), context)
                         {
@@ -3187,19 +3342,7 @@ impl TerminalApp {
                 FocusFilter(_, generation, revision, attempt) => {
                     if let Some(input) = &files.filter_input {
                         let next = FocusFilter(pane, generation, revision, attempt + 1);
-                        let sender = context.sender();
-                        let retry = next.clone();
-                        let queued = input.request_focus_result(move |r| {
-                            if attempt < 4 && !r.unwrap_or(false) {
-                                sender.send(Message::Files(retry.clone()));
-                            }
-                        });
-                        if !queued && attempt < 4 {
-                            context.spawn_background(move |_| {
-                                std::thread::sleep(Duration::from_millis(20));
-                                Message::Files(next)
-                            });
-                        }
+                        focus_file_input(input, attempt, next, context);
                     }
                 }
                 Filter(_, _, _, query) => {
@@ -3245,7 +3388,7 @@ impl TerminalApp {
                     if !may_open_dialog {
                         return Ok(());
                     }
-                    files.begin_verified_download(entry, String::new())?;
+                    files.begin_verified_download(FileTarget::Listed(entry), String::new())?;
                 }
                 Delete(_, _, entry) if may_open_dialog => {
                     files.check_selected(&entry)?;
@@ -3342,7 +3485,9 @@ impl TerminalApp {
                     if !may_open_dialog
                         || (matches!(
                             picker,
-                            TransferPicker::DownloadMarked | TransferPicker::DownloadSearch(..)
+                            TransferPicker::DownloadMarked
+                                | TransferPicker::DownloadSearch(_)
+                                | TransferPicker::Download(FileTarget::Search(..), _)
                         ) && files.busy())
                         || revision != files.listing_revision
                         || files.bookmarks.is_some()
@@ -3397,6 +3542,7 @@ impl TerminalApp {
             if drawer_was_open != tab.files.open
                 || dialog_was_open != tab.files.entry_dialog_open()
                 || was_editing != tab.files.filter_editing()
+                || search_before != tab.files.search_serial()
             {
                 self.connection_ui(id);
             }
@@ -3516,7 +3662,7 @@ impl TerminalApp {
                         pane,
                         generation,
                         serial,
-                        TransferPicker::Download(entry, None),
+                        TransferPicker::Download(FileTarget::Listed(entry), None),
                         Ok(vec![local.join("download.bin")]),
                     ),
                     context,
@@ -4780,7 +4926,11 @@ mod tests {
         };
         let entry = list(&mut drawer, "report files", directory);
         let (op, status) = drawer
-            .download_operation(&entry, destination.clone(), None)
+            .download_operation(
+                &FileTarget::Listed(entry.clone()),
+                destination.clone(),
+                None,
+            )
             .unwrap();
         assert!(matches!(op, Operation::GetDir {remote, local, ..}
             if remote == "/srv/report files" && local == destination.join("report files")));
@@ -4806,11 +4956,15 @@ mod tests {
         );
         assert!(
             drawer
-                .download_operation(&entry, destination.clone(), None)
+                .download_operation(
+                    &FileTarget::Listed(entry.clone()),
+                    destination.clone(),
+                    None
+                )
                 .is_err()
         );
         let (op, _) = drawer
-            .download_operation(&file, destination.clone(), None)
+            .download_operation(&FileTarget::Listed(file), destination.clone(), None)
             .unwrap();
         assert!(
             matches!(op, Operation::Get { overwrite: true, local, .. } if local == destination)
@@ -4819,7 +4973,11 @@ mod tests {
             let entry = list(&mut drawer, name, directory);
             assert!(
                 drawer
-                    .download_operation(&entry, destination.clone(), None)
+                    .download_operation(
+                        &FileTarget::Listed(entry.clone()),
+                        destination.clone(),
+                        None
+                    )
                     .is_err()
             );
         }

@@ -15,7 +15,9 @@ $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $picker = Join-Path $State 'picker'
 $env:W11TERM_SFTP_PICKER_SMOKE_DIR = $picker
 $null = New-Item -ItemType Directory -Path (Join-Path $picker 'received')
-$readGate = Join-Path ([IO.File]::ReadAllText((Join-Path $State 'fixture-root'))) 'hold-transfer-read'
+$peerRoot = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
+$readGate = Join-Path $peerRoot 'hold-transfer-read'
+$refreshGate = Join-Path $peerRoot 'hold-opendir'
 $profiles = Join-Path $State 'profiles.json'
 $parent = '/shell directory'
 # Windows PowerShell 5.1 also reads this fixture on non-UTF-8 code pages.
@@ -39,6 +41,40 @@ function Click([string]$Name) {
 }
 function Filter-Edit {
     Find-Element 'Filter filenames' ([System.Windows.Automation.ControlType]::Edit)
+}
+function Wait-FilenameSearchFocus {
+    Wait-Until 'focused recursive filename field' {
+        $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+        if ($query -and $query.Current.HasKeyboardFocus) { $query }
+    }
+}
+function Focus-FilenameSearch {
+    $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $query.SetFocus()
+    $null = Wait-FilenameSearchFocus
+}
+function Set-ResultType([string]$Name) {
+    $controlType = [System.Windows.Automation.ControlType]::ComboBox
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selector = Wait-Until 'enabled search result type selector' {
+        $box = Find-Element 'Search result type' $controlType
+        if ($box -and $box.Current.IsEnabled) { $box }
+    }
+    $selector.GetCurrentPattern($expand).Expand()
+    $choice = Wait-Until "search result type '$Name'" {
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $popup = Wait-Until "selected search result type '$Name'" {
+        $box = Find-Element 'Search result type' $controlType
+        if ($box) {
+            $selected = $box.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            if ($selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Name) {
+                $box.GetCurrentPattern($expand)
+            }
+        }
+    }
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 function Check-PathCopy([string]$ButtonName, [string]$Expected) {
     $control = Wait-Until "available '$ButtonName' command" {
@@ -76,11 +112,32 @@ function Set-Filter([string]$Text) {
 }
 function Save-SearchResult([string]$Result, [string]$Destination) {
     Click $Result
+    Set-DownloadDestination $Destination
+}
+function Set-DownloadDestination([string]$Destination) {
     $dialog = Wait-Until 'owned download save dialog from the result' { Find-OwnedDialog 'Save As' }
     $null = Wait-Until 'enter download destination' {
         [FixtureDialog]::SetFilename($dialog, $Destination, 'nested-content.txt')
     }
     $null = Wait-Until 'accept download destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+function Save-MarkedResults([string]$Destination) {
+    Click 'Download marked results'
+    $dialog = Wait-Until 'destination picker for marked search results' {
+        Find-OwnedDialog 'Download marked search results'
+    }
+    $null = Wait-Until 'choose the new download folder name' {
+        [FixtureDialog]::SetFilename($dialog, $Destination, 'Search results')
+    }
+    $null = Wait-Until 'start marked search download' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+function Read-SearchProperties([string]$Path, [string]$Type) {
+    Click "Properties $Path"
+    $field = Wait-Until 'fresh Properties from the search result' { Find-Element 'File properties' }
+    $text = $field.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+    if ($text -cnotlike "*Path  $Path*" -or $text -cnotlike "*Type  $Type*") {
+        throw "Unexpected properties for $Path. $text"
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -162,11 +219,42 @@ try {
     Click 'Back'
     $null = Wait-Until 'parent directory restored' { Find-Element $parent }
     Click ('Find files' + [char]0x2026)
-    $field = Wait-Until 'recursive filename search field' {
-        Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $field = Wait-FilenameSearchFocus
+    Set-ResultType 'Folders'
+    $null = Wait-Until 'type-only search enabled' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
     }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('NESTED')
+    Focus-FilenameSearch
+    $null = Press-FocusedKey 13
+    $null = Wait-Until 'folder-only search omits files and still sees nested content' {
+        (Find-Element '1 matches in 2 folders') -and (Button "Reveal $parent/nested") -and
+            !(Button "Reveal $parent/nested/nested-content.txt")
+    }
+    Set-ResultType 'All types'
+    $on = [System.Windows.Automation.ToggleState]::On
+    $off = [System.Windows.Automation.ToggleState]::Off
+    (Wait-CheckBox 'Regex' $off).Toggle()
+    (Wait-CheckBox 'Match case' $off).Toggle()
+    $null = Wait-CheckBox 'Regex' $on
+    $null = Wait-CheckBox 'Match case' $on
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern($value).SetValue('(')
     Click 'Search'
+    $searchView = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $searchStatus = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-search-status')
+    $null = Wait-Until 'invalid filename regex reported' {
+        $status = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $searchStatus)
+        $status -and $status.Current.Name.Contains('Invalid filename regex')
+    }
+    $pattern = '^nested(?:-(?:added|content)\.txt)?$|^BUILD-00\.log$'
+    $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern($value).SetValue($pattern)
+    Click 'Search'
+    Read-SearchProperties "$parent/nested" 'Directory'
+    Click 'Close properties'
     $fileResult = "Download $parent/nested/nested-content.txt"
     $destination = Join-Path $picker 'from-search.txt'
     [IO.File]::WriteAllBytes($readGate, [byte[]]@())
@@ -184,12 +272,32 @@ try {
         !(Button 'Cancel transfer') -and ![IO.File]::Exists($destination) -and
             (Button $fileResult).Current.IsEnabled
     }
-    Save-SearchResult $fileResult $destination
     $contents = 'f' * 70000
-    $null = Wait-Until 'file downloaded with search results still shown' {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $expectedDigest = -join ($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($contents)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $hasher.Dispose() }
+    Read-SearchProperties "$parent/nested/nested-content.txt" 'Regular file'
+    Click 'Calculate SHA-256'
+    $digest = Wait-Until 'SHA-256 from search result Properties' { Find-Element 'SHA-256 digest' }
+    if ($digest.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1).Trim() -cne $expectedDigest) {
+        throw 'Properties hashed the wrong search result'
+    }
+    Click 'Use for verified download'
+    $field = Wait-Until 'prefilled digest' { Find-Element 'Expected SHA-256' }
+    if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne $expectedDigest) {
+        throw 'Verified download did not reuse the search result digest'
+    }
+    Click 'Choose destination'
+    Set-DownloadDestination $destination
+    $null = Wait-Until 'verified file downloaded with search results still shown' {
         [IO.File]::Exists($destination) -and
             [IO.File]::ReadAllText($destination) -ceq $contents -and
             (Button "Reveal $parent/nested/nested-content.txt") -and (Button $fileResult).Current.IsEnabled
+    }
+    $null = Wait-Until 'verified search transfer recorded' {
+        $events = (Control @('events','--pane',"$remote",'--since','0','--timeout','0')).journal.events
+        $events | Where-Object { $_.kind -ceq 'sftp-transfer' -and
+            $_.data.outcome -ceq 'completed' -and $_.data.message -clike '*SHA-256 verified*' }
     }
     Click "Download $parent/nested"
     $dialog = Wait-Until 'owned folder picker from the result' {
@@ -203,26 +311,91 @@ try {
             [IO.File]::ReadAllText($folderItem) -ceq $contents -and
             (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled
     }
+    Click ('Select downloads' + [char]0x2026)
+    (Wait-CheckBox "Mark $parent/nested/nested-content.txt" $off).Toggle()
+    (Wait-CheckBox "Mark $parent/nested" $off).Toggle()
     Click "Reveal $parent/nested/nested-content.txt"
     $null = Wait-Until 'search result shown and selected in its containing folder' {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
     Click 'Back to search results'
+    $null = Wait-FilenameSearchFocus
     $field = Wait-Until 'original search restored with both matches' {
         $edit = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
         if ($edit -and (Button "Reveal $parent/nested") -and (Button "Reveal $parent/nested/nested-content.txt")) {
             $edit
         }
     }
-    if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'NESTED') {
+    if ($field.GetCurrentPattern($value).Current.Value -cne $pattern) {
         throw 'Returning to results changed the search query'
     }
+    $null = Wait-CheckBox 'Regex' $on
+    $null = Wait-CheckBox 'Match case' $on
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    $null = Wait-CheckBox "Mark $parent/nested" $on
     Check-PathCopy "Copy path $parent/nested/nested-content.txt" "$parent/nested/nested-content.txt"
     Check-PathCopy 'Copy all paths' "$parent/nested`r`n$parent/nested/nested-content.txt"
     $null = Wait-Until 'result summary and copy confirmation share the panel' {
         (Find-Element '2 matches in 2 folders') -and (Find-Element 'Copied 2 paths')
     }
-    Click 'Back to files'
+    [IO.File]::WriteAllText((Join-Path $peerRoot 'shell directory/nested-added.txt'), 'added after search')
+    [IO.File]::WriteAllText($refreshGate, $parent)
+    Click 'Refresh results'
+    $null = Wait-Until 'previous search results visible with actions disabled during refresh' {
+        $downloadMarked = Button 'Download marked results'
+        (Test-Path -LiteralPath (Join-Path $peerRoot 'opendir-paused')) -and
+            (Button "Reveal $parent/nested/nested-content.txt") -and
+            $downloadMarked -and !$downloadMarked.Current.IsEnabled
+    }
+    Click 'Cancel search'
+    $null = Wait-Until 'refresh cancellation requested' {
+        $cancel = Button 'Cancel search'
+        $cancel -and !$cancel.Current.IsEnabled
+    }
+    [IO.File]::Delete($refreshGate)
+    $null = Wait-Until 'cancelled refresh keeps the original results' {
+        (Find-Element 'Refresh cancelled. Showing previous results.') -and
+            (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled -and
+            !(Button "Reveal $parent/nested-added.txt")
+    }
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    Click 'Refresh results'
+    $null = Wait-Until 'refresh includes the new unmarked result' {
+        (Find-Element '3 matches in 2 folders') -and (Button "Reveal $parent/nested-added.txt")
+    }
+    $null = Wait-CheckBox "Mark $parent/nested-added.txt" $off
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    $null = Wait-CheckBox "Mark $parent/nested" $on
+    $cancelled = Join-Path $picker 'cancelled search batch'
+    [IO.File]::WriteAllBytes($readGate, [byte[]]@())
+    Save-MarkedResults $cancelled
+    $null = Wait-Until 'marked search download stages bytes before publication' {
+        (Find-Element '32768 bytes') -and (Button 'Cancel transfer').Current.IsEnabled
+    }
+    if ([IO.Directory]::Exists($cancelled)) { throw 'Batch published before its transfer finished' }
+    Click 'Cancel transfer'
+    $null = Wait-Until 'marked search download is cancelling' {
+        $cancel = Button 'Cancel transfer'
+        $cancel -and !$cancel.Current.IsEnabled
+    }
+    [IO.File]::Delete($readGate)
+    $null = Wait-Until 'cancelled search batch cleans up its own staging directory' {
+        !(Button 'Cancel transfer') -and ![IO.Directory]::Exists($cancelled) -and
+            [IO.Directory]::GetDirectories($picker, '.w11term-download-*').Count -eq 0
+    }
+    $null = Wait-CheckBox "Mark $parent/nested" $on
+    $batch = Join-Path $picker 'marked search batch'
+    Save-MarkedResults $batch
+    $batchFile = Join-Path $batch 'nested/nested-content.txt'
+    $null = Wait-Until 'marked search download publishes the selected tree' {
+        [IO.File]::Exists($batchFile) -and [IO.File]::ReadAllText($batchFile) -ceq $contents -and
+            (Button 'Download marked results').Current.IsEnabled
+    }
+    if ([IO.Directory]::GetFileSystemEntries($batch).Count -ne 1) {
+        throw 'Batch downloaded something outside the marked folder'
+    }
+    Focus-FilenameSearch
+    $null = Press-FocusedKey 27
     $null = Wait-Until 'listing remains at the revealed file after leaving the results' {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
@@ -232,6 +405,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','filter-ssh-ready')
 } finally {
     [IO.File]::Delete($readGate)
+    [IO.File]::Delete($refreshGate)
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

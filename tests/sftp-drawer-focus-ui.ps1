@@ -28,6 +28,13 @@ function Select-Row([string]$Name, [bool]$Directory, [string]$ExpectedWire) {
         (Find-Element 'Open folder' $button).Current.IsEnabled -eq $Directory -and (Find-Element $download $button).Current.IsEnabled -ne $Directory
     }
 }
+function Focus-TerminalCanvas {
+    $request = Join-Path $State 'double-click'
+    $pending = Join-Path $State 'double-click.tmp'
+    [IO.File]::WriteAllText($pending,'ready')
+    [IO.File]::Move($pending,$request)
+    $null = Wait-Until 'click on the terminal canvas' { !(Test-Path -LiteralPath $request) }
+}
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -46,15 +53,24 @@ try {
     $null = Press-FocusedKey 0x1b
     $null = Wait-Until 'command palette closed' { !(Find-Element 'Search commands') }
     Focus-Row 'note.txt'
-    $request = Join-Path $State 'double-click'
-    $pending = Join-Path $State 'double-click.tmp'
-    [IO.File]::WriteAllText($pending,'ready')
-    [IO.File]::Move($pending,$request)
-    $null = Wait-Until 'click on the terminal canvas' { !(Test-Path -LiteralPath $request) }
+    Focus-TerminalCanvas
     foreach ($ch in 'canvas-typed'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','canvas-typed')
     Select-Row 'projects/' $true 'canvas-typed'
     Select-Row 'note.txt' $false 'canvas-typed'
+
+    Invoke-Button (Wait-Until 'Find files button' { Find-Element ('Find files' + [char]0x2026) $button })
+    $null = Wait-Until 'focused file search query' {
+        $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+        $query -and $query.Current.HasKeyboardFocus
+    }
+    Focus-TerminalCanvas
+    foreach ($ch in 'search-canvas-typed'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
+    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','search-canvas-typed')
+    $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    if (!$query -or $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne '') {
+        throw 'Returning to the terminal changed or closed the search'
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

@@ -3012,8 +3012,9 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
         }
     }
     // Each listing returns one entry per READDIR plus EOF. Filtering reads no
-    // directory pages. Recursive search reads the root and its child once each.
-    // Direct file download keeps those results and the folder download lists its own tree.
+    // directory pages. Each recursive search reads the root and child once.
+    // Each download of a marked folder lists its subtree once. Selecting a
+    // descendant as well does not start a separate operation for that entry.
     assert_eq!(
         listings,
         [
@@ -3023,7 +3024,14 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory", fillers + 5),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
+            ("/shell directory/nested", 2),
+            ("/shell directory/nested", 2),
+            ("/shell directory", 0), // Cancelled in OPENDIR before reading a page.
+            ("/shell directory", fillers + 6), // The refresh sees a newly added file.
+            ("/shell directory/nested", 2),
+            ("/shell directory/nested", 1), // Cancelled during the first page.
             ("/shell directory/nested", 2),
         ]
     );
@@ -3174,7 +3182,10 @@ async fn native_sftp_file_rows_own_keyboard_focus_until_the_canvas_is_clicked() 
     )
     .unwrap();
     drive_mixed_gui("sftp-drawer-focus-ui.ps1", &ssh, state.path());
-    assert_eq!(fs::read(keyboard).unwrap(), b"canvas-typed");
+    assert_eq!(
+        fs::read(keyboard).unwrap(),
+        b"canvas-typedsearch-canvas-typed"
+    );
     assert_eq!(channels.load(Ordering::Relaxed), 2);
     server.abort();
 }
@@ -3721,7 +3732,7 @@ async fn native_pane_picker_routes_keys_across_tabs_and_restores_focus_on_escape
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens a new PTY in a bookmarked SFTP directory through the native drawer"]
+#[ignore = "opens new PTYs from an SFTP bookmark and a recursive search result through the native drawer"]
 async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_transport() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, channels, server) =
@@ -3749,21 +3760,29 @@ async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_t
     assert_eq!(accepted.load(Ordering::Relaxed), 1, "SSH transports");
     assert_eq!(
         channels.load(Ordering::Relaxed),
-        3,
-        "two PTYs and one SFTP subsystem"
+        4,
+        "three PTYs and one SFTP subsystem"
     );
     let users = fs::read_to_string(remote.path().join("authenticated-users")).unwrap();
     assert_eq!(users.lines().collect::<Vec<_>>(), ["test"]);
     let exec = fs::read_to_string(remote.path().join("workspace-exec.bin")).unwrap();
-    let expected = w11term::workspace::SshStartup::new(&ssh, "/Pilot's Work".into(), String::new())
-        .unwrap()
-        .exec_request();
+    let expected: String = ["/Pilot's Work", "/Pilot's Work/deeper"]
+        .into_iter()
+        .map(|path| {
+            w11term::workspace::SshStartup::new(&ssh, path.into(), String::new())
+                .unwrap()
+                .exec_request()
+        })
+        .collect();
     assert_eq!(exec, expected);
     let trace = fs::read_to_string(remote.path().join("pty-trace")).unwrap();
     let ptys: Vec<_> = trace.lines().collect();
-    assert_eq!(ptys.len(), 2);
-    assert_ne!(ptys[0], ptys[1]);
-    assert_eq!(fs::read_dir(&inputs).unwrap().count(), 2);
+    assert_eq!(ptys.len(), 3);
+    assert_eq!(
+        ptys.iter().collect::<std::collections::HashSet<_>>().len(),
+        3
+    );
+    assert_eq!(fs::read_dir(&inputs).unwrap().count(), 3);
     assert_eq!(
         fs::read_to_string(inputs.join(ptys[0])).unwrap(),
         "parent-live"
@@ -3771,6 +3790,10 @@ async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_t
     assert_eq!(
         fs::read_to_string(inputs.join(ptys[1])).unwrap(),
         "child-live"
+    );
+    assert_eq!(
+        fs::read_to_string(inputs.join(ptys[2])).unwrap(),
+        "search-child-live"
     );
     server.abort();
 }
@@ -3856,7 +3879,7 @@ async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "edits UTF-8 text in the SFTP drawer and saves a conflicting draft under a new name"]
+#[ignore = "edits UTF-8 text from the SFTP listing and search, and preserves conflicting drafts"]
 async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
         unreachable!()
@@ -3866,6 +3889,9 @@ async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() 
     let source = folder.join("pilot 雪.ini");
     let original = "\u{feff}pilot=one\r\nspeed=slow\nlabel=雪";
     fs::write(&source, original.as_bytes()).unwrap();
+    let generated = folder.join("generated");
+    fs::create_dir(&generated).unwrap();
+    fs::write(generated.join("pilot 雪.ini"), original.as_bytes()).unwrap();
     fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
     let keys = remote.path().join("keyboard-input.bin");
     fs::write(&keys, []).unwrap();
@@ -3885,8 +3911,13 @@ async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() 
         "\u{feff}pilot=two\r\nspeed=fast\nlabel=雪".as_bytes()
     );
     assert_eq!(
+        fs::read(generated.join("pilot 雪.ini")).unwrap(),
+        "\u{feff}pilot=one\r\nspeed=fast\nlabel=雪".as_bytes()
+    );
+    assert_eq!(fs::read_dir(&generated).unwrap().count(), 1);
+    assert_eq!(
         fs::read_dir(&folder).unwrap().count(),
-        2,
+        3,
         "editor left staging files behind"
     );
     assert_eq!(fs::read(keys).unwrap(), b"after-editor");
