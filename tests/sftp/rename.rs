@@ -10,6 +10,14 @@ fn rename(from: &str, to: &str) -> Operation {
     }
 }
 
+fn move_entry(from: &str, directory: &str, kind: w11term::sftp::EntryKind) -> Operation {
+    Operation::MoveEntry {
+        from: from.into(),
+        directory: directory.into(),
+        kind: Some(kind),
+    }
+}
+
 fn trace(root: &std::path::Path) -> Vec<[String; 2]> {
     mutation_trace(root, "rename-trace.jsonl")
 }
@@ -191,8 +199,106 @@ async fn drawer_rename_names_the_link_itself_and_refuses_a_dangling_destination(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drawer_move_checks_both_folders_and_preserves_the_entry_name() {
+    use w11term::sftp::EntryKind::{Directory, File, Symlink};
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let root = remote.path();
+    let generation = pane.frames.load().connection_generation;
+    let approved = Some(generation);
+    let channels = opens.load(Ordering::Relaxed);
+    fs::write(root.join("rename-trace.jsonl"), []).unwrap();
+    fs::create_dir_all(root.join("from/tree/child")).unwrap();
+    fs::create_dir(root.join("to folder")).unwrap();
+    fs::write(root.join("from/entry"), b"original").unwrap();
+    fs::write(root.join("to folder/entry"), b"collision").unwrap();
+    directory_junction(&root.join("from"), "link", "tree");
+
+    let move_file = |directory| move_entry("/from/entry", directory, File);
+    for expected in [None, Some(generation + 1)] {
+        let error = run(&pane, expected, move_file("/to folder"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("not started"), "{error}");
+        assert_eq!(opens.load(Ordering::Relaxed), channels);
+    }
+    for (operation, expected) in [
+        (move_file("/from"), "different destination folder"),
+        (move_file("/from/entry"), "not a folder"),
+        (move_file("/absent"), "check the destination folder"),
+        (move_file("/to folder"), "already exists"),
+        (
+            move_entry("/from/entry", "/to folder", Directory),
+            "entry type changed",
+        ),
+        (
+            move_entry("/from/tree", "/from/tree/child", Directory),
+            "descendants",
+        ),
+    ] {
+        let error = run(&pane, approved, operation).await.unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
+    assert!(trace(root).is_empty());
+    assert_eq!(fs::read(root.join("from/entry")).unwrap(), b"original");
+    assert_eq!(
+        fs::read(root.join("to folder/entry")).unwrap(),
+        b"collision"
+    );
+    fs::remove_file(root.join("to folder/entry")).unwrap();
+
+    fs::write(root.join("race-next-rename"), []).unwrap();
+    let error = run(&pane, approved, move_file("/to folder"))
+        .await
+        .unwrap_err();
+    assert!(!error.contains("unknown"), "{error}");
+    assert_eq!(fs::read(root.join("from/entry")).unwrap(), b"original");
+    assert_eq!(
+        fs::read(root.join("to folder/entry")).unwrap(),
+        b"racing entry"
+    );
+    fs::remove_file(root.join("to folder/entry")).unwrap();
+    let moved = run(&pane, approved, move_file("/to folder")).await.unwrap();
+    assert_eq!(moved["directory"], "/to folder");
+    assert!(!root.join("from/entry").exists());
+    assert_eq!(fs::read(root.join("to folder/entry")).unwrap(), b"original");
+
+    run(
+        &pane,
+        approved,
+        move_entry("/from/link", "/to folder", Symlink),
+    )
+    .await
+    .unwrap();
+    assert!(
+        fs::symlink_metadata(root.join("to folder/link"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(root.join("from/tree/child").is_dir());
+    run(
+        &pane,
+        approved,
+        move_entry("/from/tree", "/to folder", Directory),
+    )
+    .await
+    .unwrap();
+    assert!(root.join("to folder/tree/child").is_dir());
+    assert!(!root.join("from/tree").exists());
+    assert_eq!(
+        trace(root),
+        [
+            ["/from/entry", "/to folder/entry"],
+            ["/from/entry", "/to folder/entry"],
+            ["/from/link", "/to folder/link"],
+            ["/from/tree", "/to folder/tree"],
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drawer_rename_connection_loss_distinguishes_preflight_from_unacknowledged_mutation() {
-    for dispatched in [false, true] {
+    for (moving, dispatched) in [(false, false), (false, true), (true, false), (true, true)] {
         let (Source::Ssh(mut ssh), remote, _, server) = fixture_connections(false, 2).await else {
             unreachable!()
         };
@@ -200,6 +306,16 @@ async fn drawer_rename_connection_loss_distinguishes_preflight_from_unacknowledg
         ssh.player.reconnect = true;
         fs::write(root.join("rename-trace.jsonl"), []).unwrap();
         fs::write(root.join("source"), b"original").unwrap();
+        let (operation, target, verb) = if moving {
+            fs::create_dir(root.join("dest")).unwrap();
+            (
+                move_entry("/source", "/dest", w11term::sftp::EntryKind::File),
+                "dest/source",
+                "Move",
+            )
+        } else {
+            (rename("/source", "/target"), "target", "Rename")
+        };
         fs::write(
             root.join(if dispatched {
                 "disconnect-after-rename"
@@ -210,6 +326,7 @@ async fn drawer_rename_connection_loss_distinguishes_preflight_from_unacknowledg
         )
         .unwrap();
         let pane = Session::start(Source::Ssh(ssh));
+        let mut operation = Some(operation);
         for generation in [1, 2] {
             tokio::time::timeout(Duration::from_secs(8), async {
                 while pane.frames.load().connection_generation != generation {
@@ -219,14 +336,18 @@ async fn drawer_rename_connection_loss_distinguishes_preflight_from_unacknowledg
             .await
             .unwrap();
             if generation == 1 {
-                let error = run(&pane, Some(1), rename("/source", "/target"))
+                let error = run(&pane, Some(1), operation.take().unwrap())
                     .await
                     .unwrap_err();
                 if dispatched {
-                    assert!(error.contains("Rename outcome unknown"), "{error}");
+                    assert!(
+                        error.contains(&format!("{verb} outcome unknown")),
+                        "{error}"
+                    );
                 } else {
                     assert!(
-                        error.contains("Rename was not started") && !error.contains("unknown"),
+                        error.contains(&format!("{verb} was not started"))
+                            && !error.contains("unknown"),
                         "{error}"
                     );
                 }
@@ -234,12 +355,12 @@ async fn drawer_rename_connection_loss_distinguishes_preflight_from_unacknowledg
         }
         assert_eq!(trace(root).len(), usize::from(dispatched));
         assert_eq!(
-            fs::read(root.join(if dispatched { "target" } else { "source" })).unwrap(),
+            fs::read(root.join(if dispatched { target } else { "source" })).unwrap(),
             b"original"
         );
         assert!(
             !root
-                .join(if dispatched { "source" } else { "target" })
+                .join(if dispatched { "source" } else { target })
                 .exists()
         );
         drop(pane);

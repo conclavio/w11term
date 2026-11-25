@@ -758,6 +758,52 @@ try {
     $null = Wait-Until 'listing remains at the revealed file after leaving the results' {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
+    $move = 'Move to folder' + [char]0x2026
+    $movedFile = Join-Path $peerRoot 'shell directory/nested-content.txt'
+    Click $move
+    $destination = Wait-Until 'the listed move shows the source and destination editor' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($field -and (Find-Element 'Remote move source')) { $field }
+    }
+    $destination.GetCurrentPattern($value).SetValue($parent)
+    Click 'Move'
+    $null = Wait-Until 'the source listing refreshes without the moved entry' {
+        (Find-Element "Moved nested-content.txt to $parent") -and !(Button 'nested-content.txt') -and
+            [IO.File]::Exists($movedFile) -and ![IO.File]::Exists($fixtureText) -and
+            (Button 'Up').Current.IsEnabled
+    }
+    Click ('Go to folder' + [char]0x2026)
+    $folderPath = Wait-Until 'the folder navigation dialog accepts a path' {
+        Find-Element 'Remote folder path' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $folderPath.GetCurrentPattern($value).SetValue($parent)
+    Click 'Open'
+    $null = Wait-Until 'the destination listing is ready' {
+        (Find-Element $parent) -and (Button $filterAction).Current.IsEnabled
+    }
+    Click $filterAction
+    $listingFilter = Wait-Until 'the destination filename filter is available' { Filter-Edit }
+    $listingFilter.GetCurrentPattern($value).SetValue('nested-content.txt')
+    $null = Wait-Until 'the destination listing contains the moved entry on a later page' { Button 'nested-content.txt' }
+    Click 'Clear filter'
+    Click ('Find files' + [char]0x2026)
+    $field = Wait-FilenameSearchFocus
+    $field.GetCurrentPattern($value).SetValue('nested-content.txt')
+    Click 'Search'
+    Click "Move to folder $parent/nested-content.txt"
+    $destination = Wait-Until 'the search result offers its own destination editor' {
+        Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $destination.GetCurrentPattern($value).SetValue('nested')
+    Click 'Move'
+    $null = Wait-Until 'the running search follows the entry to its new path' {
+        (Find-Element "Moved nested-content.txt to $parent/nested. 1 matches in 2 folders") -and
+            (Button "Reveal $parent/nested/nested-content.txt") -and !(Button "Reveal $parent/nested-content.txt") -and
+            [IO.File]::Exists($fixtureText) -and ![IO.File]::Exists($movedFile)
+    }
+    if ([IO.File]::ReadAllText($fixtureText) -cne $contents) {
+        throw 'Moving the entry changed its contents'
+    }
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
