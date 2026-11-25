@@ -103,12 +103,28 @@ struct JsonReport<'a> {
     current: Root<'a>,
     counts: Counts,
     differences: Vec<Difference<'a>>,
+    file_verifications: Vec<FileVerification<'a>>,
+}
+
+#[derive(Serialize)]
+struct FileVerification<'a> {
+    path: &'a str,
+    result: &'static str,
+    completed_at_unix_seconds: Option<u64>,
+    reference_sha256: &'a str,
+    current_sha256: &'a str,
+}
+
+struct CapturedReport {
+    report: Arc<FolderComparison>,
+    checks: Arc<verify::Checks>,
 }
 
 fn write_report(
     file: impl Write,
     endpoint: Endpoint<'_>,
     report: &FolderComparison,
+    checks: &verify::Checks,
 ) -> io::Result<()> {
     let report = JsonReport {
         schema_version: 1,
@@ -133,6 +149,20 @@ fn write_report(
             matching: report.matching,
         },
         differences: report.differences.iter().map(Difference::from).collect(),
+        file_verifications: checks
+            .iter()
+            .map(|(path, check)| FileVerification {
+                path,
+                result: if check.digests.contents_match() {
+                    "match"
+                } else {
+                    "different"
+                },
+                completed_at_unix_seconds: check.completed_at_unix_seconds,
+                reference_sha256: &check.digests.reference_sha256,
+                current_sha256: &check.digests.current_sha256,
+            })
+            .collect(),
     };
     let mut output = io::BufWriter::new(file);
     serde_json::to_writer_pretty(&mut output, &report)?;
@@ -141,19 +171,23 @@ fn write_report(
 }
 
 impl FileDrawer {
-    fn captured_for_export(&self, target: FolderComparisonTarget) -> Option<Arc<FolderComparison>> {
+    fn captured_for_export(&self, target: FolderComparisonTarget) -> Option<CapturedReport> {
         let panel = self.folder_report.as_ref()?;
         if !self.open
             || self.generation != target.generation
             || panel.serial != target.serial
             || panel.revision != target.revision
+            || panel.verification.open
         {
             return None;
         }
         let State::Loaded(Ok(Report::Comparison(report))) = &panel.state else {
             return None;
         };
-        Some(report.clone())
+        Some(CapturedReport {
+            report: report.clone(),
+            checks: panel.verification.checks.clone(),
+        })
     }
 }
 
@@ -182,7 +216,7 @@ impl TerminalApp {
         let Source::Ssh(ssh) = &tab.source else {
             return;
         };
-        let Some(report) = tab.files.captured_for_export(target) else {
+        let Some(captured) = tab.files.captured_for_export(target) else {
             return;
         };
         let (host, port, user) = (ssh.host.clone(), ssh.port, ssh.user.clone());
@@ -196,7 +230,8 @@ impl TerminalApp {
                         port,
                         user: &user,
                     },
-                    &report,
+                    &captured.report,
+                    &captured.checks,
                 )
             },
             context,
@@ -208,6 +243,7 @@ impl TerminalApp {
 mod tests {
     use super::*;
     use serde_json::json;
+    use w11term::sftp::VerifiedFolderFile;
 
     fn report() -> FolderComparison {
         FolderComparison {
@@ -234,6 +270,16 @@ mod tests {
     #[test]
     fn json_preserves_origin_unicode_and_absent_metadata() {
         let mut bytes = Vec::new();
+        let checks = verify::Checks::from([(
+            "docs/check.txt".into(),
+            verify::CompletedCheck {
+                completed_at_unix_seconds: Some(1_700_000_010),
+                digests: VerifiedFolderFile {
+                    reference_sha256: "a".repeat(64),
+                    current_sha256: "b".repeat(64),
+                },
+            },
+        )]);
         write_report(
             &mut bytes,
             Endpoint {
@@ -242,6 +288,7 @@ mod tests {
                 user: "ops",
             },
             &report(),
+            &checks,
         )
         .unwrap();
         let data: Value = serde_json::from_slice(&bytes).unwrap();
@@ -260,6 +307,14 @@ mod tests {
         );
         assert_eq!(data["counts"]["matching"], 4);
         assert_eq!(data["counts"]["reference_only"], 1);
+        assert_eq!(
+            data["file_verifications"],
+            json!([{
+                "path":"docs/check.txt", "result":"different",
+                "completed_at_unix_seconds":1_700_000_010,
+                "reference_sha256":"a".repeat(64), "current_sha256":"b".repeat(64),
+            }])
+        );
         assert_eq!(
             data["differences"],
             json!([{
@@ -288,14 +343,14 @@ mod tests {
             revision: 0,
         };
         let captured = files.captured_for_export(target).unwrap();
-        assert!(Arc::ptr_eq(&captured, &original));
+        assert!(Arc::ptr_eq(&captured.report, &original));
         let panel = files.folder_report.as_mut().unwrap();
         panel.revision += 1;
         let mut replacement = report();
         replacement.current_root = "/replacement".into();
         panel.state = State::Loaded(Ok(Report::Comparison(Arc::new(replacement))));
         assert!(files.captured_for_export(target).is_none());
-        assert_eq!(captured.current_root, "/srv/site");
+        assert_eq!(captured.report.current_root, "/srv/site");
         files.generation += 1;
         assert!(
             files

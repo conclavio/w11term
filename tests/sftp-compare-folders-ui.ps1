@@ -48,6 +48,12 @@ function Select-DifferenceType([string]$Name) {
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 
+function File-Digest([string]$Path) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { -join ($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $hasher.Dispose() }
+}
+
 function Test-ComparisonExport {
     $save = 'Save comparison as JSON' + [char]0x2026
     $output = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'sftp-folder-comparison.json'
@@ -88,12 +94,18 @@ function Test-ComparisonExport {
     $report = $json | ConvertFrom-Json
     $modified = $report.differences | Where-Object path -ceq 'nested/data.txt'
     $later = $report.differences | Where-Object path -ceq 'bulk-239.txt'
+    $check = $report.file_verifications | Where-Object path -ceq 'same-metadata.txt'
+    $referenceHash = File-Digest (Join-Path $fixture 'shell directory/archive/same-metadata.txt')
+    $currentHash = File-Digest (Join-Path $fixture 'shell directory/live/same-metadata.txt')
     if ($report.schema_version -ne 1 -or $report.ssh.host -cne '127.0.0.1' -or $report.ssh.port -le 0 -or
         $report.ssh.user -cne 'test' -or $report.reference.path -cne $reference -or $report.reference.origin -cne 'remote' -or
         $report.current.path -cne $current -or $report.current.origin -cne 'remote' -or $report.differences.Count -ne 244 -or
         $report.counts.current_only -ne 241 -or $report.counts.needs_inspection -ne 1 -or
         $modified.change -cne 'metadata_changed' -or $modified.reference.size_bytes -ne 3 -or $modified.current.size_bytes -ne 8 -or
-        $later.change -cne 'current_only' -or $null -ne $later.reference -or $later.current.kind -cne 'file') {
+        $later.change -cne 'current_only' -or $null -ne $later.reference -or $later.current.kind -cne 'file' -or
+        $report.file_verifications.Count -ne 1 -or $check.result -cne 'different' -or
+        $check.completed_at_unix_seconds -le 0 -or $check.reference_sha256 -cne $referenceHash -or
+        $check.current_sha256 -cne $currentHash) {
         throw 'Export did not preserve the complete comparison and the pinned metadata'
     }
 }
@@ -151,8 +163,6 @@ try {
     }
     Set-Query ''
     Wait-Range 1 1 1
-    Test-ComparisonExport
-    Wait-Range 1 1 1
     Select-DifferenceType 'Files with matching metadata'
     $null = Wait-Until 'the matching-files view excludes the matching directory' {
         (Find-Element '1 file with matching metadata') -and
@@ -173,8 +183,10 @@ try {
     $null = Wait-Until 'return restores the matching-file filter and query' {
         $query = Find-Element 'Filter relative paths' $edit
         $query -and $query.GetCurrentPattern($value).Current.Value -ceq 'SAME-METADATA' -and
-            (Find-Element '1 file with matching metadata')
+            (Find-Element '1 file with matching metadata') -and
+            (Find-Element 'Last SHA-256 check found different contents')
     }
+    Test-ComparisonExport
     Set-Query ''
     Select-DifferenceType 'Needs inspection'
     Wait-Range 1 1 1
@@ -189,6 +201,11 @@ try {
         [IO.File]::Delete($hold)
     }
     Wait-Range 1 1 1
+    Select-DifferenceType 'Files with matching metadata'
+    $null = Wait-Until 'the refreshed report has a matching file' { Find-Element '1 file with matching metadata' }
+    if (Find-Element 'Last SHA-256 check found different contents') {
+        throw 'A prior check was carried into the refreshed report'
+    }
     Select-DifferenceType 'All differences'
     Wait-Range 1 40 244
     Set-Query 'removed.txt'

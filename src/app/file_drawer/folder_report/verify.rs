@@ -1,4 +1,8 @@
 use super::*;
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use w11term::sftp::{FILE_VERIFICATION_LIMIT, VerifiedFolderFile, valid_comparison_file_path};
 
 #[derive(Clone)]
@@ -17,6 +21,25 @@ pub(super) struct Verification {
     path: String,
     result: Option<Result<VerifiedFolderFile, String>>,
     cancel: Option<TransferCancel>,
+    pub(super) checks: Arc<Checks>,
+}
+
+pub(super) type Checks = BTreeMap<String, CompletedCheck>;
+
+#[derive(Clone)]
+pub(super) struct CompletedCheck {
+    pub(super) completed_at_unix_seconds: Option<u64>,
+    pub(super) digests: VerifiedFolderFile,
+}
+
+impl CompletedCheck {
+    pub(super) fn label(&self) -> &'static str {
+        if self.digests.contents_match() {
+            "Last SHA-256 check found matching contents"
+        } else {
+            "Last SHA-256 check found different contents"
+        }
+    }
 }
 
 impl Drop for Verification {
@@ -85,7 +108,7 @@ impl Verification {
         }
         match &self.result {
             Some(Ok(result)) => {
-                let status = if result.reference_sha256 == result.current_sha256 {
+                let status = if result.contents_match() {
                     "File contents match"
                 } else {
                     "File contents differ"
@@ -254,12 +277,95 @@ impl FileDrawer {
         };
         let stopped = cancel.is_cancelled();
         cancel.cancel();
-        view.result = Some(if stopped {
+        let result = if stopped {
             Err("File comparison cancelled".into())
         } else {
             reply
-                .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
+                .and_then(|value| {
+                    serde_json::from_value::<VerifiedFolderFile>(value)
+                        .map_err(|error| error.to_string())
+                })
                 .map_err(|error| format!("Could not compare file contents. {error}"))
+        };
+        if let Ok(digests) = &result {
+            Arc::make_mut(&mut view.checks).insert(
+                view.path.clone(),
+                CompletedCheck {
+                    completed_at_unix_seconds: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .map(|elapsed| elapsed.as_secs()),
+                    digests: digests.clone(),
+                },
+            );
+        }
+        view.result = Some(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_completed_checks_replace_results_and_refresh_starts_a_new_history() {
+        let reference = Arc::new(FolderInventory {
+            root: "/reference".into(),
+            origin: FolderOrigin::Remote,
+            entries: Default::default(),
         });
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 7,
+            directory: Some("/live".into()),
+            folder_reference: Some(reference),
+            ..Default::default()
+        };
+        let serial = drawer.begin_folder_report(Kind::Comparison, "/live".into());
+        let panel = drawer.folder_report.as_mut().unwrap();
+        panel.state = super::super::State::Loaded(Ok(Report::Comparison(Arc::new(
+            FolderComparison::default(),
+        ))));
+        panel.verification.path = "test.txt".into();
+        panel.verification.cancel = Some(TransferCancel::default());
+        let first = json!({"reference_sha256":"a", "current_sha256":"b"});
+        let second = json!({"reference_sha256":"a", "current_sha256":"a"});
+        drawer.finish_compared_verification(serial, Ok(first));
+        let saved = drawer
+            .folder_report
+            .as_ref()
+            .unwrap()
+            .verification
+            .checks
+            .clone();
+        assert!(!saved["test.txt"].digests.contents_match());
+
+        let cancel = TransferCancel::default();
+        cancel.cancel();
+        drawer.folder_report.as_mut().unwrap().verification.cancel = Some(cancel);
+        drawer.finish_compared_verification(serial, Ok(second.clone()));
+        let active = &drawer.folder_report.as_ref().unwrap().verification.checks;
+        assert!(Arc::ptr_eq(active, &saved));
+
+        drawer.folder_report.as_mut().unwrap().verification.cancel =
+            Some(TransferCancel::default());
+        drawer.finish_compared_verification(serial, Ok(second));
+        assert!(
+            drawer.folder_report.as_ref().unwrap().verification.checks["test.txt"]
+                .digests
+                .contents_match()
+        );
+        assert!(!saved["test.txt"].digests.contents_match());
+        assert!(drawer.refresh_folder_report(serial).is_some());
+        assert!(
+            drawer
+                .folder_report
+                .as_ref()
+                .unwrap()
+                .verification
+                .checks
+                .is_empty()
+        );
     }
 }

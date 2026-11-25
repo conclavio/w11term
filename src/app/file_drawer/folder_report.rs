@@ -304,6 +304,7 @@ impl Panel {
                     message,
                     self.revision,
                     !self.reveal.checking(),
+                    &self.verification.checks,
                 ));
                 if let Some(status) = self.reveal.text() {
                     rows.push(KeyedView::new(
@@ -551,6 +552,7 @@ impl FileDrawer {
             .operation(panel.directory.clone(), self.folder_reference.as_ref())?;
         panel.state = State::Loading;
         panel.reveal = reveal::State::default();
+        panel.verification = verify::Verification::default();
         panel.revision = panel.revision.wrapping_add(1);
         panel.cancel = TransferCancel::default();
         Some(operation)

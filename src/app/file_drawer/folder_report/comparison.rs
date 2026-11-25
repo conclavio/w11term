@@ -175,6 +175,7 @@ impl Browser {
         message: impl Fn(super::Action) -> Message + Copy + 'static,
         revision: u64,
         reveal_enabled: bool,
+        checks: &super::verify::Checks,
     ) -> Vec<KeyedView> {
         let mut rows = vec![
             KeyedView::new(
@@ -307,7 +308,8 @@ impl Browser {
                                 }))
                                 .content("Verify contents")
                         });
-                        Some(result_row(item, reveal, verify))
+                        let check = checks.get(item.path);
+                        Some(result_row(item, reveal, verify, check))
                     }),
                 )),
         ));
@@ -390,7 +392,12 @@ fn change_label(kind: Option<FolderChange>) -> &'static str {
     }
 }
 
-fn result_row(item: RowDetails<'_>, reveal: Option<View>, verify: Option<View>) -> KeyedView {
+fn result_row(
+    item: RowDetails<'_>,
+    reveal: Option<View>,
+    verify: Option<View>,
+    check: Option<&super::verify::CompletedCheck>,
+) -> KeyedView {
     let label = item
         .change
         .map_or("Matching metadata", |change| change_label(Some(change)));
@@ -410,9 +417,19 @@ fn result_row(item: RowDetails<'_>, reveal: Option<View>, verify: Option<View>) 
             .columns([GridLength::Star(1.0), GridLength::Auto])
             .column_spacing(6.0)
             .children((
-                TextBlock::new()
-                    .text(format!("{label} · {}\n{detail}", item.path))
-                    .text_wrapping(TextWrapping::Wrap),
+                StackPanel::new().spacing(4.0).children((
+                    TextBlock::new()
+                        .text(format!("{label} · {}\n{detail}", item.path))
+                        .text_wrapping(TextWrapping::Wrap),
+                    check
+                        .map(|check| -> View {
+                            TextBlock::new()
+                                .text(check.label())
+                                .text_wrapping(TextWrapping::Wrap)
+                                .into()
+                        })
+                        .unwrap_or_else(View::empty),
+                )),
                 StackPanel::new()
                     .grid_column(1)
                     .vertical_alignment(VerticalAlignment::Top)
