@@ -1169,6 +1169,8 @@ mod download_folder;
 mod filesystem_space;
 #[path = "sftp/find.rs"]
 mod find;
+#[path = "sftp/folder_contents.rs"]
+mod folder_contents;
 #[path = "sftp/in_band_resize.rs"]
 mod in_band_resize;
 #[cfg(feature = "ui-smoke")]

@@ -90,7 +90,7 @@ function Check-Actions {
     $actionsScroll = $actions.GetCurrentPattern($scroll)
     $remaining = [Collections.Generic.HashSet[string]]::new()
     $ellipsis = [char]0x2026
-    foreach ($label in 'Close',"Go to folder$ellipsis",'Back','Forward','Up','Refresh',"Filesystem space$ellipsis","Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Move to folder$ellipsis","Delete$ellipsis",
+    foreach ($label in 'Close',"Go to folder$ellipsis",'Back','Forward','Up','Refresh',"Filesystem space$ellipsis","Folder contents$ellipsis","Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Move to folder$ellipsis","Delete$ellipsis",
         'Open folder',"Download$ellipsis",'Open shell here','Copy directory path','Copy selected path','Follow shell directory',
         'Replace existing files','Sort by name','Sort newest first','Sort largest first',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
     $horizontal = if ($actionsScroll.Current.HorizontallyScrollable) { 0,100 } else { -1 }

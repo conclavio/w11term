@@ -37,7 +37,8 @@ mod find;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
     ContentMatch, ContentScan, FileSizeRange, FileTextMatch, FilenameFilter, FilenameMatch,
-    FilenameSearch, FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
+    FilenameSearch, FilenameSort, FolderContents, ModifiedDateRange, SearchProgress,
+    valid_filename_query,
 };
 mod resume_download;
 use resume_download::ResumeDownload;
@@ -268,6 +269,10 @@ pub enum Operation {
         preserve_times: bool,
     },
     Ls {
+        path: String,
+    },
+    #[serde(skip)]
+    MeasureFolder {
         path: String,
     },
     /// List folder choices for the drawer's move dialog on its existing connection.
@@ -727,6 +732,9 @@ pub(crate) async fn run(
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
                 }
+                Operation::MeasureFolder { .. } => {
+                    Some("Missing SSH connection for folder contents")
+                }
                 Operation::OpenLinkTarget { .. } => {
                     Some("Missing SSH connection for opening the link target")
                 }
@@ -861,6 +869,7 @@ pub(crate) async fn run(
                     JobStage::Checking("File text search did not finish")
                 }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
+                Operation::MeasureFolder { .. } => JobStage::Checking("Folder scan did not finish"),
                 Operation::GetDir { .. } | Operation::GetSearch { .. } => {
                     JobStage::DirectoryDownload {
                         staging: None,
@@ -1487,6 +1496,17 @@ impl Engine {
                         modified_dates,
                         content_query,
                     },
+                    cancel,
+                    match job_progress {
+                        Some(JobProgress::Search(sender)) => Some(sender),
+                        _ => None,
+                    },
+                )
+                .await?,
+            )?,
+            MeasureFolder { path } => serde_json::to_value(
+                self.measure_folder(
+                    &path,
                     cancel,
                     match job_progress {
                         Some(JobProgress::Search(sender)) => Some(sender),

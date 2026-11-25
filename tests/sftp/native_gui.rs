@@ -3380,6 +3380,35 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measures folder contents and retains a stopped scan in the native SFTP drawer"]
+async fn native_sftp_folder_contents_reports_and_stops_a_recursive_scan() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("sub")).unwrap();
+    fs::write(folder.join("payload.bin"), vec![1; 4096]).unwrap();
+    fs::write(folder.join("sub/extra.bin"), vec![2; 1024]).unwrap();
+    directory_junction(&folder, "link-to-sub", "sub");
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let listing = root.join("listing-trace");
+    fs::write(&listing, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-folder-contents-ui.ps1", &ssh, state.path());
+    assert!(fs::read(trace).unwrap().is_empty());
+    assert!(
+        !fs::read_to_string(listing)
+            .unwrap()
+            .contains("OPENDIR /shell directory/link-to-sub")
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "shows and refreshes remote filesystem capacity through the native SFTP drawer"]
 async fn native_sftp_filesystem_space_refreshes_the_current_folder() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
