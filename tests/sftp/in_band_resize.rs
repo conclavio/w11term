@@ -25,7 +25,7 @@ impl WireReader {
         (id, handle)
     }
 
-    async fn window(&mut self, channel: ChannelId, expected: [u32; 4]) {
+    pub(super) async fn window(&mut self, channel: ChannelId, expected: [u32; 4]) {
         match self.next().await {
             Wire::Window(id, dimensions) => {
                 assert_eq!(id, channel);

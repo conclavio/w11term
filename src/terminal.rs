@@ -2572,8 +2572,14 @@ mod tests {
         assert_eq!(slices(&terminal), [0, 1, 2]);
         terminal.resize(TerminalSize { cols: 14, ..size });
         assert_eq!(slices(&terminal), [0, 1, 2]);
+        terminal.resize(TerminalSize { cols: 5, ..size });
+        assert!(
+            terminal
+                .screen()
+                .physical_lines()
+                .all(|line| !line.contains_multicell_text())
+        );
         terminal.resize(TerminalSize { cols: 8, ..size });
-        assert!(slices(&terminal).is_empty());
 
         for edit in [
             "\x1b[2;1H\x1b[L",
@@ -2586,6 +2592,115 @@ mod tests {
             terminal.advance_bytes(edit);
             assert!(slices(&terminal).is_empty(), "{edit:?}");
         }
+    }
+
+    #[test]
+    fn kitty_multicell_reflow_keeps_a_tail_and_its_cursor_beside_the_lower_slice() {
+        use wezterm_term::color::ColorAttribute;
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 6,
+            rows: 5,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b]66;s=3;A\x07bc\x1b[31mX\x1b[0m\x1b[1;6H");
+        let before = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert!(before.bookmark_target().unwrap().toggle(&mut terminal, 0));
+        terminal.resize(TerminalSize { cols: 5, ..size });
+        let after = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        for (offset, line) in after.rows[..3].iter().enumerate() {
+            let cell = line.get_cell(0).unwrap();
+            assert_eq!(cell.attrs().multicell_row().unwrap().offset(), offset as u8);
+            assert_eq!(cell.width(), 3);
+        }
+        assert_eq!(after.rows[0].as_str().trim_end(), "Abc");
+        assert!(after.rows[0].last_cell_was_wrapped());
+        let tail = after.rows[1].get_cell(3).unwrap();
+        assert_eq!(tail.str(), "X");
+        assert_eq!(tail.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        assert_eq!((after.cursor.x, after.cursor.y), (3, 1));
+        assert_eq!(&*after.scrollback_bookmarks, &[after.first_stable_row + 1]);
+    }
+
+    #[test]
+    fn kitty_multicell_reflow_moves_fitting_rectangles_past_the_edge_and_back() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 8,
+            rows: 5,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"12345\x1b]66;s=2;W\x07q\x1b[1;8H");
+        terminal.resize(TerminalSize { cols: 6, ..size });
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "12345");
+        assert_eq!(frame.rows[1].as_str().trim_end(), "Wq");
+        assert_eq!(
+            frame.rows[2]
+                .get_cell(0)
+                .unwrap()
+                .attrs()
+                .multicell_row()
+                .unwrap()
+                .offset(),
+            1
+        );
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2, 1));
+        terminal.resize(size);
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "12345Wq");
+        assert_eq!(
+            frame.rows[1]
+                .get_cell(5)
+                .unwrap()
+                .attrs()
+                .multicell_row()
+                .unwrap()
+                .offset(),
+            1
+        );
+        assert_eq!((frame.cursor.x, frame.cursor.y), (7, 0));
+    }
+
+    #[test]
+    fn kitty_multicell_reflow_keeps_text_visible_when_an_oversized_rectangle_is_removed() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 7,
+            rows: 6,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b]66;s=4;W\x07abc\x1b[1;7H");
+        terminal.resize(TerminalSize {
+            cols: 3,
+            rows: 3,
+            ..size
+        });
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "abc");
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2, 0));
+        assert!(
+            terminal
+                .screen()
+                .physical_lines()
+                .all(|line| !line.contains_multicell_text())
+        );
+
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b[?1049h\x1b[1;5H\x1b]66;s=2;R\x07X");
+        terminal.resize(TerminalSize { cols: 5, ..size });
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert!(frame.alternate);
+        assert!(
+            frame
+                .rows
+                .iter()
+                .all(|line| !line.contains_multicell_text())
+        );
+        assert!(frame.rows.iter().all(|line| !line.as_str().contains('X')));
     }
 
     #[test]

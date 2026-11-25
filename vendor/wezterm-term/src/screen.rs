@@ -10,10 +10,12 @@ use termwiz::input::KeyboardEncoding;
 use wezterm_surface::SequenceNo;
 
 mod live_command_output;
+mod multicell_reflow;
 mod multicell_text;
 pub use live_command_output::{
     LiveCommandOutput, LiveOutputBatch, LiveOutputCursor, LiveOutputLine,
 };
+use multicell_reflow::{multicell_regions, reflow_multicell_rows, ReflowPoint};
 
 /// Horizontal scale of a DEC line rendition relative to the terminal grid.
 pub fn line_width_scale(line: &Line) -> usize {
@@ -112,6 +114,7 @@ enum ReflowAnchor {
     Start(usize),
     End(usize),
     Bookmark,
+    Cursor,
 }
 
 impl Screen {
@@ -434,12 +437,66 @@ impl Screen {
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
         let num_rows = self.lines.len();
+        let mut multicell_regions = multicell_regions(&self.lines).into_iter().peekable();
         let mut lines = self.lines.drain(..).enumerate().peekable();
         while let Some((phys_idx, mut line)) = lines.next() {
+            if let Some(region) = multicell_regions.next_if(|region| region.start == phys_idx) {
+                let base = discarded + rewrapped.len();
+                let mut tracked = Vec::new();
+                if let Some((row, col)) = marker.filter(|(row, _)| region.contains(row)) {
+                    tracked.push((None, ReflowPoint::new(row, col)));
+                }
+                if region.contains(&cursor_y) {
+                    tracked.push((
+                        Some(ReflowAnchor::Cursor),
+                        ReflowPoint::new(cursor_y, cursor_x),
+                    ));
+                }
+                while let Some((row, anchor, col)) =
+                    outputs.next_if(|(row, _, _)| region.contains(row))
+                {
+                    tracked.push((Some(anchor), ReflowPoint::new(row, col)));
+                }
+                tracked.sort_unstable_by_key(|(_, point)| point.source);
+                let mut points: Vec<_> = tracked.iter().map(|(_, point)| *point).collect();
+                let first = std::iter::once((phys_idx, line));
+                let (removed, new_lines) = reflow_multicell_rows(
+                    first.chain(lines.by_ref().take(region.len() - 1)),
+                    physical_cols,
+                    physical_rows,
+                    capacity,
+                    seqno,
+                    &mut points,
+                );
+                if removed != 0 {
+                    discarded += rewrapped.len() + removed;
+                    rewrapped.clear();
+                }
+                rewrapped.extend(new_lines);
+                for ((anchor, _), point) in tracked.into_iter().zip(points) {
+                    let (row, col) = point.target;
+                    let row = base + row;
+                    let stable = (self.stable_row_index_offset + row) as StableRowIndex;
+                    match anchor {
+                        Some(ReflowAnchor::Start(index)) => remapped[index].0 = Some((stable, col)),
+                        Some(ReflowAnchor::End(index)) => remapped[index].1 = Some((stable, col)),
+                        Some(ReflowAnchor::Bookmark) => {
+                            self.scrollback_bookmarks.push((stable, col))
+                        }
+                        Some(ReflowAnchor::Cursor) => {
+                            adjusted_cursor = (col.min(physical_cols - 1), row)
+                        }
+                        None => self.command_start = Some((stable, col)),
+                    }
+                }
+                let excess = rewrapped.len().saturating_sub(capacity);
+                rewrapped.drain(..excess);
+                discarded += excess;
+                continue;
+            }
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
             let sized = line_width_scale(&line) == 2;
-            let multicell = line.contains_multicell_text();
             if let Some((row, col)) = marker {
                 if phys_idx == row {
                     logical_marker = Some(logical_line.as_ref().map_or(0, Line::len) + col);
@@ -474,19 +531,18 @@ impl Screen {
 
             if was_wrapped
                 && !sized
-                && !multicell
-                && lines.peek().is_some_and(|(_, next)| {
-                    line_width_scale(next) == 1 && !next.contains_multicell_text()
-                })
+                && lines
+                    .peek()
+                    .is_some_and(|(_, next)| line_width_scale(next) == 1)
             {
                 logical_line.replace(line);
                 continue;
             }
 
             if let Some(x) = logical_cursor_x.take() {
-                if sized || multicell {
+                if sized {
                     adjusted_cursor = (
-                        x.min((physical_cols / if sized { 2 } else { 1 }).max(1) - 1),
+                        x.min((physical_cols / 2).max(1) - 1),
                         discarded + rewrapped.len(),
                     );
                 } else {
@@ -517,7 +573,7 @@ impl Screen {
             }
 
             let first_rewrapped = rewrapped.len();
-            if sized || multicell {
+            if sized {
                 let mut line = line;
                 clip_sized_line(&mut line, physical_cols, seqno);
                 rewrapped.push_back(line);
@@ -549,6 +605,7 @@ impl Screen {
                             Some(ReflowAnchor::Bookmark) => {
                                 self.scrollback_bookmarks.push((row, col))
                             }
+                            Some(ReflowAnchor::Cursor) => unreachable!(),
                             None => self.command_start = Some((row, col)),
                         }
                         break;
@@ -620,7 +677,10 @@ impl Screen {
         self.dpi = size.dpi;
         if physical_cols != self.physical_cols || physical_rows != self.physical_rows {
             self.invalidate_row_coordinates();
-            if physical_cols < self.physical_cols || physical_rows < self.physical_rows {
+            let primary_reflow = self.allow_scrollback && physical_cols != self.physical_cols;
+            if !primary_reflow
+                && (physical_cols < self.physical_cols || physical_rows < self.physical_rows)
+            {
                 self.clip_multicell_text(physical_cols, physical_rows, seqno);
             }
         }

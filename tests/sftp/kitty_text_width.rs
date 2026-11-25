@@ -2,6 +2,46 @@ use super::{in_band_resize::WireReader, *};
 use tokio::sync::mpsc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn primary_screen_reflows_scaled_text_and_surrounding_output_on_ssh_resize() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (source, _root, _, server) = fixture_with_wire(false, 1, Arc::default(), Some(tx)).await;
+    let size = wezterm_term::TerminalSize {
+        cols: 8,
+        rows: 5,
+        pixel_width: 64,
+        pixel_height: 75,
+        dpi: 96,
+    };
+    let session = Session::start_sized(source, size);
+    let mut wire = WireReader(rx);
+    let (channel, peer) = wire.shell().await;
+    peer.data(
+        channel,
+        b"\x1b[2J\x1b[H12345\x1b]66;s=2;W\x07q\x1b[1;8H\x1b[6n".as_slice(),
+    )
+    .await
+    .unwrap();
+    wire.input(channel, b"\x1b[1;8R").await;
+    for (cols, new_cursor) in [(6, b"\x1b[2;3R".as_slice()), (8, b"\x1b[1;8R".as_slice())] {
+        session
+            .input
+            .send(w11term::session::Command::Resize(
+                wezterm_term::TerminalSize {
+                    cols,
+                    pixel_width: 8 * cols,
+                    ..size
+                },
+            ))
+            .unwrap();
+        wire.window(channel, [cols as u32, 5, (8 * cols) as u32, 75])
+            .await;
+        peer.data(channel, b"\x1b[6n".as_slice()).await.unwrap();
+        wire.input(channel, new_cursor).await;
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kitty_text_sizing_probe_multicell_fraction_and_payload_limit_over_ssh() {
     let (tx, rx) = mpsc::unbounded_channel();
     let (source, _root, _, server) = fixture_with_wire(false, 1, Arc::default(), Some(tx)).await;
