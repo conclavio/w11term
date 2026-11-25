@@ -1,7 +1,46 @@
 use super::guarded_job as run;
 use super::*;
-use w11term::sftp::Operation;
+use w11term::sftp::{Operation, ReviewedRename};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_preflight_checks_all_destinations_before_mutating_anything() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    for (name, content) in [
+        ("a-old", "first"),
+        ("b-old", "second"),
+        ("b-new", "occupied"),
+    ] {
+        fs::write(root.join(name), content).unwrap();
+    }
+    let trace = root.join("rename-trace.jsonl");
+    fs::write(&trace, []).unwrap();
+    let generation = pane.frames.load().connection_generation;
+    let check = || Operation::CheckRenameBatch {
+        entries: [("/a-old", "/a-new"), ("/b-old", "/b-new")]
+            .into_iter()
+            .map(|(from, to)| ReviewedRename {
+                from: from.into(),
+                to: to.into(),
+                kind: w11term::sftp::EntryKind::File,
+            })
+            .collect(),
+    };
+    assert!(guarded_job(&pane, None, check()).await.is_err());
+    let error = guarded_job(&pane, Some(generation), check())
+        .await
+        .unwrap_err();
+    assert!(error.contains("already exists at /b-new"), "{error}");
+    assert!(fs::read(&trace).unwrap().is_empty());
+    assert_eq!(fs::read(root.join("a-old")).unwrap(), b"first");
+    assert_eq!(fs::read(root.join("b-old")).unwrap(), b"second");
+    assert_eq!(fs::read(root.join("b-new")).unwrap(), b"occupied");
+    fs::remove_file(root.join("b-new")).unwrap();
+    guarded_job(&pane, Some(generation), check()).await.unwrap();
+    assert!(fs::read(&trace).unwrap().is_empty());
+    assert!(!root.join("a-new").exists());
+    server.abort();
+}
 fn rename(from: &str, to: &str) -> Operation {
     Operation::RenameEntry {
         from: from.into(),

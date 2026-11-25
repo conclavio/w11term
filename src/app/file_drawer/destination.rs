@@ -172,7 +172,7 @@ impl Picker {
             button(
                 "Use this folder",
                 Action::Choose(revision),
-                ready && directory.is_some_and(|path| entry.check_move_folder(path).is_ok()),
+                ready && directory.is_some_and(|path| entry.check_destination_folder(path).is_ok()),
             )
             .content("Use this folder"),
         ));
@@ -205,13 +205,11 @@ impl FileDrawer {
         session: &Session,
         ctx: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
-        let Some(entry) = self.dialog.as_mut().filter(|entry| {
-            entry.serial == serial
-                && matches!(
-                    entry.action,
-                    EditAction::Move(..) | EditAction::MoveBatch(..)
-                )
-        }) else {
+        let Some(entry) = self
+            .dialog
+            .as_mut()
+            .filter(|entry| entry.serial == serial && entry.action.uses_folder_picker())
+        else {
             return Ok(());
         };
         let path = match action {
@@ -233,7 +231,7 @@ impl FileDrawer {
                     .as_ref()
                     .filter(|p| p.ready(revision))
                     && let Some(listing) = &picker.folders
-                    && entry.check_move_folder(&listing.directory).is_ok()
+                    && entry.check_destination_folder(&listing.directory).is_ok()
                 {
                     entry.name = listing.directory.clone();
                     entry.destination_picker.take();
@@ -389,9 +387,13 @@ mod tests {
         files.finish_destination_listing(serial, 7, Ok(listing));
         assert!(!current(&files));
         let entry = files.dialog.as_ref().unwrap();
-        assert!(entry.check_move_folder("/work").is_err());
-        assert!(entry.check_move_folder("/work/project/child").is_err());
-        assert!(entry.check_move_folder("/work/project-old").is_ok());
+        assert!(entry.check_destination_folder("/work").is_err());
+        assert!(
+            entry
+                .check_destination_folder("/work/project/child")
+                .is_err()
+        );
+        assert!(entry.check_destination_folder("/work/project-old").is_ok());
 
         let result = files
             .finish_edit(serial, ContentDialogResult::Primary)

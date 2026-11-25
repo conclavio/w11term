@@ -1,6 +1,6 @@
 use super::*;
-use std::collections::HashSet;
-use w11term::sftp::MOVE_OUTCOME_UNKNOWN;
+use std::collections::{HashMap, HashSet};
+use w11term::sftp::{MOVE_OUTCOME_UNKNOWN, RENAME_OUTCOME_UNKNOWN, ReviewedRename};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Origin {
@@ -8,15 +8,76 @@ pub(super) enum Origin {
     Search(u64),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Move,
+    Copy,
+    Rename,
+}
+
+impl Kind {
+    pub(super) fn action(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::Copy => "copy",
+            Self::Rename => "rename",
+        }
+    }
+
+    pub(super) fn subject(self, count: usize) -> &'static str {
+        match (self, count) {
+            (Self::Move | Self::Rename, 1) => "entry",
+            (Self::Move | Self::Rename, _) => "entries",
+            (Self::Copy, 1) => "file",
+            (Self::Copy, _) => "files",
+        }
+    }
+
+    fn ongoing(self) -> &'static str {
+        match self {
+            Self::Move => "moving",
+            Self::Copy => "copying",
+            Self::Rename => "renaming",
+        }
+    }
+}
+
 pub(super) struct ListingRefresh {
     pub(super) directory: String,
     pub(super) note: String,
 }
 
+enum Plan {
+    Move(String),
+    Copy(String),
+    Rename {
+        names: HashMap<String, String>,
+        preflight_cancel: TransferCancel,
+    },
+}
+
+impl Plan {
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Move(_) => Kind::Move,
+            Self::Copy(_) => Kind::Copy,
+            Self::Rename { .. } => Kind::Rename,
+        }
+    }
+
+    fn update_directory(&mut self, reply: &Value) {
+        if let (Self::Move(directory) | Self::Copy(directory), Some(resolved)) =
+            (self, reply["directory"].as_str())
+        {
+            *directory = resolved.to_owned();
+        }
+    }
+}
+
 pub(super) struct Batch {
     id: u64,
+    plan: Plan,
     origin: Origin,
-    destination: String,
     current: FilenameMatch,
     remaining: VecDeque<FilenameMatch>,
     confirmed: usize,
@@ -24,16 +85,22 @@ pub(super) struct Batch {
     stop_requested: bool,
 }
 
-fn validate_sources(hits: &[FilenameMatch]) -> Result<()> {
-    ensure!(!hits.is_empty(), "Mark at least one search result");
+fn validate_sources(kind: Kind, hits: &[FilenameMatch]) -> Result<()> {
+    ensure!(!hits.is_empty(), "Mark at least one entry");
     let mut names = HashSet::new();
     let mut directories = HashSet::new();
     for hit in hits {
         let path = entry_path(&hit.parent, &hit.name)?;
-        ensure!(
-            matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
-            "Mark files or folders to move"
-        );
+        match kind {
+            Kind::Move | Kind::Rename => ensure!(
+                matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
+                "Mark files or folders to move"
+            ),
+            Kind::Copy => ensure!(
+                hit.kind == Some(EntryKind::File),
+                "Mark regular files to copy"
+            ),
+        }
         ensure!(
             names.insert(hit.name.as_str()),
             "Marked entries share the name {}. They need separate destinations.",
@@ -59,17 +126,55 @@ fn validate_sources(hits: &[FilenameMatch]) -> Result<()> {
 impl Batch {
     pub(super) fn new(
         id: u64,
+        kind: Kind,
         origin: Origin,
         hits: Vec<FilenameMatch>,
         destination: String,
     ) -> Result<Self> {
-        let total = hits.len();
-        let mut hits = hits.into_iter();
-        let current = hits.next().context("Mark at least one search result")?;
-        Ok(Self {
+        let plan = match kind {
+            Kind::Move => Plan::Move(destination),
+            Kind::Copy => Plan::Copy(destination),
+            Kind::Rename => bail!("Choose the new names before starting a rename"),
+        };
+        Self::with_plan(id, origin, hits, plan)
+    }
+
+    pub(super) fn for_rename(
+        id: u64,
+        origin: Origin,
+        edits: Vec<(FilenameMatch, String)>,
+    ) -> Result<(Self, Operation)> {
+        let mut hits = Vec::new();
+        let mut names = HashMap::new();
+        let mut entries = Vec::new();
+        for (hit, name) in edits {
+            let from = entry_path(&hit.parent, &hit.name)?;
+            let to = entry_path(&hit.parent, &name)?;
+            let kind = hit.kind.context("Missing type for marked rename")?;
+            names.insert(from.clone(), name);
+            entries.push(ReviewedRename { from, to, kind });
+            hits.push(hit);
+        }
+        let batch = Self::with_plan(
             id,
             origin,
-            destination,
+            hits,
+            Plan::Rename {
+                names,
+                preflight_cancel: TransferCancel::default(),
+            },
+        )?;
+        Ok((batch, Operation::CheckRenameBatch { entries }))
+    }
+
+    fn with_plan(id: u64, origin: Origin, hits: Vec<FilenameMatch>, plan: Plan) -> Result<Self> {
+        let total = hits.len();
+        let mut hits = hits.into_iter();
+        let current = hits.next().context("Mark at least one entry")?;
+        Ok(Self {
+            id,
+            plan,
+            origin,
             current,
             remaining: hits.collect(),
             confirmed: 0,
@@ -88,17 +193,34 @@ impl Batch {
     fn completed(&self) -> String {
         let summary = self.summary();
         if self.stop_requested {
-            format!("{summary}. Stopped after the current move")
+            format!(
+                "{summary}. Stopped after the current {}",
+                self.plan.kind().action()
+            )
         } else {
             summary
         }
     }
 
     fn summary(&self) -> String {
-        format!(
-            "Moved {} of {} marked entries to {}",
-            self.confirmed, self.total, self.destination,
-        )
+        match &self.plan {
+            Plan::Move(destination) => format!(
+                "Moved {} of {} marked entries to {destination}",
+                self.confirmed, self.total
+            ),
+            Plan::Copy(destination) => format!(
+                "Copied {} of {} marked {} to {destination}",
+                self.confirmed,
+                self.total,
+                Kind::Copy.subject(self.total)
+            ),
+            Plan::Rename { .. } => format!(
+                "Renamed {} of {} marked {}",
+                self.confirmed,
+                self.total,
+                Kind::Rename.subject(self.total)
+            ),
+        }
     }
 
     pub(super) fn reconnect_status(
@@ -109,9 +231,7 @@ impl Batch {
         match reply.try_recv() {
             Ok(Ok(value)) => {
                 self.confirmed += 1;
-                if let Some(directory) = value["directory"].as_str() {
-                    self.destination = directory.into();
-                }
+                self.plan.update_directory(&value);
                 format!(
                     "{} before SSH reconnected. Refresh to browse.",
                     self.summary()
@@ -120,30 +240,52 @@ impl Batch {
             Ok(Err(error)) => format!("{}. {error}", self.summary()),
             Err(TryRecvError::Closed) => {
                 format!(
-                    "{}. SSH reconnected before the next move started.",
-                    self.summary()
+                    "{}. SSH reconnected before the next {} started.",
+                    self.summary(),
+                    self.plan.kind().action()
                 )
             }
-            Err(TryRecvError::Empty) => format!(
-                "{}. SSH reconnected while moving {}. {MOVE_OUTCOME_UNKNOWN}.",
-                self.summary(),
-                self.current.name,
-            ),
+            Err(TryRecvError::Empty) => {
+                let advice = match self.plan.kind() {
+                    Kind::Move => MOVE_OUTCOME_UNKNOWN,
+                    Kind::Copy => "Copy outcome unknown; refresh the destination folder",
+                    Kind::Rename => RENAME_OUTCOME_UNKNOWN,
+                };
+                format!(
+                    "{}. SSH reconnected while {} {}. {advice}.",
+                    self.summary(),
+                    self.plan.kind().ongoing(),
+                    self.current.name,
+                )
+            }
+        }
+    }
+
+    pub(super) fn preflight_cancel(&self) -> Option<TransferCancel> {
+        match &self.plan {
+            Plan::Rename {
+                preflight_cancel, ..
+            } => Some(preflight_cancel.clone()),
+            _ => None,
         }
     }
 }
 
 impl FileDrawer {
-    pub(super) fn stop_move_batch_button(
+    pub(super) fn stop_folder_batch_button(
         &self,
         pane: u64,
         origin: Origin,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
-        let Step::MoveBatch(batch) = &self.pending.as_ref()?.step else {
-            return None;
+        let (batch, checking) = match &self.pending.as_ref()?.step {
+            Step::FolderBatch(batch) => (batch, false),
+            Step::RenamePreflight(batch) => (batch, true),
+            _ => return None,
         };
-        if batch.origin != origin || (batch.remaining.is_empty() && !batch.stop_requested) {
+        if batch.origin != origin
+            || (!checking && batch.remaining.is_empty() && !batch.stop_requested)
+        {
             return None;
         }
         let generation = self.generation;
@@ -151,22 +293,38 @@ impl FileDrawer {
         Some(
             Button::new()
                 .is_enabled(!batch.stop_requested)
-                .on_click(
-                    context.callback(move |_| {
-                        Message::Files(FileAction::StopMoves(pane, generation, id))
-                    }),
-                )
-                .content(if batch.stop_requested {
-                    "Stopping after current move…"
+                .on_click(context.callback(move |_| {
+                    Message::Files(FileAction::StopFolderBatch(pane, generation, id))
+                }))
+                .content(if checking {
+                    "Cancel rename check"
                 } else {
-                    "Stop after current move"
+                    match (batch.plan.kind(), batch.stop_requested) {
+                        (Kind::Move, true) => "Stopping after current move…",
+                        (Kind::Move, false) => "Stop after current move",
+                        (Kind::Copy, true) => "Stopping after current copy…",
+                        (Kind::Copy, false) => "Stop after current copy",
+                        (Kind::Rename, true) => "Stopping after current rename…",
+                        (Kind::Rename, false) => "Stop after current rename",
+                    }
                 }),
         )
     }
 
-    pub(super) fn stop_move_batch(&mut self, id: u64) {
+    pub(super) fn stop_folder_batch(&mut self, id: u64) {
+        if let Some(Step::RenamePreflight(batch)) =
+            self.pending.as_ref().map(|pending| &pending.step)
+            && batch.id == id
+        {
+            if let Some(cancel) = batch.preflight_cancel() {
+                cancel.cancel();
+            }
+            self.pending.take();
+            self.status = "Rename check cancelled. No entries were renamed.".into();
+            return;
+        }
         if let Some(Pending {
-            step: Step::MoveBatch(batch),
+            step: Step::FolderBatch(batch),
             ..
         }) = self.pending.as_mut()
             && batch.id == id
@@ -175,9 +333,12 @@ impl FileDrawer {
         }
     }
 
-    pub(super) fn marked_moves(&self, origin: Origin) -> Result<(String, Vec<FilenameMatch>)> {
+    pub(super) fn marked_folder_sources(
+        &self,
+        origin: Origin,
+    ) -> Result<(String, Vec<FilenameMatch>)> {
         match origin {
-            Origin::Search(serial) => self.marked_search_moves(serial),
+            Origin::Search(serial) => self.marked_search_sources(serial),
             Origin::Listing(revision) => {
                 ensure!(
                     self.open && self.listing_revision == revision,
@@ -204,16 +365,24 @@ impl FileDrawer {
         }
     }
 
-    pub(super) fn begin_marked_move(&mut self, origin: Origin) -> Result<()> {
+    pub(super) fn begin_folder_batch(&mut self, kind: Kind, origin: Origin) -> Result<()> {
         ensure!(!self.busy(), "Wait for the active SFTP operation to finish");
-        let (root, hits) = self.marked_moves(origin)?;
-        validate_sources(&hits)?;
+        let (root, hits) = self.marked_folder_sources(origin)?;
+        if kind == Kind::Rename {
+            self.end_filter_edit();
+            self.show_entry_dialog(
+                Some(root),
+                EditAction::RenameMarked(rename_batch::Review::new(origin, hits)),
+            );
+            return Ok(());
+        }
+        validate_sources(kind, &hits)?;
         self.end_filter_edit();
-        self.show_entry_dialog(Some(root), EditAction::MoveBatch(origin, hits));
+        self.show_entry_dialog(Some(root), EditAction::FolderBatch(kind, origin, hits));
         Ok(())
     }
 
-    pub(super) fn start_move_batch(
+    pub(super) fn start_folder_batch(
         &mut self,
         pane: u64,
         session: &Session,
@@ -221,34 +390,55 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         let from = entry_path(&batch.current.parent, &batch.current.name)?;
-        let operation = Operation::MoveEntry {
-            from: from.clone(),
-            directory: batch.destination.clone(),
-            kind: batch.current.kind,
-            destination_is_canonical: batch.confirmed != 0,
+        let destination_is_canonical = batch.confirmed != 0;
+        let operation = match &batch.plan {
+            Plan::Move(directory) => Operation::MoveEntry {
+                from: from.clone(),
+                directory: directory.clone(),
+                kind: batch.current.kind,
+                destination_is_canonical,
+            },
+            Plan::Copy(directory) => Operation::CopyEntry {
+                from: from.clone(),
+                destination: CopyDestination::Folder {
+                    directory: directory.clone(),
+                    is_canonical: destination_is_canonical,
+                },
+            },
+            Plan::Rename { names, .. } => Operation::RenameEntry {
+                from: from.clone(),
+                to: entry_path(
+                    &batch.current.parent,
+                    names.get(&from).context("Missing reviewed rename target")?,
+                )?,
+                search_kind: batch.current.kind,
+            },
+        };
+        let (activity, subject) = match batch.plan.kind() {
+            Kind::Move => ("Moving", "entry"),
+            Kind::Copy => ("Copying", "file"),
+            Kind::Rename => ("Renaming", "entry"),
         };
         self.status = format!(
-            "Moving marked entry {} of {}…",
+            "{activity} marked {subject} {} of {}…",
             batch.confirmed + 1,
             batch.total,
         );
+        let summary = batch.summary();
+        let kind = batch.plan.kind();
         let origin = batch.origin;
         let source = batch.current.parent.clone();
-        let summary = batch.summary();
-        if let Err(error) = self.job(pane, session, operation, Step::MoveBatch(batch), context) {
-            self.refresh_after_move_batch(
-                pane,
-                session,
-                origin,
-                source,
-                format!("{summary}. Could not start moving {from}. {error:#}"),
-                context,
+        if let Err(error) = self.job(pane, session, operation, Step::FolderBatch(batch), context) {
+            let note = format!(
+                "{summary}. Could not start {} {from}. {error:#}",
+                kind.ongoing()
             );
+            self.refresh_after_folder_batch(pane, session, (kind, origin), source, note, context);
         }
         Ok(())
     }
 
-    pub(super) fn finish_move_batch(
+    pub(super) fn finish_folder_batch(
         &mut self,
         pane: u64,
         session: &Session,
@@ -258,28 +448,55 @@ impl FileDrawer {
     ) -> Result<()> {
         let note = match reply {
             Ok(value) => {
-                if let Some(directory) = value["directory"].as_str() {
-                    batch.destination = directory.into();
-                }
+                batch.plan.update_directory(&value);
                 batch.confirmed += 1;
-                let change = EntryChange::Move {
-                    name: batch.current.name.clone(),
-                    directory: batch.destination.clone(),
-                };
-                match batch.origin {
-                    Origin::Search(serial) => {
-                        self.apply_search_change(serial, &batch.current, &change)?
+                match (&batch.plan, batch.origin) {
+                    (Plan::Move(directory), Origin::Search(serial)) => self.apply_search_change(
+                        serial,
+                        &batch.current,
+                        &EntryChange::Move {
+                            name: batch.current.name.clone(),
+                            directory: directory.clone(),
+                        },
+                    )?,
+                    (Plan::Copy(directory), Origin::Search(serial)) => self.apply_search_change(
+                        serial,
+                        &batch.current,
+                        &EntryChange::Copy {
+                            name: batch.current.name.clone(),
+                            directory: directory.clone(),
+                            size: value["bytes_copied"].as_u64(),
+                        },
+                    )?,
+                    (Plan::Rename { names, .. }, Origin::Search(serial)) => {
+                        let from = entry_path(&batch.current.parent, &batch.current.name)?;
+                        self.apply_search_change(
+                            serial,
+                            &batch.current,
+                            &EntryChange::Rename {
+                                from: batch.current.name.clone(),
+                                to: names
+                                    .get(&from)
+                                    .context("Missing reviewed rename target")?
+                                    .clone(),
+                            },
+                        )?;
                     }
-                    Origin::Listing(revision) => self.discard_moved_row(revision, &batch.current),
+                    (Plan::Move(_) | Plan::Rename { .. }, Origin::Listing(revision)) => {
+                        self.discard_moved_row(revision, &batch.current)
+                    }
+                    (Plan::Copy(_), Origin::Listing(_)) => {}
                 }
                 if let Some(next) = batch.remaining.pop_front() {
                     batch.current = next;
-                    return self.start_move_batch(pane, session, batch, context);
+                    return self.start_folder_batch(pane, session, batch, context);
                 }
                 batch.completed()
             }
             Err(error) => {
-                if error.contains(MOVE_OUTCOME_UNKNOWN) {
+                if (batch.plan.kind() == Kind::Move && error.contains(MOVE_OUTCOME_UNKNOWN))
+                    || (batch.plan.kind() == Kind::Rename && error.contains(RENAME_OUTCOME_UNKNOWN))
+                {
                     match batch.origin {
                         Origin::Search(serial) => {
                             self.invalidate_search_entry(serial, &batch.current)?;
@@ -297,10 +514,10 @@ impl FileDrawer {
                 format!("{}. Stopped at {from}. {error}", batch.summary())
             }
         };
-        self.refresh_after_move_batch(
+        self.refresh_after_folder_batch(
             pane,
             session,
-            batch.origin,
+            (batch.plan.kind(), batch.origin),
             batch.current.parent,
             note,
             context,
@@ -338,18 +555,22 @@ impl FileDrawer {
         )
     }
 
-    fn refresh_after_move_batch(
+    fn refresh_after_folder_batch(
         &mut self,
         pane: u64,
         session: &Session,
-        origin: Origin,
+        batch: (Kind, Origin),
         source: String,
         note: String,
         context: &ComponentContext<TerminalApp>,
     ) {
-        let revision = match origin {
-            Origin::Listing(revision) => revision,
-            Origin::Search(serial) => {
+        let revision = match batch {
+            (Kind::Move | Kind::Rename, Origin::Listing(revision)) => revision,
+            (Kind::Copy, Origin::Listing(_)) => {
+                self.status = note;
+                return;
+            }
+            (_, Origin::Search(serial)) => {
                 self.refresh_changed_search(pane, session, serial, note, context);
                 return;
             }
@@ -420,8 +641,14 @@ mod tests {
             ..Default::default()
         };
         assert!(drawer.marked_entries().is_err()); // Not a Windows download name.
-        assert!(drawer.begin_marked_move(Origin::Listing(6)).is_err());
-        drawer.begin_marked_move(Origin::Listing(7)).unwrap();
+        assert!(
+            drawer
+                .begin_folder_batch(Kind::Move, Origin::Listing(6))
+                .is_err()
+        );
+        drawer
+            .begin_folder_batch(Kind::Move, Origin::Listing(7))
+            .unwrap();
         let review = drawer.dialog.as_mut().unwrap();
         let serial = review.serial;
         review.name = "/archive".into();
@@ -431,7 +658,9 @@ mod tests {
                 .finish_edit(serial, ContentDialogResult::Primary)
                 .is_err()
         );
-        drawer.begin_marked_move(Origin::Listing(7)).unwrap();
+        drawer
+            .begin_folder_batch(Kind::Move, Origin::Listing(7))
+            .unwrap();
         let review = drawer.dialog.as_mut().unwrap();
         let serial = review.serial;
         review.name = "/archive".into();
@@ -440,7 +669,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(review.action, EditAction::MoveBatch(_, hits) if hits.len() == 1 && hits[0].name == "CON")
+            matches!(review.action, EditAction::FolderBatch(Kind::Move, _, hits) if hits.len() == 1 && hits[0].name == "CON")
         );
     }
 
@@ -488,19 +717,40 @@ mod tests {
     fn reviews_reject_colliding_names_and_selected_descendants() {
         let directory = hit("/work", "assets", EntryKind::Directory);
         let unrelated = hit("/work/assets-old", "icon.svg", EntryKind::File);
-        assert!(validate_sources(&[directory.clone(), unrelated.clone()]).is_ok());
+        assert!(validate_sources(Kind::Move, &[directory.clone(), unrelated.clone()]).is_ok());
         let inside = hit("/work/assets/nested", "icon.svg", EntryKind::File);
         assert!(
-            validate_sources(&[inside.clone(), directory])
+            validate_sources(Kind::Move, &[inside.clone(), directory])
                 .unwrap_err()
                 .to_string()
                 .contains("/work/assets")
         );
         assert!(
-            validate_sources(&[unrelated, inside])
+            validate_sources(Kind::Move, &[unrelated, inside])
                 .unwrap_err()
                 .to_string()
                 .contains("share the name icon.svg")
+        );
+    }
+
+    #[test]
+    fn copy_review_rejects_folders_and_duplicate_basenames() {
+        let first = hit("/work", "report", EntryKind::File);
+        let other = hit("/work/subdir", "other", EntryKind::File);
+        assert!(validate_sources(Kind::Copy, &[first.clone(), other]).is_ok());
+        let same_name = hit("/work/subdir", "report", EntryKind::File);
+        assert!(
+            validate_sources(Kind::Copy, &[first.clone(), same_name])
+                .unwrap_err()
+                .to_string()
+                .contains("share the name report")
+        );
+        let directory = hit("/work", "archive", EntryKind::Directory);
+        assert!(
+            validate_sources(Kind::Copy, &[first, directory])
+                .unwrap_err()
+                .to_string()
+                .contains("Mark regular files")
         );
     }
 
@@ -510,7 +760,14 @@ mod tests {
             hit("/work", "one", EntryKind::File),
             hit("/work", "two", EntryKind::File),
         ];
-        let mut batch = Batch::new(5, Origin::Search(4), hits.clone(), "/target".into()).unwrap();
+        let mut batch = Batch::new(
+            5,
+            Kind::Move,
+            Origin::Search(4),
+            hits.clone(),
+            "/target".into(),
+        )
+        .unwrap();
         let (send, mut receive) = oneshot::channel();
         assert!(
             batch
@@ -523,7 +780,8 @@ mod tests {
             batch.reconnect_status(&mut receive),
             "Moved 1 of 2 marked entries to /canonical before SSH reconnected. Refresh to browse."
         );
-        let mut batch = Batch::new(5, Origin::Search(4), hits, "/target".into()).unwrap();
+        let mut batch =
+            Batch::new(5, Kind::Move, Origin::Search(4), hits, "/target".into()).unwrap();
         let (send, mut receive) = oneshot::channel();
         send.send(Err("Move was not started".into())).unwrap();
         assert_eq!(
@@ -538,6 +796,7 @@ mod tests {
         let second = hit("/work", "second", EntryKind::File);
         let mut batch = Batch::new(
             5,
+            Kind::Move,
             Origin::Search(4),
             vec![first.clone(), second],
             "/target".into(),
@@ -555,7 +814,14 @@ mod tests {
             "Moved 1 of 2 marked entries to /target. Stopped after the current move"
         );
 
-        let mut last = Batch::new(6, Origin::Listing(4), vec![first], "/target".into()).unwrap();
+        let mut last = Batch::new(
+            6,
+            Kind::Move,
+            Origin::Listing(4),
+            vec![first],
+            "/target".into(),
+        )
+        .unwrap();
         last.request_stop();
         assert!(!last.stop_requested);
     }

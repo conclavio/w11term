@@ -339,6 +339,28 @@ pub struct FilenameSearch {
     pub cancelled: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FolderContents {
+    pub logical_bytes: String,
+    pub files: usize,
+    pub files_without_size: usize,
+    pub links: usize,
+    pub unclassified_entries: usize,
+    pub scanned_directories: usize,
+    pub skipped_directories: usize,
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
+#[derive(Default)]
+struct Measurement {
+    logical_bytes: u128,
+    files: usize,
+    files_without_size: usize,
+    links: usize,
+    unclassified_entries: usize,
+}
+
 /// A snapshot of a running scan. Totals are unknown until the search ends.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SearchProgress {
@@ -366,6 +388,7 @@ struct Search<'a> {
     directories: HashSet<String>,
     matched: HashSet<String>,
     result: FilenameSearch,
+    measurement: Option<Measurement>,
 }
 
 fn unavailable(error: &anyhow::Error) -> bool {
@@ -431,7 +454,105 @@ fn content_excerpt(line: &str, match_start: usize) -> String {
     excerpt
 }
 
-impl Search<'_> {
+impl<'a> Search<'a> {
+    fn new(
+        engine: &'a Engine,
+        root: String,
+        cancel: Option<&'a TransferCancel>,
+        progress: Option<&'a watch::Sender<SearchProgress>>,
+    ) -> Self {
+        Self {
+            engine,
+            pattern: FilenamePattern::All,
+            match_path: false,
+            kind: None,
+            exclude_dirs: None,
+            file_size: FileSizeRange::default(),
+            modified_days: None,
+            content_pattern: None,
+            content_reads: 0,
+            content_limit_hit: false,
+            cancel,
+            progress,
+            next_progress: Instant::now(),
+            queued: VecDeque::from([(root.clone(), 0)]),
+            directories: HashSet::from([root.clone()]),
+            matched: HashSet::new(),
+            result: FilenameSearch {
+                root,
+                matches: Vec::new(),
+                scanned_directories: 0,
+                scanned_entries: 0,
+                skipped_directories: 0,
+                excluded_directories: 0,
+                content_scan: None,
+                truncated: false,
+                cancelled: false,
+            },
+            measurement: None,
+        }
+    }
+
+    async fn run(&mut self) -> Result<()> {
+        while let Some((path, depth)) = self.queued.pop_front() {
+            if self.cancelled() || self.limit_reached() {
+                break;
+            }
+            self.report_progress(&path, true);
+            match self.scan(&path, depth).await {
+                Ok(true) => self.result.scanned_directories += 1,
+                Ok(false) if depth == 0 && !self.cancelled() => {
+                    bail!("The search root changed or is not a directory")
+                }
+                Ok(false) => self.result.skipped_directories += 1,
+                Err(error) if depth > 0 && unavailable(&error) => {
+                    self.result.skipped_directories += 1
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.result.cancelled = self.cancelled();
+        Ok(())
+    }
+
+    async fn measure_entry(
+        &mut self,
+        path: &str,
+        attrs: &FileAttributes,
+        missing_type: bool,
+    ) -> Result<()> {
+        let measurement = self.measurement.as_mut().unwrap();
+        match EntryKind::from_permissions(attrs.permissions) {
+            Some(EntryKind::File) => {
+                measurement.files += 1;
+                let mut size = attrs.size;
+                if size.is_none() && !missing_type {
+                    match self.engine.raw.lstat(path).await {
+                        Ok(reply)
+                            if EntryKind::from_permissions(reply.attrs.permissions)
+                                == Some(EntryKind::File) =>
+                        {
+                            size = reply.attrs.size;
+                        }
+                        Err(error) if transport_error(&error) => return Err(error.into()),
+                        _ => {}
+                    }
+                }
+                if let Some(size) = size {
+                    measurement.logical_bytes += u128::from(size);
+                } else {
+                    measurement.files_without_size += 1;
+                }
+            }
+            Some(EntryKind::Symlink) => measurement.links += 1,
+            None if attrs.permissions.is_none_or(|mode| mode & 0o170000 == 0) => {
+                measurement.unclassified_entries += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn report_progress(&mut self, folder: &str, new_folder: bool) {
         let Some(progress) = self.progress else {
             return;
@@ -549,6 +670,11 @@ impl Search<'_> {
                         || name.contains(['/', '\\'])
                         || name.chars().any(char::is_control)
                     {
+                        if let Some(measurement) = &mut self.measurement
+                            && !matches!(name.as_str(), "." | "..")
+                        {
+                            measurement.unclassified_entries += 1;
+                        }
                         continue;
                     }
                     let prefix = path.trim_end_matches('/');
@@ -596,7 +722,11 @@ impl Search<'_> {
                     } else {
                         &name
                     };
-                    if self.kind.is_none_or(|want| Some(want) == kind)
+                    if self.measurement.is_some() {
+                        if !directory && self.matched.insert(child.clone()) {
+                            self.measure_entry(&child, &attrs, missing_type).await?;
+                        }
+                    } else if self.kind.is_none_or(|want| Some(want) == kind)
                         && self.pattern.matches(candidate)
                         && (self.content_pattern.is_none() || kind == Some(EntryKind::File))
                     {
@@ -690,7 +820,6 @@ impl Engine {
             "The search folder path is too long"
         );
         let mut search = Search {
-            engine: self,
             pattern,
             match_path: filter.match_path,
             kind: filter.kind,
@@ -698,45 +827,42 @@ impl Engine {
             file_size: filter.file_size,
             modified_days,
             content_pattern,
-            content_reads: 0,
-            content_limit_hit: false,
-            cancel,
-            progress,
-            next_progress: Instant::now(),
-            queued: VecDeque::from([(root.clone(), 0)]),
-            directories: HashSet::from([root.clone()]),
-            matched: HashSet::new(),
-            result: FilenameSearch {
-                root,
-                matches: Vec::new(),
-                scanned_directories: 0,
-                scanned_entries: 0,
-                skipped_directories: 0,
-                excluded_directories: 0,
-                content_scan,
-                truncated: false,
-                cancelled: false,
-            },
+            ..Search::new(self, root, cancel, progress)
         };
-        while let Some((path, depth)) = search.queued.pop_front() {
-            if search.cancelled() || search.limit_reached() {
-                break;
-            }
-            search.report_progress(&path, true);
-            match search.scan(&path, depth).await {
-                Ok(true) => search.result.scanned_directories += 1,
-                Ok(false) if depth == 0 && !search.cancelled() => {
-                    bail!("The search root changed or is not a directory")
-                }
-                Ok(false) => search.result.skipped_directories += 1,
-                Err(error) if depth > 0 && unavailable(&error) => {
-                    search.result.skipped_directories += 1
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        search.result.cancelled = search.cancelled();
+        search.result.content_scan = content_scan;
+        search.run().await?;
         FilenameSort::Folder.apply(&mut search.result.matches);
         Ok(search.result)
+    }
+
+    pub(super) async fn measure_folder(
+        &self,
+        path: &str,
+        cancel: Option<&TransferCancel>,
+        progress: Option<&watch::Sender<SearchProgress>>,
+    ) -> Result<FolderContents> {
+        let root = self.canonical_remote_path(path).await?;
+        ensure!(
+            root == path,
+            "The measured folder changed. Refresh the drawer"
+        );
+        ensure!(root.len() <= MAX_PATH_BYTES, "The folder path is too long");
+        let mut scan = Search {
+            measurement: Some(Measurement::default()),
+            ..Search::new(self, root, cancel, progress)
+        };
+        scan.run().await?;
+        let measurement = scan.measurement.unwrap();
+        Ok(FolderContents {
+            logical_bytes: measurement.logical_bytes.to_string(),
+            files: measurement.files,
+            files_without_size: measurement.files_without_size,
+            links: measurement.links,
+            unclassified_entries: measurement.unclassified_entries,
+            scanned_directories: scan.result.scanned_directories,
+            skipped_directories: scan.result.skipped_directories,
+            truncated: scan.result.truncated,
+            cancelled: scan.result.cancelled,
+        })
     }
 }

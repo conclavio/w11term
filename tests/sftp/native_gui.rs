@@ -2973,6 +2973,108 @@ async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "previews, checks and stops marked renames in the native SFTP listing and search"]
+async fn native_sftp_renames_marked_entries_with_preflight_and_stop() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("nested")).unwrap();
+    for (name, bytes) in [
+        ("simple-old-a.txt", "first"),
+        ("simple-old-b.txt", "second"),
+        ("simple-new-b.txt", "occupied"),
+        ("scan-old-01.txt", "root"),
+        ("nested/scan-old-02.txt", "nested"),
+    ] {
+        fs::write(folder.join(name), bytes).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    fs::write(root.join("rename-trace.jsonl"), []).unwrap();
+    drive_mixed_gui("sftp-rename-marked-ui.ps1", &ssh, state.path());
+    for (name, bytes) in [
+        ("simple-new-a.txt", "first"),
+        ("simple-new-b.txt", "second"),
+        ("scan-new-01.txt", "root"),
+        ("nested/scan-old-02.txt", "nested"),
+    ] {
+        assert_eq!(fs::read(folder.join(name)).unwrap(), bytes.as_bytes());
+    }
+    assert_eq!(
+        mutation_trace(root, "rename-trace.jsonl"),
+        [
+            [
+                "/shell directory/simple-old-a.txt",
+                "/shell directory/simple-new-a.txt"
+            ],
+            [
+                "/shell directory/simple-old-b.txt",
+                "/shell directory/simple-new-b.txt"
+            ],
+            [
+                "/shell directory/scan-old-01.txt",
+                "/shell directory/scan-new-01.txt"
+            ],
+        ],
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "copies and duplicates regular files from the native listing and recursive search over one live SSH connection"]
+async fn native_sftp_copy_from_listing_and_search_keeps_both_originals() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path().join("shell directory");
+    fs::create_dir_all(root.join("archive")).unwrap();
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join("copy-first.bin"), b"original\0file").unwrap();
+    fs::write(root.join("sub/copy-nested.bin"), b"nested\0file").unwrap();
+    fs::write(root.join("batch-01.bin"), b"first").unwrap();
+    fs::write(root.join("batch-02.bin"), b"source").unwrap();
+    fs::write(root.join("batch-03.bin"), b"last").unwrap();
+    fs::write(root.join("archive/batch-02.bin"), b"existing").unwrap();
+    fs::write(root.join("archive/scan-copy-01.bin"), b"search first").unwrap();
+    fs::write(root.join("sub/scan-copy-02.bin"), b"search second").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("sftp-copy-ui.ps1", &ssh, state.path());
+    for (path, expected) in [
+        ("copy-first.bin", b"original\0file".as_slice()),
+        ("archive/copy-first.bin", b"original\0file".as_slice()),
+        ("sub/copy-nested.bin", b"nested\0file".as_slice()),
+        ("copy-nested.bin", b"nested\0file".as_slice()),
+        ("batch-01.bin", b"first".as_slice()),
+        ("batch-02.bin", b"source".as_slice()),
+        ("batch-03.bin", b"last".as_slice()),
+        ("archive/batch-01.bin", b"first".as_slice()),
+        ("archive/batch-02.bin", b"existing".as_slice()),
+        ("archive/scan-copy-01.bin", b"search first".as_slice()),
+        ("sub/scan-copy-02.bin", b"search second".as_slice()),
+        ("scan-copy-01.bin", b"search first".as_slice()),
+        ("scan-copy-02.bin", b"search second".as_slice()),
+        ("scan-copy-01 copy.bin", b"search first".as_slice()),
+        (
+            "sub/scan-copy-search duplicate.bin",
+            b"search second".as_slice(),
+        ),
+    ] {
+        assert_eq!(fs::read(root.join(path)).unwrap(), expected);
+    }
+    assert!(!root.join("archive/batch-03.bin").exists());
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "filters a paginated SFTP listing while checking shell input and directory reads"]
 async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
@@ -3325,6 +3427,73 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
         2,
         "one shell and one SFTP channel"
     );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measures folder contents and retains a stopped scan in the native SFTP drawer"]
+async fn native_sftp_folder_contents_reports_and_stops_a_recursive_scan() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("sub")).unwrap();
+    fs::write(folder.join("payload.bin"), vec![1; 4096]).unwrap();
+    fs::write(folder.join("sub/extra.bin"), vec![2; 1024]).unwrap();
+    directory_junction(&folder, "link-to-sub", "sub");
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let listing = root.join("listing-trace");
+    fs::write(&listing, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-folder-contents-ui.ps1", &ssh, state.path());
+    assert!(fs::read(trace).unwrap().is_empty());
+    assert!(
+        !fs::read_to_string(listing)
+            .unwrap()
+            .contains("OPENDIR /shell directory/link-to-sub")
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "shows and refreshes remote filesystem capacity through the native SFTP drawer"]
+async fn native_sftp_filesystem_space_refreshes_the_current_folder() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("child")).unwrap();
+    fs::write(folder.join("keep.txt"), b"original file").unwrap();
+    fs::write(
+        root.join("fixture-space.json"),
+        crate::filesystem_space::fixture_stats(262144, 0).to_string(),
+    )
+    .unwrap();
+    let trace = root.join("properties-trace");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-filesystem-space-ui.ps1", &ssh, state.path());
+    let requests = fs::read_to_string(trace).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| line.starts_with("STATVFS "))
+            .collect::<Vec<_>>(),
+        [
+            "STATVFS /shell directory",
+            "STATVFS /shell directory",
+            "STATVFS /shell directory/child",
+            "STATVFS /shell directory/child",
+        ]
+    );
+    assert_eq!(fs::read(folder.join("keep.txt")).unwrap(), b"original file");
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
     server.abort();
 }
 
@@ -3967,7 +4136,7 @@ async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "edits UTF-8 text from the SFTP listing and search, and preserves conflicting drafts"]
+#[ignore = "creates and edits UTF-8 text from the SFTP drawer and preserves conflicting drafts"]
 async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
         unreachable!()
@@ -4004,8 +4173,13 @@ async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() 
     );
     assert_eq!(fs::read_dir(&generated).unwrap().count(), 1);
     assert_eq!(
+        fs::read(folder.join("new 雪.txt")).unwrap(),
+        "new=first\nlabel=雪".as_bytes()
+    );
+    assert!(fs::read(folder.join("empty.txt")).unwrap().is_empty());
+    assert_eq!(
         fs::read_dir(&folder).unwrap().count(),
-        3,
+        5,
         "editor left staging files behind"
     );
     assert_eq!(fs::read(keys).unwrap(), b"after-editor");
