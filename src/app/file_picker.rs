@@ -26,6 +26,7 @@ pub(super) enum Purpose {
     Folder,
     DownloadFolder,
     Save(String),
+    SaveSearchResults,
     Scrollback,
     PaneImage,
     CommandOutput(String),
@@ -290,6 +291,17 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 }
                 let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
+                None
+            }
+            Purpose::SaveSearchResults => {
+                #[cfg(feature = "ui-smoke")]
+                fixture_picker_folder(&dialog, "W11TERM_SFTP_PICKER_SMOKE_DIR")?;
+                dialog.SetTitle(w!("Download marked search results"))?;
+                dialog.SetFileNameLabel(w!("New folder name:"))?;
+                dialog.SetOkButtonLabel(w!("Download"))?;
+                dialog.SetFileName(w!("Search results"))?;
+                options &= !FOS_OVERWRITEPROMPT;
+                options |= FOS_PATHMUSTEXIST | FOS_NOTESTFILECREATE | FOS_DONTADDTORECENT;
                 None
             }
             Purpose::GroupLiveRecording(suggestion) => {

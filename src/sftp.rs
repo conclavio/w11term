@@ -45,7 +45,7 @@ pub use transfer_status::{
 };
 mod upload_directory;
 pub(crate) use directory::valid_component;
-pub use directory::{validate_download_name, validate_download_names};
+pub use directory::{SearchDownload, validate_download_name, validate_download_names};
 pub use drop_source::{DropSource, classify_drop};
 
 pub const CHUNK: usize = 32 * 1024;
@@ -207,6 +207,12 @@ pub enum Operation {
         remote: String,
         local: PathBuf,
         #[serde(default)]
+        preserve_mtime: bool,
+    },
+    #[serde(skip)]
+    GetSearch {
+        selection: SearchDownload,
+        local: PathBuf,
         preserve_mtime: bool,
     },
     PutDir {
@@ -629,6 +635,7 @@ pub(crate) async fn run(
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
                 }
+                Operation::GetSearch { .. } => Some("Missing SSH connection for search results"),
                 _ => None,
             };
             if let Some(message) = missing {
@@ -681,13 +688,20 @@ pub(crate) async fn run(
             let _ = reply.send(Ok(state.cancelled(local)));
             continue;
         }
-        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
-            && let Operation::Put { local, remote, .. }
-            | Operation::Get { local, remote, .. }
-            | Operation::GetDir { local, remote, .. } = &operation
-        {
-            let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
-            continue;
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled) {
+            let paths = match &operation {
+                Operation::Put { local, remote, .. }
+                | Operation::Get { local, remote, .. }
+                | Operation::GetDir { local, remote, .. } => Some((local, remote.as_str())),
+                Operation::GetSearch {
+                    selection, local, ..
+                } => Some((local, selection.root())),
+                _ => None,
+            };
+            if let Some((local, remote)) = paths {
+                let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
+                continue;
+            }
         }
         let detached_close = reply.is_closed() && matches!(operation, Operation::Close { .. });
         let deadline = if detached_close {
@@ -739,10 +753,12 @@ pub(crate) async fn run(
                     JobStage::Checking("SHA-256 calculation did not finish")
                 }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
-                Operation::GetDir { .. } => JobStage::DirectoryDownload {
-                    staging: None,
-                    deadline,
-                },
+                Operation::GetDir { .. } | Operation::GetSearch { .. } => {
+                    JobStage::DirectoryDownload {
+                        staging: None,
+                        deadline,
+                    }
+                }
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
                 Operation::SaveText { .. } => JobStage::Checking("Save was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
@@ -1019,8 +1035,30 @@ impl Engine {
                 local,
                 preserve_mtime,
             } => {
-                self.get_dir(remote, local, preserve_mtime, progress, cancel, stage)
-                    .await?
+                self.get_dir(
+                    directory::DownloadSource::Entire(remote),
+                    local,
+                    preserve_mtime,
+                    progress,
+                    cancel,
+                    stage,
+                )
+                .await?
+            }
+            GetSearch {
+                selection,
+                local,
+                preserve_mtime,
+            } => {
+                self.get_dir(
+                    directory::DownloadSource::Selection(selection),
+                    local,
+                    preserve_mtime,
+                    progress,
+                    cancel,
+                    stage,
+                )
+                .await?
             }
             PutDir {
                 local,

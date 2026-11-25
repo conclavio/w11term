@@ -1,5 +1,7 @@
 use super::*;
-use w11term::sftp::{EntryKind, FilenameSearch, Job, Operation, TransferCancel};
+use w11term::sftp::{
+    EntryKind, FilenameMatch, FilenameSearch, Job, Operation, SearchDownload, TransferCancel,
+};
 
 fn search(path: &str, query: &str) -> Operation {
     Operation::Find {
@@ -8,6 +10,92 @@ fn search(path: &str, query: &str) -> Operation {
         regex: false,
         match_case: false,
     }
+}
+
+fn hit(parent: &str, name: &str, kind: EntryKind) -> FilenameMatch {
+    FilenameMatch {
+        parent: parent.into(),
+        name: name.into(),
+        kind: Some(kind),
+    }
+}
+
+#[test]
+fn search_download_rejects_unsafe_components_and_collisions_between_folders() {
+    let selected = hit("/tree/Logs", "shared.txt", EntryKind::File);
+    for bad in [
+        hit("/trees/Logs", "other.txt", EntryKind::File),
+        hit("/tree/../Logs", "other.txt", EntryKind::File),
+        hit("/tree/Logs", "NUL.txt", EntryKind::File),
+        hit("/tree/logs", "different.txt", EntryKind::File),
+        hit("/tree/Logs", "SHARED.TXT", EntryKind::File),
+        hit("/tree/Logs", "other.txt", EntryKind::Symlink),
+    ] {
+        assert!(
+            SearchDownload::new("/tree", [&selected, &bad]).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn marked_search_download_preserves_paths_and_publishes_only_complete_folders() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path().join("tree");
+    fs::create_dir_all(root.join("primary")).unwrap();
+    fs::create_dir_all(root.join("backup")).unwrap();
+    fs::write(root.join("primary/report.txt"), b"primary").unwrap();
+    fs::write(root.join("primary/ignore.txt"), b"unmarked").unwrap();
+    fs::write(root.join("backup/report.txt"), b"backup").unwrap();
+    fs::write(root.join("backup/keep.txt"), b"inside the marked folder").unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let destination = local.path().join("Reports");
+    let selection = [
+        hit("/tree/backup", "report.txt", EntryKind::File),
+        hit("/tree", "backup", EntryKind::Directory),
+        hit("/tree/primary", "report.txt", EntryKind::File),
+    ];
+    let op = |local: PathBuf, hits: &[FilenameMatch]| Operation::GetSearch {
+        selection: SearchDownload::new("/tree", hits).unwrap(),
+        local,
+        preserve_mtime: false,
+    };
+    let generation = Some(pane.frames.load().connection_generation);
+    let reply = guarded_job(&pane, generation, op(destination.clone(), &selection))
+        .await
+        .unwrap();
+    assert_eq!(reply["files"], 3);
+    assert_eq!(
+        fs::read(destination.join("primary/report.txt")).unwrap(),
+        b"primary"
+    );
+    assert_eq!(
+        fs::read(destination.join("backup/report.txt")).unwrap(),
+        b"backup"
+    );
+    assert_eq!(
+        fs::read(destination.join("backup/keep.txt")).unwrap(),
+        b"inside the marked folder"
+    );
+    assert!(!destination.join("primary/ignore.txt").exists());
+    let rejected = guarded_job(&pane, generation, op(destination.clone(), &selection))
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.contains("local destination already exists"),
+        "{rejected}"
+    );
+
+    let interrupted = local.path().join("Missing");
+    let mut missing = selection.to_vec();
+    missing.push(hit("/tree/primary", "zz-vanished.txt", EntryKind::File));
+    let rejected = guarded_job(&pane, generation, op(interrupted.clone(), &missing))
+        .await
+        .unwrap_err();
+    assert!(rejected.contains("No such file"), "{rejected}");
+    assert!(!interrupted.exists());
+    assert_eq!(fs::read_dir(local.path()).unwrap().count(), 1);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
