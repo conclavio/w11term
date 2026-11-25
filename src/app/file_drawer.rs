@@ -3953,10 +3953,9 @@ impl TerminalApp {
                         files.finish_compared_verification(serial, Err(format!("{error:#}")));
                     }
                 }
-                FolderReport(_, _, serial, folder_report::Action::Reveal { revision, index }) => {
+                FolderReport(_, _, serial, folder_report::Action::Reveal { revision, row }) => {
                     if may_open_dialog
-                        && let Some(operation) =
-                            files.begin_compared_reveal(serial, revision, index)
+                        && let Some(operation) = files.begin_compared_reveal(serial, revision, row)
                         && let Err(error) = files.job(
                             pane,
                             session,

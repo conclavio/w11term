@@ -16,7 +16,7 @@ pub enum Action {
     Stop,
     Close,
     Browse(comparison::Action),
-    Reveal { revision: u64, index: usize },
+    Reveal { revision: u64, row: comparison::Row },
     Verify(verify::Action),
 }
 

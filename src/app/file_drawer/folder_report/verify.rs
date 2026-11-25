@@ -4,6 +4,7 @@ use w11term::sftp::{FILE_VERIFICATION_LIMIT, VerifiedFolderFile, valid_compariso
 #[derive(Clone)]
 pub enum Action {
     Open,
+    Row { revision: u64, row: comparison::Row },
     Path(String),
     Start,
     Stop,
@@ -152,12 +153,28 @@ impl FileDrawer {
             return None;
         };
         let view = &mut panel.verification;
-        if matches!(action, Action::Open) {
-            if self.pending.is_none() && !panel.reveal.checking() {
-                view.open = true;
+        let action = match action {
+            Action::Open => {
+                if self.pending.is_none() && !panel.reveal.checking() {
+                    view.open = true;
+                }
+                return None;
             }
-            return None;
-        }
+            Action::Row { revision, row } => {
+                if panel.revision != revision
+                    || self.pending.is_some()
+                    || panel.reveal.checking()
+                    || view.cancel.is_some()
+                {
+                    return None;
+                }
+                let row = row.get(report).filter(|row| row.can_verify())?;
+                view.path = row.path.into();
+                view.open = true;
+                Action::Start
+            }
+            action => action,
+        };
         if !view.open {
             return None;
         }

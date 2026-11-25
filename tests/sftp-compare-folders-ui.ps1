@@ -40,11 +40,11 @@ function Set-Query([string]$Query) {
 }
 
 function Select-DifferenceType([string]$Name) {
-    $field = Wait-Until 'difference type filter' { Find-Element 'Folder difference type' $combo }
+    $field = Wait-Until 'folder comparison filter' { Find-Element 'Folder comparison filter' $combo }
     $field.GetCurrentPattern($expand).Expand()
     $choice = Wait-Until "difference type '$Name'" { Find-Element $Name $listItem -Visible }
     $choice.GetCurrentPattern($selection).Select()
-    $popup = (Find-Element 'Folder difference type' $combo).GetCurrentPattern($expand)
+    $popup = (Find-Element 'Folder comparison filter' $combo).GetCurrentPattern($expand)
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 
@@ -153,14 +153,30 @@ try {
     Wait-Range 1 1 1
     Test-ComparisonExport
     Wait-Range 1 1 1
-    Click ('Verify file contents' + [char]0x2026)
-    $relative = Wait-Until 'relative file path for SHA-256' { Find-Element 'Relative file path' $edit }
-    $relative.GetCurrentPattern($value).SetValue('same-metadata.txt')
-    Click 'Compare SHA-256'
+    Select-DifferenceType 'Files with matching metadata'
+    $null = Wait-Until 'the matching-files view excludes the matching directory' {
+        (Find-Element '1 file with matching metadata') -and
+            (Find-Element 'Show remote entry same-metadata.txt' $button)
+    }
+    Set-Query 'no-such-match'
+    $null = Wait-Until 'the query can hide matching files' {
+        Find-Element 'No files with matching metadata fit the path filter.'
+    }
+    Set-Query 'SAME-METADATA'
+    Click 'Verify contents of same-metadata.txt'
     $null = Wait-Until 'SHA-256 finds different content despite matching metadata' {
-        Find-Element 'File contents differ'
+        $relative = Find-Element 'Relative file path' $edit
+        $relative -and $relative.GetCurrentPattern($value).Current.Value -ceq 'same-metadata.txt' -and
+            (Find-Element 'File contents differ')
     }
     Click 'Back to comparison'
+    $null = Wait-Until 'return restores the matching-file filter and query' {
+        $query = Find-Element 'Filter relative paths' $edit
+        $query -and $query.GetCurrentPattern($value).Current.Value -ceq 'SAME-METADATA' -and
+            (Find-Element '1 file with matching metadata')
+    }
+    Set-Query ''
+    Select-DifferenceType 'Needs inspection'
     Wait-Range 1 1 1
     $hold = Join-Path $fixture 'hold-opendir'
     [IO.File]::WriteAllText($hold, "$current/nested")

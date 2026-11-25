@@ -1,21 +1,82 @@
 use super::*;
-use w11term::sftp::{FolderChange, FolderDifference, FolderEntry};
+use w11term::sftp::{FolderChange, FolderEntry};
 
 const PAGE_SIZE: usize = 40;
 const MAX_QUERY_CHARS: usize = 4096;
-const FILTERS: [Option<FolderChange>; 6] = [
-    None,
-    Some(FolderChange::ReferenceOnly),
-    Some(FolderChange::CurrentOnly),
-    Some(FolderChange::Type),
-    Some(FolderChange::Metadata),
-    Some(FolderChange::Unknown),
+const FILTERS: [Filter; 7] = [
+    Filter::Differences(None),
+    Filter::Differences(Some(FolderChange::ReferenceOnly)),
+    Filter::Differences(Some(FolderChange::CurrentOnly)),
+    Filter::Differences(Some(FolderChange::Type)),
+    Filter::Differences(Some(FolderChange::Metadata)),
+    Filter::Differences(Some(FolderChange::Unknown)),
+    Filter::MatchingFiles,
 ];
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum Filter {
+    Differences(Option<FolderChange>),
+    MatchingFiles,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self::Differences(None)
+    }
+}
+
+impl Filter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Differences(change) => change_label(change),
+            Self::MatchingFiles => "Files with matching metadata",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Row {
+    Difference(usize),
+    MatchingFile(usize),
+}
+
+impl Row {
+    pub(super) fn get(self, report: &FolderComparison) -> Option<RowDetails<'_>> {
+        match self {
+            Self::Difference(index) => report.differences.get(index).map(|row| RowDetails {
+                path: &row.path,
+                change: Some(row.change),
+                reference: row.reference,
+                current: row.current,
+            }),
+            Self::MatchingFile(index) => report.matching_files.get(index).map(|row| RowDetails {
+                path: &row.path,
+                change: None,
+                reference: Some(row.reference),
+                current: Some(row.current),
+            }),
+        }
+    }
+}
+
+pub(super) struct RowDetails<'a> {
+    pub(super) path: &'a str,
+    change: Option<FolderChange>,
+    reference: Option<FolderEntry>,
+    pub(super) current: Option<FolderEntry>,
+}
+
+impl RowDetails<'_> {
+    pub(super) fn can_verify(&self) -> bool {
+        self.reference.is_some_and(FolderEntry::is_file)
+            && self.current.is_some_and(FolderEntry::is_file)
+    }
+}
 
 #[derive(Clone)]
 pub enum Action {
     Query(String),
-    Filter(Option<FolderChange>),
+    Filter(Filter),
     Previous,
     Next,
 }
@@ -23,9 +84,9 @@ pub enum Action {
 #[derive(Default)]
 pub(super) struct Browser {
     query: String,
-    kind: Option<FolderChange>,
+    filter: Filter,
     page: usize,
-    matches: Vec<usize>,
+    matches: Vec<Row>,
     viewport_revision: u64,
 }
 
@@ -36,8 +97,8 @@ impl Browser {
                 self.query = query;
                 self.index(report);
             }
-            Action::Filter(kind) if self.kind != kind => {
-                self.kind = kind;
+            Action::Filter(filter) if self.filter != filter => {
+                self.filter = filter;
                 self.index(report);
             }
             Action::Previous if self.page > 0 => {
@@ -72,19 +133,39 @@ impl Browser {
             };
             Some(pattern)
         };
-        self.matches.extend(
-            report
-                .differences
-                .iter()
-                .enumerate()
-                .filter_map(|(index, row)| {
-                    (self.kind.is_none_or(|kind| row.change == kind)
-                        && pattern
-                            .as_ref()
-                            .is_none_or(|pattern| pattern.is_match(&row.path)))
-                    .then_some(index)
-                }),
-        );
+        let matches_path = |path: &str| {
+            pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.is_match(path))
+        };
+        match self.filter {
+            Filter::Differences(kind) => {
+                self.matches
+                    .extend(
+                        report
+                            .differences
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, row)| {
+                                (kind.is_none_or(|kind| row.change == kind)
+                                    && matches_path(&row.path))
+                                .then_some(Row::Difference(index))
+                            }),
+                    )
+            }
+            Filter::MatchingFiles => {
+                self.matches
+                    .extend(
+                        report
+                            .matching_files
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, row)| {
+                                matches_path(&row.path).then_some(Row::MatchingFile(index))
+                            }),
+                    )
+            }
+        }
     }
 
     pub(super) fn rows(
@@ -115,7 +196,7 @@ impl Browser {
             ),
             KeyedView::new("totals", totals(report)),
         ];
-        if report.differences.is_empty() {
+        if report.differences.is_empty() && report.matching_files.is_empty() {
             rows.push(KeyedView::new(
                 "empty",
                 TextBlock::new().text("No differences in the reported metadata."),
@@ -139,32 +220,56 @@ impl Browser {
                         ),
                     ComboBox::new()
                         .grid_column(1)
-                        .automation_name("Folder difference type")
-                        .items_source(FILTERS.map(change_label))
-                        .selected_index(FILTERS.iter().position(|&kind| kind == self.kind))
+                        .automation_name("Folder comparison filter")
+                        .items_source(FILTERS.map(Filter::label))
+                        .selected_index(FILTERS.iter().position(|&filter| filter == self.filter))
                         .on_selection_changed(context.callback(move |index: Option<usize>| {
                             index
                                 .and_then(|i| FILTERS.get(i))
-                                .map_or(Message::ControlIdle, |&kind| {
-                                    dispatch(Action::Filter(kind))
+                                .map_or(Message::ControlIdle, |&filter| {
+                                    dispatch(Action::Filter(filter))
                                 })
                         })),
                 )),
         ));
+        let matching_files = self.filter == Filter::MatchingFiles;
         if self.matches.is_empty() {
             rows.push(KeyedView::new(
                 "empty",
-                TextBlock::new().text("No differences match these filters."),
+                TextBlock::new().text(if matching_files {
+                    "No files with matching metadata fit the path filter."
+                } else if report.differences.is_empty() {
+                    "No differences in the reported metadata."
+                } else {
+                    "No differences match these filters."
+                }),
             ));
             return rows;
         }
         let start = self.page * PAGE_SIZE;
         let total = self.matches.len();
         let end = (start + PAGE_SIZE).min(total);
+        let (singular, plural, previous, next, list_name) = if matching_files {
+            (
+                "file with matching metadata",
+                "files with matching metadata",
+                "Previous matching files",
+                "Next matching files",
+                "Files with matching metadata",
+            )
+        } else {
+            (
+                "difference",
+                "differences",
+                "Previous differences",
+                "Next differences",
+                "Folder differences",
+            )
+        };
         let status = match total {
-            1 => "1 difference".into(),
-            _ if end == start + 1 => format!("Showing {end} of {total} differences"),
-            _ => format!("Showing {}–{end} of {total} differences", start + 1),
+            1 => format!("1 {singular}"),
+            _ if end == start + 1 => format!("Showing {end} of {total} {plural}"),
+            _ => format!("Showing {}–{end} of {total} {plural}", start + 1),
         };
         rows.push(KeyedView::new(
             "range",
@@ -175,24 +280,34 @@ impl Browser {
         rows.push(KeyedView::new(
             format!("differences-{}", self.viewport_revision),
             ScrollViewer::new()
-                .automation_name("Folder differences")
+                .automation_name(list_name)
                 .max_height(154.0)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .content(StackPanel::new().spacing(6.0).keyed_children(
-                    self.matches[start..end].iter().map(|&index| {
-                        let item = &report.differences[index];
+                    self.matches[start..end].iter().filter_map(|&row| {
+                        let item = row.get(report)?;
                         let reveal = item.current.map(|_| {
                             Button::new()
-                                .grid_column(1)
-                                .vertical_alignment(VerticalAlignment::Top)
                                 .automation_name(format!("Show remote entry {}", item.path))
                                 .is_enabled(reveal_enabled)
                                 .on_click(context.callback(move |_| {
-                                    message(super::Action::Reveal { revision, index })
+                                    message(super::Action::Reveal { revision, row })
                                 }))
                                 .content("Show in drawer")
                         });
-                        difference_row(item, reveal)
+                        let verify = item.can_verify().then(|| {
+                            Button::new()
+                                .automation_name(format!("Verify contents of {}", item.path))
+                                .is_enabled(reveal_enabled)
+                                .on_click(context.callback(move |_| {
+                                    message(super::Action::Verify(super::verify::Action::Row {
+                                        revision,
+                                        row,
+                                    }))
+                                }))
+                                .content("Verify contents")
+                        });
+                        Some(result_row(item, reveal, verify))
                     }),
                 )),
         ));
@@ -206,11 +321,11 @@ impl Browser {
                         Button::new()
                             .is_enabled(start > 0)
                             .on_click(context.callback(move |_| dispatch(Action::Previous)))
-                            .content("Previous differences"),
+                            .content(previous),
                         Button::new()
                             .is_enabled(end < total)
                             .on_click(context.callback(move |_| dispatch(Action::Next)))
-                            .content("Next differences"),
+                            .content(next),
                     )),
             ));
         }
@@ -275,9 +390,12 @@ fn change_label(kind: Option<FolderChange>) -> &'static str {
     }
 }
 
-fn difference_row(item: &FolderDifference, reveal: Option<View>) -> KeyedView {
-    let label = change_label(Some(item.change));
+fn result_row(item: RowDetails<'_>, reveal: Option<View>, verify: Option<View>) -> KeyedView {
+    let label = item
+        .change
+        .map_or("Matching metadata", |change| change_label(Some(change)));
     let detail = match (item.reference, item.current) {
+        (Some(entry), Some(_)) if item.change.is_none() => entry_summary(entry),
         (Some(reference), Some(current)) => format!(
             "Reference  {}\nCurrent  {}",
             entry_summary(reference),
@@ -287,7 +405,7 @@ fn difference_row(item: &FolderDifference, reveal: Option<View>) -> KeyedView {
         (None, None) => String::new(),
     };
     KeyedView::new(
-        item.path.as_str(),
+        item.path,
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Auto])
             .column_spacing(6.0)
@@ -295,7 +413,14 @@ fn difference_row(item: &FolderDifference, reveal: Option<View>) -> KeyedView {
                 TextBlock::new()
                     .text(format!("{label} · {}\n{detail}", item.path))
                     .text_wrapping(TextWrapping::Wrap),
-                reveal.unwrap_or_else(View::empty),
+                StackPanel::new()
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .spacing(4.0)
+                    .children((
+                        reveal.unwrap_or_else(View::empty),
+                        verify.unwrap_or_else(View::empty),
+                    )),
             )),
     )
 }
@@ -320,6 +445,8 @@ fn entry_summary(entry: FolderEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use w11term::sftp::{FolderDifference, FolderMatchedFile};
 
     #[test]
     fn paging_and_literal_path_filters_cover_the_complete_report() {
@@ -349,14 +476,51 @@ mod tests {
         browser.update(&report, Action::Previous);
         assert_eq!(browser.page * PAGE_SIZE, last - PAGE_SIZE);
         browser.update(&report, Action::Query("ä[SUMMARY]".into()));
-        assert_eq!(browser.matches, [last]);
+        assert_eq!(browser.matches, [Row::Difference(last)]);
         assert_eq!(browser.page, 0);
-        browser.update(&report, Action::Filter(Some(FolderChange::CurrentOnly)));
+        browser.update(
+            &report,
+            Action::Filter(Filter::Differences(Some(FolderChange::CurrentOnly))),
+        );
         assert!(browser.matches.is_empty());
-        browser.update(&report, Action::Filter(Some(FolderChange::Metadata)));
+        browser.update(
+            &report,
+            Action::Filter(Filter::Differences(Some(FolderChange::Metadata))),
+        );
         browser.index(&report);
-        assert_eq!(browser.matches, [last]);
+        assert_eq!(browser.matches, [Row::Difference(last)]);
         browser.update(&report, Action::Query("x".repeat(MAX_QUERY_CHARS + 1)));
         assert!(browser.matches.is_empty());
+    }
+
+    #[test]
+    fn matching_files_are_searchable_when_the_report_has_no_differences() {
+        let file = serde_json::from_value(json!({
+            "kind": 0o100000, "size": 10, "mtime": 5,
+        }))
+        .unwrap();
+        let report = FolderComparison {
+            matching_files: (0..45)
+                .map(|index| FolderMatchedFile {
+                    path: format!("docs/{index:02}.txt"),
+                    reference: file,
+                    current: file,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut browser = Browser::default();
+        browser.index(&report);
+        assert!(browser.matches.is_empty());
+        browser.update(&report, Action::Filter(Filter::MatchingFiles));
+        browser.update(&report, Action::Next);
+        assert_eq!(browser.matches.len(), 45);
+        assert_eq!(browser.page, 1);
+        browser.update(&report, Action::Query("DOCS/44".into()));
+        assert_eq!(browser.matches, [Row::MatchingFile(44)]);
+        assert_eq!(browser.page, 0);
+        let row = browser.matches[0].get(&report).unwrap();
+        assert_eq!(row.path, "docs/44.txt");
+        assert!(row.can_verify());
     }
 }

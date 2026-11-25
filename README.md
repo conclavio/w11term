@@ -423,6 +423,8 @@ Choose **Show in drawer** beside a difference with a current remote entry to ope
 
 Choose **Verify file contents…** and enter an exact relative path from the reference to compare the live files by SHA-256. This works with a Windows or remote reference and can find byte changes even when the file size and modification time match. Each file may be up to 32 MiB. The result describes the bytes read during verification, independently of the captured metadata report.
 
+Select **Files with matching metadata** in the comparison filter to browse regular files with equal reported size and modification time. Use **Verify contents** on any row with regular files on both sides to start a SHA-256 check for that exact path. **Back to comparison** restores the filter and page.
+
 Choose **Preview image…** on a PNG, JPEG or GIF in the SFTP listing or search results to see the image and its original dimensions. The preview reads a regular file over the pane’s existing connection and displays a scaled still image, including the first frame of an animated GIF. It accepts files up to 8 MiB with dimensions up to 4096 pixels per side and up to 8,388,608 pixels in total.
 
 Choose **Tail text file…** in the listing or search results to read up to 200 lines from the last 64 KiB of a regular UTF-8 file. The drawer shows the file size and indicates when it omitted earlier text. **Refresh tail** reads the path again, so it picks up appended output or a log file replaced by rotation. You can select and copy the text.
