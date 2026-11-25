@@ -753,7 +753,7 @@ impl Line {
             cells.push(c.as_cell());
             for _ in 1..c.width() {
                 let mut attrs = c.attrs().clone();
-                attrs.set_explicit_width(false);
+                attrs.clear_text_sizing();
                 cells.push(Cell::blank_with_attrs(attrs));
             }
         }
@@ -886,7 +886,7 @@ impl Line {
         // are overlapped by this one are blanked out.
         if width > 1 {
             let mut attrs = cell.attrs().clone();
-            attrs.set_explicit_width(false);
+            attrs.clear_text_sizing();
             let blank = Cell::blank_with_attrs(attrs);
             for i in 1..width {
                 self.raw_set_cell(idx + i, blank.clone(), clear);
@@ -951,7 +951,7 @@ impl Line {
             let end = start + cells[start].width();
             if end > cutoff && cells[start].attrs().explicit_width() {
                 let mut attrs = cells[start].attrs().clone();
-                attrs.set_explicit_width(false).set_wrapped(false);
+                attrs.clear_text_sizing().set_wrapped(false);
                 #[cfg(feature = "use_image")]
                 attrs.clear_images();
                 let blank = Cell::blank_with_attrs(attrs);
@@ -1233,7 +1233,7 @@ impl Line {
                     cells.push(cell.as_cell());
                     for _ in 1..cell.width() {
                         let mut attrs = cell.attrs().clone();
-                        attrs.set_explicit_width(false);
+                        attrs.clear_text_sizing();
                         cells.push(Cell::new(' ', attrs));
                     }
                 }

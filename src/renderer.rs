@@ -10,7 +10,7 @@ use w11term::{
     terminal::{Rgba, Snapshot, colors, rgba},
 };
 use wezterm_term::{
-    Intensity, Underline,
+    FractionalTextScale, Intensity, Underline,
     image::{ImageCell, ImageDataType},
 };
 use windows_canvas::{
@@ -117,6 +117,7 @@ struct TextRun<'a> {
     cols: usize,
     shape: bool,
     explicit_width: bool,
+    fraction: Option<FractionalTextScale>,
     scale: (f32, f32),
 }
 
@@ -231,7 +232,7 @@ enum RunKind {
 }
 
 fn run_kind(cell: &wezterm_term::CellRef<'_>, ligatures: bool, rtl: bool) -> Option<RunKind> {
-    if cell.attrs().explicit_width() {
+    if cell.attrs().explicit_width() || cell.attrs().fractional_text_scale().is_some() {
         return None;
     }
     let text = cell.str();
@@ -307,6 +308,20 @@ fn glyph_row(line: &wezterm_term::Line, top: f32, cell_height: f32) -> (f32, f32
     } else {
         (top, 1.0)
     }
+}
+
+fn fractional_glyph_row(
+    fraction: Option<FractionalTextScale>,
+    top: f32,
+    height: f32,
+) -> (f32, f32) {
+    fraction.map_or((top, height), |fraction| {
+        let reduced_height = height * fraction.factor();
+        (
+            top + fraction.vertical_offset(height - reduced_height),
+            reduced_height,
+        )
+    })
 }
 
 fn draw_ink_lines(
@@ -439,13 +454,14 @@ impl Renderer {
     fn shape_text(
         &mut self,
         run: TextRun<'_>,
-    ) -> windows_canvas::Result<Option<(&TextLayout, (f32, f32))>> {
+    ) -> windows_canvas::Result<Option<(&CachedLayout, (f32, f32))>> {
         let TextRun {
             text,
             style,
             cols,
             shape,
             explicit_width,
+            fraction,
             mut scale,
         } = run;
         if text.trim_end_matches(' ').is_empty() {
@@ -475,11 +491,19 @@ impl Renderer {
         let cached = &self.layouts[&key];
         // Anchor each shaped run to its occupied grid columns even when DirectWrite
         // chose a proportional fallback font or the grid was snapped to physical pixels.
-        if (shape || explicit_width) && cached.natural_width > 0.0 {
+        let factor = fraction.map_or(1.0, FractionalTextScale::factor);
+        if (shape || explicit_width || fraction.is_some()) && cached.natural_width > 0.0 {
             let fit = cols as f32 * self.metrics.cell_width / cached.natural_width;
-            scale.0 *= if explicit_width { fit.min(1.0) } else { fit };
+            scale.0 *= if explicit_width || fraction.is_some() {
+                fit.min(factor)
+            } else {
+                fit
+            };
+        } else {
+            scale.0 *= factor;
         }
-        Ok(Some((&cached.layout, scale)))
+        scale.1 *= factor;
+        Ok(Some((cached, scale)))
     }
 
     pub fn draw(
@@ -859,7 +883,7 @@ impl Renderer {
                 )
         });
         let mut block_extent = None;
-        let mut block_decorations = (Underline::None, false, false);
+        let mut block_decorations = (Underline::None, false, false, None);
         let mut cursor_ink = None;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
@@ -911,8 +935,12 @@ impl Renderer {
                     ));
                     if !cell.attrs().invisible() {
                         let attrs = cell.attrs();
-                        block_decorations =
-                            (attrs.underline(), attrs.overline(), attrs.strikethrough());
+                        block_decorations = (
+                            attrs.underline(),
+                            attrs.overline(),
+                            attrs.strikethrough(),
+                            attrs.fractional_text_scale(),
+                        );
                     }
                 }
             }
@@ -925,6 +953,9 @@ impl Renderer {
                     if attrs.invisible() {
                         continue;
                     }
+                    let fraction = attrs.fractional_text_scale();
+                    let (glyph_top, glyph_height) =
+                        fractional_glyph_row(fraction, glyph_top, glyph_height);
                     let visual = map.visual(col);
                     let x = PADDING + visual as f32 * row_cw;
                     let (fg, _) = colors(attrs, &frame.palette);
@@ -955,7 +986,6 @@ impl Renderer {
                         } else {
                             text
                         };
-                        let origin = (PADDING + left as f32 * row_cw, glyph_top);
                         let layout = self.shape_text(TextRun {
                             text,
                             style: TextStyle {
@@ -966,9 +996,16 @@ impl Renderer {
                             cols,
                             shape: kind.is_some(),
                             explicit_width: attrs.explicit_width(),
+                            fraction,
                             scale: (width_scale as f32, height_scale),
                         })?;
-                        if let Some((layout, scale)) = layout {
+                        if let Some((cached, scale)) = layout {
+                            let inset = fraction.map_or(0.0, |fraction| {
+                                let extra = cols as f32 * row_cw - cached.natural_width * scale.0;
+                                fraction.horizontal_offset(extra.max(0.0))
+                            });
+                            let origin = (PADDING + left as f32 * row_cw + inset, glyph_top);
+                            let layout = &cached.layout;
                             let run = ShapedRun {
                                 layout,
                                 origin,
@@ -976,7 +1013,7 @@ impl Renderer {
                                 ink: fg,
                             };
                             let columns = left * width_scale..(left + cols) * width_scale;
-                            if attrs.explicit_width() {
+                            if attrs.explicit_width() || fraction.is_some() {
                                 native.with_clip(row.rect(columns.clone()), || {
                                     run.draw(&native, row, columns, selected_ink)
                                 })?;
@@ -1063,16 +1100,18 @@ impl Renderer {
                         if let Some((layout, origin, scale)) = cursor_ink {
                             native.cursor_text(&layout, origin, ink, scale)?;
                         }
-                        let (underline, overline, strike) = block_decorations;
+                        let (underline, overline, strike, fraction) = block_decorations;
                         if underline != Underline::None || overline || strike {
                             brush.set_color(color(ink));
                             let (glyph_top, height_scale) =
                                 glyph_row(&frame.rows[cursor.row], y, ch);
+                            let (glyph_top, glyph_height) =
+                                fractional_glyph_row(fraction, glyph_top, ch * height_scale);
                             let glyph_rect = Rect::from_xywh(
                                 PADDING + left as f32 * cw,
                                 glyph_top,
                                 cols as f32 * cw,
-                                ch * height_scale,
+                                glyph_height,
                             );
                             draw_underline(ctx, &brush, underline, glyph_rect, self.metrics.scale);
                             draw_ink_lines(
@@ -2306,6 +2345,62 @@ mod tests {
         let cell = |col: u32| actual.get_pixel((2 * col + 1) * actual.width() / 6, y).0;
         assert_eq!(cell(0), [255, 0, 0], "default background shows the image");
         assert_eq!(cell(1), [0, 0, 0], "explicit RGB paints over the image");
+    }
+
+    #[test]
+    fn offscreen_kitty_fractional_text_scales_and_aligns_both_axes() {
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 4,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b]66;n=1:d=2:w=3;WW\x07\r\n",
+            "\x1b]66;n=1:d=2:w=3:h=2:v=2;WW\x07\r\n",
+            "\x1b]66;n=1:d=2:w=3:h=1:v=1;WW\x07\r\n",
+            "\x1b]66;w=3;WW\x07"
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kitty-fractional.png");
+        let (width, height) = screenshot(&frame, size, &path).unwrap();
+        let pixels = image::open(path).unwrap().into_rgb8();
+        let cw = width / 8;
+        let ch = height / 4;
+        let bounds = |row: u32| {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for y in 0..ch {
+                for x in 0..width {
+                    if pixels.get_pixel(x, row * ch + y).0 != [0, 0, 0] {
+                        assert!(x < 3 * cw, "ink escaped its three columns");
+                        xs.push(x);
+                        ys.push(y);
+                    }
+                }
+            }
+            (
+                *xs.iter().min().unwrap(),
+                *xs.iter().max().unwrap(),
+                *ys.iter().min().unwrap(),
+                *ys.iter().max().unwrap(),
+            )
+        };
+        let (top, middle, bottom, full) = (bounds(0), bounds(1), bounds(2), bounds(3));
+        assert!(
+            top.0 < middle.0 && middle.0 < bottom.0,
+            "{top:?} {middle:?} {bottom:?}"
+        );
+        assert!(
+            top.2 < middle.2 && middle.2 < bottom.2,
+            "{top:?} {middle:?} {bottom:?}"
+        );
+        assert!(top.1 - top.0 < full.1 - full.0);
+        assert!(top.3 - top.2 < full.3 - full.2);
     }
 
     #[test]

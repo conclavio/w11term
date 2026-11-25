@@ -19,7 +19,8 @@ use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 use wezterm_bidi::ParagraphDirectionHint;
 use wezterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, FractionalTextScale,
+    SemanticType,
 };
 use wezterm_escape_parser::csi::{
     CharacterPath, CsiParam, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -138,12 +139,17 @@ impl Performer<'_> {
         } else {
             p.as_str()
         };
-        self.print_cells(text, None);
+        self.print_cells(text, None, None);
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
     }
 
-    fn print_cells(&mut self, text: &str, explicit_width: Option<usize>) {
+    fn print_cells(
+        &mut self,
+        text: &str,
+        explicit_width: Option<usize>,
+        fraction: Option<FractionalTextScale>,
+    ) {
         let seqno = self.seqno;
         let row_geometry = |state: &TerminalState| {
             let scale = state.screen().line_width_scale(state.cursor.y);
@@ -157,6 +163,7 @@ impl Performer<'_> {
         };
         let (mut sized, mut right) = row_geometry(self.state);
         let track = self.track_primary_prints && !self.is_alt_screen_active();
+        let sized_text = explicit_width.is_some() || fraction.is_some();
         let mut last_print = None;
         let mut text_run = explicit_width.map(|_| text);
         let mut graphemes = Graphemes::new(if explicit_width.is_some() { "" } else { text });
@@ -218,10 +225,10 @@ impl Performer<'_> {
             }
 
             let left = self.left_and_right_margins.start.min(right - 1);
-            if explicit_width.is_some() && print_width > right - left {
+            if sized_text && print_width > right - left {
                 continue;
             }
-            if (sized || explicit_width.is_some())
+            if (sized || sized_text)
                 && self.dec_auto_wrap
                 && self.cursor.x > left
                 && self.cursor.x.saturating_add(print_width) > right
@@ -264,7 +271,7 @@ impl Performer<'_> {
             }
 
             let y = self.cursor.y;
-            let x = if explicit_width.is_some() {
+            let x = if sized_text {
                 if print_width > right - self.left_and_right_margins.start.min(right - 1) {
                     continue;
                 }
@@ -284,6 +291,9 @@ impl Performer<'_> {
             let mut pen = self.pen.clone();
             if explicit_width.is_some() {
                 pen.set_explicit_width(true);
+            }
+            if fraction.is_some() {
+                pen.set_fractional_text_scale(fraction);
             }
 
             let wrappable = x + print_width >= right;
@@ -323,7 +333,7 @@ impl Performer<'_> {
                 self.wrap_next = false;
             } else {
                 self.wrap_next = self.dec_auto_wrap;
-                if explicit_width.is_some() {
+                if sized_text {
                     self.cursor.x = right - 1;
                 }
             }
@@ -334,7 +344,7 @@ impl Performer<'_> {
         }
     }
 
-    fn kitty_text_width(&mut self, metadata: &[u8], payload: &[u8]) {
+    fn kitty_text_size(&mut self, metadata: &[u8], payload: &[u8]) {
         let Ok(metadata) = std::str::from_utf8(metadata) else {
             return;
         };
@@ -345,6 +355,7 @@ impl Performer<'_> {
             return;
         }
         let mut width = 0;
+        let (mut numerator, mut denominator, mut horizontal, mut vertical) = (0, 0, 0, 0);
         for field in metadata.split(':').filter(|field| !field.is_empty()) {
             let Some((key, value)) = field.split_once('=') else {
                 return;
@@ -355,12 +366,18 @@ impl Performer<'_> {
             match key {
                 "w" if number <= 7 => width = usize::from(number),
                 "s" if number == 1 => {}
-                "n" | "d" if number == 0 => {}
-                "h" | "v" if number <= 2 => {}
+                "n" if number <= 15 => numerator = number,
+                "d" if number <= 15 => denominator = number,
+                "h" if number <= 2 => horizontal = number,
+                "v" if number <= 2 => vertical = number,
                 _ => return,
             }
         }
-        self.print_cells(text, (width != 0).then_some(width));
+        if denominator != 0 && numerator >= denominator {
+            return;
+        }
+        let fraction = FractionalTextScale::new(numerator, denominator, horizontal, vertical);
+        self.print_cells(text, (width != 0).then_some(width), fraction);
     }
 
     /// ConPTY, at the time of writing, does something horrible to rewrite
@@ -1164,7 +1181,7 @@ impl Performer<'_> {
             OperatingSystemCommand::Unspecified(unspec) => {
                 match unspec.as_slice() {
                     [selector, metadata, payload] if selector == b"66" => {
-                        self.kitty_text_width(metadata, payload);
+                        self.kitty_text_size(metadata, payload);
                         return;
                     }
                     [selector, body] if selector == b"22" => {

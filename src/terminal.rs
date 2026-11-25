@@ -2336,6 +2336,73 @@ mod tests {
     }
 
     #[test]
+    fn kitty_fractional_text_keeps_ratios_local_and_preserves_grid_advance() {
+        use wezterm_term::FractionalTextScale;
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes(concat!(
+            "\x1b]66;n=1:d=2:h=1:v=2:w=1;ab\x07",
+            "\x1b]66;v=1:d=3:n=2;界x\x1b\\",
+            "\x1b]66;w=5:n=2:d=2;invalid\x07",
+            "\x1b]66;w=5:n=1:d=16;invalid\x07",
+            "\x1b]66;w=5:n=1:d=2:h=3;invalid\x07",
+            "\x1b]66;s=2:n=1:d=2;unsupported\x07",
+            "Z\x1b[6n"
+        ));
+        assert_eq!(receive(&mut wire), b"\x1b[1;6R");
+        let check_frame = |frame: &Snapshot, tail_row: usize, tail_col: usize| {
+            let mut cells = frame.rows[0].visible_cells();
+            let cell = cells.next().unwrap();
+            assert_eq!((cell.str(), cell.width()), ("ab", 1));
+            assert_eq!(
+                cell.attrs().fractional_text_scale(),
+                FractionalTextScale::new(1, 2, 1, 2)
+            );
+            for (expected, width) in [("界", 2), ("x", 1)] {
+                let cell = cells.next().unwrap();
+                assert_eq!((cell.str(), cell.width()), (expected, width));
+                assert_eq!(
+                    cell.attrs().fractional_text_scale(),
+                    FractionalTextScale::new(2, 3, 0, 1)
+                );
+                assert!(!cell.attrs().explicit_width());
+            }
+            let tail = frame.rows[tail_row].get_cell(tail_col).unwrap();
+            assert_eq!(tail.str(), "Z");
+            assert_eq!(tail.attrs().fractional_text_scale(), None);
+        };
+        check_frame(
+            &Snapshot::capture(&terminal, None, 1, 0, String::new(), 0),
+            0,
+            4,
+        );
+        let rows = terminal.screen().physical_rows;
+        terminal.resize(TerminalSize {
+            cols: 4,
+            rows,
+            ..TerminalSize::default()
+        });
+        check_frame(
+            &Snapshot::capture(&terminal, None, 2, 0, String::new(), 0),
+            1,
+            0,
+        );
+
+        terminal.resize(TerminalSize {
+            cols: 6,
+            rows,
+            ..TerminalSize::default()
+        });
+        terminal.advance_bytes("\x1b[2J\x1b[H12345\x1b]66;n=1:d=2;界\x07Q\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[2;4R");
+        let frame = Snapshot::capture(&terminal, None, 3, 0, String::new(), 0);
+        let mut cells = frame.rows[1].visible_cells();
+        let wide = cells.next().unwrap();
+        assert_eq!((wide.cell_index(), wide.width(), wide.str()), (0, 2, "界"));
+        assert!(wide.attrs().fractional_text_scale().is_some());
+        assert_eq!(cells.next().unwrap().cell_index(), 2);
+    }
+
+    #[test]
     fn kitty_text_width_places_literal_text_and_answers_the_width_probe() {
         let (mut terminal, mut wire) = engine();
         for bytes in [

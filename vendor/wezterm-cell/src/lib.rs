@@ -195,6 +195,51 @@ impl Default for SemanticType {
 
 pub use wezterm_escape_parser::csi::{Blink, Intensity, Underline, VerticalAlign};
 
+/// Placement of a reduced text run inside its original cell area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FractionalTextScale {
+    numerator: u8,
+    denominator: u8,
+    horizontal: u8,
+    vertical: u8,
+}
+
+impl FractionalTextScale {
+    pub fn new(numerator: u8, denominator: u8, horizontal: u8, vertical: u8) -> Option<Self> {
+        (numerator != 0
+            && numerator < denominator
+            && denominator <= 15
+            && horizontal <= 2
+            && vertical <= 2)
+            .then_some(Self { numerator, denominator, horizontal, vertical })
+    }
+
+    pub fn factor(self) -> f32 {
+        f32::from(self.numerator) / f32::from(self.denominator)
+    }
+
+    pub fn horizontal_offset(self, extra: f32) -> f32 {
+        Self::offset(self.horizontal, extra)
+    }
+
+    pub fn vertical_offset(self, extra: f32) -> f32 {
+        Self::offset(self.vertical, extra)
+    }
+
+    fn offset(alignment: u8, extra: f32) -> f32 {
+        match alignment {
+            1 => extra,
+            2 => extra * 0.5,
+            _ => 0.0,
+        }
+    }
+}
+
+// Four bits each for the ratio and two each for the alignments fit in the
+// existing attributes word. An ordinary cell uses zero for the whole field.
+const FRACTIONAL_SCALE_SHIFT: u32 = 19;
+const FRACTIONAL_SCALE_MASK: u32 = 0xfff << FRACTIONAL_SCALE_SHIFT;
+
 impl Default for CellAttributes {
     fn default() -> Self {
         Self::blank()
@@ -215,6 +260,32 @@ impl CellAttributes {
     bitfield!(vertical_align, set_vertical_align, VerticalAlign, 0b11, 15);
     bitfield!(protected, set_protected, 17);
     bitfield!(explicit_width, set_explicit_width, 18);
+
+    pub fn fractional_text_scale(&self) -> Option<FractionalTextScale> {
+        let bits = (self.attributes & FRACTIONAL_SCALE_MASK) >> FRACTIONAL_SCALE_SHIFT;
+        FractionalTextScale::new(
+            (bits & 15) as u8,
+            ((bits >> 4) & 15) as u8,
+            ((bits >> 8) & 3) as u8,
+            ((bits >> 10) & 3) as u8,
+        )
+    }
+
+    pub fn set_fractional_text_scale(&mut self, scale: Option<FractionalTextScale>) -> &mut Self {
+        let bits = scale.map_or(0, |scale| {
+            u32::from(scale.numerator)
+                | u32::from(scale.denominator) << 4
+                | u32::from(scale.horizontal) << 8
+                | u32::from(scale.vertical) << 10
+        });
+        self.attributes =
+            (self.attributes & !FRACTIONAL_SCALE_MASK) | bits << FRACTIONAL_SCALE_SHIFT;
+        self
+    }
+
+    pub fn clear_text_sizing(&mut self) -> &mut Self {
+        self.set_explicit_width(false).set_fractional_text_scale(None)
+    }
 
     pub const fn blank() -> Self {
         Self {
@@ -450,6 +521,7 @@ impl CellAttributes {
         // easier time in get_semantic_zones.
         res.set_semantic_type(SemanticType::default());
         res.set_protected(false);
+        res.clear_text_sizing();
         res.set_underline_color(self.underline_color());
 
         // Turn off underline because it can have surprising results

@@ -2,7 +2,7 @@ use super::{in_band_resize::WireReader, *};
 use tokio::sync::mpsc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kitty_text_width_probe_and_payload_limit_over_ssh() {
+async fn kitty_text_sizing_probe_fraction_and_payload_limit_over_ssh() {
     let (tx, rx) = mpsc::unbounded_channel();
     let (source, _root, _, server) = fixture_with_wire(false, 1, Arc::default(), Some(tx)).await;
     let session = Session::start_sized(
@@ -29,12 +29,19 @@ async fn kitty_text_width_probe_and_payload_limit_over_ssh() {
     wire.input(channel, b"\x1b[1;10R").await;
     peer.data(channel, too_long.into_bytes()).await.unwrap();
     wire.input(channel, b"\x1b[1;11R").await;
+    peer.data(
+        channel,
+        b"\x1b[2;1H\x1b]66;w=3:n=1:d=2:h=1:v=1;SUP\x07!\x1b[6n".as_slice(),
+    )
+    .await
+    .unwrap();
+    wire.input(channel, b"\x1b[2;5R").await;
     let frame = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
             let frame = session.frames.load();
-            if frame.rows[0]
-                .get_cell(9)
-                .is_some_and(|cell| cell.str() == "Z")
+            if frame.rows[1]
+                .get_cell(3)
+                .is_some_and(|cell| cell.str() == "!")
             {
                 break frame;
             }
@@ -42,7 +49,7 @@ async fn kitty_text_width_probe_and_payload_limit_over_ssh() {
         }
     })
     .await
-    .expect("published text width frame");
+    .expect("published fractional text");
     let mut cells = frame.rows[0].visible_cells();
     assert_eq!(cells.next().unwrap().width(), 2);
     let text = cells.next().unwrap();
@@ -52,5 +59,11 @@ async fn kitty_text_width_probe_and_payload_limit_over_ssh() {
     );
     let tail = cells.next().unwrap();
     assert_eq!((tail.cell_index(), tail.str()), (9, "Z"));
+    let cell = frame.rows[1].get_cell(0).unwrap();
+    assert_eq!((cell.str(), cell.width()), ("SUP", 3));
+    assert_eq!(
+        cell.attrs().fractional_text_scale(),
+        wezterm_term::FractionalTextScale::new(1, 2, 1, 1)
+    );
     server.abort();
 }
