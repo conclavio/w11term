@@ -22,6 +22,7 @@ mod downloads;
 mod editor;
 pub(super) mod find;
 mod history;
+mod move_batch;
 mod preview;
 mod properties;
 mod sort;
@@ -353,6 +354,7 @@ enum EditAction {
     Rename(ListedEntry),
     RenameSearch(u64, FilenameMatch),
     Move(FileTarget, Option<EntryKind>),
+    MoveSearchBatch(u64, Vec<FilenameMatch>),
     VerifyDownload(FileTarget),
     Delete(FileTarget, EntryKind),
 }
@@ -364,6 +366,7 @@ impl EditAction {
             | Self::Create
             | Self::VerifyDownload(_)
             | Self::RenameSearch(..)
+            | Self::MoveSearchBatch(..)
             | Self::Move(FileTarget::Search(..), _)
             | Self::Delete(FileTarget::Search(..), _) => None,
             Self::Rename(entry)
@@ -383,6 +386,36 @@ impl EditAction {
 }
 
 impl EntryDialog {
+    fn check_move_folder(&self, folder: &str) -> Result<()> {
+        let check = |parent: &str, name: &str, kind| {
+            ensure!(
+                folder.trim_end_matches('/') != parent.trim_end_matches('/'),
+                "Choose a destination different from the containing folder of {name}"
+            );
+            if kind == Some(EntryKind::Directory) {
+                let path = entry_path(parent, name)?;
+                ensure!(
+                    folder != path
+                        && !folder
+                            .strip_prefix(&path)
+                            .is_some_and(|suffix| suffix.starts_with('/')),
+                    "A folder cannot be moved into itself or one of its descendants"
+                );
+            }
+            Ok(())
+        };
+        match &self.action {
+            EditAction::Move(target, kind) => check(target.parent(), target.name(), *kind),
+            EditAction::MoveSearchBatch(_, hits) => {
+                for hit in hits {
+                    check(&hit.parent, &hit.name, hit.kind)?;
+                }
+                Ok(())
+            }
+            _ => bail!("Open a move dialog before choosing its destination"),
+        }
+    }
+
     fn destination(&self) -> Result<String> {
         let parent = || self.parent.as_deref().context("Missing remote directory");
         match &self.action {
@@ -407,7 +440,7 @@ impl EntryDialog {
             EditAction::RenameSearch(_, hit) if self.name == hit.name => {
                 bail!("Enter a different name")
             }
-            EditAction::Move(_, _) => {
+            EditAction::Move(..) | EditAction::MoveSearchBatch(..) => {
                 ensure!(
                     !self.name.trim().is_empty()
                         && !self.name.contains('\\')
@@ -422,10 +455,7 @@ impl EntryDialog {
                 };
                 let trimmed = folder.trim_end_matches('/');
                 let folder = if trimmed.is_empty() { "/" } else { trimmed };
-                ensure!(
-                    folder.trim_end_matches('/') != source.trim_end_matches('/'),
-                    "Choose a different destination folder"
-                );
+                self.check_move_folder(folder)?;
                 Ok(folder.to_owned())
             }
             EditAction::Delete(target, _) => delete_path(parent()?, target.name()),
@@ -482,6 +512,7 @@ enum Step {
     IdentifyDelete(ListedEntry),
     Preview(u64),
     MoveDestination(u64, u64),
+    MoveSearchBatch(move_batch::Batch),
     Search(u64, Option<String>),
     SaveText(editor::Save),
     Transfer(TransferFile),
@@ -1336,7 +1367,9 @@ impl FileDrawer {
             serial: self.dialog_serial,
             parent,
             name: match &action {
-                EditAction::VerifyDownload(_) | EditAction::Move(..) => String::new(),
+                EditAction::VerifyDownload(_)
+                | EditAction::Move(..)
+                | EditAction::MoveSearchBatch(..) => String::new(),
                 EditAction::RenameSearch(_, hit) => hit.name.clone(),
                 action => action
                     .original()
@@ -1373,7 +1406,9 @@ impl FileDrawer {
         }
         ensure!(
             self.open
-                && (dialog.action.search_hit().is_some() || self.directory == dialog.parent)
+                && (dialog.action.search_hit().is_some()
+                    || matches!(dialog.action, EditAction::MoveSearchBatch(..))
+                    || self.directory == dialog.parent)
                 && !matches!(dialog.action, EditAction::GoToFolder { revision } if revision != self.listing_revision),
             "The directory changed. Open the file action again."
         );
@@ -1389,6 +1424,17 @@ impl FileDrawer {
                 "Wait for the current file operation to finish"
             );
             self.search_hit_path(serial, hit)?;
+        }
+        if let EditAction::MoveSearchBatch(serial, hits) = &dialog.action {
+            ensure!(
+                !self.busy(),
+                "Wait for the current file operation to finish"
+            );
+            let (root, current) = self.marked_search_moves(*serial)?;
+            ensure!(
+                dialog.parent.as_deref() == Some(root.as_str()) && *hits == current,
+                "The marked results changed. Review the move again."
+            );
         }
         let path = dialog.destination()?;
         Ok(Some((dialog, path)))
@@ -1447,6 +1493,9 @@ impl FileDrawer {
                 ("Rename entry", "New name", "Rename")
             }
             EditAction::Move(..) => ("Move remote entry", "Destination folder", "Move"),
+            EditAction::MoveSearchBatch(..) => {
+                ("Move marked entries", "Destination folder", "Move")
+            }
             EditAction::VerifyDownload(_) => (
                 "Download and verify",
                 "Expected SHA-256",
@@ -1502,6 +1551,42 @@ impl FileDrawer {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             );
+        } else if let EditAction::MoveSearchBatch(_, hits) = &dialog.action {
+            let paths = hits
+                .iter()
+                .map(|hit| format!("{}/{}", hit.parent.trim_end_matches('/'), hit.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fields.insert(
+                0,
+                KeyedView::new(
+                    "move-sources",
+                    StackPanel::new().spacing(4.0).children((
+                        TextBlock::new()
+                            .text(format!(
+                                "{} entries on {}@{}:{}",
+                                hits.len(),
+                                ssh.user,
+                                ssh.host,
+                                ssh.port
+                            ))
+                            .text_wrapping(TextWrapping::Wrap),
+                        ScrollViewer::new()
+                            .max_height(145.0)
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            .content(
+                                TextBlock::new()
+                                    .text(paths)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            ),
+                    )),
+                ),
+            );
+        }
+        if matches!(
+            dialog.action,
+            EditAction::Move(..) | EditAction::MoveSearchBatch(..)
+        ) {
             fields.push(KeyedView::new(
                 "browse-destination",
                 Button::new()
@@ -1518,7 +1603,10 @@ impl FileDrawer {
             fields.push(KeyedView::new(
                 "move-relative",
                 TextBlock::new()
-                    .text(format!("Relative paths start in {}.", target.parent()))
+                    .text(format!(
+                        "Relative paths start in {}.",
+                        dialog.parent.as_deref().unwrap_or("/")
+                    ))
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -1756,6 +1844,11 @@ impl FileDrawer {
                 reply,
                 ..
             }) => change_reconnect_status(change, reply),
+            Some(Pending {
+                step: Step::MoveSearchBatch(batch),
+                reply,
+                ..
+            }) => batch.reconnect_status(reply),
             Some(Pending {
                 step: Step::Transfer(file),
                 reply,
@@ -2644,6 +2737,9 @@ impl FileDrawer {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
             (Step::MoveDestination(serial, revision), reply) => {
                 self.finish_destination_listing(serial, revision, reply)
+            }
+            (Step::MoveSearchBatch(batch), reply) => {
+                self.finish_move_batch(id, session, batch, reply, context)?
             }
             (Step::Search(serial, note), reply) => {
                 self.finish_search(serial, reply, note.as_deref())
@@ -3578,8 +3674,13 @@ impl TerminalApp {
                                         from,
                                         directory: path,
                                         kind,
+                                        destination_is_canonical: false,
                                     },
                                 )
+                            }
+                            EditAction::MoveSearchBatch(serial, hits) => {
+                                let batch = move_batch::Batch::new(serial, hits, path)?;
+                                return files.start_move_batch(pane, session, batch, context);
                             }
                             EditAction::Create => {
                                 files.status = format!("Creating folder {name}…");

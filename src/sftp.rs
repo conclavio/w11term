@@ -55,6 +55,7 @@ pub use drop_source::{DropSource, classify_drop};
 pub const CHUNK: usize = 32 * 1024;
 pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
+pub const MOVE_OUTCOME_UNKNOWN: &str = "Move outcome unknown; refresh both folders to check";
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 pub fn normalize_sha256(value: &str) -> Result<String> {
@@ -356,6 +357,7 @@ pub enum Operation {
         from: String,
         directory: String,
         kind: Option<EntryKind>,
+        destination_is_canonical: bool,
     },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
@@ -1145,6 +1147,7 @@ impl Engine {
         from: String,
         directory: String,
         expected_kind: Option<EntryKind>,
+        destination_is_canonical: bool,
         stage: &mut JobStage,
     ) -> Result<Value> {
         let (parent, name) = from.rsplit_once('/').context("Missing source folder")?;
@@ -1166,6 +1169,10 @@ impl Engine {
             .canonical_remote_path(&directory)
             .await
             .context("Could not resolve the destination folder")?;
+        ensure!(
+            !destination_is_canonical || destination == directory,
+            "The destination folder changed. Refresh the drawer."
+        );
         ensure!(
             parent != destination,
             "Choose a different destination folder"
@@ -1203,13 +1210,8 @@ impl Engine {
             "The destination is not a folder"
         );
         let to = format!("{}/{name}", destination.trim_end_matches('/'));
-        self.rename_without_replacement(
-            from,
-            to,
-            "Move outcome unknown; refresh both folders to check",
-            stage,
-        )
-        .await?;
+        self.rename_without_replacement(from, to, MOVE_OUTCOME_UNKNOWN, stage)
+            .await?;
         Ok(json!({"directory":destination}))
     }
 
@@ -1602,7 +1604,11 @@ impl Engine {
                 from,
                 directory,
                 kind,
-            } => self.move_entry(from, directory, kind, stage).await?,
+                destination_is_canonical,
+            } => {
+                self.move_entry(from, directory, kind, destination_is_canonical, stage)
+                    .await?
+            }
             RemoveEntry {
                 path,
                 kind,

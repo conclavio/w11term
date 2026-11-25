@@ -34,6 +34,7 @@ pub enum Action {
     Page(u64, usize),
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
+    MoveMarked(u64),
     Reveal(u64, FilenameMatch),
     Rename(u64, FilenameMatch),
     Delete(u64, FilenameMatch),
@@ -227,6 +228,11 @@ impl Panel {
     }
 
     fn search_download_selection(&self, serial: u64) -> Result<SearchDownload> {
+        let (result, hits) = self.marked_hits(serial)?;
+        SearchDownload::new(&result.root, hits)
+    }
+
+    fn marked_hits(&self, serial: u64) -> Result<(&FilenameSearch, Vec<&FilenameMatch>)> {
         let result = self
             .result
             .as_ref()
@@ -241,7 +247,8 @@ impl Panel {
             .map(|&index| result.matches.get(index))
             .collect::<Option<Vec<_>>>()
             .context("The search results changed. Mark the files again.")?;
-        SearchDownload::new(&result.root, hits)
+        ensure!(!hits.is_empty(), "Mark at least one search result");
+        Ok((result, hits))
     }
 
     fn mark_download(&mut self, index: usize, checked: bool) {
@@ -590,9 +597,9 @@ impl Panel {
                 .any(|hit| matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)))
         }) {
             let mode = if self.marked_downloads.is_some() {
-                "Exit download selection"
+                "Exit selection"
             } else {
-                "Select downloads…"
+                "Select results…"
             };
             let select = button(mode, Action::SelectDownloads(serial), ready);
             let mut actions = vec![KeyedView::new("select", select)];
@@ -612,13 +619,18 @@ impl Panel {
                         }))
                         .content(format!("Download marked ({})…", marked.len())),
                 ));
+                actions.push(KeyedView::new(
+                    "move",
+                    button(
+                        "Move marked results…",
+                        Action::MoveMarked(serial),
+                        ready && !marked.is_empty(),
+                    ),
+                ));
             }
             rows.push(KeyedView::new(
                 "marking",
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(6.0)
-                    .keyed_children(actions),
+                StackPanel::new().spacing(6.0).keyed_children(actions),
             ));
         }
         if self
@@ -795,7 +807,7 @@ impl Panel {
                                     Action::MarkDownload(serial, index, checked),
                                 ))
                             }))
-                            .content("Mark for download"),
+                            .content("Mark result"),
                     ));
                 }
                 if hit.kind == Some(EntryKind::File) {
@@ -1012,6 +1024,16 @@ impl FileDrawer {
             .search_download_selection(serial)
     }
 
+    pub(super) fn marked_search_moves(&self, serial: u64) -> Result<(String, Vec<FilenameMatch>)> {
+        ensure!(self.open, "Open the file drawer");
+        let (result, hits) = self
+            .search
+            .as_ref()
+            .context("The search results closed")?
+            .marked_hits(serial)?;
+        Ok((result.root.clone(), hits.into_iter().cloned().collect()))
+    }
+
     pub(super) fn search_hit_path(&self, serial: u64, hit: &FilenameMatch) -> Result<String> {
         ensure!(
             self.search
@@ -1095,7 +1117,7 @@ impl FileDrawer {
                 if cleared > 0 {
                     use std::fmt::Write;
                     let ending = if cleared == 1 { "" } else { "s" };
-                    let _ = write!(status, ". {cleared} download mark{ending} cleared");
+                    let _ = write!(status, ". {cleared} selection mark{ending} cleared");
                 }
                 status
             }
@@ -1216,11 +1238,22 @@ impl FileDrawer {
         ctx: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         let status = change.completed();
+        self.apply_search_change(serial, &hit, &change)?;
+        self.refresh_changed_search(pane, session, serial, status, ctx);
+        Ok(())
+    }
+
+    pub(super) fn apply_search_change(
+        &mut self,
+        serial: u64,
+        hit: &FilenameMatch,
+        change: &EntryChange,
+    ) -> Result<()> {
         let old_path = entry_path(&hit.parent, &hit.name)?;
         if let Some(directory) = self.directory.clone() {
             if directory == hit.parent {
                 let mut entries = std::mem::take(&mut self.entries);
-                match &change {
+                match change {
                     EntryChange::Rename { to, .. } => {
                         entries.retain(|entry| &entry.name != to);
                         if let Some(entry) = entries.iter_mut().find(|entry| entry.name == hit.name)
@@ -1242,7 +1275,7 @@ impl FileDrawer {
             } else if let EntryChange::Move {
                 directory: destination,
                 ..
-            } = &change
+            } = change
                 && directory == *destination
                 && let Some(kind) = hit.kind
             {
@@ -1257,7 +1290,7 @@ impl FileDrawer {
                 self.sort_order.sort(&mut entries);
                 self.accept_listing(None, directory, entries);
             } else if let Some(suffix) = within(&directory, &old_path) {
-                let new_path = match &change {
+                let new_path = match change {
                     EntryChange::Rename { to, .. } => Some(entry_path(&hit.parent, to)?),
                     EntryChange::Move { directory, .. } => Some(entry_path(directory, &hit.name)?),
                     _ => None,
@@ -1272,7 +1305,15 @@ impl FileDrawer {
                 }
             }
         }
-        self.status = status.clone();
+        self.invalidate_search_entry(serial, hit)
+    }
+
+    pub(super) fn invalidate_search_entry(
+        &mut self,
+        serial: u64,
+        hit: &FilenameMatch,
+    ) -> Result<()> {
+        let old_path = entry_path(&hit.parent, &hit.name)?;
         let Some(panel) = self.search.as_mut().filter(|panel| panel.serial == serial) else {
             return Ok(());
         };
@@ -1285,8 +1326,22 @@ impl FileDrawer {
             });
             panel.install_result(previous);
         }
-        self.start_filename_search(pane, session, ctx, Some(status));
         Ok(())
+    }
+
+    pub(super) fn refresh_changed_search(
+        &mut self,
+        pane: u64,
+        session: &Session,
+        serial: u64,
+        status: String,
+        ctx: &ComponentContext<TerminalApp>,
+    ) {
+        if self.search_serial() == Some(serial) {
+            self.start_filename_search(pane, session, ctx, Some(status));
+        } else {
+            self.status = status;
+        }
     }
 
     pub(super) fn filename_search(
@@ -1413,6 +1468,7 @@ impl FileDrawer {
             Action::MarkDownload(serial, index, checked) if serial == panel.serial && !busy => {
                 panel.mark_download(index, checked);
             }
+            Action::MoveMarked(serial) if !busy => self.begin_marked_move(serial)?,
             Action::Rename(serial, hit) if !busy => self.begin_search_rename(serial, hit)?,
             Action::Delete(serial, hit) if !busy => self.begin_search_delete(serial, hit)?,
             Action::CopyPaths(serial, hit) if !busy => {
@@ -1683,7 +1739,7 @@ mod tests {
         assert_eq!(panel.marked_downloads, Some(BTreeSet::from([2])));
         assert!(panel.search_download_selection(3).is_err());
         assert!(panel.search_download_selection(4).is_ok());
-        assert!(drawer.status.ends_with("2 download marks cleared"));
+        assert!(drawer.status.ends_with("2 selection marks cleared"));
 
         let mut cancelled = search_result("/project", &[]);
         cancelled.cancelled = true;
@@ -1703,7 +1759,7 @@ mod tests {
         let moved_root = search_result("/project/nested", &[("keep", File)]);
         drawer.finish_search(6, Ok(json!(moved_root)), None);
         assert!(drawer.search_download_selection(7).is_err());
-        assert!(drawer.status.ends_with("1 download mark cleared"));
+        assert!(drawer.status.ends_with("1 selection mark cleared"));
     }
 
     #[test]
