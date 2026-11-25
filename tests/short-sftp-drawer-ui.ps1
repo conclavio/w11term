@@ -90,7 +90,7 @@ function Check-Actions {
     $actionsScroll = $actions.GetCurrentPattern($scroll)
     $remaining = [Collections.Generic.HashSet[string]]::new()
     $ellipsis = [char]0x2026
-    foreach ($label in 'Close',"Go to folder$ellipsis",'Back','Forward','Up','Refresh',"Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Delete$ellipsis",
+    foreach ($label in 'Close',"Go to folder$ellipsis",'Back','Forward','Up','Refresh',"Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Move to folder$ellipsis","Delete$ellipsis",
         'Open folder',"Download$ellipsis",'Open shell here','Copy directory path','Copy selected path','Follow shell directory',
         'Replace existing files','Sort by name','Sort newest first','Sort largest first',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
     $horizontal = if ($actionsScroll.Current.HorizontallyScrollable) { 0,100 } else { -1 }
@@ -129,6 +129,7 @@ try {
     Run-Palette 'SFTP files'
     $folder = Wait-Until 'first remote directory' { Find-Element 'projects/' $button }
     $entries = Wait-Until 'SFTP entry viewport' { Find-Element 'SFTP entries' }
+    $tallOuterHeight = $root.Current.BoundingRectangle.Height
     $tallHeight = $entries.Current.BoundingRectangle.Height
     $rowHeight = $folder.Current.BoundingRectangle.Height
     if ($rowHeight -lt 10 -or $tallHeight -lt 3 * $rowHeight) { throw 'Expected at least three visible rows in the tall window' }
@@ -142,7 +143,10 @@ try {
         if (!$entries -or !$folder) { return }
         $height = $entries.Current.BoundingRectangle.Height
         $pt = Control-Point $folder $entries
-        if ($pt -and $height -lt $tallHeight -and $folder.Current.BoundingRectangle.Height -ge $rowHeight-1 -and
+        # The native minimum can be tall enough at some DPIs to retain the full
+        # entry viewport. Verify that the window shrank and the row still fits.
+        if ($pt -and $root.Current.BoundingRectangle.Height -lt $tallOuterHeight -and
+            $folder.Current.BoundingRectangle.Height -ge $rowHeight-1 -and
             $height -ge $rowHeight -and (Is-Hit $folder $pt)) { $pt }
     } } catch {
         $folder = Find-Element 'projects/' $button
@@ -160,7 +164,10 @@ try {
     }
     $null = Wait-Until 'first selectable folder activated' { (Is-Enabled 'Open folder') -and !(Is-Enabled ('Download' + [char]0x2026)) }
     $resize.Resize($tallWidth,$tallWindowHeight)
-    $null = Wait-Until 'file list expands again' { (Find-Element 'SFTP entries').Current.BoundingRectangle.Height -ge $tallHeight-2 }
+    $null = Wait-Until 'the tall window restores its entry viewport' {
+        $root.Current.BoundingRectangle.Height -ge $tallOuterHeight-2 -and
+            (Find-Element 'SFTP entries').Current.BoundingRectangle.Height -ge $tallHeight-2
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

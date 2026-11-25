@@ -3052,6 +3052,12 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 1), // Cancelled during the first page.
             ("/shell directory/nested", 2),
+            ("/shell directory/nested", 1), // The listed file moved up one folder.
+            ("/shell directory", fillers + 6), // Browse to the destination.
+            ("/shell directory", fillers + 6), // Find the moved file at its new path.
+            ("/shell directory/nested", 1),
+            ("/shell directory", fillers + 5), // Moving from search rescans the same root.
+            ("/shell directory/nested", 2),
         ]
     );
     assert_eq!(

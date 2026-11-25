@@ -935,6 +935,25 @@ impl Panel {
                                 .content("Delete…"),
                         ));
                     }
+                    if entry_path(&hit.parent, &hit.name).is_ok() {
+                        actions.push(KeyedView::new(
+                            "move",
+                            Button::new()
+                                .automation_name(format!("Move to folder {path}"))
+                                .is_enabled(ready)
+                                .on_click({
+                                    let hit = hit.clone();
+                                    ctx.callback(move |_| {
+                                        Message::Files(FileAction::MoveEntry(
+                                            pane,
+                                            generation,
+                                            FileTarget::Search(serial, hit.clone()),
+                                        ))
+                                    })
+                                })
+                                .content("Move to folder…"),
+                        ));
+                    }
                 }
                 KeyedView::new(
                     index,
@@ -1220,9 +1239,30 @@ impl FileDrawer {
                     _ => entries.retain(|entry| entry.name != hit.name),
                 }
                 self.accept_listing(None, directory, entries);
+            } else if let EntryChange::Move {
+                directory: destination,
+                ..
+            } = &change
+                && directory == *destination
+                && let Some(kind) = hit.kind
+            {
+                let mut entries = std::mem::take(&mut self.entries);
+                entries.retain(|entry| entry.name != hit.name);
+                entries.push(Entry {
+                    name: hit.name.clone(),
+                    kind: ListedKind::Known(kind),
+                    mtime: hit.mtime,
+                    size: hit.size,
+                });
+                self.sort_order.sort(&mut entries);
+                self.accept_listing(None, directory, entries);
             } else if let Some(suffix) = within(&directory, &old_path) {
-                if let EntryChange::Rename { to, .. } = &change {
-                    let new_path = entry_path(&hit.parent, to)?;
+                let new_path = match &change {
+                    EntryChange::Rename { to, .. } => Some(entry_path(&hit.parent, to)?),
+                    EntryChange::Move { directory, .. } => Some(entry_path(directory, &hit.name)?),
+                    _ => None,
+                };
+                if let Some(new_path) = new_path {
                     let entries = std::mem::take(&mut self.entries);
                     self.accept_listing(None, format!("{new_path}{suffix}"), entries);
                 } else {

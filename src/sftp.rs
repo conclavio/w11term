@@ -345,6 +345,13 @@ pub enum Operation {
         to: String,
         search_kind: Option<EntryKind>,
     },
+    /// Move an approved drawer entry into a folder on the same SSH connection.
+    #[serde(skip)]
+    MoveEntry {
+        from: String,
+        directory: String,
+        kind: Option<EntryKind>,
+    },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
     RemoveEntry {
@@ -645,6 +652,9 @@ pub(crate) async fn run(
                 Operation::RenameEntry { .. } => {
                     Some("Missing SSH connection approval; rename was not started")
                 }
+                Operation::MoveEntry { .. } => {
+                    Some("Missing SSH connection approval; move was not started")
+                }
                 Operation::RemoveEntry { .. } => {
                     Some("Missing SSH connection approval; delete was not started")
                 }
@@ -787,6 +797,7 @@ pub(crate) async fn run(
                     }
                 }
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
+                Operation::MoveEntry { .. } => JobStage::Checking("Move was not started"),
                 Operation::SaveText { .. } => JobStage::Checking("Save was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
@@ -1014,6 +1025,102 @@ impl Engine {
             "The search result's containing folder changed"
         );
         Ok(())
+    }
+
+    async fn rename_without_replacement(
+        &self,
+        from: String,
+        to: String,
+        unknown_outcome: &'static str,
+        stage: &mut JobStage,
+    ) -> Result<()> {
+        // LSTAT sees the directory entry even if it is a dangling link.
+        // A concurrent creator after this check is the v3 server's responsibility.
+        match self.raw.lstat(&to).await {
+            Ok(_) => bail!("An entry with that name already exists"),
+            Err(Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => {}
+            Err(error) => {
+                return Err(
+                    anyhow::Error::from(error).context("Could not check the destination name")
+                );
+            }
+        }
+        *stage = JobStage::AwaitingStatus(unknown_outcome);
+        self.raw.rename(from, to).await?;
+        Ok(())
+    }
+
+    async fn move_entry(
+        &self,
+        from: String,
+        directory: String,
+        expected_kind: Option<EntryKind>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        let (parent, name) = from.rsplit_once('/').context("Missing source folder")?;
+        let parent = if parent.is_empty() { "/" } else { parent };
+        ensure!(
+            from.starts_with('/')
+                && directory.starts_with('/')
+                && !matches!(name, "" | "." | "..")
+                && !from.contains('\\')
+                && !directory.contains('\\')
+                && !from.chars().chain(directory.chars()).any(char::is_control),
+            "Choose a remote entry and destination folder"
+        );
+        ensure!(
+            self.canonical_remote_path(parent).await? == parent,
+            "The source folder changed. Refresh the drawer."
+        );
+        let destination = self
+            .canonical_remote_path(&directory)
+            .await
+            .context("Could not resolve the destination folder")?;
+        ensure!(
+            parent != destination,
+            "Choose a different destination folder"
+        );
+        let attributes = self
+            .raw
+            .lstat(&from)
+            .await
+            .context("Could not check the selected entry")?
+            .attrs;
+        let kind = EntryKind::from_permissions(attributes.permissions)
+            .context("The server did not identify the entry as a file, folder or link")?;
+        ensure!(
+            expected_kind.is_none_or(|expected| kind == expected),
+            "The selected entry type changed. Refresh the drawer."
+        );
+        ensure!(
+            kind != EntryKind::Directory
+                || !(destination == from
+                    || destination
+                        .strip_prefix(&from)
+                        .is_some_and(|suffix| suffix.starts_with('/'))),
+            "A folder cannot be moved into itself or one of its descendants"
+        );
+        let attrs = self
+            .raw
+            .stat(&destination)
+            .await
+            .context("Could not check the destination folder")?
+            .attrs;
+        ensure!(
+            attrs.permissions.is_none_or(|mode| {
+                EntryKind::from_permissions(Some(mode)) == Some(EntryKind::Directory)
+            }),
+            "The destination is not a folder"
+        );
+        let to = format!("{}/{name}", destination.trim_end_matches('/'));
+        self.rename_without_replacement(
+            from,
+            to,
+            "Move outcome unknown; refresh both folders to check",
+            stage,
+        )
+        .await?;
+        Ok(json!({"directory":destination}))
     }
 
     async fn execute(
@@ -1415,20 +1522,20 @@ impl Engine {
                         "The search result's entry type changed. Refresh the results."
                     );
                 }
-                // LSTAT sees the directory entry even if it is a dangling link.
-                // A concurrent creator after this check is the v3 server's responsibility.
-                match self.raw.lstat(&to).await {
-                    Ok(_) => bail!("An entry with that name already exists"),
-                    Err(Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => {}
-                    Err(error) => {
-                        return Err(anyhow::Error::from(error)
-                            .context("Could not check the destination name"));
-                    }
-                }
-                *stage = JobStage::AwaitingStatus("Rename outcome unknown; refresh to check");
-                self.raw.rename(from, to).await?;
+                self.rename_without_replacement(
+                    from,
+                    to,
+                    "Rename outcome unknown; refresh to check",
+                    stage,
+                )
+                .await?;
                 ok
             }
+            MoveEntry {
+                from,
+                directory,
+                kind,
+            } => self.move_entry(from, directory, kind, stage).await?,
             RemoveEntry {
                 path,
                 kind,
