@@ -43,7 +43,7 @@ impl BookmarkPeer {
         )
     }
 
-    fn check_profile(&self, options: &SshOptions) -> Result<()> {
+    pub(super) fn check_profile(&self, options: &SshOptions) -> Result<()> {
         ensure!(
             matches_profile(
                 (&self.host, &self.user, self.port, &self.fingerprint),

@@ -6,11 +6,57 @@ fn rename(from: &str, to: &str) -> Operation {
     Operation::RenameEntry {
         from: from.into(),
         to: to.into(),
+        search_kind: None,
     }
 }
 
 fn trace(root: &std::path::Path) -> Vec<[String; 2]> {
     mutation_trace(root, "rename-trace.jsonl")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_rename_rechecks_the_source_kind_and_parent() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    let generation = Some(pane.frames.load().connection_generation);
+    fs::write(root.join("rename-trace.jsonl"), []).unwrap();
+    fs::create_dir(root.join("folder")).unwrap();
+    fs::write(root.join("folder/source"), b"preserved").unwrap();
+    let rename = |to: &str, kind| Operation::RenameEntry {
+        from: "/folder/source".into(),
+        to: to.into(),
+        search_kind: Some(kind),
+    };
+    let wrong_type = run(
+        &pane,
+        generation,
+        rename("/folder/new", w11term::sftp::EntryKind::Directory),
+    )
+    .await
+    .unwrap_err();
+    assert!(wrong_type.contains("entry type changed"), "{wrong_type}");
+    let wrong_folder = run(
+        &pane,
+        generation,
+        rename("/elsewhere", w11term::sftp::EntryKind::File),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        wrong_folder.contains("containing folder changed"),
+        "{wrong_folder}"
+    );
+    assert!(trace(root).is_empty());
+    run(
+        &pane,
+        generation,
+        rename("/folder/new", w11term::sftp::EntryKind::File),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(root.join("folder/new")).unwrap(), b"preserved");
+    assert!(!root.join("folder/source").exists());
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -628,6 +628,9 @@ mod tests {
             parent: "/Pilot's Work/deeper".into(),
             name: "child-witness.txt".into(),
             kind: None,
+            mtime: None,
+            size: None,
+            content_match: None,
         };
         let origin = Origin::search(14, 3, 8, &hit).unwrap();
         assert_eq!(origin.pane, 14);

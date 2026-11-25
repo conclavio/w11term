@@ -34,7 +34,11 @@ pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_pa
 mod drop_source;
 mod editor;
 mod find;
-pub use find::{FilenameFilter, FilenameMatch, FilenameSearch, valid_filename_query};
+pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
+pub use find::{
+    ContentMatch, ContentScan, FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch,
+    FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
+};
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
@@ -256,8 +260,18 @@ pub enum Operation {
         regex: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         match_case: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        match_path: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<EntryKind>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        exclude_dir_regex: String,
+        #[serde(default, skip_serializing_if = "FileSizeRange::is_unrestricted")]
+        file_size: FileSizeRange,
+        #[serde(default, skip_serializing_if = "ModifiedDateRange::is_unrestricted")]
+        modified_dates: ModifiedDateRange,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        content_query: String,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -329,12 +343,14 @@ pub enum Operation {
     RenameEntry {
         from: String,
         to: String,
+        search_kind: Option<EntryKind>,
     },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
     RemoveEntry {
         path: String,
         kind: EntryKind,
+        check_parent: bool,
     },
     RemoveFile {
         path: String,
@@ -486,6 +502,12 @@ fn report(progress: Option<&watch::Sender<TransferProgress>>, bytes: u64, total:
 type JobResult = Result<Value, String>;
 
 #[derive(Debug)]
+pub enum JobProgress {
+    Transfer(watch::Sender<TransferProgress>),
+    Search(watch::Sender<SearchProgress>),
+}
+
+#[derive(Debug)]
 pub struct Job {
     /// A UI action approved against a particular live SSH connection.
     /// The worker owns that connection and rejects stale approvals before I/O.
@@ -493,7 +515,7 @@ pub struct Job {
     pub operation: Operation,
     pub deadline: Instant,
     pub reply: oneshot::Sender<JobResult>,
-    pub progress: Option<watch::Sender<TransferProgress>>,
+    pub progress: Option<JobProgress>,
     /// Used by native transfers. A stopped transfer replies with cancelled,
     /// bytes_transferred and remote_may_be_partial after closing its handle.
     pub cancel: Option<TransferCancel>,
@@ -754,6 +776,9 @@ pub(crate) async fn run(
                 Operation::Sha256 { .. } => {
                     JobStage::Checking("SHA-256 calculation did not finish")
                 }
+                Operation::Find { content_query, .. } if !content_query.is_empty() => {
+                    JobStage::Checking("File text search did not finish")
+                }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
                 Operation::GetDir { .. } | Operation::GetSearch { .. } => {
                     JobStage::DirectoryDownload {
@@ -982,14 +1007,27 @@ impl Engine {
         Ok(())
     }
 
+    async fn check_search_parent(&self, parent: &str) -> Result<()> {
+        let expected = if parent.is_empty() { "/" } else { parent };
+        ensure!(
+            self.canonical_remote_path(expected).await? == expected,
+            "The search result's containing folder changed"
+        );
+        Ok(())
+    }
+
     async fn execute(
         &mut self,
         op: Operation,
-        progress: Option<&watch::Sender<TransferProgress>>,
+        job_progress: Option<&JobProgress>,
         cancel: Option<&TransferCancel>,
         stage: &mut JobStage,
     ) -> Result<Value> {
         use Operation::*;
+        let progress = match job_progress {
+            Some(JobProgress::Transfer(sender)) => Some(sender),
+            _ => None,
+        };
         let ok = json!({});
         let mounted = matches!(op, ListMountedFolder { .. });
         Ok(match op {
@@ -1137,7 +1175,12 @@ impl Engine {
                 query,
                 regex,
                 match_case,
+                match_path,
                 kind,
+                exclude_dir_regex,
+                file_size,
+                modified_dates,
+                content_query,
             } => serde_json::to_value(
                 self.find_filenames(
                     &path,
@@ -1145,9 +1188,18 @@ impl Engine {
                     FilenameFilter {
                         regex,
                         match_case,
+                        match_path,
                         kind,
+                        exclude_dir_regex,
+                        file_size,
+                        modified_dates,
+                        content_query,
                     },
                     cancel,
+                    match job_progress {
+                        Some(JobProgress::Search(sender)) => Some(sender),
+                        _ => None,
+                    },
                 )
                 .await?,
             )?,
@@ -1342,7 +1394,27 @@ impl Engine {
                 self.raw.rename(from, to).await?;
                 ok
             }
-            RenameEntry { from, to } => {
+            RenameEntry {
+                from,
+                to,
+                search_kind,
+            } => {
+                if let Some(kind) = search_kind {
+                    let (parent, _) = from
+                        .rsplit_once('/')
+                        .context("Missing search result parent")?;
+                    ensure!(
+                        to.rsplit_once('/')
+                            .is_some_and(|(target, _)| target == parent),
+                        "The search result's containing folder changed"
+                    );
+                    self.check_search_parent(parent).await?;
+                    let attributes = self.raw.lstat(&from).await?.attrs;
+                    ensure!(
+                        EntryKind::from_permissions(attributes.permissions) == Some(kind),
+                        "The search result's entry type changed. Refresh the results."
+                    );
+                }
                 // LSTAT sees the directory entry even if it is a dangling link.
                 // A concurrent creator after this check is the v3 server's responsibility.
                 match self.raw.lstat(&to).await {
@@ -1357,7 +1429,11 @@ impl Engine {
                 self.raw.rename(from, to).await?;
                 ok
             }
-            RemoveEntry { path, kind } => {
+            RemoveEntry {
+                path,
+                kind,
+                check_parent,
+            } => {
                 // A trailing slash can make even LSTAT dereference a directory link;
                 // Windows SFTP servers can also interpret backslashes in a leaf.
                 let name = path.rsplit('/').next().unwrap_or("");
@@ -1367,6 +1443,12 @@ impl Engine {
                         && !path.contains('\0'),
                     "Expected a remote directory entry name"
                 );
+                if check_parent {
+                    let (parent, _) = path
+                        .rsplit_once('/')
+                        .context("Missing search result parent")?;
+                    self.check_search_parent(parent).await?;
+                }
                 let attrs = self
                     .raw
                     .lstat(&path)
