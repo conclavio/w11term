@@ -4,7 +4,15 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 
 $env:USERPROFILE = Join-Path $State 'ssh-home'
 $null = [IO.Directory]::CreateDirectory((Join-Path $env:USERPROFILE '.ssh'))
-$known = Join-Path $env:USERPROFILE '.ssh/known_hosts'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$elevated = [Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+$known = if ($elevated) {
+    Join-Path $env:W11TERM_DATA_DIR 'known_hosts'
+} else {
+    Join-Path $env:USERPROFILE '.ssh/known_hosts'
+}
 $before = [IO.File]::ReadAllText($profiles)
 $peer = ($before | ConvertFrom-Json).profiles.'palette-ssh'
 $endpoint = "$($peer.user)@$($peer.host):$($peer.port)"

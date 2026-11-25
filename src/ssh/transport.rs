@@ -123,6 +123,13 @@ impl Handler {
     fn learn(&self, key: &russh::keys::PublicKey) -> Result<()> {
         let (name, port) = host_key_target(&self.options);
         crate::options::validate_host_key_alias(name)?;
+        if let Some(parent) = self
+            .known_hosts
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         russh::keys::known_hosts::learn_known_hosts_path(
             &name.to_ascii_lowercase(),
             port,
@@ -474,7 +481,9 @@ pub(super) async fn handshake(
                 .map_err(|error| stop(format!("checking process integrity: {error:#}")))?;
             if elevated {
                 // Do not trust Medium-integrity %USERPROFILE%\.ssh\known_hosts when elevated.
-                crate::control::security::elevated_data_dir()
+                // `keys::data_dir()` routes to the verified elevated directory in production
+                // while still respecting explicit `W11TERM_DATA_DIR` isolation in tests.
+                crate::keys::data_dir()
                     .map_err(|error| {
                         stop(format!("cannot locate elevated known_hosts: {error:#}"))
                     })?

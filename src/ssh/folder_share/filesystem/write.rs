@@ -340,7 +340,7 @@ fn check_extension(current_len: u64, target_len: u64) -> io::Result<()> {
     Ok(())
 }
 fn zero_fill_gap(file: &File, root: &Root, mut offset: u64, target_len: u64) -> io::Result<()> {
-    const CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
+    static CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
     while offset < target_len {
         root.check_write()?;
         let step = (target_len - offset).min(CHUNK.len() as u64) as usize;

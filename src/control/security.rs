@@ -229,7 +229,6 @@ fn ensure_pinned_elevated_component(
     );
 
     let mut owner_sid = PSID::default();
-    let mut sacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
     let status = unsafe {
         GetSecurityInfo(
@@ -239,7 +238,7 @@ fn ensure_pinned_elevated_component(
             Some(&mut owner_sid),
             None,
             None,
-            Some(&mut sacl),
+            None,
             Some(&mut sd),
         )
     };
@@ -270,60 +269,77 @@ fn ensure_pinned_elevated_component(
         path.display()
     );
 
-    let label_rid = unsafe { mandatory_label_rid(sacl)? };
+    let label_sddl = label_sddl_string(sd)?;
+    let label_rid = parse_high_mandatory_label(&label_sddl)?;
     ensure!(
         label_rid >= HIGH_INTEGRITY_RID,
-        "elevated directory {} lacks a High-integrity mandatory label (found {label_rid})",
+        "elevated directory {} lacks a High-integrity No-Write-Up mandatory label ({label_sddl})",
         path.display()
     );
     Ok((dir, actual_final))
 }
 
-unsafe fn mandatory_label_rid(sacl: *const ACL) -> Result<u32> {
-    if sacl.is_null() {
-        return Ok(0);
-    }
-    let mut size_info = ACL_SIZE_INFORMATION::default();
+fn label_sddl_string(sd: PSECURITY_DESCRIPTOR) -> Result<String> {
+    use windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+    let mut text = PWSTR::null();
     unsafe {
-        GetAclInformation(
-            sacl,
-            (&mut size_info as *mut ACL_SIZE_INFORMATION).cast(),
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            1,
+            LABEL_SECURITY_INFORMATION,
+            &mut text,
+            None,
         )?;
     }
-    for index in 0..size_info.AceCount {
-        let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            GetAce(sacl, index, &mut ace_ptr)?;
-        }
-        if ace_ptr.is_null() {
-            continue;
-        }
-        let header = unsafe { std::ptr::read_unaligned(ace_ptr as *const ACE_HEADER) };
-        if header.AceType
-            == windows::Win32::System::SystemServices::SYSTEM_MANDATORY_LABEL_ACE_TYPE as u8
-            && usize::from(header.AceSize) >= std::mem::size_of::<SYSTEM_MANDATORY_LABEL_ACE>()
-        {
-            let sid_offset = std::mem::offset_of!(SYSTEM_MANDATORY_LABEL_ACE, SidStart);
-            let sid = PSID(unsafe { (ace_ptr as *mut u8).add(sid_offset).cast() });
-            ensure!(
-                !sid.0.is_null() && unsafe { IsValidSid(sid).as_bool() },
-                "invalid mandatory label SID"
-            );
-            let count_ptr = unsafe { GetSidSubAuthorityCount(sid) };
-            ensure!(
-                !count_ptr.is_null(),
-                "missing mandatory label subauthority count"
-            );
-            let count = unsafe { *count_ptr };
-            ensure!(count > 0, "empty mandatory label SID");
-            let rid_ptr = unsafe { GetSidSubAuthority(sid, u32::from(count - 1)) };
-            ensure!(!rid_ptr.is_null(), "missing mandatory label RID");
-            return Ok(unsafe { *rid_ptr });
+    ensure!(!text.0.is_null(), "missing label SDDL string");
+    let _text = LocalMemory(text.0.cast());
+    Ok(unsafe { text.to_string()? })
+}
+
+fn has_no_write_up(rights: &str) -> bool {
+    if let Some(hex) = rights
+        .strip_prefix("0x")
+        .or_else(|| rights.strip_prefix("0X"))
+    {
+        return u32::from_str_radix(hex, 16).is_ok_and(|mask| (mask & 1) != 0);
+    }
+    let (pairs, rem) = rights.as_bytes().as_chunks::<2>();
+    rem.is_empty() && pairs.contains(b"NW")
+}
+
+/// Parse the mandatory integrity RID from an SDDL `LABEL_SECURITY_INFORMATION`
+/// string (e.g. `S:(ML;OICI;NWNR;;;HI)` or `S:(ML;;NW;;;S-1-16-12288)`),
+/// requiring No-Write-Up (`NW`) enforcement.
+fn parse_high_mandatory_label(sddl: &str) -> Result<u32> {
+    let Some(rest) = sddl.split_once("S:").map(|(_, tail)| tail) else {
+        return Ok(0);
+    };
+    let mut highest = 0u32;
+    let mut slice = rest;
+    while let Some(start) = slice.find('(') {
+        let after = &slice[start + 1..];
+        let Some(end) = after.find(')') else {
+            break;
+        };
+        let ace = &after[..end];
+        slice = &after[end + 1..];
+        let parts: Vec<&str> = ace.split(';').collect();
+        if parts.len() == 6 && parts[0] == "ML" && has_no_write_up(parts[2]) {
+            let rid = match parts[5] {
+                "LW" => 0x1000,
+                "ME" => 0x2000,
+                "MP" => 0x2100,
+                "HI" => HIGH_INTEGRITY_RID,
+                "SI" => 0x4000,
+                sid => sid
+                    .strip_prefix("S-1-16-")
+                    .and_then(|num| num.parse::<u32>().ok())
+                    .unwrap_or(0),
+            };
+            highest = highest.max(rid);
         }
     }
-    Ok(0)
+    Ok(highest)
 }
 
 pub(super) fn current_scope() -> Result<(String, u32, u32)> {
@@ -684,6 +700,32 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+    #[test]
+    fn mandatory_label_sddl_parser_requires_high_no_write_up() {
+        assert_eq!(
+            parse_high_mandatory_label("S:(ML;OICI;NWNR;;;HI)").unwrap(),
+            HIGH_INTEGRITY_RID
+        );
+        assert_eq!(
+            parse_high_mandatory_label("S:AI(ML;;NW;;;SI)").unwrap(),
+            0x4000
+        );
+        assert_eq!(
+            parse_high_mandatory_label("S:(ML;OICI;NWNR;;;S-1-16-12288)").unwrap(),
+            HIGH_INTEGRITY_RID
+        );
+        assert_eq!(
+            parse_high_mandatory_label("S:(ML;;0x1;;;HI)").unwrap(),
+            HIGH_INTEGRITY_RID
+        );
+        assert_eq!(parse_high_mandatory_label("S:(ML;;NR;;;HI)").unwrap(), 0);
+        assert_eq!(parse_high_mandatory_label("S:(ML;;0x2;;;HI)").unwrap(), 0);
+        assert_eq!(
+            parse_high_mandatory_label("S:(ML;;NW;;;ME)").unwrap(),
+            0x2000
+        );
+        assert_eq!(parse_high_mandatory_label("").unwrap(), 0);
     }
     #[test]
     fn native_medium_server_refuses_low_integrity_client() {

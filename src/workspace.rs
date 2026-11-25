@@ -645,13 +645,15 @@ mod tests {
         let decode_octal = |encoded: &str| -> String {
             assert!(
                 !encoded.is_empty()
-                    && encoded.len() % 3 == 0
+                    && encoded.len().is_multiple_of(3)
                     && encoded.bytes().all(|b| (b'0'..=b'7').contains(&b)),
                 "argument must be pure octal triplets: {encoded:?}"
             );
             let bytes: Vec<u8> = encoded
                 .as_bytes()
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 8).unwrap())
                 .collect();
             String::from_utf8(bytes).unwrap()
