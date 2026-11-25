@@ -208,7 +208,7 @@ fn eligible() -> bool {
                         && !s.search
                         && !s.modal
                         && !s.drawer_focused
-                        && s.session_search.is_none()
+                        && !s.search_field_owns_keys()
                         && !s.switcher
                         && s.picker.is_none()
                         && s.local_mode.is_none()
@@ -619,8 +619,8 @@ mod tests {
         let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
         let seen = actions.clone();
         let mut state = State {
-            session_search: Some((1, 2, 3)),
-            session_search_focused: true,
+            search_field: Some(crate::input::SearchField::Sessions(1, 2, 3)),
+            search_field_focused: true,
             ..State::new(move |s| seen.borrow_mut().push(s))
         };
         let key = |message| MSG {

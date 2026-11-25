@@ -1,5 +1,5 @@
 use crate::{
-    input::{KeyboardBridge, PickerStage, Shortcut},
+    input::{KeyboardBridge, PickerStage, SearchField, Shortcut},
     renderer::{Metrics, PADDING, Renderer, STATUS_HEIGHT},
 };
 use anyhow::Context as _;
@@ -1445,12 +1445,19 @@ impl TerminalApp {
             .discovery
             .as_ref()
             .and_then(|_| tab.session.durable_state());
-        self.keyboard.watch_session_search(
+        self.keyboard.watch_search_field(
             tab.discovery
                 .as_ref()
                 .zip(discovery.as_ref())
                 .filter(|(_, state)| state.phase.is_browser() && prompt_id.is_none())
-                .map(|(browser, state)| (id, state.listing_revision, browser.query_revision)),
+                .map(|(browser, state)| {
+                    SearchField::Sessions(id, state.listing_revision, browser.query_revision)
+                })
+                .or_else(|| {
+                    tab.files
+                        .keyboard_search(tab.session.pane_id)
+                        .filter(|_| prompt_id.is_none())
+                }),
         );
         // A browser can pass through Connecting or Failed after Choose. Keep
         // keyboard input local until the verified remote PTY is attached.
@@ -2864,7 +2871,7 @@ impl TerminalApp {
         if target.is_none() {
             self.keyboard.set_modal(false);
             self.keyboard.watch_file_drawer(None);
-            self.keyboard.watch_session_search(None);
+            self.keyboard.watch_search_field(None);
         }
         self.keyboard.set_target(target);
         self.sync_ime_surface();
@@ -6310,6 +6317,14 @@ impl Component for TerminalApp {
                 Shortcut::SubmitSessionSearch(id, listing, query) => {
                     self.submit_session_search(id, listing, query)
                 }
+                Shortcut::SubmitFileSearch(pane, generation, serial) => self.file_action(
+                    FileAction::Search(pane, generation, file_drawer::find::Action::Run(serial)),
+                    context,
+                ),
+                Shortcut::CloseFileSearch(pane, generation, serial) => self.file_action(
+                    FileAction::Search(pane, generation, file_drawer::find::Action::Back(serial)),
+                    context,
+                ),
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
                 Shortcut::FindTab => self.open_tab_search(context),

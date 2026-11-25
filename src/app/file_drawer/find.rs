@@ -13,6 +13,7 @@ const RESULT_TYPES: [(Option<EntryKind>, &str); 4] = [
 pub enum Action {
     Show(u64),
     Restore(u64),
+    FocusQuery(u64, u8),
     Query(u64, String),
     SetOption(u64, MatchOption),
     Run(u64),
@@ -36,6 +37,7 @@ pub(super) struct Panel {
     pub(super) serial: u64,
     root: String,
     query: String,
+    input: ElementRef<TextBox>,
     filter: FilenameFilter,
     result: Option<FilenameSearch>,
     page: usize,
@@ -192,6 +194,8 @@ impl Panel {
         let query = TextBox::new()
             .min_width(0.0)
             .automation_name("Filename contains")
+            .automation_id(crate::input::file_search_tag(pane))
+            .element_ref(&self.input)
             .placeholder_text(match (self.filter.regex, self.filter.kind.is_some()) {
                 (true, true) => "Filename regex (optional)",
                 (true, false) => "Filename regex",
@@ -543,6 +547,10 @@ impl Panel {
 }
 
 impl FileDrawer {
+    pub(super) fn search_serial(&self) -> Option<u64> {
+        self.search.as_ref().map(|panel| panel.serial)
+    }
+
     pub(super) fn search_download_selection(&self, serial: u64) -> Result<SearchDownload> {
         ensure!(self.open, "Open the file drawer");
         self.search
@@ -590,13 +598,11 @@ impl FileDrawer {
         }
     }
 
-    fn restore_search(&mut self, serial: u64) {
+    fn restore_search(&mut self, serial: u64) -> Option<u64> {
         if self.busy() || !self.open || self.search.is_some() || self.bookmarks.is_some() {
-            return;
+            return None;
         }
-        let Some(mut panel) = self.saved_search.take_if(|panel| panel.serial == serial) else {
-            return;
-        };
+        let mut panel = self.saved_search.take_if(|panel| panel.serial == serial)?;
         self.end_filter_edit();
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
@@ -605,6 +611,7 @@ impl FileDrawer {
             .as_ref()
             .map_or_else(String::new, result_status);
         self.search = Some(panel);
+        Some(self.dialog_serial)
     }
 
     pub(super) fn finish_search(&mut self, serial: u64, result: Result<Value, String>) {
@@ -647,6 +654,7 @@ impl FileDrawer {
                 serial: self.dialog_serial,
                 root,
                 query: String::new(),
+                input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 result: None,
                 page: 0,
@@ -654,10 +662,21 @@ impl FileDrawer {
                 copy_status: None,
                 marked_downloads: None,
             });
+            ctx.sender().send(Message::Files(FileAction::Search(
+                pane,
+                self.generation,
+                Action::FocusQuery(self.dialog_serial, 0),
+            )));
             return Ok(());
         }
         if let Action::Restore(serial) = action {
-            self.restore_search(serial);
+            if let Some(serial) = self.restore_search(serial) {
+                ctx.sender().send(Message::Files(FileAction::Search(
+                    pane,
+                    self.generation,
+                    Action::FocusQuery(serial, 0),
+                )));
+            }
             return Ok(());
         }
         let busy = self.busy();
@@ -665,6 +684,14 @@ impl FileDrawer {
             return Ok(());
         };
         match action {
+            Action::FocusQuery(serial, attempt) if serial == panel.serial && !busy => {
+                let next = FileAction::Search(
+                    pane,
+                    self.generation,
+                    Action::FocusQuery(serial, attempt + 1),
+                );
+                focus_file_input(&panel.input, attempt, next, ctx);
+            }
             Action::Query(serial, query) if serial == panel.serial && !busy => {
                 if panel.query != query {
                     panel.query = query;
@@ -776,6 +803,7 @@ mod tests {
                 serial: 7,
                 root: "/project".into(),
                 query: "log".into(),
+                input: ElementRef::new(),
                 filter: FilenameFilter {
                     regex: true,
                     match_case: true,
@@ -797,9 +825,9 @@ mod tests {
             }),
             ..FileDrawer::default()
         };
-        drawer.restore_search(6);
+        assert_eq!(drawer.restore_search(6), None);
         assert!(drawer.search.is_none());
-        drawer.restore_search(7);
+        assert_eq!(drawer.restore_search(7), Some(8));
         let mut panel = drawer.search.take().unwrap();
         assert_eq!(panel.page, 1);
         assert_eq!(panel.query, "log");
@@ -849,6 +877,7 @@ mod tests {
                 serial: 2,
                 root: "/project".into(),
                 query: "log".into(),
+                input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
@@ -909,6 +938,7 @@ mod tests {
                 serial: 4,
                 root: "/project".into(),
                 query: "settings".into(),
+                input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
@@ -972,6 +1002,7 @@ mod tests {
                 serial: 2,
                 root: "/project".into(),
                 query: "log".into(),
+                input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
@@ -1055,6 +1086,7 @@ mod tests {
             serial: 4,
             root: "/".into(),
             query: "snap".into(),
+            input: ElementRef::new(),
             filter: FilenameFilter::default(),
             result: Some(FilenameSearch {
                 root: "/".into(),
