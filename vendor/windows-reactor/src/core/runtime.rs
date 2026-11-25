@@ -300,6 +300,9 @@ pub enum Command {
         slot: Option<SlotId>,
         transition: ExitTransition,
     },
+    BringIntoView {
+        node: NodeId,
+    },
     Focus {
         node: NodeId,
         completion: Callback<Result<bool, RuntimeError>>,

@@ -1,4 +1,7 @@
 use super::*;
+use std::io::Read;
+use upload_directory::{Source, open_source};
+use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_SHARE_READ};
 
 pub(super) struct PreviewLimit {
     pub bytes: u64,
@@ -12,6 +15,34 @@ const TEXT: PreviewLimit = PreviewLimit {
     limit: "the 256 KiB text preview limit",
 };
 
+/// Read a selected Windows file using the same text and size limits as a remote preview.
+pub fn local_preview_text(path: &Path, cancel: &TransferCancel) -> Result<String> {
+    let check_cancel = || check_preview_cancel(Some(cancel), "Text comparison");
+    check_cancel()?;
+    let Source::File(file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
+        bail!("Choose a regular local text file");
+    };
+    TEXT.check_size(Some(size))?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(TEXT.bytes + 1)
+        .read_to_end(&mut bytes)
+        .context("reading the selected local text file")?;
+    check_cancel()?;
+    ensure!(
+        bytes.len() as u64 == size,
+        "The local file changed while reading"
+    );
+    decode_preview_text(bytes)
+}
+
+fn decode_preview_text(bytes: Vec<u8>) -> Result<String> {
+    ensure!(
+        !bytes.contains(&0),
+        "This file contains NUL bytes and cannot be previewed as text"
+    );
+    String::from_utf8(bytes).context("This file cannot be previewed as UTF-8 text")
+}
+
 impl Engine {
     pub(super) async fn read_preview_text(
         &self,
@@ -19,11 +50,7 @@ impl Engine {
         cancel: Option<&TransferCancel>,
     ) -> Result<String> {
         let bytes = self.read_preview_bytes(path, cancel, &TEXT).await?;
-        ensure!(
-            !bytes.contains(&0),
-            "This file contains NUL bytes and cannot be previewed as text"
-        );
-        String::from_utf8(bytes).context("This file cannot be previewed as UTF-8 text")
+        decode_preview_text(bytes)
     }
 
     pub(super) async fn read_preview_bytes(
@@ -149,6 +176,51 @@ impl PreviewLimit {
             size.is_none_or(|size| size <= self.bytes),
             "This file exceeds {}",
             self.limit
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_comparison_reads_exact_utf8_and_rejects_binary_and_oversize() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("layout 雪.txt");
+        let cancel = TransferCancel::default();
+        let text = "\u{feff}line 1\r\nline 雪";
+        std::fs::write(&path, text)?;
+        assert_eq!(local_preview_text(&path, &cancel)?, text);
+        std::fs::write(&path, b"one\0two")?;
+        assert!(
+            local_preview_text(&path, &cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("NUL bytes")
+        );
+        std::fs::write(&path, [0xff])?;
+        assert!(
+            local_preview_text(&path, &cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+        std::fs::write(&path, vec![b'x'; TEXT_PREVIEW_MAX_BYTES + 1])?;
+        assert!(
+            local_preview_text(&path, &cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("256 KiB")
+        );
+        assert!(local_preview_text(temp.path(), &cancel).is_err());
+        cancel.cancel();
+        assert!(
+            local_preview_text(&path, &cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
         );
         Ok(())
     }
