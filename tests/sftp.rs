@@ -275,6 +275,16 @@ impl server::Handler for Peer {
                     .append(true)
                     .open(self.root.join("split-inputs").join(c.to_string()))?
                     .write_all(data)?;
+                if self.root.join("notification-fixture").is_file() {
+                    if let Some(outbound) = data.strip_prefix(b"notification-fixture:") {
+                        s.data(c, outbound.to_vec())?;
+                        return Ok(());
+                    }
+                    if data.starts_with(b"\x1b]99;") {
+                        // Record real terminal replies without reflecting them back as requests.
+                        return Ok(());
+                    }
+                }
                 let report: Option<&[u8]> = match data {
                     b"report-foreign" => Some(b"\x1b]7;file://unrelated.invalid/srv/foreign\x1b\\\r\nforeign-reported\r\n"),
                     b"report-current" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-reported\r\n"),

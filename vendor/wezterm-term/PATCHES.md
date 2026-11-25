@@ -187,3 +187,7 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - SGR pixel mouse reporting encodes Kitty pointer departures and clears the
   last motion sample so the first re-entry motion is reported again.
+
+- OSC 99 forwards Kitty notification metadata and payload to the embedding's
+  alert handler. The handler can return protocol replies on the same terminal
+  stream. This keeps the notification lifecycle and UI in w11term.

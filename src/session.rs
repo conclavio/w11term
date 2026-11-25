@@ -47,6 +47,7 @@ pub enum Command {
     RestartExited(ClaimedRestart),
     /// Ordered with both native input and control-pipe writes on this pane.
     SetReadOnly(bool),
+    NotificationReply(crate::events::NotificationResponse),
     /// Change the local display defaults without sending input to the transport.
     SetColorScheme(ColorScheme),
     /// Input method committed text has no corresponding physical key presses.
@@ -190,6 +191,7 @@ fn contain_worker_failure(
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         events.close_restart();
         events.command_stream(None);
+        events.notification_stream(None);
         events.set_terminal_activity(wezterm_term::Progress::None, None);
         // Never resume a possibly inconsistent terminal engine after unwinding.
         let mut frame = (*frames.load()).clone();
@@ -694,6 +696,7 @@ impl Drop for Session {
             .set_policy(RemoteClipboardPolicy::Disabled);
         self.events.close_restart();
         self.events.command_stream(None);
+        self.events.notification_stream(None);
         let _ = self.input.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -820,6 +823,7 @@ async fn run(
     let mut replay_label = None;
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
+    let notification_evictions = events.notification_evictions();
     loop {
         if replay_ready && let Some(capture) = replay.take() {
             if let Some((cols, rows)) = capture.grid {
@@ -921,6 +925,7 @@ async fn run(
         if inspecting {
             frames.set_inspection(Some(terminal::TerminalModes::read(&terminal)));
         }
+        let notification_expiry = events.next_notification_expiry();
         let animation_deadline = presentation.animation_deadline(&terminal);
         let replay_deadline = animation_deadline
             .into_iter()
@@ -958,6 +963,20 @@ async fn run(
                 }
             }
             _ = colors.changed() => {},
+            _ = notification_evictions.notified() => {
+                if let Some(response) = events.expire_notifications() {
+                    send_notification_reply(&writer, connection_generation, response);
+                }
+            },
+            _ = async {
+                if let Some(deadline) = notification_expiry {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if notification_expiry.is_some() => {
+                if let Some(response) = events.expire_notifications() {
+                    send_notification_reply(&writer, connection_generation, response);
+                }
+            },
             _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if !is_timed_replay && animation_deadline.is_some() => {
                 presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
             },
@@ -1008,6 +1027,7 @@ async fn run(
                         Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
+                        Some(Command::NotificationReply(_)) => continue,
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
                         Some(Command::Key {..} | Command::DetailedKey {..} | Command::Composed(_) | Command::Text(_) | Command::Paste(_) | Command::Mouse(_) | Command::MouseLeave { .. }) => continue,
                         Some(Command::Wheel(lines, _)) => Some(Command::Scroll(lines)),
@@ -1496,6 +1516,10 @@ async fn run(
                     Some(Command::MouseLeave { connection, modifiers }) => {
                         if connection == connection_generation { terminal.mouse_left(modifiers) } else { Ok(()) }
                     }
+                    Some(Command::NotificationReply(response)) => {
+                        send_notification_reply(&writer, connection_generation, response);
+                        Ok(())
+                    }
                     Some(Command::Focus(focused)) => { terminal.focus_changed(focused); Ok(()) }
                     Some(Command::ReloadDemo) => { if is_demo { scroll_offset = presentation.advance(&mut terminal,demo::bytes(),scroll_offset,&status,total_bytes); } Ok(()) }
                 };
@@ -1512,6 +1536,7 @@ async fn run(
                     let joined = transports.join_next().await;
                     prompts.cancel();
                     events.command_stream(None);
+                    events.notification_stream(None);
                     let program = if show_progress {
                         terminal.retire_running_program_statuses();
                         terminal.program_status().cloned()
@@ -1563,6 +1588,7 @@ async fn run(
                             terminal.clear_resize_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
                             events.command_stream(None);
+                            events.notification_stream(None);
                             let program = if show_progress {
                                 terminal.retire_running_program_statuses();
                                 terminal.program_status().cloned()
@@ -1643,6 +1669,7 @@ async fn run(
                             connection_generation = generation;
                             phase = Phase::Running;
                             events.command_stream(live_commands.then_some(generation));
+                            events.notification_stream(interactive.then_some(generation));
                             if is_ssh {
                                 events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connected);
                             }
@@ -1655,6 +1682,7 @@ async fn run(
         }
     }
     events.command_stream(None);
+    events.notification_stream(None);
     drop(output);
     transports.shutdown().await;
     if let Some(task) = asset_task {
@@ -1662,6 +1690,22 @@ async fn run(
     }
     if let Some(recorder) = recorder {
         let _ = finish_recording(recorder, &events);
+    }
+}
+
+fn send_notification_reply(
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    generation: u64,
+    response: crate::events::NotificationResponse,
+) {
+    if response.connection == generation && !response.wire.is_empty() {
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let _ = writer.send(TransportInput::Scoped {
+            connection: generation,
+            bytes: response.wire.concat().into_bytes(),
+            reply,
+            kind: terminal::ScopedInput::Notification,
+        });
     }
 }
 

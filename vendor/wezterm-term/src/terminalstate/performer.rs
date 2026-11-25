@@ -1084,6 +1084,15 @@ impl Performer<'_> {
                         self.perform_pointer_shape(b"");
                         return;
                     }
+                    [selector, metadata, payload] if selector == b"99" => {
+                        if let Some(handler) = self.alert_handler.as_mut() {
+                            for reply in handler.kitty_notification(metadata, payload) {
+                                self.writer.write_all(reply.as_bytes()).ok();
+                            }
+                            self.writer.flush().ok();
+                        }
+                        return;
+                    }
                     _ => {}
                 }
                 if let [selector, body] = unspec.as_slice() {

@@ -467,6 +467,14 @@ The remote account needs SSH exec channels, stock SSHFS 3, `fusermount3` 3.15 or
 
 The **Inbox** button beside the tab menu shows how many bells and terminal notifications are unread across this window. The inbox keeps the newest 128 alerts, including alerts from background tabs and splits. Select a message to mark it read and focus its source pane. **Mark all read** acknowledges the remaining messages, and **Clear inbox** empties the list. Both leave the per-pane control event journals available to scripts.
 
+SSH applications can send Kitty OSC 99 notifications to the Attention inbox, including multipart titles and bodies and action buttons. Run this in a remote shell to send a title followed by a body.
+
+```sh
+printf '\033]99;i=build:d=0;Build finished\033\\\033]99;i=build:p=body;Artifacts are ready\033\\'
+```
+
+The application can update a notification by ID, close it, or supply an expiry time. Clicking a notification can focus its pane and report the selected action to the originating connection when requested. The pane's event journal records the published message. Capability queries describe the actions, occasions, and payload types supported by the inbox. [Kitty notification protocol](https://sw.kovidgoyal.net/kitty/desktop-notifications/)
+
 Choose **caret → Panes → Open files here** to open the drawer at the directory the focused SSH shell reported. For example, the OSC 7 URI `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. With iTerm2 shell integration, the paired report supplies the absolute path as literal text. An absent, invalid or foreign-host report opens the usual SFTP working directory.
 
 To keep a remote directory for another session, open it in the SFTP drawer and choose **Bookmarks… → Bookmark this folder**. Select its path to reopen it over the current SSH connection, or choose **Remove** beside the path. Bookmarks belong to the saved profile, SSH account, host, port and verified host key. If a bookmarked directory has moved, the drawer shows the error and keeps the previous listing.

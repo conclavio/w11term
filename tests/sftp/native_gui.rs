@@ -623,6 +623,25 @@ async fn native_pointer_shape_is_scoped_to_the_hovered_ssh_pane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "activates Kitty notification buttons in a native inbox with two loopback SSH panes"]
+async fn native_kitty_notifications_use_the_originating_ssh_pane() {
+    let (Source::Ssh(ssh), remote, shells, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::create_dir(remote.path().join("split-inputs")).unwrap();
+    fs::write(remote.path().join("notification-fixture"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("kitty-notification-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "watches OSC 133 commands in a background SSH tab while a real PowerShell stays active"]
 async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {

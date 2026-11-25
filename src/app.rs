@@ -2633,6 +2633,27 @@ impl TerminalApp {
         }
     }
 
+    fn refresh_notification_visibility(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, IsIconic, IsWindowVisible,
+        };
+        let (foreground, shown) = self.keyboard.hwnd().map_or((false, false), |hwnd| unsafe {
+            (
+                GetForegroundWindow() == hwnd,
+                IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool(),
+            )
+        });
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(tab) = &entry.value.page {
+                let visible = shown && self.tabs.visible(entry.id);
+                let focused = visible && foreground && self.tabs.active_id() == Some(entry.id);
+                tab.session
+                    .events
+                    .set_notification_visibility(focused, visible);
+            }
+        }
+    }
+
     fn refresh_remote_clipboard_focus(&mut self) {
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -2664,6 +2685,7 @@ impl TerminalApp {
         self.pane_drop.cancel();
         self.cancel_directory_copy();
         self.refresh_remote_clipboard_focus();
+        self.refresh_notification_visibility();
         self.tabs.record_pane_focus(AppTab::visited_terminal);
         self.clipboard.input_origin.set(self.paste_origin());
         self.discard_inactive_paste();
@@ -6203,6 +6225,7 @@ impl Component for TerminalApp {
                     self.taskbar.borrow_mut().shell_restarted();
                 }
                 Shortcut::CaretPresentationChanged => {
+                    self.refresh_notification_visibility();
                     self.caret_interval = crate::cursor_blink::system_interval();
                 }
                 Shortcut::DrawerFocusChanged => {}
@@ -6338,6 +6361,7 @@ impl Component for TerminalApp {
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
+                self.refresh_notification_visibility();
                 if let Some(access) = self.focused_osc52.take() {
                     access.set_focused_window(None);
                 }
@@ -6350,6 +6374,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::WindowActivation(true) => {
+                self.refresh_notification_visibility();
                 self.refresh_remote_clipboard_focus();
                 self.header.borrow_mut().take();
                 self.refresh_open_commands();

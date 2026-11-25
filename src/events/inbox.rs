@@ -6,6 +6,8 @@ use std::{
     time::Instant,
 };
 
+use tokio::sync::Notify;
+
 const CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +52,7 @@ pub struct SshLoginResult {
 pub struct Notice {
     arrival: u64,
     effect: Effect,
+    eviction: Option<Arc<Notify>>,
     pub target: NoticeTarget,
     pub source: Arc<str>,
     pub message: String,
@@ -161,11 +164,17 @@ impl Inbox {
             message,
             event.command,
             None,
-            match (live, event.kind.as_str()) {
-                (true, "command-finished") => Effect::FlashTaskbar,
-                (true, "bell") => Effect::VisualBell(Instant::now()),
-                _ => Effect::None,
-            },
+            (
+                match (live, event.kind.as_str()) {
+                    (true, "command-finished") => Effect::FlashTaskbar,
+                    (true, "notification") if event.data["protocol"] == "kitty" => {
+                        Effect::FlashTaskbar
+                    }
+                    (true, "bell") => Effect::VisualBell(Instant::now()),
+                    _ => Effect::None,
+                },
+                event.eviction.clone(),
+            ),
         );
     }
 
@@ -191,7 +200,7 @@ impl Inbox {
             message,
             None,
             None,
-            Effect::FlashTaskbar,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -214,7 +223,7 @@ impl Inbox {
             format!("{result} · {}", display_field(host)),
             None,
             None,
-            Effect::FlashTaskbar,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -240,7 +249,7 @@ impl Inbox {
             format!("SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"),
             None,
             Some(results.into()),
-            Effect::FlashTaskbar,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -269,7 +278,7 @@ impl Inbox {
             message,
             None,
             None,
-            Effect::FlashTaskbar,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -335,7 +344,7 @@ impl Inbox {
             message,
             None,
             None,
-            Effect::FlashTaskbar,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -346,11 +355,13 @@ impl Inbox {
         message: String,
         command: Option<CommandLink>,
         login_results: Option<Arc<[SshLoginResult]>>,
-        effect: Effect,
+        (effect, eviction): (Effect, Option<Arc<Notify>>),
     ) {
         let mut state = self.state.lock().unwrap();
-        if state.rows.len() == CAPACITY {
-            state.rows.pop_front();
+        if state.rows.len() == CAPACITY
+            && let Some(eviction) = state.rows.pop_front().and_then(|notice| notice.eviction)
+        {
+            eviction.notify_one();
         }
         state.rows.push_back(Notice {
             arrival: {
@@ -359,6 +370,7 @@ impl Inbox {
             },
             target,
             effect,
+            eviction,
             source,
             message,
             unread: true,
@@ -438,7 +450,13 @@ impl Inbox {
             .make_contiguous()
             .sort_by_key(|notice| notice.arrival);
         let excess = dest.rows.len().saturating_sub(CAPACITY);
-        dest.rows.drain(..excess);
+        for eviction in dest
+            .rows
+            .drain(..excess)
+            .filter_map(|notice| notice.eviction)
+        {
+            eviction.notify_one();
+        }
         drop(dest);
         (self.wake)();
         (target.wake)();
@@ -485,6 +503,25 @@ impl Inbox {
             .cloned()
     }
 
+    pub(super) fn has_notification(&self, pane: u64, sequence: u64) -> bool {
+        let target = NoticeTarget::Pane { pane, sequence };
+        self.state
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.target == target)
+    }
+
+    pub(super) fn remove_notification(&self, pane: u64, sequence: u64) {
+        let target = NoticeTarget::Pane { pane, sequence };
+        let mut state = self.state.lock().unwrap();
+        if let Some(index) = state.rows.iter().position(|row| row.target == target) {
+            state.rows.remove(index);
+            self.wake_ui(state);
+        }
+    }
+
     pub fn mark_read(&self, pane: u64, sequence: u64) -> bool {
         self.mark_target_read(NoticeTarget::Pane { pane, sequence })
     }
@@ -515,7 +552,10 @@ impl Inbox {
     }
 
     pub fn clear(&self) {
-        self.state.lock().unwrap().rows.clear();
+        let mut state = self.state.lock().unwrap();
+        for eviction in state.rows.drain(..).filter_map(|notice| notice.eviction) {
+            eviction.notify_one();
+        }
     }
 }
 

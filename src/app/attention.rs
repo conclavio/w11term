@@ -1,6 +1,6 @@
 use super::{host_groups::FailedLogin, *};
 use std::{fmt::Write as _, io::Write as _};
-use w11term::events::{NoticeTarget, SshAttemptOutcome, SshLoginResult};
+use w11term::events::{NoticeTarget, NotificationChoice, SshAttemptOutcome, SshLoginResult};
 
 mod group_output;
 
@@ -27,6 +27,11 @@ pub enum Action {
     Visit {
         pane: u64,
         sequence: u64,
+    },
+    Notification {
+        pane: u64,
+        sequence: u64,
+        choice: NotificationChoice,
     },
     VisitGroup(NoticeTarget),
     ViewGroupOutput(NoticeTarget),
@@ -121,6 +126,34 @@ impl TerminalApp {
                     return;
                 };
                 if !self.inbox.mark_read(pane, sequence) {
+                    return;
+                }
+                self.tabs.select(id);
+                if matches!(self.tabs.get(id), Some(AppTab { page: Page::Terminal(live), .. }) if live.find.open)
+                {
+                    self.find(true, None, ctx);
+                }
+            }
+            Action::Notification {
+                pane,
+                sequence,
+                choice,
+            } => {
+                let Some(id) = self.tab_for_pane(pane) else {
+                    return;
+                };
+                let Some(Page::Terminal(tab)) = self.tabs.get(id).map(|tab| &tab.page) else {
+                    return;
+                };
+                let Some(response) = tab.session.events.act_on_notification(sequence, choice)
+                else {
+                    return;
+                };
+                let focus = response.focus;
+                if !response.wire.is_empty() {
+                    let _ = tab.session.input.send(Command::NotificationReply(response));
+                }
+                if !focus {
                     return;
                 }
                 self.tabs.select(id);
@@ -369,11 +402,20 @@ impl TerminalApp {
                         |tab| tab.label.clone(),
                     );
                     let label = format!("{status} · {source} · Pane {pane} · {}", row.message);
+                    let buttons = tab.and_then(|tab| match &tab.page {
+                        Page::Terminal(live) => live.session.events.notification_buttons(sequence),
+                        _ => None,
+                    });
+                    let kitty = buttons.is_some();
                     let visit = Button::new()
                         .automation_name(label.clone())
                         .is_enabled(tab.is_some())
                         .on_click(ctx.callback(move |_| {
-                            Message::Attention(Action::Visit { pane, sequence })
+                            Message::Attention(if kitty {
+                                Action::Notification { pane, sequence, choice: NotificationChoice::Activate(None) }
+                            } else {
+                                Action::Visit { pane, sequence }
+                            })
                         }))
                         .content(
                             TextBlock::new()
@@ -384,7 +426,31 @@ impl TerminalApp {
                         self.history_frame(pane)
                             .is_some_and(|frame| frame.has_command(link))
                     });
-                    let content: View = if let Some(command) = command {
+                    let content: View = if let Some(buttons) = buttons {
+                        let mut controls = Vec::new();
+                        for (index, label) in buttons.iter().enumerate().filter(|(_, label)| !label.is_empty()) {
+                            controls.push(KeyedView::new(format!("action-{index}"),
+                                Button::new()
+                                    .style(ButtonStyle::Subtle)
+                                    .automation_name(format!("{label} for Pane {pane}"))
+                                    .on_click(ctx.callback(move |_| Message::Attention(Action::Notification {
+                                        pane, sequence, choice: NotificationChoice::Activate(Some(index)),
+                                    })))
+                                    .content(label.clone())));
+                        }
+                        controls.push(KeyedView::new("dismiss",
+                            Button::new()
+                                .style(ButtonStyle::Subtle)
+                                .automation_name(format!("Dismiss notification for Pane {pane}"))
+                                .on_click(ctx.callback(move |_| Message::Attention(Action::Notification {
+                                    pane, sequence, choice: NotificationChoice::Dismiss,
+                                })))
+                                .content("Dismiss")));
+                        StackPanel::new().spacing(2.0).children((
+                            visit,
+                            StackPanel::new().spacing(4.0).keyed_children(controls),
+                        ))
+                    } else if let Some(command) = command {
                         Grid::new()
                             .columns([GridLength::STAR, GridLength::Auto])
                             .column_spacing(8.0)
