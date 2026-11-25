@@ -40,6 +40,11 @@ impl<R: NativeRuntime> Pump<R> {
                 continue;
             }
             match queued.work {
+                ImperativeRequest::BringIntoView { node } => {
+                    if self.tree.try_native(node).is_some() {
+                        commands.push(Command::BringIntoView { node });
+                    }
+                }
                 ImperativeRequest::Focus { node, completion } => {
                     if self.tree.try_native(node).is_none() {
                         _ = completion.call(Err(RuntimeError::MissingNode(node)));
