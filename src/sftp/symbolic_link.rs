@@ -47,7 +47,7 @@ impl Engine {
             _ => bail!("The link target is not a regular file or directory"),
         };
         let entries = self
-            .read_directory(directory, cancel)
+            .read_directory(directory, cancel, false)
             .await
             .context("Could not list the link target's folder")?;
         Ok(json!({"directory":directory,"selected":selected,"entries":entries}))

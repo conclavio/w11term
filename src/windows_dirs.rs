@@ -10,7 +10,8 @@ use windows::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FILE_NAMES_INFORMATION, FileNamesInformation, NtCreateFile, NtQueryDirectoryFile,
+            FILE_DIRECTORY_INFORMATION, FILE_NAMES_INFORMATION, FileDirectoryInformation,
+            FileNamesInformation, NtCreateFile, NtQueryDirectoryFile,
         },
     },
     Win32::{
@@ -127,6 +128,109 @@ pub(crate) fn names(dir: &File, mut visit: impl FnMut(&[u16]) -> Result<()>) -> 
         let name = &record.name[..bytes / 2];
         if !matches!(name, [46] | [46, 46]) {
             visit(name)?;
+        }
+    }
+}
+
+pub(crate) struct DirectoryEntry<'a> {
+    pub name: &'a [u16],
+    pub attributes: FILE_FLAGS_AND_ATTRIBUTES,
+    pub size: Option<u64>,
+    pub last_write_time: i64,
+}
+
+pub(crate) fn entries(
+    dir: &File,
+    mut visit: impl FnMut(DirectoryEntry<'_>) -> Result<()>,
+) -> Result<()> {
+    #[repr(C, align(8))]
+    #[derive(Default)]
+    struct RecordHeader {
+        next: u32,
+        index: u32,
+        created: i64,
+        accessed: i64,
+        written: i64,
+        changed: i64,
+        end_of_file: i64,
+        allocated: i64,
+        attributes: u32,
+        name_bytes: u32,
+    }
+    #[repr(C, align(8))]
+    struct Record {
+        header: RecordHeader,
+        name: [u16; 256],
+    }
+    const {
+        assert!(offset_of!(Record, name) == offset_of!(FILE_DIRECTORY_INFORMATION, FileName));
+        assert!(
+            offset_of!(RecordHeader, written)
+                == offset_of!(FILE_DIRECTORY_INFORMATION, LastWriteTime)
+        );
+        assert!(
+            offset_of!(RecordHeader, end_of_file)
+                == offset_of!(FILE_DIRECTORY_INFORMATION, EndOfFile)
+        );
+        assert!(
+            offset_of!(RecordHeader, attributes)
+                == offset_of!(FILE_DIRECTORY_INFORMATION, FileAttributes)
+        );
+        assert!(
+            offset_of!(RecordHeader, name_bytes)
+                == offset_of!(FILE_DIRECTORY_INFORMATION, FileNameLength)
+        );
+    }
+    let mut record = Record {
+        header: RecordHeader::default(),
+        name: [0; 256],
+    };
+    let mut first = true;
+    loop {
+        let mut ios = IO_STATUS_BLOCK::default();
+        // Return one record at a time. The borrowed name is used before the buffer is reused.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                HANDLE(dir.as_raw_handle()),
+                None,
+                None,
+                None,
+                &mut ios,
+                (&raw mut record).cast(),
+                size_of::<Record>() as u32,
+                FileDirectoryInformation,
+                true,
+                None,
+                first,
+            )
+        };
+        if status == STATUS_NO_MORE_FILES || (first && status == STATUS_NO_SUCH_FILE) {
+            return Ok(());
+        }
+        if status != STATUS_SUCCESS {
+            return Err(io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32
+            )
+            .into());
+        }
+        first = false;
+        let bytes = record.header.name_bytes as usize;
+        if record.header.next != 0
+            || bytes == 0
+            || !bytes.is_multiple_of(2)
+            || bytes > size_of_val(&record.name)
+            || ios.Information < offset_of!(Record, name) + bytes
+        {
+            bail!("invalid local directory record");
+        }
+        let name = &record.name[..bytes / 2];
+        if !matches!(name, [46] | [46, 46]) {
+            visit(DirectoryEntry {
+                name,
+                attributes: FILE_FLAGS_AND_ATTRIBUTES(record.header.attributes),
+                size: u64::try_from(record.header.end_of_file).ok(),
+                last_write_time: record.header.written,
+            })?;
         }
     }
 }

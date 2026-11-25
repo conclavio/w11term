@@ -1,14 +1,23 @@
 use super::*;
 use russh_sftp::extensions::Statvfs;
-use w11term::sftp::{FolderChange, FolderComparison, FolderContents, FolderEntry};
+use w11term::sftp::{FolderComparison, FolderContents, FolderOrigin, capture_local_folder};
+
+mod comparison;
+mod export;
+mod reveal;
+mod verify;
+pub(super) use reveal::Listing as ComparedListing;
 
 const READ_ONLY: u64 = 1;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Action {
     Refresh,
     Stop,
     Close,
+    Browse(comparison::Action),
+    Reveal { revision: u64, row: comparison::Row },
+    Verify(verify::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -16,6 +25,7 @@ pub enum Kind {
     Space,
     Contents,
     Reference,
+    LocalReference,
     Comparison,
 }
 
@@ -36,6 +46,7 @@ impl Kind {
                 path,
                 reference: Some(reference?.clone()),
             },
+            Self::LocalReference => return None,
         })
     }
 
@@ -50,24 +61,37 @@ impl Kind {
                     .context("Invalid folder size")?;
                 Ok(Report::Contents(counts, bytes))
             }
-            Self::Reference => {
+            Self::Reference | Self::LocalReference => {
                 let inventory: FolderInventory = serde_json::from_value(reply)?;
                 let count = inventory.entries.len();
                 *reference = Some(Arc::new(inventory));
                 Ok(Report::Saved(count))
             }
             Self::Comparison => serde_json::from_value(reply)
-                .map(Report::Comparison)
+                .map(|report| Report::Comparison(Arc::new(report)))
                 .map_err(Into::into),
         }
     }
 }
 
+pub(super) fn reference_label(origin: FolderOrigin, report: bool) -> &'static str {
+    match (origin, report) {
+        (FolderOrigin::Remote, false) => "Folder reference",
+        (FolderOrigin::Remote, true) => "Reference folder",
+        (FolderOrigin::Windows, false) => "Windows folder reference",
+        (FolderOrigin::Windows, true) => "Windows reference folder",
+    }
+}
+
 pub(super) struct Panel {
     serial: u64,
+    revision: u64,
     directory: String,
     kind: Kind,
     state: State,
+    comparison: comparison::Browser,
+    reveal: reveal::State,
+    verification: verify::Verification,
     pub(super) cancel: TransferCancel,
 }
 
@@ -80,7 +104,7 @@ enum Report {
     Space(Capacity),
     Contents(FolderContents, u128),
     Saved(usize),
-    Comparison(FolderComparison),
+    Comparison(Arc<FolderComparison>),
 }
 
 impl Drop for Panel {
@@ -136,33 +160,46 @@ impl Panel {
         pane: u64,
         generation: u64,
         progress: Option<&SearchProgress>,
+        export: &text_export::Export,
         context: &ViewContext<TerminalApp>,
     ) -> View {
         let serial = self.serial;
         let (title, refresh, close) = match self.kind {
-            Kind::Space => ("Filesystem space", "Refresh space", "Close space report"),
-            Kind::Contents => ("Folder contents", "Measure again", "Close contents report"),
+            Kind::Space => (
+                "Filesystem space",
+                Some("Refresh space"),
+                "Close space report",
+            ),
+            Kind::Contents => (
+                "Folder contents",
+                Some("Measure again"),
+                "Close contents report",
+            ),
             Kind::Reference => (
                 "Folder reference",
-                "Capture again",
+                Some("Capture again"),
                 "Close folder reference",
             ),
+            Kind::LocalReference => ("Windows folder reference", None, "Close folder reference"),
             Kind::Comparison => (
                 "Folder comparison",
-                "Compare again",
+                Some("Compare again"),
                 "Close folder comparison",
             ),
         };
         let message = move |action| {
             Message::Files(FileAction::FolderReport(pane, generation, serial, action))
         };
+        if self.verification.open {
+            return self.verification.dialog(context, message);
+        }
         let mut rows = vec![KeyedView::new(
             "folder",
             TextBlock::new()
                 .automation_id(match self.kind {
                     Kind::Space => "sftp-space-folder",
                     Kind::Contents => "sftp-contents-folder",
-                    Kind::Reference => "sftp-reference-folder",
+                    Kind::Reference | Kind::LocalReference => "sftp-reference-folder",
                     Kind::Comparison => "sftp-comparison-folder",
                 })
                 .text(&self.directory)
@@ -175,6 +212,7 @@ impl Panel {
                     _ if self.cancel.is_cancelled() => "Stopping folder scan…",
                     Kind::Contents => "Scanning folder contents…",
                     Kind::Reference => "Capturing folder reference…",
+                    Kind::LocalReference => "Capturing Windows folder reference…",
                     Kind::Comparison => "Scanning folder for comparison…",
                 };
                 rows.push(KeyedView::new("loading", TextBlock::new().text(loading)));
@@ -205,7 +243,7 @@ impl Panel {
                 let (id, prefix) = match self.kind {
                     Kind::Space => ("sftp-space-error", "Could not read filesystem space"),
                     Kind::Contents => ("sftp-contents-error", "Could not measure folder contents"),
-                    Kind::Reference => (
+                    Kind::Reference | Kind::LocalReference => (
                         "sftp-reference-error",
                         "Could not capture a folder reference",
                     ),
@@ -260,17 +298,52 @@ impl Panel {
                 ));
             }
             State::Loaded(Ok(Report::Comparison(comparison))) => {
-                rows.extend(comparison_rows(comparison));
+                rows.extend(self.comparison.rows(
+                    comparison,
+                    context,
+                    message,
+                    self.revision,
+                    !self.reveal.checking(),
+                    &self.verification.checks,
+                ));
+                if let Some(status) = self.reveal.text() {
+                    rows.push(KeyedView::new(
+                        "reveal-status",
+                        TextBlock::new()
+                            .automation_id("sftp-comparison-reveal-status")
+                            .text(status)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
+                let target = text_export::FolderComparisonTarget {
+                    pane,
+                    generation,
+                    serial,
+                    revision: self.revision,
+                };
+                rows.extend(export::controls(target, export, context));
+                rows.push(KeyedView::new(
+                    "verify-contents",
+                    Button::new()
+                        .is_enabled(!self.reveal.checking())
+                        .on_click(
+                            context
+                                .callback(move |_| message(Action::Verify(verify::Action::Open))),
+                        )
+                        .content("Verify file contents…"),
+                ));
             }
         }
-        rows.push(KeyedView::new(
-            "refresh",
-            Button::new()
-                .automation_name(refresh)
-                .is_enabled(!matches!(self.state, State::Loading))
-                .on_click(context.callback(move |_| message(Action::Refresh)))
-                .content(refresh),
-        ));
+        if let Some(refresh) = refresh {
+            rows.push(KeyedView::new(
+                "refresh",
+                Button::new()
+                    .automation_name(refresh)
+                    .is_enabled(!matches!(self.state, State::Loading) && !self.reveal.checking())
+                    .on_click(context.callback(move |_| message(Action::Refresh)))
+                    .content(refresh),
+            ));
+        }
         ContentDialog::new()
             .title(title)
             .close_button_text(close)
@@ -283,103 +356,6 @@ impl Panel {
                     .keyed_children(rows),
             )
     }
-}
-
-fn entry_summary(entry: FolderEntry) -> String {
-    if let Some(size) = entry.size {
-        format!(
-            "{} · {}",
-            size_value(entry.kind_label(), u128::from(size)),
-            properties::timestamp(entry.mtime)
-        )
-    } else if entry.is_file() {
-        format!(
-            "File · Size unavailable · {}",
-            properties::timestamp(entry.mtime)
-        )
-    } else {
-        entry.kind_label().into()
-    }
-}
-
-fn comparison_rows(report: &FolderComparison) -> Vec<KeyedView> {
-    let mut rows = vec![
-        KeyedView::new(
-            "reference",
-            TextBlock::new()
-                .automation_id("sftp-folder-comparison-reference")
-                .text(format!("Reference folder  {}", report.reference_root))
-                .text_wrapping(TextWrapping::Wrap),
-        ),
-        KeyedView::new(
-            "scope",
-            TextBlock::new()
-                .text("Compares paths, entry types, and regular-file sizes and modification times. File contents and link targets are unchecked.")
-                .text_wrapping(TextWrapping::Wrap),
-        ),
-    ];
-    for (key, label, count) in [
-        ("reference-only", "Only in reference", report.reference_only),
-        (
-            "current-only",
-            "Only in current folder",
-            report.current_only,
-        ),
-        ("type", "Type changed", report.types_changed),
-        ("metadata", "File metadata changed", report.metadata_changed),
-        ("unknown", "Needs inspection", report.unknown),
-        ("matching", "Matching inventory entries", report.matching),
-    ] {
-        rows.push(KeyedView::new(
-            key,
-            TextBlock::new()
-                .automation_id(format!("sftp-comparison-{key}"))
-                .text(format!("{label}  {count}")),
-        ));
-    }
-    if !report.differences.is_empty() {
-        rows.push(KeyedView::new(
-            "differences",
-            ScrollViewer::new()
-                .automation_name("Folder differences")
-                .max_height(180.0)
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(StackPanel::new().spacing(6.0).keyed_children(
-                    report.differences.iter().map(|item| {
-                        let label = match item.change {
-                            FolderChange::ReferenceOnly => "Only in reference",
-                            FolderChange::CurrentOnly => "Only in current folder",
-                            FolderChange::Type => "Type changed",
-                            FolderChange::Metadata => "File metadata changed",
-                            FolderChange::Unknown => "Needs inspection",
-                        };
-                        let detail = match (item.reference, item.current) {
-                            (Some(reference), Some(current)) => format!(
-                                "Reference  {}\nCurrent  {}",
-                                entry_summary(reference),
-                                entry_summary(current),
-                            ),
-                            (Some(entry), None) | (None, Some(entry)) => entry_summary(entry),
-                            (None, None) => String::new(),
-                        };
-                        KeyedView::new(
-                            item.path.as_str(),
-                            TextBlock::new()
-                                .text(format!("{label} · {}\n{detail}", item.path))
-                                .text_wrapping(TextWrapping::Wrap),
-                        )
-                    }),
-                )),
-        ));
-    }
-    let unshown = report.unshown();
-    if unshown > 0 {
-        rows.push(KeyedView::new(
-            "unshown",
-            TextBlock::new().text(format!("{unshown} more entries included in the totals")),
-        ));
-    }
-    rows
 }
 
 fn contents_rows(counts: &FolderContents, bytes: u128) -> Vec<KeyedView> {
@@ -467,28 +443,94 @@ impl FileDrawer {
         revision: u64,
         kind: Kind,
     ) -> Option<(u64, Operation)> {
-        if !self.open
-            || self.busy()
-            || self.generation == 0
-            || revision != self.listing_revision
-            || self.search.is_some()
-            || self.bookmarks.is_some()
-        {
+        if !self.can_report_folder(revision) {
             return None;
         }
         let directory = self.directory.clone()?;
         let operation = kind.operation(directory.clone(), self.folder_reference.as_ref())?;
+        let serial = self.begin_folder_report(kind, directory);
+        Some((serial, operation))
+    }
+
+    pub(super) fn can_report_folder(&self, revision: u64) -> bool {
+        self.open
+            && !self.busy()
+            && self.generation != 0
+            && revision == self.listing_revision
+            && self.directory.is_some()
+            && self.search.is_none()
+            && self.bookmarks.is_none()
+    }
+
+    fn begin_folder_report(&mut self, kind: Kind, directory: String) -> u64 {
         self.end_filter_edit();
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         let serial = self.dialog_serial;
         self.folder_report = Some(Panel {
             serial,
-            directory: directory.clone(),
+            revision: 0,
+            directory,
             kind,
             state: State::Loading,
+            comparison: comparison::Browser::default(),
+            reveal: reveal::State::default(),
+            verification: verify::Verification::default(),
             cancel: TransferCancel::default(),
         });
-        Some((serial, operation))
+        serial
+    }
+
+    pub(super) fn start_local_folder_reference(
+        &mut self,
+        pane: u64,
+        revision: u64,
+        path: PathBuf,
+        context: &ComponentContext<TerminalApp>,
+    ) {
+        if !self.can_report_folder(revision) {
+            return;
+        }
+        let serial = self.begin_folder_report(Kind::LocalReference, path.display().to_string());
+        let cancel = self.folder_report.as_ref().unwrap().cancel.clone();
+        let generation = self.generation;
+        let message = move |result| {
+            Message::Files(FileAction::LocalFolderCaptured(
+                pane, generation, serial, result,
+            ))
+        };
+        context.spawn_background_with_rejection(
+            move |_| {
+                message(
+                    capture_local_folder(&path, &cancel)
+                        .map(Arc::new)
+                        .map_err(|error| format!("{error:#}")),
+                )
+            },
+            message(Err("Folder capture worker unavailable. Try again.".into())),
+        );
+    }
+
+    pub(super) fn finish_local_folder_reference(
+        &mut self,
+        serial: u64,
+        result: Result<Arc<FolderInventory>, String>,
+    ) {
+        if let Some(panel) = self.folder_report.as_mut().filter(|panel| {
+            panel.serial == serial
+                && panel.kind == Kind::LocalReference
+                && matches!(panel.state, State::Loading)
+        }) {
+            let result = if panel.cancel.is_cancelled() {
+                Err("Windows folder capture stopped".into())
+            } else {
+                result.map(|inventory| {
+                    let count = inventory.entries.len();
+                    self.folder_reference = Some(inventory);
+                    Report::Saved(count)
+                })
+            };
+            panel.state = State::Loaded(result);
+        }
     }
 
     pub(super) fn refresh_folder_report(&mut self, serial: u64) -> Option<Operation> {
@@ -500,6 +542,8 @@ impl FileDrawer {
             || self.directory.as_ref() != Some(&panel.directory)
             || self.pending.is_some()
             || matches!(panel.state, State::Loading)
+            || panel.reveal.checking()
+            || panel.verification.open
         {
             return None;
         }
@@ -507,6 +551,9 @@ impl FileDrawer {
             .kind
             .operation(panel.directory.clone(), self.folder_reference.as_ref())?;
         panel.state = State::Loading;
+        panel.reveal = reveal::State::default();
+        panel.verification = verify::Verification::default();
+        panel.revision = panel.revision.wrapping_add(1);
         panel.cancel = TransferCancel::default();
         Some(operation)
     }
@@ -523,6 +570,20 @@ impl FileDrawer {
                     .report(value, &mut self.folder_reference)
                     .map_err(|error| format!("{error:#}"))
             }));
+            if let State::Loaded(Ok(Report::Comparison(report))) = &panel.state {
+                panel.comparison.index(report);
+            }
+        }
+    }
+
+    pub(super) fn browse_folder_comparison(&mut self, serial: u64, action: comparison::Action) {
+        if let Some(panel) = self
+            .folder_report
+            .as_mut()
+            .filter(|panel| panel.serial == serial)
+            && let State::Loaded(Ok(Report::Comparison(report))) = &panel.state
+        {
+            panel.comparison.update(report, action);
         }
     }
 
@@ -552,7 +613,8 @@ impl FileDrawer {
         if self.folder_report.take().is_some() {
             if matches!(
                 self.pending.as_ref().map(|pending| &pending.step),
-                Some(Step::FolderReport(_))
+                Some(Step::FolderReport(_) | Step::RevealCompared(..))
+                    | Some(Step::VerifyCompared(_))
             ) {
                 self.pending.take();
             }
@@ -671,5 +733,48 @@ mod tests {
         drawer.close_folder_report(serial);
         drawer.observe_connection(8);
         assert!(drawer.folder_reference.is_none());
+    }
+
+    #[test]
+    fn stopping_or_closing_a_windows_capture_preserves_the_previous_reference() {
+        let original = Arc::new(FolderInventory {
+            root: "/previous".into(),
+            origin: FolderOrigin::Remote,
+            entries: Default::default(),
+        });
+        let replacement = Arc::new(FolderInventory {
+            root: r"C:\local".into(),
+            origin: FolderOrigin::Windows,
+            entries: Default::default(),
+        });
+        let mut drawer = FileDrawer {
+            folder_reference: Some(original.clone()),
+            ..Default::default()
+        };
+        let serial = drawer.begin_folder_report(Kind::LocalReference, replacement.root.clone());
+        drawer.stop_folder_report(serial);
+        drawer.finish_local_folder_reference(serial, Ok(replacement.clone()));
+        assert!(Arc::ptr_eq(
+            drawer.folder_reference.as_ref().unwrap(),
+            &original
+        ));
+        assert!(matches!(
+            &drawer.folder_report.as_ref().unwrap().state,
+            State::Loaded(Err(error)) if error.contains("stopped")
+        ));
+        drawer.close_folder_report(serial);
+        let serial = drawer.begin_folder_report(Kind::LocalReference, replacement.root.clone());
+        drawer.close_folder_report(serial);
+        drawer.finish_local_folder_reference(serial, Ok(replacement.clone()));
+        assert!(Arc::ptr_eq(
+            drawer.folder_reference.as_ref().unwrap(),
+            &original
+        ));
+        let serial = drawer.begin_folder_report(Kind::LocalReference, replacement.root.clone());
+        drawer.finish_local_folder_reference(serial, Ok(replacement.clone()));
+        assert!(Arc::ptr_eq(
+            drawer.folder_reference.as_ref().unwrap(),
+            &replacement
+        ));
     }
 }
