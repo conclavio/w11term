@@ -465,6 +465,8 @@ Enable **Match path** to search the path relative to the search folder. Paths us
 
 Enter a regex in **Exclude folder paths** to skip matching folders and their contents. The regex uses paths relative to the search root and follows **Match case**. For example, `(^|/)(\.git|node_modules)$` skips those folder names at any depth. The CLI accepts the same pattern with `--exclude-dir-regex`. You can use exclusions on their own or with the other filters, and saved searches retain them.
 
+Open **More filters** to edit folder exclusions, file sizes, and modification dates. **Hide filters** gives the results more room and keeps the selected advanced filters visible in a summary.
+
 Use **Min size** or **Max size** to find regular files within inclusive size limits. Enter whole bytes or binary units such as `16 MiB`. Leave either bound blank for an open-ended range. Size filters apply before the result cap, and files whose size the server cannot report are omitted. The CLI offers `--min-size` and `--max-size`, and saved searches retain both limits.
 
 Use **Modified from** or **Modified through** with `YYYY-MM-DD` dates to filter by modification time. Both dates are inclusive UTC days. To search a single day, enter it in both fields. Date filters apply before the result cap, and entries whose modification time the server cannot report are omitted. Use `--modified-from` and `--modified-through` in the CLI. Saved searches retain these dates.
