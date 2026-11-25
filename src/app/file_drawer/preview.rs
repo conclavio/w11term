@@ -1,12 +1,13 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::cell::OnceCell;
-use w11term::sftp::{FileTextMatch, PermissionReview};
+use w11term::sftp::{FileTail, FileTextMatch, PermissionReview};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewKind {
     Text,
     Image,
+    Tail,
     Properties,
     Checksum(u64),
 }
@@ -48,6 +49,7 @@ pub(super) struct EntryPreview {
     link_target: Option<String>,
     opening_link: bool,
     comparison: Option<LocalComparison>,
+    tail_refreshing: bool,
     status: Option<String>,
     pub(super) cancel: TransferCancel,
     // Terminal output can re-render the window while the user selects text.
@@ -58,6 +60,7 @@ enum Contents {
     Loading,
     Ready(String),
     Image(ImagePreview),
+    Tail(FileTail),
     Error(String),
 }
 
@@ -236,6 +239,7 @@ impl EntryPreview {
                         .text(match self.kind {
                             PreviewKind::Text => "Loading preview…",
                             PreviewKind::Image => "Loading image preview…",
+                            PreviewKind::Tail => "Reading the end of the file…",
                             PreviewKind::Properties => "Loading properties…",
                             PreviewKind::Checksum(_) => "Calculating SHA-256 over SFTP…",
                         })
@@ -247,6 +251,9 @@ impl EntryPreview {
                             }
                             PreviewKind::Image => {
                                 ("sftp-image-error", "Could not preview this image.")
+                            }
+                            PreviewKind::Tail => {
+                                ("sftp-tail-error", "Could not read the file tail.")
                             }
                             PreviewKind::Properties => {
                                 ("sftp-properties-error", "Could not read properties.")
@@ -279,6 +286,18 @@ impl EntryPreview {
                         match_view.unwrap_or_else(|| self.full_text_view(text))
                     }
                     Contents::Image(image) => image.view(self.target.name()),
+                    Contents::Tail(tail) => {
+                        let size = format!("File size  {} bytes", tail.file_size);
+                        let summary = if tail.omitted_prefix {
+                            format!("{size} · Earlier text omitted")
+                        } else {
+                            size
+                        };
+                        StackPanel::new().spacing(6.0).children((
+                            TextBlock::new().text(summary),
+                            self.full_text_view(&tail.text),
+                        ))
+                    }
                 };
                 let serial = self.serial;
                 let body_key = if self.full_text {
@@ -289,6 +308,23 @@ impl EntryPreview {
                     "document".to_owned()
                 };
                 let mut fields = vec![KeyedView::new(body_key, body)];
+                if self.kind == PreviewKind::Tail {
+                    fields.push(KeyedView::new(
+                        "refresh-tail",
+                        Button::new()
+                            .is_enabled(
+                                !self.tail_refreshing && !matches!(self.content, Contents::Loading),
+                            )
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::RefreshTail(pane, generation, serial))
+                            }))
+                            .content(if self.tail_refreshing {
+                                "Refreshing tail…"
+                            } else {
+                                "Refresh tail"
+                            }),
+                    ));
+                }
                 if let Some(hits) = matches {
                     if !self.full_text && hits.lines.len() > 1 {
                         let nav_button = |label, forward, enabled| {
@@ -465,6 +501,7 @@ impl EntryPreview {
                     .title(self.target.name())
                     .close_button_text(match self.kind {
                         PreviewKind::Text | PreviewKind::Image => "Close preview",
+                        PreviewKind::Tail => "Close tail",
                         PreviewKind::Properties => "Close properties",
                         PreviewKind::Checksum(_) if matches!(self.content, Contents::Loading) => {
                             "Cancel calculation"
@@ -541,6 +578,7 @@ impl EntryPreview {
     fn full_text_view(&self, text: &str) -> View {
         let (name, id) = match self.kind {
             PreviewKind::Text | PreviewKind::Image => ("File contents", "sftp-preview-text"),
+            PreviewKind::Tail => ("File tail", "sftp-file-tail"),
             PreviewKind::Properties => ("File properties", "sftp-properties-text"),
             PreviewKind::Checksum(_) => ("SHA-256 digest", "sftp-checksum-text"),
         };
@@ -554,6 +592,11 @@ impl EntryPreview {
         )];
         if self.kind == PreviewKind::Text && text.is_empty() {
             fields.push(KeyedView::new("empty", TextBlock::new().text("Empty file")));
+        } else if self.kind == PreviewKind::Tail && text.is_empty() {
+            fields.push(KeyedView::new(
+                "empty",
+                TextBlock::new().text("No complete text at the end of the file"),
+            ));
         }
         ScrollViewer::new()
             .max_height(420.0)
@@ -598,13 +641,13 @@ impl FileDrawer {
         );
         let path = self.checked_target_path(&target)?;
         let operation = match kind {
-            PreviewKind::Text => {
+            PreviewKind::Text | PreviewKind::Image | PreviewKind::Tail => {
                 ensure!(target.is_regular_file(), "Select a regular file to preview");
-                Operation::PreviewText { path }
-            }
-            PreviewKind::Image => {
-                ensure!(target.is_regular_file(), "Select a regular file to preview");
-                Operation::PreviewImage { path }
+                match kind {
+                    PreviewKind::Image => Operation::PreviewImage { path },
+                    PreviewKind::Tail => Operation::PreviewTail { path },
+                    _ => Operation::PreviewText { path },
+                }
             }
             PreviewKind::Properties => Operation::EntryProperties { path },
             PreviewKind::Checksum(properties) => {
@@ -636,6 +679,7 @@ impl FileDrawer {
             link_target: None,
             opening_link: false,
             comparison: None,
+            tail_refreshing: false,
             status: None,
             cancel: TransferCancel::default(),
             view: OnceCell::new(),
@@ -662,6 +706,9 @@ impl FileDrawer {
                 _ => Err("Missing text in the SFTP preview reply".into()),
             },
             PreviewKind::Image => ImagePreview::from_reply(&value).map(Contents::Image),
+            PreviewKind::Tail => serde_json::from_value(value)
+                .map(Contents::Tail)
+                .map_err(|error| format!("Invalid file tail reply. {error}")),
             PreviewKind::Properties => {
                 let target = value
                     .get("target")
@@ -690,6 +737,14 @@ impl FileDrawer {
                 .and_then(|sha256| normalize_sha256(sha256).map_err(|error| error.to_string()))
                 .map(Contents::Ready),
         });
+        if std::mem::take(&mut preview.tail_refreshing)
+            && matches!(preview.content, Contents::Tail(_))
+            && let Err(error) = &content
+        {
+            preview.status = Some(format!("Could not refresh the file tail. {error}"));
+            preview.view.take();
+            return;
+        }
         preview.content = match content {
             Ok(content) => {
                 if preview.kind == PreviewKind::Text
@@ -708,6 +763,24 @@ impl FileDrawer {
             Err(error) => Contents::Error(error),
         };
         preview.view.take();
+    }
+
+    pub(super) fn begin_tail_refresh(&mut self, serial: u64) -> Option<Operation> {
+        let preview = self.preview.as_ref().filter(|preview| {
+            preview.serial == serial
+                && preview.kind == PreviewKind::Tail
+                && !preview.tail_refreshing
+                && !matches!(preview.content, Contents::Loading)
+        })?;
+        if !self.open || self.pending.is_some() {
+            return None;
+        }
+        let path = self.checked_target_path(&preview.target).ok()?;
+        let preview = self.preview.as_mut().unwrap();
+        preview.tail_refreshing = true;
+        preview.status = None;
+        preview.view.take();
+        Some(Operation::PreviewTail { path })
     }
 
     pub(super) fn begin_link_target(&mut self, serial: u64) -> Option<Operation> {
@@ -1131,6 +1204,48 @@ mod tests {
         assert!(cancel.is_cancelled());
         files.finish_local_checksum(checksum, Ok(digest));
         assert!(!files.can_compare_checksum(checksum));
+    }
+
+    #[test]
+    fn tail_refresh_stays_on_the_same_selection_and_keeps_the_last_good_read() {
+        let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
+        let (serial, operation) = files
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Tail)
+            .unwrap();
+        let Operation::PreviewTail { path } = operation else {
+            panic!("expected the tail operation");
+        };
+        assert!(files.begin_tail_refresh(serial).is_none());
+        files.finish_preview(
+            serial,
+            Ok(json!({"text":"old", "file_size":3, "omitted_prefix":false})),
+        );
+        assert!(files.begin_tail_refresh(serial + 1).is_none());
+        assert!(matches!(
+            files.begin_tail_refresh(serial),
+            Some(Operation::PreviewTail { path: target }) if target == path
+        ));
+        assert!(files.begin_tail_refresh(serial).is_none());
+        files.finish_preview(serial, Err("File unavailable".into()));
+        let preview = files.preview.as_ref().unwrap();
+        assert!(matches!(&preview.content, Contents::Tail(tail) if tail.text == "old"));
+        assert!(
+            preview
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("File unavailable")
+        );
+        assert!(files.begin_tail_refresh(serial).is_some());
+        files.finish_preview(
+            serial,
+            Ok(json!({"text":"new", "file_size":3, "omitted_prefix":false})),
+        );
+        let preview = files.preview.as_ref().unwrap();
+        assert!(matches!(&preview.content, Contents::Tail(tail) if tail.text == "new"));
+        assert!(preview.status.is_none());
+        files.close_preview(serial);
+        assert!(files.begin_tail_refresh(serial).is_none());
     }
 
     fn selected(kind: ListedKind) -> (FileDrawer, ListedEntry) {

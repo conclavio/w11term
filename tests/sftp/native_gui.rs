@@ -2586,6 +2586,36 @@ async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reads a large remote log tail and refreshes it after append and rotation in WinUI"]
+async fn native_sftp_tail_opens_from_the_listing_and_search_and_picks_up_rotation() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let parent = root.join("shell directory");
+    fs::create_dir_all(&parent).unwrap();
+    let log = parent.join("server 雪.log");
+    fs::write(&log, format!("{}\ninitial line\n", "x".repeat(512 * 1024))).unwrap();
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-tail-ui.ps1", &ssh, state.path());
+    let requests = fs::read_to_string(trace).unwrap();
+    assert_eq!(
+        requests
+            .matches("OPEN /shell directory/server 雪.log")
+            .count(),
+        4
+    );
+    assert_eq!(requests.lines().filter(|line| *line == "CLOSE").count(), 4);
+    assert!(!requests.contains("WRITE"));
+    assert_eq!(fs::read(&log).unwrap(), b"rotated log\n");
+    assert_eq!(channels.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
 async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

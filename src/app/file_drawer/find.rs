@@ -911,6 +911,7 @@ impl Panel {
                         "Preview text"
                     };
                     entry_actions.push(preview("preview", label, PreviewKind::Text));
+                    entry_actions.push(preview("tail", "Tail text file", PreviewKind::Tail));
                 }
                 if shell_ready
                     && let Some(origin) =

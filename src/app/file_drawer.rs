@@ -126,6 +126,7 @@ pub enum FileAction {
     BulkListingMarks(u64, u64, u64, SelectionChange),
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     Preview(u64, u64, FileTarget, PreviewKind),
+    RefreshTail(u64, u64, u64),
     ClosePreview(u64, u64, u64),
     OpenLinkTarget(u64, u64, u64),
     LinkTargetListed(u64, u64, u64, Result<link_target::Listing, String>),
@@ -2468,11 +2469,19 @@ impl FileDrawer {
                         preview(PreviewKind::Properties),
                     ),
                 );
-                if regular && selected.is_some_and(|e| image_preview_name(&e.name)) {
-                    StackPanel::new().spacing(6.0).children((
-                        button("Preview image…", writable, preview(PreviewKind::Image)),
-                        actions,
-                    ))
+                if regular {
+                    let tail = button("Tail text file…", writable, preview(PreviewKind::Tail));
+                    let supplemental = if selected.is_some_and(|e| image_preview_name(&e.name)) {
+                        button_pair(
+                            button("Preview image…", writable, preview(PreviewKind::Image)),
+                            tail,
+                        )
+                    } else {
+                        tail
+                    };
+                    StackPanel::new()
+                        .spacing(6.0)
+                        .children((actions, supplemental))
                 } else {
                     actions
                 }
@@ -3532,6 +3541,7 @@ impl TerminalApp {
             | BulkListingMarks(id, ..)
             | CopyPath(id, ..)
             | Preview(id, ..)
+            | RefreshTail(id, ..)
             | ClosePreview(id, ..)
             | OpenLinkTarget(id, ..)
             | LinkTargetListed(id, ..)
@@ -4211,6 +4221,16 @@ impl TerminalApp {
                         {
                             files.finish_preview(serial, Err(format!("{error:#}")));
                         }
+                    }
+                }
+                RefreshTail(_, generation, serial) => {
+                    if may_open_dialog
+                        && generation == files.generation
+                        && let Some(operation) = files.begin_tail_refresh(serial)
+                        && let Err(error) =
+                            files.job(pane, session, operation, Step::Preview(serial), context)
+                    {
+                        files.finish_preview(serial, Err(format!("{error:#}")));
                     }
                 }
                 _ if !files.open

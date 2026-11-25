@@ -33,6 +33,8 @@ mod group_upload;
 pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_path};
 mod drop_source;
 mod editor;
+mod file_tail;
+pub use file_tail::FileTail;
 mod find;
 mod image_preview;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
@@ -318,6 +320,10 @@ pub enum Operation {
     },
     #[serde(skip)]
     PreviewImage {
+        path: String,
+    },
+    #[serde(skip)]
+    PreviewTail {
         path: String,
     },
     #[serde(skip)]
@@ -745,6 +751,7 @@ pub(crate) async fn run(
                 }
                 Operation::PreviewText { .. } => Some("Missing SSH connection for text preview"),
                 Operation::PreviewImage { .. } => Some("Missing SSH connection for image preview"),
+                Operation::PreviewTail { .. } => Some("Missing SSH connection for file tail"),
                 Operation::PutDrop { .. } => Some("Missing SSH connection for this dropped upload"),
                 Operation::PutGroupFile { .. } => {
                     Some("Missing SSH connection for this group upload")
@@ -782,6 +789,7 @@ pub(crate) async fn run(
             && let Some(message) = match operation {
                 Operation::PreviewText { .. } => Some("Text preview cancelled"),
                 Operation::PreviewImage { .. } => Some("Image preview cancelled"),
+                Operation::PreviewTail { .. } => Some("File tail cancelled"),
                 Operation::EntryProperties { .. } => Some("File properties cancelled"),
                 Operation::OpenLinkTarget { .. } => Some("Opening the link target was cancelled"),
                 Operation::Sha256 { .. } => Some("SHA-256 calculation cancelled"),
@@ -880,6 +888,7 @@ pub(crate) async fn run(
                 Operation::PreviewImage { .. } => {
                     JobStage::Checking("Image preview did not finish")
                 }
+                Operation::PreviewTail { .. } => JobStage::Checking("File tail did not finish"),
                 Operation::OpenLinkTarget { .. } => {
                     JobStage::Checking("Link target lookup did not finish")
                 }
@@ -1515,6 +1524,9 @@ impl Engine {
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
             PreviewImage { path } => self.read_preview_image(&path, cancel).await?,
+            PreviewTail { path } => {
+                serde_json::to_value(self.read_file_tail(&path, cancel).await?)?
+            }
             Sha256 { path, max_bytes } => self.remote_sha256(&path, max_bytes, cancel).await?,
             Find {
                 path,

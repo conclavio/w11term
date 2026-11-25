@@ -32,35 +32,54 @@ impl Engine {
         cancel: Option<&TransferCancel>,
         limit: &PreviewLimit,
     ) -> Result<Vec<u8>> {
+        let (handle, _) = self
+            .open_preview_file(path, limit.name, Some(limit), cancel)
+            .await?;
+        let mut bytes = Vec::new();
+        let read = self
+            .read_contents(
+                &handle,
+                &mut bytes,
+                0,
+                Some((limit.bytes, limit.limit)),
+                cancel,
+                |_, _| Ok(()),
+            )
+            .await;
+        // Propagate transport/close errors so the worker can invalidate a broken subsystem.
+        self.raw.close(handle).await?;
+        check_preview_cancel(cancel, limit.name)?;
+        read?;
+        Ok(bytes)
+    }
+
+    pub(super) async fn open_preview_file(
+        &self,
+        path: &str,
+        name: &str,
+        limit: Option<&PreviewLimit>,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<(String, Option<u64>)> {
         ensure!(
             path.starts_with('/')
                 && !path.contains('\0')
                 && !matches!(path.rsplit('/').next(), None | Some("" | "." | "..")),
-            "{} requires an absolute remote file path",
-            limit.name
+            "{name} requires an absolute remote file path"
         );
-        let check_cancel = || {
-            ensure!(
-                !cancel.is_some_and(TransferCancel::is_cancelled),
-                "{} cancelled",
-                limit.name
-            );
-            Ok::<_, anyhow::Error>(())
-        };
-        check_cancel()?;
-        self.check_preview_entry(path, limit).await?;
-        check_cancel()?;
+        check_preview_cancel(cancel, name)?;
+        self.check_preview_entry(path, name, limit).await?;
+        check_preview_cancel(cancel, name)?;
         let handle = self
             .raw
             .open(path, OpenFlags::READ, FileAttributes::empty())
             .await?
             .handle;
-        let read = async {
-            check_cancel()?;
-            // SFTP v3 has no no-follow OPEN. Re-check the directory entry and
-            // reject a special file type on the opened handle if the peer supplies one.
-            self.check_preview_entry(path, limit).await?;
-            match self.raw.fstat(&handle).await {
+        let checked = async {
+            check_preview_cancel(cancel, name)?;
+            // SFTP v3 has no no-follow OPEN. Recheck the directory entry and
+            // verify the opened handle's type when its server supplies one.
+            let path_size = self.check_preview_entry(path, name, limit).await?;
+            let size = match self.raw.fstat(&handle).await {
                 Ok(reply) => {
                     if let Some(mode) = reply.attrs.permissions
                         && mode & 0o170000 != 0
@@ -70,45 +89,58 @@ impl Engine {
                             "The opened entry is not a regular file"
                         );
                     }
-                    limit.check_size(reply.attrs.size)?;
+                    if let Some(limit) = limit {
+                        limit.check_size(reply.attrs.size)?;
+                    }
+                    reply.attrs.size.or(path_size)
                 }
                 Err(Error::Status(status))
                     if matches!(
                         status.status_code,
                         StatusCode::OpUnsupported | StatusCode::PermissionDenied
-                    ) => {}
+                    ) =>
+                {
+                    path_size
+                }
                 Err(error) => return Err(error.into()),
-            }
-            let mut bytes = Vec::new();
-            self.read_contents(
-                &handle,
-                &mut bytes,
-                0,
-                Some((limit.bytes, limit.limit)),
-                cancel,
-                |_, _| Ok(()),
-            )
-            .await?;
-            check_cancel()?;
-            Ok(bytes)
+            };
+            check_preview_cancel(cancel, name)?;
+            Ok(size)
         }
         .await;
-        let closed = self.raw.close(handle).await;
-        // Propagate transport/close errors so the worker can invalidate a broken subsystem.
-        closed?;
-        check_cancel()?;
-        read
+        match checked {
+            Ok(size) => Ok((handle, size)),
+            Err(error) => {
+                self.raw.close(handle).await?;
+                Err(error)
+            }
+        }
     }
 
-    async fn check_preview_entry(&self, path: &str, limit: &PreviewLimit) -> Result<()> {
+    async fn check_preview_entry(
+        &self,
+        path: &str,
+        name: &str,
+        limit: Option<&PreviewLimit>,
+    ) -> Result<Option<u64>> {
         let attrs = self.raw.lstat(path).await?.attrs;
         ensure!(
             EntryKind::from_permissions(attrs.permissions) == Some(EntryKind::File),
-            "{} requires a confirmed regular file",
-            limit.name
+            "{name} requires a confirmed regular file"
         );
-        limit.check_size(attrs.size)
+        if let Some(limit) = limit {
+            limit.check_size(attrs.size)?;
+        }
+        Ok(attrs.size)
     }
+}
+
+pub(super) fn check_preview_cancel(cancel: Option<&TransferCancel>, name: &str) -> Result<()> {
+    ensure!(
+        !cancel.is_some_and(TransferCancel::is_cancelled),
+        "{name} cancelled"
+    );
+    Ok(())
 }
 
 impl PreviewLimit {
