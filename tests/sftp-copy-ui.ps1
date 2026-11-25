@@ -11,6 +11,7 @@ $edit = [System.Windows.Automation.ControlType]::Edit
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $parent = '/shell directory'
 $copy = 'Copy to folder' + [char]0x2026
+$duplicate = 'Duplicate as' + [char]0x2026
 $batchCopy = 'Copy marked files' + [char]0x2026
 $on = [System.Windows.Automation.ToggleState]::On
 $off = [System.Windows.Automation.ToggleState]::Off
@@ -165,9 +166,41 @@ try {
     $null = Wait-Until 'the new search batch completes' {
         (Drawer-Status 'sftp-search-status') -ceq "Copied 1 of 1 marked file to $parent. 4 matches in 3 folders"
     }
+    Click "Duplicate as $parent/sub/scan-copy-02.bin"
+    $name = Wait-Until 'the duplicate dialog offers a suggested sibling name' {
+        $field = Find-Element 'New name' $edit
+        if ($field -and $field.GetCurrentPattern($value).Current.Value -ceq 'scan-copy-02 copy.bin') { $field }
+    }
+    $name.GetCurrentPattern($value).SetValue('scan-copy-search duplicate.bin')
+    Click 'Duplicate'
+    $null = Wait-Until 'the refreshed search shows the duplicate and its source' {
+        (Drawer-Status 'sftp-search-status') -ceq "Copied scan-copy-search duplicate.bin to $parent/sub. 5 matches in 3 folders" -and
+            (Find-Element "Reveal $parent/sub/scan-copy-search duplicate.bin" $button) -and
+            (Find-Element "Reveal $parent/sub/scan-copy-02.bin" $button)
+    }
+    $null = Wait-CheckBox "Mark $parent/sub/scan-copy-02.bin" $on
     Click 'Back to files'
     $null = Wait-Until 'the cached listing includes both search copies' {
         (Find-Element 'scan-copy-01.bin' $button) -and (Find-Element 'scan-copy-02.bin' $button)
+    }
+    Click 'scan-copy-01.bin'
+    Click $duplicate
+    $name = Wait-Until 'the listing duplicate dialog is open' { Find-Element 'New name' $edit }
+    $name.GetCurrentPattern($value).SetValue('scan-copy-02.bin')
+    Click 'Duplicate'
+    $null = Wait-Until 'duplicate reports an occupied name in the same folder' {
+        (Drawer-Status 'sftp-listing-status') -like "*An entry already exists at $parent/scan-copy-02.bin*"
+    }
+    Click $duplicate
+    $null = Wait-Until 'the listing offers the original default again' {
+        $field = Find-Element 'New name' $edit
+        $field -and $field.GetCurrentPattern($value).Current.Value -ceq 'scan-copy-01 copy.bin'
+    }
+    Click 'Duplicate'
+    $null = Wait-Until 'the listing shows both files after duplication' {
+        (Drawer-Status 'sftp-listing-status') -ceq "Copied scan-copy-01 copy.bin to $parent" -and
+            (Find-Element 'scan-copy-01 copy.bin' $button) -and
+            (Find-Element 'scan-copy-01.bin' $button)
     }
 } catch {
     $status = if ($window -and !$app.HasExited) {

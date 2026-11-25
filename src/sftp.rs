@@ -179,6 +179,17 @@ impl EntryKind {
     }
 }
 
+#[derive(Debug)]
+pub enum CopyDestination {
+    Folder {
+        directory: String,
+        is_canonical: bool,
+    },
+    Sibling {
+        name: String,
+    },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
@@ -360,12 +371,11 @@ pub enum Operation {
         kind: Option<EntryKind>,
         destination_is_canonical: bool,
     },
-    /// Copy an approved regular file into another folder on the same connection.
+    /// Copy an approved regular file on the same connection.
     #[serde(skip)]
     CopyEntry {
         from: String,
-        directory: String,
-        destination_is_canonical: bool,
+        destination: CopyDestination,
     },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
@@ -1205,27 +1215,36 @@ impl Engine {
         Ok(json!({"directory":destination}))
     }
 
-    async fn cross_folder_paths(
-        &self,
-        from: &str,
-        directory: &str,
-        destination_is_canonical: bool,
-    ) -> Result<(String, String)> {
+    async fn checked_source_folder<'a>(&self, from: &'a str) -> Result<(&'a str, &'a str)> {
         let (parent, name) = from.rsplit_once('/').context("Missing source folder")?;
         let parent = if parent.is_empty() { "/" } else { parent };
         ensure!(
             from.starts_with('/')
-                && directory.starts_with('/')
                 && !matches!(name, "" | "." | "..")
                 && !from.contains('\\')
-                && !directory.contains('\\')
-                && !from.chars().chain(directory.chars()).any(char::is_control),
+                && !from.chars().any(char::is_control),
             "Choose a remote entry and destination folder"
         );
         ensure!(
             self.canonical_remote_path(parent).await? == parent,
             "The source folder changed. Refresh the drawer."
         );
+        Ok((parent, name))
+    }
+
+    async fn cross_folder_paths(
+        &self,
+        from: &str,
+        directory: &str,
+        destination_is_canonical: bool,
+    ) -> Result<(String, String)> {
+        ensure!(
+            directory.starts_with('/')
+                && !directory.contains('\\')
+                && !directory.chars().any(char::is_control),
+            "Choose a remote entry and destination folder"
+        );
+        let (parent, name) = self.checked_source_folder(from).await?;
         let destination = self
             .canonical_remote_path(directory)
             .await
@@ -1652,14 +1671,7 @@ impl Engine {
                 self.move_entry(from, directory, kind, destination_is_canonical, stage)
                     .await?
             }
-            CopyEntry {
-                from,
-                directory,
-                destination_is_canonical,
-            } => {
-                self.copy_entry(&from, &directory, destination_is_canonical, stage)
-                    .await?
-            }
+            CopyEntry { from, destination } => self.copy_entry(&from, destination, stage).await?,
             RemoveEntry {
                 path,
                 kind,

@@ -2973,7 +2973,7 @@ async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "copies single and marked regular files from the native listing and recursive search over one live SSH connection"]
+#[ignore = "copies and duplicates regular files from the native listing and recursive search over one live SSH connection"]
 async fn native_sftp_copy_from_listing_and_search_keeps_both_originals() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
         unreachable!()
@@ -3010,6 +3010,11 @@ async fn native_sftp_copy_from_listing_and_search_keeps_both_originals() {
         ("sub/scan-copy-02.bin", b"search second".as_slice()),
         ("scan-copy-01.bin", b"search first".as_slice()),
         ("scan-copy-02.bin", b"search second".as_slice()),
+        ("scan-copy-01 copy.bin", b"search first".as_slice()),
+        (
+            "sub/scan-copy-search duplicate.bin",
+            b"search second".as_slice(),
+        ),
     ] {
         assert_eq!(fs::read(root.join(path)).unwrap(), expected);
     }

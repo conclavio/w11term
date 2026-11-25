@@ -294,8 +294,10 @@ impl FileDrawer {
             },
             Kind::Copy => Operation::CopyEntry {
                 from: from.clone(),
-                directory: batch.destination.clone(),
-                destination_is_canonical,
+                destination: CopyDestination::Folder {
+                    directory: batch.destination.clone(),
+                    is_canonical: destination_is_canonical,
+                },
             },
         };
         let (activity, subject) = match batch.kind {
