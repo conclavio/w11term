@@ -216,6 +216,7 @@ pub(super) struct PaneSurface {
     pub(super) invalidator: Invalidator,
     pub(super) scrollbar: Rc<scrollback_bar::ScrollBar>,
     cursor_blink: Rc<RefCell<crate::cursor_blink::CursorBlink>>,
+    cursor_guide: Rc<Cell<CursorGuide>>,
     bell: Rc<Cell<visual_bell::Pulse>>,
     pub(super) area: Rc<Cell<Option<(f32, f32, f32)>>>,
     window_grid: Rc<Cell<WindowGrid>>,
@@ -467,6 +468,7 @@ impl TerminalApp {
         let area = surface.area.clone();
         let selection = tab.selection.clone();
         let read_only = tab.read_only.clone();
+        let cursor_guide = surface.cursor_guide.clone();
         let scrollbar = surface.scrollbar.clone();
         let scrollbar_brush = RefCell::new(None);
         let bell = surface.bell.clone();
@@ -491,6 +493,7 @@ impl TerminalApp {
                 .filter(|m| m.pane == id && m.state.valid(&frame));
             renderer.copy_cursor = mode.map(|m| m.state.cursor);
             renderer.read_only = read_only.get();
+            renderer.cursor_guide = cursor_guide.get();
             let marked = mode.and_then(|m| m.state.selection());
             let measured = {
                 let mouse_selection = selection.borrow();
@@ -591,15 +594,19 @@ impl TerminalApp {
                 .borrow()
                 .as_ref()
                 .is_some_and(|m| m.pane == id);
-        if tab.surface.scrollbar.configure(
-            show_scrollbar,
-            tab.find.open,
-            self.appearance
-                .read()
-                .unwrap()
-                .interaction
-                .failed_command_marks,
-        ) {
+        let (failed_marks, cursor_guide) = {
+            let appearance = self.appearance.read().unwrap();
+            (
+                appearance.interaction.failed_command_marks,
+                appearance.cursor_guide,
+            )
+        };
+        let scrollbar_changed =
+            tab.surface
+                .scrollbar
+                .configure(show_scrollbar, tab.find.open, failed_marks);
+        let guide_changed = tab.surface.cursor_guide.replace(cursor_guide) != cursor_guide;
+        if scrollbar_changed || guide_changed {
             tab.surface.invalidator.invalidate();
         }
         let focused = tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input);

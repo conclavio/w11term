@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use w11term::{
-    appearance::{Appearance, DefaultCursorStyle, installed_fonts},
+    appearance::{Appearance, CursorGuide, DefaultCursorStyle, installed_fonts},
     clipboard::RemoteClipboardAccess,
     control::{Pane, Registry, Server},
     interaction::{
@@ -1177,6 +1177,7 @@ pub enum Message {
     ImportConfig(config_import::Action),
     Font(Option<usize>),
     DefaultCursorStyle(Option<usize>),
+    CursorGuide(Option<usize>),
     Ligatures(bool),
     FollowWindowsTextSize(bool),
     WindowsTextSizeChanged,
@@ -2227,6 +2228,11 @@ impl TerminalApp {
                 .items_source(DefaultCursorStyle::CHOICES.iter().map(|(_, label)| *label))
                 .selected_index(DefaultCursorStyle::CHOICES.iter().position(|(style, _)| *style == appearance.default_cursor_style))
                 .on_selection_changed(context.callback(Message::DefaultCursorStyle)).into(),
+            TextBlock::new().text("Cursor guide").into(),
+            ComboBox::new().width(260.0).automation_name("Cursor guide")
+                .items_source(CursorGuide::CHOICES.iter().map(|(_, label)| *label))
+                .selected_index(CursorGuide::CHOICES.iter().position(|(mode, _)| *mode == appearance.cursor_guide))
+                .on_selection_changed(context.callback(Message::CursorGuide)).into(),
             TextBlock::new().text("Applies to all tabs. Changes are saved automatically.").into(),
         ];
         let mut profiles: Vec<View> =
@@ -6728,6 +6734,15 @@ impl Component for TerminalApp {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     if appearance.default_cursor_style != style {
                         appearance.default_cursor_style = style;
+                        self.save_preferences(appearance);
+                    }
+                }
+            }
+            Message::CursorGuide(index) => {
+                if let Some(&(mode, _)) = index.and_then(|index| CursorGuide::CHOICES.get(index)) {
+                    let mut appearance = self.appearance.read().unwrap().clone();
+                    if appearance.cursor_guide != mode {
+                        appearance.cursor_guide = mode;
                         self.save_preferences(appearance);
                     }
                 }

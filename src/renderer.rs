@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Instant};
 use termwiz::surface::CursorShape;
 use w11term::{
+    appearance::CursorGuide,
     interaction::Selection,
     terminal::{Rgba, Snapshot, colors, rgba},
 };
@@ -75,6 +76,7 @@ impl CellHit {
 /// The engine/transport boundary allows an atlas renderer to replace this independently.
 pub struct Renderer {
     pub live_cursor: Option<Rc<RefCell<CursorBlink>>>,
+    pub cursor_guide: CursorGuide,
     pub read_only: bool,
     pub copy_cursor: Option<w11term::interaction::Point>,
     normal: TextFormat,
@@ -438,6 +440,7 @@ impl Renderer {
         Ok(Self {
             live_cursor: None,
             copy_cursor: None,
+            cursor_guide: CursorGuide::Off,
             read_only: false,
             normal,
             bold,
@@ -871,6 +874,32 @@ impl Renderer {
             }
         }
         self.draw_images(&native, frame, &tiles[under_background..under_text])?;
+        let focused = display == CursorDisplay::Live
+            && self
+                .live_cursor
+                .as_ref()
+                .is_some_and(|blink| blink.borrow().is_focused());
+        if focused
+            && self.copy_cursor.is_none()
+            && frame.cursor_visible
+            && self.cursor_guide.shown(frame.application_cursor_guide)
+            && let Ok(row) = usize::try_from(frame.cursor.y)
+            && row < self.metrics.rows.min(frame.rows.len())
+        {
+            let mut guide = rgba(frame.palette.foreground);
+            guide[3] = 0.35;
+            brush.set_color(color(guide));
+            let bottom = ((PADDING + (row + 1) as f32 * ch) * scale).round();
+            ctx.fill_rect(
+                &Rect::from_xywh(
+                    PADDING,
+                    (bottom - 1.0) / scale,
+                    frame.cols.min(self.metrics.cols) as f32 * cw,
+                    1.0 / scale,
+                ),
+                &brush,
+            );
+        }
         let selection = selection.filter(|s| {
             frame.selection_colors != Default::default()
                 && s.alternate == frame.alternate
@@ -900,11 +929,7 @@ impl Renderer {
         });
         let block = cursor.filter(|cursor| {
             self.copy_cursor.is_none()
-                && display == CursorDisplay::Live
-                && self
-                    .live_cursor
-                    .as_ref()
-                    .is_some_and(|blink| blink.borrow().is_focused())
+                && focused
                 && matches!(
                     cursor.shape,
                     CursorShape::Default | CursorShape::SteadyBlock | CursorShape::BlinkingBlock
@@ -1696,6 +1721,73 @@ mod tests {
                 "inactive cursor"
             );
         }
+    }
+
+    #[test]
+    fn cursor_guide_is_one_physical_pixel_on_the_focused_live_row() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::with_size("Cascadia Mono", false, 16.0).unwrap();
+        let blink = Rc::new(RefCell::new(CursorBlink::default()));
+        let surface = windows_canvas::Invalidator::new();
+        renderer.live_cursor = Some(blink.clone());
+        blink.borrow_mut().set_focus(true, None, &surface);
+        let (width, height) = (330_u32, 210_u32);
+        let dpi = 120.0;
+        let scale = dpi / 96.0;
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(width, height).unwrap();
+        let metrics = renderer.measure(width as f32 / scale, height as f32 / scale, scale);
+        let render = |renderer: &mut Renderer, frame: &Snapshot, display| {
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(dpi);
+                    renderer.paint(
+                        ctx,
+                        (width as f32 / scale, height as f32 / scale),
+                        false,
+                        frame,
+                        display,
+                        None,
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            target.read_pixels().unwrap()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(wezterm_term::TerminalSize::default(), tx);
+        terminal.advance_bytes(b"\x1b[2;4H\x1b[6 q");
+        let mut frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let unmarked = render(&mut renderer, &frame, CursorDisplay::Live);
+        renderer.cursor_guide = CursorGuide::FollowApplications;
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), unmarked);
+        frame.application_cursor_guide = true;
+        let marked = render(&mut renderer, &frame, CursorDisplay::Live);
+        let changed_rows: Vec<_> = marked
+            .chunks_exact(width as usize * 4)
+            .zip(unmarked.chunks_exact(width as usize * 4))
+            .enumerate()
+            .filter_map(|(row, (marked, unmarked))| (marked != unmarked).then_some(row))
+            .collect();
+        assert_eq!(
+            changed_rows,
+            [((PADDING + 2.0 * metrics.cell_height) * scale).round() as usize - 1]
+        );
+
+        frame.application_cursor_guide = false;
+        renderer.cursor_guide = CursorGuide::On;
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), marked);
+        assert_eq!(
+            render(&mut renderer, &frame, CursorDisplay::Static),
+            unmarked
+        );
+        blink.borrow_mut().set_focus(false, None, &surface);
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), unmarked);
+        blink.borrow_mut().set_focus(true, None, &surface);
+        frame.cursor_visible = false;
+        let hidden = render(&mut renderer, &frame, CursorDisplay::Live);
+        renderer.cursor_guide = CursorGuide::Off;
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), hidden);
     }
 
     #[test]

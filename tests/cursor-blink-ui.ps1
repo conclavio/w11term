@@ -109,6 +109,37 @@ try {
     $null = Wait-Until 'application cursor still overrides the preference' { (Sample-Cell) -eq $block }
     $null = Send-Sequence '[0 q'
     Assert-Steady
+
+    $null = Send-Sequence "[4;20HGuideProbe$esc[4;4H"
+    $guideBounds = Get-CursorCell 'palette-ssh' 'GuideProbe'
+    function Sample-Guide {
+        [CursorCellProbe]::Sample($window, $guideBounds.X, $guideBounds.Y, $guideBounds.Width, $guideBounds.Height)
+    }
+    $noGuide = Sample-Guide
+    $null = Send-Sequence (']1337;HighlightCursorLine=yes' + [char]7)
+    if ((Sample-Guide) -ne $noGuide) { throw 'Cursor guide is visible with the setting off' }
+    Run-Palette 'Settings'
+    $field = Wait-Until 'cursor guide choice' { Find-Element 'Cursor guide' $combo }
+    $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $follow = Wait-Until 'application-controlled cursor guide' {
+        Find-Element 'Follow applications' ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $follow.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'cursor guide mode persisted' {
+        (Get-Content -LiteralPath $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).cursor_guide -ceq 'follow_applications'
+    }
+    $field = Find-Element 'Cursor guide' $combo
+    $popup = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    Press-Key 0x77
+    Wait-Focus $pane
+    $null = Wait-Until 'application guide visible on the original row' { (Sample-Guide) -ne $noGuide }
+    $null = Send-Sequence '[?25l'
+    $null = Wait-Until 'guide hidden with the caret' { (Sample-Guide) -eq $noGuide }
+    $null = Send-Sequence '[?25h'
+    $null = Wait-Until 'guide restored with the caret' { (Sample-Guide) -ne $noGuide }
+    $null = Send-Sequence (']1337;HighlightCursorLine=no' + [char]7)
+    $null = Wait-Until 'application hides the guide' { (Sample-Guide) -eq $noGuide }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

@@ -967,6 +967,7 @@ impl Performer<'_> {
             // reset graphic rendition, erase all positions, move active position to first
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
+                self.application_cursor_guide = false;
                 self.pointer_shapes = Default::default();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.terminal_reset();
@@ -1318,6 +1319,7 @@ impl Performer<'_> {
                 }
             }
             OperatingSystemCommand::ITermProprietary(iterm) => match iterm {
+                ITermProprietary::HighlightCursorLine(show) => self.application_cursor_guide = show,
                 ITermProprietary::RequestCellSize => {
                     let screen = self.screen();
                     let height = screen.physical_rows;

@@ -48,6 +48,31 @@ impl DefaultCursorStyle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorGuide {
+    #[default]
+    Off,
+    On,
+    FollowApplications,
+}
+
+impl CursorGuide {
+    pub const CHOICES: [(Self, &'static str); 3] = [
+        (Self::Off, "Off"),
+        (Self::On, "On"),
+        (Self::FollowApplications, "Follow applications"),
+    ];
+
+    pub fn shown(self, application_requested: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => true,
+            Self::FollowApplications => application_requested,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
@@ -56,6 +81,7 @@ pub struct Appearance {
     pub font_size: f32,
     pub follow_windows_text_size: bool,
     pub default_cursor_style: DefaultCursorStyle,
+    pub cursor_guide: CursorGuide,
     #[serde(skip, default = "default_text_scale")]
     windows_text_scale: f32,
     pub interaction: crate::interaction::Interaction,
@@ -73,6 +99,7 @@ impl Default for Appearance {
             font_size: 16.0,
             follow_windows_text_size: true,
             default_cursor_style: DefaultCursorStyle::default(),
+            cursor_guide: CursorGuide::default(),
             windows_text_scale: default_text_scale(),
             interaction: crate::interaction::Interaction::default(),
             shortcuts: Default::default(),

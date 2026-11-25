@@ -683,6 +683,7 @@ pub struct Snapshot {
     pub visual_bell_color: Option<SrgbaTuple>,
     pub cursor: CursorPosition,
     pub cursor_visible: bool,
+    pub application_cursor_guide: bool,
     pub pointer_shape: Option<PointerShape>,
     pub cols: usize,
     pub scroll_offset: usize,
@@ -937,6 +938,7 @@ impl Snapshot {
             cursor,
             cursor_visible: offset == 0
                 && cursor.visibility == termwiz::surface::CursorVisibility::Visible,
+            application_cursor_guide: terminal.application_cursor_guide(),
             pointer_shape: terminal.application_pointer_shape(),
             cols: screen.physical_cols,
             scroll_offset: offset,
@@ -1039,6 +1041,7 @@ impl Snapshot {
             && self.alternate == old.alternate
             && self.bracketed_paste == old.bracketed_paste
             && self.cursor_visible == old.cursor_visible
+            && self.application_cursor_guide == old.application_cursor_guide
             && self.pointer_shape == old.pointer_shape
             && self.mouse_grabbed == old.mouse_grabbed
             && (
@@ -4110,6 +4113,30 @@ mod tests {
         terminal.advance_bytes(b"\x1b[6 q");
         terminal.reset_connection();
         assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+    }
+
+    #[test]
+    fn iterm_cursor_guide_requests_update_the_snapshot_and_reset_with_the_session() {
+        let (mut terminal, mut replies) = engine();
+        let capture = |terminal: &Terminal, old: Option<&Snapshot>| {
+            Snapshot::capture(terminal, old, 1, 0, String::new(), 0)
+        };
+        let before = capture(&terminal, None);
+        assert!(!before.application_cursor_guide);
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=yes\x07");
+        let enabled = capture(&terminal, Some(&before));
+        assert!(enabled.application_cursor_guide);
+        assert!(!enabled.same_presentation(&before));
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=invalid\x07");
+        assert!(capture(&terminal, Some(&enabled)).same_presentation(&enabled));
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=no\x1b\\");
+        assert!(!capture(&terminal, None).application_cursor_guide);
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=yes\x07\x1bc");
+        assert!(!capture(&terminal, None).application_cursor_guide);
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=yes\x07");
+        terminal.reset_connection();
+        assert!(!capture(&terminal, None).application_cursor_guide);
+        assert!(replies.try_recv().is_err());
     }
     fn text(t: &Terminal) -> String {
         let s = t.screen();

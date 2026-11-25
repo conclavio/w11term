@@ -373,6 +373,7 @@ pub struct TerminalState {
     /// of the screen.  0-based index.
     cursor: CursorPosition,
     default_cursor_shape: CursorShape,
+    application_cursor_guide: bool,
 
     /// if true, implicitly move to the next line on the next
     /// printed character
@@ -719,6 +720,7 @@ impl TerminalState {
             pen: CellAttributes::default(),
             cursor: CursorPosition::default(),
             default_cursor_shape: CursorShape::Default,
+            application_cursor_guide: false,
             top_and_bottom_margins: 0..size.rows as VisibleRowIndex,
             left_and_right_margins: 0..size.cols,
             left_and_right_margin_mode: false,
@@ -1649,6 +1651,10 @@ impl TerminalState {
         let previous = self.effective_cursor_shape();
         self.default_cursor_shape = shape;
         previous != self.effective_cursor_shape()
+    }
+
+    pub fn application_cursor_guide(&self) -> bool {
+        self.application_cursor_guide
     }
 
     /// Returns the current cell attributes of the screen

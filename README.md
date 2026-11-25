@@ -541,6 +541,8 @@ The terminal follows **Windows Settings → Accessibility → Text size** by def
 
 In w11term Settings, choose **Default cursor style** for a steady or blinking block, bar, or underline. The choice applies in the current window and is saved for new windows. Applications can still set their own cursor style. When they reset it, the pane uses your preference again. Blinking follows the Windows caret interval.
 
+Set **Cursor guide** to **On** for a horizontal rule at the focused pane’s live cursor row. Choose **Follow applications** to let an editor show or hide the rule with iTerm2’s `OSC 1337;HighlightCursorLine` sequence. The guide is off by default. It stays visible while the caret blinks and disappears while browsing scrollback or when the application hides the caret. [iTerm2 cursor guide](https://iterm2.com/documentation-escape-codes.html#cursor-guide)
+
 SSH supports OpenSSH private keys supplied with `--identity`, protected w11term device keys, the Windows OpenSSH agent (the default for `ssh user@host`), `--auth none`, `--auth password`, and `--auth keyboard-interactive`. Password and MFA challenges use native dialogs; hidden answers never enter terminal input, profiles, event logs, or recordings. A successful password remains in memory only for reconnection; one-time codes are requested again. Passphrase-protected OpenSSH keys can be used through the agent.
 
 Choose **Private key file** in Quick Connect or an SSH profile, then use **Browse…** to select the file through the Windows dialog. The picker starts beside the entered path when that folder is available locally, or in your OpenSSH `.ssh` folder when it exists.
