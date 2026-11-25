@@ -2336,6 +2336,94 @@ mod tests {
     }
 
     #[test]
+    fn kitty_text_width_places_literal_text_and_answers_the_width_probe() {
+        let (mut terminal, mut wire) = engine();
+        for bytes in [
+            b"\r\x1b[6n".as_slice(),
+            b"\x1b]66;w=2; \x07\x1b[6n",
+            b"\x1b]66;s=2; \x07\x1b[6n",
+        ] {
+            terminal.advance_bytes(bytes);
+        }
+        assert_eq!(receive(&mut wire), b"\x1b[1;1R");
+        assert_eq!(receive(&mut wire), b"\x1b[1;3R");
+        assert_eq!(receive(&mut wire), b"\x1b[1;3R");
+        for byte in "\x1b]66;w=7;字;a\x1b\\X".as_bytes() {
+            terminal.advance_bytes([*byte]);
+        }
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let cells: Vec<_> = frame.rows[0].visible_cells().take(3).collect();
+        assert_eq!((cells[0].cell_index(), cells[0].width()), (0, 2));
+        assert_eq!((cells[1].cell_index(), cells[1].width()), (2, 7));
+        assert_eq!(cells[1].str(), "字;a");
+        assert_eq!((cells[2].cell_index(), cells[2].str()), (9, "X"));
+        terminal.advance_bytes(b"\x1b[1;7H!");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert!(frame.rows[0].as_str().starts_with("     !  X"));
+    }
+
+    #[test]
+    fn kitty_text_width_survives_scrollback_and_reflow() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 8,
+            rows: 3,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"1234567\x1b]66;w=5;hello\x07X\r\nmore\r\nscroll\r\n");
+        let expect_width = |terminal: &Terminal| {
+            let screen = terminal.screen();
+            let line = screen
+                .physical_lines()
+                .find(|line| line.as_str().contains("hello"))
+                .expect("retained sized text");
+            let mut visible = line.visible_cells();
+            let block = visible.find(|cell| cell.str() == "hello").unwrap();
+            assert_eq!(block.width(), 5);
+            let next = visible.next().unwrap();
+            assert_eq!(next.cell_index(), block.cell_index() + 5);
+            assert_eq!(next.str(), "X");
+        };
+        assert!(terminal.screen().phys_row(0) >= 2);
+        expect_width(&terminal);
+        terminal.resize(TerminalSize { cols: 14, ..size });
+        expect_width(&terminal);
+        terminal.resize(TerminalSize { cols: 4, ..size });
+        assert!(terminal.screen().physical_lines().all(|line| {
+            !line.as_str().contains("hello")
+                && line
+                    .visible_cells()
+                    .all(|cell| cell.cell_index() + cell.width() <= 4)
+        }));
+    }
+
+    #[test]
+    fn kitty_text_width_preserves_combining_marks_and_edits_whole_cells() {
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes("\x1b]66;w=1;♥\x07\u{fe0f}\u{0301}\x1b[6n".as_bytes());
+        assert_eq!(receive(&mut wire), b"\x1b[1;2R");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let first = frame.rows[0].visible_cells().next().unwrap();
+        assert_eq!(first.str(), "♥\u{fe0f}\u{0301}");
+        assert_eq!(first.width(), 1);
+        for edit in ["@", "P", "X", "K"] {
+            terminal.advance_bytes(b"\x1b[2J\x1b[H[A\x1b]66;w=6;sized\x07Z");
+            terminal.advance_bytes(format!("\x1b[1;6H\x1b[{edit}").as_bytes());
+            let frame = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+            assert!(!frame.rows[0].as_str().contains("sized"), "{edit}");
+        }
+        terminal.advance_bytes(b"\x1b[2J\x1b[H\x1b[?7l\x1b[80G\x1b]66;w=5;end\x07\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[1;80R");
+        let frame = Snapshot::capture(&terminal, None, 3, 0, String::new(), 0);
+        let last = frame.rows[0].visible_cells().last().unwrap();
+        assert_eq!(
+            (last.cell_index(), last.width(), last.str()),
+            (75, 5, "end")
+        );
+    }
+
+    #[test]
     fn xterm_other_keys_settings_roundtrip_and_reset() {
         let (mut terminal, mut wire) = engine();
         terminal.advance_bytes(b"\x1b[?4m\x1b[?4g");

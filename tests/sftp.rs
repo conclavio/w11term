@@ -1054,6 +1054,8 @@ mod in_band_resize;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
+#[path = "sftp/kitty_text_width.rs"]
+mod kitty_text_width;
 #[path = "sftp/local_forward.rs"]
 mod local_forward;
 #[cfg(feature = "ui-smoke")]

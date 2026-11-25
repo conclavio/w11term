@@ -70,6 +70,7 @@ impl<'a> CellRef<'a> {
     /// Computes a hash over the cell that only changes based on its content.
     pub fn compute_shape_hash<H: Hasher>(&self, hasher: &mut H) {
         self.str().hash(hasher);
+        self.width().hash(hasher);
         self.attrs().compute_shape_hash(hasher);
     }
 }

@@ -116,6 +116,7 @@ struct TextRun<'a> {
     style: TextStyle,
     cols: usize,
     shape: bool,
+    explicit_width: bool,
     scale: (f32, f32),
 }
 
@@ -230,6 +231,9 @@ enum RunKind {
 }
 
 fn run_kind(cell: &wezterm_term::CellRef<'_>, ligatures: bool, rtl: bool) -> Option<RunKind> {
+    if cell.attrs().explicit_width() {
+        return None;
+    }
     let text = cell.str();
     if text.is_ascii() {
         return (ligatures && cell.width() == 1 && text.len() == 1).then_some(RunKind::Ascii);
@@ -441,6 +445,7 @@ impl Renderer {
             style,
             cols,
             shape,
+            explicit_width,
             mut scale,
         } = run;
         if text.trim_end_matches(' ').is_empty() {
@@ -470,8 +475,9 @@ impl Renderer {
         let cached = &self.layouts[&key];
         // Anchor each shaped run to its occupied grid columns even when DirectWrite
         // chose a proportional fallback font or the grid was snapped to physical pixels.
-        if shape && cached.natural_width > 0.0 {
-            scale.0 *= cols as f32 * self.metrics.cell_width / cached.natural_width;
+        if (shape || explicit_width) && cached.natural_width > 0.0 {
+            let fit = cols as f32 * self.metrics.cell_width / cached.natural_width;
+            scale.0 *= if explicit_width { fit.min(1.0) } else { fit };
         }
         Ok(Some((&cached.layout, scale)))
     }
@@ -959,6 +965,7 @@ impl Renderer {
                             },
                             cols,
                             shape: kind.is_some(),
+                            explicit_width: attrs.explicit_width(),
                             scale: (width_scale as f32, height_scale),
                         })?;
                         if let Some((layout, scale)) = layout {
@@ -968,12 +975,14 @@ impl Renderer {
                                 scale,
                                 ink: fg,
                             };
-                            run.draw(
-                                &native,
-                                row,
-                                left * width_scale..(left + cols) * width_scale,
-                                selected_ink,
-                            )?;
+                            let columns = left * width_scale..(left + cols) * width_scale;
+                            if attrs.explicit_width() {
+                                native.with_clip(row.rect(columns.clone()), || {
+                                    run.draw(&native, row, columns, selected_ink)
+                                })?;
+                            } else {
+                                run.draw(&native, row, columns, selected_ink)?;
+                            }
                             if block_col.is_some_and(|col| {
                                 (left..left + cols).contains(&(col / width_scale))
                             }) {
@@ -2297,6 +2306,41 @@ mod tests {
         let cell = |col: u32| actual.get_pixel((2 * col + 1) * actual.width() / 6, y).0;
         assert_eq!(cell(0), [255, 0, 0], "default background shows the image");
         assert_eq!(cell(1), [0, 0, 0], "explicit RGB paints over the image");
+    }
+
+    #[test]
+    fn offscreen_kitty_text_width_keeps_ink_and_background_in_the_requested_cells() {
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 2,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b[48;2;0;0;255m\x1b]66;w=5; \x07\x1b[49m",
+            "\x1b]66;w=1;WWWWWWW\x07"
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kitty-width.png");
+        let (width, _) = screenshot(&frame, size, &path).unwrap();
+        let pixels = image::open(path).unwrap().into_rgb8();
+        let cw = width / 8;
+        let mut ink = false;
+        for y in 2..15 {
+            for x in 0..width {
+                let color = pixels.get_pixel(x, y).0;
+                match x / cw {
+                    0..=4 => assert_eq!(color, [0, 0, 255]),
+                    5 => ink |= color != [0, 0, 0],
+                    _ => assert_eq!(color, [0, 0, 0], "ink overflow at {x}, {y}"),
+                }
+            }
+        }
+        assert!(ink);
     }
 
     #[test]

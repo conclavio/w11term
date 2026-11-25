@@ -128,7 +128,6 @@ impl Performer<'_> {
             return;
         }
 
-        let seqno = self.seqno;
         let mut p = std::mem::take(&mut self.print);
         let normalized: String;
         let text = if self.config.normalize_output_to_unicode_nfc()
@@ -139,7 +138,13 @@ impl Performer<'_> {
         } else {
             p.as_str()
         };
+        self.print_cells(text, None);
+        std::mem::swap(&mut self.print, &mut p);
+        self.print.clear();
+    }
 
+    fn print_cells(&mut self, text: &str, explicit_width: Option<usize>) {
+        let seqno = self.seqno;
         let row_geometry = |state: &TerminalState| {
             let scale = state.screen().line_width_scale(state.cursor.y);
             (
@@ -153,10 +158,39 @@ impl Performer<'_> {
         let (mut sized, mut right) = row_geometry(self.state);
         let track = self.track_primary_prints && !self.is_alt_screen_active();
         let mut last_print = None;
-        for g in Graphemes::new(text) {
-            let g = self.remap_grapheme(g);
+        let mut text_run = explicit_width.map(|_| text);
+        let mut graphemes = Graphemes::new(if explicit_width.is_some() { "" } else { text });
+        while let Some(g) = text_run.take().or_else(|| graphemes.next()) {
+            let g = if explicit_width.is_some() {
+                g
+            } else {
+                self.remap_grapheme(g)
+            };
 
-            let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
+            let mut print_width = explicit_width
+                .unwrap_or_else(|| grapheme_column_width(g, Some(&self.unicode_version)));
+            if explicit_width.is_none()
+                && (print_width == 0 && !is_white_space_grapheme(g)
+                    || matches!(g, "\u{fe0e}" | "\u{fe0f}"))
+            {
+                let x = self.cursor.x;
+                let prior = if self.wrap_next {
+                    Some(x)
+                } else {
+                    x.checked_sub(1)
+                };
+                if let Some(prior) = prior {
+                    let y = self.cursor.y;
+                    let screen = self.screen_mut();
+                    let index = screen.phys_row(y);
+                    if screen
+                        .line_mut(index)
+                        .append_to_explicit_width(prior, g, seqno)
+                    {
+                        continue;
+                    }
+                }
+            }
             if print_width == 0 {
                 // We got a zero-width grapheme.
 
@@ -183,9 +217,13 @@ impl Performer<'_> {
                 }
             }
 
-            if sized
+            let left = self.left_and_right_margins.start.min(right - 1);
+            if explicit_width.is_some() && print_width > right - left {
+                continue;
+            }
+            if (sized || explicit_width.is_some())
                 && self.dec_auto_wrap
-                && self.cursor.x > self.left_and_right_margins.start.min(right - 1)
+                && self.cursor.x > left
                 && self.cursor.x.saturating_add(print_width) > right
             {
                 self.wrap_next = true;
@@ -226,7 +264,12 @@ impl Performer<'_> {
             }
 
             let y = self.cursor.y;
-            let x = if sized {
+            let x = if explicit_width.is_some() {
+                if print_width > right - self.left_and_right_margins.start.min(right - 1) {
+                    continue;
+                }
+                self.cursor.x.min(right - print_width)
+            } else if sized {
                 self.cursor.x.min(right - 1)
             } else {
                 self.cursor.x
@@ -238,7 +281,10 @@ impl Performer<'_> {
                 continue;
             }
 
-            let pen = self.pen.clone();
+            let mut pen = self.pen.clone();
+            if explicit_width.is_some() {
+                pen.set_explicit_width(true);
+            }
 
             let wrappable = x + print_width >= right;
 
@@ -277,14 +323,44 @@ impl Performer<'_> {
                 self.wrap_next = false;
             } else {
                 self.wrap_next = self.dec_auto_wrap;
+                if explicit_width.is_some() {
+                    self.cursor.x = right - 1;
+                }
             }
         }
 
         if last_print.is_some() {
             self.last_primary_print = last_print;
         }
-        std::mem::swap(&mut self.print, &mut p);
-        self.print.clear();
+    }
+
+    fn kitty_text_width(&mut self, metadata: &[u8], payload: &[u8]) {
+        let Ok(metadata) = std::str::from_utf8(metadata) else {
+            return;
+        };
+        let Ok(text) = std::str::from_utf8(payload) else {
+            return;
+        };
+        if text.is_empty() || text.len() > 4096 || text.chars().any(char::is_control) {
+            return;
+        }
+        let mut width = 0;
+        for field in metadata.split(':').filter(|field| !field.is_empty()) {
+            let Some((key, value)) = field.split_once('=') else {
+                return;
+            };
+            let Ok(number) = value.parse::<u8>() else {
+                return;
+            };
+            match key {
+                "w" if number <= 7 => width = usize::from(number),
+                "s" if number == 1 => {}
+                "n" | "d" if number == 0 => {}
+                "h" | "v" if number <= 2 => {}
+                _ => return,
+            }
+        }
+        self.print_cells(text, (width != 0).then_some(width));
     }
 
     /// ConPTY, at the time of writing, does something horrible to rewrite
@@ -1087,6 +1163,10 @@ impl Performer<'_> {
             }
             OperatingSystemCommand::Unspecified(unspec) => {
                 match unspec.as_slice() {
+                    [selector, metadata, payload] if selector == b"66" => {
+                        self.kitty_text_width(metadata, payload);
+                        return;
+                    }
                     [selector, body] if selector == b"22" => {
                         self.perform_pointer_shape(body);
                         return;

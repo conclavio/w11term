@@ -2,7 +2,6 @@ use crate::line::cellref::CellRef;
 use alloc::sync::Arc;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
-use unicode_segmentation::UnicodeSegmentation;
 use wezterm_cell::Cell;
 
 extern crate alloc;
@@ -36,33 +35,26 @@ impl VecStorage {
 
     pub(crate) fn scan_and_create_hyperlinks(
         &mut self,
-        line: &str,
         matches: Vec<crate::hyperlink::RuleMatch>,
     ) -> bool {
-        // The capture range is measured in bytes but we need to translate
-        // that to the index of the column.  This is complicated a bit further
-        // because double wide sequences have a blank column cell after them
-        // in the cells array, but the string we match against excludes that
-        // string.
+        // Match offsets are measured against visible text. A cell can
+        // contain multiple graphemes and can cover hidden continuation cells.
         let mut cell_idx = 0;
+        let mut byte_start = 0;
         let mut has_implicit_hyperlinks = false;
-        for (byte_idx, _grapheme) in line.grapheme_indices(true) {
+        while cell_idx < self.cells.len() {
             let cell = &mut self.cells[cell_idx];
-            let mut matched = false;
-            for m in &matches {
-                if m.range.contains(&byte_idx) {
-                    let attrs = cell.attrs_mut();
-                    // Don't replace existing links
-                    if attrs.hyperlink().is_none() {
-                        attrs.set_hyperlink(Some(Arc::clone(&m.link)));
-                        matched = true;
-                    }
+            let byte_end = byte_start + cell.str().len();
+            if cell.attrs().hyperlink().is_none() {
+                if let Some(matched) = matches.iter().find(|m| {
+                    byte_start < m.range.end && m.range.start < byte_end
+                }) {
+                    cell.attrs_mut().set_hyperlink(Some(Arc::clone(&matched.link)));
+                    has_implicit_hyperlinks = true;
                 }
             }
-            cell_idx += cell.width();
-            if matched {
-                has_implicit_hyperlinks = true;
-            }
+            byte_start = byte_end;
+            cell_idx += cell.width().max(1);
         }
 
         has_implicit_hyperlinks

@@ -88,7 +88,11 @@ impl Line {
     }
 
     pub fn from_cells(cells: Vec<Cell>, seqno: SequenceNo) -> Self {
-        let bits = LineBits::NONE;
+        let bits = if cells.iter().any(|cell| cell.attrs().explicit_width()) {
+            LineBits::EXPLICIT_WIDTH
+        } else {
+            LineBits::NONE
+        };
         Self {
             bits,
             cells: CellStorage::V(VecStorage::new(cells)),
@@ -204,6 +208,9 @@ impl Line {
     }
 
     pub fn resize(&mut self, width: usize, seqno: SequenceNo) {
+        if width < self.len() {
+            self.clear_explicit_width_overlaps(width..width + 1);
+        }
         self.coerce_vec_storage().resize_with(width, Cell::blank);
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
@@ -213,12 +220,21 @@ impl Line {
     /// Returns the list of resultant line(s)
     pub fn wrap(self, width: usize, seqno: SequenceNo) -> Vec<Self> {
         let mut cells: Vec<CellRef> = self.visible_cells().collect();
-        if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
+        if let Some(end_idx) = cells
+            .iter()
+            .rposition(|c| c.str() != " " || c.attrs().explicit_width())
+        {
             cells.truncate(end_idx + 1);
 
             let mut lines: Vec<Self> = vec![];
             let mut delta = 0;
+            let mut discarded = 0;
             for cell in cells {
+                if cell.attrs().explicit_width() && cell.width() > width {
+                    discarded += cell.width();
+                    continue;
+                }
+                let col = cell.cell_index() - discarded;
                 let need_new_line = lines
                     .last_mut()
                     .map(|line| line.len() + cell.width() > width)
@@ -228,16 +244,19 @@ impl Line {
                         .last_mut()
                         .map(|line| line.set_last_cell_was_wrapped(true, seqno));
                     lines.push(Line::new(seqno));
-                    delta = cell.cell_index();
+                    delta = col;
                 }
                 let line = lines.last_mut().unwrap();
                 line.set_cell_grapheme(
-                    cell.cell_index() - delta,
+                    col - delta,
                     cell.str(),
                     cell.width(),
                     (*cell.attrs()).clone(),
                     seqno,
                 );
+            }
+            if lines.is_empty() {
+                lines.push(Line::new(seqno));
             }
 
             lines
@@ -549,9 +568,8 @@ impl Line {
             return;
         }
 
-        let line = line.into_owned();
         let cells = self.coerce_vec_storage();
-        if cells.scan_and_create_hyperlinks(&line, matches) {
+        if cells.scan_and_create_hyperlinks(matches) {
             self.bits |= LineBits::HAS_IMPLICIT_HYPERLINKS;
         }
     }
@@ -642,6 +660,7 @@ impl Line {
     }
 
     pub fn split_off(&mut self, idx: usize, seqno: SequenceNo) -> Self {
+        self.clear_explicit_width_crossing(idx);
         let my_cells = self.coerce_vec_storage();
         // Clamp to avoid out of bounds panic if the line is shorter
         // than the requested split point
@@ -732,15 +751,13 @@ impl Line {
                 break;
             }
             cells.push(c.as_cell());
+            for _ in 1..c.width() {
+                let mut attrs = c.attrs().clone();
+                attrs.set_explicit_width(false);
+                cells.push(Cell::blank_with_attrs(attrs));
+            }
         }
-        Self {
-            bits: LineBits::NONE,
-            cells: CellStorage::V(VecStorage::new(cells)),
-            seqno: self.current_seqno(),
-            zones: vec![],
-            #[cfg(feature = "appdata")]
-            appdata: Mutex::new(None),
-        }
+        Self::from_cells(cells, self.current_seqno())
     }
 
     /// If we're about to modify a cell obscured by a double-width
@@ -765,6 +782,10 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        if attr.explicit_width() {
+            self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+            return;
+        }
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
@@ -814,6 +835,10 @@ impl Line {
         // we grow the cells array to hold this bogus entry.
         // https://github.com/wezterm/wezterm/issues/768
         let width = cell.width().max(1);
+        if cell.attrs().explicit_width() {
+            self.make_cells();
+            self.bits.insert(LineBits::EXPLICIT_WIDTH);
+        }
 
         self.invalidate_implicit_hyperlinks(seqno);
         self.invalidate_zones();
@@ -854,12 +879,18 @@ impl Line {
             }
         }
 
+        self.clear_explicit_width_overlaps(idx..idx + width);
         self.invalidate_grapheme_at_or_before(idx);
 
         // For double-wide or wider chars, ensure that the cells that
         // are overlapped by this one are blanked out.
-        for i in 1..=width.saturating_sub(1) {
-            self.raw_set_cell(idx + i, Cell::blank_with_attrs(cell.attrs().clone()), clear);
+        if width > 1 {
+            let mut attrs = cell.attrs().clone();
+            attrs.set_explicit_width(false);
+            let blank = Cell::blank_with_attrs(attrs);
+            for i in 1..width {
+                self.raw_set_cell(idx + i, blank.clone(), clear);
+            }
         }
 
         self.raw_set_cell(idx, cell, clear);
@@ -894,16 +925,79 @@ impl Line {
             let width = cells[prior].width();
             if width > 1 {
                 let attrs = cells[prior].attrs().clone();
-                for nerf in prior..prior + width {
+                for nerf in prior..(prior + width).min(cells.len()) {
                     cells[nerf] = Cell::blank_with_attrs(attrs.clone());
                 }
             }
         }
     }
 
+    fn clear_explicit_width_overlaps(&mut self, range: Range<usize>) {
+        self.clear_explicit_width_spans(range.start.saturating_sub(6)..range.end, range.start);
+    }
+
+    fn clear_explicit_width_crossing(&mut self, col: usize) {
+        self.clear_explicit_width_spans(col.saturating_sub(6)..col, col);
+    }
+
+    fn clear_explicit_width_spans(&mut self, range: Range<usize>, cutoff: usize) {
+        if !self.bits.contains(LineBits::EXPLICIT_WIDTH) {
+            return;
+        }
+        let cells = self.coerce_vec_storage();
+        // OSC 66 width overrides up to seven columns. The anchor can be
+        // before the first column being edited.
+        for start in range.start..range.end.min(cells.len()) {
+            let end = start + cells[start].width();
+            if end > cutoff && cells[start].attrs().explicit_width() {
+                let mut attrs = cells[start].attrs().clone();
+                attrs.set_explicit_width(false).set_wrapped(false);
+                #[cfg(feature = "use_image")]
+                attrs.clear_images();
+                let blank = Cell::blank_with_attrs(attrs);
+                for col in start..end.min(cells.len()) {
+                    cells.set_cell(col, blank.clone(), false);
+                }
+            }
+        }
+    }
+
+    /// Attach a combining string without changing the application's cell width.
+    pub fn append_to_explicit_width(&mut self, col: usize, text: &str, seqno: SequenceNo) -> bool {
+        if !self.bits.contains(LineBits::EXPLICIT_WIDTH) {
+            return false;
+        }
+        let cells = self.coerce_vec_storage();
+        let Some(start) = (col.saturating_sub(6)..=col.min(cells.len().saturating_sub(1)))
+            .rev()
+            .find(|&start| {
+                cells.get(start).is_some_and(|cell| {
+                    cell.attrs().explicit_width() && col < start + cell.width()
+                })
+            })
+        else {
+            return false;
+        };
+        // Each packet is capped at 4 KiB. Limit further combining text retained
+        // by the same cell if a peer repeatedly appends marks to it.
+        if cells[start].str().len() + text.len() <= 8192 {
+            self.invalidate_implicit_hyperlinks(seqno);
+            let cell = &mut self.coerce_vec_storage()[start];
+            let mut combined = String::from(cell.str());
+            combined.push_str(text);
+            *cell = Cell::new_grapheme_with_width(&combined, cell.width(), cell.attrs().clone());
+            self.invalidate_zones();
+            self.update_last_change_seqno(seqno);
+        }
+        true
+    }
+
     pub fn insert_cell(&mut self, x: usize, cell: Cell, right_margin: usize, seqno: SequenceNo) {
         self.invalidate_implicit_hyperlinks(seqno);
 
+        // Only a cell crossing the insertion point is split.
+        self.clear_explicit_width_crossing(x);
+        self.clear_explicit_width_overlaps(right_margin.saturating_sub(1)..right_margin);
         let cells = self.coerce_vec_storage();
         if right_margin <= cells.len() {
             cells.remove(right_margin - 1);
@@ -931,6 +1025,7 @@ impl Line {
             return;
         }
         self.invalidate_implicit_hyperlinks(seqno);
+        self.clear_explicit_width_overlaps(x..x + 1);
         self.invalidate_grapheme_at_or_before(x);
         {
             let cells = self.coerce_vec_storage();
@@ -947,6 +1042,7 @@ impl Line {
             return;
         }
         self.invalidate_implicit_hyperlinks(seqno);
+        self.clear_explicit_width_overlaps(x..x + 1);
         self.invalidate_grapheme_at_or_before(x);
         self.coerce_vec_storage().remove(x);
         self.update_last_change_seqno(seqno);
@@ -961,7 +1057,9 @@ impl Line {
         blank_attr: CellAttributes,
     ) {
         self.invalidate_implicit_hyperlinks(seqno);
+        self.clear_explicit_width_crossing(right_margin);
         if x < self.len() {
+            self.clear_explicit_width_overlaps(x..x + 1);
             self.invalidate_grapheme_at_or_before(x);
             self.coerce_vec_storage().remove(x);
         }
@@ -990,7 +1088,8 @@ impl Line {
             .iter()
             .rposition(|c| c.str() != " " || c.attrs() != &def_attr)
         {
-            cells.resize_with(end_idx + 1, Cell::blank);
+            let end = end_idx + cells[end_idx].width().max(1);
+            cells.resize_with(end, Cell::blank);
             self.update_last_change_seqno(seqno);
             self.invalidate_zones();
         }
@@ -1067,6 +1166,9 @@ impl Line {
     /// re-materialize the storage in a form that is suitable
     /// for mutation.
     pub fn compress_for_scrollback(&mut self) {
+        if self.bits.contains(LineBits::EXPLICIT_WIDTH) {
+            return;
+        }
         let cv = match &self.cells {
             CellStorage::V(v) => ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
             CellStorage::C(_) => return,
@@ -1106,8 +1208,12 @@ impl Line {
             return;
         }
 
-        let cells = self.coerce_vec_storage();
-        if let Some(cell) = cells.last_mut() {
+        let last = if self.bits.contains(LineBits::EXPLICIT_WIDTH) {
+            self.visible_cells().last().map(|cell| cell.cell_index())
+        } else {
+            self.len().checked_sub(1)
+        };
+        if let Some(cell) = last.and_then(|index| self.coerce_vec_storage().get_mut(index)) {
             cell.attrs_mut().set_wrapped(wrapped);
         }
     }
@@ -1117,12 +1223,18 @@ impl Line {
     /// This function is used by rewrapping logic when joining wrapped
     /// lines back together.
     pub fn append_line(&mut self, other: Line, seqno: SequenceNo) {
+        if other.bits.contains(LineBits::EXPLICIT_WIDTH) {
+            self.make_cells();
+            self.bits.insert(LineBits::EXPLICIT_WIDTH);
+        }
         match &mut self.cells {
             CellStorage::V(cells) => {
                 for cell in other.visible_cells() {
                     cells.push(cell.as_cell());
                     for _ in 1..cell.width() {
-                        cells.push(Cell::new(' ', cell.attrs().clone()));
+                        let mut attrs = cell.attrs().clone();
+                        attrs.set_explicit_width(false);
+                        cells.push(Cell::new(' ', attrs));
                     }
                 }
             }

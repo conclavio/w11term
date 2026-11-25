@@ -214,6 +214,7 @@ impl CellAttributes {
     bitfield!(semantic_type, set_semantic_type, SemanticType, 0b11, 13);
     bitfield!(vertical_align, set_vertical_align, VerticalAlign, 0b11, 15);
     bitfield!(protected, set_protected, 17);
+    bitfield!(explicit_width, set_explicit_width, 18);
 
     pub const fn blank() -> Self {
         Self {
@@ -703,14 +704,14 @@ impl core::clone::Clone for TeenyString {
         if Self::is_marker_bit_set(self.0) {
             Self(self.0)
         } else {
-            Self::from_str(self.str(), None, None)
+            Self::from_str(self.str(), Some(self.width()), None)
         }
     }
 }
 
 impl core::cmp::PartialEq for TeenyString {
     fn eq(&self, rhs: &Self) -> bool {
-        self.as_bytes().eq(rhs.as_bytes())
+        self.width() == rhs.width() && self.as_bytes().eq(rhs.as_bytes())
     }
 }
 impl core::cmp::Eq for TeenyString {}

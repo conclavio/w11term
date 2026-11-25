@@ -49,5 +49,8 @@ bitflags! {
         /// Otherwise, the auto-detect direction is used, falling back
         /// to the direction specified by the RTL bit.
         const AUTO_DETECT_DIRECTION = 1<<8;
+
+        /// The line uses individually stored cells to preserve width overrides.
+        const EXPLICIT_WIDTH = 1<<9;
     }
 }

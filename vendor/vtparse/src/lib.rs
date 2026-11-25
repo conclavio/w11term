@@ -331,6 +331,8 @@ const MAX_OSC_PROGRAM_STATUS_BYTES: usize = 4096 - b"\x1b]7501;\x1b\\".len();
 // A single OSC 21 can carry all 256 palette entries and named colors.
 const MAX_OSC_KITTY_COLORS_BYTES: usize = 16 * 1024;
 const MAX_OSC_POINTER_NAMES_BYTES: usize = 4096;
+const MAX_OSC_TEXT_SIZE_METADATA: usize = 128;
+const MAX_OSC_TEXT_SIZE_BYTES: usize = 4096;
 const MAX_NOTIFICATION_METADATA: usize = 1024;
 const MAX_NOTIFICATION_WIRE_PAYLOAD: usize = 4096;
 pub const MAX_REPORTED_COMMAND_BYTES: usize = 4096;
@@ -366,10 +368,21 @@ impl OscState {
         let notification_metadata = self.num_params == 2
             && self.param_indices[0] == 2
             && self.buffer.starts_with(b"99");
+        let text_size_metadata = self.num_params == 2
+            && self.param_indices[0] == 2
+            && self.buffer.starts_with(b"66");
         if notification_metadata
             && param != ';'
             && (!param.is_ascii_graphic()
                 || self.buffer.len() + param.len_utf8() > 2 + MAX_NOTIFICATION_METADATA)
+        {
+            self.discard_osc();
+            return;
+        }
+        if text_size_metadata
+            && param != ';'
+            && (!param.is_ascii_graphic()
+                || self.buffer.len() + param.len_utf8() > 2 + MAX_OSC_TEXT_SIZE_METADATA)
         {
             self.discard_osc();
             return;
@@ -396,6 +409,9 @@ impl OscState {
             }
             if notification_metadata {
                 self.literal_field = Some((self.buffer.len(), MAX_NOTIFICATION_WIRE_PAYLOAD));
+            }
+            if text_size_metadata {
+                self.literal_field = Some((self.buffer.len(), MAX_OSC_TEXT_SIZE_BYTES));
             }
             if self.num_params == 2 && self.param_indices[0] == 1 && self.buffer.as_slice() == b"99"
             {
