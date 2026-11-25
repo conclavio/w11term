@@ -3680,6 +3680,11 @@ async fn native_sftp_compares_a_windows_folder_with_the_remote_listing() {
     fs::write(local.join("local-only.txt"), []).unwrap();
     fs::write(outside.join("outside-only.txt"), b"outside the selection").unwrap();
     directory_junction(&local, "jump", outside.to_str().unwrap());
+    fs::write(
+        state.path().join("canonical-picker-directory"),
+        fs::canonicalize(&local).unwrap().to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("sftp-compare-windows-folder-ui.ps1", &ssh, state.path());
     assert!(
         fs::read(trace).unwrap().is_empty(),

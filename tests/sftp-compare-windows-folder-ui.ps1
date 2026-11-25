@@ -24,6 +24,22 @@ function Click([string]$Name) {
     })
 }
 
+function Read-TextById([string]$Id) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $byId = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $Id)
+    $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)
+    if ($item) { $item.Current.Name }
+}
+
+function Normalize-FixturePath([string]$Path) {
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Path.Substring(8).TrimEnd('\')
+    }
+    if ($Path.StartsWith('\\?\')) { $Path = $Path.Substring(4) }
+    return $Path.TrimEnd('\')
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -35,11 +51,19 @@ try {
     $dialog = Wait-Until 'owned Windows folder picker' { Find-OwnedDialog $pickerTitle }
     Select-DialogItem $dialog $name
     $null = Wait-Until 'accept the selected Windows folder' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'capture excludes the target of the Windows junction' {
-        (Find-Element "Captured folder reference $dot 5 entries") -and (Find-Element $source $text)
+    $captured = Wait-Until 'capture excludes the target of the Windows junction' {
+        if (Find-Element "Captured folder reference $dot 5 entries") {
+            Read-TextById 'sftp-reference-folder'
+        }
+    }
+    # Windows can seed the test with an 8.3 temporary path and return the full path from its picker.
+    $canonical = [IO.File]::ReadAllText((Join-Path $State 'canonical-picker-directory'))
+    $expected = @((Normalize-FixturePath $source), (Normalize-FixturePath $canonical))
+    if ($expected -inotcontains (Normalize-FixturePath $captured)) {
+        throw "Picker captured '$captured'. Expected '$source' or '$canonical'"
     }
     Click 'Close folder reference'
-    $label = "Windows folder reference  $source"
+    $label = "Windows folder reference  $captured"
     $null = Wait-Until 'the drawer shows the captured Windows reference' { Find-Element $label $text }
     Click $choose
     $dialog = Wait-Until 'folder picker reopened' { Find-OwnedDialog $pickerTitle }
@@ -52,7 +76,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $source 'nested/config.txt'), 'current!', [Text.UTF8Encoding]::new($false))
     Click $compare
     $null = Wait-Until 'the comparison matches exact path case and reports the link as uncertain' {
-        (Find-Element "Windows reference folder  $source" $text) -and
+        (Find-Element "Windows reference folder  $captured" $text) -and
             (Find-Element '/shell directory' $text) -and
             (Find-Element 'Only in reference  2' $text) -and
             (Find-Element 'Only in current folder  2' $text) -and
@@ -77,7 +101,17 @@ try {
         throw 'The Windows folder comparison changed the SSH connection'
     }
 } catch {
-    throw "$($_.Exception.Message)$([char]10)$($_.ScriptStackTrace)"
+    $failure = $_
+    $details = try {
+        if ($window -and !$app.HasExited) {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            $condition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $text)
+            ($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition) |
+                ForEach-Object { $_.Current.Name } | Select-Object -Last 32) -join ' | '
+        }
+    } catch {}
+    throw "$($failure.Exception.Message)$([char]10)$($failure.ScriptStackTrace)$([char]10)Window text: $details"
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
