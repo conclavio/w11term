@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use w11term::{
     control::Request,
-    sftp::{Attributes, DEFAULT_TIMEOUT, Operation, normalize_sha256},
+    sftp::{Attributes, DEFAULT_TIMEOUT, EntryKind, FilenameFilter, Operation, normalize_sha256},
 };
 
 pub const HELP: &str = "w11term-cli [--pid PID] sftp list-transfers [--pane ID]\n\
@@ -16,7 +16,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY [--preserve-mtime]\n\
   put-dir LOCAL NEW_REMOTE_DIRECTORY [--preserve-times]\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
-  find ROOT QUERY [--regex] [--match-case]\n\
+  find ROOT [QUERY] [--regex] [--match-case] [--kind file|directory|symlink]\n\
   sha256 PATH [--max-bytes N]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -236,17 +236,29 @@ pub fn parse(
         }
         "find" => {
             fields.insert("path".into(), json!(path()?));
-            let query = paths.next().context("missing filename pattern")?;
+            let query = paths.next().unwrap_or_default();
+            let kind = opts
+                .remove("--kind")
+                .map(|name| serde_json::from_value::<EntryKind>(json!(name)))
+                .transpose()
+                .context("--kind must be file, directory, or symlink")?;
+            let regex = opts.remove("--regex").is_some();
+            let match_case = opts.remove("--match-case").is_some();
             ensure!(
-                w11term::sftp::valid_filename_query(&query),
-                "Enter a filename pattern up to 256 bytes"
+                FilenameFilter {
+                    regex,
+                    match_case,
+                    kind
+                }
+                .valid_query(&query),
+                "Enter a filename pattern up to 256 bytes or use --kind"
             );
             fields.insert("query".into(), json!(query));
-            fields.insert("regex".into(), json!(opts.remove("--regex").is_some()));
-            fields.insert(
-                "match_case".into(),
-                json!(opts.remove("--match-case").is_some()),
-            );
+            fields.insert("regex".into(), json!(regex));
+            fields.insert("match_case".into(), json!(match_case));
+            if let Some(kind) = kind {
+                fields.insert("kind".into(), json!(kind));
+            }
         }
         "sha256" => {
             fields.insert("path".into(), json!(path()?));
@@ -460,6 +472,7 @@ mod tests {
                         query,
                         regex: false,
                         match_case: false,
+                        kind: None,
                     },
                 ..
             },
@@ -503,6 +516,36 @@ mod tests {
         assert!(matches!(request, Request::Sftp {
             operation: Operation::Find { query, regex: false, .. }, ..
         } if query == "--regex"));
+    }
+
+    #[test]
+    fn filename_search_accepts_an_exact_result_type_with_or_without_a_pattern() {
+        let (_, request) = p(&["find", "--pane", "2", "/logs", "--kind", "symlink"]).unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { query, kind: Some(EntryKind::Symlink), .. }, ..
+        } if query.is_empty()));
+        let (_, request) = p(&[
+            "find", "--pane", "2", "/logs", "^ERROR", "--regex", "--kind", "file",
+        ])
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::Sftp {
+                operation: Operation::Find {
+                    regex: true,
+                    kind: Some(EntryKind::File),
+                    ..
+                },
+                ..
+            }
+        ));
+        for args in [
+            &["find", "--pane", "2", "/logs", "--kind", "device"][..],
+            &["find", "--pane", "2", "/logs", "--regex"],
+            &["ls", "--pane", "2", "/logs", "--kind", "directory"],
+        ] {
+            assert!(p(args).is_err(), "{args:?}");
+        }
     }
 
     #[test]

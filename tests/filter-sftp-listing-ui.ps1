@@ -40,6 +40,29 @@ function Click([string]$Name) {
 function Filter-Edit {
     Find-Element 'Filter filenames' ([System.Windows.Automation.ControlType]::Edit)
 }
+function Set-ResultType([string]$Name) {
+    $controlType = [System.Windows.Automation.ControlType]::ComboBox
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selector = Wait-Until 'enabled search result type selector' {
+        $box = Find-Element 'Search result type' $controlType
+        if ($box -and $box.Current.IsEnabled) { $box }
+    }
+    $selector.GetCurrentPattern($expand).Expand()
+    $choice = Wait-Until "search result type '$Name'" {
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $popup = Wait-Until "selected search result type '$Name'" {
+        $box = Find-Element 'Search result type' $controlType
+        if ($box) {
+            $selected = $box.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            if ($selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Name) {
+                $box.GetCurrentPattern($expand)
+            }
+        }
+    }
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
 function Check-PathCopy([string]$ButtonName, [string]$Expected) {
     $control = Wait-Until "available '$ButtonName' command" {
         $b = Button $ButtonName
@@ -186,6 +209,13 @@ try {
     $field = Wait-Until 'recursive filename search field' {
         Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     }
+    Set-ResultType 'Folders'
+    Click 'Search'
+    $null = Wait-Until 'folder-only search omits files and still sees nested content' {
+        (Find-Element '1 matches in 2 folders') -and (Button "Reveal $parent/nested") -and
+            !(Button "Reveal $parent/nested/nested-content.txt")
+    }
+    Set-ResultType 'All types'
     $on = [System.Windows.Automation.ToggleState]::On
     $off = [System.Windows.Automation.ToggleState]::Off
     (Wait-CheckBox 'Regex' $off).Toggle()

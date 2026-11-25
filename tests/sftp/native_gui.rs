@@ -3012,7 +3012,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
         }
     }
     // Each listing returns one entry per READDIR plus EOF. Filtering reads no
-    // directory pages. Recursive search reads the root and its child once each.
+    // directory pages. Each recursive search reads the root and child once.
     // Each download of a marked folder lists its subtree once. Selecting a
     // descendant as well does not start a separate operation for that entry.
     assert_eq!(
@@ -3022,6 +3022,8 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
+            ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),

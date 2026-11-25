@@ -461,6 +461,8 @@ Choose **Find files…** to search the displayed directory and its subdirectorie
 
 After revealing a match, choose **Back to search results** to return to the same query and results page without rescanning. **Find files…** starts a new search from the current folder. Closing the drawer or reconnecting ends the saved search.
 
+Use **Search result type** to find only files, folders, or symbolic links. Choose a type and leave the filename field empty to match any name of that type. Only matching entries count toward the 200-result limit. A file search still descends into real subfolders.
+
 Choose **Properties…** beside a search result to inspect its current metadata without leaving the results. For regular files, you can also calculate or copy the SHA-256 digest and use it for a verified download.
 
 Choose **Preview text…** on a regular file to read its UTF-8 contents, or choose **Edit** in the preview to make an explicit save. **Resume draft** is available from the results if you close the editor with a draft.

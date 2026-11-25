@@ -34,7 +34,7 @@ pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_pa
 mod drop_source;
 mod editor;
 mod find;
-pub use find::{FilenameMatch, FilenameSearch, valid_filename_query};
+pub use find::{FilenameFilter, FilenameMatch, FilenameSearch, valid_filename_query};
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
@@ -256,6 +256,8 @@ pub enum Operation {
         regex: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         match_case: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<EntryKind>,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -1135,9 +1137,19 @@ impl Engine {
                 query,
                 regex,
                 match_case,
+                kind,
             } => serde_json::to_value(
-                self.find_filenames(&path, &query, regex, match_case, cancel)
-                    .await?,
+                self.find_filenames(
+                    &path,
+                    &query,
+                    FilenameFilter {
+                        regex,
+                        match_case,
+                        kind,
+                    },
+                    cancel,
+                )
+                .await?,
             )?,
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);

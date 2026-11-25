@@ -1,7 +1,13 @@
 use super::*;
-use w11term::sftp::{FilenameSearch, SearchDownload, valid_filename_query};
+use w11term::sftp::{FilenameFilter, FilenameSearch, SearchDownload};
 
 const RESULTS_PER_PAGE: usize = 25;
+const RESULT_TYPES: [(Option<EntryKind>, &str); 4] = [
+    (None, "All types"),
+    (Some(EntryKind::File), "Files"),
+    (Some(EntryKind::Directory), "Folders"),
+    (Some(EntryKind::Symlink), "Symbolic links"),
+];
 
 #[derive(Clone)]
 pub enum Action {
@@ -23,14 +29,14 @@ pub enum Action {
 pub enum MatchOption {
     Regex(bool),
     MatchCase(bool),
+    Kind(Option<EntryKind>),
 }
 
 pub(super) struct Panel {
     pub(super) serial: u64,
     root: String,
     query: String,
-    regex: bool,
-    match_case: bool,
+    filter: FilenameFilter,
     result: Option<FilenameSearch>,
     page: usize,
     pub(super) cancel: Option<TransferCancel>,
@@ -161,6 +167,46 @@ impl Panel {
                 .content(label)
         };
         let running = self.cancel.as_ref();
+        let type_filter = ComboBox::new()
+            .grid_column(1)
+            .automation_name("Search result type")
+            .is_enabled(ready)
+            .items_source(RESULT_TYPES.map(|(_, label)| label))
+            .selected_index(
+                RESULT_TYPES
+                    .iter()
+                    .position(|(kind, _)| *kind == self.filter.kind),
+            )
+            .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                index.and_then(|i| RESULT_TYPES.get(i)).map_or(
+                    Message::ControlIdle,
+                    |&(kind, _)| {
+                        Message::Files(FileAction::Search(
+                            pane,
+                            generation,
+                            Action::SetOption(serial, MatchOption::Kind(kind)),
+                        ))
+                    },
+                )
+            }));
+        let query = TextBox::new()
+            .min_width(0.0)
+            .automation_name("Filename contains")
+            .placeholder_text(match (self.filter.regex, self.filter.kind.is_some()) {
+                (true, true) => "Filename regex (optional)",
+                (true, false) => "Filename regex",
+                (false, true) => "Filename contains (optional)",
+                (false, false) => "Filename contains",
+            })
+            .is_enabled(ready)
+            .text(&self.query)
+            .on_text_changed(ctx.callback(move |text| {
+                Message::Files(FileAction::Search(
+                    pane,
+                    generation,
+                    Action::Query(serial, text),
+                ))
+            }));
         let mut rows = vec![
             KeyedView::new(
                 "back",
@@ -178,22 +224,10 @@ impl Panel {
             ),
             KeyedView::new(
                 "query",
-                TextBox::new()
-                    .automation_name("Filename contains")
-                    .placeholder_text(if self.regex {
-                        "Filename regex"
-                    } else {
-                        "Filename contains"
-                    })
-                    .is_enabled(ready)
-                    .text(&self.query)
-                    .on_text_changed(ctx.callback(move |text| {
-                        Message::Files(FileAction::Search(
-                            pane,
-                            generation,
-                            Action::Query(serial, text),
-                        ))
-                    })),
+                Grid::new()
+                    .columns([GridLength::Star(1.0), GridLength::Auto])
+                    .column_spacing(8.0)
+                    .children((query, type_filter)),
             ),
         ];
         let check = |label, checked, option: fn(bool) -> MatchOption| {
@@ -216,8 +250,8 @@ impl Panel {
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)
                 .children((
-                    check("Regex", self.regex, MatchOption::Regex),
-                    check("Match case", self.match_case, MatchOption::MatchCase),
+                    check("Regex", self.filter.regex, MatchOption::Regex),
+                    check("Match case", self.filter.match_case, MatchOption::MatchCase),
                 )),
         ));
         let run = if let Some(cancel) = running {
@@ -230,7 +264,7 @@ impl Panel {
             button(
                 "Search",
                 Action::Run(serial),
-                ready && valid_filename_query(&self.query),
+                ready && self.filter.valid_query(&self.query),
             )
         };
         let search_actions = if self
@@ -613,8 +647,7 @@ impl FileDrawer {
                 serial: self.dialog_serial,
                 root,
                 query: String::new(),
-                regex: false,
-                match_case: false,
+                filter: FilenameFilter::default(),
                 result: None,
                 page: 0,
                 cancel: None,
@@ -640,24 +673,26 @@ impl FileDrawer {
                 }
             }
             Action::SetOption(serial, option) if serial == panel.serial && !busy => {
-                let (current, enabled) = match option {
-                    MatchOption::Regex(enabled) => (&mut panel.regex, enabled),
-                    MatchOption::MatchCase(enabled) => (&mut panel.match_case, enabled),
-                };
-                if *current != enabled {
-                    *current = enabled;
+                let previous = panel.filter;
+                match option {
+                    MatchOption::Regex(enabled) => panel.filter.regex = enabled,
+                    MatchOption::MatchCase(enabled) => panel.filter.match_case = enabled,
+                    MatchOption::Kind(kind) => panel.filter.kind = kind,
+                }
+                if panel.filter != previous {
                     panel.clear_results();
                     self.status.clear();
                 }
             }
             Action::Run(serial)
-                if serial == panel.serial && !busy && valid_filename_query(&panel.query) =>
+                if serial == panel.serial && !busy && panel.filter.valid_query(&panel.query) =>
             {
                 let op = Operation::Find {
                     path: panel.root.clone(),
                     query: panel.query.clone(),
-                    regex: panel.regex,
-                    match_case: panel.match_case,
+                    regex: panel.filter.regex,
+                    match_case: panel.filter.match_case,
+                    kind: panel.filter.kind,
                 };
                 self.dialog_serial = self.dialog_serial.wrapping_add(1);
                 panel.serial = self.dialog_serial;
@@ -741,8 +776,11 @@ mod tests {
                 serial: 7,
                 root: "/project".into(),
                 query: "log".into(),
-                regex: true,
-                match_case: true,
+                filter: FilenameFilter {
+                    regex: true,
+                    match_case: true,
+                    kind: Some(EntryKind::File),
+                },
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches,
@@ -766,7 +804,8 @@ mod tests {
         assert_eq!(panel.page, 1);
         assert_eq!(panel.query, "log");
         assert_eq!(panel.serial, 8);
-        assert!(panel.regex && panel.match_case);
+        assert!(panel.filter.regex && panel.filter.match_case);
+        assert_eq!(panel.filter.kind, Some(EntryKind::File));
         panel.mark_download(RESULTS_PER_PAGE, true);
         assert_eq!(
             panel.marked_downloads,
@@ -810,8 +849,7 @@ mod tests {
                 serial: 2,
                 root: "/project".into(),
                 query: "log".into(),
-                regex: false,
-                match_case: false,
+                filter: FilenameFilter::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![file.clone(), folder.clone(), link.clone()],
@@ -871,8 +909,7 @@ mod tests {
                 serial: 4,
                 root: "/project".into(),
                 query: "settings".into(),
-                regex: false,
-                match_case: false,
+                filter: FilenameFilter::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![other, hit.clone()],
@@ -935,8 +972,7 @@ mod tests {
                 serial: 2,
                 root: "/project".into(),
                 query: "log".into(),
-                regex: false,
-                match_case: false,
+                filter: FilenameFilter::default(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![hit.clone()],
@@ -1019,8 +1055,7 @@ mod tests {
             serial: 4,
             root: "/".into(),
             query: "snap".into(),
-            regex: false,
-            match_case: false,
+            filter: FilenameFilter::default(),
             result: Some(FilenameSearch {
                 root: "/".into(),
                 matches: vec![link, file.clone()],

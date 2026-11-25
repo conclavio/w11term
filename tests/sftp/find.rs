@@ -9,6 +9,7 @@ fn search(path: &str, query: &str) -> Operation {
         query: query.into(),
         regex: false,
         match_case: false,
+        kind: None,
     }
 }
 
@@ -118,6 +119,7 @@ async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_be
         query: query.into(),
         regex,
         match_case,
+        kind: None,
     };
     let error = guarded_job(&pane, None, options("(", true, false))
         .await
@@ -156,10 +158,58 @@ async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_be
         Operation::Find {
             regex: false,
             match_case: false,
+            kind: None,
             ..
         }
     ));
     assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filename_type_limits_results_without_skipping_subdirectories() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let top = remote.path().join("tree");
+    fs::create_dir_all(top.join("branch/nested")).unwrap();
+    for n in 0..205 {
+        fs::write(top.join(format!("{n:03}.log")), []).unwrap();
+    }
+    fs::write(top.join("branch/nested/report.log"), []).unwrap();
+    directory_junction(&top, "linked", top.join("branch").to_str().unwrap());
+    for (query, regex, kind, expected) in [
+        ("", false, EntryKind::Directory, &["branch", "nested"][..]),
+        ("^report\\.log$", true, EntryKind::File, &["report.log"][..]),
+        ("", false, EntryKind::Symlink, &["linked"][..]),
+    ] {
+        let result: FilenameSearch = serde_json::from_value(
+            guarded_job(
+                &pane,
+                None,
+                Operation::Find {
+                    path: "/tree".into(),
+                    query: query.into(),
+                    regex,
+                    match_case: false,
+                    kind: Some(kind),
+                },
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.scanned_directories, 3);
+        assert!(result.scanned_entries > 200);
+        assert!(result.matches.iter().all(|hit| hit.kind == Some(kind)));
+        assert_eq!(
+            result
+                .matches
+                .iter()
+                .map(|hit| hit.name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
     server.abort();
 }
 
