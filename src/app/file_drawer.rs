@@ -116,6 +116,13 @@ pub enum FileAction {
     ShowFolderReport(u64, u64, u64, folder_report::Kind),
     FolderReport(u64, u64, u64, folder_report::Action),
     LocalFolderCaptured(u64, u64, u64, Result<Arc<FolderInventory>, String>),
+    ComparedEntryListed(
+        u64,
+        u64,
+        u64,
+        u64,
+        Result<folder_report::ComparedListing, String>,
+    ),
     ClearFolderReference(u64, u64, u64),
     OpenEntry(u64, u64, ListedEntry),
     EditFilter(u64, u64, u64, bool),
@@ -617,6 +624,8 @@ enum Step {
     CompareReference(u64, u64),
     OpenLinkTarget(u64),
     FolderReport(u64),
+    RevealCompared(u64, u64),
+    VerifyCompared(u64),
     Permissions(u64, u32),
     MoveDestination(u64, u64),
     FolderBatch(folder_batch::Batch),
@@ -1623,6 +1632,7 @@ impl FileDrawer {
         &self,
         pane: u64,
         ssh: &SshOptions,
+        export: &text_export::Export,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
         if let Some(editor) = self.editor.as_ref().filter(|e| e.is_open()) {
@@ -1637,7 +1647,7 @@ impl FileDrawer {
                 .as_ref()
                 .and_then(|pending| pending.search_progress.as_ref())
                 .map(|progress| progress.borrow().clone());
-            return Some(space.dialog(pane, self.generation, progress.as_ref(), context));
+            return Some(space.dialog(pane, self.generation, progress.as_ref(), export, context));
         }
         let dialog = self.dialog.as_ref()?;
         let serial = dialog.serial;
@@ -3003,10 +3013,12 @@ impl FileDrawer {
                     batch.preflight_cancel()
                 } else if matches!(step, Step::Search(..)) {
                     self.search.as_ref().and_then(|p| p.cancel.clone())
-                } else if matches!(step, Step::FolderReport(_)) {
+                } else if matches!(step, Step::FolderReport(_) | Step::RevealCompared(..)) {
                     self.folder_report
                         .as_ref()
                         .map(|panel| panel.cancel.clone())
+                } else if matches!(step, Step::VerifyCompared(_)) {
+                    self.comparison_verification_cancel()
                 } else if move_picker {
                     self.dialog
                         .as_ref()
@@ -3159,6 +3171,14 @@ impl FileDrawer {
                 }
             }
             (Step::FolderReport(serial), reply) => self.finish_folder_report(serial, reply),
+            (Step::RevealCompared(serial, revision), reply) => {
+                self.parse_compared_listing(id, serial, revision, reply, context);
+            }
+            (Step::VerifyCompared(serial), reply) => {
+                if let Some(operation) = self.finish_compared_verification(serial, reply) {
+                    self.queue_compared_verification(id, session, serial, operation, context);
+                }
+            }
             (Step::OpenLinkTarget(serial), reply) => {
                 self.finish_link_target(id, serial, reply, context)
             }
@@ -3626,6 +3646,7 @@ impl TerminalApp {
             | ShowFolderReport(id, ..)
             | FolderReport(id, ..)
             | LocalFolderCaptured(id, ..)
+            | ComparedEntryListed(id, ..)
             | ClearFolderReference(id, ..)
             | OpenEntry(id, ..)
             | EditFilter(id, ..)
@@ -3918,6 +3939,34 @@ impl TerminalApp {
                 }
                 FolderReport(_, _, serial, folder_report::Action::Browse(action)) => {
                     files.browse_folder_comparison(serial, action);
+                }
+                FolderReport(_, _, serial, folder_report::Action::Verify(action)) => {
+                    if may_open_dialog
+                        && let Some(operation) =
+                            files.comparison_verification_action(serial, action)
+                    {
+                        files
+                            .queue_compared_verification(pane, session, serial, operation, context);
+                    }
+                }
+                FolderReport(_, _, serial, folder_report::Action::Reveal { revision, row }) => {
+                    if may_open_dialog
+                        && let Some(operation) = files.begin_compared_reveal(serial, revision, row)
+                        && let Err(error) = files.job(
+                            pane,
+                            session,
+                            operation,
+                            Step::RevealCompared(serial, revision),
+                            context,
+                        )
+                    {
+                        files.finish_compared_reveal(serial, revision, Err(format!("{error:#}")));
+                    }
+                }
+                ComparedEntryListed(_, generation, serial, revision, reply) => {
+                    if generation == files.generation {
+                        files.finish_compared_reveal(serial, revision, reply);
+                    }
                 }
                 LocalFolderCaptured(_, generation, serial, result) => {
                     if generation == files.generation {

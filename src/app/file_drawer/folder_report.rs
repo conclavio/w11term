@@ -3,6 +3,10 @@ use russh_sftp::extensions::Statvfs;
 use w11term::sftp::{FolderComparison, FolderContents, FolderOrigin, capture_local_folder};
 
 mod comparison;
+mod export;
+mod reveal;
+mod verify;
+pub(super) use reveal::Listing as ComparedListing;
 
 const READ_ONLY: u64 = 1;
 
@@ -12,6 +16,8 @@ pub enum Action {
     Stop,
     Close,
     Browse(comparison::Action),
+    Reveal { revision: u64, row: comparison::Row },
+    Verify(verify::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,7 +68,7 @@ impl Kind {
                 Ok(Report::Saved(count))
             }
             Self::Comparison => serde_json::from_value(reply)
-                .map(Report::Comparison)
+                .map(|report| Report::Comparison(Arc::new(report)))
                 .map_err(Into::into),
         }
     }
@@ -79,10 +85,13 @@ pub(super) fn reference_label(origin: FolderOrigin, report: bool) -> &'static st
 
 pub(super) struct Panel {
     serial: u64,
+    revision: u64,
     directory: String,
     kind: Kind,
     state: State,
     comparison: comparison::Browser,
+    reveal: reveal::State,
+    verification: verify::Verification,
     pub(super) cancel: TransferCancel,
 }
 
@@ -95,7 +104,7 @@ enum Report {
     Space(Capacity),
     Contents(FolderContents, u128),
     Saved(usize),
-    Comparison(FolderComparison),
+    Comparison(Arc<FolderComparison>),
 }
 
 impl Drop for Panel {
@@ -151,6 +160,7 @@ impl Panel {
         pane: u64,
         generation: u64,
         progress: Option<&SearchProgress>,
+        export: &text_export::Export,
         context: &ViewContext<TerminalApp>,
     ) -> View {
         let serial = self.serial;
@@ -180,6 +190,9 @@ impl Panel {
         let message = move |action| {
             Message::Files(FileAction::FolderReport(pane, generation, serial, action))
         };
+        if self.verification.open {
+            return self.verification.dialog(context, message);
+        }
         let mut rows = vec![KeyedView::new(
             "folder",
             TextBlock::new()
@@ -285,7 +298,40 @@ impl Panel {
                 ));
             }
             State::Loaded(Ok(Report::Comparison(comparison))) => {
-                rows.extend(self.comparison.rows(comparison, context, message));
+                rows.extend(self.comparison.rows(
+                    comparison,
+                    context,
+                    message,
+                    self.revision,
+                    !self.reveal.checking(),
+                    &self.verification.checks,
+                ));
+                if let Some(status) = self.reveal.text() {
+                    rows.push(KeyedView::new(
+                        "reveal-status",
+                        TextBlock::new()
+                            .automation_id("sftp-comparison-reveal-status")
+                            .text(status)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
+                let target = text_export::FolderComparisonTarget {
+                    pane,
+                    generation,
+                    serial,
+                    revision: self.revision,
+                };
+                rows.extend(export::controls(target, export, context));
+                rows.push(KeyedView::new(
+                    "verify-contents",
+                    Button::new()
+                        .is_enabled(!self.reveal.checking())
+                        .on_click(
+                            context
+                                .callback(move |_| message(Action::Verify(verify::Action::Open))),
+                        )
+                        .content("Verify file contents…"),
+                ));
             }
         }
         if let Some(refresh) = refresh {
@@ -293,7 +339,7 @@ impl Panel {
                 "refresh",
                 Button::new()
                     .automation_name(refresh)
-                    .is_enabled(!matches!(self.state, State::Loading))
+                    .is_enabled(!matches!(self.state, State::Loading) && !self.reveal.checking())
                     .on_click(context.callback(move |_| message(Action::Refresh)))
                     .content(refresh),
             ));
@@ -422,10 +468,13 @@ impl FileDrawer {
         let serial = self.dialog_serial;
         self.folder_report = Some(Panel {
             serial,
+            revision: 0,
             directory,
             kind,
             state: State::Loading,
             comparison: comparison::Browser::default(),
+            reveal: reveal::State::default(),
+            verification: verify::Verification::default(),
             cancel: TransferCancel::default(),
         });
         serial
@@ -493,6 +542,8 @@ impl FileDrawer {
             || self.directory.as_ref() != Some(&panel.directory)
             || self.pending.is_some()
             || matches!(panel.state, State::Loading)
+            || panel.reveal.checking()
+            || panel.verification.open
         {
             return None;
         }
@@ -500,6 +551,9 @@ impl FileDrawer {
             .kind
             .operation(panel.directory.clone(), self.folder_reference.as_ref())?;
         panel.state = State::Loading;
+        panel.reveal = reveal::State::default();
+        panel.verification = verify::Verification::default();
+        panel.revision = panel.revision.wrapping_add(1);
         panel.cancel = TransferCancel::default();
         Some(operation)
     }
@@ -559,7 +613,8 @@ impl FileDrawer {
         if self.folder_report.take().is_some() {
             if matches!(
                 self.pending.as_ref().map(|pending| &pending.step),
-                Some(Step::FolderReport(_))
+                Some(Step::FolderReport(_) | Step::RevealCompared(..))
+                    | Some(Step::VerifyCompared(_))
             ) {
                 self.pending.take();
             }

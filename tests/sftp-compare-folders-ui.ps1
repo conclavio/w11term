@@ -3,8 +3,11 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = Join-Path $State 'exports'
+[void][IO.Directory]::CreateDirectory($env:W11TERM_EXPORT_SMOKE_DIR)
 $profiles = Join-Path $State 'profiles.json'
 $fixture = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $button = [System.Windows.Automation.ControlType]::Button
@@ -37,12 +40,76 @@ function Set-Query([string]$Query) {
 }
 
 function Select-DifferenceType([string]$Name) {
-    $field = Wait-Until 'difference type filter' { Find-Element 'Folder difference type' $combo }
+    $field = Wait-Until 'folder comparison filter' { Find-Element 'Folder comparison filter' $combo }
     $field.GetCurrentPattern($expand).Expand()
     $choice = Wait-Until "difference type '$Name'" { Find-Element $Name $listItem -Visible }
     $choice.GetCurrentPattern($selection).Select()
-    $popup = (Find-Element 'Folder difference type' $combo).GetCurrentPattern($expand)
+    $popup = (Find-Element 'Folder comparison filter' $combo).GetCurrentPattern($expand)
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+
+function File-Digest([string]$Path) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { -join ($hasher.ComputeHash([IO.File]::ReadAllBytes($Path)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $hasher.Dispose() }
+}
+
+function Test-ComparisonExport {
+    $save = 'Save comparison as JSON' + [char]0x2026
+    $output = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'sftp-folder-comparison.json'
+    $null = Wait-Until 'the comparison export button is visible' { Find-Element $save $button -Visible }
+    Click $save
+    $dialog = Wait-Until 'owned comparison Save dialog' { Find-OwnedDialog 'Save folder comparison as JSON' }
+    $null = Wait-Until 'cancel the comparison save' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'the comparison is ready to export again' {
+        $item = Find-Element $save $button
+        $item -and $item.Current.IsEnabled
+    }
+    if ([IO.File]::Exists($output)) { throw 'Cancel created a comparison export' }
+    Click $save
+    $dialog = Wait-Until 'owned comparison Save dialog reopened' { Find-OwnedDialog 'Save folder comparison as JSON' }
+    $null = Wait-Until 'save the comparison JSON' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $prefix = 'Saved folder comparison to '
+    $published = Wait-Until 'an export status inside the comparison dialog confirms publication' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $byId = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-folder-comparison-export-status')
+        $status = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)
+        if ($status -and $status.Current.Name.StartsWith('Could not save folder comparison.')) {
+            throw $status.Current.Name
+        }
+        if ($status -and $status.Current.Name.StartsWith($prefix)) {
+            $status.Current.Name.Substring($prefix.Length)
+        }
+    }
+    # The shell picker can expand a short temporary-directory path to its long spelling.
+    if (![IO.File]::Exists($output) -or ![IO.File]::Exists($published)) {
+        throw "Expected the saved export at '$output'. The dialog reported '$published'"
+    }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $json = [IO.File]::ReadAllText($output, $encoding)
+    if ([IO.File]::ReadAllText($published, $encoding) -cne $json) {
+        throw "The export status refers to a different file: '$published'"
+    }
+    $report = $json | ConvertFrom-Json
+    $modified = $report.differences | Where-Object path -ceq 'nested/data.txt'
+    $later = $report.differences | Where-Object path -ceq 'bulk-239.txt'
+    $check = $report.file_verifications | Where-Object path -ceq 'same-metadata.txt'
+    $matchingCheck = $report.file_verifications | Where-Object path -ceq 'same-other.txt'
+    $referenceHash = File-Digest (Join-Path $fixture 'shell directory/archive/same-metadata.txt')
+    $currentHash = File-Digest (Join-Path $fixture 'shell directory/live/same-metadata.txt')
+    if ($report.schema_version -ne 1 -or $report.ssh.host -cne '127.0.0.1' -or $report.ssh.port -le 0 -or
+        $report.ssh.user -cne 'test' -or $report.reference.path -cne $reference -or $report.reference.origin -cne 'remote' -or
+        $report.current.path -cne $current -or $report.current.origin -cne 'remote' -or $report.differences.Count -ne 244 -or
+        $report.counts.current_only -ne 241 -or $report.counts.needs_inspection -ne 1 -or
+        $modified.change -cne 'metadata_changed' -or $modified.reference.size_bytes -ne 3 -or $modified.current.size_bytes -ne 8 -or
+        $later.change -cne 'current_only' -or $null -ne $later.reference -or $later.current.kind -cne 'file' -or
+        $report.file_verifications.Count -ne 2 -or $check.result -cne 'different' -or
+        $check.completed_at_unix_seconds -le 0 -or $check.reference_sha256 -cne $referenceHash -or
+        $check.current_sha256 -cne $currentHash -or $matchingCheck.result -cne 'match' -or
+        $matchingCheck.reference_sha256 -cne $matchingCheck.current_sha256) {
+        throw 'Export did not preserve the complete comparison and the pinned metadata'
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -57,7 +124,7 @@ try {
     Click 'Open folder'
     Click ('Set folder as comparison reference' + [char]0x2026)
     $null = Wait-Until 'the reference inventory is captured' {
-        Find-Element "Captured folder reference $dot 4 entries"
+        Find-Element "Captured folder reference $dot 7 entries"
     }
     Click 'Close folder reference'
     $null = Wait-Until 'the folder reference is visible in the drawer' {
@@ -98,6 +165,52 @@ try {
     }
     Set-Query ''
     Wait-Range 1 1 1
+    Select-DifferenceType 'Files with matching metadata'
+    $null = Wait-Until 'the matching-files view excludes the matching directory' {
+        (Find-Element "Showing 1${dash}3 of 3 files with matching metadata") -and
+            (Find-Element 'Show remote entry same-metadata.txt' $button)
+    }
+    Set-Query 'no-such-match'
+    $null = Wait-Until 'the query can hide matching files' {
+        Find-Element 'No files with matching metadata fit the path filter.'
+    }
+    Set-Query 'SAME-METADATA'
+    Click 'Verify contents of same-metadata.txt'
+    $null = Wait-Until 'SHA-256 finds different content despite matching metadata' {
+        $relative = Find-Element 'Relative file path' $edit
+        $relative -and $relative.GetCurrentPattern($value).Current.Value -ceq 'same-metadata.txt' -and
+            (Find-Element 'File contents differ')
+    }
+    Click 'Back to comparison'
+    $null = Wait-Until 'return restores the matching-file filter and query' {
+        $query = Find-Element 'Filter relative paths' $edit
+        $query -and $query.GetCurrentPattern($value).Current.Value -ceq 'SAME-METADATA' -and
+            (Find-Element '1 file with matching metadata') -and
+            (Find-Element 'Last SHA-256 check found different contents')
+    }
+    Set-Query ''
+    $null = Wait-Until 'the page batch includes all three matching rows' {
+        Find-Element "Showing 1${dash}3 of 3 files with matching metadata"
+    }
+    $missing = Join-Path $fixture 'shell directory/live/same-missing.txt'
+    [IO.File]::Delete($missing)
+    Click ('Verify files on this page' + [char]0x2026)
+    Click 'Start page verification'
+    $null = Wait-Until 'page verification reports a match, a difference, and a failed file' {
+        (Find-Element 'Page verification complete') -and
+            (Find-Element 'Processed 3 of 3 files') -and
+            (Find-Element "1 matched $dot 1 differed $dot 1 failed")
+    }
+    Click 'Back to comparison'
+    $null = Wait-Until 'the batch stores its completed checks in the report' {
+        (Find-Element 'Last SHA-256 check found matching contents') -and
+            (Find-Element 'Last SHA-256 check found different contents')
+    }
+    [IO.File]::WriteAllBytes($missing, [Text.Encoding]::ASCII.GetBytes('same'))
+    [IO.File]::SetLastWriteTimeUtc($missing, [DateTimeOffset]::FromUnixTimeSeconds(1700000100).UtcDateTime)
+    Test-ComparisonExport
+    Select-DifferenceType 'Needs inspection'
+    Wait-Range 1 1 1
     $hold = Join-Path $fixture 'hold-opendir'
     [IO.File]::WriteAllText($hold, "$current/nested")
     try {
@@ -109,10 +222,43 @@ try {
         [IO.File]::Delete($hold)
     }
     Wait-Range 1 1 1
+    Select-DifferenceType 'Files with matching metadata'
+    $null = Wait-Until 'the refreshed report has three matching files' { Find-Element "Showing 1${dash}3 of 3 files with matching metadata" }
+    if (Find-Element 'Last SHA-256 check found different contents') {
+        throw 'A prior check was carried into the refreshed report'
+    }
     Select-DifferenceType 'All differences'
     Wait-Range 1 40 244
-    Click 'Close folder comparison'
-    $null = Wait-Until 'the comparison dialog is closed' { !(Find-Element 'Close folder comparison' $button) }
+    Set-Query 'removed.txt'
+    Wait-Range 1 1 1
+    if (Find-Element 'Show remote entry removed.txt' $button) {
+        throw 'The report offered to reveal a reference-only file'
+    }
+    Set-Query 'nested/data.txt'
+    Wait-Range 1 1 1
+    $remoteFile = Join-Path $fixture 'shell directory/live/nested/data.txt'
+    [IO.File]::Delete($remoteFile)
+    Click 'Show remote entry nested/data.txt'
+    $null = Wait-Until 'a missing entry leaves the comparison open with an error' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $byId = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-comparison-reveal-status')
+        $status = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)
+        $status -and $status.Current.Name.StartsWith('Could not show remote entry.') -and
+            $status.Current.Name.Contains('The remote entry is no longer available') -and
+            (Find-Element 'Close folder comparison' $button)
+    }
+    [IO.File]::WriteAllText($remoteFile, 'current!', [Text.UTF8Encoding]::new($false))
+    Click 'Show remote entry nested/data.txt'
+    $null = Wait-Until 'the drawer shows the containing folder and has the file selected' {
+        $preview = Find-Element ('Preview text' + [char]0x2026) $button
+        !(Find-Element 'Close folder comparison' $button) -and (Find-Element "$current/nested") -and
+            (Find-Element 'data.txt' $button) -and $preview -and $preview.Current.IsEnabled
+    }
+    Click 'Back'
+    $null = Wait-Until 'Back reaches the folder that was compared, with the reference still available' {
+        (Find-Element $current) -and (Find-Element "Folder reference  $reference")
+    }
     Click 'Clear folder reference'
     $null = Wait-Until 'comparison actions are removed' {
         !(Find-Element "Folder reference  $reference") -and

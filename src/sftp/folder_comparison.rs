@@ -9,7 +9,9 @@ const WINDOWS_REPARSE: u32 = 1 << 31;
 const WINDOWS_SPECIAL: u32 = 1 << 30;
 
 mod local;
+mod verify;
 pub use local::capture_local_folder;
+pub use verify::{FILE_VERIFICATION_LIMIT, VerifiedFolderFile, valid_comparison_file_path};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FolderOrigin {
@@ -37,6 +39,20 @@ impl FolderEntry {
             SYMBOLIC_LINK => "Symbolic link",
             WINDOWS_REPARSE => "Windows reparse point",
             _ => "Special entry",
+        }
+    }
+
+    pub fn kind_key(self) -> &'static str {
+        match self.kind {
+            DIRECTORY => "directory",
+            REGULAR => "file",
+            SYMBOLIC_LINK => "symbolic_link",
+            WINDOWS_REPARSE => "windows_reparse_point",
+            0o010000 => "fifo",
+            0o020000 => "character_device",
+            0o060000 => "block_device",
+            0o140000 => "socket",
+            _ => "special",
         }
     }
 }
@@ -106,6 +122,13 @@ pub struct FolderDifference {
     pub current: Option<FolderEntry>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FolderMatchedFile {
+    pub path: String,
+    pub reference: FolderEntry,
+    pub current: FolderEntry,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct FolderComparison {
     pub reference_root: String,
@@ -119,6 +142,8 @@ pub struct FolderComparison {
     pub unknown: usize,
     pub matching: usize,
     pub differences: Vec<FolderDifference>,
+    #[serde(default)]
+    pub matching_files: Vec<FolderMatchedFile>,
 }
 
 fn entry_change(reference: FolderEntry, current: FolderEntry) -> Option<FolderChange> {
@@ -147,6 +172,52 @@ fn entry_change(reference: FolderEntry, current: FolderEntry) -> Option<FolderCh
     }
 }
 
+impl Engine {
+    pub(super) async fn reveal_compared_entry(
+        &self,
+        path: &str,
+        expected: FolderEntry,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<Value> {
+        ensure!(
+            !cancel.is_some_and(TransferCancel::is_cancelled),
+            "Compared entry lookup cancelled"
+        );
+        ensure!(
+            path.len() <= find::MAX_PATH_BYTES,
+            "The compared entry path is too long"
+        );
+        let (parent, name) = self.checked_source_folder(path).await?;
+        let live = self
+            .raw
+            .lstat(path)
+            .await
+            .context("The remote entry is no longer available. Compare again")?;
+        ensure!(
+            live.attrs
+                .permissions
+                .is_some_and(|mode| mode & TYPE_MASK == expected.kind),
+            "The remote entry type changed or could not be verified. Compare again"
+        );
+        let entries = self.read_directory(parent, cancel, true).await?;
+        let mut matches = entries.iter().filter(|entry| entry.filename == name);
+        ensure!(
+            matches.next().is_some_and(|entry| {
+                entry.attrs.permissions.is_none_or(|mode| {
+                    let kind = mode & TYPE_MASK;
+                    kind == 0 || kind == expected.kind
+                })
+            }) && matches.next().is_none(),
+            "The remote entry changed while listing its folder. Compare again"
+        );
+        ensure!(
+            self.canonical_remote_path(parent).await? == parent,
+            "The containing folder changed. Compare again"
+        );
+        Ok(json!({"directory": parent, "selected": name, "entries": entries}))
+    }
+}
+
 pub(super) fn compare(reference: &FolderInventory, current: FolderInventory) -> FolderComparison {
     let mut report = FolderComparison {
         reference_root: reference.root.clone(),
@@ -170,6 +241,15 @@ pub(super) fn compare(reference: &FolderInventory, current: FolderInventory) -> 
         };
         let Some(change) = change else {
             report.matching += 1;
+            if let (Some(reference), Some(current)) = (before, after)
+                && reference.is_file()
+            {
+                report.matching_files.push(FolderMatchedFile {
+                    path: path.clone(),
+                    reference,
+                    current,
+                });
+            }
             continue;
         };
         match change {
@@ -244,5 +324,38 @@ mod tests {
         assert_eq!(report.differences.len(), 250);
         assert_eq!(report.differences[0].path, "file000");
         assert_eq!(report.differences[249].path, "file249");
+    }
+
+    #[test]
+    fn matching_file_rows_include_only_regular_files_with_complete_metadata() {
+        let mut before = InventoryBuilder::default();
+        let mut after = InventoryBuilder::default();
+        let attrs = FileAttributes {
+            permissions: Some(REGULAR),
+            size: Some(4),
+            mtime: Some(10),
+            ..Default::default()
+        };
+        let directory = FileAttributes {
+            permissions: Some(DIRECTORY),
+            ..Default::default()
+        };
+        let missing = FileAttributes {
+            mtime: None,
+            ..attrs.clone()
+        };
+        for inventory in [&mut before, &mut after] {
+            inventory.insert("nested", &directory).unwrap();
+            inventory.insert("nested/known.txt", &attrs).unwrap();
+            inventory.insert("nested/unknown.txt", &missing).unwrap();
+        }
+        let report = compare(
+            &before.finish("/before".into(), FolderOrigin::Remote),
+            after.finish("/after".into(), FolderOrigin::Remote),
+        );
+        assert_eq!(report.matching, 2);
+        assert_eq!(report.matching_files.len(), 1);
+        assert_eq!(report.matching_files[0].path, "nested/known.txt");
+        assert_eq!(report.differences[0].change, FolderChange::Unknown);
     }
 }
