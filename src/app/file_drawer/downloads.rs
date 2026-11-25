@@ -81,6 +81,12 @@ impl FileDrawer {
     }
 
     pub(super) fn marked_entries(&self) -> Result<Vec<&Entry>> {
+        let entries = self.marked_listing_entries()?;
+        validate_download_names(entries.iter().map(|entry| entry.name.as_str()))?;
+        Ok(entries)
+    }
+
+    pub(super) fn marked_listing_entries(&self) -> Result<Vec<&Entry>> {
         let marks = self
             .marked_downloads
             .as_ref()
@@ -95,7 +101,6 @@ impl FileDrawer {
             entries.len() == marks.len(),
             "The remote listing changed. Mark the files again."
         );
-        validate_download_names(entries.iter().map(|entry| entry.name.as_str()))?;
         Ok(entries)
     }
 

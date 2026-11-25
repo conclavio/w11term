@@ -951,6 +951,60 @@ try {
             ![IO.File]::Exists($stoppedSecond)
     }
     $null = Wait-CheckBox "Mark $parent/build-02.log" $on
+    Click 'Back to files'
+    Click ('Select entries' + [char]0x2026)
+    (Wait-CheckBox 'Mark build-03.log' $off).Toggle()
+    $null = Wait-CheckBox 'Mark build-03.log' $on
+    Click 'Next'
+    (Wait-CheckBox 'Mark build-34.log' $off).Toggle()
+    $null = Wait-CheckBox 'Mark build-34.log' $on
+    $listedMove = 'Move marked entries' + [char]0x2026
+    $listedReview = "$($account.user)@$($account.host):$($account.port) " + [char]0xb7 + " $parent"
+    $listedFirst = Join-Path $archive 'build-03.log'
+    $listedLast = Join-Path $archive 'build-34.log'
+    $listedRemaining = Join-Path $peerRoot 'shell directory/build-34.log'
+    Click $listedMove
+    $destination = Wait-Until 'the listed batch reviews both pages of marks' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "2 entries on $listedReview")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click $browseDestination
+    $null = Wait-Until 'the listed batch can browse the typed destination' { Find-Element '/move archive' -Visible }
+    Click 'Use this folder'
+    [IO.File]::WriteAllBytes($renameGate, [byte[]]@())
+    Click 'Move'
+    $null = Wait-Until 'the listed batch exposes Stop during the held rename' {
+        [IO.File]::Exists($listedFirst) -and (Button $stop).Current.IsEnabled
+    }
+    Click $stop
+    $null = Wait-Until 'the listed batch is stopping' {
+        $stopping = Button ('Stopping after current move' + [char]0x2026)
+        $stopping -and !$stopping.Current.IsEnabled
+    }
+    [IO.File]::Delete($renameGate)
+    $null = Wait-Until 'the refreshed listing reports a stopped batch' {
+        (Find-Element 'Moved 1 of 2 marked entries to /move archive. Stopped after the current move') -and
+            (Button $listedMove).Current.IsEnabled -and [IO.File]::Exists($listedRemaining) -and
+            ![IO.File]::Exists($listedLast)
+    }
+    $null = Wait-CheckBox 'Mark build-34.log' $on
+    Click $listedMove
+    $destination = Wait-Until 'the listed batch reviews just the untouched entry' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "1 entry on $listedReview")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click 'Move'
+    $null = Wait-Until 'retrying the remaining listed mark completes and clears it' {
+        (Find-Element 'Moved 1 of 1 marked entries to /move archive') -and
+            !(Button $listedMove).Current.IsEnabled -and [IO.File]::Exists($listedLast) -and
+            ![IO.File]::Exists($listedRemaining)
+    }
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }

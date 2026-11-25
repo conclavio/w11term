@@ -209,7 +209,7 @@ impl FileDrawer {
             entry.serial == serial
                 && matches!(
                     entry.action,
-                    EditAction::Move(..) | EditAction::MoveSearchBatch(..)
+                    EditAction::Move(..) | EditAction::MoveBatch(..)
                 )
         }) else {
             return Ok(());
