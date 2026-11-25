@@ -52,6 +52,7 @@ mod permissions;
 mod remote_copy;
 mod symbolic_link;
 mod text_preview;
+pub use text_preview::local_preview_text;
 mod transfer_status;
 pub use transfer_status::{
     TransferBatchProgress, TransferId, TransferOperation, TransferOutcome, TransferPhase,

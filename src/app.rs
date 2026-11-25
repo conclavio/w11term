@@ -98,6 +98,7 @@ mod tab_colors;
 mod tab_title;
 mod tab_windows;
 mod taskbar;
+mod text_diff;
 mod text_export;
 mod text_size;
 mod visual_bell;

@@ -409,6 +409,10 @@ After a file or folder is saved, choose **Show download in File Explorer** in th
 
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
+Choose **Compare with local file…** from a text preview to see changed lines with their original remote and local line numbers. The comparison includes line endings, final newlines and UTF-8 byte order marks. It compares a local UTF-8 file up to 256 KiB with the remote snapshot already displayed. Choose **Return to preview** to go back to the remote file.
+
+To compare two remote text files, open the first preview and choose **Set as comparison reference**. Browse to the second file and choose **Compare selected with reference…**, or use **Compare with reference…** in the search results. The view shows both paths and uses the captured reference text. The reference belongs to the SSH pane and expires when it reconnects. Use **Clear comparison reference** when you’re done.
+
 Choose **Preview image…** on a PNG, JPEG or GIF in the SFTP listing or search results to see the image and its original dimensions. The preview reads a regular file over the pane’s existing connection and displays a scaled still image, including the first frame of an animated GIF. It accepts files up to 8 MiB with dimensions up to 4096 pixels per side and up to 8,388,608 pixels in total.
 
 Choose **Tail text file…** in the listing or search results to read up to 200 lines from the last 64 KiB of a regular UTF-8 file. The drawer shows the file size and indicates when it omitted earlier text. **Refresh tail** reads the path again, so it picks up appended output or a log file replaced by rotation. You can select and copy the text.
