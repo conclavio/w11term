@@ -20,7 +20,13 @@ function Invoke-Sftp([string[]]$Arguments) {
 }
 try {
     $terminal = Start-Process -FilePath $gui -WorkingDirectory $project -ArgumentList @('--profile', $Profile, '--cols', '120', '--rows', '32') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'gui.log') -RedirectStandardError (Join-Path $state 'gui.err')
-    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($terminal.Id).json"
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    $manifest = if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Join-Path $env:ProgramData "w11term\elevated\$($identity.User.Value)\instances\$($terminal.Id).json"
+    } else {
+        Join-Path $env:LOCALAPPDATA "w11term\instances\$($terminal.Id).json"
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     while (-not (Test-Path -LiteralPath $manifest)) {
         if ($terminal.HasExited -or [DateTime]::UtcNow -gt $deadline) { throw "GUI did not start; see $state\gui.err" }

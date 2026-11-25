@@ -39,7 +39,7 @@ for ($launch=1; $launch -le 2; $launch++) {
             $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
             $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern).Resize(900,422)
         }
-        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
         $ssh = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
         $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','15','ready')
         Paint $ssh

@@ -54,24 +54,57 @@ impl TerminalState {
             }
         };
 
+        // Bound total pixel-column work across the entire graphic so repeated
+        // `Repeat` + `CarriageReturn` loops cannot multiply into billions of writes.
+        let bands = (height as u64).saturating_add(5) / 6;
+        let mut remaining_work = (width as u64)
+            .saturating_mul(bands)
+            .saturating_mul(16)
+            .clamp(65_536, 16_777_216);
+
         for d in &sixel.data {
+            if remaining_work == 0 {
+                log::error!("Aborting sixel decode after exceeding work budget");
+                return;
+            }
             match d {
                 SixelData::Data(d) => {
-                    emit_sixel(d, &foreground_color, x, y);
-                    x += 1;
+                    remaining_work -= 1;
+                    if y < height {
+                        emit_sixel(d, &foreground_color, x, y);
+                    }
+                    x = x.saturating_add(1);
                 }
 
                 SixelData::Repeat { repeat_count, data } => {
-                    for _ in 0..*repeat_count {
-                        emit_sixel(data, &foreground_color, x, y);
-                        x += 1;
+                    let count = (*repeat_count).min(width.saturating_sub(x));
+                    if count == 0 {
+                        remaining_work -= 1;
+                    } else if y >= height {
+                        remaining_work = remaining_work.saturating_sub(1);
+                        x = x.saturating_add(count);
+                    } else {
+                        let steps = (count as u64).min(remaining_work) as u32;
+                        remaining_work -= steps as u64;
+                        for _ in 0..steps {
+                            emit_sixel(data, &foreground_color, x, y);
+                            x = x.saturating_add(1);
+                        }
+                        if (steps as u32) < count {
+                            log::error!("Aborting sixel decode after exceeding work budget");
+                            return;
+                        }
                     }
                 }
 
-                SixelData::CarriageReturn => x = 0,
-                SixelData::NewLine => {
+                SixelData::CarriageReturn => {
+                    remaining_work -= 1;
                     x = 0;
-                    y += 6;
+                }
+                SixelData::NewLine => {
+                    remaining_work -= 1;
+                    x = 0;
+                    y = y.saturating_add(6);
                 }
 
                 SixelData::DefineColorMapRGB { color_number, rgb } => {

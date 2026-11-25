@@ -323,6 +323,21 @@ pub fn validate_host_key_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an SSH hostname or literal IP address so it cannot inject
+/// `known_hosts` wildcards, multi-host lists, markers, options, or line breaks.
+pub fn validate_ssh_host(host: &str) -> Result<()> {
+    ensure!(
+        !host.is_empty()
+            && host.len() <= 255
+            && !host.starts_with(['-', '!', '@', '#', '|'])
+            && !host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || "*,?/\\@#[]".contains(c)),
+        "invalid SSH host {host:?}"
+    );
+    Ok(())
+}
+
 pub(crate) fn deserialize_host_key_alias<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
@@ -364,6 +379,7 @@ impl SshOptions {
     }
 
     pub(crate) fn validate_route(&self) -> Result<()> {
+        validate_ssh_host(&self.host)?;
         ensure!(
             self.proxy_jump.len() <= MAX_JUMPS,
             "at most {MAX_JUMPS} SSH jump hosts are supported"
@@ -380,6 +396,7 @@ impl SshOptions {
                 !hop.host.trim().is_empty() && !hop.user.trim().is_empty() && hop.port != 0,
                 "an SSH jump host requires a host, user and port"
             );
+            validate_ssh_host(&hop.host).with_context(|| format!("jump host {}", hop.host))?;
         }
         Ok(())
     }
@@ -397,23 +414,8 @@ fn default_port() -> u16 {
     22
 }
 
-fn default_profiles_path() -> PathBuf {
-    let local = PathBuf::from("profiles.json");
-    if local.is_file() {
-        return local;
-    }
-    // Also support double-clicking a development executable under target/debug or target/release.
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
-        && let Some(path) = parent
-            .ancestors()
-            .take(3)
-            .map(|dir| dir.join("profiles.json"))
-            .find(|path| path.is_file())
-    {
-        return path;
-    }
-    local
+fn default_profiles_path() -> Result<PathBuf> {
+    Ok(crate::keys::data_dir()?.join("profiles.json"))
 }
 
 pub type SshRecipientSets = BTreeMap<String, Vec<String>>;
@@ -792,7 +794,7 @@ impl Options {
         let mut workspace_name = None;
         let mut switch_workspace = false;
         let mut explicit_source = false;
-        let mut profiles_path = default_profiles_path();
+        let mut profiles_path: Option<PathBuf> = None;
         let mut list_profiles = false;
         let mut paused = false;
         let mut port = None;
@@ -812,7 +814,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -837,7 +839,7 @@ impl Options {
                 "--tab" => extra_profiles.push(value(&mut args, &arg)?),
                 "--cols" => cols = Some(value(&mut args, &arg)?.parse::<usize>()?),
                 "--rows" => rows = Some(value(&mut args, &arg)?.parse::<usize>()?),
-                "--profiles" => profiles_path = value(&mut args, &arg)?.into(),
+                "--profiles" => profiles_path = Some(value(&mut args, &arg)?.into()),
                 "--list-profiles" => list_profiles = true,
                 "--paused" => paused = true,
                 "--benchmark" => benchmark = true,
@@ -893,6 +895,10 @@ impl Options {
                     && profile.is_none()),
             "--paused requires --replay-timed"
         );
+        let profiles_path = match profiles_path {
+            Some(path) => path,
+            None => default_profiles_path()?,
+        };
         if paused {
             source = source.start_paused()?;
         }
@@ -960,6 +966,7 @@ impl Options {
                 ssh.host_key_alias = Some(alias);
             }
             ensure!(ssh.port != 0, "SSH port must be nonzero");
+            ssh.validate_route()?;
         } else {
             ensure!(
                 !ssh_override,
@@ -1448,5 +1455,77 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&options).unwrap()).unwrap();
             assert_eq!(restored, options);
         }
+    }
+
+    #[test]
+    fn default_profiles_path_uses_data_dir_not_cwd() {
+        let path = default_profiles_path().unwrap();
+        assert_eq!(path, crate::keys::data_dir().unwrap().join("profiles.json"));
+        assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn ssh_host_validation_rejects_known_hosts_injection_and_accepts_literals() {
+        for valid in [
+            "example.com",
+            "dev-01.internal.local",
+            "127.0.0.1",
+            "::1",
+            "fe80::1%eth0",
+        ] {
+            assert!(validate_ssh_host(valid).is_ok(), "{valid:?}");
+        }
+        let too_long = "a".repeat(256);
+        for bad in [
+            "",
+            "*",
+            "*,github.com",
+            "host?1",
+            "!excluded",
+            "@cert-authority *",
+            "#comment",
+            "|1|hash",
+            "-oProxyCommand=calc",
+            "host\n@cert-authority *",
+            "host\r\n",
+            "host name",
+            "[::1]",
+            "a/b",
+            r"a\b",
+            "user@host",
+            too_long.as_str(),
+        ] {
+            assert!(validate_ssh_host(bad).is_err(), "{bad:?}");
+        }
+
+        let mut options = SshOptions {
+            host: "*,github.com".into(),
+            user: "alice".into(),
+            port: 22,
+            authentication: Authentication::Agent,
+            host_key: None,
+            host_key_alias: None,
+            terminal_type: TerminalType::default(),
+            color_scheme: Default::default(),
+            tab_color: Default::default(),
+            scrollback_lines: ScrollbackLines::default(),
+            player: PlayerOptions::default(),
+            proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
+            durable: false,
+            group_prompt: None,
+        };
+        assert!(options.validate_route().is_err());
+
+        options.host = "target.example".into();
+        options.proxy_jump.push(JumpHost {
+            host: "*".into(),
+            user: "jump".into(),
+            port: 22,
+            authentication: Authentication::Agent,
+            host_key: None,
+            host_key_alias: None,
+        });
+        assert!(options.validate_route().is_err());
     }
 }

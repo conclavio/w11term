@@ -55,16 +55,23 @@ $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profile
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'foreground terminal window' { [FixtureMessages]::GetForegroundWindow() -eq $window }
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $first = @(Sessions)[0].id
     Wait-Text $first 'ready'
     $second = (Control @('open','--profile','palette-ssh')).pane
     Wait-Focus $first
     Wait-Text $second 'ready'
+    # Default policy restricts OSC 52 writes to the foreground pane.
+    Send-Osc52 $first 'default-foreground'
+    Expect-Clipboard 'default-foreground'
+    Send-Osc52 $second 'default-background-denied'
+    Expect-NoChange 'default-foreground'
+
+    Run-Palette 'Settings'
+    Toggle-Setting $focusLabel 'On' 'osc52ForegroundOnly' $false
     Send-Osc52 $second 'legacy-background'
     Expect-Clipboard 'legacy-background'
 
-    Run-Palette 'Settings'
     Toggle-Setting $focusLabel 'Off' 'osc52ForegroundOnly' $true
     Send-Osc52 $second 'settings-background'
     Expect-NoChange 'legacy-background'

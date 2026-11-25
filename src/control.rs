@@ -27,7 +27,7 @@ use windows::Win32::{
 mod command_history;
 mod find;
 mod registry;
-mod security;
+pub(crate) mod security;
 mod ssh_groups;
 pub use command_history::CommandStatus;
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
@@ -790,6 +790,9 @@ pub fn desktop_scope() -> Result<(String, u32, u32)> {
 }
 
 pub fn discovery_dir() -> Result<PathBuf> {
+    if security::is_elevated()? {
+        return Ok(security::elevated_data_dir()?.join("instances"));
+    }
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?)
             .join("w11term")

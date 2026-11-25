@@ -40,7 +40,7 @@ $catalog = @{ profiles = @{
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--cols','140','--profile','"Drop PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $psPane = (Sessions | Where-Object label -eq 'Drop PowerShell').id
     Wait-Text $psPane 'PS '
     Type-Line 'function ShowDrop { (''drop''+''-ps='')+([string]::Join(''|'', [string[]]$args)) }'

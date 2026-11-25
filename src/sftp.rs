@@ -1300,6 +1300,7 @@ impl Engine {
             if cancel.as_ref().is_some_and(TransferCancel::is_cancelled) {
                 return Ok(false);
             }
+            apply_mark_of_the_web(temp.path())?;
             if overwrite {
                 temp.persist(destination)
             } else {
@@ -1394,6 +1395,36 @@ impl Engine {
         Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
     }
 }
+/// Attach Windows Mark-of-the-Web (`Zone.Identifier`, ZoneId=3 / Internet) to a
+/// staged downloaded file before publication so SmartScreen, PowerShell
+/// `RemoteSigned`, and Office Protected View treat remote SFTP files as untrusted.
+/// Gracefully tolerates filesystems (e.g. FAT32/exFAT) that do not support NTFS ADS.
+pub(crate) fn apply_mark_of_the_web(path: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    let mut ads = path.as_os_str().to_owned();
+    ads.push(":Zone.Identifier");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(&ads)
+    {
+        Ok(mut stream) => {
+            stream.write_all(b"[ZoneTransfer]\r\nZoneId=3\r\n")?;
+            stream.sync_all()?;
+            Ok(())
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 87 | 123)) => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("writing Zone.Identifier for {}", path.display()))
+        }
+    }
+}
+
 fn eof(error: &Error) -> bool {
     matches!(error,Error::Status(s) if s.status_code==StatusCode::Eof)
 }
@@ -1427,5 +1458,21 @@ mod tests {
         ] {
             assert_eq!(EntryKind::from_permissions(mode), None);
         }
+    }
+
+    #[test]
+    fn mark_of_the_web_tags_staged_downloads_and_survives_atomic_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut staged = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::io::Write::write_all(&mut staged, b"downloaded payload").unwrap();
+        super::apply_mark_of_the_web(staged.path()).unwrap();
+        let dest = dir.path().join("remote.ps1");
+        staged.persist(&dest).unwrap();
+
+        let mut ads = dest.as_os_str().to_owned();
+        ads.push(":Zone.Identifier");
+        let zone = std::fs::read_to_string(&ads).unwrap();
+        assert!(zone.contains("[ZoneTransfer]"));
+        assert!(zone.contains("ZoneId=3"));
     }
 }

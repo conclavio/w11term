@@ -543,6 +543,7 @@ impl ProfileDraft {
                 && !user.chars().any(|c| c.is_whitespace() || c.is_control()),
             "Host and user cannot contain spaces or control characters"
         );
+        w11term::options::validate_ssh_host(host)?;
         let port = self
             .port
             .trim()
@@ -1488,15 +1489,17 @@ impl TerminalApp {
             .close_button_text("Cancel")
             .on_closed(context.callback(move |result| Message::PromptReply(id, prompt_id, result)))
             .content(
-                StackPanel::new()
-                    .max_width(500.0)
-                    .spacing(12.0)
-                    .keyed_children(
-                        children
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, v)| KeyedView::new(i.to_string(), v)),
-                    ),
+                ScrollViewer::new().max_height(360.0).content(
+                    StackPanel::new()
+                        .max_width(500.0)
+                        .spacing(12.0)
+                        .keyed_children(
+                            children
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, v)| KeyedView::new(i.to_string(), v)),
+                        ),
+                ),
             )
     }
     fn find(&mut self, close: bool, direction: Option<isize>, context: &ComponentContext<Self>) {

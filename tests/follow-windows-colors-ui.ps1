@@ -123,7 +123,7 @@ for ($launch=1; $launch -le 2; $launch++) {
     $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','68','--rows','16') -WindowStyle Hidden -PassThru -RedirectStandardError $log
     try {
         $window = Wait-InputWindow
-        $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
         $pane = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
         $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','palette-witness')
         if ($launch -eq 1) {

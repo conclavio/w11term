@@ -34,7 +34,7 @@ function Wait-Preview([string]$Profile, [string]$Text) {
 
 try {
     $window = Wait-Until 'the fixture window' { $app.Refresh(); if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } }
-    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json"
+    $manifest = Get-ControlManifestPath $app.Id
     $null = Wait-Until 'the fixture control pipe' { Test-Path -LiteralPath $manifest }
     $panes = (Control @('list')).sessions
     $left = ($panes | Where-Object label -eq 'dev1').id

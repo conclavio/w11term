@@ -148,7 +148,7 @@ $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -P
 try {
     $window = Wait-InputWindow
     $origin = $window
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     Run-Palette "Review SSH group${dot}Limited" -Enter
     Expect-LoginLimit 'Unlimited'
     Set-LoginLimit

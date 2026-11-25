@@ -95,12 +95,8 @@ fn parse_host(input: &str, uri: bool) -> Result<(Cow<'_, str>, u16)> {
         (input, None, false)
     };
     let host = decode(host, uri)?;
-    ensure!(
-        !host.is_empty()
-            && !host.chars().any(|ch| ch.is_whitespace() || ch.is_control())
-            && !host.contains(['[', ']', '/', '\\', '?', '#', '@']),
-        "Enter a valid SSH host"
-    );
+    crate::options::validate_ssh_host(&host)
+        .map_err(|_| anyhow::anyhow!("Enter a valid SSH host"))?;
     if bracketed || host.contains(':') {
         let address = match host.split_once('%') {
             Some((address, zone)) => {

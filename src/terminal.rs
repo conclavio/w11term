@@ -4757,4 +4757,119 @@ mod tests {
             "stale image cells survived deletion after reflow"
         );
     }
+
+    #[test]
+    fn bracketed_paste_encoding_defangs_nested_and_c1_escape_sequences() {
+        let (mut t, _) = engine();
+        t.advance_bytes(b"\x1b[?2004h");
+        for payload in [
+            "a\x1b[2\x1b[201~01~b",
+            "a\x1b[20\x1b[200~1~b",
+            "a\u{009b}201~b",
+            "a\u{009b}2\u{009b}201~01~b",
+            "a\x1b[\u{009b}201~201~b",
+            "a\x1b]52;c;YQ==\x07b",
+        ] {
+            let encoded = t.encode_paste(payload);
+            let inner = encoded
+                .strip_prefix("\x1b[200~")
+                .and_then(|s| s.strip_suffix("\x1b[201~"))
+                .expect("bracketed paste delimiters");
+            assert!(
+                !inner.contains("\x1b[200~")
+                    && !inner.contains("\x1b[201~")
+                    && !inner.contains('\x1b')
+                    && !inner
+                        .chars()
+                        .any(|c| ('\u{0080}'..='\u{009f}').contains(&c)),
+                "escaped control leaked into paste body: {inner:?} from {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malicious_sixel_and_image_placements_do_not_freeze_oom_or_panic() {
+        let (mut t, _) = engine();
+        // Oversized Sixel raster attributes (previously triggered ~1.2 GiB Vec::reserve).
+        t.advance_bytes(b"\x1bPq\"1;1;10000;10000\x1b\\");
+        // Sixel repeat `!` without digits (previously cast -1i64 as u32::MAX = 4.29B iterations).
+        t.advance_bytes(b"\x1bPq\"1;1;1;1!~\x1b\\");
+        // Unbounded Kitty placement columns/rows and u32 overflow / zero triggers.
+        t.advance_bytes(b"\x1b_Ga=T,f=32,s=1,v=1,i=10,c=1000000,r=1000000,q=2;/wAA/w==\x1b\\");
+        t.advance_bytes(b"\x1b_Ga=T,f=32,s=1,v=1,i=11,c=536870912,r=1,q=2;/wAA/w==\x1b\\");
+        t.advance_bytes(b"\x1b_Ga=T,f=32,s=1,v=1,i=12,c=0,r=0,q=2;/wAA/w==\x1b\\");
+        // Oversized iTerm2 inline display dimensions with valid 1x1 PNG.
+        t.advance_bytes(
+            b"\x1b]1337;File=inline=1;width=999999px;height=999999px:iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\x07",
+        );
+        // Terminal remains responsive and clean after rejecting all hostile graphics.
+        t.advance_bytes(b"alive");
+        let snapshot = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+        let text: String = snapshot
+            .rows
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("alive"));
+    }
+
+    #[test]
+    fn unbounded_csi_repeats_and_oversized_osc_dcs_do_not_freeze_or_exhaust_memory() {
+        let (mut t, _) = engine();
+        // F-13: Unbounded u32::MAX CSI repeat loops (CUB, PopKittyState, ICH, REP).
+        t.advance_bytes(b"A\x1b[4294967295D");
+        t.advance_bytes(b"\x1b[<4294967295u");
+        t.advance_bytes(b"\x1b[4294967295@");
+        t.advance_bytes(b"A\x1b[4294967295b");
+
+        // F-14: Oversized DECRQSS / XTGETTCAP / ESC k title / user_vars / unicode_version_stack.
+        let mut dcs = Vec::from(b"\x1bP$q".as_slice());
+        dcs.resize(128 * 1024, b'm');
+        dcs.extend_from_slice(b"\x1b\\");
+        t.advance_bytes(&dcs);
+
+        let mut tcap = Vec::from(b"\x1bP+q".as_slice());
+        tcap.resize(128 * 1024, b'4');
+        tcap.extend_from_slice(b"\x1b\\");
+        t.advance_bytes(&tcap);
+
+        let mut title = Vec::from(b"\x1bk".as_slice());
+        title.resize(16 * 1024, b'T');
+        title.extend_from_slice(b"\x1b\\");
+        t.advance_bytes(&title);
+
+        for i in 0..200 {
+            let seq =
+                format!("\x1b]1337;SetUserVar=k{i}=dg==\x07\x1b]1337;UnicodeVersion=push l{i}\x07");
+            t.advance_bytes(seq.as_bytes());
+        }
+        // Oversized UnicodeVersion stack label (> 256 bytes) is rejected cleanly.
+        let huge_label = format!("\x1b]1337;UnicodeVersion=push {}\x07", "L".repeat(8192));
+        t.advance_bytes(huge_label.as_bytes());
+
+        // Repeated Sixel Repeat + CarriageReturn overpaints hit the total work budget cleanly.
+        let mut sixel_loop = Vec::from(b"\x1bPq\"1;1;4096;1".as_slice());
+        for _ in 0..500 {
+            sixel_loop.extend_from_slice(b"!4096~$");
+        }
+        sixel_loop.extend_from_slice(b"\x1b\\");
+        t.advance_bytes(&sixel_loop);
+
+        // Oversized OSC (> 4 MiB) is discarded cleanly and parser recovers on ST.
+        let mut big_osc = Vec::from(b"\x1b]2;".as_slice());
+        big_osc.resize(4 * 1024 * 1024 + 64, b'X');
+        big_osc.extend_from_slice(b"\x07");
+        t.advance_bytes(&big_osc);
+
+        t.advance_bytes(b"\r\nresponsive");
+        let snapshot = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+        let text: String = snapshot
+            .rows
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("responsive"));
+    }
 }

@@ -329,6 +329,7 @@ const MAX_OSC_REMOTE_HOST_BYTES: usize = 1024;
 // OSC 7501 has a 4096-byte wire limit including its introducer and ST.
 const MAX_OSC_PROGRAM_STATUS_BYTES: usize = 4096 - b"\x1b]7501;\x1b\\".len();
 pub const MAX_REPORTED_COMMAND_BYTES: usize = 4096;
+const MAX_OSC_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PARAMS: usize = 256;
 
 struct OscState {
@@ -420,6 +421,12 @@ impl OscState {
                     self.discard_literal();
                     return;
                 }
+            }
+            if self.buffer.len().saturating_add(param.len_utf8()) > MAX_OSC_BYTES {
+                self.buffer.clear();
+                self.num_params = 0;
+                self.full = true;
+                return;
             }
             let mut buf = [0u8; 8];
             let extend_result = self

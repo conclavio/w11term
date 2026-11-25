@@ -122,6 +122,14 @@ impl Handler {
 
     fn learn(&self, key: &russh::keys::PublicKey) -> Result<()> {
         let (name, port) = host_key_target(&self.options);
+        crate::options::validate_host_key_alias(name)?;
+        if let Some(parent) = self
+            .known_hosts
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         russh::keys::known_hosts::learn_known_hosts_path(
             &name.to_ascii_lowercase(),
             port,
@@ -322,17 +330,43 @@ async fn authenticate(
                         let answer = if count == 0 {
                             Answer::Authentication(Vec::new())
                         } else {
+                            ensure!(
+                                name.len() <= 1024
+                                    && instructions.len() <= 8192
+                                    && questions.iter().all(|p| p.prompt.len() <= 4096),
+                                Permanent("authentication challenge exceeds display limits".into())
+                            );
+                            let remote_name = crate::prompts::sanitize_single_line(&name, 256);
+                            let remote_instructions =
+                                crate::prompts::sanitize_multiline(&instructions, 2048, 24);
+                            let attributed_instructions =
+                                match (remote_name.is_empty(), remote_instructions.is_empty()) {
+                                    (false, false) => format!(
+                                        "Remote server ({remote_name}):\n{remote_instructions}"
+                                    ),
+                                    (false, true) => format!("Remote server: {remote_name}"),
+                                    (true, false) => {
+                                        format!("Remote server message:\n{remote_instructions}")
+                                    }
+                                    (true, true) => {
+                                        "Remote server requested authentication.".into()
+                                    }
+                                };
                             prompts
                                 .ask(Question::Authentication {
+                                    // Keep the dialog title strictly local so remote server
+                                    // text cannot spoof or reorder the verified endpoint.
                                     name: format!(
-                                        "{}@{}:{} · {name}",
+                                        "Sign in as {}@{}:{}",
                                         options.user, options.host, options.port
                                     ),
-                                    instructions,
+                                    instructions: attributed_instructions,
                                     challenges: questions
                                         .into_iter()
                                         .map(|p| Challenge {
-                                            label: p.prompt,
+                                            label: crate::prompts::sanitize_single_line(
+                                                &p.prompt, 256,
+                                            ),
                                             echo: p.echo,
                                         })
                                         .collect(),
@@ -440,11 +474,27 @@ pub(super) async fn handshake(
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 ) -> Result<(client::Handle<Handler>, String)> {
-    let known_hosts = prompts
-        .and_then(Prompts::known_hosts)
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
-        .ok_or_else(|| stop("cannot locate known_hosts"))?;
+    let known_hosts = match prompts.and_then(Prompts::known_hosts) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let elevated = crate::control::security::is_elevated()
+                .map_err(|error| stop(format!("checking process integrity: {error:#}")))?;
+            if elevated {
+                // Do not trust Medium-integrity %USERPROFILE%\.ssh\known_hosts when elevated.
+                // `keys::data_dir()` routes to the verified elevated directory in production
+                // while still respecting explicit `W11TERM_DATA_DIR` isolation in tests.
+                crate::keys::data_dir()
+                    .map_err(|error| {
+                        stop(format!("cannot locate elevated known_hosts: {error:#}"))
+                    })?
+                    .join("known_hosts")
+            } else {
+                std::env::home_dir()
+                    .map(|home| home.join(".ssh/known_hosts"))
+                    .ok_or_else(|| stop("cannot locate known_hosts"))?
+            }
+        }
+    };
     let (name, port) = host_key_target(options);
     let trust_host_ca = super::known_hosts::has_authority(&known_hosts, name, port)
         .map_err(|error| stop(format!("reading host certificate authorities: {error:#}")))?;

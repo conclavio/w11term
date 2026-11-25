@@ -164,7 +164,7 @@ $argsForApp = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','110','--
 $app = Start-Process -FilePath $Gui -ArgumentList $argsForApp -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $origin = (Wait-Until 'the active Demo pane' {
         (Control @('list')).sessions | Where-Object active | Select-Object -First 1
     }).id

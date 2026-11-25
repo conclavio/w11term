@@ -28,6 +28,9 @@ pub fn data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("W11TERM_DATA_DIR") {
         return Ok(std::path::absolute(path)?);
     }
+    if crate::control::security::is_elevated()? {
+        return crate::control::security::elevated_data_dir();
+    }
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA unavailable")?)
             .join("w11term"),

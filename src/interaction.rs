@@ -46,6 +46,7 @@ pub enum PasteWarning {
     MultiLine,
     Large,
     LargeMultiLine,
+    ControlCharacters,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,7 +85,7 @@ impl Default for Interaction {
             sticky_command_context: true,
             detect_urls: true,
             osc52: true,
-            osc52_foreground_only: false,
+            osc52_foreground_only: true,
             word_delimiters: " /\\()\"'-:,.;<>~!@#$%^&*|+=[]{}?│".into(),
         }
     }
@@ -121,11 +122,18 @@ impl Interaction {
         // Windows measures the clipboard's UTF-16 units. Count only far
         // enough to distinguish the last unprompted unit from the first over.
         let large = self.large_paste_warning && text.encode_utf16().nth(5 * 1024).is_some();
-        let warning = match (warn_multiline && text.contains(['\r', '\n']), large) {
-            (true, true) => Some(PasteWarning::LargeMultiLine),
-            (true, false) => Some(PasteWarning::MultiLine),
-            (false, true) => Some(PasteWarning::Large),
-            (false, false) => None,
+        let has_control = text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\r' | '\n' | '\t'));
+        let warning = if has_control {
+            Some(PasteWarning::ControlCharacters)
+        } else {
+            match (warn_multiline && text.contains(['\r', '\n']), large) {
+                (true, true) => Some(PasteWarning::LargeMultiLine),
+                (true, false) => Some(PasteWarning::MultiLine),
+                (false, true) => Some(PasteWarning::Large),
+                (false, false) => None,
+            }
         };
         (text, warning)
     }
@@ -572,11 +580,13 @@ mod tests {
     fn legacy_osc52_settings_keep_their_scope_and_the_disable_switch_takes_precedence() {
         use crate::clipboard::RemoteClipboardPolicy::*;
         for (json, expected) in [
-            (r#"{}"#, AnyPane),
-            (r#"{"osc52":true}"#, AnyPane),
+            (r#"{}"#, ForegroundPane),
+            (r#"{"osc52":true}"#, ForegroundPane),
+            (r#"{"osc52ForegroundOnly":false}"#, AnyPane),
             (r#"{"osc52":false}"#, Disabled),
             (r#"{"osc52ForegroundOnly":true}"#, ForegroundPane),
             (r#"{"osc52":false,"osc52ForegroundOnly":true}"#, Disabled),
+            (r#"{"osc52":false,"osc52ForegroundOnly":false}"#, Disabled),
         ] {
             let settings: Interaction = serde_json::from_str(json).unwrap();
             assert_eq!(settings.remote_clipboard_policy(), expected);
@@ -709,6 +719,31 @@ mod tests {
             settings.clipboard_paste(&over, true, false).1,
             Some(PasteWarning::MultiLine)
         );
+    }
+
+    #[test]
+    fn clipboard_paste_warns_on_control_and_escape_characters_even_when_bracketed() {
+        let mut settings = Interaction::default();
+        for payload in [
+            "echo ok\x1b[201~\nid",
+            "echo ok\x1b[2\x1b[201~01~\nid",
+            "echo ok\u{009b}201~\nid",
+            "plain\x07bell",
+        ] {
+            assert_eq!(
+                settings.clipboard_paste(payload, false, true).1,
+                Some(PasteWarning::ControlCharacters),
+                "{payload:?}"
+            );
+            settings.multi_line_paste_warning = MultiLinePasteWarning::Never;
+            assert_eq!(
+                settings.clipboard_paste(payload, false, true).1,
+                Some(PasteWarning::ControlCharacters),
+                "{payload:?}"
+            );
+            settings.multi_line_paste_warning = MultiLinePasteWarning::Automatic;
+        }
+        assert_eq!(settings.clipboard_paste("a\tb", false, true).1, None);
     }
 
     #[test]

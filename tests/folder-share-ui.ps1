@@ -163,7 +163,7 @@ for ($launch = 1; $launch -le 3; $launch++) {
     $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile',$initialProfile) -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State "share-ui-$launch.log")
     try {
         $window = Wait-InputWindow
-        $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
         if ($launch -eq 3) {
             Test-OfflineRevoke
             continue

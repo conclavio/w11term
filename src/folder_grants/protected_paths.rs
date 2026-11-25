@@ -54,6 +54,24 @@ fn contains(parent: &[u16], child: &[u16]) -> Result<bool> {
     Ok(comparison == CSTR_EQUAL)
 }
 
+fn overlaps(a: &[u16], b: &[u16]) -> Result<bool> {
+    Ok(contains(a, b)? || contains(b, a)?)
+}
+
+fn protected_optional(path: &Path) -> Result<Option<Vec<u16>>> {
+    match protected_path(path) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|io_err| io_err.kind() == io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn check(root: &FolderRoot, scope: &FolderScope) -> Result<()> {
     let selected =
         volume_path(root.directory_handle()).context("Checking the selected writable folder")?;
@@ -62,10 +80,57 @@ pub(super) fn check(root: &FolderRoot, scope: &FolderScope) -> Result<()> {
     std::fs::create_dir_all(&scope.store_dir).context("Checking the w11term data directory")?;
     let data = protected_path(&scope.store_dir).context("Checking the w11term data directory")?;
     let catalog = protected_path(&scope.catalog).context("Checking the w11term profile catalog")?;
-    if contains(&selected, &data)? || contains(&data, &selected)? || contains(&selected, &catalog)?
-    {
+    let catalog_parent = scope
+        .catalog
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| {
+            protected_path(parent).context("Checking the w11term profile catalog directory")
+        })
+        .transpose()?;
+    let exposes_catalog_parent = catalog_parent
+        .as_deref()
+        .map(|parent| contains(&selected, parent))
+        .transpose()?
+        .unwrap_or(false);
+    if overlaps(&selected, &data)? || contains(&selected, &catalog)? || exposes_catalog_parent {
         bail!(
             "Write access would expose w11term's data directory or profile catalog. Choose a different folder or share it read-only."
+        );
+    }
+    // Protect the user's OpenSSH directory (~/.ssh) so a writable share cannot
+    // tamper with known_hosts, private keys, or OpenSSH config. If ~/.ssh does
+    // not exist yet, still block sharing the home directory (or its ancestors)
+    // writable so a remote host cannot pre-create ~/.ssh/known_hosts.
+    if let Some(home) = std::env::home_dir() {
+        let ssh_dir = home.join(".ssh");
+        if let Some(ssh_resolved) =
+            protected_optional(&ssh_dir).context("Checking the OpenSSH directory")?
+        {
+            if overlaps(&selected, &ssh_resolved)? {
+                bail!(
+                    "Write access would expose your OpenSSH directory (.ssh). Choose a different folder or share it read-only."
+                );
+            }
+        } else if let Some(home_resolved) =
+            protected_optional(&home).context("Checking the user home directory")?
+            && contains(&selected, &home_resolved)?
+        {
+            bail!(
+                "Write access would expose your user profile and OpenSSH directory (.ssh). Choose a different folder or share it read-only."
+            );
+        }
+    }
+    // Protect the directory containing the running executable against DLL/binary
+    // planting when --profiles resides outside the install directory.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+        && let Some(exe_resolved) =
+            protected_optional(exe_dir).context("Checking the w11term executable directory")?
+        && overlaps(&selected, &exe_resolved)?
+    {
+        bail!(
+            "Write access would expose w11term's executable directory. Choose a different folder or share it read-only."
         );
     }
     Ok(())
@@ -107,6 +172,51 @@ mod tests {
             &wide(r"volume\DONNÉES\Keys")
         )?);
         assert!(!contains(&wide(r"Volume\Data"), &wide(r"volume\database"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn writable_selection_excludes_catalog_parent_even_through_hardlink_and_blocks_exe_dir()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path().join("State");
+        let real_dir = temp.path().join("Dotfiles");
+        let work_dir = temp.path().join("Work");
+        let work_sub = work_dir.join("Sub");
+        std::fs::create_dir_all(&real_dir)?;
+        std::fs::create_dir_all(&work_sub)?;
+        let real_catalog = real_dir.join("profiles.json");
+        let linked_catalog = work_dir.join("profiles.json");
+        std::fs::write(&real_catalog, b"{}")?;
+        std::fs::hard_link(&real_catalog, &linked_catalog)?;
+
+        let scope = FolderScope::new(linked_catalog, "pilot".into(), data);
+        for blocked in [temp.path(), &work_dir] {
+            let root = FolderRoot::open(blocked)?;
+            assert!(
+                check(&root, &scope)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Write access would expose"),
+                "{blocked:?}"
+            );
+        }
+        // A subdirectory strictly below the catalog's parent does not expose
+        // profiles.json or its sibling lock/temp files and remains shareable.
+        check(&FolderRoot::open(&work_sub)?, &scope)?;
+
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(exe_dir) = exe.parent()
+        {
+            let root = FolderRoot::open(exe_dir)?;
+            assert!(
+                check(&root, &scope)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Write access would expose"),
+                "executable directory must be protected"
+            );
+        }
         Ok(())
     }
 }

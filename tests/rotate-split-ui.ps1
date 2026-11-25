@@ -73,7 +73,7 @@ function Expect-Disabled {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--workspace','original','--cols','154','--rows','38') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $baseline = Wait-Until 'initial asymmetric layout' {
         $p = Three-Panes
         if ($p -and $p['palette-ssh'].cols -eq $p['Inner PowerShell'].cols -and

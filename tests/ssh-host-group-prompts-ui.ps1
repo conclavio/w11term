@@ -57,7 +57,7 @@ $app = Start-Process -FilePath $Gui -ArgumentList $argsForApp -WindowStyle Hidde
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'the control pipe' {
-        Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json")
+        Test-Path -LiteralPath (Get-ControlManifestPath $app.Id)
     }
     Run-Palette "Open SSH group${dot}Prompt review"
     $sessions = Wait-Until 'the two SSH panes are created' {

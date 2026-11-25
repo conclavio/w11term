@@ -43,7 +43,7 @@ function Check-FocusAndLock {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','68','--rows','16') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $screen = Control @('wait-for-text','--pane',"$remote",'--timeout','15','history-one-ready')
     if ($screen.cols -ge $command.Length) { throw 'Fixture needs a command spanning multiple physical rows' }

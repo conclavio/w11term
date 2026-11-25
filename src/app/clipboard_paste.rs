@@ -313,6 +313,9 @@ impl TerminalApp {
             PasteWarning::LargeMultiLine => {
                 "The clipboard contains multiple lines and exceeds 5,120 UTF-16 code units."
             }
+            PasteWarning::ControlCharacters => {
+                "The clipboard contains control or escape characters."
+            }
         };
         let destination = format!(
             "Paste into {} (pane {}).",

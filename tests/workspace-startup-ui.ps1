@@ -17,7 +17,7 @@ foreach ($mode in @('profile', 'workspace')) {
     $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), "--$mode", $name) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
     try {
         $window = Wait-Until 'window' { $app.Refresh(); if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } }
-        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
         $pane = (Control @('list')).sessions[0].id
         if ($mode -eq 'workspace') {
             $null = Control @('wait-for-text','--pane',"$pane",'--timeout','12','workspace-command-started')

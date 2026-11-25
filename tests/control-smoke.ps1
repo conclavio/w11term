@@ -29,7 +29,13 @@ function Invoke-Control([string[]]$Arguments) {
     return $result.result
 }
 function Wait-ControlManifest {
-    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($terminal.Id).json"
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    $manifest = if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Join-Path $env:ProgramData "w11term\elevated\$($identity.User.Value)\instances\$($terminal.Id).json"
+    } else {
+        Join-Path $env:LOCALAPPDATA "w11term\instances\$($terminal.Id).json"
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     while (-not (Test-Path -LiteralPath $manifest)) {
         if ($terminal.HasExited -or [DateTime]::UtcNow -gt $deadline) { throw "GUI did not publish its control manifest. See $state" }

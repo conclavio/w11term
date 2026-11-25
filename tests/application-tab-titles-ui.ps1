@@ -75,7 +75,7 @@ function Shell-Witness([string]$Tag) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $origin = (Control @('list')).sessions[0]
     $remote = $origin.id
     $null = Wait-Until 'initial SSH title' { (Control @('get-text','--pane',"$remote")).title -ceq 'ssh-seed' }

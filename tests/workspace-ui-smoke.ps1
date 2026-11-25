@@ -92,7 +92,7 @@ try {
     Assert-FailedLaunch 'absent-workspace' 'Unknown workspace absent-workspace'
     Assert-FailedLaunch 'missing-profile' 'Unknown workspace profile absent-profile'
     $terminal = Start-WorkspaceGui @('--workspace', 'two-tabs') 'startup.err'
-    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($terminal.Id).json"
+    $manifest = Get-ControlManifestPath $terminal.Id
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     $ready = $false
     do {

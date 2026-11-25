@@ -4,13 +4,17 @@ use crate::{Sixel, SixelData};
 use alloc::vec;
 
 const MAX_PARAMS: usize = 5;
-const MAX_SIXEL_SIZE: usize = 100_000_000;
+const MAX_SIXEL_SIZE: usize = 8 * 1024 * 1024;
+const MAX_SIXEL_DIM: i64 = 16_384;
+const MAX_SIXEL_INITIAL_RESERVE: usize = 65_536;
+const MAX_SIXEL_DATA_LEN: usize = 2_000_000;
 
 pub struct SixelBuilder {
     pub sixel: Sixel,
     params: [i64; MAX_PARAMS],
     param_no: usize,
     current_command: u8,
+    overflowed: bool,
 }
 
 impl SixelBuilder {
@@ -41,29 +45,56 @@ impl SixelBuilder {
             param_no: 0,
             params: [-1; MAX_PARAMS],
             current_command: 0,
+            overflowed: false,
         }
     }
 
+    fn push_data(&mut self, item: SixelData) {
+        if self.overflowed {
+            return;
+        }
+        if self.sixel.data.len() >= MAX_SIXEL_DATA_LEN {
+            log::error!(
+                "Ignoring sixel data because command count exceeded {}",
+                MAX_SIXEL_DATA_LEN
+            );
+            self.overflowed = true;
+            self.sixel.pixel_width = None;
+            self.sixel.pixel_height = None;
+            self.sixel.data.clear();
+            return;
+        }
+        self.sixel.data.push(item);
+    }
+
     pub fn push(&mut self, data: u8) {
+        if self.overflowed {
+            return;
+        }
         match data {
             b'$' => {
                 self.finish_command();
-                self.sixel.data.push(SixelData::CarriageReturn);
+                self.push_data(SixelData::CarriageReturn);
             }
             b'-' => {
                 self.finish_command();
-                self.sixel.data.push(SixelData::NewLine);
+                self.push_data(SixelData::NewLine);
             }
             0x3f..=0x7e if self.current_command == b'!' => {
-                self.sixel.data.push(SixelData::Repeat {
-                    repeat_count: self.params[0] as u32,
+                let repeat_count = if self.params[0] <= 0 {
+                    1
+                } else {
+                    self.params[0].min(MAX_SIXEL_DIM) as u32
+                };
+                self.push_data(SixelData::Repeat {
+                    repeat_count,
                     data: data - 0x3f,
                 });
                 self.finish_command();
             }
             0x3f..=0x7e => {
                 self.finish_command();
-                self.sixel.data.push(SixelData::Data(data - 0x3f));
+                self.push_data(SixelData::Data(data - 0x3f));
             }
             b'#' | b'!' | b'"' => {
                 self.finish_command();
@@ -106,7 +137,7 @@ impl SixelBuilder {
                 let c = self.params[4] as u8;
 
                 if system == 1 {
-                    self.sixel.data.push(SixelData::DefineColorMapHSL {
+                    self.push_data(SixelData::DefineColorMapHSL {
                         color_number,
                         hue_angle: a,
                         lightness: b,
@@ -117,18 +148,14 @@ impl SixelBuilder {
                     let g = b as f32 * 255.0 / 100.;
                     let b = c as f32 * 255.0 / 100.;
                     let rgb = RgbColor::new_8bpc(r as u8, g as u8, b as u8); // FIXME: from linear
-                    self.sixel
-                        .data
-                        .push(SixelData::DefineColorMapRGB { color_number, rgb });
+                    self.push_data(SixelData::DefineColorMapRGB { color_number, rgb });
                 }
             }
             b'#' => {
                 // Use a color
                 let color_number = self.params[0] as u16;
 
-                self.sixel
-                    .data
-                    .push(SixelData::SelectColorMapEntry(color_number));
+                self.push_data(SixelData::SelectColorMapEntry(color_number));
             }
             b'"' => {
                 // Set raster attributes
@@ -149,30 +176,34 @@ impl SixelBuilder {
                 self.sixel.pad = pad;
 
                 if self.param_no >= 3 {
-                    self.sixel.pixel_width.replace(pixel_width as u32);
-                    self.sixel.pixel_height.replace(pixel_height as u32);
+                    let valid_dims = pixel_width > 0
+                        && pixel_height > 0
+                        && pixel_width <= MAX_SIXEL_DIM
+                        && pixel_height <= MAX_SIXEL_DIM;
+                    let (size, overflow) = if valid_dims {
+                        (pixel_width as usize).overflowing_mul(pixel_height as usize)
+                    } else {
+                        (0, true)
+                    };
 
-                    let (size, overflow) =
-                        (pixel_width as usize).overflowing_mul(pixel_height as usize);
-
-                    // Ideally we'd just use `try_reserve` here, but that is
-                    // nightly Rust only at the time of writing this comment:
-                    // <https://github.com/rust-lang/rust/issues/48043>
-                    if size > MAX_SIXEL_SIZE || overflow {
+                    if !valid_dims || size > MAX_SIXEL_SIZE || overflow {
                         log::error!(
-                            "Ignoring sixel data {}x{} because {} bytes \
+                            "Ignoring sixel data {}x{} because {} pixels \
                              either overflows or exceeds the max allowed {}",
                             pixel_width,
                             pixel_height,
                             size,
                             MAX_SIXEL_SIZE
                         );
+                        self.overflowed = true;
                         self.sixel.pixel_width = None;
                         self.sixel.pixel_height = None;
                         self.sixel.data.clear();
                         return;
                     }
-                    self.sixel.data.reserve(size);
+                    self.sixel.pixel_width.replace(pixel_width as u32);
+                    self.sixel.pixel_height.replace(pixel_height as u32);
+                    self.sixel.data.reserve(size.min(MAX_SIXEL_INITIAL_RESERVE));
                 }
             }
             _ => {}

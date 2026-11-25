@@ -60,7 +60,7 @@ function Shell-Pid([string]$Tag, [int]$Pane = $localPane) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $localPane = (Control @('list')).sessions[0].id
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','20','PS ')
     $pidBefore = Shell-Pid 'browse-before'

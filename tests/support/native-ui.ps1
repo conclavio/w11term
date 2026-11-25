@@ -113,6 +113,14 @@ function Wait-InputWindow {
         }
     }
 }
+function Get-ControlManifestPath([int]$ProcessId) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        return Join-Path $env:ProgramData "w11term\elevated\$($identity.User.Value)\instances\$ProcessId.json"
+    }
+    return Join-Path $env:LOCALAPPDATA "w11term\instances\$ProcessId.json"
+}
 function Control([string[]]$Command) {
     $reply = & $Cli --pid $app.Id @Command | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $reply.ok) { throw "Control request failed: $Command $($reply.error)" }

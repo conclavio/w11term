@@ -9,6 +9,99 @@ use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn is_bidi_or_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Sanitize untrusted single-line text (e.g. remote prompt names/labels) by
+/// stripping control characters and Unicode BiDi override/isolate characters.
+pub fn sanitize_single_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut last_space = true;
+    let mut count = 0;
+    for ch in text.chars() {
+        if count >= max_chars {
+            break;
+        }
+        if is_bidi_or_separator(ch) {
+            continue;
+        }
+        if matches!(ch, '\r' | '\n' | '\t') || ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+                count += 1;
+            }
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        out.push(ch);
+        last_space = false;
+        count += 1;
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Sanitize untrusted multi-line instructions by normalizing line endings,
+/// stripping BiDi overrides and control characters, and bounding line/char counts.
+pub fn sanitize_multiline(text: &str, max_chars: usize, max_lines: usize) -> String {
+    let mut out = String::new();
+    let mut chars = 0;
+    let mut lines = 1;
+    let mut iter = text.chars().peekable();
+    while let Some(ch) = iter.next() {
+        if chars >= max_chars {
+            break;
+        }
+        if is_bidi_or_separator(ch) {
+            continue;
+        }
+        match ch {
+            '\r' => {
+                if iter.peek() == Some(&'\n') {
+                    let _ = iter.next();
+                }
+                if lines < max_lines {
+                    out.push('\n');
+                    lines += 1;
+                    chars += 1;
+                }
+            }
+            '\n' => {
+                if lines < max_lines {
+                    out.push('\n');
+                    lines += 1;
+                    chars += 1;
+                }
+            }
+            '\t' => {
+                out.push(' ');
+                chars += 1;
+            }
+            c if c.is_control() => {}
+            c => {
+                out.push(c);
+                chars += 1;
+            }
+        }
+    }
+    out.trim().to_string()
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Challenge {
     pub label: String,
@@ -91,12 +184,12 @@ impl Prompts {
         state.reply.take();
         self.1.notify_one();
     }
-    pub async fn ask(&self, question: Question) -> Result<Answer> {
+    pub async fn ask(&self, mut question: Question) -> Result<Answer> {
         if let Question::Authentication {
             name,
             instructions,
             challenges,
-        } = &question
+        } = &mut question
         {
             ensure!(
                 name.len() <= 1024
@@ -105,6 +198,11 @@ impl Prompts {
                     && challenges.iter().all(|c| c.label.len() <= 4096),
                 "authentication challenge exceeds display limits"
             );
+            *name = sanitize_single_line(name, 256);
+            *instructions = sanitize_multiline(instructions, 2048, 24);
+            for challenge in challenges.iter_mut() {
+                challenge.label = sanitize_single_line(&challenge.label, 256);
+            }
         }
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let (reply, response) = oneshot::channel();
@@ -134,5 +232,59 @@ impl Prompts {
             .await
             .context("authentication question timed out")?
             .context("authentication cancelled")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_sanitizers_strip_bidi_overrides_controls_and_bound_lines() {
+        assert_eq!(
+            sanitize_single_line("MFA\u{202E}gnifoops\r\n\x1b[31mPrompt\x07", 256),
+            "MFAgnifoops [31mPrompt"
+        );
+        let many_lines = (0..40)
+            .map(|i| format!("line-{i}\u{202E}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let sanitized = sanitize_multiline(&many_lines, 2048, 24);
+        assert!(!sanitized.contains('\u{202E}'));
+        assert!(!sanitized.contains('\r'));
+        assert_eq!(sanitized.lines().count(), 24);
+    }
+
+    #[tokio::test]
+    async fn ask_sanitizes_authentication_prompt_fields() {
+        let prompts = Prompts::default();
+        let waiter = prompts.clone();
+        let handle = tokio::spawn(async move {
+            waiter
+                .ask(Question::Authentication {
+                    name: "Sign in\u{202E}\nspoof".into(),
+                    instructions: "Remote\x1b[2J\u{2066}body".into(),
+                    challenges: vec![Challenge {
+                        label: "Code\r\n\u{202E}:".into(),
+                        echo: false,
+                    }],
+                })
+                .await
+        });
+        prompts.changed().await;
+        let current = prompts.current().expect("pending prompt");
+        let Question::Authentication {
+            name,
+            instructions,
+            challenges,
+        } = current.question
+        else {
+            panic!("expected authentication question");
+        };
+        assert_eq!(name, "Sign in spoof");
+        assert_eq!(instructions, "Remote[2Jbody");
+        assert_eq!(challenges[0].label, "Code :");
+        prompts.cancel();
+        assert!(handle.await.unwrap().is_err());
     }
 }

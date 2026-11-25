@@ -85,7 +85,7 @@ function Expect-Style($MarkedCell, [string]$Style, [IntPtr]$Foreground = $window
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','80','--rows','16') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $left = ((Control @('list')).sessions | Where-Object active).id
     $null = Control @('wait-for-text','--pane',"$left",'--timeout','15','ready')
     Show-CursorWindow

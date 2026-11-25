@@ -15,7 +15,7 @@ $app = $null
 function Start-Fixture([string]$Name, [string[]]$Arguments) {
     $script:phase = $Name
     $script:app = Start-Process -FilePath $Gui -ArgumentList (@('--profiles',('"' + $profiles + '"')) + $Arguments) -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State "$Name.log")
-    $null = Wait-Until "control pipe for $Name" { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $null = Wait-Until "control pipe for $Name" { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
 }
 function Stop-Fixture {
     if (!$app) { return }

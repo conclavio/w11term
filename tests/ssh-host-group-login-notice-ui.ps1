@@ -51,7 +51,7 @@ $launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '-
 $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json"
+    $manifest = Get-ControlManifestPath $app.Id
     $null = Wait-Until 'the fixture control pipe' { Test-Path -LiteralPath $manifest }
     Run-Palette "Open SSH group${dot}Notices" -Enter
     Click-Button 'Notify when logins finish'
