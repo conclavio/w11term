@@ -11,9 +11,9 @@ use w11term::events::SavedDownload;
 use w11term::folder_grants::Authority;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
-    DEFAULT_TIMEOUT, EntryKind, FilenameMatch, Job, Operation, TransferBatchProgress,
-    TransferCancel, TransferOperation, TransferOutcome, TransferPhase, TransferProgress,
-    normalize_sha256, validate_download_name,
+    DEFAULT_TIMEOUT, EntryKind, FilenameMatch, Job, JobProgress, Operation, SearchProgress,
+    TransferBatchProgress, TransferCancel, TransferOperation, TransferOutcome, TransferPhase,
+    TransferProgress, normalize_sha256, validate_download_name,
 };
 
 mod bookmarks;
@@ -726,6 +726,7 @@ struct Pending {
     step: Step,
     reply: oneshot::Receiver<Result<Value, String>>,
     transfer: Option<ActiveTransfer>,
+    search_progress: Option<watch::Receiver<SearchProgress>>,
     destination: Rc<RefCell<LocalSender<Message>>>,
     _timer: crate::ui_timer::RetryTimer,
 }
@@ -1724,7 +1725,7 @@ impl FileDrawer {
             view
         };
         if let Some(search) = &self.search {
-            return cache(search.view(self, pane, shell_ready, context));
+            return cache(search.view(self, pane, shell_ready, layout, profile, context));
         }
         if let Some(list) = &self.bookmarks
             && Some(list.profile.as_str()) == profile
@@ -2325,19 +2326,25 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         let (tx, reply) = oneshot::channel();
-        let (tx_progress, transfer) = if matches!(step, Step::Transfer(_)) {
-            let (tx, progress) = watch::channel(TransferProgress::default());
-            let id = self.transfer_id(id);
-            (
-                Some(tx),
-                Some(ActiveTransfer {
-                    id,
-                    cancel: TransferCancel::default(),
-                    progress,
-                }),
-            )
-        } else {
-            (None, None)
+        let (tx_progress, transfer, search_progress) = match &step {
+            Step::Transfer(_) => {
+                let (tx, progress) = watch::channel(TransferProgress::default());
+                let id = self.transfer_id(id);
+                (
+                    Some(JobProgress::Transfer(tx)),
+                    Some(ActiveTransfer {
+                        id,
+                        cancel: TransferCancel::default(),
+                        progress,
+                    }),
+                    None,
+                )
+            }
+            Step::Search(..) => {
+                let (tx, progress) = watch::channel(SearchProgress::default());
+                (Some(JobProgress::Search(tx)), None, Some(progress))
+            }
+            _ => (None, None, None),
         };
         let destination = Rc::new(RefCell::new(context.sender()));
         let tick = destination.clone();
@@ -2372,6 +2379,7 @@ impl FileDrawer {
             step,
             reply,
             transfer,
+            search_progress,
             destination,
             _timer: timer,
         });
@@ -2459,6 +2467,12 @@ impl FileDrawer {
                     && transfer.progress.has_changed().unwrap_or(false)
                 {
                     let _ = transfer.progress.borrow_and_update();
+                    self.cached.borrow_mut().take();
+                }
+                if let Some(progress) = pending.search_progress.as_mut()
+                    && progress.has_changed().unwrap_or(false)
+                {
+                    let _ = progress.borrow_and_update();
                     self.cached.borrow_mut().take();
                 }
                 return Ok(());
@@ -3059,7 +3073,13 @@ impl TerminalApp {
                 Search(_, generation, action)
                     if files.open && may_open_dialog && generation == files.generation =>
                 {
-                    files.filename_search(pane, session, action, context)?;
+                    files.filename_search(
+                        pane,
+                        session,
+                        action,
+                        tab.profile_name.as_deref().map(|name| (name, &self.store)),
+                        context,
+                    )?;
                 }
                 Search(..) => {}
                 Bookmarks(_, generation, action)
