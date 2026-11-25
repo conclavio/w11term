@@ -9,6 +9,7 @@ pub(super) struct Batch {
     remaining: VecDeque<FilenameMatch>,
     confirmed: usize,
     total: usize,
+    stop_requested: bool,
 }
 
 fn validate_sources(hits: &[FilenameMatch]) -> Result<()> {
@@ -55,7 +56,24 @@ impl Batch {
             remaining: hits.collect(),
             confirmed: 0,
             total,
+            stop_requested: false,
         })
+    }
+
+    fn request_stop(&mut self) {
+        if !self.remaining.is_empty() {
+            self.remaining.clear();
+            self.stop_requested = true;
+        }
+    }
+
+    fn completed(&self) -> String {
+        let summary = self.summary();
+        if self.stop_requested {
+            format!("{summary}. Stopped after the current move")
+        } else {
+            summary
+        }
     }
 
     fn summary(&self) -> String {
@@ -98,6 +116,48 @@ impl Batch {
 }
 
 impl FileDrawer {
+    pub(super) fn stop_move_batch_button(
+        &self,
+        pane: u64,
+        serial: u64,
+        context: &ViewContext<TerminalApp>,
+    ) -> Option<View> {
+        let Step::MoveSearchBatch(batch) = &self.pending.as_ref()?.step else {
+            return None;
+        };
+        if batch.serial != serial || (batch.remaining.is_empty() && !batch.stop_requested) {
+            return None;
+        }
+        let generation = self.generation;
+        Some(
+            Button::new()
+                .is_enabled(!batch.stop_requested)
+                .on_click(context.callback(move |_| {
+                    Message::Files(FileAction::Search(
+                        pane,
+                        generation,
+                        find::Action::StopMoves(serial),
+                    ))
+                }))
+                .content(if batch.stop_requested {
+                    "Stopping after current move…"
+                } else {
+                    "Stop after current move"
+                }),
+        )
+    }
+
+    pub(super) fn stop_move_batch(&mut self, serial: u64) {
+        if let Some(Pending {
+            step: Step::MoveSearchBatch(batch),
+            ..
+        }) = self.pending.as_mut()
+            && batch.serial == serial
+        {
+            batch.request_stop();
+        }
+    }
+
     pub(super) fn begin_marked_move(&mut self, serial: u64) -> Result<()> {
         let (root, hits) = self.marked_search_moves(serial)?;
         validate_sources(&hits)?;
@@ -167,7 +227,7 @@ impl FileDrawer {
                     batch.current = next;
                     return self.start_move_batch(pane, session, batch, context);
                 }
-                batch.summary()
+                batch.completed()
             }
             Err(error) => {
                 if error.contains(MOVE_OUTCOME_UNKNOWN) {
@@ -249,5 +309,27 @@ mod tests {
             batch.reconnect_status(&mut receive),
             "Moved 0 of 2 marked entries to /target. Move was not started"
         );
+    }
+
+    #[test]
+    fn stopping_drops_queued_moves_but_preserves_the_current_request() {
+        let first = hit("/work", "first", EntryKind::File);
+        let second = hit("/work", "second", EntryKind::File);
+        let mut batch = Batch::new(5, vec![first.clone(), second], "/target".into()).unwrap();
+        batch.request_stop();
+        batch.request_stop();
+        assert!(batch.stop_requested);
+        assert!(batch.remaining.is_empty());
+        assert_eq!(batch.current, first);
+        assert_eq!(batch.confirmed, 0);
+        batch.confirmed += 1;
+        assert_eq!(
+            batch.completed(),
+            "Moved 1 of 2 marked entries to /target. Stopped after the current move"
+        );
+
+        let mut last = Batch::new(6, vec![first], "/target".into()).unwrap();
+        last.request_stop();
+        assert!(!last.stop_requested);
     }
 }
