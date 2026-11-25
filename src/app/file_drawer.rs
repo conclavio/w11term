@@ -3892,6 +3892,9 @@ impl TerminalApp {
                 FolderReport(_, _, serial, folder_report::Action::Close) => {
                     files.close_folder_report(serial);
                 }
+                FolderReport(_, _, serial, folder_report::Action::Browse(action)) => {
+                    files.browse_folder_comparison(serial, action);
+                }
                 ClearFolderReference(_, generation, revision) => {
                     if generation == files.generation && may_open_dialog {
                         files.clear_folder_reference(revision);

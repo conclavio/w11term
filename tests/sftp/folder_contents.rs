@@ -106,7 +106,7 @@ async fn folder_inventory_compares_nested_metadata_without_opening_files_or_link
     assert_eq!(report.types_changed, 1);
     assert_eq!(report.unknown, 2);
     assert_eq!(report.matching, 1);
-    assert_eq!(report.unshown(), 0);
+    assert_eq!(report.differences.len(), 6);
     let changed = report
         .differences
         .iter()

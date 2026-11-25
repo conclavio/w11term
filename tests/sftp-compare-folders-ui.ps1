@@ -8,7 +8,14 @@ $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 $fixture = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $button = [System.Windows.Automation.ControlType]::Button
+$edit = [System.Windows.Automation.ControlType]::Edit
+$combo = [System.Windows.Automation.ControlType]::ComboBox
+$listItem = [System.Windows.Automation.ControlType]::ListItem
+$value = [System.Windows.Automation.ValuePattern]::Pattern
+$expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+$selection = [System.Windows.Automation.SelectionItemPattern]::Pattern
 $dot = [char]0xb7
+$dash = [char]0x2013
 $reference = '/shell directory/archive'
 $current = '/shell directory/live'
 
@@ -17,6 +24,25 @@ function Click([string]$Name) {
         $item = Find-Element $Name $button
         if ($item -and $item.Current.IsEnabled) { $item }
     })
+}
+
+function Wait-Range([int]$First, [int]$Last, [int]$Total) {
+    $range = if ($Total -eq 1) { '1 difference' } else { "Showing $First$dash$Last of $Total differences" }
+    $null = Wait-Until $range { Find-Element $range }
+}
+
+function Set-Query([string]$Query) {
+    $field = Wait-Until 'relative path filter' { Find-Element 'Filter relative paths' $edit }
+    $field.GetCurrentPattern($value).SetValue($Query)
+}
+
+function Select-DifferenceType([string]$Name) {
+    $field = Wait-Until 'difference type filter' { Find-Element 'Folder difference type' $combo }
+    $field.GetCurrentPattern($expand).Expand()
+    $choice = Wait-Until "difference type '$Name'" { Find-Element $Name $listItem -Visible }
+    $choice.GetCurrentPattern($selection).Select()
+    $popup = (Find-Element 'Folder difference type' $combo).GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -45,9 +71,16 @@ try {
     Click ('Compare folder with reference' + [char]0x2026)
     $null = Wait-Until 'a comparison identifies both folders and the expected counts' {
         (Find-Element "Reference folder  $reference") -and (Find-Element $current) -and
-            (Find-Element 'Only in reference  1') -and (Find-Element 'Only in current folder  1') -and
+            (Find-Element 'Only in reference  1') -and (Find-Element 'Only in current folder  241') -and
             (Find-Element 'File metadata changed  1') -and (Find-Element 'Needs inspection  1')
     }
+    Wait-Range 1 40 244
+    Click 'Next differences'
+    Wait-Range 41 80 244
+    Click 'Previous differences'
+    Wait-Range 1 40 244
+    Set-Query 'NESTED/DATA.TXT'
+    Wait-Range 1 1 1
     $null = Wait-Until 'the changed nested file shows the pinned and current sizes' {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $text = [System.Windows.Automation.PropertyCondition]::new(
@@ -59,6 +92,25 @@ try {
                 $name.Contains('Reference  File  3 bytes') -and $name.Contains('Current  File  8 bytes')
         }
     }
+    Select-DifferenceType 'Needs inspection'
+    $null = Wait-Until 'the path and change filters are intersected' {
+        Find-Element 'No differences match these filters.'
+    }
+    Set-Query ''
+    Wait-Range 1 1 1
+    $hold = Join-Path $fixture 'hold-opendir'
+    [IO.File]::WriteAllText($hold, "$current/nested")
+    try {
+        Click 'Compare again'
+        $null = Wait-Until 'the refreshed comparison is scanning the directory' {
+            Test-Path -LiteralPath (Join-Path $fixture 'opendir-paused')
+        }
+    } finally {
+        [IO.File]::Delete($hold)
+    }
+    Wait-Range 1 1 1
+    Select-DifferenceType 'All differences'
+    Wait-Range 1 40 244
     Click 'Close folder comparison'
     $null = Wait-Until 'the comparison dialog is closed' { !(Find-Element 'Close folder comparison' $button) }
     Click 'Clear folder reference'

@@ -3618,6 +3618,9 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
     fs::write(live.join("nested/data.txt"), b"current!").unwrap();
     fs::write(archive.join("removed.txt"), []).unwrap();
     fs::write(live.join("added.txt"), []).unwrap();
+    for index in 0..240 {
+        fs::write(live.join(format!("bulk-{index:03}.txt")), []).unwrap();
+    }
     let trace = root.join("transfer-trace");
     let listing = root.join("listing-trace");
     fs::write(&trace, []).unwrap();
@@ -3629,12 +3632,20 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
         fs::read(trace).unwrap().is_empty(),
         "comparison read file data"
     );
+    let scans = fs::read_to_string(listing).unwrap();
     assert!(
-        !fs::read_to_string(listing)
-            .unwrap()
+        !scans
             .lines()
             .any(|line| line.starts_with("OPENDIR ") && line.ends_with("/link")),
         "comparison traversed a symbolic link"
+    );
+    assert_eq!(
+        scans
+            .lines()
+            .filter(|line| *line == "OPENDIR /shell directory/live/nested")
+            .count(),
+        2,
+        "the initial comparison and explicit Compare again each scanned once"
     );
     assert_eq!(opens.load(Ordering::Relaxed), 2);
     server.abort();

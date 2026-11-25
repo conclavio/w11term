@@ -1,7 +1,6 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-const MAX_PREVIEW: usize = 200;
 const TYPE_MASK: u32 = 0o170000;
 const DIRECTORY: u32 = 0o040000;
 const REGULAR: u32 = 0o100000;
@@ -100,17 +99,6 @@ pub struct FolderComparison {
     pub differences: Vec<FolderDifference>,
 }
 
-impl FolderComparison {
-    pub fn unshown(&self) -> usize {
-        (self.reference_only
-            + self.current_only
-            + self.types_changed
-            + self.metadata_changed
-            + self.unknown)
-            .saturating_sub(self.differences.len())
-    }
-}
-
 fn entry_change(reference: FolderEntry, current: FolderEntry) -> Option<FolderChange> {
     if reference.kind != current.kind {
         return Some(FolderChange::Type);
@@ -165,14 +153,12 @@ pub(super) fn compare(reference: &FolderInventory, current: FolderInventory) -> 
             FolderChange::Metadata => report.metadata_changed += 1,
             FolderChange::Unknown => report.unknown += 1,
         }
-        if report.differences.len() < MAX_PREVIEW {
-            report.differences.push(FolderDifference {
-                path: path.clone(),
-                change,
-                reference: before,
-                current: after,
-            });
-        }
+        report.differences.push(FolderDifference {
+            path: path.clone(),
+            change,
+            reference: before,
+            current: after,
+        });
     }
     report
 }
@@ -214,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_is_bounded_while_totals_cover_every_path() {
+    fn comparison_keeps_every_difference_in_path_order() {
         let reference = InventoryBuilder::default().finish("/a".into());
         let mut builder = InventoryBuilder::default();
         let attrs = FileAttributes {
@@ -226,8 +212,8 @@ mod tests {
         }
         let report = compare(&reference, builder.finish("/b".into()));
         assert_eq!(report.current_only, 250);
-        assert_eq!(report.unshown(), 50);
+        assert_eq!(report.differences.len(), 250);
         assert_eq!(report.differences[0].path, "file000");
-        assert_eq!(report.differences[199].path, "file199");
+        assert_eq!(report.differences[249].path, "file249");
     }
 }

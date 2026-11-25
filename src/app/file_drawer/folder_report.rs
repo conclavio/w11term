@@ -1,14 +1,17 @@
 use super::*;
 use russh_sftp::extensions::Statvfs;
-use w11term::sftp::{FolderChange, FolderComparison, FolderContents, FolderEntry};
+use w11term::sftp::{FolderComparison, FolderContents};
+
+mod comparison;
 
 const READ_ONLY: u64 = 1;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Action {
     Refresh,
     Stop,
     Close,
+    Browse(comparison::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,7 @@ pub(super) struct Panel {
     directory: String,
     kind: Kind,
     state: State,
+    comparison: comparison::Browser,
     pub(super) cancel: TransferCancel,
 }
 
@@ -260,7 +264,7 @@ impl Panel {
                 ));
             }
             State::Loaded(Ok(Report::Comparison(comparison))) => {
-                rows.extend(comparison_rows(comparison));
+                rows.extend(self.comparison.rows(comparison, context, message));
             }
         }
         rows.push(KeyedView::new(
@@ -283,103 +287,6 @@ impl Panel {
                     .keyed_children(rows),
             )
     }
-}
-
-fn entry_summary(entry: FolderEntry) -> String {
-    if let Some(size) = entry.size {
-        format!(
-            "{} · {}",
-            size_value(entry.kind_label(), u128::from(size)),
-            properties::timestamp(entry.mtime)
-        )
-    } else if entry.is_file() {
-        format!(
-            "File · Size unavailable · {}",
-            properties::timestamp(entry.mtime)
-        )
-    } else {
-        entry.kind_label().into()
-    }
-}
-
-fn comparison_rows(report: &FolderComparison) -> Vec<KeyedView> {
-    let mut rows = vec![
-        KeyedView::new(
-            "reference",
-            TextBlock::new()
-                .automation_id("sftp-folder-comparison-reference")
-                .text(format!("Reference folder  {}", report.reference_root))
-                .text_wrapping(TextWrapping::Wrap),
-        ),
-        KeyedView::new(
-            "scope",
-            TextBlock::new()
-                .text("Compares paths, entry types, and regular-file sizes and modification times. File contents and link targets are unchecked.")
-                .text_wrapping(TextWrapping::Wrap),
-        ),
-    ];
-    for (key, label, count) in [
-        ("reference-only", "Only in reference", report.reference_only),
-        (
-            "current-only",
-            "Only in current folder",
-            report.current_only,
-        ),
-        ("type", "Type changed", report.types_changed),
-        ("metadata", "File metadata changed", report.metadata_changed),
-        ("unknown", "Needs inspection", report.unknown),
-        ("matching", "Matching inventory entries", report.matching),
-    ] {
-        rows.push(KeyedView::new(
-            key,
-            TextBlock::new()
-                .automation_id(format!("sftp-comparison-{key}"))
-                .text(format!("{label}  {count}")),
-        ));
-    }
-    if !report.differences.is_empty() {
-        rows.push(KeyedView::new(
-            "differences",
-            ScrollViewer::new()
-                .automation_name("Folder differences")
-                .max_height(180.0)
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(StackPanel::new().spacing(6.0).keyed_children(
-                    report.differences.iter().map(|item| {
-                        let label = match item.change {
-                            FolderChange::ReferenceOnly => "Only in reference",
-                            FolderChange::CurrentOnly => "Only in current folder",
-                            FolderChange::Type => "Type changed",
-                            FolderChange::Metadata => "File metadata changed",
-                            FolderChange::Unknown => "Needs inspection",
-                        };
-                        let detail = match (item.reference, item.current) {
-                            (Some(reference), Some(current)) => format!(
-                                "Reference  {}\nCurrent  {}",
-                                entry_summary(reference),
-                                entry_summary(current),
-                            ),
-                            (Some(entry), None) | (None, Some(entry)) => entry_summary(entry),
-                            (None, None) => String::new(),
-                        };
-                        KeyedView::new(
-                            item.path.as_str(),
-                            TextBlock::new()
-                                .text(format!("{label} · {}\n{detail}", item.path))
-                                .text_wrapping(TextWrapping::Wrap),
-                        )
-                    }),
-                )),
-        ));
-    }
-    let unshown = report.unshown();
-    if unshown > 0 {
-        rows.push(KeyedView::new(
-            "unshown",
-            TextBlock::new().text(format!("{unshown} more entries included in the totals")),
-        ));
-    }
-    rows
 }
 
 fn contents_rows(counts: &FolderContents, bytes: u128) -> Vec<KeyedView> {
@@ -486,6 +393,7 @@ impl FileDrawer {
             directory: directory.clone(),
             kind,
             state: State::Loading,
+            comparison: comparison::Browser::default(),
             cancel: TransferCancel::default(),
         });
         Some((serial, operation))
@@ -523,6 +431,20 @@ impl FileDrawer {
                     .report(value, &mut self.folder_reference)
                     .map_err(|error| format!("{error:#}"))
             }));
+            if let State::Loaded(Ok(Report::Comparison(report))) = &panel.state {
+                panel.comparison.index(report);
+            }
+        }
+    }
+
+    pub(super) fn browse_folder_comparison(&mut self, serial: u64, action: comparison::Action) {
+        if let Some(panel) = self
+            .folder_report
+            .as_mut()
+            .filter(|panel| panel.serial == serial)
+            && let State::Loaded(Ok(Report::Comparison(report))) = &panel.state
+        {
+            panel.comparison.update(report, action);
         }
     }
 
