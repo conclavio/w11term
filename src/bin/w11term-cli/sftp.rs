@@ -16,7 +16,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY [--preserve-mtime]\n\
   put-dir LOCAL NEW_REMOTE_DIRECTORY [--preserve-times]\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
-  find ROOT [QUERY] [--regex] [--match-case] [--kind file|directory|symlink]\n\
+  find ROOT [QUERY] [--regex] [--match-case] [--match-path] [--kind file|directory|symlink]\n\
   sha256 PATH [--max-bytes N]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -27,6 +27,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   write --handle ID [--offset N] --base64 DATA\n\
   fstat --handle ID | fsetstat --handle ID [ATTRS] | fsync --handle ID\n\
 ATTRS: --size N --uid N --gid N --permissions OCTAL --atime UNIX_SECONDS --mtime UNIX_SECONDS\n\
+Find matches filenames by default. --match-path matches slash-separated paths relative to ROOT.\n\
 Underscore spellings (remove_file, remove_dir) are accepted. Use -- before paths starting with --.\n\
 Transfers stream through the GUI's existing SSH connection. Folder transfers require a new\n\
 destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
@@ -80,7 +81,7 @@ pub fn parse(
                 ensure!(!spec_order, "duplicate --spec-order");
                 spec_order = true;
             }
-            "--regex" | "--match-case" => {
+            "--regex" | "--match-case" | "--match-path" => {
                 ensure!(
                     opts.insert(arg.clone(), String::new()).is_none(),
                     "duplicate option {arg}"
@@ -244,10 +245,12 @@ pub fn parse(
                 .context("--kind must be file, directory, or symlink")?;
             let regex = opts.remove("--regex").is_some();
             let match_case = opts.remove("--match-case").is_some();
+            let match_path = opts.remove("--match-path").is_some();
             ensure!(
                 FilenameFilter {
                     regex,
                     match_case,
+                    match_path,
                     kind
                 }
                 .valid_query(&query),
@@ -256,6 +259,9 @@ pub fn parse(
             fields.insert("query".into(), json!(query));
             fields.insert("regex".into(), json!(regex));
             fields.insert("match_case".into(), json!(match_case));
+            if match_path {
+                fields.insert("match_path".into(), json!(true));
+            }
             if let Some(kind) = kind {
                 fields.insert("kind".into(), json!(kind));
             }
@@ -472,6 +478,7 @@ mod tests {
                         query,
                         regex: false,
                         match_case: false,
+                        match_path: false,
                         kind: None,
                     },
                 ..
@@ -516,6 +523,40 @@ mod tests {
         assert!(matches!(request, Request::Sftp {
             operation: Operation::Find { query, regex: false, .. }, ..
         } if query == "--regex"));
+    }
+
+    #[test]
+    fn find_match_path_is_a_boolean_flag_for_search_only() {
+        let (_, request) = p(&[
+            "find",
+            "--pane",
+            "2",
+            "/logs",
+            "^archive/.*",
+            "--match-path",
+            "--regex",
+        ])
+        .unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { query, match_path: true, regex: true, .. }, ..
+        } if query == "^archive/.*"));
+        assert!(p(&["ls", "--pane", "2", "/logs", "--match-path"]).is_err());
+        assert!(
+            p(&[
+                "find",
+                "--pane",
+                "2",
+                "/logs",
+                "x",
+                "--match-path",
+                "--match-path"
+            ])
+            .is_err()
+        );
+        let (_, request) = p(&["find", "--pane", "2", "--", "/logs", "--match-path"]).unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { query, match_path: false, .. }, ..
+        } if query == "--match-path"));
     }
 
     #[test]

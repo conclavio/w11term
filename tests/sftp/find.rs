@@ -9,6 +9,7 @@ fn search(path: &str, query: &str) -> Operation {
         query: query.into(),
         regex: false,
         match_case: false,
+        match_path: false,
         kind: None,
     }
 }
@@ -168,6 +169,7 @@ async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_be
         query: query.into(),
         regex,
         match_case,
+        match_path: false,
         kind: None,
     };
     let error = guarded_job(&pane, None, options("(", true, false))
@@ -207,6 +209,7 @@ async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_be
         Operation::Find {
             regex: false,
             match_case: false,
+            match_path: false,
             kind: None,
             ..
         }
@@ -239,6 +242,7 @@ async fn filename_type_limits_results_without_skipping_subdirectories() {
                     query: query.into(),
                     regex,
                     match_case: false,
+                    match_path: false,
                     kind: Some(kind),
                 },
             )
@@ -257,6 +261,101 @@ async fn filename_type_limits_results_without_skipping_subdirectories() {
                 .map(|hit| hit.name.as_str())
                 .collect::<Vec<_>>(),
             expected
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relative_path_matching_uses_the_canonical_search_root_and_full_components() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    for folder in [
+        "tree/Raw Logs/雪",
+        "tree/other/雪",
+        "tree/previous Raw Logs/雪",
+    ] {
+        fs::create_dir_all(root.join(folder)).unwrap();
+        fs::write(root.join(folder).join("report.txt"), b"fixture").unwrap();
+    }
+    fs::write(root.join("tree/root.txt"), []).unwrap();
+    fs::create_dir_all(root.join("canonical-parent/sub")).unwrap();
+    fs::write(root.join("canonical-parent/sub/report.txt"), []).unwrap();
+    for (root, query, regex, match_case, match_path, expected) in [
+        (
+            "/tree",
+            "^Raw Logs/雪/report\\.txt$",
+            true,
+            true,
+            true,
+            &["/tree/Raw Logs/雪"][..],
+        ),
+        (
+            "/tree",
+            "raw logs/雪/report",
+            false,
+            false,
+            true,
+            &["/tree/Raw Logs/雪", "/tree/previous Raw Logs/雪"][..],
+        ),
+        ("/tree", "raw logs/雪/report", false, true, true, &[][..]),
+        ("/tree", "^/Raw Logs/", true, true, true, &[][..]),
+        ("/tree", "Raw Logs/雪/report", false, true, false, &[][..]),
+        (
+            "/tree",
+            "^report\\.txt$",
+            true,
+            true,
+            false,
+            &[
+                "/tree/Raw Logs/雪",
+                "/tree/other/雪",
+                "/tree/previous Raw Logs/雪",
+            ][..],
+        ),
+        ("/tree", "^root\\.txt$", true, true, true, &["/tree"][..]),
+        (
+            "alias",
+            r"^sub/report\.txt$",
+            true,
+            true,
+            true,
+            &["/canonical-parent/sub"][..],
+        ),
+        (
+            "/",
+            "^tree/Raw Logs/雪/report\\.txt$",
+            true,
+            true,
+            true,
+            &["/tree/Raw Logs/雪"][..],
+        ),
+    ] {
+        let found: FilenameSearch = serde_json::from_value(
+            guarded_job(
+                &pane,
+                None,
+                Operation::Find {
+                    path: root.into(),
+                    query: query.into(),
+                    regex,
+                    match_case,
+                    match_path,
+                    kind: Some(EntryKind::File),
+                },
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            found
+                .matches
+                .iter()
+                .map(|hit| hit.parent.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{root} {query}"
         );
     }
     server.abort();

@@ -257,6 +257,8 @@ pub enum Operation {
         regex: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         match_case: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        match_path: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<EntryKind>,
     },
@@ -1149,6 +1151,7 @@ impl Engine {
                 query,
                 regex,
                 match_case,
+                match_path,
                 kind,
             } => serde_json::to_value(
                 self.find_filenames(
@@ -1157,6 +1160,7 @@ impl Engine {
                     FilenameFilter {
                         regex,
                         match_case,
+                        match_path,
                         kind,
                     },
                     cancel,

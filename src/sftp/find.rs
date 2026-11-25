@@ -19,6 +19,8 @@ pub fn valid_filename_query(query: &str) -> bool {
 pub struct FilenameFilter {
     pub regex: bool,
     pub match_case: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub match_path: bool,
     pub kind: Option<EntryKind>,
 }
 
@@ -80,12 +82,12 @@ impl FilenamePattern {
         })
     }
 
-    fn matches(&self, name: &str) -> bool {
+    fn matches(&self, candidate: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Literal(query) => name.contains(query),
-            Self::Folded(query) => name.to_lowercase().contains(query),
-            Self::Regex(regex) => regex.is_match(name),
+            Self::Literal(query) => candidate.contains(query),
+            Self::Folded(query) => candidate.to_lowercase().contains(query),
+            Self::Regex(regex) => regex.is_match(candidate),
         }
     }
 }
@@ -116,6 +118,7 @@ pub struct FilenameSearch {
 struct Search<'a> {
     engine: &'a Engine,
     pattern: FilenamePattern,
+    match_path: bool,
     kind: Option<EntryKind>,
     cancel: Option<&'a TransferCancel>,
     queued: VecDeque<(String, usize)>,
@@ -199,8 +202,16 @@ impl Search<'_> {
                         }
                     }
                     let kind = EntryKind::from_permissions(attrs.permissions);
+                    let candidate = if self.match_path {
+                        child
+                            .strip_prefix(self.result.root.trim_end_matches('/'))
+                            .and_then(|suffix| suffix.strip_prefix('/'))
+                            .context("SFTP search entry is outside the requested root")?
+                    } else {
+                        &name
+                    };
                     if self.kind.is_none_or(|want| Some(want) == kind)
-                        && self.pattern.matches(&name)
+                        && self.pattern.matches(candidate)
                         && self.matched.insert(child.clone())
                     {
                         self.result.matches.push(FilenameMatch {
@@ -246,6 +257,7 @@ impl Engine {
         let mut search = Search {
             engine: self,
             pattern,
+            match_path: filter.match_path,
             kind: filter.kind,
             cancel,
             queued: VecDeque::from([(root.clone(), 0)]),

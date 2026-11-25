@@ -42,6 +42,7 @@ pub enum Action {
 pub enum MatchOption {
     Regex(bool),
     MatchCase(bool),
+    MatchPath(bool),
     Kind(Option<EntryKind>),
 }
 
@@ -245,16 +246,25 @@ impl Panel {
                     },
                 )
             }));
+        let input_label = if self.filter.match_path {
+            "Relative path contains"
+        } else {
+            "Filename contains"
+        };
+        let prompt = match (self.filter.match_path, self.filter.regex) {
+            (true, true) => "Relative path regex",
+            (false, true) => "Filename regex",
+            (_, false) => input_label,
+        };
         let query = TextBox::new()
             .min_width(0.0)
-            .automation_name("Filename contains")
+            .automation_name(input_label)
             .automation_id(crate::input::file_search_tag(pane))
             .element_ref(&self.input)
-            .placeholder_text(match (self.filter.regex, self.filter.kind.is_some()) {
-                (true, true) => "Filename regex (optional)",
-                (true, false) => "Filename regex",
-                (false, true) => "Filename contains (optional)",
-                (false, false) => "Filename contains",
+            .placeholder_text(if self.filter.kind.is_some() {
+                format!("{prompt} (optional)")
+            } else {
+                prompt.into()
             })
             .is_enabled(ready)
             .text(&self.query)
@@ -305,11 +315,16 @@ impl Panel {
         rows.push(KeyedView::new(
             "options",
             StackPanel::new()
-                .orientation(Orientation::Horizontal)
+                .orientation(if layout.content_width() >= 280.0 {
+                    Orientation::Horizontal
+                } else {
+                    Orientation::Vertical
+                })
                 .spacing(8.0)
                 .children((
                     check("Regex", self.filter.regex, MatchOption::Regex),
                     check("Match case", self.filter.match_case, MatchOption::MatchCase),
+                    check("Match path", self.filter.match_path, MatchOption::MatchPath),
                 )),
         ));
         let run = if let Some(cancel) = running {
@@ -856,6 +871,7 @@ impl FileDrawer {
             query: panel.query.clone(),
             regex: panel.filter.regex,
             match_case: panel.filter.match_case,
+            match_path: panel.filter.match_path,
             kind: panel.filter.kind,
         };
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
@@ -1044,6 +1060,7 @@ impl FileDrawer {
                 match option {
                     MatchOption::Regex(enabled) => panel.filter.regex = enabled,
                     MatchOption::MatchCase(enabled) => panel.filter.match_case = enabled,
+                    MatchOption::MatchPath(enabled) => panel.filter.match_path = enabled,
                     MatchOption::Kind(kind) => panel.filter.kind = kind,
                 }
                 if panel.filter != previous {
@@ -1361,6 +1378,7 @@ mod tests {
                 filter: FilenameFilter {
                     regex: true,
                     match_case: true,
+                    match_path: false,
                     kind: Some(EntryKind::File),
                 },
                 sort: ResultSort::default(),

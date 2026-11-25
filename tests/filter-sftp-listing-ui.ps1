@@ -237,13 +237,17 @@ try {
     $off = [System.Windows.Automation.ToggleState]::Off
     (Wait-CheckBox 'Regex' $off).Toggle()
     (Wait-CheckBox 'Match case' $off).Toggle()
+    (Wait-CheckBox 'Match path' $off).Toggle()
     $null = Wait-CheckBox 'Regex' $on
     $null = Wait-CheckBox 'Match case' $on
+    $null = Wait-CheckBox 'Match path' $on
     $value = [System.Windows.Automation.ValuePattern]::Pattern
-    $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $field = Wait-Until 'relative path search field' {
+        Find-Element 'Relative path contains' ([System.Windows.Automation.ControlType]::Edit)
+    }
     $fileOnPageTwo = "$parent/nested/nested-content.txt"
     $newest = "$parent/build-37.log"
-    $largeFilesPattern = '^build-[0-9]+\.log$|^nested-content\.txt$'
+    $largeFilesPattern = '^build-[0-9]+\.log$|^nested/nested-content\.txt$'
     $field.GetCurrentPattern($value).SetValue($largeFilesPattern)
     Click 'Search'
     $null = Wait-Until 'folder-sorted recursive results span two pages' {
@@ -275,7 +279,8 @@ try {
         if ($data) {
             $entry = $data[0].searches.'Large build files'
             $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
-                $entry.filter.regex -and $entry.filter.match_case -and $entry.sort -ceq 'largest'
+                $entry.filter.regex -and $entry.filter.match_case -and $entry.filter.match_path -and
+                $entry.sort -ceq 'largest'
         }
     }
     Click 'Hide saved searches'
@@ -306,6 +311,7 @@ try {
     }
     $null = Wait-CheckBox 'Regex' $on
     $null = Wait-CheckBox 'Match case' $on
+    $null = Wait-CheckBox 'Match path' $on
     Click $savedSearchesButton
     Click 'Remove saved search'
     $null = Wait-Until 'removed preset disappears from picker and profile' {
@@ -314,15 +320,31 @@ try {
     }
     Click 'Hide saved searches'
     Set-SearchChoice 'Sort search results' 'Sort by folder'
-    $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    (Wait-CheckBox 'Match path' $on).Toggle()
+    $null = Wait-CheckBox 'Match path' $off
+    $field = Wait-Until 'filename search field restored' {
+        Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $field.GetCurrentPattern($value).SetValue('')
+    $null = Wait-Until 'cleared filename query disables Search' {
+        $search = Button 'Search'
+        $search -and !$search.Current.IsEnabled
+    }
     $field.GetCurrentPattern($value).SetValue('(')
     Click 'Search'
     $searchView = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $searchStatus = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-search-status')
-    $null = Wait-Until 'invalid filename regex reported' {
+    try {
+        $null = Wait-Until 'invalid filename regex reported' {
+            $status = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $searchStatus)
+            $status -and $status.Current.Name.Contains('Invalid filename regex')
+        }
+    } catch {
         $status = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $searchStatus)
-        $status -and $status.Current.Name.Contains('Invalid filename regex')
+        $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+        $query = if ($field) { $field.GetCurrentPattern($value).Current.Value }
+        throw "$_ Observed query '$query' and status '$($status.Current.Name)'."
     }
     $pattern = '^nested(?:-(?:added|content|renamed)\.txt)?$|^BUILD-00\.log$'
     $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)

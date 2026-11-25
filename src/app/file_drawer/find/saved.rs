@@ -108,7 +108,7 @@ impl List {
                 .find(|(sort, _)| *sort == search.sort)
                 .map_or("Sort by folder", |(_, label)| *label);
             let query = if search.query.is_empty() {
-                "Any filename".into()
+                "Any name".into()
             } else {
                 let mode = if search.filter.regex {
                     "Regex"
@@ -122,6 +122,11 @@ impl List {
                 };
                 format!("{mode} “{}” · {case}", search.query)
             };
+            let scope = if search.filter.match_path {
+                " · Relative path"
+            } else {
+                ""
+            };
             rows.push(KeyedView::new(
                 "root",
                 TextBlock::new()
@@ -131,7 +136,7 @@ impl List {
             rows.push(KeyedView::new(
                 "criteria",
                 TextBlock::new()
-                    .text(format!("{query} · {kind} · {sort}"))
+                    .text(format!("{query}{scope} · {kind} · {sort}"))
                     .text_wrapping(TextWrapping::Wrap),
             ));
             rows.push(KeyedView::new(

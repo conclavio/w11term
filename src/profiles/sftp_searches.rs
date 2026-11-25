@@ -186,10 +186,11 @@ mod tests {
     fn preset() -> SavedSftpSearch {
         SavedSftpSearch {
             root: "/srv/crew's 日本".into(),
-            query: r"^Report.+\.log$".into(),
+            query: r"^live/Report.+\.log$".into(),
             filter: FilenameFilter {
                 regex: true,
                 match_case: true,
+                match_path: true,
                 kind: Some(EntryKind::File),
             },
             sort: FilenameSort::Newest,
@@ -261,6 +262,21 @@ mod tests {
         let doc: Value = serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
         assert!(doc["profiles"]["renamed"].get(FIELD).is_none());
         assert_eq!(doc["profiles"]["renamed"]["custom"], 42);
+    }
+
+    #[test]
+    fn older_presets_default_to_filename_matching() {
+        let old: SavedSftpSearch = serde_json::from_value(json!({
+            "root": "/srv", "query": "report", "filter": { "regex": false, "match_case": true }
+        }))
+        .unwrap();
+        assert!(old.filter.match_case);
+        assert!(!old.filter.match_path);
+        assert!(
+            serde_json::to_value(old).unwrap()["filter"]
+                .get("match_path")
+                .is_none()
+        );
     }
 
     #[test]
