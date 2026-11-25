@@ -8,9 +8,12 @@ impl Engine {
         &self,
         from: &str,
         directory: &str,
+        destination_is_canonical: bool,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        let (folder, destination) = self.cross_folder_paths(from, directory, false).await?;
+        let (folder, destination) = self
+            .cross_folder_paths(from, directory, destination_is_canonical)
+            .await?;
         self.require_destination_directory(&folder).await?;
         self.require_new_name(&destination).await?;
         let before = self.copy_source_attributes(from).await?;

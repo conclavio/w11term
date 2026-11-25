@@ -6,6 +6,7 @@ fn copy() -> Operation {
     Operation::CopyEntry {
         from: "/original.bin".into(),
         directory: "/archive".into(),
+        destination_is_canonical: false,
     }
 }
 

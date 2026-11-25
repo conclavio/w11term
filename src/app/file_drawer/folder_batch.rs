@@ -8,6 +8,37 @@ pub(super) enum Origin {
     Search(u64),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Move,
+    Copy,
+}
+
+impl Kind {
+    pub(super) fn action(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::Copy => "copy",
+        }
+    }
+
+    pub(super) fn subject(self, count: usize) -> &'static str {
+        match (self, count) {
+            (Self::Move, 1) => "entry",
+            (Self::Move, _) => "entries",
+            (Self::Copy, 1) => "file",
+            (Self::Copy, _) => "files",
+        }
+    }
+
+    fn ongoing(self) -> &'static str {
+        match self {
+            Self::Move => "moving",
+            Self::Copy => "copying",
+        }
+    }
+}
+
 pub(super) struct ListingRefresh {
     pub(super) directory: String,
     pub(super) note: String,
@@ -15,6 +46,7 @@ pub(super) struct ListingRefresh {
 
 pub(super) struct Batch {
     id: u64,
+    kind: Kind,
     origin: Origin,
     destination: String,
     current: FilenameMatch,
@@ -24,16 +56,22 @@ pub(super) struct Batch {
     stop_requested: bool,
 }
 
-fn validate_sources(hits: &[FilenameMatch]) -> Result<()> {
-    ensure!(!hits.is_empty(), "Mark at least one search result");
+fn validate_sources(kind: Kind, hits: &[FilenameMatch]) -> Result<()> {
+    ensure!(!hits.is_empty(), "Mark at least one entry");
     let mut names = HashSet::new();
     let mut directories = HashSet::new();
     for hit in hits {
         let path = entry_path(&hit.parent, &hit.name)?;
-        ensure!(
-            matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
-            "Mark files or folders to move"
-        );
+        match kind {
+            Kind::Move => ensure!(
+                matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
+                "Mark files or folders to move"
+            ),
+            Kind::Copy => ensure!(
+                hit.kind == Some(EntryKind::File),
+                "Mark regular files to copy"
+            ),
+        }
         ensure!(
             names.insert(hit.name.as_str()),
             "Marked entries share the name {}. They need separate destinations.",
@@ -59,15 +97,17 @@ fn validate_sources(hits: &[FilenameMatch]) -> Result<()> {
 impl Batch {
     pub(super) fn new(
         id: u64,
+        kind: Kind,
         origin: Origin,
         hits: Vec<FilenameMatch>,
         destination: String,
     ) -> Result<Self> {
         let total = hits.len();
         let mut hits = hits.into_iter();
-        let current = hits.next().context("Mark at least one search result")?;
+        let current = hits.next().context("Mark at least one entry")?;
         Ok(Self {
             id,
+            kind,
             origin,
             destination,
             current,
@@ -88,16 +128,29 @@ impl Batch {
     fn completed(&self) -> String {
         let summary = self.summary();
         if self.stop_requested {
-            format!("{summary}. Stopped after the current move")
+            format!(
+                "{summary}. Stopped after the current {}",
+                self.kind.action()
+            )
         } else {
             summary
         }
     }
 
     fn summary(&self) -> String {
+        let verb = match self.kind {
+            Kind::Move => "Moved",
+            Kind::Copy => "Copied",
+        };
         format!(
-            "Moved {} of {} marked entries to {}",
-            self.confirmed, self.total, self.destination,
+            "{verb} {} of {} marked {} to {}",
+            self.confirmed,
+            self.total,
+            match self.kind {
+                Kind::Move => "entries",
+                Kind::Copy => self.kind.subject(self.total),
+            },
+            self.destination,
         )
     }
 
@@ -120,27 +173,35 @@ impl Batch {
             Ok(Err(error)) => format!("{}. {error}", self.summary()),
             Err(TryRecvError::Closed) => {
                 format!(
-                    "{}. SSH reconnected before the next move started.",
-                    self.summary()
+                    "{}. SSH reconnected before the next {} started.",
+                    self.summary(),
+                    self.kind.action()
                 )
             }
-            Err(TryRecvError::Empty) => format!(
-                "{}. SSH reconnected while moving {}. {MOVE_OUTCOME_UNKNOWN}.",
-                self.summary(),
-                self.current.name,
-            ),
+            Err(TryRecvError::Empty) => {
+                let advice = match self.kind {
+                    Kind::Move => MOVE_OUTCOME_UNKNOWN,
+                    Kind::Copy => "Copy outcome unknown; refresh the destination folder",
+                };
+                format!(
+                    "{}. SSH reconnected while {} {}. {advice}.",
+                    self.summary(),
+                    self.kind.ongoing(),
+                    self.current.name,
+                )
+            }
         }
     }
 }
 
 impl FileDrawer {
-    pub(super) fn stop_move_batch_button(
+    pub(super) fn stop_folder_batch_button(
         &self,
         pane: u64,
         origin: Origin,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
-        let Step::MoveBatch(batch) = &self.pending.as_ref()?.step else {
+        let Step::FolderBatch(batch) = &self.pending.as_ref()?.step else {
             return None;
         };
         if batch.origin != origin || (batch.remaining.is_empty() && !batch.stop_requested) {
@@ -151,22 +212,21 @@ impl FileDrawer {
         Some(
             Button::new()
                 .is_enabled(!batch.stop_requested)
-                .on_click(
-                    context.callback(move |_| {
-                        Message::Files(FileAction::StopMoves(pane, generation, id))
-                    }),
-                )
-                .content(if batch.stop_requested {
-                    "Stopping after current move…"
-                } else {
-                    "Stop after current move"
+                .on_click(context.callback(move |_| {
+                    Message::Files(FileAction::StopFolderBatch(pane, generation, id))
+                }))
+                .content(match (batch.kind, batch.stop_requested) {
+                    (Kind::Move, true) => "Stopping after current move…",
+                    (Kind::Move, false) => "Stop after current move",
+                    (Kind::Copy, true) => "Stopping after current copy…",
+                    (Kind::Copy, false) => "Stop after current copy",
                 }),
         )
     }
 
-    pub(super) fn stop_move_batch(&mut self, id: u64) {
+    pub(super) fn stop_folder_batch(&mut self, id: u64) {
         if let Some(Pending {
-            step: Step::MoveBatch(batch),
+            step: Step::FolderBatch(batch),
             ..
         }) = self.pending.as_mut()
             && batch.id == id
@@ -175,9 +235,12 @@ impl FileDrawer {
         }
     }
 
-    pub(super) fn marked_moves(&self, origin: Origin) -> Result<(String, Vec<FilenameMatch>)> {
+    pub(super) fn marked_folder_sources(
+        &self,
+        origin: Origin,
+    ) -> Result<(String, Vec<FilenameMatch>)> {
         match origin {
-            Origin::Search(serial) => self.marked_search_moves(serial),
+            Origin::Search(serial) => self.marked_search_sources(serial),
             Origin::Listing(revision) => {
                 ensure!(
                     self.open && self.listing_revision == revision,
@@ -204,16 +267,16 @@ impl FileDrawer {
         }
     }
 
-    pub(super) fn begin_marked_move(&mut self, origin: Origin) -> Result<()> {
+    pub(super) fn begin_folder_batch(&mut self, kind: Kind, origin: Origin) -> Result<()> {
         ensure!(!self.busy(), "Wait for the active SFTP operation to finish");
-        let (root, hits) = self.marked_moves(origin)?;
-        validate_sources(&hits)?;
+        let (root, hits) = self.marked_folder_sources(origin)?;
+        validate_sources(kind, &hits)?;
         self.end_filter_edit();
-        self.show_entry_dialog(Some(root), EditAction::MoveBatch(origin, hits));
+        self.show_entry_dialog(Some(root), EditAction::FolderBatch(kind, origin, hits));
         Ok(())
     }
 
-    pub(super) fn start_move_batch(
+    pub(super) fn start_folder_batch(
         &mut self,
         pane: u64,
         session: &Session,
@@ -221,34 +284,44 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         let from = entry_path(&batch.current.parent, &batch.current.name)?;
-        let operation = Operation::MoveEntry {
-            from: from.clone(),
-            directory: batch.destination.clone(),
-            kind: batch.current.kind,
-            destination_is_canonical: batch.confirmed != 0,
+        let destination_is_canonical = batch.confirmed != 0;
+        let operation = match batch.kind {
+            Kind::Move => Operation::MoveEntry {
+                from: from.clone(),
+                directory: batch.destination.clone(),
+                kind: batch.current.kind,
+                destination_is_canonical,
+            },
+            Kind::Copy => Operation::CopyEntry {
+                from: from.clone(),
+                directory: batch.destination.clone(),
+                destination_is_canonical,
+            },
+        };
+        let (activity, subject) = match batch.kind {
+            Kind::Move => ("Moving", "entry"),
+            Kind::Copy => ("Copying", "file"),
         };
         self.status = format!(
-            "Moving marked entry {} of {}…",
+            "{activity} marked {subject} {} of {}…",
             batch.confirmed + 1,
             batch.total,
         );
+        let summary = batch.summary();
+        let kind = batch.kind;
         let origin = batch.origin;
         let source = batch.current.parent.clone();
-        let summary = batch.summary();
-        if let Err(error) = self.job(pane, session, operation, Step::MoveBatch(batch), context) {
-            self.refresh_after_move_batch(
-                pane,
-                session,
-                origin,
-                source,
-                format!("{summary}. Could not start moving {from}. {error:#}"),
-                context,
+        if let Err(error) = self.job(pane, session, operation, Step::FolderBatch(batch), context) {
+            let note = format!(
+                "{summary}. Could not start {} {from}. {error:#}",
+                kind.ongoing()
             );
+            self.refresh_after_folder_batch(pane, session, (kind, origin), source, note, context);
         }
         Ok(())
     }
 
-    pub(super) fn finish_move_batch(
+    pub(super) fn finish_folder_batch(
         &mut self,
         pane: u64,
         session: &Session,
@@ -262,24 +335,37 @@ impl FileDrawer {
                     batch.destination = directory.into();
                 }
                 batch.confirmed += 1;
-                let change = EntryChange::Move {
-                    name: batch.current.name.clone(),
-                    directory: batch.destination.clone(),
-                };
-                match batch.origin {
-                    Origin::Search(serial) => {
-                        self.apply_search_change(serial, &batch.current, &change)?
+                match (batch.kind, batch.origin) {
+                    (Kind::Move, Origin::Search(serial)) => self.apply_search_change(
+                        serial,
+                        &batch.current,
+                        &EntryChange::Move {
+                            name: batch.current.name.clone(),
+                            directory: batch.destination.clone(),
+                        },
+                    )?,
+                    (Kind::Copy, Origin::Search(serial)) => self.apply_search_change(
+                        serial,
+                        &batch.current,
+                        &EntryChange::Copy {
+                            name: batch.current.name.clone(),
+                            directory: batch.destination.clone(),
+                            size: value["bytes_copied"].as_u64(),
+                        },
+                    )?,
+                    (Kind::Move, Origin::Listing(revision)) => {
+                        self.discard_moved_row(revision, &batch.current)
                     }
-                    Origin::Listing(revision) => self.discard_moved_row(revision, &batch.current),
+                    (Kind::Copy, Origin::Listing(_)) => {}
                 }
                 if let Some(next) = batch.remaining.pop_front() {
                     batch.current = next;
-                    return self.start_move_batch(pane, session, batch, context);
+                    return self.start_folder_batch(pane, session, batch, context);
                 }
                 batch.completed()
             }
             Err(error) => {
-                if error.contains(MOVE_OUTCOME_UNKNOWN) {
+                if batch.kind == Kind::Move && error.contains(MOVE_OUTCOME_UNKNOWN) {
                     match batch.origin {
                         Origin::Search(serial) => {
                             self.invalidate_search_entry(serial, &batch.current)?;
@@ -297,10 +383,10 @@ impl FileDrawer {
                 format!("{}. Stopped at {from}. {error}", batch.summary())
             }
         };
-        self.refresh_after_move_batch(
+        self.refresh_after_folder_batch(
             pane,
             session,
-            batch.origin,
+            (batch.kind, batch.origin),
             batch.current.parent,
             note,
             context,
@@ -338,18 +424,22 @@ impl FileDrawer {
         )
     }
 
-    fn refresh_after_move_batch(
+    fn refresh_after_folder_batch(
         &mut self,
         pane: u64,
         session: &Session,
-        origin: Origin,
+        batch: (Kind, Origin),
         source: String,
         note: String,
         context: &ComponentContext<TerminalApp>,
     ) {
-        let revision = match origin {
-            Origin::Listing(revision) => revision,
-            Origin::Search(serial) => {
+        let revision = match batch {
+            (Kind::Move, Origin::Listing(revision)) => revision,
+            (Kind::Copy, Origin::Listing(_)) => {
+                self.status = note;
+                return;
+            }
+            (_, Origin::Search(serial)) => {
                 self.refresh_changed_search(pane, session, serial, note, context);
                 return;
             }
@@ -420,8 +510,14 @@ mod tests {
             ..Default::default()
         };
         assert!(drawer.marked_entries().is_err()); // Not a Windows download name.
-        assert!(drawer.begin_marked_move(Origin::Listing(6)).is_err());
-        drawer.begin_marked_move(Origin::Listing(7)).unwrap();
+        assert!(
+            drawer
+                .begin_folder_batch(Kind::Move, Origin::Listing(6))
+                .is_err()
+        );
+        drawer
+            .begin_folder_batch(Kind::Move, Origin::Listing(7))
+            .unwrap();
         let review = drawer.dialog.as_mut().unwrap();
         let serial = review.serial;
         review.name = "/archive".into();
@@ -431,7 +527,9 @@ mod tests {
                 .finish_edit(serial, ContentDialogResult::Primary)
                 .is_err()
         );
-        drawer.begin_marked_move(Origin::Listing(7)).unwrap();
+        drawer
+            .begin_folder_batch(Kind::Move, Origin::Listing(7))
+            .unwrap();
         let review = drawer.dialog.as_mut().unwrap();
         let serial = review.serial;
         review.name = "/archive".into();
@@ -440,7 +538,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(review.action, EditAction::MoveBatch(_, hits) if hits.len() == 1 && hits[0].name == "CON")
+            matches!(review.action, EditAction::FolderBatch(Kind::Move, _, hits) if hits.len() == 1 && hits[0].name == "CON")
         );
     }
 
@@ -488,19 +586,40 @@ mod tests {
     fn reviews_reject_colliding_names_and_selected_descendants() {
         let directory = hit("/work", "assets", EntryKind::Directory);
         let unrelated = hit("/work/assets-old", "icon.svg", EntryKind::File);
-        assert!(validate_sources(&[directory.clone(), unrelated.clone()]).is_ok());
+        assert!(validate_sources(Kind::Move, &[directory.clone(), unrelated.clone()]).is_ok());
         let inside = hit("/work/assets/nested", "icon.svg", EntryKind::File);
         assert!(
-            validate_sources(&[inside.clone(), directory])
+            validate_sources(Kind::Move, &[inside.clone(), directory])
                 .unwrap_err()
                 .to_string()
                 .contains("/work/assets")
         );
         assert!(
-            validate_sources(&[unrelated, inside])
+            validate_sources(Kind::Move, &[unrelated, inside])
                 .unwrap_err()
                 .to_string()
                 .contains("share the name icon.svg")
+        );
+    }
+
+    #[test]
+    fn copy_review_rejects_folders_and_duplicate_basenames() {
+        let first = hit("/work", "report", EntryKind::File);
+        let other = hit("/work/subdir", "other", EntryKind::File);
+        assert!(validate_sources(Kind::Copy, &[first.clone(), other]).is_ok());
+        let same_name = hit("/work/subdir", "report", EntryKind::File);
+        assert!(
+            validate_sources(Kind::Copy, &[first.clone(), same_name])
+                .unwrap_err()
+                .to_string()
+                .contains("share the name report")
+        );
+        let directory = hit("/work", "archive", EntryKind::Directory);
+        assert!(
+            validate_sources(Kind::Copy, &[first, directory])
+                .unwrap_err()
+                .to_string()
+                .contains("Mark regular files")
         );
     }
 
@@ -510,7 +629,14 @@ mod tests {
             hit("/work", "one", EntryKind::File),
             hit("/work", "two", EntryKind::File),
         ];
-        let mut batch = Batch::new(5, Origin::Search(4), hits.clone(), "/target".into()).unwrap();
+        let mut batch = Batch::new(
+            5,
+            Kind::Move,
+            Origin::Search(4),
+            hits.clone(),
+            "/target".into(),
+        )
+        .unwrap();
         let (send, mut receive) = oneshot::channel();
         assert!(
             batch
@@ -523,7 +649,8 @@ mod tests {
             batch.reconnect_status(&mut receive),
             "Moved 1 of 2 marked entries to /canonical before SSH reconnected. Refresh to browse."
         );
-        let mut batch = Batch::new(5, Origin::Search(4), hits, "/target".into()).unwrap();
+        let mut batch =
+            Batch::new(5, Kind::Move, Origin::Search(4), hits, "/target".into()).unwrap();
         let (send, mut receive) = oneshot::channel();
         send.send(Err("Move was not started".into())).unwrap();
         assert_eq!(
@@ -538,6 +665,7 @@ mod tests {
         let second = hit("/work", "second", EntryKind::File);
         let mut batch = Batch::new(
             5,
+            Kind::Move,
             Origin::Search(4),
             vec![first.clone(), second],
             "/target".into(),
@@ -555,7 +683,14 @@ mod tests {
             "Moved 1 of 2 marked entries to /target. Stopped after the current move"
         );
 
-        let mut last = Batch::new(6, Origin::Listing(4), vec![first], "/target".into()).unwrap();
+        let mut last = Batch::new(
+            6,
+            Kind::Move,
+            Origin::Listing(4),
+            vec![first],
+            "/target".into(),
+        )
+        .unwrap();
         last.request_stop();
         assert!(!last.stop_requested);
     }

@@ -2973,7 +2973,7 @@ async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "copies regular files from the native listing and recursive search over one live SSH connection"]
+#[ignore = "copies single and marked regular files from the native listing and recursive search over one live SSH connection"]
 async fn native_sftp_copy_from_listing_and_search_keeps_both_originals() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
         unreachable!()
@@ -2983,16 +2983,37 @@ async fn native_sftp_copy_from_listing_and_search_keeps_both_originals() {
     fs::create_dir(root.join("sub")).unwrap();
     fs::write(root.join("copy-first.bin"), b"original\0file").unwrap();
     fs::write(root.join("sub/copy-nested.bin"), b"nested\0file").unwrap();
+    fs::write(root.join("batch-01.bin"), b"first").unwrap();
+    fs::write(root.join("batch-02.bin"), b"source").unwrap();
+    fs::write(root.join("batch-03.bin"), b"last").unwrap();
+    fs::write(root.join("archive/batch-02.bin"), b"existing").unwrap();
+    fs::write(root.join("archive/scan-copy-01.bin"), b"search first").unwrap();
+    fs::write(root.join("sub/scan-copy-02.bin"), b"search second").unwrap();
     let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("sftp-copy-ui.ps1", &ssh, state.path());
     for (path, expected) in [
         ("copy-first.bin", b"original\0file".as_slice()),
         ("archive/copy-first.bin", b"original\0file".as_slice()),
         ("sub/copy-nested.bin", b"nested\0file".as_slice()),
         ("copy-nested.bin", b"nested\0file".as_slice()),
+        ("batch-01.bin", b"first".as_slice()),
+        ("batch-02.bin", b"source".as_slice()),
+        ("batch-03.bin", b"last".as_slice()),
+        ("archive/batch-01.bin", b"first".as_slice()),
+        ("archive/batch-02.bin", b"existing".as_slice()),
+        ("archive/scan-copy-01.bin", b"search first".as_slice()),
+        ("sub/scan-copy-02.bin", b"search second".as_slice()),
+        ("scan-copy-01.bin", b"search first".as_slice()),
+        ("scan-copy-02.bin", b"search second".as_slice()),
     ] {
         assert_eq!(fs::read(root.join(path)).unwrap(), expected);
     }
+    assert!(!root.join("archive/batch-03.bin").exists());
     assert_eq!(opens.load(Ordering::Relaxed), 2);
     server.abort();
 }

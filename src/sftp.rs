@@ -365,6 +365,7 @@ pub enum Operation {
     CopyEntry {
         from: String,
         directory: String,
+        destination_is_canonical: bool,
     },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
@@ -1651,7 +1652,14 @@ impl Engine {
                 self.move_entry(from, directory, kind, destination_is_canonical, stage)
                     .await?
             }
-            CopyEntry { from, directory } => self.copy_entry(&from, &directory, stage).await?,
+            CopyEntry {
+                from,
+                directory,
+                destination_is_canonical,
+            } => {
+                self.copy_entry(&from, &directory, destination_is_canonical, stage)
+                    .await?
+            }
             RemoveEntry {
                 path,
                 kind,

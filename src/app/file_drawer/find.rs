@@ -35,7 +35,7 @@ pub enum Action {
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
     BulkMarks(u64, SelectionChange),
-    MoveMarked(u64),
+    StartFolderBatch(u64, FolderBatchKind),
     Reveal(u64, FilenameMatch),
     Rename(u64, FilenameMatch),
     Delete(u64, FilenameMatch),
@@ -668,8 +668,23 @@ impl Panel {
                     "move",
                     button(
                         "Move marked results…",
-                        Action::MoveMarked(serial),
+                        Action::StartFolderBatch(serial, FolderBatchKind::Move),
                         ready && !marked.is_empty(),
+                    ),
+                ));
+                actions.push(KeyedView::new(
+                    "copy",
+                    button(
+                        "Copy marked files…",
+                        Action::StartFolderBatch(serial, FolderBatchKind::Copy),
+                        ready
+                            && !marked.is_empty()
+                            && marked.iter().all(|&index| {
+                                result
+                                    .matches
+                                    .get(index)
+                                    .is_some_and(|hit| hit.kind == Some(EntryKind::File))
+                            }),
                     ),
                 ));
             }
@@ -720,8 +735,10 @@ impl Panel {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        if let Some(button) = files.stop_move_batch_button(pane, MoveOrigin::Search(serial), ctx) {
-            rows.push(KeyedView::new("stop-moves", button));
+        if let Some(button) =
+            files.stop_folder_batch_button(pane, FolderBatchOrigin::Search(serial), ctx)
+        {
+            rows.push(KeyedView::new("stop-batch", button));
         }
         if let Some(progress) = files.search_progress(serial) {
             let entries = if progress.scanned_entries == 1 {
@@ -1091,7 +1108,10 @@ impl FileDrawer {
             .search_download_selection(serial)
     }
 
-    pub(super) fn marked_search_moves(&self, serial: u64) -> Result<(String, Vec<FilenameMatch>)> {
+    pub(super) fn marked_search_sources(
+        &self,
+        serial: u64,
+    ) -> Result<(String, Vec<FilenameMatch>)> {
         ensure!(self.open, "Open the file drawer");
         let (result, hits) = self
             .search
@@ -1558,8 +1578,8 @@ impl FileDrawer {
             Action::BulkMarks(serial, change) if serial == panel.serial && !busy => {
                 panel.bulk_marks(change);
             }
-            Action::MoveMarked(serial) if !busy => {
-                self.begin_marked_move(MoveOrigin::Search(serial))?
+            Action::StartFolderBatch(serial, kind) if !busy => {
+                self.begin_folder_batch(kind, FolderBatchOrigin::Search(serial))?
             }
             Action::Rename(serial, hit) if !busy => self.begin_search_rename(serial, hit)?,
             Action::Delete(serial, hit) if !busy => self.begin_search_delete(serial, hit)?,
