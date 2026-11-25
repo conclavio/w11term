@@ -529,6 +529,11 @@ impl russh_sftp::server::Handler for Files {
                     .insert("lsetstat@openssh.com".into(), "1".into());
             }
         }
+        if self.root.join("fixture-space.json").is_file() {
+            version
+                .extensions
+                .insert("statvfs@openssh.com".into(), "2".into());
+        }
         Ok(version)
     }
     async fn extended(
@@ -549,6 +554,9 @@ impl russh_sftp::server::Handler for Files {
             }
             self.set_permissions("LSETSTAT", path, &attrs)?;
             return Ok(Packet::Status(status(id)));
+        }
+        if request == "statvfs@openssh.com" {
+            return self.fixture_statvfs(id, data);
         }
         if request == "copy-data" && self.root.join("fixture-copy-data").is_file() {
             self.trace_transfer("COPY-DATA")?;
@@ -1157,8 +1165,12 @@ mod cancellation;
 mod checksum;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
+#[path = "sftp/filesystem_space.rs"]
+mod filesystem_space;
 #[path = "sftp/find.rs"]
 mod find;
+#[path = "sftp/folder_contents.rs"]
+mod folder_contents;
 #[path = "sftp/in_band_resize.rs"]
 mod in_band_resize;
 #[cfg(feature = "ui-smoke")]
