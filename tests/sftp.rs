@@ -29,6 +29,22 @@ struct Peer {
     opens: Arc<AtomicUsize>,
     reject: bool,
 }
+
+fn set_fixture_modified(path: &std::path::Path, seconds: u64) -> std::time::SystemTime {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
+
+    let time = std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+    fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+    time
+}
+
 impl server::Handler for Peer {
     type Error = anyhow::Error;
     async fn auth_none(&mut self, _user: &str) -> anyhow::Result<server::Auth> {
@@ -741,6 +757,15 @@ impl russh_sftp::server::Handler for Files {
         if let Some(size) = attrs.size {
             self.file(&h)?.set_len(size).map_err(io)?;
         }
+        if let (Some(atime), Some(mtime)) = (attrs.atime, attrs.mtime) {
+            if self.root.join("deny-upload-times").is_file() {
+                return Err(StatusCode::PermissionDenied);
+            }
+            let times = fs::FileTimes::new()
+                .set_accessed(std::time::UNIX_EPOCH + Duration::from_secs(u64::from(atime)))
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(u64::from(mtime)));
+            self.file(&h)?.set_times(times).map_err(io)?;
+        }
         Ok(status(id))
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
@@ -1052,6 +1077,8 @@ async fn guarded_job(
 
 #[path = "sftp/cancellation.rs"]
 mod cancellation;
+#[path = "sftp/checksum.rs"]
+mod checksum;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
 #[path = "sftp/find.rs"]
@@ -1685,6 +1712,7 @@ async fn verified_download_checks_every_chunk_before_replacing_the_destination()
                     max_bytes: Some(data.len() as u64),
                     expected_sha256: Some(expected_sha256),
                     resume: false,
+                    preserve_mtime: false,
                 },
                 expected_generation: None,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(10),
@@ -1761,6 +1789,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         max_bytes: None,
         expected_sha256: None,
         resume: false,
+        preserve_mtime: false,
     };
     let hold = remote.path().join("hold-next-chunk");
     fs::write(&hold, []).unwrap();
@@ -1810,6 +1839,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         remote: "/upload".into(),
         overwrite: false,
         atomic: false,
+        preserve_times: false,
     };
     let fail = remote.path().join("fail-next-write");
     fs::write(&fail, []).unwrap();
@@ -1843,6 +1873,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
             remote: "/upload".into(),
             overwrite: true,
             atomic: false,
+            preserve_times: false,
         },
     );
     assert_eq!(response.await.unwrap().unwrap()["bytes_transferred"], size);
@@ -1863,6 +1894,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
             remote: "/dropped".into(),
             overwrite: false,
             atomic: false,
+            preserve_times: false,
         },
     );
     let error = response

@@ -2601,6 +2601,10 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let verified = b"verify the downloaded bytes\x00\xff";
     fs::write(parent.join("verified.bin"), verified).unwrap();
     fs::write(parent.join("z-later.bin"), b"later item").unwrap();
+    let verified_time = set_fixture_modified(&parent.join("verified.bin"), 1_000_000_010);
+    let snapshot_file_time =
+        set_fixture_modified(&source.join("data 雪/trace 例.bin"), 1_000_000_008);
+    let snapshot_root_time = set_fixture_modified(&source, 1_000_000_004);
     {
         use sha2::{Digest, Sha256};
         fs::write(
@@ -2632,6 +2636,13 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     assert_eq!(
         fs::read(state.path().join("accepted.bin")).unwrap(),
         verified
+    );
+    assert_eq!(
+        fs::metadata(state.path().join("accepted.bin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        verified_time
     );
     assert!(!state.path().join("rejected.bin").exists());
     assert_eq!(
@@ -2666,6 +2677,24 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     );
 
     let downloaded = received.join("snapshot");
+    assert_eq!(
+        fs::metadata(&downloaded).unwrap().modified().unwrap(),
+        snapshot_root_time
+    );
+    assert_eq!(
+        fs::metadata(downloaded.join("data 雪/trace 例.bin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        snapshot_file_time
+    );
+    assert_eq!(
+        fs::metadata(batch_received.join("verified.bin"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        verified_time
+    );
     assert_eq!(
         fs::read(downloaded.join(".manifest")).unwrap(),
         b"remote manifest\n"
@@ -2952,7 +2981,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     let parent = remote.path().join("shell directory");
     let child = parent.join("nested");
     fs::create_dir_all(&child).unwrap();
-    fs::write(child.join("inside.txt"), []).unwrap();
+    fs::write(child.join("nested-content.txt"), vec![b'f'; 70_000]).unwrap();
     let fillers = 38;
     for index in 0..fillers {
         fs::write(parent.join(format!("build-{index:02}.log")), []).unwrap();
@@ -2965,6 +2994,11 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     fs::write(&wire, []).unwrap();
 
     let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("filter-sftp-listing-ui.ps1", &ssh, state.path());
 
     let trace = fs::read_to_string(wire).unwrap();
@@ -2979,6 +3013,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     }
     // Each listing returns one entry per READDIR plus EOF. Filtering reads no
     // directory pages. Recursive search reads the root and its child once each.
+    // Direct file download keeps those results and the folder download lists its own tree.
     assert_eq!(
         listings,
         [
@@ -2987,6 +3022,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
             ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
         ]

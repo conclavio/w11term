@@ -9,9 +9,82 @@ async fn fetch(pane: &Session, remote: &str, local: &Path) -> Result<Value, Stri
         Operation::GetDir {
             remote: remote.into(),
             local: local.into(),
+            preserve_mtime: false,
         },
     )
     .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_mtime_is_opt_in_and_preserves_files_empty_folders_and_the_root() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let tree = remote.path().join("tree");
+    let file = tree.join("data/hello");
+    fs::create_dir_all(tree.join("data/empty")).unwrap();
+    fs::write(&file, b"downloaded data").unwrap();
+    let paths = ["data/hello", "data/empty", "data", ""];
+    let times = [1_000_000_006, 1_000_000_004, 1_000_000_002, 1_000_000_000];
+    let expected = std::array::from_fn::<_, 4, _>(|index| {
+        set_fixture_modified(&tree.join(paths[index]), times[index])
+    });
+    let destination = tempfile::tempdir().unwrap();
+
+    for (name, preserve_mtime) in [
+        ("default", false),
+        ("preserved", true),
+        ("unreported", true),
+    ] {
+        if name == "unreported" {
+            fs::write(remote.path().join("no-fstat"), []).unwrap();
+        }
+        let path = destination.path().join(name);
+        guarded_job(
+            &pane,
+            None,
+            Operation::Get {
+                remote: "/tree/data/hello".into(),
+                local: path.clone(),
+                overwrite: false,
+                max_bytes: None,
+                expected_sha256: None,
+                resume: false,
+                preserve_mtime,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"downloaded data");
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap() == expected[0],
+            name == "preserved"
+        );
+    }
+
+    // A server without FSTAT still provides the tree entries' times via LSTAT.
+    let path = destination.path().join("tree");
+    guarded_job(
+        &pane,
+        None,
+        Operation::GetDir {
+            remote: "/tree".into(),
+            local: path.clone(),
+            preserve_mtime: true,
+        },
+    )
+    .await
+    .unwrap();
+    for (entry, expected) in paths.into_iter().zip(expected) {
+        assert_eq!(
+            fs::metadata(path.join(entry)).unwrap().modified().unwrap(),
+            expected,
+            "{entry}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(path.join("data/hello:Zone.Identifier")).unwrap(),
+        "[ZoneTransfer]\r\nZoneId=3\r\n"
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

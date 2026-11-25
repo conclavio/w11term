@@ -11,9 +11,9 @@ use w11term::events::SavedDownload;
 use w11term::folder_grants::Authority;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
-    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferBatchProgress, TransferCancel,
-    TransferOperation, TransferOutcome, TransferPhase, TransferProgress, normalize_sha256,
-    validate_download_name,
+    DEFAULT_TIMEOUT, EntryKind, FilenameMatch, Job, Operation, TransferBatchProgress,
+    TransferCancel, TransferOperation, TransferOutcome, TransferPhase, TransferProgress,
+    normalize_sha256, validate_download_name,
 };
 
 mod bookmarks;
@@ -97,6 +97,8 @@ pub enum FileAction {
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     Preview(u64, u64, ListedEntry, PreviewKind),
     ClosePreview(u64, u64, u64),
+    CopyChecksum(u64, u64, u64),
+    VerifyChecksum(u64, u64, u64),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
@@ -109,7 +111,9 @@ pub enum FileAction {
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
     Replace(u64, u64, bool),
+    PreserveMtime(u64, u64, bool),
     AtomicUploads(u64, u64, bool),
+    PreserveUploadTimes(u64, u64, bool),
     Pick(u64, u64, u64, TransferPicker),
     Picked(u64, u64, u64, TransferPicker, Result<Vec<PathBuf>, String>),
     Drop(DropTarget, Vec<PathBuf>),
@@ -134,6 +138,7 @@ pub(super) struct FileDrawer {
     history: FolderHistory,
     bookmarks: Option<bookmarks::List>,
     search: Option<find::Panel>,
+    saved_search: Option<find::Panel>,
     /// Describes an explicit navigation request if either REALPATH or listing fails.
     opening_target: Option<String>,
     following: bool,
@@ -154,7 +159,9 @@ pub(super) struct FileDrawer {
     editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
+    preserve_mtime: bool,
     atomic_uploads: bool,
+    preserve_upload_times: bool,
     picking: Option<u64>,
     parsing: bool,
     pending: Option<Pending>,
@@ -217,6 +224,7 @@ pub enum TransferPicker {
     UploadFolder(String),
     Download(ListedEntry, Option<DownloadVerification>),
     DownloadMarked,
+    DownloadSearch(u64, FilenameMatch),
 }
 
 #[derive(Clone)]
@@ -240,14 +248,9 @@ impl TransferPicker {
                     Purpose::UploadFiles
                 })
             }
-            Self::Download(entry, _) => {
-                let remote = files.selected_path(entry)?;
-                if entry.kind == ListedKind::Known(EntryKind::Directory) {
-                    validate_download_name(&entry.name)?;
-                    Ok(Purpose::DownloadFolder)
-                } else {
-                    Ok(Purpose::Save(dialog_filename(&remote).into()))
-                }
+            Self::Download(entry, _) => files.selected_download_target(entry)?.purpose(),
+            Self::DownloadSearch(serial, hit) => {
+                files.search_download_target(*serial, hit)?.purpose()
             }
             Self::DownloadMarked => {
                 files.marked_entries()?;
@@ -924,32 +927,29 @@ impl FileDrawer {
         remote_child(&entry.parent, &entry.name)
     }
 
+    fn selected_download_target<'a>(
+        &self,
+        entry: &'a ListedEntry,
+    ) -> Result<downloads::DownloadTarget<'a>> {
+        Ok(downloads::DownloadTarget {
+            remote: self.selected_path(entry)?,
+            name: &entry.name,
+            directory: entry.kind == ListedKind::Known(EntryKind::Directory),
+        })
+    }
+
     fn download_operation(
         &self,
         entry: &ListedEntry,
         destination: PathBuf,
         verification: Option<DownloadVerification>,
     ) -> Result<(Operation, TransferFile)> {
-        let remote = self.selected_path(entry)?;
-        ensure!(
-            destination.is_absolute(),
-            "Choose an absolute download destination"
-        );
-        let directory = entry.kind == ListedKind::Known(EntryKind::Directory);
-        let local = if directory {
-            ensure!(verification.is_none(), "Choose a file to verify");
-            validate_download_name(&entry.name)?;
-            destination.join(&entry.name)
-        } else {
-            destination
-        };
-        Ok(downloads::download_to(
-            remote,
-            local,
-            directory,
+        self.selected_download_target(entry)?.operation(
+            destination,
             self.replace,
+            self.preserve_mtime,
             verification,
-        ))
+        )
     }
 
     fn prepare_folder_upload(
@@ -974,6 +974,7 @@ impl FileDrawer {
             Operation::PutDir {
                 local,
                 remote: remote.clone(),
+                preserve_times: self.preserve_upload_times,
             },
             TransferFile::UploadFolder { remote },
         ))
@@ -1100,6 +1101,17 @@ impl FileDrawer {
             self.end_filter_edit();
             self.show_entry_dialog(self.directory.clone(), EditAction::GoToFolder { revision });
         }
+    }
+
+    fn begin_verified_download(&mut self, entry: ListedEntry, digest: String) -> Result<()> {
+        ensure!(
+            entry.kind != ListedKind::Known(EntryKind::Directory),
+            "Choose a file to verify"
+        );
+        self.end_filter_edit();
+        self.begin_edit(entry.parent.clone(), EditAction::VerifyDownload(entry))?;
+        self.dialog.as_mut().unwrap().name = digest;
+        Ok(())
     }
 
     fn show_entry_dialog(&mut self, parent: Option<String>, action: EditAction) {
@@ -1279,6 +1291,7 @@ impl FileDrawer {
         self.open = false;
         self.marked_downloads = None;
         self.close_search();
+        self.saved_search = None;
         if self.preparing_drop.take().is_some() {
             self.status = "Cancelled before uploading any dropped items.".into();
         }
@@ -1314,6 +1327,17 @@ impl FileDrawer {
             Step::Transfer(file) => Some(file),
             _ => None,
         }
+    }
+
+    fn transfer_controls(&self, ctx: &ViewContext<TerminalApp>) -> Option<[View; 3]> {
+        let transfer = self.pending.as_ref()?.transfer.as_ref()?;
+        let id = transfer.id;
+        let (bar, bytes) = transfer_progress_views(*transfer.progress.borrow());
+        let cancel = Button::new()
+            .is_enabled(!transfer.cancel.is_cancelled())
+            .on_click(ctx.callback(move |_| Message::Files(FileAction::CancelTransfer(id))))
+            .content("Cancel transfer");
+        Some([bar, bytes, cancel])
     }
 
     pub(super) fn active_transfer(&self, generation: u64) -> Option<TransferView<'_>> {
@@ -1408,11 +1432,7 @@ impl FileDrawer {
                 .transfer_stamp()
                 .is_none_or(|(current, _)| current != id)
         {
-            let saved = self
-                .last_download
-                .as_ref()
-                .filter(|_| download && background)
-                .cloned();
+            let saved = self.last_download.as_ref().filter(|_| download).cloned();
             session
                 .events
                 .sftp_transfer_finished(id, outcome, &self.status, saved, background);
@@ -1462,6 +1482,8 @@ impl FileDrawer {
             open: self.open,
             following: self.following,
             sort_order: self.sort_order,
+            preserve_mtime: self.preserve_mtime,
+            preserve_upload_times: self.preserve_upload_times,
             dialog_serial: self.dialog_serial,
             editor,
             last_download,
@@ -1564,6 +1586,23 @@ impl FileDrawer {
             name: entry.map_or_else(String::new, |e| e.name.clone()),
             kind: entry.map_or(ListedKind::Missing, |e| e.kind),
         };
+        let find_files = button(
+            "Find files…",
+            writable && generation != 0,
+            Search(pane, generation, find::Action::Show(revision)),
+        );
+        let search_actions = if let Some(saved) = &self.saved_search {
+            StackPanel::new().spacing(6.0).children((
+                button(
+                    "Back to search results",
+                    writable && generation != 0,
+                    Search(pane, generation, find::Action::Restore(saved.serial)),
+                ),
+                find_files,
+            ))
+        } else {
+            find_files
+        };
         let mut controls: Vec<View> = vec![
             Grid::new()
                 .width(layout.content_width())
@@ -1591,11 +1630,7 @@ impl FileDrawer {
                         GoToFolder(pane, generation, revision),
                     )),
                 )),
-            button(
-                "Find files…",
-                writable && generation != 0,
-                Search(pane, generation, find::Action::Show(revision)),
-            ),
+            search_actions,
             StackPanel::new()
                 .orientation(if layout.content_width() >= 300.0 {
                     Orientation::Horizontal
@@ -1774,12 +1809,28 @@ impl FileDrawer {
                 )
                 .content(TextBlock::new().text("Replace existing files")),
             CheckBox::new()
+                .automation_name("Preserve modification times")
+                .is_enabled(ready)
+                .is_checked(self.preserve_mtime)
+                .on_is_checked_changed(context.callback(move |enabled| {
+                    Message::Files(PreserveMtime(pane, generation, enabled))
+                }))
+                .content(TextBlock::new().text("Preserve modification times")),
+            CheckBox::new()
                 .is_enabled(ready)
                 .is_checked(self.atomic_uploads)
                 .on_is_checked_changed(
                     context.callback(move |v| Message::Files(AtomicUploads(pane, generation, v))),
                 )
                 .content(TextBlock::new().text("Upload files atomically")),
+            CheckBox::new()
+                .automation_name("Preserve upload timestamps")
+                .is_enabled(ready)
+                .is_checked(self.preserve_upload_times)
+                .on_is_checked_changed(context.callback(move |enabled| {
+                    Message::Files(PreserveUploadTimes(pane, generation, enabled))
+                }))
+                .content(TextBlock::new().text("Preserve upload timestamps")),
         ];
         if let Some(editor) = &self.editor {
             controls.push(button(
@@ -1906,16 +1957,8 @@ impl FileDrawer {
                 SelectDownloads(pane, generation, revision, true),
             ));
         }
-        if let Some(pending) = &self.pending
-            && let Some(transfer) = &pending.transfer
-        {
-            let (bar, bytes) = transfer_progress_views(*transfer.progress.borrow());
-            controls.extend([bar, bytes]);
-            controls.push(button(
-                "Cancel transfer",
-                !transfer.cancel.is_cancelled(),
-                CancelTransfer(transfer.id),
-            ));
+        if let Some(transfer) = self.transfer_controls(context) {
+            controls.extend(transfer);
         }
         if let Some(preparation) = &self.preparing_drop {
             controls.push(button(
@@ -2675,6 +2718,8 @@ impl TerminalApp {
             | CopyPath(id, ..)
             | Preview(id, ..)
             | ClosePreview(id, ..)
+            | CopyChecksum(id, ..)
+            | VerifyChecksum(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
@@ -2687,7 +2732,9 @@ impl TerminalApp {
             | FinishEdit(id, ..)
             | Page(id, ..)
             | Replace(id, ..)
+            | PreserveMtime(id, ..)
             | AtomicUploads(id, ..)
+            | PreserveUploadTimes(id, ..)
             | Pick(id, ..)
             | Picked(id, ..)
             | Listed(id, ..)
@@ -2740,7 +2787,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2851,6 +2898,16 @@ impl TerminalApp {
                     outcome = TransferOutcome::Cancelled;
                 }
                 ClosePreview(_, _, serial) => files.close_preview(serial),
+                CopyChecksum(_, _, serial) => {
+                    if may_open_dialog {
+                        files.copy_checksum(serial);
+                    }
+                }
+                VerifyChecksum(_, _, serial) => {
+                    if may_open_dialog {
+                        files.verify_checksum(serial)?;
+                    }
+                }
                 StartTextEditor(_, generation, serial) => {
                     if may_open_dialog && files.generation == generation {
                         files.start_editor(serial);
@@ -2932,6 +2989,7 @@ impl TerminalApp {
                                 &parent,
                                 files.replace,
                                 files.atomic_uploads,
+                                files.preserve_upload_times,
                                 id,
                             )?;
                             files.transfer_next(pane, session, context)?;
@@ -2973,6 +3031,27 @@ impl TerminalApp {
                             files.queue = files.download_queue(&parent, id)?;
                             files.marked_downloads = None;
                             files.transfer_next(pane, session, context)?;
+                        }
+                        TransferPicker::DownloadSearch(search, hit) => {
+                            ensure!(!files.busy(), "Another SFTP operation is active");
+                            let [local] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one download destination"))?;
+                            let target = files.search_download_target(search, &hit)?;
+                            let (operation, transfer) = target.operation(
+                                local,
+                                files.replace,
+                                files.preserve_mtime,
+                                None,
+                            )?;
+                            files.status = format!("Downloading {}…", hit.name);
+                            files.job(
+                                pane,
+                                session,
+                                operation,
+                                Step::Transfer(transfer),
+                                context,
+                            )?;
                         }
                     }
                 }
@@ -3076,9 +3155,11 @@ impl TerminalApp {
                         }
                     }
                 }
-                _ if files.busy() || !files.open => {}
                 Preview(_, _, entry, kind) => {
-                    if may_open_dialog {
+                    if may_open_dialog
+                        && files.open
+                        && (!files.busy() || matches!(kind, PreviewKind::Checksum(_)))
+                    {
                         let (serial, operation) = files.begin_preview(entry, kind)?;
                         if let Err(error) =
                             files.job(pane, session, operation, Step::Preview(serial), context)
@@ -3087,6 +3168,7 @@ impl TerminalApp {
                         }
                     }
                 }
+                _ if files.busy() || !files.open => {}
                 EditFilter(_, _, revision, enabled) => {
                     if enabled && files.directory.is_some() && may_open_dialog {
                         if !files.filter_editing() {
@@ -3163,12 +3245,7 @@ impl TerminalApp {
                     if !may_open_dialog {
                         return Ok(());
                     }
-                    ensure!(
-                        entry.kind != ListedKind::Known(EntryKind::Directory),
-                        "Choose a file to verify"
-                    );
-                    files.end_filter_edit();
-                    files.begin_edit(entry.parent.clone(), EditAction::VerifyDownload(entry))?;
+                    files.begin_verified_download(entry, String::new())?;
                 }
                 Delete(_, _, entry) if may_open_dialog => {
                     files.check_selected(&entry)?;
@@ -3244,7 +3321,9 @@ impl TerminalApp {
                     files.set_page(page);
                 }
                 Replace(_, _, replace) => files.replace = replace,
+                PreserveMtime(_, _, enabled) => files.preserve_mtime = enabled,
                 AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,
+                PreserveUploadTimes(_, _, enabled) => files.preserve_upload_times = enabled,
                 Drop(target, paths) => {
                     if drop_allowed {
                         files.classify_drop(target, paths, session, context);
@@ -3261,7 +3340,10 @@ impl TerminalApp {
                 }
                 Pick(_, _, revision, picker) => {
                     if !may_open_dialog
-                        || (matches!(picker, TransferPicker::DownloadMarked) && files.busy())
+                        || (matches!(
+                            picker,
+                            TransferPicker::DownloadMarked | TransferPicker::DownloadSearch(..)
+                        ) && files.busy())
                         || revision != files.listing_revision
                         || files.bookmarks.is_some()
                     {
@@ -4459,6 +4541,7 @@ mod tests {
             "/",
             false,
             false,
+            false,
             id,
         )
         .unwrap();
@@ -4605,7 +4688,7 @@ mod tests {
             .unwrap();
         assert_eq!(request_generation(&operation, 7), Some(7));
         assert!(
-            matches!(operation, Operation::PutDir { local: source, remote }
+            matches!(operation, Operation::PutDir { local: source, remote, .. }
             if source == local && remote == "/srv/logs/run 4 [雪]")
         );
         assert_eq!(drawer.status, "Uploading folder /srv/logs/run 4 [雪]…");
@@ -4699,7 +4782,7 @@ mod tests {
         let (op, status) = drawer
             .download_operation(&entry, destination.clone(), None)
             .unwrap();
-        assert!(matches!(op, Operation::GetDir {remote, local}
+        assert!(matches!(op, Operation::GetDir {remote, local, ..}
             if remote == "/srv/report files" && local == destination.join("report files")));
         assert_eq!(
             status.outcome(&json!({"bytes_transferred":6,"files":2,"skipped":3})),
@@ -4778,6 +4861,7 @@ mod tests {
                 vec![r"C:\queued".into()],
                 "/old",
                 true,
+                false,
                 false,
                 TransferId {
                     pane: 1,

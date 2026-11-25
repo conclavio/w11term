@@ -31,6 +31,7 @@ fn download(local: &Path) -> Operation {
         max_bytes: None,
         expected_sha256: None,
         resume: false,
+        preserve_mtime: false,
     }
 }
 
@@ -42,6 +43,7 @@ fn verified_resume(local: &Path, digest: String) -> Operation {
         max_bytes: None,
         expected_sha256: Some(digest),
         resume: true,
+        preserve_mtime: true,
     }
 }
 
@@ -63,6 +65,7 @@ async fn resumable_download_uses_the_checkpoint_after_a_new_ssh_connection() {
         .map(|index| (index % 241) as u8)
         .collect();
     fs::write(remote.path().join("source"), &data).unwrap();
+    let modified = set_fixture_modified(&remote.path().join("source"), 1_100_000_000);
     let parent = tempfile::tempdir().unwrap();
     let local = parent.path().join("saved.bin");
     fs::write(&local, b"existing").unwrap();
@@ -102,6 +105,7 @@ async fn resumable_download_uses_the_checkpoint_after_a_new_ssh_connection() {
     assert_eq!(result["resumed_from"], CHUNK);
     assert_eq!(result["bytes_transferred"], data.len());
     assert_eq!(fs::read(&local).unwrap(), data);
+    assert_eq!(fs::metadata(&local).unwrap().modified().unwrap(), modified);
     assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
     let log = fs::read_to_string(log).unwrap();
     assert_eq!(
@@ -156,6 +160,7 @@ fn upload(local: &Path) -> Operation {
         remote: "/destination".into(),
         overwrite: true,
         atomic: false,
+        preserve_times: false,
     }
 }
 
@@ -165,6 +170,7 @@ fn atomic_upload(local: &Path, remote: &str, overwrite: bool) -> Operation {
         remote: remote.into(),
         overwrite,
         atomic: true,
+        preserve_times: false,
     }
 }
 
@@ -260,6 +266,7 @@ async fn folder_download_timeout_removes_staging_and_publication_refuses_a_racin
             .send(Command::Sftp(Job {
                 expected_generation: Some(pane.frames.load().connection_generation),
                 operation: Operation::GetDir {
+                    preserve_mtime: false,
                     remote: "/bundle".into(),
                     local: local.clone(),
                 },
@@ -334,6 +341,7 @@ async fn cancelled_before_admission_never_opens_a_channel_or_changes_either_file
         Operation::PutDir {
             local: local.path().into(),
             remote: "/new tree".into(),
+            preserve_times: false,
         },
     ] {
         let reply = start(&pane, operation, &cancel).await.unwrap().unwrap();

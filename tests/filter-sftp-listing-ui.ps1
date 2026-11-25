@@ -3,10 +3,19 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $verifyClipboard = $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted'
-if ($verifyClipboard) { . (Join-Path $PSScriptRoot 'support/clipboard.ps1') }
+if ($verifyClipboard) {
+    . (Join-Path $PSScriptRoot 'support/clipboard.ps1')
+} else {
+    $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'copied-path.txt'
+}
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$picker = Join-Path $State 'picker'
+$env:W11TERM_SFTP_PICKER_SMOKE_DIR = $picker
+$null = New-Item -ItemType Directory -Path (Join-Path $picker 'received')
+$readGate = Join-Path ([IO.File]::ReadAllText((Join-Path $State 'fixture-root'))) 'hold-transfer-read'
 $profiles = Join-Path $State 'profiles.json'
 $parent = '/shell directory'
 # Windows PowerShell 5.1 also reads this fixture on non-UTF-8 code pages.
@@ -42,6 +51,12 @@ function Check-PathCopy([string]$ButtonName, [string]$Expected) {
         $null = Wait-Until "exact clipboard path from '$ButtonName'" {
             [FixtureClipboard]::ContainsNewText($before, $Expected)
         }
+    } else {
+        [IO.File]::Delete($env:W11TERM_TEST_COPY_FILE)
+        Invoke-Button $control
+        $null = Wait-Until "exact fixture clipboard text from '$ButtonName'" {
+            (Read-ClipboardFixture) -ceq $Expected
+        }
     }
 }
 function Filter-Value {
@@ -58,6 +73,14 @@ function Open-Filter {
 }
 function Set-Filter([string]$Text) {
     (Open-Filter).GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
+}
+function Save-SearchResult([string]$Result, [string]$Destination) {
+    Click $Result
+    $dialog = Wait-Until 'owned download save dialog from the result' { Find-OwnedDialog 'Save As' }
+    $null = Wait-Until 'enter download destination' {
+        [FixtureDialog]::SetFilename($dialog, $Destination, 'nested-content.txt')
+    }
+    $null = Wait-Until 'accept download destination' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -130,7 +153,7 @@ try {
     Click 'nested/'
     Click 'Open folder'
     $null = Wait-Until 'child directory begins unfiltered' {
-        (Find-Element "$parent/nested") -and (Button 'inside.txt') -and !(Button 'Open folder').Current.IsEnabled
+        (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and !(Button 'Open folder').Current.IsEnabled
     }
     Check-PathCopy 'Copy directory path' "$parent/nested"
     $null = Open-Filter
@@ -142,17 +165,73 @@ try {
     $field = Wait-Until 'recursive filename search field' {
         Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('INSIDE.TXT')
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('NESTED')
     Click 'Search'
-    Click "Reveal $parent/nested/inside.txt"
+    $fileResult = "Download $parent/nested/nested-content.txt"
+    $destination = Join-Path $picker 'from-search.txt'
+    [IO.File]::WriteAllBytes($readGate, [byte[]]@())
+    Save-SearchResult $fileResult $destination
+    $null = Wait-Until 'search panel shows active download progress' {
+        (Find-Element '32768 / 70000 bytes') -and (Button 'Cancel transfer').Current.IsEnabled
+    }
+    Click 'Cancel transfer'
+    $null = Wait-Until 'search panel shows cancellation in progress' {
+        $cancel = Button 'Cancel transfer'
+        $cancel -and !$cancel.Current.IsEnabled
+    }
+    [IO.File]::Delete($readGate)
+    $null = Wait-Until 'cancelled search download keeps results and leaves no destination' {
+        !(Button 'Cancel transfer') -and ![IO.File]::Exists($destination) -and
+            (Button $fileResult).Current.IsEnabled
+    }
+    Save-SearchResult $fileResult $destination
+    $contents = 'f' * 70000
+    $null = Wait-Until 'file downloaded with search results still shown' {
+        [IO.File]::Exists($destination) -and
+            [IO.File]::ReadAllText($destination) -ceq $contents -and
+            (Button "Reveal $parent/nested/nested-content.txt") -and (Button $fileResult).Current.IsEnabled
+    }
+    Click "Download $parent/nested"
+    $dialog = Wait-Until 'owned folder picker from the result' {
+        Find-OwnedDialog 'Choose a download destination folder'
+    }
+    Select-DialogItem $dialog 'received'
+    $null = Wait-Until 'accept the folder download destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $folderItem = Join-Path $picker 'received/nested/nested-content.txt'
+    $null = Wait-Until 'folder downloaded with search results still shown' {
+        [IO.File]::Exists($folderItem) -and
+            [IO.File]::ReadAllText($folderItem) -ceq $contents -and
+            (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled
+    }
+    Click "Reveal $parent/nested/nested-content.txt"
     $null = Wait-Until 'search result shown and selected in its containing folder' {
-        (Find-Element "$parent/nested") -and (Button 'inside.txt') -and (Button $download).Current.IsEnabled
+        (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
+    }
+    Click 'Back to search results'
+    $field = Wait-Until 'original search restored with both matches' {
+        $edit = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+        if ($edit -and (Button "Reveal $parent/nested") -and (Button "Reveal $parent/nested/nested-content.txt")) {
+            $edit
+        }
+    }
+    if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'NESTED') {
+        throw 'Returning to results changed the search query'
+    }
+    Check-PathCopy "Copy path $parent/nested/nested-content.txt" "$parent/nested/nested-content.txt"
+    Check-PathCopy 'Copy all paths' "$parent/nested`r`n$parent/nested/nested-content.txt"
+    $null = Wait-Until 'result summary and copy confirmation share the panel' {
+        (Find-Element '2 matches in 2 folders') -and (Find-Element 'Copied 2 paths')
+    }
+    Click 'Back to files'
+    $null = Wait-Until 'listing remains at the revealed file after leaving the results' {
+        (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','filter-ssh-ready')
 } finally {
+    [IO.File]::Delete($readGate)
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

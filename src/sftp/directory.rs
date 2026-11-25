@@ -3,10 +3,12 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeSet;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use windows::{
+    Win32::Foundation::GENERIC_READ,
     Win32::Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, MOVE_FILE_FLAGS, MoveFileExW,
+        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES,
+        MOVE_FILE_FLAGS, MoveFileExW,
     },
     core::HSTRING,
 };
@@ -62,8 +64,22 @@ impl PartialEq for WindowsName {
 
 // Open the directory itself and deny delete sharing while we use its children.
 pub(super) fn pin_directory(path: &Path, sharing: FILE_SHARE_MODE) -> Result<std::fs::File> {
+    pin_directory_for_download(path, sharing, false)
+}
+
+fn pin_directory_for_download(
+    path: &Path,
+    sharing: FILE_SHARE_MODE,
+    write_mtime: bool,
+) -> Result<std::fs::File> {
+    let access = GENERIC_READ.0
+        | if write_mtime {
+            FILE_WRITE_ATTRIBUTES.0
+        } else {
+            0
+        };
     let dir = std::fs::OpenOptions::new()
-        .read(true)
+        .access_mode(access)
         .share_mode(sharing.0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
         .open(path)?;
@@ -137,6 +153,7 @@ struct Download<'a> {
     engine: &'a Engine,
     progress: Option<&'a watch::Sender<TransferProgress>>,
     cancel: Option<&'a TransferCancel>,
+    preserve_mtime: bool,
     count: TreeCount,
 }
 
@@ -161,12 +178,13 @@ impl Download<'_> {
         if self.cancelled() {
             return Ok(());
         }
-        let _pin = pin_directory(local, FILE_SHARE_READ)?;
+        let pin = pin_directory_for_download(local, FILE_SHARE_READ, self.preserve_mtime)?;
         let attrs = self.engine.raw.lstat(remote).await?.attrs;
         ensure!(
             EntryKind::from_permissions(attrs.permissions) == Some(EntryKind::Directory),
             "expected a real remote directory: {remote}"
         );
+        let mtime = attrs.mtime.filter(|_| self.preserve_mtime);
         if self.cancelled() {
             return Ok(());
         }
@@ -241,7 +259,7 @@ impl Download<'_> {
                                 attrs.size.zip(entry.attrs.size).is_none_or(|(a, b)| a == b),
                                 "remote file size changed since directory listing: {child}"
                             );
-                            self.file(&child, &path, attrs.size.or(entry.attrs.size))
+                            self.file(&child, &path, attrs.size.or(entry.attrs.size), attrs.mtime)
                                 .await?;
                         }
                         0 => bail!("server omitted the file type from LSTAT"),
@@ -255,10 +273,19 @@ impl Download<'_> {
         let closed = self.engine.raw.close(h).await;
         work?;
         closed?;
+        if !self.cancelled() {
+            set_download_mtime(&pin, mtime)?;
+        }
         Ok(())
     }
 
-    async fn file(&mut self, remote: &str, local: &Path, listed_size: Option<u64>) -> Result<()> {
+    async fn file(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        listed_size: Option<u64>,
+        listed_mtime: Option<u32>,
+    ) -> Result<()> {
         self.check_path(remote).await?;
         if self.cancelled() {
             return Ok(());
@@ -292,7 +319,11 @@ impl Download<'_> {
                     "remote file type changed after open: {remote}"
                 );
             }
-            let size = opened.and_then(|attrs| attrs.size);
+            let size = opened.as_ref().and_then(|attrs| attrs.size);
+            let mtime = opened
+                .and_then(|attrs| attrs.mtime)
+                .or(listed_mtime)
+                .filter(|_| self.preserve_mtime);
             ensure!(
                 listed_size.zip(size).is_none_or(|(a, b)| a == b),
                 "remote file size changed before download: {remote}"
@@ -326,10 +357,19 @@ impl Download<'_> {
                     );
                 }
                 file.sync_all().await?;
-                drop(file);
                 let staged = local.to_path_buf();
-                tokio::task::spawn_blocking(move || super::apply_mark_of_the_web(&staged))
-                    .await??;
+                let file = file.into_std().await;
+                tokio::task::spawn_blocking(move || {
+                    if mtime.is_some() {
+                        // NTFS streams share timestamps. Stamp the staged handle after the mark.
+                        super::apply_mark_of_the_web(&staged)?;
+                        set_download_mtime(&file, mtime)
+                    } else {
+                        drop(file);
+                        super::apply_mark_of_the_web(&staged)
+                    }
+                })
+                .await??;
                 self.count.files += 1;
             }
             Ok::<(), anyhow::Error>(())
@@ -361,15 +401,19 @@ impl Engine {
         &self,
         remote: String,
         local: PathBuf,
+        preserve_mtime: bool,
         progress: Option<&watch::Sender<TransferProgress>>,
         cancel: Option<&TransferCancel>,
-        staging: &mut Option<tempfile::TempDir>,
-        deadline: Instant,
+        stage: &mut JobStage,
     ) -> Result<Value> {
+        let JobStage::DirectoryDownload { staging, deadline } = stage else {
+            unreachable!("directory job stage");
+        };
         let mut download = Download {
             engine: self,
             progress,
             cancel,
+            preserve_mtime,
             count: TreeCount::default(),
         };
         ensure!(local.is_absolute(), "local path must be absolute");
@@ -425,7 +469,7 @@ impl Engine {
         // Keep the no-replace commit in this future; an expired/disconnected job
         // must never leave a detached blocking task that publishes it later.
         ensure!(
-            Instant::now() < deadline,
+            Instant::now() < *deadline,
             "folder download expired before publication"
         );
         publish(stage, &destination)?;

@@ -92,6 +92,7 @@ impl Prepared {
                     max_bytes: None,
                     expected_sha256: None,
                     resume: false,
+                    preserve_mtime: false,
                 }
             }
         }

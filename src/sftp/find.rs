@@ -11,10 +11,12 @@ pub fn valid_filename_query(query: &str) -> bool {
     query.len() <= 256 && !query.trim().is_empty() && !query.chars().any(char::is_control)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FilenameMatch {
     pub parent: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EntryKind>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -99,14 +101,6 @@ impl Search<'_> {
                         continue;
                     }
                     let child = format!("{prefix}/{name}");
-                    if name.to_lowercase().contains(&self.query)
-                        && self.matched.insert(child.clone())
-                    {
-                        self.result.matches.push(FilenameMatch {
-                            parent: path.to_owned(),
-                            name,
-                        });
-                    }
                     // READDIR may omit the type. Resolve it without following links.
                     let mode = match entry.attrs.permissions {
                         Some(mode) if mode & 0o170000 != 0 => Some(mode),
@@ -116,9 +110,17 @@ impl Search<'_> {
                             Err(_) => None,
                         },
                     };
-                    if EntryKind::from_permissions(mode) == Some(EntryKind::Directory)
-                        && !self.directories.contains(&child)
+                    let kind = EntryKind::from_permissions(mode);
+                    if name.to_lowercase().contains(&self.query)
+                        && self.matched.insert(child.clone())
                     {
+                        self.result.matches.push(FilenameMatch {
+                            parent: path.to_owned(),
+                            name,
+                            kind,
+                        });
+                    }
+                    if kind == Some(EntryKind::Directory) && !self.directories.contains(&child) {
                         if depth == MAX_DEPTH || self.directories.len() == MAX_DIRECTORIES {
                             self.result.truncated = true;
                         } else {

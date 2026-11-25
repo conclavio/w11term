@@ -3,8 +3,14 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
+$verifyClipboard = $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted'
+if ($verifyClipboard) { . (Join-Path $PSScriptRoot 'support/clipboard.ps1') }
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$picker = Join-Path $State 'picker'
+$env:W11TERM_SFTP_PICKER_SMOKE_DIR = $picker
+$null = New-Item -ItemType Directory -Path $picker
 $profiles = Join-Path $State 'profiles.json'
 $fixture = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $button = [System.Windows.Automation.ControlType]::Button
@@ -33,6 +39,10 @@ function Open-Properties([string[]]$Expected) {
     $value = $null
     if ($field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$value) -and !$value.Current.IsReadOnly) { throw 'Properties exposed writable file metadata' }
     if (Find-Element 'Edit' $button) { throw 'Properties offered Edit' }
+    $checksum = Find-Element 'Calculate SHA-256' $button
+    if ([bool]$checksum -ne ($Expected -contains 'Type  Regular file')) {
+        throw 'The SHA-256 action must be available only for confirmed regular files'
+    }
     Click 'Close properties'
     $null = Wait-Until 'properties dialog dismissed' { !(Find-Element 'Close properties' $button) }
 }
@@ -43,6 +53,28 @@ function Shell-Pid([string]$Tag) {
     $pattern = "$Tag=([0-9]+)"
     $reply = Control @('wait-for-text','--pane',"$localPane",'--regex','--timeout','15',$pattern)
     return [int]([regex]::Match($reply.text,$pattern).Groups[1].Value)
+}
+function Download-WithChecksum([string]$Destination, [string]$Expected) {
+    Click 'Use for verified download'
+    $field = Wait-Until 'prefilled expected SHA-256' { Find-Element 'Expected SHA-256' }
+    if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne $Expected) {
+        throw 'Verified download did not reuse the calculated digest'
+    }
+    (Wait-CheckBox 'Resume interrupted download' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox 'Resume interrupted download' ([System.Windows.Automation.ToggleState]::On)
+    Click 'Choose destination'
+    $dialog = Wait-Until 'owned verified download save picker' { Find-OwnedDialog 'Save As' }
+    $null = Wait-Until 'enter verified download destination' {
+        [FixtureDialog]::SetFilename($dialog, $Destination, $filename)
+    }
+    $null = Wait-Until 'accept verified download destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+function Wait-TransferOutcome([string]$Outcome, [string]$Message) {
+    $null = Wait-Until "transfer result $Outcome" {
+        $events = (Control @('events','--pane',"$remote",'--since','0','--timeout','0')).journal.events
+        $events | Where-Object { $_.kind -ceq 'sftp-transfer' -and
+            $_.data.outcome -ceq $Outcome -and $_.data.message -like "*$Message*" }
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
@@ -83,6 +115,49 @@ try {
     Open-Properties @("Path  $parent/telemetry-link",'Type  Symbolic link',("Link target  ../archive/" + [char]0x822a + "/$snow"))
     Click 'sparse-meta'
     Open-Properties @("Path  $parent/sparse-meta",'Type  Not reported','Size  Not reported','Modified  Not reported','Accessed  Not reported','Permissions  Not reported','Owner UID  Not reported','Group GID  Not reported')
+    if ([IO.File]::ReadAllText((Join-Path $fixture 'transfer-trace')).Length -ne 0) {
+        throw 'Viewing properties opened a file before requesting its checksum'
+    }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $expectedDigest = -join ($hasher.ComputeHash([IO.File]::ReadAllBytes($disk)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $hasher.Dispose() }
+    Click $filename
+    Click $properties
+    Click 'Calculate SHA-256'
+    $digestField = Wait-Until 'selectable SHA-256 digest in the dialog' {
+        $b = Find-Element 'SHA-256 digest'
+        if ($b -and $b.Current.AutomationId -eq 'sftp-checksum-text') { $b }
+    }
+    $digestText = $digestField.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1).Trim()
+    if ($digestText -cne $expectedDigest) { throw 'The checksum dialog displayed the wrong digest' }
+    if ($verifyClipboard) {
+        $before = [FixtureClipboard]::GetClipboardSequenceNumber()
+        Click 'Copy SHA-256'
+        $null = Wait-Until 'exact SHA-256 digest copied' {
+            [FixtureClipboard]::ContainsNewText($before, $expectedDigest)
+        }
+    } elseif (!(Find-Element 'Copy SHA-256' $button)) {
+        throw 'The checksum dialog lacked a copy action'
+    }
+    $downloaded = Join-Path $picker 'verified.bin'
+    Download-WithChecksum $downloaded $expectedDigest
+    Wait-TransferOutcome 'completed' 'SHA-256 verified'
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($downloaded)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($disk))) {
+        throw 'The locally published file did not match the bytes hashed'
+    }
+    $sha = Control @('sftp','--pane',"$remote",'sha256',"$parent/$filename",'--max-bytes','57')
+    if ($sha.sftp.sha256 -cne $expectedDigest -or $sha.sftp.bytes -ne 57) {
+        throw 'The CLI returned an unexpected checksum or byte count'
+    }
+    Click $properties
+    Click 'Calculate SHA-256'
+    $null = Wait-Until 'digest available before the server file changes' { Find-Element 'SHA-256 digest' }
+    [IO.File]::WriteAllBytes($disk,[byte[]](1..57))
+    $rejected = Join-Path $picker 'changed.bin'
+    Download-WithChecksum $rejected $expectedDigest
+    Wait-TransferOutcome 'failed' 'SHA-256 mismatch'
+    if ([IO.File]::Exists($rejected)) { throw 'A changed remote file was installed locally' }
     $actions = Find-Element 'SFTP actions'
     $close = [System.Windows.Automation.AndCondition]::new(
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Close'),
@@ -101,7 +176,9 @@ try {
     Wait-Focus $localPane
     if ((Shell-Pid 'properties-after') -ne $pidBefore) { throw 'Properties interrupted the neighboring PowerShell' }
 } catch {
-    throw "$($_.Exception.Message) at $($_.ScriptStackTrace)"
+    $packets = [IO.File]::ReadAllText((Join-Path $fixture 'transfer-trace'))
+    $metadata = [IO.File]::ReadAllText((Join-Path $fixture 'properties-trace'))
+    throw "$($_.Exception.Message) at $($_.ScriptStackTrace). Transfer packets: $packets Metadata packets: $metadata"
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

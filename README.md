@@ -391,9 +391,13 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 Choose **Select downloads…**, mark files or folders, and use **Download marked** to select one destination folder. Marks stay selected while you change pages, sort, or filter the listing. Files and folders keep their remote names. An existing destination, transfer error, or cancellation stops the batch and keeps items already saved.
 
+Enable **Preserve modification times** in the SFTP drawer to keep the server’s reported modification times on downloaded files and folders. This covers search results, batches, and verified or resumed downloads. Entries without a reported time keep their local write time. Scripts can select the same behavior with `--preserve-mtime`. [SFTP control commands](CONTROL.md#run-sftp-operations)
+
 If a drawer transfer finishes while another pane is active or the drawer is closed, the **Attention inbox** gets one result for the transfer or batch. Select the result to open the originating pane’s SFTP drawer.
 
 Open **SFTP transfers** from the caret menu or command palette to see active drawer uploads and downloads across the current window. The tab shows the current item and byte progress for each transfer. Cancel a transfer from the list or use **Open SFTP drawer** to visit its pane.
+
+**Recent transfers** keeps the last 20 results from open panes in that window, newest first. Each result shows its outcome and the original transfer message. Downloads with saved items offer an Explorer action for the saved file or folder.
 
 Scripts can list, cancel, and wait for drawer transfers with `w11term-cli sftp list-transfers`, `cancel-transfer`, and `wait-transfer`. [SFTP control commands](CONTROL.md#control-drawer-transfers)
 
@@ -402,6 +406,8 @@ After a file or folder is saved, choose **Show download in File Explorer** in th
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
 Choose **Properties…** on a file, folder or symbolic link to read its current metadata. The dialog shows the remote path, entry type, size in bytes, octal permissions, numeric owner and group, and modification and access times in UTC. Unreported fields are marked **Not reported**. For a symbolic link, the dialog shows the link’s own attributes and asks the server for its target path. This also works for a dangling link.
+
+In a regular file’s properties, choose **Calculate SHA-256** and then **Copy SHA-256**. w11term reads the file over the existing SFTP channel and hashes it locally without saving a copy. Close the calculation to cancel. The digest describes the bytes read and covers the whole file. Reported size or modification-time changes during the read cause an error. Choose **Use for verified download** to prefill that digest and optionally enable **Resume interrupted download** before choosing a destination.
 
 Choose **Edit** in the preview to change the text. **Save** replaces the original file. **Save as…** creates a sibling file under a new name. Editing preserves the UTF-8 byte order mark and the line endings on unchanged lines. Each pane keeps one in-memory draft when you close its editor. Use **Resume draft** in the drawer to return to it or **Discard draft…** to remove it. After an SSH reconnect, copy any edits you need, discard the old draft, and reopen the remote file to edit against its current contents. Closing the pane ends its draft.
 
@@ -428,6 +434,8 @@ must be available. The drawer counts skipped junctions and other reparse
 points and shows confirmed progress. If you cancel or disconnect after the
 remote folder is created, inspect the partial tree at the reported path.
 
+Enable **Preserve upload timestamps** to keep the Windows access and modification times of uploaded regular files. This applies to folder contents, Explorer drops, and atomic file uploads. Scripts can use `--preserve-times`. The SFTP server must accept both timestamps. [SFTP file attributes](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-5)
+
 An Explorer drop keeps the item order supplied by Windows. **Replace existing
 files** applies to individual files in that batch. Each dropped folder needs a
 new remote name. Dropping a junction or another reparse point as a top-level
@@ -449,7 +457,11 @@ Enable **Upload files atomically** before selecting or dropping regular files to
 
 Choose **Filter filenames…** and type part of a name to search the entire directory listing, including later pages. Matching ignores case and treats punctuation literally. Filtering uses the listing already in memory. **Done** returns keyboard input to the terminal and keeps the results visible. **Clear filter** brings back all entries. Refresh keeps your filter in the current directory, and opening another directory starts with its full listing.
 
-Choose **Find files…** to search the displayed directory and its subdirectories by filename. Matching is case-insensitive and literal. Select a result to open its containing folder with the entry selected. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. **Cancel search** keeps the matches already collected.
+Choose **Find files…** to search the displayed directory and its subdirectories by filename. Matching is case-insensitive and literal. Select a result to open its containing folder with the entry selected, or use **Download…** or **Download folder…** beside a regular file or folder. Direct downloads use the drawer’s destination and overwrite rules, show cancellable progress, and keep the search results in place. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. **Cancel search** keeps the matches already collected.
+
+After revealing a match, choose **Back to search results** to return to the same query and results page without rescanning. **Find files…** starts a new search from the current folder. Closing the drawer or reconnecting ends the saved search.
+
+Choose **Copy path** beside a search result for its absolute remote path, or **Copy all paths** for one path per line from every retained results page. Paths are plain text and keep their spaces, Unicode, and literal names. Copy paths containing line breaks individually.
 
 Under **Sort by**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
 

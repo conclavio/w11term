@@ -2,6 +2,53 @@ use super::*;
 use std::path::Path;
 use w11term::sftp::validate_download_names;
 
+pub(super) struct DownloadTarget<'a> {
+    pub(super) remote: String,
+    pub(super) name: &'a str,
+    pub(super) directory: bool,
+}
+
+impl DownloadTarget<'_> {
+    pub(super) fn purpose(&self) -> Result<file_picker::Purpose> {
+        if self.directory {
+            validate_download_name(self.name)?;
+            Ok(file_picker::Purpose::DownloadFolder)
+        } else {
+            Ok(file_picker::Purpose::Save(
+                dialog_filename(&self.remote).into(),
+            ))
+        }
+    }
+
+    pub(super) fn operation(
+        self,
+        destination: PathBuf,
+        overwrite: bool,
+        preserve_mtime: bool,
+        verification: Option<DownloadVerification>,
+    ) -> Result<(Operation, TransferFile)> {
+        ensure!(
+            destination.is_absolute(),
+            "Choose an absolute download destination"
+        );
+        let local = if self.directory {
+            ensure!(verification.is_none(), "Choose a file to verify");
+            validate_download_name(self.name)?;
+            destination.join(self.name)
+        } else {
+            destination
+        };
+        Ok(download_to(
+            self.remote,
+            local,
+            self.directory,
+            overwrite,
+            preserve_mtime,
+            verification,
+        ))
+    }
+}
+
 impl Entry {
     pub(super) fn can_mark_for_download(&self) -> bool {
         supports_batch_download(self.kind)
@@ -66,6 +113,7 @@ impl FileDrawer {
                     parent.join(&entry.name),
                     entry.kind == ListedKind::Known(EntryKind::Directory),
                     false,
+                    self.preserve_mtime,
                     None,
                 ))
             })
@@ -85,6 +133,7 @@ pub(super) fn download_to(
     local: PathBuf,
     directory: bool,
     overwrite: bool,
+    preserve_mtime: bool,
     verification: Option<DownloadVerification>,
 ) -> (Operation, TransferFile) {
     if directory {
@@ -92,6 +141,7 @@ pub(super) fn download_to(
             Operation::GetDir {
                 remote: remote.clone(),
                 local: local.clone(),
+                preserve_mtime,
             },
             TransferFile::DownloadFolder { remote, local },
         )
@@ -105,6 +155,7 @@ pub(super) fn download_to(
                 max_bytes: None,
                 expected_sha256: verification.map(|options| options.sha256),
                 resume,
+                preserve_mtime,
             },
             TransferFile::Download {
                 remote,
@@ -163,7 +214,7 @@ mod tests {
         assert!(queue.batch_id == Some(id));
         let mut work = queue.remaining.into_iter().map(|(operation, _)| operation);
         assert!(
-            matches!(work.next(), Some(Operation::GetDir { remote, local })
+            matches!(work.next(), Some(Operation::GetDir { remote, local, .. })
             if remote == "/logs/folder" && local == Path::new(r"C:\download\folder"))
         );
         assert!(
@@ -199,6 +250,7 @@ mod tests {
         let (_, item) = download_to(
             "/logs/second".into(),
             PathBuf::from(r"C:\downloads\second"),
+            false,
             false,
             false,
             None,

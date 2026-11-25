@@ -165,6 +165,8 @@ try {
     [IO.File]::Delete($readGate)
     Wait-Status '^Cancelled download of /shell directory/interrupted\b'
 
+    (Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::On)
     Download-To 'snapshot' 'receive here'
     Wait-Status '^Downloaded /shell directory/snapshot\b.*2 files, 23 bytes'
     Assert-Explorer 'Show download in File Explorer' 'select' (Join-Path $State 'picker/receive here/snapshot')
@@ -252,6 +254,8 @@ try {
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','folder-download-live')
     Click 'Attention inbox, 0 unread'
     Assert-Explorer "Open download folder for palette-ssh, notice $($events[0].sequence)" 'explore' (Join-Path $State 'picker/batch background')
+    Run-Palette 'SFTP transfers'
+    Assert-Explorer "Open download folder for transfer $($results[1].data.transfer_id)" 'explore' (Join-Path $State 'picker/batch background conflict')
 } catch {
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
     throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"

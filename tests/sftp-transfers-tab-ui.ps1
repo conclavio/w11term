@@ -148,6 +148,14 @@ try {
         $cancelled[0].data.message -notmatch 'Cancelled download.*0 of 2 items completed') {
         throw 'The pane journal did not report the cancelled batch by ID'
     }
+    $null = Wait-Until 'cancelled result shown below the active transfer' {
+        (Find-Element 'Recent transfers' $text) -and
+            (Find-Element "Cancelled$dot$($cancelled[0].data.message)" $text) -and
+            (Find-Element $betaCancel $button)
+    }
+    if (Find-Element "Open download folder for transfer $firstId" $button) {
+        throw 'A cancelled batch without saved items offered an Explorer action in history'
+    }
     if (!$waiting.WaitForExit(15000)) { throw 'The named-pipe waiter did not return' }
     $waitReply = [IO.File]::ReadAllText($waitPath) | ConvertFrom-Json
     if ($waiting.ExitCode -ne 0 -or !$waitReply.ok -or
@@ -172,7 +180,12 @@ try {
         throw 'A late waiter did not receive the retained foreground result'
     }
     Run-Palette 'SFTP transfers'
-    $null = Wait-Until 'completed transfers leave the tab' { Find-Element $empty $text }
+    $null = Wait-Until 'no active transfers and both results remain' {
+        (Find-Element $empty $text) -and
+            (Find-Element "Completed$dot$($finished.data.message)" $text) -and
+            (Find-Element "Cancelled$dot$($cancelled[0].data.message)" $text) -and
+            (Find-Element "Show download in File Explorer for transfer $secondId" $button)
+    }
     if (@((Control @('sftp','list-transfers')).transfers).Count -ne 0) {
         throw 'The control pipe still lists an ended transfer'
     }

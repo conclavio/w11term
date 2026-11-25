@@ -17,7 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -37,6 +37,7 @@ mod find;
 pub use find::{FilenameMatch, FilenameSearch, valid_filename_query};
 mod resume_download;
 use resume_download::ResumeDownload;
+mod checksum;
 mod text_preview;
 mod transfer_status;
 pub use transfer_status::{
@@ -73,6 +74,15 @@ struct DownloadChecks {
     max_bytes: Option<u64>,
     sha256: Option<String>,
     resume: bool,
+    preserve_mtime: bool,
+}
+
+fn set_download_mtime(file: &std::fs::File, mtime: Option<u32>) -> Result<()> {
+    if let Some(seconds) = mtime {
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(u64::from(seconds)))
+            .context("preserving the remote modification time")?;
+    }
+    Ok(())
 }
 
 enum DownloadStaging {
@@ -89,11 +99,18 @@ impl DownloadStaging {
         reply
     }
 
-    fn publish(self, file: std::fs::File, destination: PathBuf, overwrite: bool) -> Result<()> {
+    fn publish(
+        self,
+        file: std::fs::File,
+        destination: PathBuf,
+        overwrite: bool,
+        mtime: Option<u32>,
+    ) -> Result<()> {
         match self {
             Self::Temporary(temp) => {
                 drop(file);
                 apply_mark_of_the_web(temp.path())?;
+                set_download_mtime(temp.as_file(), mtime)?;
                 if overwrite {
                     temp.persist(destination)
                 } else {
@@ -101,7 +118,10 @@ impl DownloadStaging {
                 }?;
                 Ok(())
             }
-            Self::Resumable(partial) => partial.publish(file, overwrite),
+            Self::Resumable(partial) => {
+                set_download_mtime(&file, mtime)?;
+                partial.publish(file, overwrite)
+            }
         }
     }
 }
@@ -110,10 +130,32 @@ impl DownloadStaging {
 struct UploadOptions {
     overwrite: bool,
     atomic: bool,
+    preserve_times: bool,
+}
+
+fn upload_times(
+    metadata: &std::fs::Metadata,
+    preserve_times: bool,
+) -> Result<Option<FileAttributes>> {
+    if !preserve_times {
+        return Ok(None);
+    }
+    let seconds = |time: std::time::SystemTime| -> Result<u32> {
+        Ok(time.duration_since(UNIX_EPOCH)?.as_secs().try_into()?)
+    };
+    let atime = seconds(metadata.accessed()?).context("SFTP cannot represent the access time")?;
+    let mtime =
+        seconds(metadata.modified()?).context("SFTP cannot represent the modification time")?;
+    Ok(Some(FileAttributes {
+        atime: Some(atime),
+        mtime: Some(mtime),
+        ..FileAttributes::empty()
+    }))
 }
 
 /// Directory entry types the drawer can delete with the SFTP v3 primitives.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EntryKind {
     File,
     Directory,
@@ -153,14 +195,25 @@ pub enum Operation {
         expected_sha256: Option<String>,
         #[serde(default)]
         resume: bool,
+        #[serde(default)]
+        preserve_mtime: bool,
+    },
+    Sha256 {
+        path: String,
+        #[serde(default)]
+        max_bytes: Option<u64>,
     },
     GetDir {
         remote: String,
         local: PathBuf,
+        #[serde(default)]
+        preserve_mtime: bool,
     },
     PutDir {
         local: PathBuf,
         remote: String,
+        #[serde(default)]
+        preserve_times: bool,
     },
     /// The source was chosen by a native Explorer drop on this connection.
     #[serde(skip)]
@@ -169,6 +222,7 @@ pub enum Operation {
         remote: String,
         overwrite: bool,
         atomic: bool,
+        preserve_times: bool,
     },
     /// A file selected once for several generation-bound native uploads.
     #[serde(skip)]
@@ -183,6 +237,8 @@ pub enum Operation {
         overwrite: bool,
         #[serde(default)]
         atomic: bool,
+        #[serde(default)]
+        preserve_times: bool,
     },
     Ls {
         path: String,
@@ -585,15 +641,14 @@ pub(crate) async fn run(
         if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
             continue;
         }
-        if matches!(
-            operation,
-            Operation::PreviewText { .. } | Operation::EntryProperties { .. }
-        ) && cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+            && let Some(message) = match operation {
+                Operation::PreviewText { .. } => Some("Text preview cancelled"),
+                Operation::EntryProperties { .. } => Some("File properties cancelled"),
+                Operation::Sha256 { .. } => Some("SHA-256 calculation cancelled"),
+                _ => None,
+            }
         {
-            let message = match operation {
-                Operation::EntryProperties { .. } => "File properties cancelled",
-                _ => "Text preview cancelled",
-            };
             let _ = reply.send(Err(message.into()));
             continue;
         }
@@ -616,7 +671,7 @@ pub(crate) async fn run(
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
-            && let Operation::PutDir { local, remote } = &operation
+            && let Operation::PutDir { local, remote, .. } = &operation
         {
             let state = upload_directory::UploadState::new(remote.clone(), deadline);
             let _ = reply.send(Ok(state.cancelled(local)));
@@ -625,7 +680,7 @@ pub(crate) async fn run(
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
             && let Operation::Put { local, remote, .. }
             | Operation::Get { local, remote, .. }
-            | Operation::GetDir { local, remote } = &operation
+            | Operation::GetDir { local, remote, .. } = &operation
         {
             let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
             continue;
@@ -676,6 +731,9 @@ pub(crate) async fn run(
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::Get { resume: true, .. } => JobStage::ResumableDownload,
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
+                Operation::Sha256 { .. } => {
+                    JobStage::Checking("SHA-256 calculation did not finish")
+                }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
                 Operation::GetDir { .. } => JobStage::DirectoryDownload {
                     staging: None,
@@ -932,6 +990,7 @@ impl Engine {
                 max_bytes,
                 expected_sha256,
                 resume,
+                preserve_mtime,
             } => {
                 self.get(
                     remote,
@@ -944,20 +1003,26 @@ impl Engine {
                             .map(normalize_sha256)
                             .transpose()?,
                         resume,
+                        preserve_mtime,
                     },
                     progress,
                     cancel,
                 )
                 .await?
             }
-            GetDir { remote, local } => {
-                let JobStage::DirectoryDownload { staging, deadline } = stage else {
-                    unreachable!("directory job stage")
-                };
-                self.get_dir(remote, local, progress, cancel, staging, *deadline)
+            GetDir {
+                remote,
+                local,
+                preserve_mtime,
+            } => {
+                self.get_dir(remote, local, preserve_mtime, progress, cancel, stage)
                     .await?
             }
-            PutDir { local, .. } => {
+            PutDir {
+                local,
+                preserve_times,
+                ..
+            } => {
                 let JobStage::DirectoryUpload(state) = stage else {
                     unreachable!("directory upload job stage");
                 };
@@ -966,13 +1031,15 @@ impl Engine {
                     Ok::<_, anyhow::Error>((local, dir))
                 })
                 .await??;
-                self.put_directory(source, progress, cancel, state).await?
+                self.put_directory(source, preserve_times, progress, cancel, state)
+                    .await?
             }
             PutDrop {
                 source,
                 remote,
                 overwrite,
                 atomic,
+                preserve_times,
             } => {
                 let (local, checked) =
                     tokio::task::spawn_blocking(move || source.open_confirmed(overwrite)).await??;
@@ -981,7 +1048,7 @@ impl Engine {
                         upload_directory::Source::Directory(dir),
                         JobStage::DirectoryUpload(state),
                     ) => {
-                        self.put_directory((local, dir), progress, cancel, state)
+                        self.put_directory((local, dir), preserve_times, progress, cancel, state)
                             .await?
                     }
                     (
@@ -991,7 +1058,11 @@ impl Engine {
                         self.put(
                             (local, tokio::fs::File::from_std(file)),
                             remote,
-                            UploadOptions { overwrite, atomic },
+                            UploadOptions {
+                                overwrite,
+                                atomic,
+                                preserve_times,
+                            },
                             progress,
                             cancel,
                             stage,
@@ -1016,6 +1087,7 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            Sha256 { path, max_bytes } => self.remote_sha256(&path, max_bytes, cancel).await?,
             Find { path, query } => {
                 serde_json::to_value(self.find_filenames(&path, &query, cancel).await?)?
             }
@@ -1048,6 +1120,7 @@ impl Engine {
                 remote,
                 overwrite,
                 atomic,
+                preserve_times,
             } => {
                 if cancel.is_some_and(TransferCancel::is_cancelled) {
                     return Ok(cancelled_transfer(&local, &remote, 0, false));
@@ -1059,7 +1132,11 @@ impl Engine {
                 self.put(
                     (local, source),
                     remote,
-                    UploadOptions { overwrite, atomic },
+                    UploadOptions {
+                        overwrite,
+                        atomic,
+                        preserve_times,
+                    },
                     progress,
                     cancel,
                     stage,
@@ -1435,15 +1512,16 @@ impl Engine {
             .handle;
         let copied = async {
             // Some servers omit size or disallow FSTAT on readable files.
-            let total = if progress.is_some() && !cancelled() {
+            let attrs = if (progress.is_some() || checks.preserve_mtime) && !cancelled() {
                 match self.raw.fstat(&h).await {
-                    Ok(reply) => reply.attrs.size,
+                    Ok(reply) => reply.attrs,
                     Err(error) if transport_error(&error) => return Err(error.into()),
-                    Err(_) => None,
+                    Err(_) => FileAttributes::empty(),
                 }
             } else {
-                None
+                FileAttributes::empty()
             };
+            let total = attrs.size;
             report(progress, resumed_from, total);
             let offset = self
                 .read_contents(
@@ -1464,11 +1542,11 @@ impl Engine {
             if !cancelled() {
                 file.sync_all().await?;
             }
-            Ok::<u64, anyhow::Error>(offset)
+            Ok::<_, anyhow::Error>((offset, attrs.mtime.filter(|_| checks.preserve_mtime)))
         }
         .await;
         let closed = self.raw.close(h).await;
-        let bytes = copied?;
+        let (bytes, mtime) = copied?;
         closed?;
         if cancelled() {
             return Ok(staging.cancelled_reply(&local, &remote, bytes));
@@ -1498,7 +1576,7 @@ impl Engine {
             if cancel.as_ref().is_some_and(TransferCancel::is_cancelled) {
                 return Ok(false);
             }
-            staging.publish(file, destination, overwrite)?;
+            staging.publish(file, destination, overwrite, mtime)?;
             Ok(true)
         })
         .await??;
@@ -1525,14 +1603,7 @@ impl Engine {
     ) -> Result<Value> {
         if options.atomic {
             return self
-                .put_atomic(
-                    (local, file),
-                    remote,
-                    options.overwrite,
-                    progress,
-                    cancel,
-                    stage,
-                )
+                .put_atomic((local, file), remote, options, progress, cancel, stage)
                 .await;
         }
         let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
@@ -1541,6 +1612,7 @@ impl Engine {
         }
         let metadata = file.metadata().await?;
         ensure!(metadata.is_file(), "local source must be a regular file");
+        let times = upload_times(&metadata, options.preserve_times)?;
         let total = Some(metadata.len());
         report(progress, 0, total);
         let flags = OpenFlags::WRITE
@@ -1572,9 +1644,19 @@ impl Engine {
                 return Err(error.into());
             }
         };
-        let copied = self
-            .write_upload(&h, &mut file, total, progress, cancel, stage)
-            .await;
+        let copied = async {
+            let (bytes, complete) = self
+                .write_upload(&h, &mut file, total, progress, cancel, stage)
+                .await?;
+            if complete && times.is_some() {
+                if cancelled() {
+                    return Ok((bytes, false));
+                }
+                self.apply_upload_times(&h, times).await?;
+            }
+            Ok::<_, anyhow::Error>((bytes, complete))
+        }
+        .await;
         let closed = self.raw.close(h).await;
         let (bytes, complete) =
             copied.context("upload failed; remote destination may contain a partial file")?;
@@ -1583,6 +1665,16 @@ impl Engine {
             return Ok(cancelled_transfer(&local, &remote, bytes, true));
         }
         Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
+    }
+
+    async fn apply_upload_times(&self, handle: &str, times: Option<FileAttributes>) -> Result<()> {
+        if let Some(times) = times {
+            self.raw
+                .fsetstat(handle, times)
+                .await
+                .context("the server did not confirm the upload timestamps")?;
+        }
+        Ok(())
     }
 
     async fn write_upload(

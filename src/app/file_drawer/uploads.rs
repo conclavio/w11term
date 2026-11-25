@@ -10,6 +10,7 @@ pub struct DropTarget {
     drawer_serial: u64,
     overwrite_files: bool,
     atomic_files: bool,
+    preserve_times: bool,
 }
 
 impl DropTarget {
@@ -22,6 +23,7 @@ impl DropTarget {
             drawer_serial: files.dialog_serial,
             overwrite_files: files.replace,
             atomic_files: files.atomic_uploads,
+            preserve_times: files.preserve_upload_times,
         }
     }
 
@@ -82,6 +84,7 @@ impl TransferQueue {
         parent: &str,
         overwrite: bool,
         atomic: bool,
+        preserve_times: bool,
         id: TransferId,
     ) -> Result<Self> {
         let mut queue = Self {
@@ -103,6 +106,7 @@ impl TransferQueue {
                     remote: remote.clone(),
                     overwrite,
                     atomic,
+                    preserve_times,
                 },
                 TransferFile::Upload {
                     name,
@@ -137,6 +141,7 @@ impl TransferQueue {
                 remote.clone(),
                 !folder && target.overwrite_files,
                 !folder && target.atomic_files,
+                target.preserve_times,
             );
             let transfer = if folder {
                 TransferFile::UploadFolder { remote }
@@ -292,6 +297,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(&last, "three").unwrap();
         let mut drawer = drawer();
+        drawer.preserve_upload_times = true;
         let target = DropTarget::new(9, &drawer, "/logs");
         let paths = vec![first, folder, last];
         let data = DroppedData::StorageItems(
@@ -310,6 +316,7 @@ mod tests {
         let token = drawer.start_drop(&captured).unwrap();
         let items = classify_drop(received, &TransferCancel::default()).unwrap();
         drawer.replace = false;
+        drawer.preserve_upload_times = false;
         assert!(drawer.finish_drop(&captured, token));
         drawer.queue = TransferQueue::dropped(&captured, token, items).unwrap();
         assert!(drawer.transfer_id(captured.pane) == token);
@@ -320,7 +327,7 @@ mod tests {
             ("/logs/three", true),
         ]) {
             assert!(
-                matches!(operation, Operation::PutDrop {remote, overwrite: replace, ..} if remote == path && *replace == overwrite)
+                matches!(operation, Operation::PutDrop {remote, overwrite: replace, preserve_times: true, ..} if remote == path && *replace == overwrite)
             );
         }
         assert_eq!(drawer.queue.remaining.len(), 3);

@@ -1,5 +1,5 @@
 use super::*;
-use w11term::sftp::{FilenameSearch, Job, Operation, TransferCancel};
+use w11term::sftp::{EntryKind, FilenameSearch, Job, Operation, TransferCancel};
 
 fn search(path: &str, query: &str) -> Operation {
     Operation::Find {
@@ -33,6 +33,20 @@ async fn recursive_filename_search_finds_literal_unicode_and_does_not_traverse_l
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].parent, "/tree/nested");
     assert_eq!(result.matches[0].name, "[Ångström].txt");
+    assert_eq!(result.matches[0].kind, Some(EntryKind::File));
+    for (name, kind) in [
+        ("nested", EntryKind::Directory),
+        ("linked", EntryKind::Symlink),
+    ] {
+        let result: FilenameSearch = serde_json::from_value(
+            guarded_job(&pane, None, search("/tree", name))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].kind, Some(kind));
+    }
     server.abort();
 }
 

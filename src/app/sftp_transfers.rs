@@ -2,10 +2,12 @@ use super::{
     file_drawer::{TransferId, TransferView, transfer_progress_views},
     *,
 };
+use std::cmp::Reverse;
 use w11term::{
     control::SftpTransferStatus,
+    events::{RECENT_SFTP_TRANSFER_LIMIT, RecentSftpTransfer},
     options::SshOptions,
-    sftp::{TransferOperation, TransferPhase},
+    sftp::{TransferOperation, TransferOutcome, TransferPhase},
 };
 
 pub(super) const LABEL: &str = "SFTP transfers";
@@ -14,10 +16,19 @@ pub enum Action {
     Open,
     Visit(TransferId),
     Cancel(TransferId),
+    ShowDownload(TransferId),
 }
 
 impl TerminalApp {
     pub(super) fn handle_sftp_transfers(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if !matches!(action, Action::Open)
+            && !matches!(
+                self.tabs.active().map(|tab| &tab.page),
+                Some(Page::SftpTransfers)
+            )
+        {
+            return;
+        }
         match action {
             Action::Open => {
                 let existing = self
@@ -41,12 +52,6 @@ impl TerminalApp {
                 }
             }
             Action::Visit(transfer) | Action::Cancel(transfer) => {
-                if !matches!(
-                    self.tabs.active().map(|tab| &tab.page),
-                    Some(Page::SftpTransfers)
-                ) {
-                    return;
-                }
                 let pane = transfer.pane;
                 let Some(id) = self.tab_for_pane(pane) else {
                     return;
@@ -70,43 +75,73 @@ impl TerminalApp {
                     self.activate(ctx);
                 }
             }
+            Action::ShowDownload(id) => {
+                if let Some(tab) = self.tab_for_pane(id.pane)
+                    && let Some(Page::Terminal(tab)) = self.tabs.get(tab).map(|tab| &tab.page)
+                    && let Some(saved) = tab
+                        .session
+                        .events
+                        .recent_sftp_transfers()
+                        .into_iter()
+                        .find(|result| result.id == id)
+                        .and_then(|result| result.saved_download)
+                {
+                    explorer::show_download(saved, ctx);
+                }
+            }
         }
     }
 
     pub(super) fn sftp_transfers_view(&self, ctx: &ViewContext<Self>) -> View {
-        let rows: Vec<_> = self
+        let mut rows: Vec<_> = self
             .window_sftp_transfers()
             .map(|(_, label, ssh, transfer)| {
-                let source = format!(
-                    "{label} · Pane {} · {}@{}:{}",
-                    transfer.id.pane, ssh.user, ssh.host, ssh.port
-                );
-                transfer_row(source, transfer, ctx)
+                transfer_row(transfer_source(label, ssh, transfer.id.pane), transfer, ctx)
             })
             .collect();
-        let content: View = if rows.is_empty() {
-            TextBlock::new()
-                .text("No active SFTP transfers in this window")
-                .into()
-        } else {
-            ScrollViewer::new()
-                .automation_name("Active SFTP transfers")
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(StackPanel::new().spacing(12.0).keyed_children(rows))
-        };
+        if rows.is_empty() {
+            rows.push(KeyedView::new(
+                "active-empty",
+                TextBlock::new().text("No active SFTP transfers in this window"),
+            ));
+        }
+        let mut recent: Vec<_> = self
+            .window_sftp_panes()
+            .flat_map(|(_, label, tab, ssh)| {
+                tab.session
+                    .events
+                    .recent_sftp_transfers()
+                    .into_iter()
+                    .map(move |result| (label, ssh, result))
+            })
+            .collect();
+        recent.sort_unstable_by_key(|(_, _, result)| Reverse((result.finished_at, result.id)));
+        if !recent.is_empty() {
+            rows.push(KeyedView::new(
+                "recent-heading",
+                TextBlock::new().text("Recent transfers").font_size(18.0),
+            ));
+            rows.extend(recent.into_iter().take(RECENT_SFTP_TRANSFER_LIMIT).map(
+                |(label, ssh, result)| {
+                    result_row(transfer_source(label, ssh, result.id.pane), result, ctx)
+                },
+            ));
+        }
         Grid::new()
             .margin(16.0)
             .row_spacing(12.0)
             .rows([GridLength::Auto, GridLength::STAR])
             .children((
                 TextBlock::new().text(LABEL).font_size(24.0),
-                Border::new().grid_row(1).content(content),
+                ScrollViewer::new()
+                    .grid_row(1)
+                    .automation_name("SFTP transfer activity")
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(StackPanel::new().spacing(12.0).keyed_children(rows)),
             ))
     }
 
-    fn window_sftp_transfers(
-        &self,
-    ) -> impl Iterator<Item = (TabId, &str, &SshOptions, TransferView<'_>)> {
+    fn window_sftp_panes(&self) -> impl Iterator<Item = (TabId, &str, &LiveTab, &SshOptions)> {
         self.tabs.entries().iter().filter_map(|entry| {
             let Page::Terminal(tab) = &entry.value.page else {
                 return None;
@@ -114,10 +149,19 @@ impl TerminalApp {
             let Source::Ssh(ssh) = &tab.source else {
                 return None;
             };
-            let generation = tab.session.frames.load().connection_generation;
-            let transfer = tab.files.active_transfer(generation)?;
-            Some((entry.id, entry.value.label.as_str(), ssh, transfer))
+            Some((entry.id, entry.value.label.as_str(), tab, ssh))
         })
+    }
+
+    fn window_sftp_transfers(
+        &self,
+    ) -> impl Iterator<Item = (TabId, &str, &SshOptions, TransferView<'_>)> {
+        self.window_sftp_panes()
+            .filter_map(|(id, label, tab, ssh)| {
+                let generation = tab.session.frames.load().connection_generation;
+                let transfer = tab.files.active_transfer(generation)?;
+                Some((id, label, ssh, transfer))
+            })
     }
 
     pub(super) fn control_sftp_transfers(&self, pane: Option<u64>) -> Vec<SftpTransferStatus> {
@@ -139,6 +183,13 @@ impl TerminalApp {
             })
             .collect()
     }
+}
+
+fn transfer_source(label: &str, ssh: &SshOptions, pane: u64) -> String {
+    format!(
+        "{label} · Pane {pane} · {}@{}:{}",
+        ssh.user, ssh.host, ssh.port
+    )
 }
 
 fn transfer_row(
@@ -207,6 +258,48 @@ fn transfer_row(
     ));
     KeyedView::new(
         pane.to_string(),
+        StackPanel::new().spacing(6.0).keyed_children(details),
+    )
+}
+
+fn result_row(
+    source: String,
+    result: RecentSftpTransfer,
+    ctx: &ViewContext<TerminalApp>,
+) -> KeyedView {
+    let id = result.id;
+    let outcome = match result.outcome {
+        TransferOutcome::Completed => "Completed",
+        TransferOutcome::Cancelled => "Cancelled",
+        TransferOutcome::Failed => "Failed",
+        TransferOutcome::Interrupted => "Interrupted",
+    };
+    let mut details = vec![
+        KeyedView::new(
+            "source",
+            TextBlock::new()
+                .text(source)
+                .text_wrapping(TextWrapping::Wrap),
+        ),
+        KeyedView::new(
+            "summary",
+            TextBlock::new()
+                .text(format!("{outcome} · {}", result.message))
+                .text_wrapping(TextWrapping::Wrap),
+        ),
+    ];
+    if let Some(saved) = result.saved_download {
+        let label = explorer::download_label(&saved);
+        details.push(KeyedView::new(
+            "download",
+            Button::new()
+                .automation_name(format!("{label} for transfer {id}"))
+                .on_click(ctx.callback(move |_| Message::SftpTransfers(Action::ShowDownload(id))))
+                .content(label),
+        ));
+    }
+    KeyedView::new(
+        format!("recent-{id}"),
         StackPanel::new().spacing(6.0).keyed_children(details),
     )
 }

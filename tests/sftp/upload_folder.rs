@@ -1,5 +1,6 @@
 use super::*;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, watch};
 use w11term::sftp::{CHUNK, Job, Operation, TransferCancel, TransferProgress};
 
@@ -7,7 +8,117 @@ fn upload(local: &Path, remote: &str) -> Operation {
     Operation::PutDir {
         local: local.into(),
         remote: remote.into(),
+        preserve_times: false,
     }
+}
+
+pub(super) fn stamp_upload_source(path: &Path) -> (SystemTime, SystemTime) {
+    let accessed = UNIX_EPOCH + Duration::from_secs(1_020_304_002);
+    let modified = UNIX_EPOCH + Duration::from_secs(1_010_203_004);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new()
+                .set_accessed(accessed)
+                .set_modified(modified),
+        )
+        .unwrap();
+    (accessed, modified)
+}
+
+pub(super) fn assert_uploaded_times(path: &Path, (accessed, modified): (SystemTime, SystemTime)) {
+    let attrs = fs::metadata(path).unwrap();
+    assert_eq!(
+        attrs.modified().unwrap(),
+        modified,
+        "modified time for {}",
+        path.display()
+    );
+    assert_eq!(
+        attrs.accessed().unwrap(),
+        accessed,
+        "access time for {}",
+        path.display()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_times_are_opt_in_and_atomic_failure_keeps_the_original() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    fs::write(remote.path().join("replace"), b"old").unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let source = local.path().join("nested");
+    fs::create_dir(&source).unwrap();
+    let file = source.join("payload.txt");
+    fs::write(&file, b"from Windows").unwrap();
+    let put = |remote: &str, atomic, preserve_times| Operation::Put {
+        local: file.clone(),
+        remote: remote.into(),
+        overwrite: atomic,
+        atomic,
+        preserve_times,
+    };
+
+    let times = stamp_upload_source(&file);
+    guarded_job(&pane, None, put("/default", false, false))
+        .await
+        .unwrap();
+    assert_ne!(
+        fs::metadata(remote.path().join("default"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        times.1
+    );
+
+    for (name, atomic) in [("direct", false), ("replace", true)] {
+        let times = stamp_upload_source(&file);
+        guarded_job(&pane, None, put(&format!("/{name}"), atomic, true))
+            .await
+            .unwrap();
+        let dst = remote.path().join(name);
+        assert_uploaded_times(&dst, times);
+        assert_eq!(fs::read(dst).unwrap(), b"from Windows");
+    }
+
+    let times = stamp_upload_source(&file);
+    guarded_job(
+        &pane,
+        None,
+        Operation::PutDir {
+            local: local.path().into(),
+            remote: "/tree".into(),
+            preserve_times: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_uploaded_times(&remote.path().join("tree/nested/payload.txt"), times);
+
+    fs::write(remote.path().join("deny-upload-times"), []).unwrap();
+    fs::write(&file, b"new bytes").unwrap();
+    let failure = guarded_job(&pane, None, put("/replace", true, true))
+        .await
+        .unwrap_err();
+    assert!(
+        failure.contains("did not confirm the upload timestamps"),
+        "{failure}"
+    );
+    assert_eq!(
+        fs::read(remote.path().join("replace")).unwrap(),
+        b"from Windows"
+    );
+    assert!(fs::read_dir(remote.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".w11term-upload-")
+    }));
+    server.abort();
 }
 
 pub(super) fn seed_source(parent: &Path) {

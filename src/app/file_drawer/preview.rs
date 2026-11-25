@@ -5,6 +5,7 @@ use std::cell::OnceCell;
 pub enum PreviewKind {
     Text,
     Properties,
+    Checksum(u64),
 }
 
 pub(super) struct EntryPreview {
@@ -12,6 +13,8 @@ pub(super) struct EntryPreview {
     entry: ListedEntry,
     kind: PreviewKind,
     content: Contents,
+    checksum_available: bool,
+    copy_status: Option<String>,
     pub(super) cancel: TransferCancel,
     // Terminal output can re-render the window while the user selects text.
     view: OnceCell<View>,
@@ -48,6 +51,7 @@ impl EntryPreview {
                         .text(match self.kind {
                             PreviewKind::Text => "Loading preview…",
                             PreviewKind::Properties => "Loading properties…",
+                            PreviewKind::Checksum(_) => "Calculating SHA-256 over SFTP…",
                         })
                         .into(),
                     Contents::Error(error) => {
@@ -57,6 +61,9 @@ impl EntryPreview {
                             }
                             PreviewKind::Properties => {
                                 ("sftp-properties-error", "Could not read properties.")
+                            }
+                            PreviewKind::Checksum(_) => {
+                                ("sftp-checksum-error", "Could not calculate SHA-256.")
                             }
                         };
                         TextBlock::new()
@@ -69,6 +76,7 @@ impl EntryPreview {
                         let (name, id) = match self.kind {
                             PreviewKind::Text => ("File contents", "sftp-preview-text"),
                             PreviewKind::Properties => ("File properties", "sftp-properties-text"),
+                            PreviewKind::Checksum(_) => ("SHA-256 digest", "sftp-checksum-text"),
                         };
                         let mut fields = vec![KeyedView::new(
                             "contents",
@@ -104,11 +112,60 @@ impl EntryPreview {
                             .content("Edit"),
                     ));
                 }
+                if self.checksum_available {
+                    let entry = self.entry.clone();
+                    fields.push(KeyedView::new(
+                        "checksum",
+                        Button::new()
+                            .automation_name("Calculate SHA-256")
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::Preview(
+                                    pane,
+                                    generation,
+                                    entry.clone(),
+                                    PreviewKind::Checksum(serial),
+                                ))
+                            }))
+                            .content("Calculate SHA-256"),
+                    ));
+                }
+                if matches!(self.kind, PreviewKind::Checksum(_))
+                    && matches!(self.content, Contents::Ready(_))
+                {
+                    fields.push(KeyedView::new(
+                        "copy",
+                        Button::new()
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::CopyChecksum(pane, generation, serial))
+                            }))
+                            .content("Copy SHA-256"),
+                    ));
+                    fields.push(KeyedView::new(
+                        "verified-download",
+                        Button::new()
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::VerifyChecksum(pane, generation, serial))
+                            }))
+                            .content("Use for verified download"),
+                    ));
+                }
+                if let Some(status) = &self.copy_status {
+                    fields.push(KeyedView::new(
+                        "copy-status",
+                        TextBlock::new()
+                            .text(status)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
                 ContentDialog::new()
                     .title(&self.entry.name)
                     .close_button_text(match self.kind {
                         PreviewKind::Text => "Close preview",
                         PreviewKind::Properties => "Close properties",
+                        PreviewKind::Checksum(_) if matches!(self.content, Contents::Loading) => {
+                            "Cancel calculation"
+                        }
+                        PreviewKind::Checksum(_) => "Close checksum",
                     })
                     .is_open(true)
                     .on_closed(context.callback(move |_| {
@@ -147,8 +204,14 @@ impl FileDrawer {
         entry: ListedEntry,
         kind: PreviewKind,
     ) -> Result<(u64, Operation)> {
+        let idle = if matches!(kind, PreviewKind::Checksum(_)) {
+            // A completed Properties dialog is the source of this request.
+            self.pending.is_none()
+        } else {
+            !self.busy()
+        };
         ensure!(
-            self.open && self.generation != 0 && !self.busy() && self.bookmarks.is_none(),
+            self.open && self.generation != 0 && idle && self.bookmarks.is_none(),
             "Open the file listing before starting a preview"
         );
         self.check_selected(&entry)?;
@@ -162,6 +225,22 @@ impl FileDrawer {
                 Operation::PreviewText { path }
             }
             PreviewKind::Properties => Operation::EntryProperties { path },
+            PreviewKind::Checksum(properties) => {
+                ensure!(
+                    self.preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.serial == properties
+                            && preview.checksum_available
+                            && preview.entry.revision == entry.revision
+                            && preview.entry.parent == entry.parent
+                            && preview.entry.name == entry.name),
+                    "Reopen the selected file's properties to calculate SHA-256"
+                );
+                Operation::Sha256 {
+                    path,
+                    max_bytes: None,
+                }
+            }
         };
         self.end_filter_edit();
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
@@ -170,6 +249,8 @@ impl FileDrawer {
             entry,
             kind,
             content: Contents::Loading,
+            checksum_available: false,
+            copy_status: None,
             cancel: TransferCancel::default(),
             view: OnceCell::new(),
         });
@@ -190,14 +271,61 @@ impl FileDrawer {
                 Some(Value::String(text)) => Ok(text),
                 _ => Err("Missing text in the SFTP preview reply".into()),
             },
-            PreviewKind::Properties => super::properties::display_text(&preview.entry, value)
-                .map_err(|error| format!("{error:#}")),
+            PreviewKind::Properties => {
+                let mode = value["attrs"]["permissions"]
+                    .as_u64()
+                    .and_then(|mode| u32::try_from(mode).ok());
+                let text = super::properties::display_text(&preview.entry, value)
+                    .map_err(|error| format!("{error:#}"));
+                preview.checksum_available =
+                    text.is_ok() && EntryKind::from_permissions(mode) == Some(EntryKind::File);
+                text
+            }
+            PreviewKind::Checksum(_) => value["sha256"]
+                .as_str()
+                .ok_or_else(|| "Missing SHA-256 in the SFTP reply".to_owned())
+                .and_then(|sha256| normalize_sha256(sha256).map_err(|error| error.to_string())),
         });
         preview.content = match text {
             Ok(text) => Contents::Ready(text),
             Err(error) => Contents::Error(error),
         };
         preview.view.take();
+    }
+
+    fn ready_checksum(&self, serial: u64) -> Option<(&ListedEntry, &str)> {
+        let preview = self.preview.as_ref().filter(|p| {
+            p.serial == serial
+                && matches!(p.kind, PreviewKind::Checksum(_))
+                && self.open
+                && self.check_selected(&p.entry).is_ok()
+        })?;
+        let Contents::Ready(sha256) = &preview.content else {
+            return None;
+        };
+        Some((&preview.entry, sha256))
+    }
+
+    pub(super) fn copy_checksum(&mut self, serial: u64) {
+        let Some((_, sha256)) = self.ready_checksum(serial) else {
+            return;
+        };
+        let status = match w11term::clipboard::write(sha256) {
+            Ok(()) => "Copied SHA-256".to_owned(),
+            Err(error) => format!("Could not copy SHA-256. {error}"),
+        };
+        let preview = self.preview.as_mut().unwrap();
+        preview.copy_status = Some(status);
+        preview.view.take();
+    }
+
+    pub(super) fn verify_checksum(&mut self, serial: u64) -> Result<()> {
+        let Some((entry, digest)) = self.ready_checksum(serial) else {
+            return Ok(());
+        };
+        let (entry, digest) = (entry.clone(), digest.to_owned());
+        self.cancel_preview();
+        self.begin_verified_download(entry, digest)
     }
 
     pub(super) fn close_preview(&mut self, serial: u64) {
@@ -223,6 +351,35 @@ impl FileDrawer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn verified_download_reuses_only_the_current_checksum_and_selection() {
+        let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
+        let (properties, _) = files
+            .begin_preview(entry.clone(), PreviewKind::Properties)
+            .unwrap();
+        files.finish_preview(properties, Ok(json!({"attrs": {"permissions": 0o100644}})));
+        let (checksum, _) = files
+            .begin_preview(entry, PreviewKind::Checksum(properties))
+            .unwrap();
+        let digest = "f".repeat(64);
+        files.finish_preview(checksum, Ok(json!({"sha256": digest})));
+
+        files.verify_checksum(properties).unwrap();
+        assert!(files.dialog.is_none());
+        let selection = files.selected.take();
+        files.verify_checksum(checksum).unwrap();
+        assert!(files.dialog.is_none());
+        files.selected = selection;
+
+        files.verify_checksum(checksum).unwrap();
+        assert!(files.preview.is_none());
+        let dialog = files.dialog.as_ref().unwrap();
+        assert!(!dialog.resume_download);
+        assert_eq!(dialog.destination().unwrap(), digest);
+        assert!(matches!(&dialog.action, EditAction::VerifyDownload(entry)
+            if entry.name == "résumé 100% [pilot].txt"));
+    }
 
     fn selected(kind: ListedKind) -> (FileDrawer, ListedEntry) {
         let name = "résumé 100% [pilot].txt";
