@@ -70,7 +70,7 @@ pub struct FilenameMatch {
     pub kind: Option<EntryKind>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FilenameSearch {
     pub root: String,
     pub matches: Vec<FilenameMatch>,

@@ -471,6 +471,8 @@ Choose **Properties…** beside a search result to inspect its current metadata 
 
 Choose **Preview text…** on a regular file to read its UTF-8 contents, or choose **Edit** in the preview to make an explicit save. **Resume draft** is available from the results if you close the editor with a draft.
 
+Choose **Rename…** beside a file, folder, or symbolic link. The dialog shows the exact source path and renames it within the same remote folder. The search refreshes after success, so the renamed entry appears if its new name still matches.
+
 Choose **Shell in containing folder** to open a right split on the same authenticated SSH connection with that folder as its working directory. The search stays open in the source pane.
 
 Choose **Copy path** beside a search result for its absolute remote path, or **Copy all paths** for one path per line from every retained results page. Paths are plain text and keep their spaces, Unicode, and literal names. Copy paths containing line breaks individually.

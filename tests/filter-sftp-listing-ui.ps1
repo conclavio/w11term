@@ -249,7 +249,7 @@ try {
         $status = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $searchStatus)
         $status -and $status.Current.Name.Contains('Invalid filename regex')
     }
-    $pattern = '^nested(?:-(?:added|content)\.txt)?$|^BUILD-00\.log$'
+    $pattern = '^nested(?:-(?:added|content|renamed)\.txt)?$|^BUILD-00\.log$'
     $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     $field.GetCurrentPattern($value).SetValue($pattern)
     Click 'Search'
@@ -364,6 +364,26 @@ try {
         (Find-Element '3 matches in 2 folders') -and (Button "Reveal $parent/nested-added.txt")
     }
     $null = Wait-CheckBox "Mark $parent/nested-added.txt" $off
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    $null = Wait-CheckBox "Mark $parent/nested" $on
+    Click "Rename $parent/nested-added.txt"
+    $newName = Wait-Until 'rename dialog for the search result' {
+        $edit = Find-Element 'New name' ([System.Windows.Automation.ControlType]::Edit)
+        if ($edit -and (Find-Element 'Remote rename source')) { $edit }
+    }
+    if ($newName.GetCurrentPattern($value).Current.Value -cne 'nested-added.txt') {
+        throw 'Rename did not prefill the selected search result'
+    }
+    $newName.GetCurrentPattern($value).SetValue('nested-renamed.txt')
+    Click 'Rename'
+    $null = Wait-Until 'same search refreshes after rename' {
+        (Find-Element 'Renamed nested-added.txt to nested-renamed.txt. 3 matches in 2 folders') -and
+            (Button "Reveal $parent/nested-renamed.txt") -and !(Button "Reveal $parent/nested-added.txt")
+    }
+    $renamedFile = Join-Path $peerRoot 'shell directory/nested-renamed.txt'
+    if ([IO.File]::ReadAllText($renamedFile) -cne 'added after search') {
+        throw 'Rename changed the bytes of the search result'
+    }
     $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
     $null = Wait-CheckBox "Mark $parent/nested" $on
     $cancelled = Join-Path $picker 'cancelled search batch'

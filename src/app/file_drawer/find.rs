@@ -22,6 +22,7 @@ pub enum Action {
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
     Reveal(u64, FilenameMatch),
+    Rename(u64, FilenameMatch),
     CopyPaths(u64, Option<FilenameMatch>),
     Back(u64),
 }
@@ -66,6 +67,11 @@ fn result_status(result: &FilenameSearch) -> String {
         );
     }
     status
+}
+
+fn within<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
+    path.strip_prefix(ancestor)
+        .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
 impl Panel {
@@ -544,6 +550,25 @@ impl Panel {
                         })
                         .content("Properties…"),
                 ));
+                if hit.kind.is_some() {
+                    actions.push(KeyedView::new(
+                        "rename",
+                        Button::new()
+                            .automation_name(format!("Rename {path}"))
+                            .is_enabled(ready)
+                            .on_click({
+                                let hit = hit.clone();
+                                ctx.callback(move |_| {
+                                    Message::Files(FileAction::Search(
+                                        pane,
+                                        generation,
+                                        Action::Rename(serial, hit.clone()),
+                                    ))
+                                })
+                            })
+                            .content("Rename…"),
+                    ));
+                }
                 KeyedView::new(
                     index,
                     Grid::new()
@@ -643,7 +668,12 @@ impl FileDrawer {
         Some(self.dialog_serial)
     }
 
-    pub(super) fn finish_search(&mut self, serial: u64, result: Result<Value, String>) {
+    pub(super) fn finish_search(
+        &mut self,
+        serial: u64,
+        result: Result<Value, String>,
+        note: Option<&str>,
+    ) {
         let Some(panel) = self.search.as_mut().filter(|panel| panel.serial == serial) else {
             return;
         };
@@ -675,6 +705,102 @@ impl FileDrawer {
             }
             Err(error) => error,
         };
+        if let Some(note) = note {
+            self.status = format!("{note}. {}", self.status);
+        }
+    }
+
+    fn start_filename_search(
+        &mut self,
+        pane: u64,
+        session: &Session,
+        ctx: &ComponentContext<TerminalApp>,
+        note: Option<String>,
+    ) {
+        let panel = self.search.as_mut().unwrap();
+        let op = Operation::Find {
+            path: panel.root.clone(),
+            query: panel.query.clone(),
+            regex: panel.filter.regex,
+            match_case: panel.filter.match_case,
+            kind: panel.filter.kind,
+        };
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        panel.serial = self.dialog_serial;
+        let serial = panel.serial;
+        panel.copy_status = None;
+        panel.cancel = Some(TransferCancel::default());
+        self.status = match (&note, panel.result.is_some()) {
+            (Some(note), _) => format!("{note}. Refreshing search results…"),
+            (None, true) => "Refreshing search results…".into(),
+            (None, false) => "Searching folders…".into(),
+        };
+        if let Err(error) = self.job(pane, session, op, Step::Search(serial, note.clone()), ctx) {
+            self.finish_search(serial, Err(format!("{error:#}")), note.as_deref());
+        }
+    }
+
+    fn begin_search_rename(&mut self, serial: u64, hit: FilenameMatch) -> Result<()> {
+        ensure!(
+            self.open && !self.busy() && hit.kind.is_some(),
+            "Select a file, folder or link in the current search"
+        );
+        self.search_hit_path(serial, &hit)?;
+        entry_path(&hit.parent, &hit.name)?;
+        self.show_entry_dialog(
+            Some(hit.parent.clone()),
+            EditAction::RenameSearch(serial, hit),
+        );
+        Ok(())
+    }
+
+    pub(super) fn search_rename_completed(
+        &mut self,
+        pane: u64,
+        session: &Session,
+        serial: u64,
+        hit: FilenameMatch,
+        change: EntryChange,
+        ctx: &ComponentContext<TerminalApp>,
+    ) -> Result<()> {
+        let status = change.completed();
+        let old_path = entry_path(&hit.parent, &hit.name)?;
+        let new_path = entry_path(&hit.parent, change.name())?;
+        if let Some(directory) = self.directory.clone() {
+            if directory == hit.parent {
+                let mut entries = std::mem::take(&mut self.entries);
+                entries.retain(|entry| entry.name != change.name());
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.name == hit.name) {
+                    entry.name = change.name().into();
+                } else if let Some(kind) = hit.kind {
+                    entries.push(Entry {
+                        name: change.name().into(),
+                        kind: ListedKind::Known(kind),
+                        mtime: None,
+                        size: None,
+                    });
+                }
+                self.sort_order.sort(&mut entries);
+                self.accept_listing(None, directory, entries);
+            } else if let Some(suffix) = within(&directory, &old_path) {
+                let entries = std::mem::take(&mut self.entries);
+                self.accept_listing(None, format!("{new_path}{suffix}"), entries);
+            }
+        }
+        self.status = status.clone();
+        let Some(panel) = self.search.as_mut().filter(|panel| panel.serial == serial) else {
+            return Ok(());
+        };
+        // Remove obsolete rows before refreshing, so an interrupted scan
+        // cannot leave the old path (or old descendants) actionable.
+        if let Some(mut previous) = panel.result.clone() {
+            previous
+                .matches
+                .retain(|entry| entry != &hit && within(&entry.parent, &old_path).is_none());
+            panel.install_result(previous);
+        }
+        self.start_filename_search(pane, session, ctx, Some(status));
+        Ok(())
     }
 
     pub(super) fn filename_search(
@@ -759,26 +885,7 @@ impl FileDrawer {
             Action::Run(serial)
                 if serial == panel.serial && !busy && panel.filter.valid_query(&panel.query) =>
             {
-                let op = Operation::Find {
-                    path: panel.root.clone(),
-                    query: panel.query.clone(),
-                    regex: panel.filter.regex,
-                    match_case: panel.filter.match_case,
-                    kind: panel.filter.kind,
-                };
-                self.dialog_serial = self.dialog_serial.wrapping_add(1);
-                panel.serial = self.dialog_serial;
-                let serial = panel.serial;
-                panel.copy_status = None;
-                panel.cancel = Some(TransferCancel::default());
-                self.status = if panel.result.is_some() {
-                    "Refreshing search results…".into()
-                } else {
-                    "Searching folders…".into()
-                };
-                if let Err(error) = self.job(pane, session, op, Step::Search(serial), ctx) {
-                    self.finish_search(serial, Err(format!("{error:#}")));
-                }
+                self.start_filename_search(pane, session, ctx, None);
             }
             Action::Cancel(serial) if serial == panel.serial => {
                 if let Some(cancel) = &panel.cancel {
@@ -795,6 +902,7 @@ impl FileDrawer {
             Action::MarkDownload(serial, index, checked) if serial == panel.serial && !busy => {
                 panel.mark_download(index, checked);
             }
+            Action::Rename(serial, hit) if !busy => self.begin_search_rename(serial, hit)?,
             Action::CopyPaths(serial, hit) if !busy => {
                 panel.copy_status = match panel.paths_to_copy(serial, hit.as_ref()) {
                     Ok(Some((paths, count))) => Some(match w11term::clipboard::write(&paths) {
@@ -856,6 +964,52 @@ mod tests {
     }
 
     #[test]
+    fn search_rename_uses_the_hit_parent_and_rejects_an_expired_result() {
+        let result = search_result("/project", &[("old name", EntryKind::File)]);
+        let hit = result.matches[0].clone();
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 1,
+            directory: Some("/project".into()),
+            dialog_serial: 5,
+            search: Some(Panel {
+                serial: 5,
+                root: "/project".into(),
+                query: "name".into(),
+                input: ElementRef::new(),
+                filter: FilenameFilter::default(),
+                result: Some(result),
+                page: 0,
+                cancel: None,
+                copy_status: None,
+                marked_downloads: None,
+            }),
+            ..FileDrawer::default()
+        };
+        drawer.begin_search_rename(5, hit.clone()).unwrap();
+        let dialog = drawer.dialog.as_mut().unwrap();
+        assert_eq!(dialog.name, "old name");
+        dialog.name = "replacement name".into();
+        let serial = dialog.serial;
+        let (_, path) = drawer
+            .finish_edit(serial, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/project/nested/replacement name");
+        assert_eq!(drawer.directory.as_deref(), Some("/project"));
+        drawer.begin_search_rename(5, hit).unwrap();
+        let dialog = drawer.dialog.as_mut().unwrap();
+        dialog.name = "replacement name".into();
+        let serial = dialog.serial;
+        drawer.search.as_mut().unwrap().serial += 1;
+        assert!(
+            drawer
+                .finish_edit(serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn refresh_remaps_marks_by_root_path_and_type_then_expires_old_callbacks() {
         use EntryKind::{Directory, File};
         let before = search_result(
@@ -883,7 +1037,7 @@ mod tests {
             "/project",
             &[("added", File), ("changed", Directory), ("keep", File)],
         );
-        drawer.finish_search(3, Ok(json!(after)));
+        drawer.finish_search(3, Ok(json!(after)), None);
         let panel = drawer.search.as_ref().unwrap();
         assert_eq!(panel.serial, 4);
         assert_eq!(panel.page, 0);
@@ -894,13 +1048,13 @@ mod tests {
 
         let mut cancelled = search_result("/project", &[]);
         cancelled.cancelled = true;
-        drawer.finish_search(4, Ok(json!(cancelled)));
+        drawer.finish_search(4, Ok(json!(cancelled)), None);
         assert_eq!(
             drawer.search.as_ref().unwrap().marked_downloads,
             Some(BTreeSet::from([2]))
         );
         assert!(drawer.status.contains("Refresh cancelled"));
-        drawer.finish_search(5, Err("SSH request timed out".into()));
+        drawer.finish_search(5, Err("SSH request timed out".into()), None);
         assert_eq!(
             drawer.search.as_ref().unwrap().marked_downloads,
             Some(BTreeSet::from([2]))
@@ -908,7 +1062,7 @@ mod tests {
         assert!(drawer.status.contains("Refresh failed"));
 
         let moved_root = search_result("/project/nested", &[("keep", File)]);
-        drawer.finish_search(6, Ok(json!(moved_root)));
+        drawer.finish_search(6, Ok(json!(moved_root)), None);
         assert!(drawer.search_download_selection(7).is_err());
         assert!(drawer.status.ends_with("1 download mark cleared"));
     }

@@ -329,6 +329,7 @@ pub enum Operation {
     RenameEntry {
         from: String,
         to: String,
+        search_kind: Option<EntryKind>,
     },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
@@ -1342,7 +1343,28 @@ impl Engine {
                 self.raw.rename(from, to).await?;
                 ok
             }
-            RenameEntry { from, to } => {
+            RenameEntry {
+                from,
+                to,
+                search_kind,
+            } => {
+                if let Some(kind) = search_kind {
+                    let (parent, _) = from
+                        .rsplit_once('/')
+                        .context("Missing search result parent")?;
+                    let canonical = if parent.is_empty() { "/" } else { parent };
+                    ensure!(
+                        to.rsplit_once('/')
+                            .is_some_and(|(target, _)| target == parent)
+                            && self.canonical_remote_path(canonical).await? == canonical,
+                        "The search result's containing folder changed"
+                    );
+                    let attributes = self.raw.lstat(&from).await?.attrs;
+                    ensure!(
+                        EntryKind::from_permissions(attributes.permissions) == Some(kind),
+                        "The search result's entry type changed. Refresh the results."
+                    );
+                }
                 // LSTAT sees the directory entry even if it is a dangling link.
                 // A concurrent creator after this check is the v3 server's responsibility.
                 match self.raw.lstat(&to).await {

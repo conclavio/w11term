@@ -338,6 +338,7 @@ enum EditAction {
     GoToFolder { revision: u64 },
     Create,
     Rename(ListedEntry),
+    RenameSearch(u64, FilenameMatch),
     VerifyDownload(FileTarget),
     Delete(ListedEntry, EntryKind),
 }
@@ -345,7 +346,10 @@ enum EditAction {
 impl EditAction {
     fn original(&self) -> Option<&ListedEntry> {
         match self {
-            Self::GoToFolder { .. } | Self::Create | Self::VerifyDownload(_) => None,
+            Self::GoToFolder { .. }
+            | Self::Create
+            | Self::VerifyDownload(_)
+            | Self::RenameSearch(..) => None,
             Self::Rename(entry) | Self::Delete(entry, _) => Some(entry),
         }
     }
@@ -373,9 +377,14 @@ impl EntryDialog {
             EditAction::Rename(original) if self.name == original.name => {
                 bail!("Enter a different name")
             }
+            EditAction::RenameSearch(_, hit) if self.name == hit.name => {
+                bail!("Enter a different name")
+            }
             EditAction::Delete(original, _) => delete_path(parent()?, &original.name),
             EditAction::VerifyDownload(_) => normalize_sha256(&self.name),
-            EditAction::Rename(_) | EditAction::Create => entry_path(parent()?, &self.name),
+            EditAction::Rename(_) | EditAction::RenameSearch(..) | EditAction::Create => {
+                entry_path(parent()?, &self.name)
+            }
         }
     }
 }
@@ -420,10 +429,14 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
-    Search(u64),
+    Search(u64, Option<String>),
     SaveText(editor::Save),
     Transfer(TransferFile),
-    Change { parent: String, change: EntryChange },
+    Change {
+        parent: String,
+        change: EntryChange,
+        search_origin: Option<(u64, FilenameMatch)>,
+    },
 }
 
 enum TransferFile {
@@ -1243,6 +1256,7 @@ impl FileDrawer {
             parent,
             name: match &action {
                 EditAction::VerifyDownload(_) => String::new(),
+                EditAction::RenameSearch(_, hit) => hit.name.clone(),
                 action => action
                     .original()
                     .map_or_else(String::new, |entry| entry.name.clone()),
@@ -1266,7 +1280,8 @@ impl FileDrawer {
         }
         ensure!(
             self.open
-                && self.directory == dialog.parent
+                && (matches!(dialog.action, EditAction::RenameSearch(..))
+                    || self.directory == dialog.parent)
                 && !matches!(dialog.action, EditAction::GoToFolder { revision } if revision != self.listing_revision),
             "The directory changed. Open the file action again."
         );
@@ -1275,6 +1290,9 @@ impl FileDrawer {
         }
         if let EditAction::VerifyDownload(target) = &dialog.action {
             self.checked_target_path(target)?;
+        }
+        if let EditAction::RenameSearch(serial, hit) = &dialog.action {
+            self.search_hit_path(*serial, hit)?;
         }
         let path = dialog.destination()?;
         Ok(Some((dialog, path)))
@@ -1326,7 +1344,9 @@ impl FileDrawer {
         }
         let (title, label, confirm) = match dialog.action {
             EditAction::GoToFolder { .. } => ("Go to folder", "Remote folder path", "Open"),
-            EditAction::Rename(_) => ("Rename entry", "New name", "Rename"),
+            EditAction::Rename(_) | EditAction::RenameSearch(..) => {
+                ("Rename entry", "New name", "Rename")
+            }
             EditAction::VerifyDownload(_) => (
                 "Download and verify",
                 "Expected SHA-256",
@@ -1345,6 +1365,25 @@ impl FileDrawer {
                     Message::Files(FileAction::EditName(pane, generation, serial, name))
                 })),
         )];
+        if let EditAction::RenameSearch(_, hit) = &dialog.action {
+            fields.insert(
+                0,
+                KeyedView::new(
+                    "rename-source",
+                    TextBlock::new()
+                        .automation_name("Remote rename source")
+                        .text(format!(
+                            "{}@{}:{} · {}/{}",
+                            ssh.user,
+                            ssh.host,
+                            ssh.port,
+                            hit.parent.trim_end_matches('/'),
+                            hit.name
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
+                ),
+            );
+        }
         if let EditAction::VerifyDownload(target) = &dialog.action {
             fields.insert(
                 0,
@@ -2300,7 +2339,7 @@ impl FileDrawer {
                 progress: tx_progress,
                 cancel: if matches!(step, Step::Preview(_)) {
                     self.preview.as_ref().map(|p| p.cancel.clone())
-                } else if matches!(step, Step::Search(_)) {
+                } else if matches!(step, Step::Search(..)) {
                     self.search.as_ref().and_then(|p| p.cancel.clone())
                 } else {
                     transfer.as_ref().map(|active| active.cancel.clone())
@@ -2434,7 +2473,9 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
-            (Step::Search(serial), reply) => self.finish_search(serial, reply),
+            (Step::Search(serial, note), reply) => {
+                self.finish_search(serial, reply, note.as_deref())
+            }
             (Step::SaveText(save), result) => {
                 if let Some((parent, name)) = self.finish_save(save, result) {
                     self.reveal = Some(RevealTarget::Existing(name));
@@ -2577,7 +2618,24 @@ impl FileDrawer {
                     self.transfer_next(id, session, context)?;
                 }
             }
-            (Step::Change { parent, change }, Ok(_)) => {
+            (
+                Step::Change {
+                    change,
+                    search_origin: Some((serial, hit)),
+                    ..
+                },
+                Ok(_),
+            ) => {
+                self.search_rename_completed(id, session, serial, hit, change, context)?;
+            }
+            (
+                Step::Change {
+                    parent,
+                    change,
+                    search_origin: None,
+                },
+                Ok(_),
+            ) => {
                 self.status = change.completed();
                 // The old name no longer identifies the entry the user selected.
                 // If the follow-up listing fails, do not leave stale rows actionable.
@@ -3281,8 +3339,35 @@ impl TerminalApp {
                                         from: entry.name,
                                         to: name,
                                     },
-                                    Operation::RenameEntry { from, to: path },
+                                    Operation::RenameEntry {
+                                        from,
+                                        to: path,
+                                        search_kind: None,
+                                    },
                                 )
+                            }
+                            EditAction::RenameSearch(search, hit) => {
+                                let from = entry_path(&hit.parent, &hit.name)?;
+                                files.status = format!("Renaming {from} to {name}…");
+                                let change = EntryChange::Rename {
+                                    from: hit.name.clone(),
+                                    to: name,
+                                };
+                                return files.job(
+                                    pane,
+                                    session,
+                                    Operation::RenameEntry {
+                                        from,
+                                        to: path,
+                                        search_kind: hit.kind,
+                                    },
+                                    Step::Change {
+                                        parent: hit.parent.clone(),
+                                        change,
+                                        search_origin: Some((search, hit)),
+                                    },
+                                    context,
+                                );
                             }
                             EditAction::Create => {
                                 files.status = format!("Creating folder {name}…");
@@ -3301,7 +3386,11 @@ impl TerminalApp {
                             pane,
                             session,
                             operation,
-                            Step::Change { parent, change },
+                            Step::Change {
+                                parent,
+                                change,
+                                search_origin: None,
+                            },
                             context,
                         )?;
                         if deleting {
