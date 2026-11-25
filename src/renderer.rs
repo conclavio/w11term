@@ -2600,6 +2600,48 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_bidi_reorders_ink_on_both_sides_of_scaled_kitty_text() {
+        let size = wezterm_term::TerminalSize {
+            cols: 9,
+            rows: 2,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b[1;4H\x1b]66;s=2:w=1;W\x07",
+            "\x1b[1;1H\x1b[31mא\x1b[32mב\x1b[1;7H\x1b[31mג\x1b[32mד",
+            "\x1b[2;1H\x1b[31mה\x1b[32mו\x1b[2;7H\x1b[31mז\x1b[32mח",
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kitty-multicell-bidi.png");
+        let (width, height) = screenshot(&frame, size, &path).unwrap();
+        let pixels = image::open(path).unwrap().into_rgb8();
+        let cw = width / 9;
+        let ch = height / 2;
+        for row in 0..2 {
+            let mut columns = [0_u8; 9];
+            for (col, mask) in columns.iter_mut().enumerate() {
+                let x = col as u32 * cw;
+                for y in row * ch..(row + 1) * ch {
+                    for x in x..x + cw {
+                        let [r, g, b] = pixels.get_pixel(x, y).0;
+                        if r > g && r > b {
+                            *mask |= 1;
+                        } else if g > r && g > b {
+                            *mask |= 2;
+                        }
+                    }
+                }
+            }
+            assert_eq!(columns, [2, 1, 0, 0, 0, 0, 2, 1, 0], "row {row}");
+        }
+    }
+
+    #[test]
     fn offscreen_kitty_multicell_bar_and_underline_follow_the_rectangle() {
         let size = wezterm_term::TerminalSize {
             cols: 6,
