@@ -1623,6 +1623,7 @@ impl FileDrawer {
         &self,
         pane: u64,
         ssh: &SshOptions,
+        export: &text_export::Export,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
         if let Some(editor) = self.editor.as_ref().filter(|e| e.is_open()) {
@@ -1637,7 +1638,7 @@ impl FileDrawer {
                 .as_ref()
                 .and_then(|pending| pending.search_progress.as_ref())
                 .map(|progress| progress.borrow().clone());
-            return Some(space.dialog(pane, self.generation, progress.as_ref(), context));
+            return Some(space.dialog(pane, self.generation, progress.as_ref(), export, context));
         }
         let dialog = self.dialog.as_ref()?;
         let serial = dialog.serial;

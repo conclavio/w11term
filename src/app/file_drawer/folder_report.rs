@@ -3,6 +3,7 @@ use russh_sftp::extensions::Statvfs;
 use w11term::sftp::{FolderComparison, FolderContents, FolderOrigin, capture_local_folder};
 
 mod comparison;
+mod export;
 
 const READ_ONLY: u64 = 1;
 
@@ -62,7 +63,7 @@ impl Kind {
                 Ok(Report::Saved(count))
             }
             Self::Comparison => serde_json::from_value(reply)
-                .map(Report::Comparison)
+                .map(|report| Report::Comparison(Arc::new(report)))
                 .map_err(Into::into),
         }
     }
@@ -79,6 +80,7 @@ pub(super) fn reference_label(origin: FolderOrigin, report: bool) -> &'static st
 
 pub(super) struct Panel {
     serial: u64,
+    revision: u64,
     directory: String,
     kind: Kind,
     state: State,
@@ -95,7 +97,7 @@ enum Report {
     Space(Capacity),
     Contents(FolderContents, u128),
     Saved(usize),
-    Comparison(FolderComparison),
+    Comparison(Arc<FolderComparison>),
 }
 
 impl Drop for Panel {
@@ -151,6 +153,7 @@ impl Panel {
         pane: u64,
         generation: u64,
         progress: Option<&SearchProgress>,
+        export: &text_export::Export,
         context: &ViewContext<TerminalApp>,
     ) -> View {
         let serial = self.serial;
@@ -286,6 +289,13 @@ impl Panel {
             }
             State::Loaded(Ok(Report::Comparison(comparison))) => {
                 rows.extend(self.comparison.rows(comparison, context, message));
+                let target = text_export::FolderComparisonTarget {
+                    pane,
+                    generation,
+                    serial,
+                    revision: self.revision,
+                };
+                rows.extend(export::controls(target, export, context));
             }
         }
         if let Some(refresh) = refresh {
@@ -422,6 +432,7 @@ impl FileDrawer {
         let serial = self.dialog_serial;
         self.folder_report = Some(Panel {
             serial,
+            revision: 0,
             directory,
             kind,
             state: State::Loading,
@@ -500,6 +511,7 @@ impl FileDrawer {
             .kind
             .operation(panel.directory.clone(), self.folder_reference.as_ref())?;
         panel.state = State::Loading;
+        panel.revision = panel.revision.wrapping_add(1);
         panel.cancel = TransferCancel::default();
         Some(operation)
     }

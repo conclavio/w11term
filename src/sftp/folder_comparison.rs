@@ -39,6 +39,20 @@ impl FolderEntry {
             _ => "Special entry",
         }
     }
+
+    pub fn kind_key(self) -> &'static str {
+        match self.kind {
+            DIRECTORY => "directory",
+            REGULAR => "file",
+            SYMBOLIC_LINK => "symbolic_link",
+            WINDOWS_REPARSE => "windows_reparse_point",
+            0o010000 => "fifo",
+            0o020000 => "character_device",
+            0o060000 => "block_device",
+            0o140000 => "socket",
+            _ => "special",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -3,8 +3,11 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = Join-Path $State 'exports'
+[void][IO.Directory]::CreateDirectory($env:W11TERM_EXPORT_SMOKE_DIR)
 $profiles = Join-Path $State 'profiles.json'
 $fixture = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $button = [System.Windows.Automation.ControlType]::Button
@@ -43,6 +46,41 @@ function Select-DifferenceType([string]$Name) {
     $choice.GetCurrentPattern($selection).Select()
     $popup = (Find-Element 'Folder difference type' $combo).GetCurrentPattern($expand)
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+
+function Test-ComparisonExport {
+    $save = 'Save comparison as JSON' + [char]0x2026
+    $output = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'sftp-folder-comparison.json'
+    $null = Wait-Until 'the comparison export button is visible' { Find-Element $save $button -Visible }
+    Click $save
+    $dialog = Wait-Until 'owned comparison Save dialog' { Find-OwnedDialog 'Save folder comparison as JSON' }
+    $null = Wait-Until 'cancel the comparison save' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'the comparison is ready to export again' {
+        $item = Find-Element $save $button
+        $item -and $item.Current.IsEnabled
+    }
+    if ([IO.File]::Exists($output)) { throw 'Cancel created a comparison export' }
+    Click $save
+    $dialog = Wait-Until 'owned comparison Save dialog reopened' { Find-OwnedDialog 'Save folder comparison as JSON' }
+    $null = Wait-Until 'save the comparison JSON' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'an export status inside the comparison dialog confirms publication' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $byId = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-folder-comparison-export-status')
+        $status = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)
+        $status -and $status.Current.Name -ceq "Saved folder comparison to $output" -and [IO.File]::Exists($output)
+    }
+    $report = [IO.File]::ReadAllText($output, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    $modified = $report.differences | Where-Object path -ceq 'nested/data.txt'
+    $later = $report.differences | Where-Object path -ceq 'bulk-239.txt'
+    if ($report.schema_version -ne 1 -or $report.ssh.host -cne '127.0.0.1' -or $report.ssh.port -le 0 -or
+        $report.ssh.user -cne 'test' -or $report.reference.path -cne $reference -or $report.reference.origin -cne 'remote' -or
+        $report.current.path -cne $current -or $report.current.origin -cne 'remote' -or $report.differences.Count -ne 244 -or
+        $report.counts.current_only -ne 241 -or $report.counts.needs_inspection -ne 1 -or
+        $modified.change -cne 'metadata_changed' -or $modified.reference.size_bytes -ne 3 -or $modified.current.size_bytes -ne 8 -or
+        $later.change -cne 'current_only' -or $null -ne $later.reference -or $later.current.kind -cne 'file') {
+        throw 'Export did not preserve the complete comparison and the pinned metadata'
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -97,6 +135,8 @@ try {
         Find-Element 'No differences match these filters.'
     }
     Set-Query ''
+    Wait-Range 1 1 1
+    Test-ComparisonExport
     Wait-Range 1 1 1
     $hold = Join-Path $fixture 'hold-opendir'
     [IO.File]::WriteAllText($hold, "$current/nested")
