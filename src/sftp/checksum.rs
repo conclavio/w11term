@@ -1,4 +1,41 @@
 use super::*;
+use std::io::Read;
+use upload_directory::{Source, open_source};
+use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_SHARE_READ};
+
+/// Hash a selected file through one read-only handle that denies writes and deletes.
+pub fn local_sha256(path: &Path, cancel: &TransferCancel) -> Result<String> {
+    let check_cancel = || {
+        ensure!(!cancel.is_cancelled(), "SHA-256 comparison cancelled");
+        Ok::<_, anyhow::Error>(())
+    };
+    check_cancel()?;
+    let Source::File(mut file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
+        bail!("Choose a regular file for SHA-256 comparison");
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = [0; CHUNK];
+    let mut bytes = 0u64;
+    loop {
+        check_cancel()?;
+        let length = file.read(&mut buffer).context("reading the local file")?;
+        if length == 0 {
+            break;
+        }
+        bytes += length as u64;
+        ensure!(
+            bytes <= size,
+            "Local file size changed during SHA-256 calculation"
+        );
+        digest.update(&buffer[..length]);
+    }
+    check_cancel()?;
+    ensure!(
+        bytes == size,
+        "Local file size changed during SHA-256 calculation"
+    );
+    Ok(digest_hex(digest))
+}
 
 impl Engine {
     pub(super) async fn remote_sha256(
@@ -117,4 +154,36 @@ fn check_unchanged(before: &FileAttributes, after: &FileAttributes) -> Result<()
         "Remote file changed during SHA-256 calculation"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compares_local_file_bytes_across_read_boundaries() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("résumé [local].bin");
+        let cancel = TransferCancel::default();
+        std::fs::write(&path, [])?;
+        assert_eq!(
+            local_sha256(&path, &cancel)?,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let data = b"w11term\0".repeat(CHUNK);
+        std::fs::write(&path, &data)?;
+        assert_eq!(
+            local_sha256(&path, &cancel)?,
+            "8caddaac9b2a1eae17432050d03e02c33b3a9fe7826debb7b6e3b1da1ad322a8"
+        );
+        assert!(local_sha256(directory.path(), &cancel).is_err());
+        cancel.cancel();
+        assert!(
+            local_sha256(&path, &cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        Ok(())
+    }
 }

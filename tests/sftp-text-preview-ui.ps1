@@ -9,6 +9,7 @@ $profiles = Join-Path $State 'profiles.json'
 $button = [System.Windows.Automation.ControlType]::Button
 $textPattern = [System.Windows.Automation.TextPattern]::Pattern
 $preview = 'Preview text' + [char]0x2026
+$previewImage = 'Preview image' + [char]0x2026
 $snow = [char]0x96ea
 $name = "build $snow.txt"
 $needle = 'second caf' + [char]0xe9
@@ -47,6 +48,15 @@ function Wait-Preview([string]$Expected) {
 function Close-Preview {
     Click 'Close preview'
     $null = Wait-Until 'file preview dialog closed' { !(Find-Element 'Close preview' $button) }
+}
+function Wait-MapPreview {
+    $dimensions = '64 ' + [char]0x00d7 + ' 32 pixels'
+    $null = Wait-Until 'image bitmap and original dimensions' {
+        $image = Find-Element "Image preview of map $snow.PNG" ([System.Windows.Automation.ControlType]::Image) -Visible
+        $image -and $image.Current.AutomationId -eq 'sftp-preview-image' -and
+            $image.Current.BoundingRectangle.Height -gt 0 -and
+            $image.Current.BoundingRectangle.Width -gt 0 -and (Find-Element $dimensions)
+    }
 }
 function Wait-DisabledPreview {
     $null = Wait-Until 'preview disabled for the current selection' {
@@ -123,6 +133,32 @@ try {
         $msg -and $msg.Current.Name.Contains('NUL bytes') -and !(Find-Element 'File contents')
     }
     Close-Preview
+    Click "map $snow.PNG"
+    Click $previewImage
+    Wait-MapPreview
+    Close-Preview
+    Click 'broken.jpeg'
+    Click $previewImage
+    $null = Wait-Until 'invalid image error and no native bitmap' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $condition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-image-error')
+        $field = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        $field -and $field.Current.Name.StartsWith('Could not preview this image.') -and
+            !(Find-Element 'Image preview of broken.jpeg' ([System.Windows.Automation.ControlType]::Image))
+    }
+    Close-Preview
+    Click ('Find files' + [char]0x2026)
+    $query = Wait-Until 'filename search query' {
+        Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('map')
+    Click 'Search'
+    Click "Preview image /shell directory/nested/map $snow.PNG"
+    Wait-MapPreview
+    Close-Preview
+    Click 'Back to files'
+    $null = Wait-Until 'file actions restored after search' { Find-Element $preview $button }
     Close-Drawer
     $null = Wait-Until 'drawer closed' { !(Find-Element $preview $button) }
     foreach ($ch in 'after-preview'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }

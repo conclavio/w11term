@@ -9,3 +9,6 @@ Local changes backport the element cursor property from
 The 0.100.0 property reconciler sets or clears WinUI's protected cursor
 on the Border through the Windows App SDK 2.4.0 ABI. Remove the local Cargo
 patch when upgrading to a release that provides Border::pointer_cursor.
+
+The local element reference can request scrolling after layout for the SFTP
+log tail. [WinUI StartBringIntoView](https://learn.microsoft.com/windows/windows-app-sdk/api/winrt/microsoft.ui.xaml.uielement.startbringintoview)

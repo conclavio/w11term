@@ -525,6 +525,9 @@ impl Panel {
                     )),
             ),
         ];
+        if let Some(reference) = files.reference_controls(pane, ctx) {
+            rows.push(KeyedView::new("comparison-reference", reference));
+        }
         let check = |label, checked, option: fn(bool) -> MatchOption| {
             CheckBox::new()
                 .automation_name(label)
@@ -884,27 +887,51 @@ impl Panel {
                     ));
                 }
                 if hit.kind == Some(EntryKind::File) {
-                    let hit = hit.clone();
+                    let preview = |key, label, kind| {
+                        let hit = hit.clone();
+                        KeyedView::new(
+                            key,
+                            Button::new()
+                                .automation_name(format!("{label} {path}"))
+                                .is_enabled(ready)
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Files(FileAction::Preview(
+                                        pane,
+                                        generation,
+                                        FileTarget::Search(serial, hit.clone()),
+                                        kind,
+                                    ))
+                                }))
+                                .content(format!("{label}…")),
+                        )
+                    };
+                    if image_preview_name(&hit.name) {
+                        entry_actions.push(preview("image", "Preview image", PreviewKind::Image));
+                    }
                     let label = if hit.content_match.is_some() {
                         "Preview match"
                     } else {
                         "Preview text"
                     };
-                    entry_actions.push(KeyedView::new(
-                        "preview",
-                        Button::new()
-                            .automation_name(format!("{label} {path}"))
-                            .is_enabled(ready)
-                            .on_click(ctx.callback(move |_| {
-                                Message::Files(FileAction::Preview(
-                                    pane,
-                                    generation,
-                                    FileTarget::Search(serial, hit.clone()),
-                                    PreviewKind::Text,
-                                ))
-                            }))
-                            .content(format!("{label}…")),
-                    ));
+                    entry_actions.push(preview("preview", label, PreviewKind::Text));
+                    entry_actions.push(preview("tail", "Tail text file", PreviewKind::Tail));
+                    if let Some(id) = files.reference_id() {
+                        let target = FileTarget::Search(serial, hit.clone());
+                        entry_actions.push(KeyedView::new(
+                            "compare-reference",
+                            Button::new()
+                                .automation_name(format!("Compare {path} with reference"))
+                                .is_enabled(ready)
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Files(FileAction::TextReference(
+                                        pane,
+                                        generation,
+                                        super::preview::ReferenceAction::Open(target.clone(), id),
+                                    ))
+                                }))
+                                .content("Compare with reference…"),
+                        ));
+                    }
                 }
                 if shell_ready
                     && let Some(origin) =
