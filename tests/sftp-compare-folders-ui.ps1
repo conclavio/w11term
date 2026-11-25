@@ -95,6 +95,7 @@ function Test-ComparisonExport {
     $modified = $report.differences | Where-Object path -ceq 'nested/data.txt'
     $later = $report.differences | Where-Object path -ceq 'bulk-239.txt'
     $check = $report.file_verifications | Where-Object path -ceq 'same-metadata.txt'
+    $matchingCheck = $report.file_verifications | Where-Object path -ceq 'same-other.txt'
     $referenceHash = File-Digest (Join-Path $fixture 'shell directory/archive/same-metadata.txt')
     $currentHash = File-Digest (Join-Path $fixture 'shell directory/live/same-metadata.txt')
     if ($report.schema_version -ne 1 -or $report.ssh.host -cne '127.0.0.1' -or $report.ssh.port -le 0 -or
@@ -103,9 +104,10 @@ function Test-ComparisonExport {
         $report.counts.current_only -ne 241 -or $report.counts.needs_inspection -ne 1 -or
         $modified.change -cne 'metadata_changed' -or $modified.reference.size_bytes -ne 3 -or $modified.current.size_bytes -ne 8 -or
         $later.change -cne 'current_only' -or $null -ne $later.reference -or $later.current.kind -cne 'file' -or
-        $report.file_verifications.Count -ne 1 -or $check.result -cne 'different' -or
+        $report.file_verifications.Count -ne 2 -or $check.result -cne 'different' -or
         $check.completed_at_unix_seconds -le 0 -or $check.reference_sha256 -cne $referenceHash -or
-        $check.current_sha256 -cne $currentHash) {
+        $check.current_sha256 -cne $currentHash -or $matchingCheck.result -cne 'match' -or
+        $matchingCheck.reference_sha256 -cne $matchingCheck.current_sha256) {
         throw 'Export did not preserve the complete comparison and the pinned metadata'
     }
 }
@@ -122,7 +124,7 @@ try {
     Click 'Open folder'
     Click ('Set folder as comparison reference' + [char]0x2026)
     $null = Wait-Until 'the reference inventory is captured' {
-        Find-Element "Captured folder reference $dot 5 entries"
+        Find-Element "Captured folder reference $dot 7 entries"
     }
     Click 'Close folder reference'
     $null = Wait-Until 'the folder reference is visible in the drawer' {
@@ -165,7 +167,7 @@ try {
     Wait-Range 1 1 1
     Select-DifferenceType 'Files with matching metadata'
     $null = Wait-Until 'the matching-files view excludes the matching directory' {
-        (Find-Element '1 file with matching metadata') -and
+        (Find-Element "Showing 1${dash}3 of 3 files with matching metadata") -and
             (Find-Element 'Show remote entry same-metadata.txt' $button)
     }
     Set-Query 'no-such-match'
@@ -186,8 +188,27 @@ try {
             (Find-Element '1 file with matching metadata') -and
             (Find-Element 'Last SHA-256 check found different contents')
     }
-    Test-ComparisonExport
     Set-Query ''
+    $null = Wait-Until 'the page batch includes all three matching rows' {
+        Find-Element "Showing 1${dash}3 of 3 files with matching metadata"
+    }
+    $missing = Join-Path $fixture 'shell directory/live/same-missing.txt'
+    [IO.File]::Delete($missing)
+    Click ('Verify files on this page' + [char]0x2026)
+    Click 'Start page verification'
+    $null = Wait-Until 'page verification reports a match, a difference, and a failed file' {
+        (Find-Element 'Page verification complete') -and
+            (Find-Element 'Processed 3 of 3 files') -and
+            (Find-Element "1 matched $dot 1 differed $dot 1 failed")
+    }
+    Click 'Back to comparison'
+    $null = Wait-Until 'the batch stores its completed checks in the report' {
+        (Find-Element 'Last SHA-256 check found matching contents') -and
+            (Find-Element 'Last SHA-256 check found different contents')
+    }
+    [IO.File]::WriteAllBytes($missing, [Text.Encoding]::ASCII.GetBytes('same'))
+    [IO.File]::SetLastWriteTimeUtc($missing, [DateTimeOffset]::FromUnixTimeSeconds(1700000100).UtcDateTime)
+    Test-ComparisonExport
     Select-DifferenceType 'Needs inspection'
     Wait-Range 1 1 1
     $hold = Join-Path $fixture 'hold-opendir'
@@ -202,7 +223,7 @@ try {
     }
     Wait-Range 1 1 1
     Select-DifferenceType 'Files with matching metadata'
-    $null = Wait-Until 'the refreshed report has a matching file' { Find-Element '1 file with matching metadata' }
+    $null = Wait-Until 'the refreshed report has three matching files' { Find-Element "Showing 1${dash}3 of 3 files with matching metadata" }
     if (Find-Element 'Last SHA-256 check found different contents') {
         throw 'A prior check was carried into the refreshed report'
     }
