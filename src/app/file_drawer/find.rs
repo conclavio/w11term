@@ -687,6 +687,14 @@ impl Panel {
                             }),
                     ),
                 ));
+                actions.push(KeyedView::new(
+                    "rename-marked",
+                    button(
+                        "Rename marked entries…",
+                        Action::StartFolderBatch(serial, FolderBatchKind::Rename),
+                        ready && !marked.is_empty(),
+                    ),
+                ));
             }
             rows.push(KeyedView::new(
                 "marking",
