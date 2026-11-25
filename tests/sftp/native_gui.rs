@@ -2973,6 +2973,57 @@ async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "previews, checks and stops marked renames in the native SFTP listing and search"]
+async fn native_sftp_renames_marked_entries_with_preflight_and_stop() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("nested")).unwrap();
+    for (name, bytes) in [
+        ("simple-old-a.txt", "first"),
+        ("simple-old-b.txt", "second"),
+        ("simple-new-b.txt", "occupied"),
+        ("scan-old-01.txt", "root"),
+        ("nested/scan-old-02.txt", "nested"),
+    ] {
+        fs::write(folder.join(name), bytes).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    fs::write(root.join("rename-trace.jsonl"), []).unwrap();
+    drive_mixed_gui("sftp-rename-marked-ui.ps1", &ssh, state.path());
+    for (name, bytes) in [
+        ("simple-new-a.txt", "first"),
+        ("simple-new-b.txt", "second"),
+        ("scan-new-01.txt", "root"),
+        ("nested/scan-old-02.txt", "nested"),
+    ] {
+        assert_eq!(fs::read(folder.join(name)).unwrap(), bytes.as_bytes());
+    }
+    assert_eq!(
+        mutation_trace(root, "rename-trace.jsonl"),
+        [
+            [
+                "/shell directory/simple-old-a.txt",
+                "/shell directory/simple-new-a.txt"
+            ],
+            [
+                "/shell directory/simple-old-b.txt",
+                "/shell directory/simple-new-b.txt"
+            ],
+            [
+                "/shell directory/scan-old-01.txt",
+                "/shell directory/scan-new-01.txt"
+            ],
+        ],
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "copies and duplicates regular files from the native listing and recursive search over one live SSH connection"]
 async fn native_sftp_copy_from_listing_and_search_keeps_both_originals() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

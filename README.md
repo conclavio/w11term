@@ -527,6 +527,8 @@ Choose **Move to folder…** in the listing or on a search result to move a file
 
 Use **Copy marked files…** in selection mode in the listing or search results to copy several regular files into one remote folder. Each file keeps its name. Copy files with the same name in separate batches. An existing destination or other error stops the batch and reports how many copies finished. **Stop after current copy** lets the active copy finish and skips the queue. Confirmed copies stay in the destination, and the originals keep their marks.
 
+Choose **Rename marked entries…** in selection mode in the listing or search results. Enter literal, case-sensitive text to find and preview every changed name in its original folder. An empty replacement removes the matched text. Before renaming, w11term checks the source types and that every destination is free. Unmark entries inside a folder you are renaming. Each rename rechecks its destination, so a new collision stops the batch. **Stop after current rename** keeps confirmed renames and skips the queue. Untouched entries keep their marks after the refresh.
+
 Choose **Duplicate as…** on a regular file to make a copy in its own folder under a new name. You can edit the suggested name before confirming. An existing name leaves both files intact. The current listing or search filter applies to the duplicate.
 
 SFTP v3 requires the server to reject an existing destination. If another process creates the name between the check and the rename, enforcement depends on the server and filesystem. [SFTP v3 rename semantics](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5) · [OpenSSH implementation](https://github.com/openssh/openssh-portable/blob/V_10_2_P1/sftp-server.c#L1187-L1249)
