@@ -12,7 +12,7 @@ $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -P
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'the fixture control pipe' {
-        Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json")
+        Test-Path -LiteralPath (Get-ControlManifestPath $app.Id)
     }
     $initial = (Control @('list')).sessions | Where-Object active
     if (!$initial -or !$initial.window_id) { throw 'The initial terminal pane has no window ID' }
