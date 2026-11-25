@@ -3602,6 +3602,143 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "compares two remote folders using a captured inventory in the native SFTP drawer"]
+async fn native_sftp_compares_two_folders_against_captured_metadata() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let archive = root.join("shell directory/archive");
+    let live = root.join("shell directory/live");
+    for folder in [&archive, &live] {
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        directory_junction(folder, "link", "nested");
+    }
+    fs::write(archive.join("nested/data.txt"), b"old").unwrap();
+    fs::write(live.join("nested/data.txt"), b"current!").unwrap();
+    let mtime = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+    for (folder, bytes) in [(&archive, b"old"), (&live, b"new")] {
+        let path = folder.join("same-metadata.txt");
+        fs::write(&path, bytes).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        for name in ["same-missing.txt", "same-other.txt"] {
+            let path = folder.join(name);
+            fs::write(&path, b"same").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        }
+    }
+    fs::write(archive.join("removed.txt"), []).unwrap();
+    fs::write(live.join("added.txt"), []).unwrap();
+    for index in 0..240 {
+        fs::write(live.join(format!("bulk-{index:03}.txt")), []).unwrap();
+    }
+    let trace = root.join("transfer-trace");
+    let listing = root.join("listing-trace");
+    fs::write(&trace, []).unwrap();
+    fs::write(&listing, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-compare-folders-ui.ps1", &ssh, state.path());
+    let packets = fs::read_to_string(trace).unwrap();
+    assert_eq!(
+        packets
+            .lines()
+            .filter(|line| line.starts_with("OPEN "))
+            .collect::<Vec<_>>(),
+        [
+            "OPEN /shell directory/archive/same-metadata.txt",
+            "OPEN /shell directory/live/same-metadata.txt",
+            "OPEN /shell directory/archive/same-metadata.txt",
+            "OPEN /shell directory/live/same-metadata.txt",
+            "OPEN /shell directory/archive/same-missing.txt",
+            "OPEN /shell directory/archive/same-other.txt",
+            "OPEN /shell directory/live/same-other.txt",
+        ],
+        "only explicit verification read file data"
+    );
+    let scans = fs::read_to_string(listing).unwrap();
+    assert!(
+        !scans
+            .lines()
+            .any(|line| line.starts_with("OPENDIR ") && line.ends_with("/link")),
+        "comparison traversed a symbolic link"
+    );
+    assert_eq!(
+        scans
+            .lines()
+            .filter(|line| *line == "OPENDIR /shell directory/live/nested")
+            .count(),
+        3,
+        "only the two scans and the successful reveal list the nested folder"
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "compares a Windows folder selected in the native picker with a live SFTP inventory"]
+async fn native_sftp_compares_a_windows_folder_with_the_remote_listing() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let remote_folder = root.join("shell directory");
+    fs::create_dir_all(remote_folder.join("nested")).unwrap();
+    fs::write(remote_folder.join("nested/config.txt"), b"current!").unwrap();
+    fs::write(remote_folder.join("case.txt"), []).unwrap();
+    fs::write(remote_folder.join("remote-only.txt"), []).unwrap();
+    directory_junction(&remote_folder, "jump", "nested");
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let listing = root.join("listing-trace");
+    fs::write(&listing, []).unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let local = picker.join("Windows reference 雪");
+    let outside = picker.join("outside");
+    fs::create_dir_all(local.join("nested")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(local.join("nested/config.txt"), b"old").unwrap();
+    fs::write(local.join("CASE.txt"), []).unwrap();
+    fs::write(local.join("local-only.txt"), []).unwrap();
+    fs::write(outside.join("outside-only.txt"), b"outside the selection").unwrap();
+    directory_junction(&local, "jump", outside.to_str().unwrap());
+    fs::write(
+        state.path().join("canonical-picker-directory"),
+        fs::canonicalize(&local).unwrap().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("sftp-compare-windows-folder-ui.ps1", &ssh, state.path());
+    assert!(
+        fs::read(trace).unwrap().is_empty(),
+        "comparison opened remote files"
+    );
+    assert!(
+        !fs::read_to_string(listing)
+            .unwrap()
+            .contains("OPENDIR /shell directory/jump"),
+        "comparison traversed the remote link"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "the terminal and its existing SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measures folder contents and retains a stopped scan in the native SFTP drawer"]
 async fn native_sftp_folder_contents_reports_and_stops_a_recursive_scan() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

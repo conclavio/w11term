@@ -15,6 +15,14 @@ pub(super) const GROUP_SHOWN_JSON_LABEL: &str = "Save shown results as JSON…";
 pub use w11term::control::SshGroupReportFormat as GroupReportFormat;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FolderComparisonTarget {
+    pub pane: u64,
+    pub generation: u64,
+    pub serial: u64,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {
     Scrollback(u64),
     PaneImage(u64),
@@ -43,6 +51,7 @@ pub enum Subject {
         baseline: u64,
         run: u64,
     },
+    FolderComparison(FolderComparisonTarget),
     SshHostList,
     SshGroupDefinition,
     SshLoginReport(u64),
@@ -68,6 +77,7 @@ impl Subject {
             Self::HostGroupDiff { .. } => "SSH group differences".into(),
             Self::HostGroupRunDiff { .. } => "SSH group run differences".into(),
             Self::HostGroupRunComparison { .. } => "SSH group run comparison".into(),
+            Self::FolderComparison(_) => "folder comparison".into(),
             Self::SshHostList => "SSH host list".into(),
             Self::SshGroupDefinition => "SSH group definition".into(),
             Self::SshLoginReport(_) => "SSH login report".into(),
@@ -120,6 +130,7 @@ impl Subject {
                     "ssh-group-run-comparison-{baseline}-to-{run}.json"
                 ))
             }
+            Self::FolderComparison(_) => file_picker::Purpose::FolderComparison,
             Self::SshHostList => file_picker::Purpose::SshHostList,
             Self::SshGroupDefinition => file_picker::Purpose::SshGroupDefinition,
             Self::SshLoginReport(sequence) => {
@@ -133,12 +144,14 @@ impl Subject {
 pub(super) struct Export {
     pub pending: Option<Subject>,
     pub status: Option<String>,
+    folder_feedback: Option<(FolderComparisonTarget, String)>,
 }
 
 pub enum Action {
     StartScrollback(Option<u64>),
     StartPaneImage(Option<u64>, ImageDestination),
     CopyPaneText(Option<u64>),
+    SaveFolderComparison(FolderComparisonTarget),
     CopiedPane(Subject, Result<bool, String>),
     Captured(u64, Result<String, String>),
     Finished(Subject, Result<Option<PathBuf>, String>),
@@ -169,6 +182,9 @@ enum PaneClipboard {
 impl TerminalApp {
     pub(super) fn handle_text_export(&mut self, action: Action, context: &ComponentContext<Self>) {
         match action {
+            Action::SaveFolderComparison(target) if self.export.pending.is_none() => {
+                self.save_folder_comparison(target, context);
+            }
             Action::StartPaneImage(Some(pane), destination) if self.export.pending.is_none() => {
                 self.export_pane_image(pane, destination, context);
             }
@@ -246,7 +262,10 @@ impl TerminalApp {
             Action::Finished(subject, result) if self.export.pending == Some(subject) => {
                 self.export.finish(subject, result);
             }
-            Action::Dismiss => self.export.status = None,
+            Action::Dismiss => {
+                self.export.status = None;
+                self.export.folder_feedback = None;
+            }
             _ => {}
         }
     }
@@ -367,6 +386,9 @@ impl TerminalApp {
         }
         self.export.pending = Some(subject);
         self.export.status = None;
+        if let Subject::FolderComparison(_) = subject {
+            self.export.folder_feedback = None;
+        }
         self.save_export(subject, write, context);
     }
 
@@ -414,6 +436,13 @@ impl TerminalApp {
 }
 
 impl Export {
+    pub(super) fn folder_status(&self, target: FolderComparisonTarget) -> Option<&str> {
+        self.folder_feedback
+            .as_ref()
+            .filter(|(reported, _)| *reported == target)
+            .map(|(_, message)| message.as_str())
+    }
+
     fn finish(&mut self, subject: Subject, result: Result<Option<PathBuf>, String>) {
         self.pending = None;
         self.status = match result {
@@ -421,5 +450,8 @@ impl Export {
             Ok(None) => None,
             Err(error) => Some(format!("Could not save {}. {error}", subject.label())),
         };
+        if let Subject::FolderComparison(target) = subject {
+            self.folder_feedback = self.status.clone().map(|status| (target, status));
+        }
     }
 }
