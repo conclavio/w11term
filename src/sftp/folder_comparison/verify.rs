@@ -3,10 +3,16 @@ use upload_directory::{Source, open_child, source_root};
 
 pub const FILE_VERIFICATION_LIMIT: u64 = 32 * 1024 * 1024;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerifiedFolderFile {
     pub reference_sha256: String,
     pub current_sha256: String,
+}
+
+impl VerifiedFolderFile {
+    pub fn contents_match(&self) -> bool {
+        self.reference_sha256 == self.current_sha256
+    }
 }
 
 pub fn valid_comparison_file_path(path: &str) -> bool {

@@ -425,6 +425,10 @@ Choose **Verify file contents…** and enter an exact relative path from the ref
 
 Select **Files with matching metadata** in the comparison filter to browse regular files with equal reported size and modification time. Use **Verify contents** on any row with regular files on both sides to start a SHA-256 check for that exact path. **Back to comparison** restores the filter and page.
 
+The comparison remembers the last completed SHA-256 check for each path until you choose **Compare again** or close the report. The JSON export lists those checks separately from the metadata differences, with both digests, a result, and the completion time in Unix seconds.
+
+Choose **Verify files on this page…** to check every row on the current page that has a regular file on both sides. The dialog shows progress and any per-file errors. **Stop page verification** keeps completed checks and leaves the remaining files unchecked.
+
 Choose **Preview image…** on a PNG, JPEG or GIF in the SFTP listing or search results to see the image and its original dimensions. The preview reads a regular file over the pane’s existing connection and displays a scaled still image, including the first frame of an animated GIF. It accepts files up to 8 MiB with dimensions up to 4096 pixels per side and up to 8,388,608 pixels in total.
 
 Choose **Tail text file…** in the listing or search results to read up to 200 lines from the last 64 KiB of a regular UTF-8 file. The drawer shows the file size and indicates when it omitted earlier text. **Refresh tail** reads the path again, so it picks up appended output or a log file replaced by rotation. You can select and copy the text.
