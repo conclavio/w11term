@@ -253,6 +253,11 @@ pub enum Operation {
     Ls {
         path: String,
     },
+    /// List folder choices for the drawer's move dialog on its existing connection.
+    #[serde(skip)]
+    BrowseMoveFolders {
+        path: String,
+    },
     Find {
         path: String,
         query: String,
@@ -655,6 +660,9 @@ pub(crate) async fn run(
                 Operation::MoveEntry { .. } => {
                     Some("Missing SSH connection approval; move was not started")
                 }
+                Operation::BrowseMoveFolders { .. } => {
+                    Some("Missing SSH connection for the destination picker")
+                }
                 Operation::RemoveEntry { .. } => {
                     Some("Missing SSH connection approval; delete was not started")
                 }
@@ -798,6 +806,9 @@ pub(crate) async fn run(
                 }
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
                 Operation::MoveEntry { .. } => JobStage::Checking("Move was not started"),
+                Operation::BrowseMoveFolders { .. } => {
+                    JobStage::Checking("Destination folders did not load")
+                }
                 Operation::SaveText { .. } => JobStage::Checking("Save was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
@@ -1025,6 +1036,85 @@ impl Engine {
             "The search result's containing folder changed"
         );
         Ok(())
+    }
+
+    async fn read_directory(
+        &self,
+        path: &str,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<Vec<russh_sftp::protocol::File>> {
+        let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
+        ensure!(!cancelled(), "Directory listing cancelled");
+        let handle = self.raw.opendir(path).await?.handle;
+        let result = async {
+            let mut entries = Vec::new();
+            let mut bytes = 0;
+            loop {
+                ensure!(!cancelled(), "Directory listing cancelled");
+                match self.raw.readdir(&handle).await {
+                    Ok(names) => {
+                        bytes += serde_json::to_vec(&names.files)?.len();
+                        ensure!(
+                            bytes <= 8 * 1024 * 1024,
+                            "directory listing exceeds 8 MiB; use opendir/readdir/close"
+                        );
+                        entries.extend(names.files);
+                    }
+                    Err(error) if eof(&error) => return Ok(entries),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        .await;
+        let closed = self.raw.close(handle).await;
+        let entries = result?;
+        closed?;
+        Ok(entries)
+    }
+
+    async fn browse_move_folders(
+        &self,
+        path: &str,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<Value> {
+        ensure!(
+            !cancel.is_some_and(TransferCancel::is_cancelled),
+            "Directory listing cancelled"
+        );
+        let directory = self.canonical_remote_path(path).await?;
+        ensure!(
+            !directory.chars().any(char::is_control),
+            "SFTP returned control characters in the directory path"
+        );
+        let mut folders = Vec::new();
+        for entry in self.read_directory(&directory, cancel).await? {
+            ensure!(
+                !cancel.is_some_and(TransferCancel::is_cancelled),
+                "Directory listing cancelled"
+            );
+            let name = entry.filename;
+            if matches!(name.as_str(), "" | "." | "..")
+                || name.contains(['/', '\\'])
+                || name.chars().any(char::is_control)
+            {
+                continue;
+            }
+            let mut mode = entry.attrs.permissions;
+            if mode.is_none_or(|mode| mode & 0o170000 == 0) {
+                let child = format!("{}/{name}", directory.trim_end_matches('/'));
+                match self.raw.lstat(child).await {
+                    Ok(reply) => mode = reply.attrs.permissions,
+                    Err(error) if transport_error(&error) => return Err(error.into()),
+                    Err(_) => continue,
+                }
+            }
+            if EntryKind::from_permissions(mode) == Some(EntryKind::Directory) {
+                folders.push(name);
+            }
+        }
+        folders.sort_unstable();
+        folders.dedup();
+        Ok(json!({"directory":directory,"folders":folders}))
     }
 
     async fn rename_without_replacement(
@@ -1396,32 +1486,9 @@ impl Engine {
                         "SFTP resolves this mount to a different path"
                     );
                 }
-                let h = self.raw.opendir(path).await?.handle;
-                let result = async {
-                    let mut entries = Vec::new();
-                    let mut bytes = 0;
-                    loop {
-                        match self.raw.readdir(&h).await {
-                            Ok(names) => {
-                                bytes += serde_json::to_vec(&names.files)?.len();
-                                ensure!(
-                                    bytes <= 8 * 1024 * 1024,
-                                    "directory listing exceeds 8 MiB; use opendir/readdir/close"
-                                );
-                                entries.extend(names.files);
-                            }
-                            Err(e) if eof(&e) => break,
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    Ok(json!({"entries":entries}))
-                }
-                .await;
-                let closed = self.raw.close(h).await;
-                let value: Value = result?;
-                closed?;
-                value
+                json!({"entries":self.read_directory(&path, None).await?})
             }
+            BrowseMoveFolders { path } => self.browse_move_folders(&path, cancel).await?,
             Read {
                 handle,
                 offset,

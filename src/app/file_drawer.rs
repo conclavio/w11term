@@ -17,6 +17,7 @@ use w11term::sftp::{
 };
 
 mod bookmarks;
+mod destination;
 mod downloads;
 mod editor;
 pub(super) mod find;
@@ -127,6 +128,7 @@ pub enum FileAction {
     TextEditor(u64, u64, editor::Action),
     Rename(u64, u64, ListedEntry),
     MoveEntry(u64, u64, FileTarget),
+    MoveDestination(u64, u64, u64, destination::Action),
     VerifyDownload(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
@@ -341,6 +343,7 @@ struct EntryDialog {
     parent: Option<String>,
     name: String,
     resume_download: bool,
+    destination_picker: Option<destination::Picker>,
     action: EditAction,
 }
 
@@ -478,6 +481,7 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    MoveDestination(u64, u64),
     Search(u64, Option<String>),
     SaveText(editor::Save),
     Transfer(TransferFile),
@@ -1031,6 +1035,7 @@ impl FileDrawer {
             self.cached.get_mut().take();
         }
         if self.dialog.take().is_some() {
+            self.stop_destination_listing();
             self.cached.get_mut().take();
         }
     }
@@ -1338,6 +1343,7 @@ impl FileDrawer {
                     .map_or_else(String::new, |entry| entry.name.clone()),
             },
             resume_download: false,
+            destination_picker: None,
             action,
         });
     }
@@ -1348,6 +1354,17 @@ impl FileDrawer {
         result: ContentDialogResult,
     ) -> Result<Option<(EntryDialog, String)>> {
         if !self.dialog.as_ref().is_some_and(|e| e.serial == serial) {
+            return Ok(None);
+        }
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|e| e.destination_picker.is_some())
+        {
+            if result != ContentDialogResult::Primary {
+                self.dialog.take();
+                self.stop_destination_listing();
+            }
             return Ok(None);
         }
         let dialog = self.dialog.take().unwrap();
@@ -1392,6 +1409,9 @@ impl FileDrawer {
         let dialog = self.dialog.as_ref()?;
         let serial = dialog.serial;
         let generation = self.generation;
+        if let Some(picker) = &dialog.destination_picker {
+            return Some(picker.dialog(dialog, pane, generation, context));
+        }
         let valid = dialog.destination();
         if let EditAction::Delete(_, kind) = &dialog.action {
             let title = match kind {
@@ -1482,6 +1502,19 @@ impl FileDrawer {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             );
+            fields.push(KeyedView::new(
+                "browse-destination",
+                Button::new()
+                    .on_click(context.callback(move |_| {
+                        Message::Files(FileAction::MoveDestination(
+                            pane,
+                            generation,
+                            serial,
+                            destination::Action::Show,
+                        ))
+                    }))
+                    .content("Browse folders…"),
+            ));
             fields.push(KeyedView::new(
                 "move-relative",
                 TextBlock::new()
@@ -2453,6 +2486,7 @@ impl FileDrawer {
         let timer = crate::ui_timer::RetryTimer::new(move || {
             tick.borrow().send(Message::Files(FileAction::Tick(id)));
         })?;
+        let move_picker = matches!(step, Step::MoveDestination(..));
         session
             .input
             .send(Command::Sftp(Job {
@@ -2463,10 +2497,16 @@ impl FileDrawer {
                     self.preview.as_ref().map(|p| p.cancel.clone())
                 } else if matches!(step, Step::Search(..)) {
                     self.search.as_ref().and_then(|p| p.cancel.clone())
+                } else if move_picker {
+                    self.dialog
+                        .as_ref()
+                        .and_then(|d| d.destination_picker.as_ref())
+                        .map(|p| p.cancel.clone())
                 } else {
                     transfer.as_ref().map(|active| active.cancel.clone())
                 },
-                deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
+                deadline: tokio::time::Instant::now()
+                    + Duration::from_secs(if move_picker { 30 } else { DEFAULT_TIMEOUT }),
                 reply: tx,
             }))
             .map_err(|_| anyhow!("SSH session has closed"))?;
@@ -2602,6 +2642,9 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::MoveDestination(serial, revision), reply) => {
+                self.finish_destination_listing(serial, revision, reply)
+            }
             (Step::Search(serial, note), reply) => {
                 self.finish_search(serial, reply, note.as_deref())
             }
@@ -3056,6 +3099,7 @@ impl TerminalApp {
             | TextEditor(id, ..)
             | Rename(id, ..)
             | MoveEntry(id, ..)
+            | MoveDestination(id, ..)
             | VerifyDownload(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
@@ -3120,7 +3164,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3416,7 +3460,9 @@ impl TerminalApp {
                 }
                 EditName(_, _, serial, name) => {
                     if let Some(dialog) = files.dialog.as_mut().filter(|e| {
-                        e.serial == serial && !matches!(e.action, EditAction::Delete(..))
+                        e.serial == serial
+                            && e.destination_picker.is_none()
+                            && !matches!(e.action, EditAction::Delete(..))
                     }) {
                         dialog.name = name;
                     }
@@ -3426,6 +3472,11 @@ impl TerminalApp {
                         e.serial == serial && matches!(e.action, EditAction::VerifyDownload(_))
                     }) {
                         dialog.resume_download = checked;
+                    }
+                }
+                MoveDestination(_, _, serial, action) => {
+                    if may_open_dialog {
+                        files.move_destination(pane, serial, action, session, context)?;
                     }
                 }
                 FinishEdit(_, _, serial, result) => {
