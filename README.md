@@ -539,6 +539,8 @@ Programming ligatures default to enabled for adjacent ASCII cells with matching 
 
 The terminal follows **Windows Settings → Accessibility → Text size** by default. Changing the slider and choosing **Apply** updates the cell grid in open panes. Terminal zoom sets the base font size, and **Reset font size** restores that base before Windows scaling is applied. Turn off **Follow Windows text size** in w11term Settings for a grid sized by terminal zoom and display DPI.
 
+In w11term Settings, choose **Default cursor style** for a steady or blinking block, bar, or underline. The choice applies in the current window and is saved for new windows. Applications can still set their own cursor style. When they reset it, the pane uses your preference again. Blinking follows the Windows caret interval.
+
 SSH supports OpenSSH private keys supplied with `--identity`, protected w11term device keys, the Windows OpenSSH agent (the default for `ssh user@host`), `--auth none`, `--auth password`, and `--auth keyboard-interactive`. Password and MFA challenges use native dialogs; hidden answers never enter terminal input, profiles, event logs, or recordings. A successful password remains in memory only for reconnection; one-time codes are requested again. Passphrase-protected OpenSSH keys can be used through the agent.
 
 Choose **Private key file** in Quick Connect or an SSH profile, then use **Browse…** to select the file through the Windows dialog. The picker starts beside the entered path when that folder is available locally, or in your OpenSSH `.ssh` folder when it exists.

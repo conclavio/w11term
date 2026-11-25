@@ -4084,6 +4084,33 @@ mod tests {
         terminal.advance_bytes(b"\x1b[?12$p");
         assert_eq!(receive(&mut replies), b"\x1b[?12;2$y");
     }
+
+    #[test]
+    fn default_cursor_shape_is_inherited_by_cursor_reset_but_respects_application_overrides() {
+        use termwiz::surface::CursorShape::*;
+        let (mut terminal, mut replies) = engine();
+        assert!(terminal.set_default_cursor_shape(SteadyBar));
+        assert_eq!(terminal.cursor_pos().shape, SteadyBar);
+        terminal.advance_bytes(b"\x1b[?12h");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingBar);
+        terminal.advance_bytes(b"\x1b[?12l");
+        assert_eq!(terminal.cursor_pos().shape, SteadyBar);
+
+        terminal.advance_bytes(b"\x1b[2 q");
+        assert!(!terminal.set_default_cursor_shape(BlinkingUnderline));
+        assert_eq!(terminal.cursor_pos().shape, SteadyBlock);
+        terminal.advance_bytes(b"\x1b[0 q\x1b[?12$p");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+        assert_eq!(receive(&mut replies), b"\x1b[?12;1$y");
+
+        terminal.advance_bytes(b"\x1b7\x1b[6 q\x1b8");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+        terminal.advance_bytes(b"\x1b[2 q\x1bc");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+        terminal.advance_bytes(b"\x1b[6 q");
+        terminal.reset_connection();
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+    }
     fn text(t: &Terminal) -> String {
         let s = t.screen();
         s.lines_in_phys_range(s.phys_row(0)..s.phys_row(0) + s.physical_rows)

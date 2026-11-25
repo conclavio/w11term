@@ -125,19 +125,23 @@ impl NewShell {
         Ok(self)
     }
 
-    fn launch(self, osc52: RemoteClipboardPolicy) -> AppTab {
+    fn launch(self, preferences: impl Into<PanePreferences> + Copy) -> AppTab {
         let mut tab = if let (Some(startup), Source::Ssh(options)) = (self.startup, &self.source) {
             // A directory-only recipe opens an interactive shell. Its directory
             // was bound to this endpoint when the user saved it in w11term.
-            let session =
-                Session::start_workspace_ssh(options.clone(), self.size, osc52, (*startup).clone());
+            let session = Session::start_workspace_ssh(
+                options.clone(),
+                self.size,
+                preferences,
+                (*startup).clone(),
+            );
             let mut tab = live_tab_for_session(self.label, self.source, session);
             if let Page::Terminal(live) = &mut tab.page {
                 live.startup = Some(startup);
             }
             tab
         } else {
-            live_tab_sized(self.label, self.source, self.size, osc52, None, None)
+            live_tab_sized(self.label, self.source, self.size, preferences, None, None)
         }
         .with_profile(self.profile);
         if let Page::Terminal(live) = &mut tab.page {
@@ -172,13 +176,9 @@ impl TerminalApp {
         };
         let catalog = self.store.catalog().ok();
         let shell = closed.shell.clone().prepare(catalog.as_ref())?;
-        let osc52 = self
-            .appearance
-            .read()
-            .unwrap()
-            .interaction
-            .remote_clipboard_policy();
-        self.tabs.reopen_pane(&closed.location, shell.launch(osc52));
+        let preferences = self.appearance.read().unwrap().pane_preferences();
+        self.tabs
+            .reopen_pane(&closed.location, shell.launch(preferences));
         self.closed_pane = None;
         self.sync_selection(context);
         self.activate(context);
@@ -218,16 +218,11 @@ impl TerminalApp {
             return Ok(());
         };
         let catalog = self.store.catalog().ok();
-        let osc52 = self
-            .appearance
-            .read()
-            .unwrap()
-            .interaction
-            .remote_clipboard_policy();
+        let preferences = self.appearance.read().unwrap().pane_preferences();
         self.tabs.reopen_group(
             &closed.layout,
             |recipe| recipe.clone().prepare(catalog.as_ref()),
-            |shell| shell.launch(osc52),
+            |shell| shell.launch(preferences),
         )?;
         self.closed_tabs.pop_back();
         self.sync_selection(context);
@@ -265,15 +260,10 @@ impl TerminalApp {
         // Only keep a profile association if the on-disk catalog still agrees.
         // A moved/deleted catalog cannot change a live pane's launch recipe.
         let catalog = self.store.catalog().ok();
-        let osc52 = self
-            .appearance
-            .read()
-            .unwrap()
-            .interaction
-            .remote_clipboard_policy();
+        let preferences = self.appearance.read().unwrap().pane_preferences();
         self.tabs.duplicate_active_group(
             |tab| NewShell::capture(tab)?.prepare(catalog.as_ref()),
-            |recipe| recipe.launch(osc52),
+            |recipe| recipe.launch(preferences),
         )?;
         self.sync_selection(context);
         self.activate(context);
@@ -297,6 +287,7 @@ fn matching_profile(catalog: &Profiles, name: Option<&str>, source: &Source) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use w11term::clipboard::RemoteClipboardPolicy;
 
     fn ssh() -> SshOptions {
         serde_json::from_value(

@@ -372,6 +372,7 @@ pub struct TerminalState {
     /// The current cursor position, relative to the top left
     /// of the screen.  0-based index.
     cursor: CursorPosition,
+    default_cursor_shape: CursorShape,
 
     /// if true, implicitly move to the next line on the next
     /// printed character
@@ -717,6 +718,7 @@ impl TerminalState {
             screen,
             pen: CellAttributes::default(),
             cursor: CursorPosition::default(),
+            default_cursor_shape: CursorShape::Default,
             top_and_bottom_margins: 0..size.rows as VisibleRowIndex,
             left_and_right_margins: 0..size.cols,
             left_and_right_margin_mode: false,
@@ -1624,7 +1626,7 @@ impl TerminalState {
         CursorPosition {
             x: self.cursor.x,
             y: self.cursor.y,
-            shape: self.cursor.shape,
+            shape: self.effective_cursor_shape(),
             visibility: if self.cursor_visible {
                 CursorVisibility::Visible
             } else {
@@ -1632,6 +1634,21 @@ impl TerminalState {
             },
             seqno: self.cursor.seqno,
         }
+    }
+
+    fn effective_cursor_shape(&self) -> CursorShape {
+        if self.cursor.shape == CursorShape::Default {
+            self.default_cursor_shape
+        } else {
+            self.cursor.shape
+        }
+    }
+
+    /// Set the local fallback for a cursor with the default DECSCUSR style.
+    pub fn set_default_cursor_shape(&mut self, shape: CursorShape) -> bool {
+        let previous = self.effective_cursor_shape();
+        self.default_cursor_shape = shape;
+        previous != self.effective_cursor_shape()
     }
 
     /// Returns the current cell attributes of the screen
@@ -2175,7 +2192,7 @@ impl TerminalState {
             DecPrivateMode::Unspecified(2031) => self.report_color_scheme_changes,
             DecPrivateMode::Code(code) => match code {
                 InBandResize => self.report_text_area_resize,
-                StartBlinkingCursor => self.cursor.shape.is_blinking(),
+                StartBlinkingCursor => self.effective_cursor_shape().is_blinking(),
                 Win32InputMode => self.keyboard_encoding == KeyboardEncoding::Win32,
                 ReverseWraparound => self.reverse_wraparound_mode,
                 LeftRightMarginMode => self.left_and_right_margin_mode,
@@ -2320,7 +2337,7 @@ impl TerminalState {
             )) => {
                 use CursorShape::*;
                 let blinking = matches!(mode, Mode::SetDecPrivateMode(_));
-                self.cursor.shape = match (self.cursor.shape, blinking) {
+                self.cursor.shape = match (self.effective_cursor_shape(), blinking) {
                     (BlinkingBar | SteadyBar, true) => BlinkingBar,
                     (BlinkingBar | SteadyBar, false) => SteadyBar,
                     (BlinkingUnderline | SteadyUnderline, true) => BlinkingUnderline,

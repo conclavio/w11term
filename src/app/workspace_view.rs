@@ -263,13 +263,13 @@ impl TerminalApp {
                         .load()?
                         .remove(&name)
                         .with_context(|| format!("Workspace {name} was removed"))?;
-                    let osc52 = self
-                        .appearance
-                        .read()
-                        .unwrap()
-                        .interaction
-                        .remote_clipboard_policy();
-                    append_workspace(&mut self.tabs, &workspace, &self.catalog.profiles, osc52)
+                    let preferences = self.appearance.read().unwrap().pane_preferences();
+                    append_workspace(
+                        &mut self.tabs,
+                        &workspace,
+                        &self.catalog.profiles,
+                        preferences,
+                    )
                 });
                 match result {
                     Ok(()) => {
@@ -533,10 +533,10 @@ pub(super) fn append_workspace(
     tabs: &mut Tabs<AppTab>,
     workspace: &Workspace,
     profiles: &BTreeMap<String, SshOptions>,
-    osc52: RemoteClipboardPolicy,
+    preferences: impl Into<PanePreferences> + Copy,
 ) -> anyhow::Result<()> {
     let sources = workspace.resolve_sources(profiles)?;
-    append_resolved_workspace(tabs, workspace, sources, osc52);
+    append_resolved_workspace(tabs, workspace, sources, preferences);
     Ok(())
 }
 
@@ -544,7 +544,7 @@ pub(super) fn append_resolved_workspace(
     tabs: &mut Tabs<AppTab>,
     workspace: &Workspace,
     mut sources: BTreeMap<u64, Source>,
-    osc52: RemoteClipboardPolicy,
+    preferences: impl Into<PanePreferences> + Copy,
 ) {
     restore_tabs(tabs, workspace, |slot, saved, pane_name| {
         let source = sources.remove(&slot).expect("validated workspace slot");
@@ -556,7 +556,7 @@ pub(super) fn append_resolved_workspace(
             session_browser::discovery_tab(
                 label,
                 options.clone(),
-                osc52,
+                preferences,
                 saved.session().cloned(),
                 saved.is_herdr_browser(),
             )
@@ -565,7 +565,7 @@ pub(super) fn append_resolved_workspace(
             let session = Session::start_workspace_ssh(
                 options.clone(),
                 TerminalSize::default(),
-                osc52,
+                preferences,
                 launch.clone(),
             );
             let mut tab = live_tab_for_session(label, source, session).with_profile(profile_name);
@@ -578,7 +578,7 @@ pub(super) fn append_resolved_workspace(
                 label,
                 source,
                 TerminalSize::default(),
-                osc52,
+                preferences,
                 None,
                 saved.session().cloned(),
             )
@@ -771,6 +771,7 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use w11term::clipboard::RemoteClipboardPolicy;
     use w11term::pane_layout::{Axis, Layout};
     use w11term::workspace::WorkspaceTab;
 

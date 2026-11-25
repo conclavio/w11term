@@ -951,11 +951,7 @@ impl TerminalApp {
                 Session::start_group_ssh(
                     ssh.clone(),
                     TerminalSize::default(),
-                    self.appearance
-                        .read()
-                        .unwrap()
-                        .interaction
-                        .remote_clipboard_policy(),
+                    self.appearance.read().unwrap().pane_preferences(),
                     gate.clone(),
                 )
             });

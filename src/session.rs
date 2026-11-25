@@ -8,6 +8,7 @@ use crate::{
 };
 use anyhow::Context as _;
 use std::{sync::Arc, thread};
+use termwiz::surface::CursorShape;
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub enum Command {
     NotificationReply(crate::events::NotificationResponse),
     /// Change the local display defaults without sending input to the transport.
     SetColorScheme(ColorScheme),
+    SetDefaultCursorShape(CursorShape),
     /// Input method committed text has no corresponding physical key presses.
     Composed(String),
     Observe(tokio::sync::oneshot::Sender<tokio::sync::broadcast::Receiver<Vec<u8>>>),
@@ -282,6 +284,27 @@ pub struct Session {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+pub struct PanePreferences {
+    pub clipboard_policy: RemoteClipboardPolicy,
+    pub default_cursor_shape: CursorShape,
+}
+
+impl From<RemoteClipboardPolicy> for PanePreferences {
+    fn from(clipboard_policy: RemoteClipboardPolicy) -> Self {
+        Self {
+            clipboard_policy,
+            default_cursor_shape: CursorShape::Default,
+        }
+    }
+}
+
+impl From<bool> for PanePreferences {
+    fn from(clipboard_enabled: bool) -> Self {
+        Self::from(RemoteClipboardPolicy::from(clipboard_enabled))
+    }
+}
+
 struct Services {
     colors: colors::PaneColors,
     prompts: crate::prompts::Prompts,
@@ -336,9 +359,9 @@ impl Session {
     pub fn start_configured(
         source: Source,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
-        Self::start_configured_with_connection(source, size, clipboard_policy, None)
+        Self::start_configured_with_connection(source, size, preferences, None)
     }
 
     /// Snapshot the authenticated connection of a ready SSH pane, for an
@@ -385,13 +408,13 @@ impl Session {
     pub fn start_configured_with_connection(
         source: Source,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
         Self::start_worker(
             source,
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             connection,
             None,
             None,
@@ -402,13 +425,13 @@ impl Session {
     pub fn start_group_ssh(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         launch_gate: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             None,
             None,
@@ -418,10 +441,22 @@ impl Session {
 
     /// A GUI pane can be created before layout assigns it a grid and pixel size.
     pub fn start_view_recording_pane(path: std::path::PathBuf, size: TerminalSize) -> Self {
+        Self::start_view_recording_pane_with_preferences(
+            path,
+            size,
+            RemoteClipboardPolicy::Disabled,
+        )
+    }
+
+    pub fn start_view_recording_pane_with_preferences(
+        path: std::path::PathBuf,
+        size: TerminalSize,
+        preferences: impl Into<PanePreferences>,
+    ) -> Self {
         Self::start_worker(
             Source::ViewRecording(path),
             has_cell_pixels(size).then_some(size),
-            RemoteClipboardPolicy::Disabled,
+            preferences.into(),
             None,
             None,
             None,
@@ -432,12 +467,12 @@ impl Session {
     pub fn start_replay_pane(
         path: std::path::PathBuf,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
         Self::start_worker(
             Source::Replay(path),
             has_cell_pixels(size).then_some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             None,
             None,
@@ -448,23 +483,23 @@ impl Session {
     pub fn start_workspace_ssh(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         startup: crate::workspace::SshStartup,
     ) -> Self {
-        Self::start_ssh_with_startup(options, size, clipboard_policy, startup, None)
+        Self::start_ssh_with_startup(options, size, preferences, startup, None)
     }
 
     pub fn start_ssh_with_startup(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         startup: crate::workspace::SshStartup,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             connection,
             None,
             Some(startup),
@@ -475,14 +510,14 @@ impl Session {
     pub fn start_durable(
         source: Source,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<crate::durable::DurableReference>,
     ) -> Self {
         Self::start_worker(
             source,
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             connection,
             Some(ssh::DurableStart::Attach(saved)),
             None,
@@ -494,13 +529,13 @@ impl Session {
     pub fn discover_durable(
         mut options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             Some(ssh::DurableStart::Discover),
             None,
@@ -512,13 +547,13 @@ impl Session {
     pub fn discover_herdr(
         mut options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             Some(ssh::DurableStart::DiscoverHerdr),
             None,
@@ -551,7 +586,7 @@ impl Session {
     fn start_worker(
         source: Source,
         initial_grid: Option<TerminalSize>,
-        clipboard_policy: RemoteClipboardPolicy,
+        preferences: PanePreferences,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<ssh::DurableStart>,
         startup: Option<crate::workspace::SshStartup>,
@@ -589,6 +624,7 @@ impl Session {
             source.scrollback_lines(),
             colors.effective(),
         );
+        terminal.set_default_cursor_shape(preferences.default_cursor_shape);
         let output_viewer = matches!(
             source,
             Source::TimedReplay(_) | Source::PausedReplay(_) | Source::ViewRecording(_)
@@ -596,7 +632,7 @@ impl Session {
         let remote_clipboard = Arc::new(RemoteClipboardAccess::new(if output_viewer {
             RemoteClipboardPolicy::Disabled
         } else {
-            clipboard_policy
+            preferences.clipboard_policy
         }));
         match &source {
             Source::Local(shell) if shell.wsl_distribution().is_some() => {
@@ -1238,6 +1274,10 @@ async fn run(
                     Some(Command::Shutdown) | None => break,
                     Some(Command::SetColorScheme(scheme)) => {
                         colors.choose(scheme);
+                        Ok(())
+                    }
+                    Some(Command::SetDefaultCursorShape(shape)) => {
+                        presentation.dirty |= terminal.set_default_cursor_shape(shape);
                         Ok(())
                     }
                     Some(Command::SetReadOnly(enabled)) => {

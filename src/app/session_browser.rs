@@ -106,7 +106,7 @@ pub enum Action {
 pub(super) fn discovery_tab(
     name: String,
     mut options: SshOptions,
-    osc52: RemoteClipboardPolicy,
+    preferences: impl Into<PanePreferences>,
     saved: Option<DurableReference>,
     herdr: bool,
 ) -> AppTab {
@@ -115,10 +115,10 @@ pub(super) fn discovery_tab(
     let source = Source::Ssh(options.clone());
     let session = match saved {
         Some(reference) => {
-            Session::start_durable(source.clone(), size, osc52, None, Some(reference))
+            Session::start_durable(source.clone(), size, preferences, None, Some(reference))
         }
-        None if herdr => Session::discover_herdr(options, size, osc52),
-        None => Session::discover_durable(options, size, osc52),
+        None if herdr => Session::discover_herdr(options, size, preferences),
+        None => Session::discover_durable(options, size, preferences),
     };
     let mut tab = live_tab_for_session(name.clone(), source, session).with_profile(Some(name));
     if let Page::Terminal(live) = &mut tab.page {
@@ -397,14 +397,9 @@ impl TerminalApp {
                     .get(name)
                     .filter(|o| !o.player.rustmush)
                 {
-                    let osc52 = self
-                        .appearance
-                        .read()
-                        .unwrap()
-                        .interaction
-                        .remote_clipboard_policy();
+                    let preferences = self.appearance.read().unwrap().pane_preferences();
                     self.insert_tab(
-                        discovery_tab(name.clone(), options.clone(), osc52, None, *herdr),
+                        discovery_tab(name.clone(), options.clone(), preferences, None, *herdr),
                         context,
                     );
                 }

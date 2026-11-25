@@ -11,8 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 use w11term::{
-    appearance::{Appearance, installed_fonts},
-    clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
+    appearance::{Appearance, DefaultCursorStyle, installed_fonts},
+    clipboard::RemoteClipboardAccess,
     control::{Pane, Registry, Server},
     interaction::{
         Link, MultiLinePasteWarning, Point, Selection, TabSwitcherMode, link_at, safe_url,
@@ -24,7 +24,7 @@ use w11term::{
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
-    session::{Command, Session},
+    session::{Command, PanePreferences, Session},
     shortcuts::Action as KeyAction,
     tabs::{BalancedPanes, PaneBalance, PaneRotation, PaneSwap, TabId, Tabs},
 };
@@ -1176,6 +1176,7 @@ pub enum Message {
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
     Font(Option<usize>),
+    DefaultCursorStyle(Option<usize>),
     Ligatures(bool),
     FollowWindowsTextSize(bool),
     WindowsTextSizeChanged,
@@ -1237,25 +1238,32 @@ pub enum Message {
     Smoke(u8),
 }
 
-fn live_tab(label: String, source: Source, osc52: impl Into<RemoteClipboardPolicy>) -> AppTab {
-    live_tab_sized(label, source, TerminalSize::default(), osc52, None, None)
+fn live_tab(label: String, source: Source, preferences: impl Into<PanePreferences>) -> AppTab {
+    live_tab_sized(
+        label,
+        source,
+        TerminalSize::default(),
+        preferences,
+        None,
+        None,
+    )
 }
 fn live_tab_sized(
     label: String,
     source: Source,
     size: TerminalSize,
-    osc52: impl Into<RemoteClipboardPolicy>,
+    preferences: impl Into<PanePreferences>,
     connection: Option<w11term::ssh::ConnectionShare>,
     saved: Option<w11term::durable::DurableReference>,
 ) -> AppTab {
     let session = if matches!(&source, Source::Ssh(ssh) if ssh.durable) {
-        Session::start_durable(source.clone(), size, osc52, connection, saved)
+        Session::start_durable(source.clone(), size, preferences, connection, saved)
     } else if let Source::Replay(path) = &source {
-        Session::start_replay_pane(path.clone(), size, osc52)
+        Session::start_replay_pane(path.clone(), size, preferences)
     } else if let Source::ViewRecording(path) = &source {
-        Session::start_view_recording_pane(path.clone(), size)
+        Session::start_view_recording_pane_with_preferences(path.clone(), size, preferences)
     } else {
-        Session::start_configured_with_connection(source.clone(), size, osc52, connection)
+        Session::start_configured_with_connection(source.clone(), size, preferences, connection)
     };
     live_tab_for_session(label, source, session)
 }
@@ -2126,6 +2134,8 @@ impl TerminalApp {
         }
     }
     fn save_preferences(&mut self, appearance: Appearance) {
+        let cursor_changed =
+            self.appearance.read().unwrap().default_cursor_style != appearance.default_cursor_style;
         self.keyboard
             .set_preferences(appearance.interaction.clone());
         for entry in self.tabs.entries() {
@@ -2133,6 +2143,11 @@ impl TerminalApp {
                 tab.session
                     .remote_clipboard
                     .set_policy(appearance.interaction.remote_clipboard_policy());
+                if cursor_changed {
+                    let _ = tab.session.input.send(Command::SetDefaultCursorShape(
+                        appearance.default_cursor_style.shape(),
+                    ));
+                }
             }
         }
         *self.appearance.write().unwrap() = appearance.clone();
@@ -2207,6 +2222,11 @@ impl TerminalApp {
             TextBlock::new().text("Follow Windows text size").into(),
             ToggleSwitch::new().automation_name("Follow Windows text size").is_on(appearance.follow_windows_text_size)
                 .on_toggled(context.callback(Message::FollowWindowsTextSize)).into(),
+            TextBlock::new().text("Default cursor style").into(),
+            ComboBox::new().width(260.0).automation_name("Default cursor style")
+                .items_source(DefaultCursorStyle::CHOICES.iter().map(|(_, label)| *label))
+                .selected_index(DefaultCursorStyle::CHOICES.iter().position(|(style, _)| *style == appearance.default_cursor_style))
+                .on_selection_changed(context.callback(Message::DefaultCursorStyle)).into(),
             TextBlock::new().text("Applies to all tabs. Changes are saved automatically.").into(),
         ];
         let mut profiles: Vec<View> =
@@ -2961,11 +2981,7 @@ impl TerminalApp {
         live_tab(
             label,
             source,
-            self.appearance
-                .read()
-                .unwrap()
-                .interaction
-                .remote_clipboard_policy(),
+            self.appearance.read().unwrap().pane_preferences(),
         )
         .with_profile(profile)
     }
@@ -3020,11 +3036,7 @@ impl TerminalApp {
             label,
             source,
             TerminalSize::default(),
-            self.appearance
-                .read()
-                .unwrap()
-                .interaction
-                .remote_clipboard_policy(),
+            self.appearance.read().unwrap().pane_preferences(),
             connection,
             None,
         )
@@ -3310,11 +3322,7 @@ impl TerminalApp {
                 *tab = live_tab(
                     source_label(&source),
                     source,
-                    self.appearance
-                        .read()
-                        .unwrap()
-                        .interaction
-                        .remote_clipboard_policy(),
+                    self.appearance.read().unwrap().pane_preferences(),
                 );
                 self.sync_selection(context);
                 self.activate(context);
@@ -3388,11 +3396,7 @@ impl TerminalApp {
                         *tab = live_tab(
                             name.clone(),
                             Source::Ssh(options.clone()),
-                            self.appearance
-                                .read()
-                                .unwrap()
-                                .interaction
-                                .remote_clipboard_policy(),
+                            self.appearance.read().unwrap().pane_preferences(),
                         )
                         .with_profile(Some(name));
                     } else if let Page::NewProfile(editor) = &mut tab.page {
@@ -4745,11 +4749,7 @@ impl Component for TerminalApp {
                 )
             })
             .unwrap_or((1120.0, 760.0));
-        let osc52 = appearance
-            .read()
-            .unwrap()
-            .interaction
-            .remote_clipboard_policy();
+        let osc52 = appearance.read().unwrap().pane_preferences();
         if let Some(workspace) = opening.as_ref().map(|window| &window.layout) {
             workspace_view::append_resolved_workspace(
                 &mut tabs,
@@ -5654,11 +5654,7 @@ impl Component for TerminalApp {
                         profile.clone(),
                         source,
                         size,
-                        self.appearance
-                            .read()
-                            .unwrap()
-                            .interaction
-                            .remote_clipboard_policy(),
+                        self.appearance.read().unwrap().pane_preferences(),
                         None,
                         None,
                     )
@@ -6725,6 +6721,17 @@ impl Component for TerminalApp {
                 }
             }
             Message::Font(None) => {}
+            Message::DefaultCursorStyle(index) => {
+                if let Some(&(style, _)) =
+                    index.and_then(|index| DefaultCursorStyle::CHOICES.get(index))
+                {
+                    let mut appearance = self.appearance.read().unwrap().clone();
+                    if appearance.default_cursor_style != style {
+                        appearance.default_cursor_style = style;
+                        self.save_preferences(appearance);
+                    }
+                }
+            }
             Message::Ligatures(enabled) => {
                 let mut appearance = self.appearance.read().unwrap().clone();
                 if appearance.ligatures != enabled {

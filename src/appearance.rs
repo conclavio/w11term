@@ -13,6 +13,41 @@ use windows::{
     core::{BOOL, w},
 };
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultCursorStyle {
+    #[default]
+    SteadyBlock,
+    SteadyBar,
+    SteadyUnderline,
+    BlinkingBlock,
+    BlinkingBar,
+    BlinkingUnderline,
+}
+
+impl DefaultCursorStyle {
+    pub const CHOICES: [(Self, &'static str); 6] = [
+        (Self::SteadyBlock, "Steady block"),
+        (Self::SteadyBar, "Steady bar"),
+        (Self::SteadyUnderline, "Steady underline"),
+        (Self::BlinkingBlock, "Blinking block"),
+        (Self::BlinkingBar, "Blinking bar"),
+        (Self::BlinkingUnderline, "Blinking underline"),
+    ];
+
+    pub fn shape(self) -> termwiz::surface::CursorShape {
+        use termwiz::surface::CursorShape;
+        match self {
+            Self::SteadyBlock => CursorShape::Default,
+            Self::SteadyBar => CursorShape::SteadyBar,
+            Self::SteadyUnderline => CursorShape::SteadyUnderline,
+            Self::BlinkingBlock => CursorShape::BlinkingBlock,
+            Self::BlinkingBar => CursorShape::BlinkingBar,
+            Self::BlinkingUnderline => CursorShape::BlinkingUnderline,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
@@ -20,6 +55,7 @@ pub struct Appearance {
     pub ligatures: bool,
     pub font_size: f32,
     pub follow_windows_text_size: bool,
+    pub default_cursor_style: DefaultCursorStyle,
     #[serde(skip, default = "default_text_scale")]
     windows_text_scale: f32,
     pub interaction: crate::interaction::Interaction,
@@ -36,6 +72,7 @@ impl Default for Appearance {
             ligatures: true,
             font_size: 16.0,
             follow_windows_text_size: true,
+            default_cursor_style: DefaultCursorStyle::default(),
             windows_text_scale: default_text_scale(),
             interaction: crate::interaction::Interaction::default(),
             shortcuts: Default::default(),
@@ -45,6 +82,13 @@ impl Default for Appearance {
     }
 }
 impl Appearance {
+    pub fn pane_preferences(&self) -> crate::session::PanePreferences {
+        crate::session::PanePreferences {
+            clipboard_policy: self.interaction.remote_clipboard_policy(),
+            default_cursor_shape: self.default_cursor_style.shape(),
+        }
+    }
+
     pub fn set_windows_text_scale(&mut self, factor: f64) {
         self.windows_text_scale = if (1.0..=2.25).contains(&factor) {
             factor as f32

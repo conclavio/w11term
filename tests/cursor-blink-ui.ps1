@@ -84,6 +84,31 @@ try {
     Assert-Blinking
     $null = Send-Sequence '[?12l'
     Assert-Steady
+
+    $null = Send-Sequence '[2 q'
+    $block = Wait-Until 'application block cursor' {
+        $sample = Sample-Cell
+        if ($sample -ne $hidden -and $sample -ne $shown) { $sample }
+    }
+    Run-Palette 'Settings'
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $field = Wait-Until 'default cursor style choice' { Find-Element 'Default cursor style' $combo }
+    $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $bar = Wait-Until 'steady bar option' {
+        Find-Element 'Steady bar' ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $bar.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'cursor style persisted' {
+        (Get-Content -LiteralPath $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).default_cursor_style -ceq 'steady_bar'
+    }
+    $field = Find-Element 'Default cursor style' $combo
+    $popup = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    Press-Key 0x77 # F8 selects the SSH tab.
+    Wait-Focus $pane
+    $null = Wait-Until 'application cursor still overrides the preference' { (Sample-Cell) -eq $block }
+    $null = Send-Sequence '[0 q'
+    Assert-Steady
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
