@@ -4,27 +4,48 @@ const BUTTON_WIDTH: f64 = 36.0;
 pub(super) const INBOX_WIDTH: f64 = 50.0;
 const GAP: f64 = 2.0;
 const CAPTION_RESERVE: f64 = 180.0;
-const MIN_TAB_WIDTH: f64 = 144.0;
 const DRAG_RESERVE: f64 = 28.0;
-const TOOLS_WIDTH: f64 = 4.0 * (BUTTON_WIDTH + GAP) + INBOX_WIDTH;
 const TAB_ACTIONS_WIDTH: f64 = 2.0 * BUTTON_WIDTH;
+const FULL_TOOLS_WIDTH: f64 = 4.0 * (BUTTON_WIDTH + GAP) + INBOX_WIDTH;
+const COMPACT_TOOLS_WIDTH: f64 = BUTTON_WIDTH + GAP + INBOX_WIDTH;
+const TAB_CHROME_RESERVE: f64 = 390.0;
+const MIN_TAB_STRIP_WIDTH: f64 = 140.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tools {
+    Full,
+    Compact,
+    Hidden,
+}
 
 pub(super) struct Layout {
     pub(super) content_width: f64,
     pub(super) tab_width: f64,
-    pub(super) show_tools: bool,
+    tools: Tools,
 }
 
 impl Layout {
     pub(super) fn new(window_width: f64, tabs: usize) -> Self {
         let width = (window_width - CAPTION_RESERVE).max(TAB_ACTIONS_WIDTH);
-        let show_tools = width >= MIN_TAB_WIDTH + TAB_ACTIONS_WIDTH + TOOLS_WIDTH + DRAG_RESERVE;
-        let content_width = width - if show_tools { TOOLS_WIDTH } else { 0.0 };
+        let tab_width = tabs as f64 * 110.0 + 16.0;
+        // Keep the former tab-strip budget when the tabs start to crowd. WinUI
+        // can leave a newly selected tab outside the realized header range.
+        let tab_budget =
+            tab_width.min((window_width - TAB_CHROME_RESERVE).max(MIN_TAB_STRIP_WIDTH));
+        let room_for_tools = width - TAB_ACTIONS_WIDTH - DRAG_RESERVE - tab_budget;
+        let (tools, tool_width) = if room_for_tools >= FULL_TOOLS_WIDTH {
+            (Tools::Full, FULL_TOOLS_WIDTH)
+        } else if room_for_tools >= COMPACT_TOOLS_WIDTH {
+            (Tools::Compact, COMPACT_TOOLS_WIDTH)
+        } else {
+            (Tools::Hidden, 0.0)
+        };
+        let content_width = width - tool_width;
         let tabs_available = (content_width - TAB_ACTIONS_WIDTH - DRAG_RESERVE).max(0.0);
         Self {
             content_width,
-            tab_width: (tabs as f64 * 110.0 + 16.0).min(tabs_available),
-            show_tools,
+            tab_width: tab_width.min(tabs_available),
+            tools,
         }
     }
 }
@@ -48,7 +69,7 @@ impl TerminalApp {
         menu_action: Callback<String>,
         context: &ViewContext<Self>,
     ) -> View {
-        if !layout.show_tools {
+        if layout.tools == Tools::Hidden {
             return View::empty();
         }
         let live = self.tabs.active().and_then(|tab| match &tab.page {
@@ -72,6 +93,16 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e8b7}"))
             .tooltip_with(below("SFTP files"));
 
+        let tools = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .spacing(GAP);
+        if layout.tools == Tools::Compact {
+            return tools.keyed_children([
+                KeyedView::new("files", files),
+                KeyedView::new("inbox", self.inbox_button(context)),
+            ]);
+        }
         let panes = button("Pane layout")
             .automation_id("w11term-title-layout")
             .is_enabled(live.is_some())
@@ -106,16 +137,32 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e756}"))
             .tooltip_with(below(shortcut_hint(palette_binding)));
 
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .spacing(GAP)
-            .keyed_children([
-                KeyedView::new("files", files),
-                KeyedView::new("panes", panes),
-                KeyedView::new("find", find),
-                KeyedView::new("palette", palette),
-                KeyedView::new("inbox", self.inbox_button(context)),
-            ])
+        tools.keyed_children([
+            KeyedView::new("files", files),
+            KeyedView::new("panes", panes),
+            KeyedView::new("find", find),
+            KeyedView::new("palette", palette),
+            KeyedView::new("inbox", self.inbox_button(context)),
+        ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_yields_space_to_a_crowded_tab_strip() {
+        let single = Layout::new(1120.0, 1);
+        assert_eq!(single.tools, Tools::Full);
+        assert_eq!(single.tab_width, 126.0);
+
+        let crowded = Layout::new(1120.0, 8);
+        assert_eq!(crowded.tools, Tools::Compact);
+        assert!(crowded.tab_width >= 730.0);
+
+        let narrow = Layout::new(440.0, 8);
+        assert_eq!(narrow.tools, Tools::Hidden);
+        assert!(narrow.tab_width >= MIN_TAB_STRIP_WIDTH);
     }
 }
