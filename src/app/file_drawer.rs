@@ -138,6 +138,7 @@ pub enum FileAction {
     VerifyDownload(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
+    NewTextFile(u64, u64, u64),
     EditName(u64, u64, u64, String),
     ResumeDownload(u64, u64, u64, bool),
     FinishEdit(u64, u64, u64, ContentDialogResult),
@@ -2266,15 +2267,20 @@ impl FileDrawer {
                         NewFolder(pane, generation, folder.into()),
                     ),
                     button(
-                        "Move to folder…",
-                        writable
-                            && generation != 0
-                            && selected.is_some_and(|entry| {
-                                entry.kind != ListedKind::Unsupported
-                                    && entry_path(folder, &entry.name).is_ok()
-                            }),
-                        MoveEntry(pane, generation, FileTarget::Listed(listed(selected))),
+                        "New text file…",
+                        self.can_start_new_editor(revision),
+                        NewTextFile(pane, generation, revision),
                     ),
+                ),
+                button(
+                    "Move to folder…",
+                    writable
+                        && generation != 0
+                        && selected.is_some_and(|entry| {
+                            entry.kind != ListedKind::Unsupported
+                                && entry_path(folder, &entry.name).is_ok()
+                        }),
+                    MoveEntry(pane, generation, FileTarget::Listed(listed(selected))),
                 ),
                 button_pair(
                     button(
@@ -3437,6 +3443,7 @@ impl TerminalApp {
             | VerifyDownload(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
+            | NewTextFile(id, ..)
             | EditName(id, ..)
             | ResumeDownload(id, ..)
             | FinishEdit(id, ..)
@@ -3498,7 +3505,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -4043,6 +4050,11 @@ impl TerminalApp {
                 GoToFolder(_, _, revision) => {
                     if may_open_dialog {
                         files.begin_go_to_folder(revision);
+                    }
+                }
+                NewTextFile(_, _, revision) => {
+                    if may_open_dialog {
+                        files.start_new_editor(revision);
                     }
                 }
                 NewFolder(_, _, parent)

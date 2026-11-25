@@ -4018,7 +4018,7 @@ async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "edits UTF-8 text from the SFTP listing and search, and preserves conflicting drafts"]
+#[ignore = "creates and edits UTF-8 text from the SFTP drawer and preserves conflicting drafts"]
 async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
         unreachable!()
@@ -4055,8 +4055,13 @@ async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() 
     );
     assert_eq!(fs::read_dir(&generated).unwrap().count(), 1);
     assert_eq!(
+        fs::read(folder.join("new 雪.txt")).unwrap(),
+        "new=first\nlabel=雪".as_bytes()
+    );
+    assert!(fs::read(folder.join("empty.txt")).unwrap().is_empty());
+    assert_eq!(
         fs::read_dir(&folder).unwrap().count(),
-        3,
+        5,
         "editor left staging files behind"
     );
     assert_eq!(fs::read(keys).unwrap(), b"after-editor");
