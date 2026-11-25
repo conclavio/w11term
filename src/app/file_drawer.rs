@@ -119,6 +119,7 @@ pub enum FileAction {
     Preview(u64, u64, FileTarget, PreviewKind),
     ClosePreview(u64, u64, u64),
     ShowFullPreview(u64, u64, u64, bool),
+    MovePreviewMatch(u64, u64, u64, bool),
     CopyChecksum(u64, u64, u64),
     VerifyChecksum(u64, u64, u64),
     StartTextEditor(u64, u64, u64),
@@ -2946,6 +2947,7 @@ impl TerminalApp {
             | Preview(id, ..)
             | ClosePreview(id, ..)
             | ShowFullPreview(id, ..)
+            | MovePreviewMatch(id, ..)
             | CopyChecksum(id, ..)
             | VerifyChecksum(id, ..)
             | StartTextEditor(id, ..)
@@ -3016,7 +3018,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3143,6 +3145,9 @@ impl TerminalApp {
                 }
                 ClosePreview(_, _, serial) => files.close_preview(serial),
                 ShowFullPreview(_, _, serial, full) => files.show_full_preview(serial, full),
+                MovePreviewMatch(_, _, serial, forward) => {
+                    files.move_preview_match(serial, forward)
+                }
                 CopyChecksum(_, _, serial) => {
                     if may_open_dialog {
                         files.copy_checksum(serial);

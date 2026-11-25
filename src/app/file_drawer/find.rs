@@ -1,7 +1,7 @@
 use super::*;
 use w11term::sftp::{
-    FileSizeRange, FilenameFilter, FilenameSearch, FilenameSort as ResultSort, SearchDownload,
-    valid_filename_query,
+    FileSizeRange, FileTextMatch, FilenameFilter, FilenameSearch, FilenameSort as ResultSort,
+    SearchDownload, valid_filename_query,
 };
 
 pub mod saved;
@@ -142,11 +142,8 @@ fn within<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
 }
 
 impl Panel {
-    pub(super) fn match_file_text(
-        &self,
-        text: &str,
-    ) -> Result<Option<w11term::sftp::ContentMatch>> {
-        self.filter.match_file_text(text)
+    pub(super) fn match_file_text_lines(&self, text: &str) -> Result<Vec<FileTextMatch>> {
+        self.filter.match_file_text_lines(text)
     }
 
     fn advanced_summary(&self) -> Option<String> {

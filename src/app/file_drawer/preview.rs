@@ -1,6 +1,6 @@
 use super::*;
 use std::cell::OnceCell;
-use w11term::sftp::ContentMatch;
+use w11term::sftp::FileTextMatch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewKind {
@@ -29,71 +29,67 @@ enum Contents {
     Error(String),
 }
 
-enum MatchPreview {
-    Found {
-        line: usize,
-        excerpt: String,
-        before: Vec<String>,
-        after: Vec<String>,
-    },
-    Missing,
+struct MatchPreview {
+    lines: Vec<FileTextMatch>,
+    selected: usize,
 }
 
-impl MatchPreview {
-    fn from_file(text: &str, hit: ContentMatch) -> Self {
+struct MatchContext {
+    excerpt: String,
+    before: Vec<String>,
+    after: Vec<String>,
+}
+
+impl MatchContext {
+    fn from_file(text: &str, hit: FileTextMatch) -> Option<Self> {
         const CONTEXT_LINES: usize = 2;
-        let index = hit.line - 1;
-        let first = index.saturating_sub(CONTEXT_LINES);
-        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let mut lines = text.lines().skip(first);
-        let before = lines
-            .by_ref()
-            .take(index - first)
+        let (before_text, from_line) = text.split_at_checked(hit.line_start)?;
+        let before_text = before_text.strip_prefix('\u{feff}').unwrap_or(before_text);
+        let mut before: Vec<_> = before_text
+            .lines()
+            .rev()
+            .take(CONTEXT_LINES)
             .map(context_line)
             .collect();
-        lines.next();
-        let after = lines.take(CONTEXT_LINES).map(context_line).collect();
-        Self::Found {
-            line: hit.line,
-            excerpt: hit.excerpt,
+        before.reverse();
+        let after = from_line
+            .lines()
+            .skip(1)
+            .take(CONTEXT_LINES)
+            .map(context_line)
+            .collect();
+        Some(Self {
+            excerpt: hit.excerpt(text)?,
             before,
             after,
-        }
+        })
     }
 
-    fn view(&self) -> Option<View> {
-        let Self::Found {
-            line,
+    fn view(self, title: String) -> View {
+        let Self {
             excerpt,
             before,
             after,
-        } = self
-        else {
-            return None;
-        };
-        let mut fields = vec![KeyedView::new(
-            "line",
-            TextBlock::new().text(format!("Match on line {line}")),
-        )];
-        for (index, text) in before.iter().chain([excerpt]).chain(after).enumerate() {
+        } = self;
+        let preceding = before.len();
+        let mut fields = vec![KeyedView::new("line", TextBlock::new().text(title))];
+        for (index, text) in before.into_iter().chain([excerpt]).chain(after).enumerate() {
             let mut block = TextBlock::new()
                 .text(text)
                 .text_wrapping(TextWrapping::Wrap)
                 .min_height(18.0)
                 .is_text_selection_enabled(true);
-            if index == before.len() {
+            if index == preceding {
                 block = block
                     .automation_id("sftp-preview-match-line")
                     .font_weight(windows_reactor::FontWeight::SEMI_BOLD);
             }
             fields.push(KeyedView::new(format!("context-{index}"), block));
         }
-        Some(
-            ScrollViewer::new()
-                .max_height(420.0)
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(StackPanel::new().keyed_children(fields)),
-        )
+        ScrollViewer::new()
+            .max_height(420.0)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .content(StackPanel::new().keyed_children(fields))
     }
 }
 
@@ -130,6 +126,10 @@ impl EntryPreview {
     ) -> View {
         self.view
             .get_or_init(|| {
+                let matches = self
+                    .text_match
+                    .as_ref()
+                    .filter(|hits| !hits.lines.is_empty());
                 let body = match &self.content {
                     Contents::Loading => TextBlock::new()
                         .text(match self.kind {
@@ -157,22 +157,59 @@ impl EntryPreview {
                             .into()
                     }
                     Contents::Ready(text) => {
-                        let context = self
-                            .text_match
-                            .as_ref()
-                            .filter(|_| !self.full_text)
-                            .and_then(MatchPreview::view);
-                        context.unwrap_or_else(|| self.full_text_view(text))
+                        let match_view = matches.filter(|_| !self.full_text).and_then(|hits| {
+                            let hit = hits.lines[hits.selected];
+                            let title = if hits.lines.len() == 1 {
+                                format!("Match on line {}", hit.line)
+                            } else {
+                                format!(
+                                    "Match {} of {} · Line {}",
+                                    hits.selected + 1,
+                                    hits.lines.len(),
+                                    hit.line,
+                                )
+                            };
+                            Some(MatchContext::from_file(text, hit)?.view(title))
+                        });
+                        match_view.unwrap_or_else(|| self.full_text_view(text))
                     }
                 };
                 let serial = self.serial;
                 let body_key = if self.full_text {
-                    "full-document"
+                    "full-document".to_owned()
+                } else if let Some(hits) = matches {
+                    format!("match-{}", hits.selected)
                 } else {
-                    "document"
+                    "document".to_owned()
                 };
                 let mut fields = vec![KeyedView::new(body_key, body)];
-                if matches!(self.text_match, Some(MatchPreview::Found { .. })) {
+                if let Some(hits) = matches {
+                    if !self.full_text && hits.lines.len() > 1 {
+                        let nav_button = |label, forward, enabled| {
+                            Button::new()
+                                .is_enabled(enabled)
+                                .on_click(context.callback(move |_| {
+                                    Message::Files(FileAction::MovePreviewMatch(
+                                        pane, generation, serial, forward,
+                                    ))
+                                }))
+                                .content(label)
+                        };
+                        fields.push(KeyedView::new(
+                            "match-navigation",
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(8.0)
+                                .children((
+                                    nav_button("Previous match", false, hits.selected > 0),
+                                    nav_button(
+                                        "Next match",
+                                        true,
+                                        hits.selected + 1 < hits.lines.len(),
+                                    ),
+                                )),
+                        ));
+                    }
                     let full = !self.full_text;
                     fields.push(KeyedView::new(
                         "toggle-match",
@@ -188,7 +225,7 @@ impl EntryPreview {
                                 "Back to match"
                             }),
                     ));
-                } else if matches!(self.text_match, Some(MatchPreview::Missing)) {
+                } else if self.text_match.is_some() {
                     fields.insert(
                         0,
                         KeyedView::new(
@@ -418,9 +455,9 @@ impl FileDrawer {
                     && hit.content_match.is_some()
                     && let Some(panel) = &self.search
                 {
-                    preview.text_match = Some(match panel.match_file_text(&text) {
-                        Ok(Some(hit)) => MatchPreview::from_file(&text, hit),
-                        _ => MatchPreview::Missing,
+                    preview.text_match = Some(MatchPreview {
+                        lines: panel.match_file_text_lines(&text).unwrap_or_default(),
+                        selected: 0,
                     });
                 }
                 Contents::Ready(text)
@@ -432,10 +469,32 @@ impl FileDrawer {
 
     pub(super) fn show_full_preview(&mut self, serial: u64, full: bool) {
         if let Some(preview) = self.preview.as_mut().filter(|p| p.serial == serial)
-            && matches!(preview.text_match, Some(MatchPreview::Found { .. }))
+            && preview
+                .text_match
+                .as_ref()
+                .is_some_and(|hits| !hits.lines.is_empty())
             && preview.full_text != full
         {
             preview.full_text = full;
+            preview.view.take();
+        }
+    }
+
+    pub(super) fn move_preview_match(&mut self, serial: u64, forward: bool) {
+        let Some(preview) = self
+            .preview
+            .as_mut()
+            .filter(|p| p.serial == serial && !p.full_text)
+        else {
+            return;
+        };
+        if let Some(hits) = &mut preview.text_match
+            && let Some(selected) = hits
+                .selected
+                .checked_add_signed(if forward { 1 } else { -1 })
+            && selected < hits.lines.len()
+        {
+            hits.selected = selected;
             preview.view.take();
         }
     }
@@ -502,29 +561,73 @@ mod tests {
     #[test]
     fn match_preview_keeps_nearby_lines_and_caps_long_context() {
         let text = format!(
-            "\u{feff}outside\r\n{}\r\n\r\n\tÉcho\r\nfollowing\r\nlast nearby\r\noutside",
+            "\u{feff}Écho\r\n{}\r\n\r\n\tÉcho Écho\r\nfollowing\r\nlast nearby\r\noutside",
             "雪".repeat(170),
         );
         let filter = w11term::sftp::FilenameFilter {
-            content_query: "^\\s*écho$".into(),
+            content_query: "^\\s*écho".into(),
             regex: true,
             ..Default::default()
         };
-        let hit = filter.match_file_text(&text).unwrap().unwrap();
-        let MatchPreview::Found {
-            line,
+        let hits = filter.match_file_text_lines(&text).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.line).collect::<Vec<_>>(), [1, 4]);
+        assert_eq!(hits[0].line_start, '\u{feff}'.len_utf8());
+        assert!(
+            MatchContext::from_file(&text, hits[0])
+                .unwrap()
+                .before
+                .is_empty()
+        );
+        let MatchContext {
             excerpt,
             before,
             after,
-        } = MatchPreview::from_file(&text, hit)
-        else {
-            unreachable!()
-        };
-        assert_eq!(line, 4);
-        assert_eq!(excerpt, " Écho");
+        } = MatchContext::from_file(&text, hits[1]).unwrap();
+        assert_eq!(excerpt, " Écho Écho");
         assert_eq!(before, [format!("{}…", "雪".repeat(160)), String::new()]);
         assert_eq!(after, ["following", "last nearby"]);
-        assert!(filter.match_file_text("outside").unwrap().is_none());
+        assert!(filter.match_file_text_lines("outside").unwrap().is_empty());
+    }
+
+    #[test]
+    fn line_navigation_stays_in_bounds_and_only_moves_the_current_context() {
+        let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
+        let (serial, _) = files
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Text)
+            .unwrap();
+        let text = "hit\r\n\r\nother\nhit hit\n";
+        let filter = w11term::sftp::FilenameFilter {
+            content_query: "hit".into(),
+            ..Default::default()
+        };
+        files.finish_preview(serial, Ok(json!({"text": text})));
+        files.preview.as_mut().unwrap().text_match = Some(MatchPreview {
+            lines: filter.match_file_text_lines(text).unwrap(),
+            selected: 0,
+        });
+        let current = |files: &FileDrawer| {
+            files
+                .preview
+                .as_ref()
+                .unwrap()
+                .text_match
+                .as_ref()
+                .unwrap()
+                .selected
+        };
+        files.move_preview_match(serial, false);
+        files.move_preview_match(serial.wrapping_add(1), true);
+        assert_eq!(current(&files), 0);
+        files.move_preview_match(serial, true);
+        files.move_preview_match(serial, true);
+        assert_eq!(current(&files), 1);
+        files.show_full_preview(serial, true);
+        files.move_preview_match(serial, false);
+        files.show_full_preview(serial, false);
+        assert_eq!(current(&files), 1);
+        files.move_preview_match(serial, false);
+        assert_eq!(current(&files), 0);
+        assert_eq!(files.take_preview_for_edit(serial).unwrap().1, text);
     }
 
     #[test]

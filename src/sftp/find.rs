@@ -197,12 +197,14 @@ impl FilenameFilter {
                     || !self.content_query.is_empty()))
     }
 
-    /// Match freshly read file text using the same rules as a recursive scan.
-    pub fn match_file_text(&self, text: &str) -> Result<Option<ContentMatch>> {
-        Ok(self
-            .compile_content_pattern()?
-            .as_ref()
-            .and_then(|pattern| first_content_match(text, pattern)))
+    /// Find each matching line in freshly read text using the recursive scan's rules.
+    pub fn match_file_text_lines(&self, text: &str) -> Result<Vec<FileTextMatch>> {
+        let Some(pattern) = self.compile_content_pattern()? else {
+            return Ok(Vec::new());
+        };
+        Ok(matching_file_lines(text, &pattern)
+            .map(|(location, _)| location)
+            .collect())
     }
 
     pub(crate) fn compile_content_pattern(&self) -> Result<Option<regex::Regex>> {
@@ -299,6 +301,23 @@ pub struct ContentMatch {
     pub excerpt: String,
 }
 
+/// A matching line in a previously read file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileTextMatch {
+    pub line: usize,
+    /// UTF-8 byte offset of this line in the original string, excluding any leading BOM.
+    pub line_start: usize,
+    match_start: usize,
+}
+
+impl FileTextMatch {
+    pub fn excerpt(&self, original: &str) -> Option<String> {
+        let line = original.get(self.line_start..)?.lines().next()?;
+        line.get(..self.match_start)?;
+        Some(content_excerpt(line, self.match_start))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ContentScan {
     pub inspected: usize,
@@ -357,34 +376,59 @@ fn unavailable(error: &anyhow::Error) -> bool {
     )
 }
 
-fn first_content_match(text: &str, pattern: &regex::Regex) -> Option<ContentMatch> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    text.lines().enumerate().find_map(|(index, line)| {
-        let matched = pattern.find(line)?;
-        let start = line[..matched.start()]
-            .char_indices()
-            .rev()
-            .nth(47)
-            .map_or(0, |(index, _)| index);
-        let mut excerpt = String::new();
-        if start > 0 {
-            excerpt.push('…');
-        }
-        let mut chars = line[start..].chars();
-        excerpt.extend(
-            chars
-                .by_ref()
-                .take(160)
-                .map(|ch| if ch.is_control() { ' ' } else { ch }),
-        );
-        if chars.next().is_some() {
-            excerpt.push('…');
-        }
-        Some(ContentMatch {
-            line: index + 1,
-            excerpt,
+fn matching_file_lines<'a>(
+    original: &'a str,
+    pattern: &'a regex::Regex,
+) -> impl Iterator<Item = (FileTextMatch, &'a str)> + 'a {
+    let text = original.strip_prefix('\u{feff}').unwrap_or(original);
+    let mut offset = original.len() - text.len();
+    text.split_inclusive('\n')
+        .enumerate()
+        .filter_map(move |(index, raw)| {
+            let line_start = offset;
+            offset += raw.len();
+            let line = raw.lines().next()?;
+            let matched = pattern.find(line)?;
+            Some((
+                FileTextMatch {
+                    line: index + 1,
+                    line_start,
+                    match_start: matched.start(),
+                },
+                line,
+            ))
         })
+}
+
+fn first_content_match(text: &str, pattern: &regex::Regex) -> Option<ContentMatch> {
+    let (location, line) = matching_file_lines(text, pattern).next()?;
+    Some(ContentMatch {
+        line: location.line,
+        excerpt: content_excerpt(line, location.match_start),
     })
+}
+
+fn content_excerpt(line: &str, match_start: usize) -> String {
+    let start = line[..match_start]
+        .char_indices()
+        .rev()
+        .nth(47)
+        .map_or(0, |(index, _)| index);
+    let mut excerpt = String::new();
+    if start > 0 {
+        excerpt.push('…');
+    }
+    let mut chars = line[start..].chars();
+    excerpt.extend(
+        chars
+            .by_ref()
+            .take(160)
+            .map(|ch| if ch.is_control() { ' ' } else { ch }),
+    );
+    if chars.next().is_some() {
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 impl Search<'_> {
