@@ -1724,7 +1724,7 @@ impl FileDrawer {
             view
         };
         if let Some(search) = &self.search {
-            return cache(search.view(self, pane, shell_ready, layout, context));
+            return cache(search.view(self, pane, shell_ready, layout, profile, context));
         }
         if let Some(list) = &self.bookmarks
             && Some(list.profile.as_str()) == profile
@@ -3059,7 +3059,13 @@ impl TerminalApp {
                 Search(_, generation, action)
                     if files.open && may_open_dialog && generation == files.generation =>
                 {
-                    files.filename_search(pane, session, action, context)?;
+                    files.filename_search(
+                        pane,
+                        session,
+                        action,
+                        tab.profile_name.as_deref().map(|name| (name, &self.store)),
+                        context,
+                    )?;
                 }
                 Search(..) => {}
                 Bookmarks(_, generation, action)

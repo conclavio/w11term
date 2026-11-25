@@ -34,7 +34,8 @@ pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_pa
 mod drop_source;
 mod editor;
 mod find;
-pub use find::{FilenameFilter, FilenameMatch, FilenameSearch, valid_filename_query};
+pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
+pub use find::{FilenameFilter, FilenameMatch, FilenameSearch, FilenameSort, valid_filename_query};
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;

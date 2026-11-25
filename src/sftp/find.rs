@@ -1,21 +1,49 @@
 use super::*;
-use std::collections::{HashSet, VecDeque};
+use std::{
+    cmp::Ordering,
+    collections::{HashSet, VecDeque},
+};
 
 const MAX_DIRECTORIES: usize = 128;
 const MAX_ENTRIES: usize = 16_384;
 const MAX_RESULTS: usize = 200;
 const MAX_DEPTH: usize = 24;
-const MAX_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_PATH_BYTES: usize = 4096;
 
 pub fn valid_filename_query(query: &str) -> bool {
     query.len() <= 256 && !query.trim().is_empty() && !query.chars().any(char::is_control)
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FilenameFilter {
     pub regex: bool,
     pub match_case: bool,
     pub kind: Option<EntryKind>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilenameSort {
+    #[default]
+    Folder,
+    Name,
+    Newest,
+    Largest,
+}
+
+impl FilenameSort {
+    pub fn apply(self, matches: &mut [FilenameMatch]) {
+        matches.sort_unstable_by(|a, b| {
+            match self {
+                Self::Folder => Ordering::Equal,
+                Self::Name => a.name.cmp(&b.name),
+                Self::Newest => b.mtime.cmp(&a.mtime),
+                Self::Largest => b.size.cmp(&a.size),
+            }
+            .then_with(|| (&a.parent, &a.name).cmp(&(&b.parent, &b.name)))
+        });
+    }
 }
 
 impl FilenameFilter {
@@ -250,10 +278,7 @@ impl Engine {
             }
         }
         search.result.cancelled = search.cancelled();
-        search
-            .result
-            .matches
-            .sort_by(|a, b| (&a.parent, &a.name).cmp(&(&b.parent, &b.name)));
+        FilenameSort::Folder.apply(&mut search.result.matches);
         Ok(search.result)
     }
 }

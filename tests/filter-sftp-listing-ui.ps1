@@ -243,7 +243,8 @@ try {
     $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     $fileOnPageTwo = "$parent/nested/nested-content.txt"
     $newest = "$parent/build-37.log"
-    $field.GetCurrentPattern($value).SetValue('^build-[0-9]+\.log$|^nested-content\.txt$')
+    $largeFilesPattern = '^build-[0-9]+\.log$|^nested-content\.txt$'
+    $field.GetCurrentPattern($value).SetValue($largeFilesPattern)
     Click 'Search'
     $null = Wait-Until 'folder-sorted recursive results span two pages' {
         (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
@@ -262,6 +263,22 @@ try {
             (Find-Element '68.4 KiB') -and !(Button "Reveal $newest")
     }
     $null = Wait-CheckBox "Mark $fileOnPageTwo" $on
+    $savedSearchesButton = 'Saved searches' + [char]0x2026
+    Click $savedSearchesButton
+    $presetName = Wait-Until 'saved search name field' {
+        Find-Element 'Saved search name' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $presetName.GetCurrentPattern($value).SetValue('Large build files')
+    Click 'Save current search'
+    $null = Wait-Until 'saved preset is written to the SSH profile' {
+        $data = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'.sftp_searches
+        if ($data) {
+            $entry = $data[0].searches.'Large build files'
+            $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
+                $entry.filter.regex -and $entry.filter.match_case -and $entry.sort -ceq 'largest'
+        }
+    }
+    Click 'Hide saved searches'
     Set-SearchChoice 'Sort search results' 'Newest first'
     $null = Wait-Until 'newest file moves onto the first page' {
         (Find-Element '1 / 2') -and (Button "Reveal $newest") -and
@@ -272,6 +289,31 @@ try {
         (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
             !(Button "Reveal $fileOnPageTwo")
     }
+    Click 'Back to files'
+    Click 'nested/'
+    Click 'Open folder'
+    $null = Wait-Until 'the drawer has moved away from the saved search root' {
+        (Find-Element "$parent/nested") -and (Button 'nested-content.txt')
+    }
+    Click ('Find files' + [char]0x2026)
+    $null = Wait-FilenameSearchFocus
+    Click $savedSearchesButton
+    Click 'Run saved search'
+    $null = Wait-Until 'saved search uses its original root, criteria, and sort' {
+        (Find-Element "Find files in $parent") -and
+            (Find-Element '39 matches in 2 folders') -and
+            (Button "Reveal $fileOnPageTwo") -and (Find-Element '68.4 KiB')
+    }
+    $null = Wait-CheckBox 'Regex' $on
+    $null = Wait-CheckBox 'Match case' $on
+    Click $savedSearchesButton
+    Click 'Remove saved search'
+    $null = Wait-Until 'removed preset disappears from picker and profile' {
+        $profile = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'
+        (Find-Element 'No saved searches') -and !$profile.PSObject.Properties['sftp_searches']
+    }
+    Click 'Hide saved searches'
+    Set-SearchChoice 'Sort search results' 'Sort by folder'
     $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     $field.GetCurrentPattern($value).SetValue('(')
     Click 'Search'

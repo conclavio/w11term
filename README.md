@@ -461,6 +461,8 @@ Choose **Find files…** to search the displayed directory and its subdirectorie
 
 Sort retained results by containing folder, filename, modification time, or file size. Sorting starts on page one, keeps marked downloads, and uses the scan’s existing metadata. Results without a reported modification time or regular file size sort last for that column. **Copy all paths** follows the displayed order across pages.
 
+On a saved SSH profile, open **Saved searches…**, enter a name, and choose **Save current search**. The preset records the remote folder, query, filters, and sort order. Choose **Run saved search** to scan that folder again from any folder in the drawer. Saved searches belong to the profile and the verified SSH endpoint. **Remove saved search** removes the preset from the profile.
+
 Choose **Refresh results** to scan again with the same settings. The previous results stay visible during the scan. A successful refresh keeps download marks for paths that still match with the same entry type. Cancelling a refresh or encountering a scan error keeps the previous results and marks.
 
 After revealing a match, choose **Back to search results** to return to the same query and results page without rescanning. **Find files…** starts a new search from the current folder. Closing the drawer or reconnecting ends the saved search.

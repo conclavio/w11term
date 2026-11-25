@@ -1,6 +1,7 @@
 use super::*;
-use std::cmp::Ordering;
-use w11term::sftp::{FilenameFilter, FilenameSearch, SearchDownload};
+use w11term::sftp::{FilenameFilter, FilenameSearch, FilenameSort as ResultSort, SearchDownload};
+
+pub mod saved;
 
 const RESULTS_PER_PAGE: usize = 25;
 const RESULT_TYPES: [(Option<EntryKind>, &str); 4] = [
@@ -8,6 +9,12 @@ const RESULT_TYPES: [(Option<EntryKind>, &str); 4] = [
     (Some(EntryKind::File), "Files"),
     (Some(EntryKind::Directory), "Folders"),
     (Some(EntryKind::Symlink), "Symbolic links"),
+];
+const RESULT_SORTS: [(ResultSort, &str); 4] = [
+    (ResultSort::Folder, "Sort by folder"),
+    (ResultSort::Name, "Sort by filename"),
+    (ResultSort::Newest, "Newest first"),
+    (ResultSort::Largest, "Largest first"),
 ];
 
 #[derive(Clone)]
@@ -27,6 +34,7 @@ pub enum Action {
     Rename(u64, FilenameMatch),
     Delete(u64, FilenameMatch),
     CopyPaths(u64, Option<FilenameMatch>),
+    Saved(u64, saved::Action),
     Back(u64),
 }
 
@@ -37,36 +45,6 @@ pub enum MatchOption {
     Kind(Option<EntryKind>),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ResultSort {
-    #[default]
-    Folder,
-    Name,
-    Newest,
-    Largest,
-}
-
-impl ResultSort {
-    const OPTIONS: [(Self, &str); 4] = [
-        (Self::Folder, "Sort by folder"),
-        (Self::Name, "Sort by filename"),
-        (Self::Newest, "Newest first"),
-        (Self::Largest, "Largest first"),
-    ];
-
-    fn apply(self, matches: &mut [FilenameMatch]) {
-        matches.sort_unstable_by(|a, b| {
-            match self {
-                Self::Folder => Ordering::Equal,
-                Self::Name => a.name.cmp(&b.name),
-                Self::Newest => b.mtime.cmp(&a.mtime),
-                Self::Largest => b.size.cmp(&a.size),
-            }
-            .then_with(|| (&a.parent, &a.name).cmp(&(&b.parent, &b.name)))
-        });
-    }
-}
-
 pub(super) struct Panel {
     pub(super) serial: u64,
     root: String,
@@ -74,6 +52,7 @@ pub(super) struct Panel {
     input: ElementRef<TextBox>,
     filter: FilenameFilter,
     sort: ResultSort,
+    saved: Option<saved::List>,
     result: Option<FilenameSearch>,
     page: usize,
     pub(super) cancel: Option<TransferCancel>,
@@ -227,6 +206,7 @@ impl Panel {
         pane: u64,
         shell_ready: bool,
         layout: DrawerLayout,
+        profile: Option<&str>,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let generation = files.generation;
@@ -365,6 +345,23 @@ impl Panel {
             run
         };
         rows.push(KeyedView::new("run", search_actions));
+        if let Some(profile) = profile.filter(|_| generation != 0) {
+            if let Some(list) = self.saved.as_ref().filter(|list| list.profile == profile) {
+                rows.push(KeyedView::new(
+                    "saved",
+                    list.view(self, pane, generation, ready, ctx),
+                ));
+            } else {
+                rows.push(KeyedView::new(
+                    "saved-toggle",
+                    button(
+                        "Saved searches…",
+                        Action::Saved(serial, saved::Action::Show),
+                        ready,
+                    ),
+                ));
+            }
+        }
         if self.result.as_ref().is_some_and(|result| {
             result
                 .matches
@@ -413,14 +410,14 @@ impl Panel {
                 ComboBox::new()
                     .automation_name("Sort search results")
                     .is_enabled(ready)
-                    .items_source(ResultSort::OPTIONS.map(|(_, label)| label))
+                    .items_source(RESULT_SORTS.map(|(_, label)| label))
                     .selected_index(
-                        ResultSort::OPTIONS
+                        RESULT_SORTS
                             .iter()
                             .position(|(order, _)| *order == self.sort),
                     )
                     .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                        index.and_then(|i| ResultSort::OPTIONS.get(i)).map_or(
+                        index.and_then(|i| RESULT_SORTS.get(i)).map_or(
                             Message::ControlIdle,
                             |&(sort, _)| {
                                 Message::Files(FileAction::Search(
@@ -974,6 +971,7 @@ impl FileDrawer {
         pane: u64,
         session: &Session,
         action: Action,
+        profile: Option<(&str, &ProfileStore)>,
         ctx: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         if let Action::Show(revision) = action {
@@ -994,6 +992,7 @@ impl FileDrawer {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 sort: ResultSort::default(),
+                saved: None,
                 result: None,
                 page: 0,
                 cancel: None,
@@ -1016,6 +1015,9 @@ impl FileDrawer {
                 )));
             }
             return Ok(());
+        }
+        if let Action::Saved(serial, action) = action {
+            return self.saved_search_action(pane, session, serial, action, profile, ctx);
         }
         let busy = self.busy();
         let Some(panel) = self.search.as_mut() else {
@@ -1147,6 +1149,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 sort: ResultSort::default(),
+                saved: None,
                 result: Some(result),
                 page: 0,
                 cancel: None,
@@ -1291,6 +1294,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 sort: ResultSort::default(),
+                saved: None,
                 result: Some(before),
                 page: 1,
                 cancel: Some(TransferCancel::default()),
@@ -1360,6 +1364,7 @@ mod tests {
                     kind: Some(EntryKind::File),
                 },
                 sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches,
@@ -1433,6 +1438,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![file.clone(), folder.clone(), link.clone()],
@@ -1497,6 +1503,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![other, hit.clone()],
@@ -1564,6 +1571,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 sort: ResultSort::default(),
+                saved: None,
                 result: Some(FilenameSearch {
                     root: "/project".into(),
                     matches: vec![hit.clone()],
@@ -1653,6 +1661,7 @@ mod tests {
             input: ElementRef::new(),
             filter: FilenameFilter::default(),
             sort: ResultSort::default(),
+            saved: None,
             result: Some(FilenameSearch {
                 root: "/".into(),
                 matches: vec![link, file.clone()],
