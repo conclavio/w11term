@@ -3026,13 +3026,22 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory", fillers + 5),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // Exclusion skips opening the nested directory.
+            ("/shell directory", fillers + 5), // File size alone can select files from subfolders.
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // A date can be the only search filter.
+            ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5), // One scan for the paginated sort fixture.
+            ("/shell directory/nested", 2),
+            ("/shell directory/nested", 2), // Enter another folder before using the saved search.
+            ("/shell directory", fillers + 5), // A saved search reruns from its original root.
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
-            ("/shell directory", 0), // Cancelled in OPENDIR before reading a page.
+            ("/shell directory", fillers + 6), // Progress includes the completed root.
+            ("/shell directory/nested", 0),    // Refresh cancelled before reading the subfolder.
             ("/shell directory", fillers + 6), // The refresh sees a newly added file.
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 6), // Rename refreshes the same search.
