@@ -214,7 +214,7 @@ impl Batch {
             operation,
             deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
             reply,
-            progress: Some(progress),
+            progress: Some(w11term::sftp::JobProgress::Transfer(progress)),
             cancel: Some(self.cancel.clone()),
         };
         if input.send(Command::Sftp(job)).is_err() {
