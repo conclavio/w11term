@@ -537,6 +537,8 @@ The **caret → Settings** command opens profile management, the terminal font s
 
 Programming ligatures default to enabled for adjacent ASCII cells with matching attributes. Monaspace also enables its programming-ligature feature sets. DirectWrite shapes connected scripts even with programming ligatures disabled. Font changes recalculate cell geometry and resize existing sessions. PNG capture uses the same font and shaping settings as the live pane. [Monaspace features](https://github.com/githubnext/monaspace#code-ligatures)
 
+The terminal follows **Windows Settings → Accessibility → Text size** by default. Changing the slider and choosing **Apply** updates the cell grid in open panes. Terminal zoom sets the base font size, and **Reset font size** restores that base before Windows scaling is applied. Turn off **Follow Windows text size** in w11term Settings for a grid sized by terminal zoom and display DPI.
+
 SSH supports OpenSSH private keys supplied with `--identity`, protected w11term device keys, the Windows OpenSSH agent (the default for `ssh user@host`), `--auth none`, `--auth password`, and `--auth keyboard-interactive`. Password and MFA challenges use native dialogs; hidden answers never enter terminal input, profiles, event logs, or recordings. A successful password remains in memory only for reconnection; one-time codes are requested again. Passphrase-protected OpenSSH keys can be used through the agent.
 
 Choose **Private key file** in Quick Connect or an SSH profile, then use **Browse…** to select the file through the Windows dialog. The picker starts beside the entered path when that folder is available locally, or in your OpenSSH `.ssh` folder when it exists.

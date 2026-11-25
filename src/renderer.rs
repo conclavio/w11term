@@ -1336,7 +1336,7 @@ pub fn screenshot_with_font(
     let mut renderer = Renderer::with_size(
         &appearance.font_family,
         appearance.ligatures,
-        appearance.font_size,
+        appearance.terminal_font_size(),
     )?;
     let scale = (size.dpi as f32 / 96.0).max(0.5);
     let cw = (renderer.base_cell.0 * scale).ceil();

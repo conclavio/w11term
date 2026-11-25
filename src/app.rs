@@ -98,6 +98,7 @@ mod tab_title;
 mod tab_windows;
 mod taskbar;
 mod text_export;
+mod text_size;
 mod visual_bell;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
@@ -892,6 +893,7 @@ enum UiWork {
     FolderAuthority,
     Control(w11term::control::UiRequest),
     AttentionChanged,
+    TextSizeChanged,
 }
 
 struct CaretMenuBinding {
@@ -1025,6 +1027,7 @@ pub struct TerminalApp {
     window_height: f64,
     initial_grid: Rc<crate::window_state::RequestedGrid>,
     appearance: Arc<RwLock<Appearance>>,
+    text_size: Option<text_size::Monitor>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
     saved_commands: w11term::saved_commands::Commands,
@@ -1170,6 +1173,8 @@ pub enum Message {
     ImportConfig(config_import::Action),
     Font(Option<usize>),
     Ligatures(bool),
+    FollowWindowsTextSize(bool),
+    WindowsTextSizeChanged,
     Interaction(InteractionField, bool),
     MultilinePasteWarning(MultiLinePasteWarning, bool),
     TabMode(Option<usize>),
@@ -1337,6 +1342,7 @@ impl TerminalApp {
                         Ok(UiWork::Control(request)) => return Message::Control(request),
                         Ok(UiWork::AttentionChanged) => return Message::AttentionChanged,
                         Ok(UiWork::FolderAuthority) => return Message::FolderAuthority,
+                        Ok(UiWork::TextSizeChanged) => return Message::WindowsTextSizeChanged,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(_) => return Message::ControlIdle,
                     }
@@ -2124,16 +2130,16 @@ impl TerminalApp {
             .err()
             .map(|e| format!("Settings could not be saved: {e:#}"));
     }
-    fn apply_appearance(&mut self, appearance: Appearance) {
+    fn remeasure_terminal_font(&mut self, appearance: &Appearance) -> bool {
         let mut renderer = match Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         ) {
             Ok(renderer) => renderer,
             Err(e) => {
                 self.appearance_error = Some(format!("Unable to use font: {e}"));
-                return;
+                return false;
             }
         };
         for entry in self.tabs.entries() {
@@ -2149,8 +2155,28 @@ impl TerminalApp {
             }
         }
         self.keyboard.set_selection(false);
-        self.save_preferences(appearance);
         self.invalidator.invalidate();
+        true
+    }
+
+    fn apply_appearance(&mut self, appearance: Appearance, context: &ComponentContext<Self>) {
+        if self.remeasure_terminal_font(&appearance) {
+            self.save_preferences(appearance);
+            self.refresh_picker_font(context);
+        }
+    }
+
+    fn update_windows_text_size(&mut self, factor: f64, context: &ComponentContext<Self>) {
+        let mut appearance = self.appearance.read().unwrap().clone();
+        let previous_size = appearance.terminal_font_size();
+        appearance.set_windows_text_scale(factor);
+        let remeasure = previous_size != appearance.terminal_font_size();
+        if !remeasure || self.remeasure_terminal_font(&appearance) {
+            *self.appearance.write().unwrap() = appearance;
+            if remeasure {
+                self.refresh_picker_font(context);
+            }
+        }
     }
 
     fn settings_view(&self, context: &ViewContext<Self>) -> View {
@@ -2166,6 +2192,9 @@ impl TerminalApp {
             TextBlock::new().text("Programming ligatures").into(),
             ToggleSwitch::new().automation_name("Programming ligatures").is_on(appearance.ligatures).on_toggled(context.callback(Message::Ligatures)).into(),
             TextBlock::new().text("Used by fonts with ligature support, such as Cascadia Code, JetBrains Mono and Fira Code.").text_wrapping(TextWrapping::Wrap).into(),
+            TextBlock::new().text("Follow Windows text size").into(),
+            ToggleSwitch::new().automation_name("Follow Windows text size").is_on(appearance.follow_windows_text_size)
+                .on_toggled(context.callback(Message::FollowWindowsTextSize)).into(),
             TextBlock::new().text("Applies to all tabs. Changes are saved automatically.").into(),
         ];
         let mut profiles: Vec<View> =
@@ -4659,10 +4688,17 @@ impl Component for TerminalApp {
             appearance.font_size = 16.0;
         }
         appearance.font_size = appearance.font_size.clamp(6.0, 72.0);
+        let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
+        let text_size = text_size::Monitor::open(control_sender.clone())
+            .inspect_err(|error| log::warn!("Opening Windows text size settings: {error}"))
+            .ok();
+        if let Some(factor) = text_size.as_ref().and_then(text_size::Monitor::current) {
+            appearance.set_windows_text_scale(factor);
+        }
         let renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         )
         .expect("creating DirectWrite formats");
         keyboard.set_shortcuts(
@@ -4747,7 +4783,6 @@ impl Component for TerminalApp {
             || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
             |window| window.registry.clone(),
         );
-        let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
         let folder_messages = control_sender.clone();
         let folder_wake = Arc::new(move || {
@@ -4845,6 +4880,7 @@ impl Component for TerminalApp {
             client_size,
             initial_grid: Rc::new(crate::window_state::RequestedGrid::new(grid)),
             appearance,
+            text_size,
             fonts,
             appearance_error,
             saved_commands: Default::default(),
@@ -4974,8 +5010,18 @@ impl Component for TerminalApp {
         }
         if matches!(
             &message,
-            Message::Control(_) | Message::AttentionChanged | Message::FolderAuthority
+            Message::Control(_)
+                | Message::AttentionChanged
+                | Message::FolderAuthority
+                | Message::WindowsTextSizeChanged
         ) {
+            if let Some(scale) = self
+                .text_size
+                .as_ref()
+                .and_then(text_size::Monitor::take_change)
+            {
+                self.update_windows_text_size(scale, context);
+            }
             let wake = self.inbox.acknowledge_wake();
             if wake.flash_taskbar
                 && let Some(hwnd) = self.keyboard.hwnd()
@@ -6255,12 +6301,12 @@ impl Component for TerminalApp {
                 Shortcut::Zoom(delta) => {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     appearance.font_size = (appearance.font_size + delta as f32).clamp(6.0, 72.0);
-                    self.apply_appearance(appearance);
+                    self.apply_appearance(appearance, context);
                 }
                 Shortcut::ResetZoom => {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     appearance.font_size = 16.0;
-                    self.apply_appearance(appearance);
+                    self.apply_appearance(appearance, context);
                 }
                 Shortcut::CommitTab => self.finish_switcher(true, context),
                 Shortcut::CancelTab => self.finish_switcher(false, context),
@@ -6615,7 +6661,7 @@ impl Component for TerminalApp {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     if appearance.font_family != *font {
                         appearance.font_family = font.clone();
-                        self.apply_appearance(appearance);
+                        self.apply_appearance(appearance, context);
                     }
                 }
             }
@@ -6624,9 +6670,22 @@ impl Component for TerminalApp {
                 let mut appearance = self.appearance.read().unwrap().clone();
                 if appearance.ligatures != enabled {
                     appearance.ligatures = enabled;
-                    self.apply_appearance(appearance);
+                    self.apply_appearance(appearance, context);
                 }
             }
+            Message::FollowWindowsTextSize(enabled) => {
+                let mut appearance = self.appearance.read().unwrap().clone();
+                if appearance.follow_windows_text_size != enabled {
+                    let previous_size = appearance.terminal_font_size();
+                    appearance.follow_windows_text_size = enabled;
+                    if previous_size == appearance.terminal_font_size() {
+                        self.save_preferences(appearance);
+                    } else {
+                        self.apply_appearance(appearance, context);
+                    }
+                }
+            }
+            Message::WindowsTextSizeChanged => {}
             Message::WindowSize(size) => {
                 self.width = size.width;
                 self.window_height = size.height;

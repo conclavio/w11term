@@ -3,6 +3,7 @@ use w11term::control::Request;
 
 thread_local! {
     static PAINT_COUNTS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    static BASE_GRIDS: Cell<[(usize, usize); 2]> = const { Cell::new([(0, 0); 2]) };
 }
 
 impl TerminalApp {
@@ -156,6 +157,32 @@ impl TerminalApp {
                     self.split_lab(2).surface.paint_count.get() > right_before,
                     "visible pane did not repaint"
                 );
+                assert!(std::env::var_os("W11TERM_SETTINGS_PATH").is_some());
+                self.update_windows_text_size(1.0, context);
+            }
+            9 => {
+                BASE_GRIDS.set([self.split_smoke_grid(1), self.split_smoke_grid(2)]);
+                self.update_windows_text_size(1.5, context);
+            }
+            10 => {
+                for (entry, (base_cols, base_rows)) in [1, 2].into_iter().zip(BASE_GRIDS.get()) {
+                    let (cols, rows) = self.split_smoke_grid(entry);
+                    assert!(cols < base_cols && rows < base_rows);
+                }
+                assert_eq!(self.appearance.read().unwrap().terminal_font_size(), 24.0);
+                let settings = Appearance::load(&Appearance::path().unwrap()).unwrap();
+                assert!(settings.follow_windows_text_size);
+                assert_eq!(settings.terminal_font_size(), 16.0);
+                self.update(Message::FollowWindowsTextSize(false), context);
+            }
+            11 => {
+                assert_eq!(
+                    [self.split_smoke_grid(1), self.split_smoke_grid(2)],
+                    BASE_GRIDS.get()
+                );
+                let settings = Appearance::load(&Appearance::path().unwrap()).unwrap();
+                assert!(!settings.follow_windows_text_size);
+                assert_eq!(settings.font_size, 16.0);
                 let stable_id = self.split_lab(2).session.pane_id;
                 let old_group = self.tabs.group_id(2);
                 self.update(Message::PaneFocus(2), context);

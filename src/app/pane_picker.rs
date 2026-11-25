@@ -23,7 +23,7 @@ impl Preview {
         let canvas = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         )
         .map(|renderer| {
             let renderer = RefCell::new(renderer);
@@ -894,6 +894,13 @@ impl TerminalApp {
             && index != picker.selected
         {
             picker.selected = index;
+            self.sync_picker_preview(ctx);
+        }
+    }
+
+    pub(super) fn refresh_picker_font(&mut self, ctx: &ComponentContext<Self>) {
+        if let Some(picker) = &mut self.picker {
+            picker.preview = None;
             self.sync_picker_preview(ctx);
         }
     }

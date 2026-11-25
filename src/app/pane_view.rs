@@ -450,7 +450,7 @@ impl TerminalApp {
         let mut renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         )?;
         renderer.live_cursor = Some(surface.cursor_blink.clone());
         let renderer = RefCell::new(renderer);
