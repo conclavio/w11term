@@ -782,6 +782,7 @@ impl russh_sftp::server::Handler for Files {
             }
         }
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
+        let omit_size = fs::read_to_string(self.root.join("omit-listed-size")).ok();
         if path == "/tree"
             && let Ok(names) = fs::read_to_string(self.root.join("tree-test-names"))
         {
@@ -802,7 +803,9 @@ impl russh_sftp::server::Handler for Files {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
                 let mut attrs = entry_attrs(&e.path())?;
-                if self.root.join("tree-unknown-size").is_file() {
+                if Some(name.as_ref()) == omit_size.as_deref()
+                    || self.root.join("tree-unknown-size").is_file()
+                {
                     attrs.size = None;
                 }
                 if Some(name.as_ref()) == omit_mode.as_deref() || name == "socket" {

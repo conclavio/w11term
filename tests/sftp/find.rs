@@ -1,6 +1,7 @@
 use super::*;
 use w11term::sftp::{
-    EntryKind, FilenameMatch, FilenameSearch, Job, Operation, SearchDownload, TransferCancel,
+    EntryKind, FileSizeRange, FilenameMatch, FilenameSearch, Job, Operation, SearchDownload,
+    TransferCancel,
 };
 
 fn search(path: &str, query: &str) -> Operation {
@@ -12,6 +13,7 @@ fn search(path: &str, query: &str) -> Operation {
         match_path: false,
         kind: None,
         exclude_dir_regex: String::new(),
+        file_size: FileSizeRange::default(),
     }
 }
 
@@ -41,6 +43,69 @@ fn search_download_rejects_unsafe_components_and_collisions_between_folders() {
             "{bad:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_size_bounds_apply_before_the_result_cap_and_lookup_omitted_sizes() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    let tree = root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    for index in 0..210 {
+        fs::write(tree.join(format!("a-{index:03}.log")), [0]).unwrap();
+    }
+    for (name, size) in [
+        ("z-empty.log", 0),
+        ("z-min.log", 16),
+        ("z-max.log", 32),
+        ("z-above.log", 33),
+    ] {
+        fs::write(tree.join(name), vec![0; size]).unwrap();
+    }
+    fs::create_dir(tree.join("z-folder.log")).unwrap();
+    fs::write(root.join("omit-listed-size"), "z-max.log").unwrap();
+    let bounded = |query: &str, minimum, maximum| Operation::Find {
+        path: "/tree".into(),
+        query: query.into(),
+        regex: false,
+        match_case: false,
+        match_path: false,
+        kind: None,
+        exclude_dir_regex: String::new(),
+        file_size: FileSizeRange { minimum, maximum },
+    };
+    let invalid = guarded_job(&pane, None, bounded("", Some(32), Some(16)))
+        .await
+        .unwrap_err();
+    assert!(
+        invalid.contains("Minimum file size must be at most the maximum"),
+        "{invalid}"
+    );
+    let found: FilenameSearch = serde_json::from_value(
+        guarded_job(&pane, None, bounded("log", Some(16), Some(32)))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(found.scanned_entries > 200);
+    assert!(!found.truncated);
+    assert_eq!(
+        found
+            .matches
+            .iter()
+            .map(|hit| (hit.name.as_str(), hit.size))
+            .collect::<Vec<_>>(),
+        [("z-max.log", Some(32)), ("z-min.log", Some(16))]
+    );
+
+    let zero = || bounded("z-empty", Some(0), Some(0));
+    let found = guarded_job(&pane, None, zero()).await.unwrap();
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(found["matches"][0]["size"], 0);
+    fs::write(root.join("tree-unknown-size"), []).unwrap();
+    let unknown = guarded_job(&pane, None, zero()).await.unwrap();
+    assert!(unknown["matches"].as_array().unwrap().is_empty());
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -173,6 +238,7 @@ async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_be
         match_path: false,
         kind: None,
         exclude_dir_regex: String::new(),
+        file_size: FileSizeRange::default(),
     };
     let error = guarded_job(&pane, None, options("(", true, false))
         .await
@@ -247,6 +313,7 @@ async fn filename_type_limits_results_without_skipping_subdirectories() {
                     match_path: false,
                     kind: Some(kind),
                     exclude_dir_regex: String::new(),
+                    file_size: FileSizeRange::default(),
                 },
             )
             .await
@@ -346,6 +413,7 @@ async fn relative_path_matching_uses_the_canonical_search_root_and_full_componen
                     match_path,
                     kind: Some(EntryKind::File),
                     exclude_dir_regex: String::new(),
+                    file_size: FileSizeRange::default(),
                 },
             )
             .await
@@ -390,6 +458,7 @@ async fn excluded_folders_are_neither_results_nor_opened_and_exclusions_respect_
         match_path: false,
         kind: None,
         exclude_dir_regex: pattern.into(),
+        file_size: FileSizeRange::default(),
     };
     let invalid = guarded_job(&pane, None, query("[", false))
         .await
@@ -472,6 +541,7 @@ async fn excluded_folders_leave_directory_budget_for_the_rest_of_the_search() {
                 match_path: true,
                 kind: Some(EntryKind::File),
                 exclude_dir_regex: r"^cache-[0-9]+$".into(),
+                file_size: FileSizeRange::default(),
             },
         )
         .await

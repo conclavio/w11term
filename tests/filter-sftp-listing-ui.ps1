@@ -248,6 +248,32 @@ try {
     $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
     $excludeField.GetCurrentPattern($value).SetValue('')
     Set-SearchChoice 'Search result type' 'All types'
+    $minSizeLabel = 'Minimum file size'
+    $maxSizeLabel = 'Maximum file size'
+    $fileOnPageTwo = "$parent/nested/nested-content.txt"
+    $minimumSize = Find-Element $minSizeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $minimumSize.GetCurrentPattern($value).SetValue('1 KiB')
+    $maximumSize.GetCurrentPattern($value).SetValue('70 KiB')
+    $null = Wait-Until 'file size bounds allow a search without a name' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
+    }
+    $maximumSize.SetFocus()
+    $null = Wait-Until 'maximum file size has keyboard focus' { $maximumSize.Current.HasKeyboardFocus }
+    $null = Press-FocusedKey 13
+    $null = Wait-Until 'only the file within the size range is returned' {
+        (Find-Element '1 matches in 2 folders') -and (Button "Reveal $fileOnPageTwo") -and
+            !(Button "Reveal $parent/build-00.log") -and !(Button "Reveal $parent/nested")
+    }
+    $minimumSize = Find-Element $minSizeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $minimumSize.GetCurrentPattern($value).SetValue('')
+    $maximumSize.GetCurrentPattern($value).SetValue('')
+    $null = Wait-Until 'clearing both sizes disables the empty search' {
+        $run = Button 'Search'
+        $run -and !$run.Current.IsEnabled
+    }
     $on = [System.Windows.Automation.ToggleState]::On
     $off = [System.Windows.Automation.ToggleState]::Off
     (Wait-CheckBox 'Regex' $off).Toggle()
@@ -259,7 +285,6 @@ try {
     $field = Wait-Until 'relative path search field' {
         Find-Element 'Relative path contains' ([System.Windows.Automation.ControlType]::Edit)
     }
-    $fileOnPageTwo = "$parent/nested/nested-content.txt"
     $newest = "$parent/build-37.log"
     $largeFilesPattern = '^build-[0-9]+\.log$|^nested/nested-content\.txt$'
     $savedExclusion = '^cache$'
@@ -270,6 +295,8 @@ try {
     }
     $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
     $excludeField.GetCurrentPattern($value).SetValue($savedExclusion)
+    $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $maximumSize.GetCurrentPattern($value).SetValue('1 MiB')
     Click 'Search'
     $null = Wait-Until 'folder-sorted recursive results span two pages' {
         (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
@@ -302,6 +329,7 @@ try {
             $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
                 $entry.filter.regex -and $entry.filter.match_case -and $entry.filter.match_path -and
                 $entry.filter.exclude_dir_regex -ceq $savedExclusion -and
+                $entry.filter.file_size.maximum -eq 1048576 -and
                 $entry.sort -ceq 'largest'
         }
     }
@@ -338,6 +366,10 @@ try {
     if ($excludeField.GetCurrentPattern($value).Current.Value -cne $savedExclusion) {
         throw 'Saved search did not restore its folder exclusion'
     }
+    $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
+    if ($maximumSize.GetCurrentPattern($value).Current.Value -cne '1048576') {
+        throw 'Saved search did not restore its maximum size'
+    }
     Click $savedSearchesButton
     Click 'Remove saved search'
     $null = Wait-Until 'removed preset disappears from picker and profile' {
@@ -348,6 +380,8 @@ try {
     Set-SearchChoice 'Sort search results' 'Sort by folder'
     $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
     $excludeField.GetCurrentPattern($value).SetValue('')
+    $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $maximumSize.GetCurrentPattern($value).SetValue('')
     (Wait-CheckBox 'Match path' $on).Toggle()
     $null = Wait-CheckBox 'Match path' $off
     $field = Wait-Until 'filename search field restored' {

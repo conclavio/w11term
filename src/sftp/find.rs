@@ -24,6 +24,76 @@ pub struct FilenameFilter {
     pub kind: Option<EntryKind>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub exclude_dir_regex: String,
+    #[serde(skip_serializing_if = "FileSizeRange::is_unrestricted")]
+    pub file_size: FileSizeRange,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileSizeRange {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<u64>,
+}
+
+impl FileSizeRange {
+    pub fn parse(minimum: &str, maximum: &str) -> Result<Self> {
+        Ok(Self {
+            minimum: parse_size_bound(minimum).context("Minimum file size")?,
+            maximum: parse_size_bound(maximum).context("Maximum file size")?,
+        })
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        self.minimum.is_none() && self.maximum.is_none()
+    }
+
+    pub fn validate(self, kind: Option<EntryKind>) -> Result<()> {
+        ensure!(
+            !matches!((self.minimum, self.maximum), (Some(min), Some(max)) if min > max),
+            "Minimum file size must be at most the maximum"
+        );
+        ensure!(
+            self.is_unrestricted() || matches!(kind, None | Some(EntryKind::File)),
+            "File size limits require Files or All types"
+        );
+        Ok(())
+    }
+
+    fn matches(self, size: Option<u64>) -> bool {
+        self.is_unrestricted()
+            || size.is_some_and(|size| {
+                self.minimum.is_none_or(|min| size >= min)
+                    && self.maximum.is_none_or(|max| size <= max)
+            })
+    }
+}
+
+fn parse_size_bound(text: &str) -> Result<Option<u64>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let boundary = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, suffix) = text.split_at(boundary);
+    let bytes: u64 = number
+        .parse()
+        .context("Expected a whole, nonnegative file size")?;
+    let scale = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" => 1 << 10,
+        "mib" => 1 << 20,
+        "gib" => 1 << 30,
+        "tib" => 1 << 40,
+        "pib" => 1 << 50,
+        "eib" => 1 << 60,
+        _ => bail!("Use bytes or a binary unit such as KiB, MiB, or GiB"),
+    };
+    bytes
+        .checked_mul(scale)
+        .map(Some)
+        .context("File size is too large")
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,7 +123,10 @@ impl FilenameSort {
 impl FilenameFilter {
     pub fn valid_query(&self, query: &str) -> bool {
         valid_filename_query(query)
-            || (query.is_empty() && (self.kind.is_some() || !self.exclude_dir_regex.is_empty()))
+            || (query.is_empty()
+                && (self.kind.is_some()
+                    || !self.exclude_dir_regex.is_empty()
+                    || !self.file_size.is_unrestricted()))
     }
 
     pub(crate) fn compile_excluded_dirs(&self) -> Result<Option<regex::Regex>> {
@@ -81,7 +154,7 @@ impl FilenamePattern {
     fn new(query: &str, filter: &FilenameFilter) -> Result<Self> {
         ensure!(
             filter.valid_query(query),
-            "Enter a search pattern up to 256 bytes, select a result type, or exclude folders"
+            "Enter a search pattern up to 256 bytes or add a search filter"
         );
         if query.is_empty() {
             return Ok(Self::All);
@@ -139,6 +212,7 @@ struct Search<'a> {
     match_path: bool,
     kind: Option<EntryKind>,
     exclude_dirs: Option<regex::Regex>,
+    file_size: FileSizeRange,
     cancel: Option<&'a TransferCancel>,
     queued: VecDeque<(String, usize)>,
     directories: HashSet<String>,
@@ -209,7 +283,8 @@ impl Search<'_> {
                     let child = format!("{prefix}/{name}");
                     // READDIR may omit the type. Resolve it without following links.
                     let mut attrs = entry.attrs;
-                    if !attrs.permissions.is_some_and(|mode| mode & 0o170000 != 0) {
+                    let missing_type = !attrs.permissions.is_some_and(|mode| mode & 0o170000 != 0);
+                    if missing_type {
                         match self.engine.raw.lstat(&child).await {
                             Ok(reply) => {
                                 attrs.permissions = reply.attrs.permissions;
@@ -247,15 +322,34 @@ impl Search<'_> {
                     };
                     if self.kind.is_none_or(|want| Some(want) == kind)
                         && self.pattern.matches(candidate)
-                        && self.matched.insert(child.clone())
                     {
-                        self.result.matches.push(FilenameMatch {
-                            parent: path.to_owned(),
-                            name,
-                            kind,
-                            mtime: attrs.mtime,
-                            size: attrs.size.filter(|_| kind == Some(EntryKind::File)),
-                        });
+                        let mut size = attrs.size.filter(|_| kind == Some(EntryKind::File));
+                        if !self.file_size.is_unrestricted()
+                            && size.is_none()
+                            && kind == Some(EntryKind::File)
+                            && !missing_type
+                        {
+                            match self.engine.raw.lstat(&child).await {
+                                Ok(reply)
+                                    if EntryKind::from_permissions(reply.attrs.permissions)
+                                        == Some(EntryKind::File) =>
+                                {
+                                    attrs.mtime = reply.attrs.mtime.or(attrs.mtime);
+                                    size = reply.attrs.size;
+                                }
+                                Err(error) if transport_error(&error) => return Err(error.into()),
+                                _ => {}
+                            }
+                        }
+                        if self.file_size.matches(size) && self.matched.insert(child.clone()) {
+                            self.result.matches.push(FilenameMatch {
+                                parent: path.to_owned(),
+                                name,
+                                kind,
+                                mtime: attrs.mtime,
+                                size,
+                            });
+                        }
                     }
                     if directory && !self.directories.contains(&child) {
                         if depth == MAX_DEPTH || self.directories.len() == MAX_DIRECTORIES {
@@ -284,6 +378,7 @@ impl Engine {
         cancel: Option<&TransferCancel>,
     ) -> Result<FilenameSearch> {
         let pattern = FilenamePattern::new(query, &filter)?;
+        filter.file_size.validate(filter.kind)?;
         let exclude_dirs = filter.compile_excluded_dirs()?;
         let root = self.canonical_remote_path(path).await?;
         ensure!(
@@ -296,6 +391,7 @@ impl Engine {
             match_path: filter.match_path,
             kind: filter.kind,
             exclude_dirs,
+            file_size: filter.file_size,
             cancel,
             queued: VecDeque::from([(root.clone(), 0)]),
             directories: HashSet::from([root.clone()]),

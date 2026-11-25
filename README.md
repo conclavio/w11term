@@ -463,6 +463,8 @@ Enable **Match path** to search the path relative to the search folder. Paths us
 
 Enter a regex in **Exclude folder paths** to skip matching folders and their contents. The regex uses paths relative to the search root and follows **Match case**. For example, `(^|/)(\.git|node_modules)$` skips those folder names at any depth. The CLI accepts the same pattern with `--exclude-dir-regex`. You can use exclusions on their own or with the other filters, and saved searches retain them.
 
+Use **Min size** or **Max size** to find regular files within inclusive size limits. Enter whole bytes or binary units such as `16 MiB`. Leave either bound blank for an open-ended range. Size filters apply before the result cap, and files whose size the server cannot report are omitted. The CLI offers `--min-size` and `--max-size`, and saved searches retain both limits.
+
 Sort retained results by containing folder, filename, modification time, or file size. Sorting starts on page one, keeps marked downloads, and uses the scan’s existing metadata. Results without a reported modification time or regular file size sort last for that column. **Copy all paths** follows the displayed order across pages.
 
 On a saved SSH profile, open **Saved searches…**, enter a name, and choose **Save current search**. The preset records the remote folder, query, filters, and sort order. Choose **Run saved search** to scan that folder again from any folder in the drawer. Saved searches belong to the profile and the verified SSH endpoint. **Remove saved search** removes the preset from the profile.

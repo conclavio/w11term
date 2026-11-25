@@ -26,6 +26,7 @@ impl SavedSftpSearch {
                 && self.root.len() <= MAX_SEARCH_PATH_BYTES,
             "Choose a canonical remote search folder"
         );
+        self.filter.file_size.validate(self.filter.kind)?;
         ensure!(
             self.filter.valid_query(&self.query),
             "Enter a search pattern, select a result type, or exclude folders"
@@ -174,7 +175,7 @@ impl ProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sftp::EntryKind;
+    use crate::sftp::{EntryKind, FileSizeRange};
     use serde_json::json;
 
     fn peer(fingerprint: &str) -> BookmarkPeer {
@@ -194,6 +195,7 @@ mod tests {
                 match_path: true,
                 kind: Some(EntryKind::File),
                 exclude_dir_regex: r"(^|/)archive$".into(),
+                file_size: FileSizeRange::parse("1 MiB", "").unwrap(),
             },
             sort: FilenameSort::Newest,
         }
@@ -275,6 +277,7 @@ mod tests {
         assert!(old.filter.match_case);
         assert!(!old.filter.match_path);
         assert!(old.filter.exclude_dir_regex.is_empty());
+        assert!(old.filter.file_size.is_unrestricted());
         assert!(
             serde_json::to_value(old).unwrap()["filter"]
                 .get("match_path")

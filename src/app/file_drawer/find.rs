@@ -1,5 +1,8 @@
 use super::*;
-use w11term::sftp::{FilenameFilter, FilenameSearch, FilenameSort as ResultSort, SearchDownload};
+use w11term::sftp::{
+    FileSizeRange, FilenameFilter, FilenameSearch, FilenameSort as ResultSort, SearchDownload,
+    valid_filename_query,
+};
 
 pub mod saved;
 
@@ -45,6 +48,33 @@ pub enum MatchOption {
     MatchPath(bool),
     Kind(Option<EntryKind>),
     ExcludeDirs(String),
+    MinimumSize(String),
+    MaximumSize(String),
+}
+
+#[derive(Default)]
+struct SizeFields {
+    minimum: String,
+    maximum: String,
+}
+
+impl SizeFields {
+    fn apply(&self, filter: &FilenameFilter) -> Result<FilenameFilter> {
+        let mut filter = filter.clone();
+        filter.file_size = FileSizeRange::parse(&self.minimum, &self.maximum)?;
+        filter.file_size.validate(filter.kind)?;
+        Ok(filter)
+    }
+}
+
+impl From<FileSizeRange> for SizeFields {
+    fn from(range: FileSizeRange) -> Self {
+        let text = |bound: Option<u64>| bound.map_or_else(String::new, |bytes| bytes.to_string());
+        Self {
+            minimum: text(range.minimum),
+            maximum: text(range.maximum),
+        }
+    }
 }
 
 pub(super) struct Panel {
@@ -53,6 +83,7 @@ pub(super) struct Panel {
     query: String,
     input: ElementRef<TextBox>,
     filter: FilenameFilter,
+    size: SizeFields,
     sort: ResultSort,
     saved: Option<saved::List>,
     result: Option<FilenameSearch>,
@@ -98,6 +129,17 @@ fn within<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
 }
 
 impl Panel {
+    fn query_optional(&self) -> bool {
+        self.filter.kind.is_some()
+            || !self.filter.exclude_dir_regex.is_empty()
+            || !self.size.minimum.trim().is_empty()
+            || !self.size.maximum.trim().is_empty()
+    }
+
+    fn can_search(&self) -> bool {
+        valid_filename_query(&self.query) || (self.query.is_empty() && self.query_optional())
+    }
+
     fn clear_results(&mut self) {
         self.result = None;
         self.page = 0;
@@ -235,6 +277,7 @@ impl Panel {
         let running = self.cancel.as_ref();
         let type_filter = ComboBox::new()
             .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Top)
             .automation_name("Search result type")
             .is_enabled(ready)
             .items_source(RESULT_TYPES.map(|(_, label)| label))
@@ -269,13 +312,11 @@ impl Panel {
             .min_width(0.0)
             .automation_name(input_label)
             .element_ref(&self.input)
-            .placeholder_text(
-                if self.filter.kind.is_some() || !self.filter.exclude_dir_regex.is_empty() {
-                    format!("{prompt} (optional)")
-                } else {
-                    prompt.into()
-                },
-            )
+            .placeholder_text(if self.query_optional() {
+                format!("{prompt} (optional)")
+            } else {
+                prompt.into()
+            })
             .is_enabled(ready)
             .text(&self.query)
             .on_text_changed(ctx.callback(move |text| {
@@ -285,6 +326,40 @@ impl Panel {
                     Action::Query(serial, text),
                 ))
             }));
+        let size_field =
+            |label: &str, placeholder: &str, text: &str, option: fn(String) -> MatchOption| {
+                TextBox::new()
+                    .min_width(0.0)
+                    .automation_name(label)
+                    .placeholder_text(placeholder)
+                    .is_enabled(ready)
+                    .text(text)
+                    .on_text_changed(ctx.callback(move |text| {
+                        Message::Files(FileAction::Search(
+                            pane,
+                            generation,
+                            Action::SetOption(serial, option(text)),
+                        ))
+                    }))
+            };
+        let sizes = Grid::new()
+            .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+            .column_spacing(6.0)
+            .children((
+                size_field(
+                    "Minimum file size",
+                    "Min size",
+                    &self.size.minimum,
+                    MatchOption::MinimumSize,
+                ),
+                size_field(
+                    "Maximum file size",
+                    "Max size",
+                    &self.size.maximum,
+                    MatchOption::MaximumSize,
+                )
+                .grid_column(1),
+            ));
         let exclude_dirs = TextBox::new()
             .min_width(0.0)
             .automation_name("Exclude folder paths (regex)")
@@ -322,7 +397,7 @@ impl Panel {
                         StackPanel::new()
                             .automation_id(crate::input::file_search_tag(pane))
                             .spacing(6.0)
-                            .children((query, exclude_dirs)),
+                            .children((query, exclude_dirs, sizes)),
                         type_filter,
                     )),
             ),
@@ -370,7 +445,7 @@ impl Panel {
                     "Search"
                 },
                 Action::Run(serial),
-                ready && self.filter.valid_query(&self.query),
+                ready && self.can_search(),
             )
         };
         let search_actions = if self
@@ -895,14 +970,22 @@ impl FileDrawer {
         note: Option<String>,
     ) {
         let panel = self.search.as_mut().unwrap();
+        let filter = match panel.size.apply(&panel.filter) {
+            Ok(filter) => filter,
+            Err(error) => {
+                self.status = format!("{error:#}");
+                return;
+            }
+        };
         let op = Operation::Find {
             path: panel.root.clone(),
             query: panel.query.clone(),
-            regex: panel.filter.regex,
-            match_case: panel.filter.match_case,
-            match_path: panel.filter.match_path,
-            kind: panel.filter.kind,
-            exclude_dir_regex: panel.filter.exclude_dir_regex.clone(),
+            regex: filter.regex,
+            match_case: filter.match_case,
+            match_path: filter.match_path,
+            kind: filter.kind,
+            exclude_dir_regex: filter.exclude_dir_regex,
+            file_size: filter.file_size,
         };
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
@@ -1037,6 +1120,7 @@ impl FileDrawer {
                 query: String::new(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
                 sort: ResultSort::default(),
                 saved: None,
                 result: None,
@@ -1086,22 +1170,28 @@ impl FileDrawer {
                 }
             }
             Action::SetOption(serial, option) if serial == panel.serial && !busy => {
-                let previous = panel.filter.clone();
+                let previous = (
+                    panel.filter.clone(),
+                    panel.size.minimum.clone(),
+                    panel.size.maximum.clone(),
+                );
                 match option {
                     MatchOption::Regex(enabled) => panel.filter.regex = enabled,
                     MatchOption::MatchCase(enabled) => panel.filter.match_case = enabled,
                     MatchOption::MatchPath(enabled) => panel.filter.match_path = enabled,
                     MatchOption::Kind(kind) => panel.filter.kind = kind,
                     MatchOption::ExcludeDirs(regex) => panel.filter.exclude_dir_regex = regex,
+                    MatchOption::MinimumSize(value) => panel.size.minimum = value,
+                    MatchOption::MaximumSize(value) => panel.size.maximum = value,
                 }
-                if panel.filter != previous {
+                if (&panel.filter, &panel.size.minimum, &panel.size.maximum)
+                    != (&previous.0, &previous.1, &previous.2)
+                {
                     panel.clear_results();
                     self.status.clear();
                 }
             }
-            Action::Run(serial)
-                if serial == panel.serial && !busy && panel.filter.valid_query(&panel.query) =>
-            {
+            Action::Run(serial) if serial == panel.serial && !busy && panel.can_search() => {
                 self.start_filename_search(pane, session, ctx, None);
             }
             Action::Cancel(serial) if serial == panel.serial => {
@@ -1197,6 +1287,7 @@ mod tests {
                 query: "name".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(result),
@@ -1342,6 +1433,7 @@ mod tests {
                 query: "test".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(before),
@@ -1413,7 +1505,9 @@ mod tests {
                     match_path: false,
                     kind: Some(EntryKind::File),
                     exclude_dir_regex: String::new(),
+                    file_size: FileSizeRange::default(),
                 },
+                size: SizeFields::default(),
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1489,6 +1583,7 @@ mod tests {
                 query: "log".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1555,6 +1650,7 @@ mod tests {
                 query: "settings".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1624,6 +1720,7 @@ mod tests {
                 query: "log".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
+                size: SizeFields::default(),
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1715,6 +1812,7 @@ mod tests {
             query: "snap".into(),
             input: ElementRef::new(),
             filter: FilenameFilter::default(),
+            size: SizeFields::default(),
             sort: ResultSort::default(),
             saved: None,
             result: Some(FilenameSearch {

@@ -35,7 +35,10 @@ mod drop_source;
 mod editor;
 mod find;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
-pub use find::{FilenameFilter, FilenameMatch, FilenameSearch, FilenameSort, valid_filename_query};
+pub use find::{
+    FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch, FilenameSort,
+    valid_filename_query,
+};
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
@@ -263,6 +266,8 @@ pub enum Operation {
         kind: Option<EntryKind>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         exclude_dir_regex: String,
+        #[serde(default, skip_serializing_if = "FileSizeRange::is_unrestricted")]
+        file_size: FileSizeRange,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -1156,6 +1161,7 @@ impl Engine {
                 match_path,
                 kind,
                 exclude_dir_regex,
+                file_size,
             } => serde_json::to_value(
                 self.find_filenames(
                     &path,
@@ -1166,6 +1172,7 @@ impl Engine {
                         match_path,
                         kind,
                         exclude_dir_regex,
+                        file_size,
                     },
                     cancel,
                 )
