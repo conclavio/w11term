@@ -42,6 +42,7 @@ pub use find::{
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
+mod permissions;
 mod remote_copy;
 mod text_preview;
 mod transfer_status;
@@ -56,6 +57,8 @@ pub use drop_source::{DropSource, classify_drop};
 pub const CHUNK: usize = 32 * 1024;
 pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
+pub use permissions::{PERMISSIONS_OUTCOME_UNKNOWN, PermissionReview};
+
 pub const MOVE_OUTCOME_UNKNOWN: &str = "Move outcome unknown; refresh both folders to check";
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
@@ -299,6 +302,12 @@ pub enum Operation {
     #[serde(skip)]
     EntryProperties {
         path: String,
+    },
+    #[serde(skip)]
+    SetEntryPermissions {
+        path: String,
+        review: PermissionReview,
+        mode: u32,
     },
     /// The absolute path verified by SSHFS can only be opened on the source pane.
     #[serde(skip)]
@@ -712,6 +721,9 @@ pub(crate) async fn run(
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
                 }
+                Operation::SetEntryPermissions { .. } => {
+                    Some("Missing SSH connection approval; permission change was not started")
+                }
                 Operation::GetSearch { .. } => Some("Missing SSH connection for search results"),
                 _ => None,
             };
@@ -846,6 +858,9 @@ pub(crate) async fn run(
                     JobStage::Checking("Destination folders did not load")
                 }
                 Operation::SaveText { .. } => JobStage::Checking("Save was not started"),
+                Operation::SetEntryPermissions { .. } => {
+                    JobStage::Checking("Permission change was not started")
+                }
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
             },
@@ -1487,6 +1502,10 @@ impl Engine {
                     }
                 }
                 result
+            }
+            SetEntryPermissions { path, review, mode } => {
+                self.set_entry_permissions(&path, review, mode, stage)
+                    .await?
             }
             Put {
                 local,

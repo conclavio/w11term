@@ -126,6 +126,7 @@ pub enum FileAction {
     MovePreviewMatch(u64, u64, u64, bool),
     CopyChecksum(u64, u64, u64),
     VerifyChecksum(u64, u64, u64),
+    Permissions(u64, u64, u64, preview::PermissionsAction),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
@@ -573,6 +574,7 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    Permissions(u64, u32),
     MoveDestination(u64, u64),
     FolderBatch(folder_batch::Batch),
     Search(u64, Option<String>),
@@ -1994,6 +1996,15 @@ impl FileDrawer {
                 ..
             }) => change_reconnect_status(change, reply),
             Some(Pending {
+                step: Step::Permissions(..),
+                reply,
+                ..
+            }) => match reply.try_recv() {
+                Ok(Ok(_)) => "Server acknowledged the permission change before SSH reconnected. Reopen Properties to check the mode.".into(),
+                Ok(Err(error)) => error,
+                Err(_) => format!("SSH reconnected. {}.", w11term::sftp::PERMISSIONS_OUTCOME_UNKNOWN),
+            },
+            Some(Pending {
                 step: Step::FolderBatch(batch),
                 reply,
                 ..
@@ -2962,6 +2973,9 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::Permissions(serial, mode), reply) => {
+                self.finish_permissions(serial, mode, reply)
+            }
             (Step::MoveDestination(serial, revision), reply) => {
                 self.finish_destination_listing(serial, revision, reply)
             }
@@ -3431,6 +3445,7 @@ impl TerminalApp {
             | MovePreviewMatch(id, ..)
             | CopyChecksum(id, ..)
             | VerifyChecksum(id, ..)
+            | Permissions(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
@@ -3505,7 +3520,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3643,6 +3658,20 @@ impl TerminalApp {
                 VerifyChecksum(_, _, serial) => {
                     if may_open_dialog {
                         files.verify_checksum(serial)?;
+                    }
+                }
+                Permissions(_, _, serial, action) => {
+                    if may_open_dialog
+                        && let Some((mode, operation)) = files.permissions_action(serial, action)
+                        && let Err(error) = files.job(
+                            pane,
+                            session,
+                            operation,
+                            Step::Permissions(serial, mode),
+                            context,
+                        )
+                    {
+                        files.finish_permissions(serial, mode, Err(format!("{error:#}")));
                     }
                 }
                 StartTextEditor(_, generation, serial) => {

@@ -521,6 +521,14 @@ impl russh_sftp::server::Handler for Files {
         if self.root.join("fixture-copy-data").is_file() {
             version.extensions.insert("copy-data".into(), "1".into());
         }
+        if let Ok(request) = fs::read_to_string(self.root.join("fixture-permissions")) {
+            self.posix.get_or_insert_with(Default::default);
+            if request == "lsetstat" {
+                version
+                    .extensions
+                    .insert("lsetstat@openssh.com".into(), "1".into());
+            }
+        }
         Ok(version)
     }
     async fn extended(
@@ -531,6 +539,16 @@ impl russh_sftp::server::Handler for Files {
     ) -> Result<Packet, StatusCode> {
         if request == "posix-rename@openssh.com" && self.posix.is_some() {
             return self.posix_rename(id, data);
+        }
+        if request == "lsetstat@openssh.com" {
+            let mut payload = data.into();
+            let (path, attrs): (String, FileAttributes) =
+                russh_sftp::de::from_bytes(&mut payload).map_err(|_| StatusCode::BadMessage)?;
+            if !payload.is_empty() {
+                return Err(StatusCode::BadMessage);
+            }
+            self.set_permissions("LSETSTAT", path, &attrs)?;
+            return Ok(Packet::Status(status(id)));
         }
         if request == "copy-data" && self.root.join("fixture-copy-data").is_file() {
             self.trace_transfer("COPY-DATA")?;
@@ -763,6 +781,10 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        if attrs.permissions.is_some() && self.root.join("fixture-permissions").is_file() {
+            self.set_permissions("SETSTAT", path, &attrs)?;
+            return Ok(status(id));
+        }
         self.trace_properties("SETSTAT", &path)?;
         if let Some(size) = attrs.size {
             fs::OpenOptions::new()

@@ -1,6 +1,41 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "changes a file and folder mode from native SFTP Properties over loopback"]
+async fn native_sftp_properties_changes_the_reviewed_file_and_directory_modes() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    fs::create_dir_all(folder.join("child-folder")).unwrap();
+    fs::write(folder.join("permissions.txt"), b"original data").unwrap();
+    directory_junction(&folder, "link-folder", "child-folder");
+    fs::write(root.join("fixture-permissions"), "lsetstat").unwrap();
+    let trace = root.join("properties-trace");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("sftp-permissions-ui.ps1", &ssh, state.path());
+    let requests = fs::read_to_string(trace).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| line.contains("SETSTAT"))
+            .collect::<Vec<_>>(),
+        [
+            "LSETSTAT /shell directory/permissions.txt",
+            "LSETSTAT /shell directory/child-folder"
+        ]
+    );
+    assert_eq!(
+        fs::read(folder.join("permissions.txt")).unwrap(),
+        b"original data"
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reads fresh SFTP properties, hashes a file and carries its digest into a verified download"]
 async fn native_sftp_properties_uses_fresh_metadata_and_keeps_the_selected_entry() {
     let accepted = Arc::new(AtomicUsize::new(0));
