@@ -20,13 +20,14 @@ mod bookmarks;
 mod destination;
 mod downloads;
 mod editor;
-mod filesystem_space;
 pub(super) mod find;
 mod folder_batch;
+mod folder_report;
 mod history;
 mod link_target;
 mod preview;
 mod properties;
+mod rename_batch;
 mod sort;
 mod text_draft;
 mod transfer_queue;
@@ -111,8 +112,8 @@ pub enum FileAction {
     Browse(u64, u64, String),
     History(u64, u64, u64, HistoryDirection),
     GoToFolder(u64, u64, u64),
-    ShowFilesystemSpace(u64, u64, u64),
-    FilesystemSpace(u64, u64, u64, filesystem_space::Action),
+    ShowFolderReport(u64, u64, u64, folder_report::Kind),
+    FolderReport(u64, u64, u64, folder_report::Action),
     OpenEntry(u64, u64, ListedEntry),
     EditFilter(u64, u64, u64, bool),
     FocusFilter(u64, u64, u64, u8),
@@ -137,6 +138,8 @@ pub enum FileAction {
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
     Rename(u64, u64, ListedEntry),
+    RenameMarkedText(u64, u64, u64, rename_batch::Field, String),
+    ConfirmRenameMarked(u64, u64, u64),
     MoveEntry(u64, u64, FileTarget),
     CopyEntry(u64, u64, FileTarget, CopyFileMode),
     StartFolderBatch(u64, u64, u64, FolderBatchKind),
@@ -203,7 +206,7 @@ pub(super) struct FileDrawer {
     reveal: Option<RevealTarget>,
     dialog: Option<EntryDialog>,
     preview: Option<preview::EntryPreview>,
-    filesystem_space: Option<filesystem_space::Panel>,
+    folder_report: Option<folder_report::Panel>,
     editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
@@ -380,6 +383,7 @@ enum EditAction {
     Create,
     Rename(ListedEntry),
     RenameSearch(u64, FilenameMatch),
+    RenameMarked(rename_batch::Review),
     Move(FileTarget, Option<EntryKind>),
     Copy(FileTarget, CopyFileMode),
     FolderBatch(FolderBatchKind, FolderBatchOrigin, Vec<FilenameMatch>),
@@ -401,6 +405,7 @@ impl EditAction {
             | Self::Create
             | Self::VerifyDownload(_)
             | Self::RenameSearch(..)
+            | Self::RenameMarked(..)
             | Self::FolderBatch(..)
             | Self::Move(FileTarget::Search(..), _)
             | Self::Copy(FileTarget::Search(..), _)
@@ -505,6 +510,7 @@ impl EntryDialog {
                 self.check_destination_folder(folder)?;
                 Ok(folder.to_owned())
             }
+            EditAction::RenameMarked(_) => bail!("Confirm the rename from its preview"),
             EditAction::Delete(target, _) => delete_path(parent()?, target.name()),
             EditAction::VerifyDownload(_) => normalize_sha256(&self.name),
             EditAction::Rename(_) | EditAction::RenameSearch(..) | EditAction::Create => {
@@ -582,10 +588,11 @@ enum Step {
     IdentifyDelete(ListedEntry),
     Preview(u64),
     OpenLinkTarget(u64),
-    FilesystemSpace(u64),
+    FolderReport(u64),
     Permissions(u64, u32),
     MoveDestination(u64, u64),
     FolderBatch(folder_batch::Batch),
+    RenamePreflight(folder_batch::Batch),
     Search(u64, Option<String>),
     SaveText(editor::Save),
     Transfer(TransferFile),
@@ -1138,12 +1145,12 @@ impl FileDrawer {
     pub(super) fn entry_dialog_open(&self) -> bool {
         self.dialog.is_some()
             || self.preview.is_some()
-            || self.filesystem_space.is_some()
+            || self.folder_report.is_some()
             || self.editor.as_ref().is_some_and(editor::Editor::is_open)
     }
 
     pub(super) fn cancel_entry_dialog(&mut self) {
-        self.cancel_filesystem_space();
+        self.cancel_folder_report();
         if let Some(editor) = self.editor.as_mut().filter(|e| e.is_open()) {
             editor.stash();
             self.cached.get_mut().take();
@@ -1596,14 +1603,22 @@ impl FileDrawer {
         if let Some(preview) = &self.preview {
             return Some(preview.dialog(pane, self.generation, self.editor.is_none(), context));
         }
-        if let Some(space) = &self.filesystem_space {
-            return Some(space.dialog(pane, self.generation, context));
+        if let Some(space) = &self.folder_report {
+            let progress = self
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.search_progress.as_ref())
+                .map(|progress| progress.borrow().clone());
+            return Some(space.dialog(pane, self.generation, progress.as_ref(), context));
         }
         let dialog = self.dialog.as_ref()?;
         let serial = dialog.serial;
         let generation = self.generation;
         if let Some(picker) = &dialog.destination_picker {
             return Some(picker.dialog(dialog, pane, generation, context));
+        }
+        if let EditAction::RenameMarked(review) = &dialog.action {
+            return Some(review.dialog(dialog, pane, generation, ssh, context));
         }
         let valid = dialog.destination();
         if let EditAction::Delete(_, kind) = &dialog.action {
@@ -1651,6 +1666,9 @@ impl FileDrawer {
             }
             EditAction::FolderBatch(FolderBatchKind::Copy, ..) => {
                 ("Copy marked files", "Destination folder", "Copy")
+            }
+            EditAction::RenameMarked(_) | EditAction::FolderBatch(FolderBatchKind::Rename, ..) => {
+                unreachable!()
             }
             EditAction::VerifyDownload(_) => (
                 "Download and verify",
@@ -2024,6 +2042,10 @@ impl FileDrawer {
                 Err(_) => format!("SSH reconnected. {}.", w11term::sftp::PERMISSIONS_OUTCOME_UNKNOWN),
             },
             Some(Pending {
+                step: Step::RenamePreflight(_),
+                ..
+            }) => "SSH reconnected while checking the rename. No entries were renamed.".into(),
+            Some(Pending {
                 step: Step::FolderBatch(batch),
                 reply,
                 ..
@@ -2256,7 +2278,12 @@ impl FileDrawer {
             button(
                 "Filesystem space…",
                 writable && generation != 0,
-                ShowFilesystemSpace(pane, generation, revision),
+                ShowFolderReport(pane, generation, revision, folder_report::Kind::Space),
+            ),
+            button(
+                "Folder contents…",
+                writable && generation != 0,
+                ShowFolderReport(pane, generation, revision, folder_report::Kind::Contents),
             ),
             StackPanel::new()
                 .orientation(if layout.content_width() >= 320.0 {
@@ -2613,6 +2640,11 @@ impl FileDrawer {
                         StartFolderBatch(pane, generation, revision, FolderBatchKind::Copy),
                     ),
                     button(
+                        "Rename marked entries…",
+                        writable && generation != 0 && !marked.is_empty(),
+                        StartFolderBatch(pane, generation, revision, FolderBatchKind::Rename),
+                    ),
+                    button(
                         "Exit selection",
                         writable,
                         SelectDownloads(pane, generation, revision, false),
@@ -2830,7 +2862,12 @@ impl FileDrawer {
                     None,
                 )
             }
-            Step::Search(..) => {
+            Step::Search(..) | Step::FolderReport(_)
+                if matches!(
+                    &operation,
+                    Operation::Find { .. } | Operation::MeasureFolder { .. }
+                ) =>
+            {
                 let (tx, progress) = watch::channel(SearchProgress::default());
                 (Some(JobProgress::Search(tx)), None, Some(progress))
             }
@@ -2850,8 +2887,14 @@ impl FileDrawer {
                 progress: tx_progress,
                 cancel: if matches!(step, Step::Preview(_) | Step::OpenLinkTarget(_)) {
                     self.preview.as_ref().map(|p| p.cancel.clone())
+                } else if let Step::RenamePreflight(batch) = &step {
+                    batch.preflight_cancel()
                 } else if matches!(step, Step::Search(..)) {
                     self.search.as_ref().and_then(|p| p.cancel.clone())
+                } else if matches!(step, Step::FolderReport(_)) {
+                    self.folder_report
+                        .as_ref()
+                        .map(|panel| panel.cancel.clone())
                 } else if move_picker {
                     self.dialog
                         .as_ref()
@@ -2997,7 +3040,7 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
-            (Step::FilesystemSpace(serial), reply) => self.finish_filesystem_space(serial, reply),
+            (Step::FolderReport(serial), reply) => self.finish_folder_report(serial, reply),
             (Step::OpenLinkTarget(serial), reply) => {
                 self.finish_link_target(id, serial, reply, context)
             }
@@ -3006,6 +3049,12 @@ impl FileDrawer {
             }
             (Step::MoveDestination(serial, revision), reply) => {
                 self.finish_destination_listing(serial, revision, reply)
+            }
+            (Step::RenamePreflight(batch), Ok(_)) => {
+                self.start_folder_batch(id, session, batch, context)?;
+            }
+            (Step::RenamePreflight(_), Err(error)) => {
+                self.status = format!("No entries were renamed. {error}");
             }
             (Step::FolderBatch(batch), reply) => {
                 self.finish_folder_batch(id, session, batch, reply, context)?
@@ -3456,8 +3505,8 @@ impl TerminalApp {
             | Browse(id, ..)
             | History(id, ..)
             | GoToFolder(id, ..)
-            | ShowFilesystemSpace(id, ..)
-            | FilesystemSpace(id, ..)
+            | ShowFolderReport(id, ..)
+            | FolderReport(id, ..)
             | OpenEntry(id, ..)
             | EditFilter(id, ..)
             | FocusFilter(id, ..)
@@ -3482,6 +3531,8 @@ impl TerminalApp {
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
             | Rename(id, ..)
+            | RenameMarkedText(id, ..)
+            | ConfirmRenameMarked(id, ..)
             | MoveEntry(id, ..)
             | CopyEntry(id, ..)
             | StartFolderBatch(id, ..)
@@ -3558,7 +3609,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | OpenLinkTarget(_, g, ..) | LinkTargetListed(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | ShowFilesystemSpace(_, g, ..) | FilesystemSpace(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | OpenLinkTarget(_, g, ..) | LinkTargetListed(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | RenameMarkedText(_, g, ..) | ConfirmRenameMarked(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | ShowFolderReport(_, g, ..) | FolderReport(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3698,36 +3749,39 @@ impl TerminalApp {
                         files.verify_checksum(serial)?;
                     }
                 }
-                ShowFilesystemSpace(_, _, revision) => {
+                ShowFolderReport(_, _, revision, kind) => {
                     if may_open_dialog
-                        && let Some((serial, operation)) = files.start_filesystem_space(revision)
+                        && let Some((serial, operation)) = files.start_folder_report(revision, kind)
                         && let Err(error) = files.job(
                             pane,
                             session,
                             operation,
-                            Step::FilesystemSpace(serial),
+                            Step::FolderReport(serial),
                             context,
                         )
                     {
-                        files.finish_filesystem_space(serial, Err(format!("{error:#}")));
+                        files.finish_folder_report(serial, Err(format!("{error:#}")));
                     }
                 }
-                FilesystemSpace(_, _, serial, filesystem_space::Action::Refresh) => {
+                FolderReport(_, _, serial, folder_report::Action::Refresh) => {
                     if may_open_dialog
-                        && let Some(operation) = files.refresh_filesystem_space(serial)
+                        && let Some(operation) = files.refresh_folder_report(serial)
                         && let Err(error) = files.job(
                             pane,
                             session,
                             operation,
-                            Step::FilesystemSpace(serial),
+                            Step::FolderReport(serial),
                             context,
                         )
                     {
-                        files.finish_filesystem_space(serial, Err(format!("{error:#}")));
+                        files.finish_folder_report(serial, Err(format!("{error:#}")));
                     }
                 }
-                FilesystemSpace(_, _, serial, filesystem_space::Action::Close) => {
-                    files.close_filesystem_space(serial);
+                FolderReport(_, _, serial, folder_report::Action::Stop) => {
+                    files.stop_folder_report(serial);
+                }
+                FolderReport(_, _, serial, folder_report::Action::Close) => {
+                    files.close_folder_report(serial);
                 }
                 OpenLinkTarget(_, _, serial) => {
                     if may_open_dialog
@@ -3934,6 +3988,16 @@ impl TerminalApp {
                     }
                 }
                 StopFolderBatch(_, _, id) => files.stop_folder_batch(id),
+                RenameMarkedText(_, _, serial, field, value) => {
+                    files.edit_rename_marked(serial, field, value);
+                }
+                ConfirmRenameMarked(_, _, serial) => {
+                    if may_open_dialog {
+                        files.confirm_rename_marked(pane, session, serial, context)?;
+                    } else {
+                        files.cancel_entry_dialog();
+                    }
+                }
                 FinishEdit(_, _, serial, result) => {
                     if !may_open_dialog {
                         files.cancel_entry_dialog();
@@ -4069,6 +4133,9 @@ impl TerminalApp {
                                 let batch =
                                     folder_batch::Batch::new(review_id, kind, origin, hits, path)?;
                                 return files.start_folder_batch(pane, session, batch, context);
+                            }
+                            EditAction::RenameMarked(_) => {
+                                bail!("Confirm the rename from its preview")
                             }
                             EditAction::Create => {
                                 files.status = format!("Creating folder {name}…");

@@ -37,7 +37,8 @@ mod find;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
     ContentMatch, ContentScan, FileSizeRange, FileTextMatch, FilenameFilter, FilenameMatch,
-    FilenameSearch, FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
+    FilenameSearch, FilenameSort, FolderContents, ModifiedDateRange, SearchProgress,
+    valid_filename_query,
 };
 mod resume_download;
 use resume_download::ResumeDownload;
@@ -60,6 +61,7 @@ pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
 pub use permissions::{PERMISSIONS_OUTCOME_UNKNOWN, PermissionReview};
 
+pub const RENAME_OUTCOME_UNKNOWN: &str = "Rename outcome unknown; refresh to check";
 pub const MOVE_OUTCOME_UNKNOWN: &str = "Move outcome unknown; refresh both folders to check";
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
@@ -184,6 +186,13 @@ impl EntryKind {
 }
 
 #[derive(Debug)]
+pub struct ReviewedRename {
+    pub from: String,
+    pub to: String,
+    pub kind: EntryKind,
+}
+
+#[derive(Debug)]
 pub enum CopyDestination {
     Folder {
         directory: String,
@@ -268,6 +277,10 @@ pub enum Operation {
         preserve_times: bool,
     },
     Ls {
+        path: String,
+    },
+    #[serde(skip)]
+    MeasureFolder {
         path: String,
     },
     /// List folder choices for the drawer's move dialog on its existing connection.
@@ -377,6 +390,10 @@ pub enum Operation {
         from: String,
         to: String,
         search_kind: Option<EntryKind>,
+    },
+    #[serde(skip)]
+    CheckRenameBatch {
+        entries: Vec<ReviewedRename>,
     },
     /// Move an approved drawer entry into a folder on the same SSH connection.
     #[serde(skip)]
@@ -701,7 +718,7 @@ pub(crate) async fn run(
         if expected_generation.is_none() {
             let missing = match operation {
                 Operation::SaveText { .. } => Some("The editor needs its original SSH connection"),
-                Operation::RenameEntry { .. } => {
+                Operation::RenameEntry { .. } | Operation::CheckRenameBatch { .. } => {
                     Some("Missing SSH connection approval; rename was not started")
                 }
                 Operation::MoveEntry { .. } => {
@@ -726,6 +743,9 @@ pub(crate) async fn run(
                 }
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
+                }
+                Operation::MeasureFolder { .. } => {
+                    Some("Missing SSH connection for folder contents")
                 }
                 Operation::OpenLinkTarget { .. } => {
                     Some("Missing SSH connection for opening the link target")
@@ -861,13 +881,16 @@ pub(crate) async fn run(
                     JobStage::Checking("File text search did not finish")
                 }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
+                Operation::MeasureFolder { .. } => JobStage::Checking("Folder scan did not finish"),
                 Operation::GetDir { .. } | Operation::GetSearch { .. } => {
                     JobStage::DirectoryDownload {
                         staging: None,
                         deadline,
                     }
                 }
-                Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
+                Operation::RenameEntry { .. } | Operation::CheckRenameBatch { .. } => {
+                    JobStage::Checking("Rename was not started")
+                }
                 Operation::MoveEntry { .. } => JobStage::Checking("Move was not started"),
                 Operation::CopyEntry { .. } => JobStage::Checking("Copy was not started"),
                 Operation::BrowseMoveFolders { .. } => {
@@ -1186,6 +1209,24 @@ impl Engine {
         Ok(json!({"directory":directory,"folders":folders}))
     }
 
+    async fn check_reviewed_rename(&self, from: &str, to: &str, kind: EntryKind) -> Result<()> {
+        let (parent, _) = from
+            .rsplit_once('/')
+            .context("Missing rename source parent")?;
+        ensure!(
+            to.rsplit_once('/')
+                .is_some_and(|(target, _)| target == parent),
+            "The entry's containing folder changed"
+        );
+        self.check_search_parent(parent).await?;
+        let attributes = self.raw.lstat(from).await?.attrs;
+        ensure!(
+            EntryKind::from_permissions(attributes.permissions) == Some(kind),
+            "The entry type changed. Refresh the file list."
+        );
+        Ok(())
+    }
+
     async fn rename_without_replacement(
         &self,
         from: String,
@@ -1495,6 +1536,17 @@ impl Engine {
                 )
                 .await?,
             )?,
+            MeasureFolder { path } => serde_json::to_value(
+                self.measure_folder(
+                    &path,
+                    cancel,
+                    match job_progress {
+                        Some(JobProgress::Search(sender)) => Some(sender),
+                        _ => None,
+                    },
+                )
+                .await?,
+            )?,
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
                 let mut result = json!({ "attrs": attrs });
@@ -1676,28 +1728,23 @@ impl Engine {
                 search_kind,
             } => {
                 if let Some(kind) = search_kind {
-                    let (parent, _) = from
-                        .rsplit_once('/')
-                        .context("Missing search result parent")?;
-                    ensure!(
-                        to.rsplit_once('/')
-                            .is_some_and(|(target, _)| target == parent),
-                        "The search result's containing folder changed"
-                    );
-                    self.check_search_parent(parent).await?;
-                    let attributes = self.raw.lstat(&from).await?.attrs;
-                    ensure!(
-                        EntryKind::from_permissions(attributes.permissions) == Some(kind),
-                        "The search result's entry type changed. Refresh the results."
-                    );
+                    self.check_reviewed_rename(&from, &to, kind).await?;
                 }
-                self.rename_without_replacement(
-                    from,
-                    to,
-                    "Rename outcome unknown; refresh to check",
-                    stage,
-                )
-                .await?;
+                self.rename_without_replacement(from, to, RENAME_OUTCOME_UNKNOWN, stage)
+                    .await?;
+                ok
+            }
+            CheckRenameBatch { entries } => {
+                for entry in entries {
+                    ensure!(
+                        !cancel.is_some_and(TransferCancel::is_cancelled),
+                        "Rename check cancelled"
+                    );
+                    self.check_reviewed_rename(&entry.from, &entry.to, entry.kind)
+                        .await
+                        .with_context(|| format!("Could not check {}", entry.from))?;
+                    self.require_new_name(&entry.to).await?;
+                }
                 ok
             }
             MoveEntry {
