@@ -38,6 +38,14 @@ impl Drop for LocalMemory {
         }
     }
 }
+struct CoTaskMem(*mut core::ffi::c_void);
+impl Drop for CoTaskMem {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(self.0));
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Identity {
@@ -59,11 +67,12 @@ pub(crate) fn is_elevated() -> Result<bool> {
     Ok(Identity::current()?.integrity >= HIGH_INTEGRITY_RID)
 }
 
-/// Return a verified, kernel-pinned directory under `%ProgramData%\w11term\elevated\<sid>`
-/// isolated to High-integrity processes. Every directory component is created with
-/// a protected DACL and High-integrity `NWNR` mandatory label, verified for non-reparse
-/// identity and ownership, and kept open without `FILE_SHARE_DELETE` so no ancestor
-/// or component can be renamed or swapped with a junction while the process runs.
+/// Return a verified, kernel-pinned directory under `FOLDERID_ProgramData\w11term\elevated\<sid>`
+/// isolated to High-integrity processes. The base directory is resolved through the
+/// Windows known-folder API rather than the inherited `ProgramData` environment variable,
+/// and every component from the root down is verified for non-reparse identity and kept
+/// open without `FILE_SHARE_DELETE` so no ancestor or component can be renamed or swapped
+/// with a junction while the process runs.
 pub(crate) fn elevated_data_dir() -> Result<std::path::PathBuf> {
     let identity = Identity::current()?;
     ensure!(
@@ -74,10 +83,8 @@ pub(crate) fn elevated_data_dir() -> Result<std::path::PathBuf> {
         return Ok(pinned.path.clone());
     }
 
-    let program_data = std::path::PathBuf::from(
-        std::env::var_os("ProgramData").context("ProgramData is unavailable")?,
-    );
-    let mut parent_final = verify_non_reparse_root(&program_data)?;
+    let program_data = program_data_dir()?;
+    let (root_handle, mut parent_final) = verify_non_reparse_root(&program_data)?;
 
     let admin_sddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)S:(ML;OICI;NWNR;;;HI)".to_string();
     let user_sddl = format!(
@@ -86,7 +93,8 @@ pub(crate) fn elevated_data_dir() -> Result<std::path::PathBuf> {
     );
 
     let mut current = program_data;
-    let mut handles = Vec::with_capacity(3);
+    let mut handles = Vec::with_capacity(4);
+    handles.push(root_handle);
     for (component, sddl, allow_user_owner) in [
         ("w11term", admin_sddl.as_str(), false),
         ("elevated", admin_sddl.as_str(), false),
@@ -112,6 +120,19 @@ pub(crate) fn elevated_data_dir() -> Result<std::path::PathBuf> {
     Ok(pinned.path.clone())
 }
 
+fn program_data_dir() -> Result<std::path::PathBuf> {
+    use windows::Win32::UI::Shell::{
+        FOLDERID_ProgramData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    };
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, KNOWN_FOLDER_FLAG(0), None) }
+        .context("resolving FOLDERID_ProgramData")?;
+    ensure!(!raw.0.is_null(), "FOLDERID_ProgramData returned null");
+    let _mem = CoTaskMem(raw.0.cast());
+    let path = unsafe { raw.to_string()? };
+    ensure!(!path.is_empty(), "FOLDERID_ProgramData returned empty path");
+    Ok(std::path::PathBuf::from(path))
+}
+
 fn volume_path(file: &std::fs::File) -> Result<Vec<u16>> {
     use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_GUID};
     let mut buf = vec![0u16; 32_768];
@@ -124,16 +145,19 @@ fn volume_path(file: &std::fs::File) -> Result<Vec<u16>> {
     Ok(buf)
 }
 
-fn verify_non_reparse_root(path: &std::path::Path) -> Result<Vec<u16>> {
+fn verify_non_reparse_root(path: &std::path::Path) -> Result<(std::fs::File, Vec<u16>)> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        GetFileInformationByHandle,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, GetFileInformationByHandle,
     };
 
+    // Open with FILE_TRAVERSE (so NT share-access checks engage) and without
+    // FILE_SHARE_DELETE or reparse traversal so this handle pins the root in place.
     let dir = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .access_mode((FILE_TRAVERSE | FILE_READ_ATTRIBUTES).0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)
         .with_context(|| format!("opening elevated base directory {}", path.display()))?;
@@ -147,7 +171,8 @@ fn verify_non_reparse_root(path: &std::path::Path) -> Result<Vec<u16>> {
         "elevated base directory {} must be a real directory, not a reparse point",
         path.display()
     );
-    volume_path(&dir)
+    let final_path = volume_path(&dir)?;
+    Ok((dir, final_path))
 }
 
 fn ensure_pinned_elevated_component(
@@ -166,8 +191,8 @@ fn ensure_pinned_elevated_component(
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_DIRECTORY,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-            READ_CONTROL,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            GetFileInformationByHandle, READ_CONTROL,
         },
     };
 
@@ -196,10 +221,10 @@ fn ensure_pinned_elevated_component(
         );
     }
 
-    // Open without FILE_SHARE_DELETE and without following reparse points so
-    // the verified handle locks this directory and its ancestors against rename.
+    // Open with FILE_TRAVERSE (engaging NT share-access checks) and without
+    // FILE_SHARE_DELETE or reparse traversal so this handle locks the directory in place.
     let dir = std::fs::OpenOptions::new()
-        .access_mode((FILE_READ_ATTRIBUTES | READ_CONTROL).0)
+        .access_mode((FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL).0)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(path)
@@ -726,6 +751,23 @@ mod tests {
             0x2000
         );
         assert_eq!(parse_high_mandatory_label("").unwrap(), 0);
+    }
+    #[test]
+    fn program_data_known_folder_and_root_pinning_work() {
+        let root = program_data_dir().expect("FOLDERID_ProgramData must resolve");
+        assert!(root.is_absolute() && root.is_dir());
+        let (_pinned_root, final_path) =
+            verify_non_reparse_root(&root).expect("ProgramData must pin as a real directory");
+        assert!(!final_path.is_empty());
+
+        // Retaining the verified root handle must prevent renaming that directory.
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("pinned-root");
+        std::fs::create_dir(&target).unwrap();
+        let (handle, _) = verify_non_reparse_root(&target).unwrap();
+        assert!(std::fs::rename(&target, temp.path().join("moved")).is_err());
+        drop(handle);
+        std::fs::rename(&target, temp.path().join("moved")).unwrap();
     }
     #[test]
     fn native_medium_server_refuses_low_integrity_client() {

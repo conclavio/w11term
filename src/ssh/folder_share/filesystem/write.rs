@@ -233,6 +233,10 @@ impl PendingWrite {
     ) -> io::Result<()> {
         self.modify(root, |file, current_len, known_vdl| {
             let end = offset.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
+            check_length(end)?;
+            if bytes.is_empty() {
+                return Ok(known_vdl);
+            }
             let vdl = probe_vdl_near(file, current_len, offset, known_vdl);
             check_extension(vdl, end)?;
             if offset > vdl && offset > current_len {
@@ -254,6 +258,10 @@ impl PendingWrite {
             let end = current_len
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(invalid)?;
+            check_length(end)?;
+            if bytes.is_empty() {
+                return Ok(known_vdl);
+            }
             let vdl = probe_vdl_near(file, current_len, current_len, known_vdl);
             check_extension(vdl, end)?;
             put(file, bytes, current_len)?;
@@ -267,18 +275,19 @@ impl PendingWrite {
     ) -> io::Result<()> {
         check_length(len)?;
         self.modify(root, |file, current_len, known_vdl| {
-            let vdl = probe_vdl_near(file, current_len, len, known_vdl);
-            check_extension(vdl, len)?;
             if len > current_len {
+                let vdl = probe_vdl_near(file, current_len, len, known_vdl);
+                check_extension(vdl, len)?;
                 // Zero-fill in revocation-checked chunks so NTFS Valid Data Length
                 // advances incrementally without stalling Forget/Revoke locks or
                 // accumulating a deferred zero-fill bomb across SETSTAT calls.
                 zero_fill_gap(file, root, current_len, len)?;
+                return Ok(len);
             }
             if len < current_len {
                 file.set_len(len)?;
             }
-            Ok(len)
+            Ok(known_vdl.min(len))
         })
     }
 }
@@ -839,6 +848,41 @@ mod tests {
         );
         existing.write_at(&root, b"head", 0)?;
         assert_eq!(fs::read(&preallocated_path)?[..4], *b"head");
+
+        // Shrinking, same-length set_len, and zero-byte writes write no data and
+        // must never advance cached VDL past the verified lower bound.
+        let uninit_path = temp.path().join("uninitialized.bin");
+        {
+            let f = File::create(&uninit_path)?;
+            f.set_len(MAX_VDL_EXTENSION + 4096)?;
+        }
+        let mut uninit = root.open_write("uninitialized.bin", false, false, false)?;
+        uninit.set_len(&root, MAX_VDL_EXTENSION)?;
+        assert_eq!(uninit.known_vdl, 0);
+        uninit.set_len(&root, MAX_VDL_EXTENSION)?;
+        assert_eq!(uninit.known_vdl, 0);
+        uninit.write_at(&root, b"", MAX_VDL_EXTENSION)?;
+        assert_eq!(uninit.known_vdl, 0);
+        uninit.append(&root, b"")?;
+        assert_eq!(uninit.known_vdl, 0);
+        assert_eq!(
+            uninit
+                .set_len(&root, MAX_VDL_EXTENSION + 1)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            uninit
+                .write_at(&root, b"x", MAX_VDL_EXTENSION)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            uninit.append(&root, b"x").unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
 
         // A genuinely populated large file (non-zero bytes near EOF) remains editable at the tail.
         let populated_path = temp.path().join("populated.bin");
