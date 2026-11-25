@@ -393,6 +393,8 @@ Choose **Select downloads…**, mark files or folders, and use **Download marked
 
 If a drawer transfer finishes while another pane is active or the drawer is closed, the **Attention inbox** gets one result for the transfer or batch. Select the result to open the originating pane’s SFTP drawer.
 
+Open **SFTP transfers** from the caret menu or command palette to see active drawer uploads and downloads across the current window. The tab shows the current item and byte progress for each transfer. Cancel a transfer from the list or use **Open SFTP drawer** to visit its pane.
+
 After a file or folder is saved, choose **Show download in File Explorer** in the drawer or beside its inbox result to select it. Use **Open download folder** for a batch that saved at least one item. Each inbox result keeps its own destination so you can find earlier downloads.
 
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.

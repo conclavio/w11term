@@ -558,6 +558,40 @@ pub struct TransferId {
     serial: u64,
 }
 
+impl TransferId {
+    pub(super) fn pane(self) -> u64 {
+        self.pane
+    }
+}
+
+pub(super) struct TransferView<'a> {
+    pub(super) id: TransferId,
+    pub(super) operation: &'static str,
+    pub(super) remote: Option<&'a str>,
+    pub(super) progress: Option<TransferProgress>,
+    pub(super) batch: Option<(usize, usize)>,
+    pub(super) cancelling: bool,
+}
+
+pub(super) fn transfer_progress_views(p: TransferProgress) -> (View, View) {
+    let mut bar = ProgressBar::new().is_indeterminate(p.total.is_none());
+    if let Some(total) = p.total {
+        bar = bar
+            .maximum(total.max(1) as f64)
+            .value(p.bytes.min(total) as f64);
+    }
+    let text = match (p.files, p.total) {
+        (Some(files), _) => format!(
+            "{} completed, {} acknowledged",
+            counted(files, "file"),
+            counted(p.bytes, "byte")
+        ),
+        (None, Some(total)) => format!("{} / {total} bytes", p.bytes),
+        (None, None) => format!("{} bytes", p.bytes),
+    };
+    (bar.into(), TextBlock::new().text(text).into())
+}
+
 struct ActiveTransfer {
     id: TransferId,
     cancel: TransferCancel,
@@ -1280,6 +1314,38 @@ impl FileDrawer {
         self.transfer_file().is_some()
     }
 
+    pub(super) fn active_transfer(&self, generation: u64) -> Option<TransferView<'_>> {
+        if self.generation != generation {
+            return None;
+        }
+        if let Some(preparation) = &self.preparing_drop {
+            return Some(TransferView {
+                id: preparation.id,
+                operation: "Preparing upload",
+                remote: self.directory.as_deref(),
+                progress: None,
+                batch: None,
+                cancelling: false,
+            });
+        }
+        let file = self.transfer_file()?;
+        let transfer = self.pending.as_ref()?.transfer.as_ref()?;
+        let (operation, remote) = match file {
+            TransferFile::Upload { remote, .. } => ("Uploading", remote),
+            TransferFile::UploadFolder { remote } => ("Uploading folder", remote),
+            TransferFile::Download { remote, .. } => ("Downloading", remote),
+            TransferFile::DownloadFolder { remote, .. } => ("Downloading folder", remote),
+        };
+        Some(TransferView {
+            id: transfer.id,
+            operation,
+            remote: Some(remote),
+            progress: Some(*transfer.progress.borrow()),
+            batch: (self.queue.total > 1).then(|| (self.queue.next_item(), self.queue.total)),
+            cancelling: transfer.cancel.is_cancelled(),
+        })
+    }
+
     fn finish_transfer_queue(&mut self) {
         if let Some(saved) = self.queue.finish(&mut self.status) {
             self.last_download = Some(saved);
@@ -1778,27 +1844,8 @@ impl FileDrawer {
         if let Some(pending) = &self.pending
             && let Some(transfer) = &pending.transfer
         {
-            let p = *transfer.progress.borrow();
-            let mut bar = ProgressBar::new().is_indeterminate(p.total.is_none());
-            if let Some(total) = p.total {
-                bar = bar
-                    .maximum(total.max(1) as f64)
-                    .value(p.bytes.min(total) as f64);
-            }
-            controls.push(bar.into());
-            let bytes = match p.total {
-                Some(total) => format!("{} / {total} bytes", p.bytes),
-                None => format!("{} bytes", p.bytes),
-            };
-            let progress = match p.files {
-                Some(files) => format!(
-                    "{} completed, {} acknowledged",
-                    counted(files, "file"),
-                    counted(p.bytes, "byte")
-                ),
-                None => bytes,
-            };
-            controls.push(TextBlock::new().text(progress).into());
+            let (bar, bytes) = transfer_progress_views(*transfer.progress.borrow());
+            controls.extend([bar, bytes]);
             controls.push(button(
                 "Cancel transfer",
                 !transfer.cancel.is_cancelled(),
@@ -2584,7 +2631,7 @@ impl TerminalApp {
         files.observe_transfer_connection(session, frame.connection_generation, visible);
         if !matches!(
             action,
-            Tick(_) | Picked(..) | Listed(..) | Drop(..) | PreparedDrop(..)
+            Tick(_) | Picked(..) | Listed(..) | Drop(..) | PreparedDrop(..) | CancelTransfer(_)
         ) && !visible
         {
             return;
@@ -2772,11 +2819,13 @@ impl TerminalApp {
                                 files.directory.as_ref() == Some(&parent),
                                 "The upload destination changed. Choose the files again."
                             );
+                            let id = files.transfer_id(pane);
                             files.queue = TransferQueue::files(
                                 paths,
                                 &parent,
                                 files.replace,
                                 files.atomic_uploads,
+                                id,
                             )?;
                             files.transfer_next(pane, session, context)?;
                         }
@@ -4306,6 +4355,7 @@ mod tests {
             "/",
             false,
             false,
+            id,
         )
         .unwrap();
         for stale in [
@@ -4613,7 +4663,18 @@ mod tests {
             directory: Some("/old".into()),
             picking: Some(1),
             replace: true,
-            queue: TransferQueue::files(vec![r"C:\queued".into()], "/old", true, false).unwrap(),
+            queue: TransferQueue::files(
+                vec![r"C:\queued".into()],
+                "/old",
+                true,
+                false,
+                TransferId {
+                    pane: 1,
+                    generation: 1,
+                    serial: 1,
+                },
+            )
+            .unwrap(),
             ..Default::default()
         };
         drawer.observe_connection(2);

@@ -75,6 +75,13 @@ function Cancel-AtSecondPacket([string]$Opcode, [string]$Gate) {
     if ($Opcode -eq 'WRITE') {
         $null = Control @('send-text','--pane',"$remote",'--no-paste','while-upload/')
         $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','while-upload/')
+        Run-Palette 'SFTP transfers'
+        $dot = ' ' + [char]0xb7 + ' '
+        $null = Wait-Until 'active upload and batch length in the transfers tab' {
+            Find-Element "Uploading /shell directory/01-first-upload$($dot)Item 1 of 2"
+        }
+        Click "Open SFTP drawer for Pane $remote"
+        Wait-Focus $remote
     }
     Click 'Cancel transfer'
     $null = Wait-Until 'cancel disabled before server acknowledges the in-flight packet' {
@@ -113,7 +120,7 @@ try {
     Click-Dialog $open 1
     $offset = Cancel-AtSecondPacket 'WRITE' $writeGate
     $null = Wait-Until 'partial upload status with acknowledged byte count' {
-        Find-Element "Cancelled upload of /shell directory/01-first-upload ($($offset * 2) bytes acknowledged). The remote file may be incomplete."
+        Find-Element "Cancelled upload of /shell directory/01-first-upload ($($offset * 2) bytes acknowledged). The remote file may be incomplete. 0 of 2 items completed."
     }
 
     (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()

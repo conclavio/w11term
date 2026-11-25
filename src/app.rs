@@ -91,6 +91,7 @@ mod quick_connect;
 mod recordings;
 mod scrollback_bar;
 mod session_browser;
+mod sftp_transfers;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
 mod tab_colors;
@@ -386,6 +387,7 @@ enum Page {
     LocalForwards(local_forwards::Panel),
     SharedFolders(folder_shares::Panel),
     Attention(attention::AttentionPage),
+    SftpTransfers,
     CommandHistory(command_history::HistoryPage),
     HostGroup(Box<host_groups::HostGroup>),
     Terminal(LiveTab),
@@ -780,6 +782,7 @@ fn tab_menu_message(label: String) -> Message {
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         "Attention inbox" => Message::Attention(attention::Action::Open),
+        sftp_transfers::LABEL => Message::SftpTransfers(sftp_transfers::Action::Open),
         host_groups::LABEL => Message::HostGroup(host_groups::Action::Open),
         host_groups::NEW_TAB_LABEL => Message::HostGroup(host_groups::Action::NewTab),
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
@@ -1072,6 +1075,7 @@ pub enum Message {
     PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
+    SftpTransfers(sftp_transfers::Action),
     AttentionChanged,
     VisualBellTick,
     ToggleInspector,
@@ -3885,6 +3889,7 @@ impl TerminalApp {
                 KeyAction::FindAllPanes,
             ),
             MenuItem::item("inbox", "Attention inbox"),
+            MenuItem::item("sftp-transfers", sftp_transfers::LABEL),
             MenuItem::item("ssh-host-group", host_groups::LABEL),
             MenuItem::item("new-ssh-group-tab", host_groups::NEW_TAB_LABEL),
             recordings.menu(),
@@ -5222,6 +5227,7 @@ impl Component for TerminalApp {
             Message::TransferCanceled(id) => self.cancel_transfer(id, context),
             Message::TabTitle(action) => self.edit_tab_title(action, context),
             Message::Attention(action) => self.handle_attention(action, context),
+            Message::SftpTransfers(action) => self.handle_sftp_transfers(action, context),
             Message::AttentionChanged | Message::FolderAuthority => {}
             Message::VisualBellTick => self.expire_visual_bells(),
             Message::ToggleInspector => {
@@ -7144,6 +7150,7 @@ impl Component for TerminalApp {
                     word_delimiters::view(editor, context)
                 }
                 Page::Attention(page) => self.attention_view(page, context),
+                Page::SftpTransfers => self.sftp_transfers_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::HostGroup(page) => self.host_group_view(id, page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),

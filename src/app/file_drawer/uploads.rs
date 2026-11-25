@@ -82,9 +82,12 @@ impl TransferQueue {
         parent: &str,
         overwrite: bool,
         atomic: bool,
+        id: TransferId,
     ) -> Result<Self> {
         let mut queue = Self {
             overwrite_files: overwrite,
+            batch_id: Some(id),
+            total: paths.len(),
             ..Self::default()
         };
         for local in paths {
