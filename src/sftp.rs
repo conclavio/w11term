@@ -39,7 +39,7 @@ mod find;
 mod folder_comparison;
 pub use folder_comparison::{
     FILE_VERIFICATION_LIMIT, FolderChange, FolderComparison, FolderDifference, FolderEntry,
-    FolderInventory, FolderOrigin, VerifiedFolderFile, capture_local_folder,
+    FolderInventory, FolderMatchedFile, FolderOrigin, VerifiedFolderFile, capture_local_folder,
     valid_comparison_file_path,
 };
 mod image_preview;

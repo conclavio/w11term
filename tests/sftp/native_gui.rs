@@ -3626,6 +3626,16 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(mtime))
             .unwrap();
+        for name in ["same-missing.txt", "same-other.txt"] {
+            let path = folder.join(name);
+            fs::write(&path, b"same").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        }
     }
     fs::write(archive.join("removed.txt"), []).unwrap();
     fs::write(live.join("added.txt"), []).unwrap();
@@ -3647,7 +3657,12 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
             .collect::<Vec<_>>(),
         [
             "OPEN /shell directory/archive/same-metadata.txt",
-            "OPEN /shell directory/live/same-metadata.txt"
+            "OPEN /shell directory/live/same-metadata.txt",
+            "OPEN /shell directory/archive/same-metadata.txt",
+            "OPEN /shell directory/live/same-metadata.txt",
+            "OPEN /shell directory/archive/same-missing.txt",
+            "OPEN /shell directory/archive/same-other.txt",
+            "OPEN /shell directory/live/same-other.txt",
         ],
         "only explicit verification read file data"
     );
