@@ -49,7 +49,7 @@ function Wait-Draft([string]$Expected, [string]$Step) {
 }
 function Open-Editor {
     Click $name
-    Click $preview
+    Invoke-SftpEntryAction $preview
     Click 'Edit'
 }
 function Replace-Word([string]$Old, [string]$New) {
@@ -220,7 +220,7 @@ try {
     Check-File (Join-Path $folder $emptyName) ''
 
     Run-Palette 'SFTP files'
-    $null = Wait-Until 'drawer closed' { !(Find-Element $preview $button) }
+    $null = Wait-Until 'drawer closed' { !(Find-Element 'Selected entry actions' $button) }
     foreach ($ch in 'after-editor'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-editor')
     $session = (Control @('list')).sessions | Where-Object id -eq $remote

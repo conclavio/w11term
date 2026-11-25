@@ -29,7 +29,6 @@ $target = "zz-[$word].txt"
 $decoy = "zz-$word.txt"
 $added = "zz-[$word]-updated.txt"
 $download = 'Download' + [char]0x2026
-$rename = 'Rename' + [char]0x2026
 $filterAction = 'Filter filenames' + [char]0x2026
 
 function Button([string]$Name) {
@@ -102,6 +101,8 @@ function Set-SearchChoice([string]$Control, [string]$Name) {
 function Check-PathCopy([string]$ButtonName, [string]$Expected) {
     if ($ButtonName -ceq 'Copy directory path') {
         $control = Get-SftpFolderAction $ButtonName
+    } elseif ($ButtonName -ceq 'Copy selected path') {
+        $control = Get-SftpEntryAction $ButtonName
     } else {
         $control = Wait-Until "available '$ButtonName' command" {
             $b = Button $ButtonName
@@ -176,8 +177,8 @@ try {
     Run-Palette 'Open files here'
     $null = Wait-Until 'first page of the shell directory' { (Find-Element $parent) -and (Button 'build-00.log') -and (Find-Element '1 / 2') }
     if (Button $target) { throw 'The Unicode target must begin outside page one' }
-    $null = Wait-Until 'Copy selected path disabled without a selection' {
-        $b = Button 'Copy selected path'
+    $null = Wait-Until 'entry actions disabled without a selection' {
+        $b = Button 'Selected entry actions'
         $b -and !$b.Current.IsEnabled
     }
     Check-PathCopy 'Copy directory path' $parent
@@ -208,8 +209,7 @@ try {
     Set-Filter 'nothing-matches-this'
     $null = Wait-Until 'no matches and no actions on the old selected file' {
         (Find-Element 'No matching files or folders') -and !(Button $target) -and
-            !(Button $download).Current.IsEnabled -and !(Button $rename).Current.IsEnabled -and
-            !(Button 'Copy selected path').Current.IsEnabled
+            !(Button $download).Current.IsEnabled -and !(Button 'Selected entry actions').Current.IsEnabled
     }
     Click 'Clear filter'
     $null = Wait-Until 'unfiltered first page without a selection' {
@@ -766,7 +766,7 @@ try {
     $move = 'Move to folder' + [char]0x2026
     $browseDestination = 'Browse folders' + [char]0x2026
     $movedFile = Join-Path $peerRoot 'shell directory/nested-content.txt'
-    Click $move
+    Invoke-SftpEntryAction $move
     $destination = Wait-Until 'the listed move shows the source and destination editor' {
         $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
         if ($field -and (Find-Element 'Remote move source')) { $field }

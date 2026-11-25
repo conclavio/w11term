@@ -102,7 +102,7 @@ try {
     if (Find-Element $target $button) { throw 'Expected the Unicode target on the second page of the name sort' }
     Click 'Next'
     Click $target
-    $null = Wait-Until 'target selected on page two' { (Find-Element '2 / 2') -and (Find-Element $preview $button).Current.IsEnabled }
+    $null = Wait-Until 'target selected on page two' { (Find-Element '2 / 2') -and (Find-Element 'Selected entry actions' $button).Current.IsEnabled }
 
     # A concurrent edit makes the selected file the oldest on disk. Resorting
     # this existing listing must still use its original READDIR attributes.
@@ -112,7 +112,7 @@ try {
     $null = Wait-Until 'page follows selected file' { Find-Element '1 / 2' }
     Wait-Order @($folder,$target,'yy-review.log','batch-34.log','batch-33.log')
     if ((Sort-Radio 'Sort by name').Current.IsSelected) { throw 'Both sort orders remained selected' }
-    Click $preview # No row reselected after the reorder.
+    Invoke-SftpEntryAction $preview # No row reselected after the reorder.
     $null = Wait-Until 'preview for the same selected Unicode file' {
         $body = Find-Element 'File contents'
         $body -and $body.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1) -ceq "selected Unicode file: $snow"
@@ -132,12 +132,12 @@ try {
     if ((Sort-Radio 'Sort by name').Current.IsSelected -or (Sort-Radio 'Sort newest first').Current.IsSelected) {
         throw 'Largest first left another sort order selected'
     }
-    if (!(Find-Element '4 matches') -or !(Find-Element $preview $button).Current.IsEnabled) {
+    if (!(Find-Element '4 matches') -or !(Find-Element 'Selected entry actions' $button).Current.IsEnabled) {
         throw 'Largest first discarded the filter or selected file'
     }
     Set-Sort 'Sort by name'
     Wait-Order @($folder,'aa-review.log','yy-review.log',$target)
-    if (!(Find-Element '4 matches') -or !(Find-Element $preview $button).Current.IsEnabled) {
+    if (!(Find-Element '4 matches') -or !(Find-Element 'Selected entry actions' $button).Current.IsEnabled) {
         throw 'Sorting discarded the filter or selected file'
     }
     Run-Palette 'SFTP files'

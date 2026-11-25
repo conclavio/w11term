@@ -21,6 +21,7 @@ mod bookmarks;
 mod destination;
 mod downloads;
 mod editor;
+mod entry_menu;
 pub(super) mod find;
 mod folder_batch;
 mod folder_report;
@@ -2213,16 +2214,6 @@ impl FileDrawer {
         let selected = self
             .page_entries()
             .find(|e| Some(&e.name) == self.selected.as_ref());
-        let download_folder =
-            selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::Directory));
-        let can_copy = writable
-            && generation != 0
-            && selected.is_some_and(|entry| {
-                matches!(
-                    entry.kind,
-                    ListedKind::Known(EntryKind::File) | ListedKind::Missing
-                ) && entry_path(folder, &entry.name).is_ok()
-            });
         let revision = self.listing_revision;
         let drop_target = DropTarget::new(pane, self, folder);
         let shell = if shell_ready {
@@ -2267,143 +2258,16 @@ impl FileDrawer {
             ));
         }
         controls.extend([
-            StackPanel::new().spacing(6.0).children((
-                button(
-                    "Move to folder…",
-                    writable
-                        && generation != 0
-                        && selected.is_some_and(|entry| {
-                            entry.kind != ListedKind::Unsupported
-                                && entry_path(folder, &entry.name).is_ok()
-                        }),
-                    MoveEntry(pane, generation, FileTarget::Listed(listed(selected))),
-                ),
-                button_pair(
-                    button(
-                        "Rename…",
-                        writable && selected.is_some_and(|e| entry_path(folder, &e.name).is_ok()),
-                        Rename(pane, generation, listed(selected)),
-                    ),
-                    button(
-                        "Delete…",
-                        writable
-                            && selected.is_some_and(|e| {
-                                e.kind != ListedKind::Unsupported
-                                    && delete_path(folder, &e.name).is_ok()
-                            }),
-                        Delete(pane, generation, listed(selected)),
-                    ),
-                ),
-                button_pair(
-                    button(
-                        "Copy to folder…",
-                        can_copy,
-                        CopyEntry(
-                            pane,
-                            generation,
-                            FileTarget::Listed(listed(selected)),
-                            CopyFileMode::ToFolder,
-                        ),
-                    ),
-                    button(
-                        "Duplicate as…",
-                        can_copy,
-                        CopyEntry(
-                            pane,
-                            generation,
-                            FileTarget::Listed(listed(selected)),
-                            CopyFileMode::Duplicate,
-                        ),
-                    ),
-                ),
-            )),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(6.0)
-                .children((
-                    button(
-                        "Open folder",
-                        ready
-                            && selected
-                                .is_some_and(|e| e.kind != ListedKind::Known(EntryKind::File)),
-                        OpenEntry(pane, generation, listed(selected)),
-                    ),
-                    Button::new()
-                        .automation_name("Open shell here")
-                        .is_enabled(shell.is_some())
-                        .on_click(context.callback(move |_| {
-                            directory_split::message(
-                                directory_split::Destination::Split(Axis::Columns),
-                                shell.as_ref(),
-                            )
-                        }))
-                        .content("Open shell here"),
-                )),
-            button_pair(
-                button(
-                    "Download and verify…",
-                    ready && selected.is_some() && !download_folder,
-                    VerifyDownload(pane, generation, listed(selected)),
-                ),
-                button(
-                    "Copy selected path",
-                    writable && selected.is_some(),
-                    CopyPath(pane, generation, revision, Some(listed(selected))),
-                ),
-            ),
-            {
-                let regular =
-                    selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File));
-                let preview =
-                    |kind| Preview(pane, generation, FileTarget::Listed(listed(selected)), kind);
-                let actions = button_pair(
-                    button(
-                        "Preview text…",
-                        writable && regular,
-                        preview(PreviewKind::Text),
-                    ),
-                    button(
-                        "Properties…",
-                        writable && selected.is_some(),
-                        preview(PreviewKind::Properties),
-                    ),
-                );
-                let actions = if regular {
-                    let tail = button("Tail text file…", writable, preview(PreviewKind::Tail));
-                    let supplemental = if selected.is_some_and(|e| image_preview_name(&e.name)) {
-                        button_pair(
-                            button("Preview image…", writable, preview(PreviewKind::Image)),
-                            tail,
-                        )
-                    } else {
-                        tail
-                    };
-                    StackPanel::new()
-                        .spacing(6.0)
-                        .children((actions, supplemental))
-                } else {
-                    actions
-                };
-                if let Some(id) = self.reference_id()
-                    && regular
-                {
-                    let target = FileTarget::Listed(listed(selected));
-                    StackPanel::new().spacing(6.0).children((
-                        actions,
-                        button(
-                            "Compare selected with reference…",
-                            writable,
-                            TextReference(
-                                pane,
-                                generation,
-                                preview::ReferenceAction::Open(target, id),
-                            ),
-                        ),
-                    ))
-                } else {
-                    actions
-                }
-            },
+            title_tools::button("Open shell here")
+                .is_enabled(shell.is_some())
+                .on_click(context.callback(move |_| {
+                    directory_split::message(
+                        directory_split::Destination::Split(Axis::Columns),
+                        shell.as_ref(),
+                    )
+                }))
+                .content(FontIcon::new().glyph("\u{e756}"))
+                .tooltip_with(title_tools::below("Open shell in this folder")),
             CheckBox::new()
                 .is_checked(self.following)
                 .on_is_checked_changed(

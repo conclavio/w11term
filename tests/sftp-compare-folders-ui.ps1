@@ -268,7 +268,7 @@ try {
     [IO.File]::WriteAllText($remoteFile, 'current!', [Text.UTF8Encoding]::new($false))
     Click 'Show remote entry nested/data.txt'
     $null = Wait-Until 'the drawer shows the containing folder and has the file selected' {
-        $preview = Find-Element ('Preview text' + [char]0x2026) $button
+        $preview = Find-Element 'Selected entry actions' $button
         !(Find-Element 'Close folder comparison' $button) -and (Find-Element "$current/nested") -and
             (Find-Element 'data.txt' $button) -and $preview -and $preview.Current.IsEnabled
     }

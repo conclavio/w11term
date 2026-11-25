@@ -3,7 +3,61 @@ use super::*;
 const ICON_SIZE: f64 = 30.0;
 const ICON_GAP: f64 = 3.0;
 const GROUP_GAP: f64 = 8.0;
-const SINGLE_ROW_WIDTH: f64 = 280.0;
+const SINGLE_ROW_WIDTH: f64 = 310.0;
+
+#[derive(Default)]
+pub(super) struct ActionMenu {
+    actions: Vec<(&'static str, FileAction)>,
+}
+
+impl ActionMenu {
+    pub(super) fn item(
+        &mut self,
+        key: &'static str,
+        label: &'static str,
+        enabled: bool,
+        action: FileAction,
+    ) -> MenuItem {
+        if enabled {
+            self.actions.push((label, action));
+        }
+        command_menu_item(key, label, enabled)
+    }
+
+    pub(super) fn button(
+        self,
+        name: &str,
+        glyph: &str,
+        tooltip: String,
+        enabled: bool,
+        items: impl IntoIterator<Item = MenuItem>,
+        context: &ViewContext<TerminalApp>,
+    ) -> View {
+        let icon = FontIcon::new().glyph(glyph);
+        let button = title_tools::button(name)
+            .width(ICON_SIZE)
+            .height(ICON_SIZE)
+            .is_enabled(enabled);
+        if !enabled {
+            return button
+                .content(icon)
+                .tooltip_with(title_tools::below(tooltip));
+        }
+        button
+            .content(icon.tooltip_with(title_tools::below(tooltip)))
+            .menu(Menu::new(
+                items,
+                context.callback(move |label: String| {
+                    self.actions
+                        .iter()
+                        .find(|(name, _)| *name == label)
+                        .map_or(Message::ControlIdle, |(_, action)| {
+                            Message::Files(action.clone())
+                        })
+                }),
+            ))
+    }
+}
 
 fn icon_button(
     label: &str,
@@ -72,7 +126,7 @@ impl FileDrawer {
                     Browse(pane, generation, folder.into()),
                 ),
             ));
-        let download = match selected {
+        let download = match &selected {
             Some(entry) => {
                 let label = if entry.kind == ListedKind::Known(EntryKind::Directory) {
                     "Download folder…"
@@ -87,7 +141,7 @@ impl FileDrawer {
                         pane,
                         generation,
                         revision,
-                        TransferPicker::Download(FileTarget::Listed(entry), None),
+                        TransferPicker::Download(FileTarget::Listed(entry.clone()), None),
                     ),
                 )
             }
@@ -120,6 +174,7 @@ impl FileDrawer {
                     ),
                 ),
                 download,
+                self.selected_entry_menu(pane, selected.as_ref(), context),
                 self.folder_menu(pane, profile, folder, context),
             ));
         let commands = if layout.content_width() >= SINGLE_ROW_WIDTH {
@@ -156,14 +211,28 @@ impl FileDrawer {
                     )),
                 commands,
                 Grid::new()
-                    .columns([GridLength::Star(1.0), GridLength::Auto])
+                    .columns([GridLength::Star(1.0), GridLength::Auto, GridLength::Auto])
                     .children((
                         TextBlock::new()
                             .vertical_alignment(VerticalAlignment::Center)
                             .text(folder)
                             .text_trimming(TextTrimming::CharacterEllipsis)
                             .tooltip_with(title_tools::below(folder)),
-                        Border::new().grid_column(1).content(button(
+                        Border::new().grid_column(1).content(match selected {
+                            Some(entry) => button(
+                                "Open folder",
+                                "\u{e838}",
+                                ready && entry.kind != ListedKind::Known(EntryKind::File),
+                                OpenEntry(pane, generation, entry),
+                            ),
+                            None => title_tools::button("Open folder")
+                                .width(ICON_SIZE)
+                                .height(ICON_SIZE)
+                                .is_enabled(false)
+                                .content(FontIcon::new().glyph("\u{e838}"))
+                                .tooltip_with(title_tools::below("Select a folder to open")),
+                        }),
+                        Border::new().grid_column(2).content(button(
                             "Go to folder…",
                             "\u{e8b7}",
                             ready && generation != 0,
@@ -188,13 +257,8 @@ impl FileDrawer {
         let revision = self.listing_revision;
         let can_report = writable && generation != 0;
         let has_reference = self.folder_reference.is_some();
-        let mut actions = Vec::new();
-        let mut item = |key, label: &'static str, enabled, action| {
-            if enabled {
-                actions.push((label, action));
-            }
-            command_menu_item(key, label, enabled)
-        };
+        let mut menu = ActionMenu::default();
+        let mut item = |key, label, enabled, action| menu.item(key, label, enabled, action);
         let reports = |kind| ShowFolderReport(pane, generation, revision, kind);
         let items = [
             item(
@@ -282,25 +346,13 @@ impl FileDrawer {
                 ],
             ),
         ];
-        title_tools::button("More folder actions")
-            .width(ICON_SIZE)
-            .height(ICON_SIZE)
-            .is_enabled(ready)
-            .content(
-                FontIcon::new()
-                    .glyph("\u{e712}")
-                    .tooltip_with(title_tools::below("More folder actions")),
-            )
-            .menu(Menu::new(
-                items,
-                context.callback(move |label: String| {
-                    actions
-                        .iter()
-                        .find(|(name, _)| *name == label)
-                        .map_or(Message::ControlIdle, |(_, action)| {
-                            Message::Files(action.clone())
-                        })
-                }),
-            ))
+        menu.button(
+            "More folder actions",
+            "\u{e712}",
+            "More folder actions".into(),
+            ready,
+            items,
+            context,
+        )
     }
 }

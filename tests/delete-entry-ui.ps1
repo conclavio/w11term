@@ -22,7 +22,7 @@ function Click([string]$Name) {
 function Choose-Delete([string]$Name, [string]$Kind) {
     $row = if ($Kind -eq 'folder') { "$Name/" } else { $Name }
     Click $row
-    Click $action
+    Invoke-SftpEntryAction $action
     $null = Wait-Until "confirmed identity for $Kind '$Name'" {
         (Find-Element "Delete remote ${Kind}?") -and (Find-Element "$($account.user)@$($account.host):$($account.port)") -and
             (Find-Element "$parent/$Name") -and
@@ -81,8 +81,8 @@ try {
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
     Wait-Drawer
-    $null = Wait-Until 'Delete disabled with no selection' {
-        $b = Find-Element $action $button
+    $null = Wait-Until 'entry actions disabled with no selection' {
+        $b = Find-Element 'Selected entry actions' $button
         $b -and !$b.Current.IsEnabled
     }
     $phase = 'cancel deletion of keep.txt'

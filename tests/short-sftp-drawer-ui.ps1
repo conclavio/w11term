@@ -72,7 +72,7 @@ function Check-NarrowNavigation {
         $find = 'Find files' + [char]0x2026
         $upload = 'Upload' + [char]0x2026
         $download = 'Download' + [char]0x2026
-        foreach ($label in 'Back','Forward','Up','Refresh',$find,$upload,$download,'More folder actions') {
+        foreach ($label in 'Back','Forward','Up','Refresh',$find,$upload,$download,'Selected entry actions','More folder actions') {
             $item = Find-Element $label $button -Visible
             if (!$item -or $item.Current.IsOffscreen) { return }
             $rect = $item.Current.BoundingRectangle
@@ -99,8 +99,7 @@ function Check-Actions {
     $actionsScroll = $actions.GetCurrentPattern($scroll)
     $remaining = [Collections.Generic.HashSet[string]]::new()
     $ellipsis = [char]0x2026
-    foreach ($label in "Rename$ellipsis","Move to folder$ellipsis","Delete$ellipsis",
-        'Open folder',"Download and verify$ellipsis",'Open shell here','Copy selected path','Follow shell directory',
+    foreach ($label in 'Open shell here','Follow shell directory',
         'Replace existing files','Sort by name','Sort newest first','Sort largest first',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
     $horizontal = if ($actionsScroll.Current.HorizontallyScrollable) { 0,100 } else { -1 }
     $step = [Math]::Max(1, [Math]::Min(20, [Math]::Floor($actionsScroll.Current.VerticalViewSize / 2)))
@@ -181,6 +180,21 @@ try {
         Invoke-Button (Find-Element 'projects/' $button)
     }
     $null = Wait-Until 'first selectable folder activated' { (Is-Enabled 'Open folder') -and !(Is-Enabled ('Download' + [char]0x2026)) }
+    $verify = Get-SftpEntryAction ('Download and verify' + [char]0x2026) -AllowDisabled
+    if ($verify.Current.IsEnabled) { throw 'Folder selection offered verified file download' }
+    $menu = [System.Windows.Automation.ControlType]::MenuItem
+    Invoke-Button (Wait-Until 'selected folder Properties in the short drawer' {
+        $item = Find-Element ('Properties' + [char]0x2026) $menu
+        if ($item -and $item.Current.IsEnabled) { $item }
+    })
+    $null = Wait-Until 'properties described the selected directory' {
+        $item = Find-Element 'File properties'
+        if ($item) {
+            $body = $item.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+            $body.Contains('Path  /projects') -and $body.Contains('Type  Directory')
+        }
+    }
+    Invoke-Button (Wait-Until 'Close properties' { Find-Element 'Close properties' $button })
     $resize.Resize($tallWidth,$tallWindowHeight)
     $null = Wait-Until 'the tall window restores its entry viewport' {
         $root.Current.BoundingRectangle.Height -ge $tallOuterHeight-2 -and

@@ -10,7 +10,6 @@ $fixture = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $statsPath = Join-Path $fixture 'fixture-space.json'
 $button = [System.Windows.Automation.ControlType]::Button
 $space = 'Filesystem space' + [char]0x2026
-$properties = 'Properties' + [char]0x2026
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -55,7 +54,7 @@ try {
     $null = Wait-Until 'the refreshed filesystem is read-only' { Find-Element 'Read-only filesystem' }
     Click 'Close space report'
     $null = Wait-Until 'the selected file remains active' {
-        $item = Find-Element $properties $button
+        $item = Find-Element 'Selected entry actions' $button
         $item -and $item.Current.IsEnabled
     }
 

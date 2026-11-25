@@ -59,7 +59,7 @@ try {
     Click 'archive/'
     Click 'Open folder'
     Click 'config.txt'
-    Click ('Preview text' + [char]0x2026)
+    Invoke-SftpEntryAction ('Preview text' + [char]0x2026)
     Click 'Set as comparison reference'
     Wait-Reference
     $null = Wait-Until 'pinning returns to the file list' { !(Find-Element 'Close preview' $button) }
@@ -71,7 +71,7 @@ try {
     Click 'Open folder'
     Wait-Reference
     Click 'config.txt'
-    Click ('Compare selected with reference' + [char]0x2026)
+    Invoke-SftpEntryAction ('Compare selected with reference' + [char]0x2026)
     Wait-Difference
     Click 'Return to preview'
     $null = Wait-Until 'the second file can be read in its normal preview' {

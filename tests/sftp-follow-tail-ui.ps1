@@ -57,7 +57,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
     Click 'engine.log'
-    Click ('Tail text file' + [char]0x2026)
+    Invoke-SftpEntryAction ('Tail text file' + [char]0x2026)
     Wait-Tail 'seed-080'
     [IO.File]::AppendAllText($log, "live line$([char]10)", $utf8)
     Assert-NoNewReads

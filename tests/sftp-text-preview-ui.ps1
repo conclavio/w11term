@@ -58,26 +58,8 @@ function Wait-MapPreview {
             $image.Current.BoundingRectangle.Width -gt 0 -and (Find-Element $dimensions)
     }
 }
-function Wait-DisabledPreview {
-    $null = Wait-Until 'preview disabled for the current selection' {
-        $b = Find-Element $preview $button
-        $b -and !$b.Current.IsEnabled
-    }
-}
 function Close-Drawer {
-    # The window caption also has a Close button. Find the one in the nearest
-    # common WinUI container with the file actions.
-    $scope = Find-Element $preview $button
-    $condition = [System.Windows.Automation.AndCondition]::new(
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Close'),
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button))
-    while ($scope -and $scope.Current.ProcessId -eq $app.Id) {
-        $options = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
-        if ($options.Count -eq 1) { Invoke-Button $options[0]; return }
-        if ($options.Count -gt 1) { break }
-        $scope = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($scope)
-    }
-    throw 'Could not locate the drawer Close button independently of the window caption'
+    Click 'Close files'
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -99,10 +81,13 @@ try {
     Wait-Focus $remote
     Run-Palette 'Open files here'
     $null = Wait-Until 'shell directory listing' { (Find-Element '/shell directory') -and (Find-Element $name $button) }
-    Wait-DisabledPreview
+    $null = Wait-Until 'entry actions disabled with no selection' {
+        $item = Find-Element 'Selected entry actions' $button
+        $item -and !$item.Current.IsEnabled
+    }
 
     Click $name
-    Click $preview
+    Invoke-SftpEntryAction $preview
     $text = Wait-Preview $outer
     $text.DocumentRange.Select()
     $null = Wait-Until 'native preview selection contains the displayed text' {
@@ -113,19 +98,31 @@ try {
     $null = Wait-Preview $outer
     Close-Preview
     # A second preview without clicking a row proves the drawer kept its selection.
-    Click $preview
+    Invoke-SftpEntryAction $preview
     $null = Wait-Preview $outer
     Close-Preview
     Click 'nested/'
-    Wait-DisabledPreview
+    $properties = Get-SftpEntryAction ('Properties' + [char]0x2026)
+    if (Find-Element $preview ([System.Windows.Automation.ControlType]::MenuItem)) {
+        throw 'A directory offered text preview'
+    }
+    Invoke-Button $properties
+    $null = Wait-Until 'the menu is scoped to the selected directory' {
+        $item = Find-Element 'File properties'
+        if ($item) {
+            $body = $item.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+            $body.Contains('Path  /shell directory/nested') -and $body.Contains('Type  Directory')
+        }
+    }
+    Click 'Close properties'
     Click 'Open folder'
     $null = Wait-Until 'child directory listing' { (Find-Element '/shell directory/nested') -and (Find-Element 'binary.dat' $button) }
     Click $name
-    Click $preview
+    Invoke-SftpEntryAction $preview
     $null = Wait-Preview $inner
     Close-Preview
     Click 'binary.dat'
-    Click $preview
+    Invoke-SftpEntryAction $preview
     $null = Wait-Until 'binary file rejected inside the preview dialog' {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-preview-error')
@@ -134,11 +131,11 @@ try {
     }
     Close-Preview
     Click "map $snow.PNG"
-    Click $previewImage
+    Invoke-SftpEntryAction $previewImage
     Wait-MapPreview
     Close-Preview
     Click 'broken.jpeg'
-    Click $previewImage
+    Invoke-SftpEntryAction $previewImage
     $null = Wait-Until 'invalid image error and no native bitmap' {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $condition = [System.Windows.Automation.PropertyCondition]::new(
@@ -158,9 +155,9 @@ try {
     Wait-MapPreview
     Close-Preview
     Click 'Back to files'
-    $null = Wait-Until 'file actions restored after search' { Find-Element $preview $button }
+    $null = Wait-Until 'file actions restored after search' { Find-Element 'Selected entry actions' $button }
     Close-Drawer
-    $null = Wait-Until 'drawer closed' { !(Find-Element $preview $button) }
+    $null = Wait-Until 'drawer closed' { !(Find-Element 'Selected entry actions' $button) }
     foreach ($ch in 'after-preview'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-preview')
     $active = (Control @('list')).sessions | Where-Object id -eq $remote

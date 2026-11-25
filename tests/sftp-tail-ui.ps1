@@ -37,7 +37,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
     Click $name
-    Click $tail
+    Invoke-SftpEntryAction $tail
     Wait-Tail 'initial line'
     $size = [IO.FileInfo]::new($disk).Length
     $summary = "File size  $size bytes " + [char]0xb7 + ' Earlier text omitted'

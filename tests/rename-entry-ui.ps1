@@ -23,7 +23,7 @@ function Name-Field {
     Find-Element 'New name' ([System.Windows.Automation.ControlType]::Edit)
 }
 function Open-Rename([string]$Expected) {
-    Click $renameAction
+    Invoke-SftpEntryAction $renameAction
     $null = Wait-Until "rename dialog for $Expected" {
         $edit = Name-Field
         $edit -and $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq $Expected
@@ -48,7 +48,7 @@ try {
     Wait-Focus $remote
     Run-Palette 'Open files here'
     $null = Wait-Until 'remote file listing' { (Find-Element $parent) -and (Button 'before.bin') }
-    $null = Wait-Until 'Rename disabled with no selection' { $b = Button $renameAction; $b -and !$b.Current.IsEnabled }
+    $null = Wait-Until 'entry actions disabled with no selection' { $b = Button 'Selected entry actions'; $b -and !$b.Current.IsEnabled }
     Click 'before.bin'
     Open-Rename 'before.bin'
     Set-Name '../outside'
@@ -93,7 +93,7 @@ try {
     Click 'Open folder'
     $null = Wait-Until 'contents survive directory rename' { (Find-Element "$parent/build results") -and (Button 'inside.bin') }
     Run-Palette 'SFTP files'
-    $null = Wait-Until 'drawer closed' { !(Button $renameAction) }
+    $null = Wait-Until 'drawer closed' { !(Button 'Selected entry actions') }
     foreach ($c in 'rename-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','rename-ssh-ready')
     Picker-Query 'Palette PowerShell'

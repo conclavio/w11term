@@ -11,7 +11,6 @@ $gate = Join-Path $fixture 'hold-opendir'
 $paused = Join-Path $fixture 'opendir-paused'
 $button = [System.Windows.Automation.ControlType]::Button
 $contents = 'Folder contents' + [char]0x2026
-$properties = 'Properties' + [char]0x2026
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -55,7 +54,7 @@ try {
     Wait-Row 'files' 'Regular files 1'
     Click 'Close contents report'
     $null = Wait-Until 'the selected file stays active after closing' {
-        $item = Find-Element $properties $button
+        $item = Find-Element 'Selected entry actions' $button
         $item -and $item.Current.IsEnabled
     }
 } catch {

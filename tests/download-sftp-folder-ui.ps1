@@ -74,7 +74,7 @@ function Assert-Explorer([string]$ButtonName, [string]$Action, [string]$Expected
 
 function Download-Verified([string]$Digest, [string]$Destination, [switch]$ResumeDownload) {
     Click 'verified.bin'
-    Click ('Download and verify' + [char]0x2026)
+    Invoke-SftpEntryAction ('Download and verify' + [char]0x2026)
     $field = Wait-Until 'expected SHA-256 field' { Find-Element 'Expected SHA-256' }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Digest)
     if ($ResumeDownload) {

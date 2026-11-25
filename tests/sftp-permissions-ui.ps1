@@ -43,7 +43,7 @@ try {
     Run-Palette 'Open files here'
 
     Click 'permissions.txt'
-    Click $properties
+    Invoke-SftpEntryAction $properties
     Wait-Properties 'Permissions  0640'
     Set-Mode '0640' '0890'
     $null = Wait-Until 'invalid octal entry cannot be applied' {
@@ -59,7 +59,7 @@ try {
     Click 'Close properties'
 
     Click 'link-folder'
-    Click $properties
+    Invoke-SftpEntryAction $properties
     Wait-Properties 'Type  Symbolic link'
     if (Find-Element $editMode $button) { throw 'Symbolic link showed a permission edit action' }
     Click 'Close properties'
