@@ -384,6 +384,22 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches bookmarked SSH history using the native Windows command palette and UIA"]
+async fn native_bookmark_search_reveals_the_selected_history_and_restores_input() {
+    let mut history = String::from("Deploy Alpha checkpoint\r\nDeploy Omega checkpoint\r\n");
+    for row in 0..200 {
+        history.push_str(&format!("deploy-log-{row:03}\r\n"));
+    }
+    history.push_str("deploy-stream-ready");
+    run_palette_fixture(
+        "scrollback-bookmark-ui.ps1",
+        b"after-bookmark",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives pointer boundaries and capture across a live SSH and PowerShell split"]
 async fn native_pixel_mouse_leave_follows_the_pointer_and_preserves_capture() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

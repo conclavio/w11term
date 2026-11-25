@@ -19,7 +19,9 @@ mod kitty;
 mod retained_rows;
 pub use retained_rows::RetainedRows;
 mod scrollback_view;
-pub use scrollback_view::{BookmarkTarget, CommandContext, ScrollbackTarget, ScrollbackView};
+pub use scrollback_view::{
+    BookmarkEntry, BookmarkScreen, BookmarkTarget, CommandContext, ScrollbackTarget, ScrollbackView,
+};
 #[cfg(test)]
 mod program_status_tests;
 #[cfg(test)]

@@ -86,6 +86,50 @@ fn scrollback_bookmark_uses_the_live_caret_column_and_refuses_stale_screen_reque
 }
 
 #[test]
+fn bookmark_search_reads_retained_rows_and_masks_concealed_cells() {
+    let mut term = terminal(8);
+    term.advance_bytes("A\x1b[8msecret\x1b[28m Ω\r\nB\r\nC\r\nD\r\nE");
+    assert!(
+        frame(&term, 2)
+            .bookmark_target()
+            .unwrap()
+            .toggle(&mut term, 0)
+    );
+    let scope = frame(&term, 0).bookmark_screen().unwrap();
+    let rows = scope.list(&term, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].row, rows[0].excerpt.as_str()), (0, "A Ω"));
+    assert_eq!(scope.offset(&term, 0, 0), Some(2));
+    assert_eq!(scope.offset(&term, 0, 1), None);
+    assert!(scope.list(&term, 1).is_none());
+    term.advance_bytes("\x1b[?2026h");
+    assert!(scope.list(&term, 0).is_none());
+    assert_eq!(scope.offset(&term, 0, 0), None);
+    term.advance_bytes("\x1b[?2026l");
+    let target = frame(&term, 2).bookmark_target().unwrap();
+    assert!(target.toggle(&mut term, 0));
+    assert_eq!(scope.offset(&term, 0, 0), None);
+    assert!(target.toggle(&mut term, 0));
+    term.resize(TerminalSize { cols: 8, ..size() });
+    assert!(scope.list(&term, 0).is_none());
+    assert_eq!(scope.offset(&term, 0, 0), None);
+    let fresh = frame(&term, 0).bookmark_screen().unwrap();
+    // The visible suffix wraps to the next physical row at eight columns.
+    assert_eq!(fresh.list(&term, 0).unwrap()[0].excerpt, "A");
+    term.advance_bytes("\x1b[3J");
+    assert_eq!(fresh.offset(&term, 0, 0), None);
+}
+
+#[test]
+fn bookmark_excerpt_handles_indentation_and_bounds_long_graphemes() {
+    let text = format!("{}Q{}", " ".repeat(350), "\u{301}".repeat(1500));
+    let line = wezterm_term::Line::from_text(&text, &Default::default(), 0, None);
+    let excerpt = bookmark_excerpt(&line);
+    assert!(excerpt.starts_with('Q'));
+    assert_eq!(excerpt.chars().count(), 200);
+}
+
+#[test]
 fn drag_targets_keep_the_same_row_or_clamp_to_the_oldest_survivor() {
     let mut term = terminal(4);
     term.advance_bytes(LINES);

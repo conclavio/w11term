@@ -115,7 +115,7 @@ struct LiveTab {
     discovery: Option<session_browser::Browser>,
     copy_output_unavailable: Option<&'static str>,
     failed_command_jumps: [bool; 2],
-    bookmark_actions: [bool; 3],
+    bookmark_actions: [bool; 4],
     can_clear_scrollback: bool,
     split_directory_report: Option<Arc<str>>,
     confirm_end: bool,
@@ -1079,6 +1079,7 @@ pub enum Message {
     PaneText(pane_picker::TextAction),
     PickerHover(u64),
     PickerFrame(u64, u64),
+    BookmarksRead(Arc<()>, Option<Vec<w11term::terminal::BookmarkEntry>>),
     PickerChoose(u64),
     PlacePane(TabId, TabId, Direction),
     PickerFocus(u8),
@@ -1272,7 +1273,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             discovery: None,
             copy_output_unavailable: Some("waiting for shell markers"),
             failed_command_jumps: [false; 2],
-            bookmark_actions: [false; 3],
+            bookmark_actions: [false; 4],
             can_clear_scrollback: false,
             split_directory_report: None,
             color_scheme: source.color_scheme(),
@@ -5004,6 +5005,7 @@ impl Component for TerminalApp {
                 | Message::HostGroup(host_groups::Action::Tick | host_groups::Action::Edit(..))
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
+                | Message::BookmarksRead(..)
                 | Message::PickerFocus(..)
                 | Message::PickerFocusAfterMenu(..)
                 | Message::PaneRatio(..)
@@ -5219,6 +5221,7 @@ impl Component for TerminalApp {
             Message::PaneText(action) => self.pane_text_action(action, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
+            Message::BookmarksRead(launch, entries) => self.bookmarks_received(&launch, entries),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
             Message::PlacePane(source, target, side) => {
                 self.place_pane(source, target, side, context)
@@ -5972,10 +5975,19 @@ impl Component for TerminalApp {
                             frame.bookmark_target().is_some(),
                             frame.adjacent_bookmark(true).is_some(),
                             frame.adjacent_bookmark(false).is_some(),
+                            !frame.scrollback_bookmarks.is_empty(),
                         ];
                         if tab.bookmark_actions != bookmarks {
                             tab.bookmark_actions = bookmarks;
                             pane_actions_changed |= active;
+                        }
+                        if active
+                            && self
+                                .picker
+                                .as_ref()
+                                .is_some_and(|picker| picker.bookmark_results_expired(&frame))
+                        {
+                            pane_actions_changed = true;
                         }
                         let can_clear = !frame.alternate
                             && (frame.scroll_offset > 0

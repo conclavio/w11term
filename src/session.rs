@@ -133,6 +133,14 @@ pub enum Command {
     },
     ScrollViewport(crate::terminal::ScrollbackTarget),
     ToggleScrollbackBookmark(crate::terminal::BookmarkTarget),
+    ReadScrollbackBookmarks {
+        screen: crate::terminal::BookmarkScreen,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<crate::terminal::BookmarkEntry>>>,
+    },
+    RevealScrollbackBookmark {
+        screen: crate::terminal::BookmarkScreen,
+        row: isize,
+    },
     ScrollRange(RangeScrollRequest),
     CopyWord {
         screen: crate::copy_mode::ScreenId,
@@ -1451,6 +1459,18 @@ async fn run(
                     }
                     Some(Command::ToggleScrollbackBookmark(target)) => {
                         presentation.dirty |= target.toggle(&mut terminal, connection_generation);
+                        Ok(())
+                    }
+                    Some(Command::ReadScrollbackBookmarks { screen, reply }) => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(screen.list(&terminal, connection_generation));
+                        }
+                        Ok(())
+                    }
+                    Some(Command::RevealScrollbackBookmark { screen, row }) => {
+                        if let Some(offset) = screen.offset(&terminal, connection_generation, row) {
+                            scroll_offset = offset;
+                        }
                         Ok(())
                     }
                     Some(Command::ScrollTo(top)) => {

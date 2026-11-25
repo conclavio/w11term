@@ -735,6 +735,8 @@ When a pane has scrollback, drag the scrollbar at its right edge to browse histo
 
 Use **Toggle scrollback bookmark** in the command palette to mark the current cursor row or, while viewing history, the top visible row. Click a blue mark at the outer edge of the scrollbar, or use **Previous bookmark** and **Next bookmark**. Run the toggle again at the row to remove the bookmark. Each pane holds up to 256 marks and keeps them with retained text as the window resizes. They expire when their rows are discarded or when the terminal connection resets.
 
+Choose **Find scrollback bookmark…** to search the focused pane’s bookmarks by their line previews. The picker shows the newest marks first and omits concealed terminal text from previews. Press Enter to jump to the highlighted result or Esc to return to the pane at its current scroll position.
+
 The alternate screen has no local scrollback. A TUI receives wheel reports when it enables mouse reporting. For other TUIs, **Alternate-screen wheel keys** enables the arrow-key fallback used by pagers. It defaults to on for standard profiles and off in game mode. Shift+wheel scrolls local primary-screen history and has no effect on the alternate screen. Find on the alternate screen searches its current contents. Returning to the primary screen restores its history position.
 
 When you scroll into the middle of a command’s retained output, its command line appears at the top of the pane. Select it to jump to the start of the output. **Settings → Interaction → Show command context in scrollback** controls this behavior and is on by default.

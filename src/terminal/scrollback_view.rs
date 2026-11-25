@@ -71,24 +71,104 @@ pub(super) fn bookmark_rows(
 pub struct BookmarkTarget {
     row: isize,
     col: usize,
+    screen: BookmarkScreen,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BookmarkScreen {
     epoch: u64,
     clear: u64,
     connection: u64,
 }
 
-impl BookmarkTarget {
-    pub(crate) fn toggle(self, term: &mut Terminal, connection: u64) -> bool {
-        if !term.is_alt_screen_active()
+#[derive(Debug)]
+pub struct BookmarkEntry {
+    pub row: isize,
+    pub excerpt: String,
+}
+
+impl BookmarkScreen {
+    fn matches(self, term: &Terminal, connection: u64) -> bool {
+        !term.is_alt_screen_active()
             && !term.synchronized_output()
             && self.connection == connection
             && self.epoch == term.screen().row_epoch()
             && self.clear == term.screen().history_clear_count()
-        {
-            return term
-                .screen_mut()
-                .toggle_scrollback_bookmark(self.row, self.col);
+    }
+
+    pub(crate) fn list(self, term: &Terminal, connection: u64) -> Option<Vec<BookmarkEntry>> {
+        if !self.matches(term, connection) {
+            return None;
         }
-        false
+        let screen = term.screen();
+        let mut entries = Vec::new();
+        for row in screen.scrollback_bookmark_rows() {
+            // Two marks on different physical rows can land on the same row
+            // when reflow rejoins them.
+            if entries
+                .last()
+                .is_some_and(|entry: &BookmarkEntry| entry.row == row)
+            {
+                continue;
+            }
+            if let Some(line) = screen
+                .stable_row_to_phys(row)
+                .and_then(|phys| screen.physical_lines().nth(phys))
+            {
+                entries.push(BookmarkEntry {
+                    row,
+                    excerpt: bookmark_excerpt(line),
+                });
+            }
+        }
+        Some(entries)
+    }
+
+    pub(crate) fn offset(self, term: &Terminal, connection: u64, row: isize) -> Option<usize> {
+        let screen = term.screen();
+        if !self.matches(term, connection)
+            || !screen.scrollback_bookmark_rows().any(|mark| mark == row)
+        {
+            return None;
+        }
+        let live = screen.visible_row_to_stable_row(0);
+        Some(live.saturating_sub(row).max(0) as usize)
+    }
+}
+
+fn bookmark_excerpt(line: &wezterm_term::Line) -> String {
+    const MAX_CELLS: usize = 1024;
+    const MAX_CHARS: usize = 200;
+    let mut remaining = MAX_CHARS;
+    let mut text = String::new();
+    for cell in line.visible_cells().take(MAX_CELLS) {
+        let visible = if cell.attrs().invisible() {
+            " "
+        } else {
+            cell.str()
+        };
+        if text.is_empty() && visible == " " {
+            continue;
+        }
+        for ch in visible.chars().take(remaining) {
+            if !text.is_empty() || !ch.is_whitespace() {
+                text.push(ch);
+            }
+            remaining -= 1;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    crate::events::display_field(&text)
+}
+
+impl BookmarkTarget {
+    pub(crate) fn toggle(self, term: &mut Terminal, connection: u64) -> bool {
+        self.screen.matches(term, connection)
+            && term
+                .screen_mut()
+                .toggle_scrollback_bookmark(self.row, self.col)
     }
 }
 
@@ -106,24 +186,25 @@ pub struct ScrollbackView {
 }
 
 impl Snapshot {
-    pub fn bookmark_target(&self) -> Option<BookmarkTarget> {
-        (!self.alternate && !self.rows.is_empty()).then(|| {
-            let (row, col) = if self.scroll_offset == 0 {
-                (
-                    self.first_stable_row.saturating_add(self.cursor.y as isize),
-                    self.cursor.x,
-                )
-            } else {
-                (self.first_stable_row, 0)
-            };
-            BookmarkTarget {
-                row,
-                col,
-                epoch: self.row_epoch,
-                clear: self.history_clear_count,
-                connection: self.connection_generation,
-            }
+    pub fn bookmark_screen(&self) -> Option<BookmarkScreen> {
+        (!self.alternate && !self.rows.is_empty()).then_some(BookmarkScreen {
+            epoch: self.row_epoch,
+            clear: self.history_clear_count,
+            connection: self.connection_generation,
         })
+    }
+
+    pub fn bookmark_target(&self) -> Option<BookmarkTarget> {
+        let screen = self.bookmark_screen()?;
+        let (row, col) = if self.scroll_offset == 0 {
+            (
+                self.first_stable_row.saturating_add(self.cursor.y as isize),
+                self.cursor.x,
+            )
+        } else {
+            (self.first_stable_row, 0)
+        };
+        Some(BookmarkTarget { row, col, screen })
     }
 
     pub fn adjacent_bookmark(&self, older: bool) -> Option<ScrollbackTarget> {
