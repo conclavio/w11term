@@ -2952,7 +2952,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     let parent = remote.path().join("shell directory");
     let child = parent.join("nested");
     fs::create_dir_all(&child).unwrap();
-    fs::write(child.join("inside.txt"), []).unwrap();
+    fs::write(child.join("nested-content.txt"), vec![b'f'; 70_000]).unwrap();
     let fillers = 38;
     for index in 0..fillers {
         fs::write(parent.join(format!("build-{index:02}.log")), []).unwrap();
@@ -2965,6 +2965,11 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     fs::write(&wire, []).unwrap();
 
     let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("filter-sftp-listing-ui.ps1", &ssh, state.path());
 
     let trace = fs::read_to_string(wire).unwrap();
@@ -2979,6 +2984,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     }
     // Each listing returns one entry per READDIR plus EOF. Filtering reads no
     // directory pages. Recursive search reads the root and its child once each.
+    // Direct file download keeps those results and the folder download lists its own tree.
     assert_eq!(
         listings,
         [
@@ -2987,6 +2993,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5),
             ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
         ]

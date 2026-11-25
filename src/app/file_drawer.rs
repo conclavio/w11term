@@ -11,9 +11,9 @@ use w11term::events::SavedDownload;
 use w11term::folder_grants::Authority;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
-    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferBatchProgress, TransferCancel,
-    TransferOperation, TransferOutcome, TransferPhase, TransferProgress, normalize_sha256,
-    validate_download_name,
+    DEFAULT_TIMEOUT, EntryKind, FilenameMatch, Job, Operation, TransferBatchProgress,
+    TransferCancel, TransferOperation, TransferOutcome, TransferPhase, TransferProgress,
+    normalize_sha256, validate_download_name,
 };
 
 mod bookmarks;
@@ -217,6 +217,7 @@ pub enum TransferPicker {
     UploadFolder(String),
     Download(ListedEntry, Option<DownloadVerification>),
     DownloadMarked,
+    DownloadSearch(u64, FilenameMatch),
 }
 
 #[derive(Clone)]
@@ -240,14 +241,9 @@ impl TransferPicker {
                     Purpose::UploadFiles
                 })
             }
-            Self::Download(entry, _) => {
-                let remote = files.selected_path(entry)?;
-                if entry.kind == ListedKind::Known(EntryKind::Directory) {
-                    validate_download_name(&entry.name)?;
-                    Ok(Purpose::DownloadFolder)
-                } else {
-                    Ok(Purpose::Save(dialog_filename(&remote).into()))
-                }
+            Self::Download(entry, _) => files.selected_download_target(entry)?.purpose(),
+            Self::DownloadSearch(serial, hit) => {
+                files.search_download_target(*serial, hit)?.purpose()
             }
             Self::DownloadMarked => {
                 files.marked_entries()?;
@@ -924,32 +920,25 @@ impl FileDrawer {
         remote_child(&entry.parent, &entry.name)
     }
 
+    fn selected_download_target<'a>(
+        &self,
+        entry: &'a ListedEntry,
+    ) -> Result<downloads::DownloadTarget<'a>> {
+        Ok(downloads::DownloadTarget {
+            remote: self.selected_path(entry)?,
+            name: &entry.name,
+            directory: entry.kind == ListedKind::Known(EntryKind::Directory),
+        })
+    }
+
     fn download_operation(
         &self,
         entry: &ListedEntry,
         destination: PathBuf,
         verification: Option<DownloadVerification>,
     ) -> Result<(Operation, TransferFile)> {
-        let remote = self.selected_path(entry)?;
-        ensure!(
-            destination.is_absolute(),
-            "Choose an absolute download destination"
-        );
-        let directory = entry.kind == ListedKind::Known(EntryKind::Directory);
-        let local = if directory {
-            ensure!(verification.is_none(), "Choose a file to verify");
-            validate_download_name(&entry.name)?;
-            destination.join(&entry.name)
-        } else {
-            destination
-        };
-        Ok(downloads::download_to(
-            remote,
-            local,
-            directory,
-            self.replace,
-            verification,
-        ))
+        self.selected_download_target(entry)?
+            .operation(destination, self.replace, verification)
     }
 
     fn prepare_folder_upload(
@@ -1314,6 +1303,17 @@ impl FileDrawer {
             Step::Transfer(file) => Some(file),
             _ => None,
         }
+    }
+
+    fn transfer_controls(&self, ctx: &ViewContext<TerminalApp>) -> Option<[View; 3]> {
+        let transfer = self.pending.as_ref()?.transfer.as_ref()?;
+        let id = transfer.id;
+        let (bar, bytes) = transfer_progress_views(*transfer.progress.borrow());
+        let cancel = Button::new()
+            .is_enabled(!transfer.cancel.is_cancelled())
+            .on_click(ctx.callback(move |_| Message::Files(FileAction::CancelTransfer(id))))
+            .content("Cancel transfer");
+        Some([bar, bytes, cancel])
     }
 
     pub(super) fn active_transfer(&self, generation: u64) -> Option<TransferView<'_>> {
@@ -1902,16 +1902,8 @@ impl FileDrawer {
                 SelectDownloads(pane, generation, revision, true),
             ));
         }
-        if let Some(pending) = &self.pending
-            && let Some(transfer) = &pending.transfer
-        {
-            let (bar, bytes) = transfer_progress_views(*transfer.progress.borrow());
-            controls.extend([bar, bytes]);
-            controls.push(button(
-                "Cancel transfer",
-                !transfer.cancel.is_cancelled(),
-                CancelTransfer(transfer.id),
-            ));
+        if let Some(transfer) = self.transfer_controls(context) {
+            controls.extend(transfer);
         }
         if let Some(preparation) = &self.preparing_drop {
             controls.push(button(
@@ -2970,6 +2962,23 @@ impl TerminalApp {
                             files.marked_downloads = None;
                             files.transfer_next(pane, session, context)?;
                         }
+                        TransferPicker::DownloadSearch(search, hit) => {
+                            ensure!(!files.busy(), "Another SFTP operation is active");
+                            let [local] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one download destination"))?;
+                            let target = files.search_download_target(search, &hit)?;
+                            let (operation, transfer) =
+                                target.operation(local, files.replace, None)?;
+                            files.status = format!("Downloading {}…", hit.name);
+                            files.job(
+                                pane,
+                                session,
+                                operation,
+                                Step::Transfer(transfer),
+                                context,
+                            )?;
+                        }
                     }
                 }
                 EditName(_, _, serial, name) => {
@@ -3257,7 +3266,10 @@ impl TerminalApp {
                 }
                 Pick(_, _, revision, picker) => {
                     if !may_open_dialog
-                        || (matches!(picker, TransferPicker::DownloadMarked) && files.busy())
+                        || (matches!(
+                            picker,
+                            TransferPicker::DownloadMarked | TransferPicker::DownloadSearch(..)
+                        ) && files.busy())
                         || revision != files.listing_revision
                         || files.bookmarks.is_some()
                     {

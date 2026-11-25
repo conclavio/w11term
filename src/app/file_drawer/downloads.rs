@@ -2,6 +2,51 @@ use super::*;
 use std::path::Path;
 use w11term::sftp::validate_download_names;
 
+pub(super) struct DownloadTarget<'a> {
+    pub(super) remote: String,
+    pub(super) name: &'a str,
+    pub(super) directory: bool,
+}
+
+impl DownloadTarget<'_> {
+    pub(super) fn purpose(&self) -> Result<file_picker::Purpose> {
+        if self.directory {
+            validate_download_name(self.name)?;
+            Ok(file_picker::Purpose::DownloadFolder)
+        } else {
+            Ok(file_picker::Purpose::Save(
+                dialog_filename(&self.remote).into(),
+            ))
+        }
+    }
+
+    pub(super) fn operation(
+        self,
+        destination: PathBuf,
+        overwrite: bool,
+        verification: Option<DownloadVerification>,
+    ) -> Result<(Operation, TransferFile)> {
+        ensure!(
+            destination.is_absolute(),
+            "Choose an absolute download destination"
+        );
+        let local = if self.directory {
+            ensure!(verification.is_none(), "Choose a file to verify");
+            validate_download_name(self.name)?;
+            destination.join(self.name)
+        } else {
+            destination
+        };
+        Ok(download_to(
+            self.remote,
+            local,
+            self.directory,
+            overwrite,
+            verification,
+        ))
+    }
+}
+
 impl Entry {
     pub(super) fn can_mark_for_download(&self) -> bool {
         supports_batch_download(self.kind)

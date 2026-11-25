@@ -1,5 +1,5 @@
 use super::*;
-use w11term::sftp::{FilenameMatch, FilenameSearch, valid_filename_query};
+use w11term::sftp::{FilenameSearch, valid_filename_query};
 
 const RESULTS_PER_PAGE: usize = 25;
 
@@ -37,7 +37,9 @@ impl Panel {
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let generation = files.generation;
+        let revision = files.listing_revision;
         let serial = self.serial;
+        let ready = !files.busy();
         let button = |label: &str, action: Action, enabled: bool| {
             Button::new()
                 .automation_name(label)
@@ -49,7 +51,14 @@ impl Panel {
         };
         let running = self.cancel.as_ref();
         let mut rows = vec![
-            KeyedView::new("back", button("Back to files", Action::Back(serial), true)),
+            KeyedView::new(
+                "back",
+                button(
+                    "Back to files",
+                    Action::Back(serial),
+                    files.picking.is_none(),
+                ),
+            ),
             KeyedView::new(
                 "path",
                 TextBlock::new()
@@ -61,7 +70,7 @@ impl Panel {
                 TextBox::new()
                     .automation_name("Filename contains")
                     .placeholder_text("Filename contains")
-                    .is_enabled(running.is_none())
+                    .is_enabled(ready)
                     .text(&self.query)
                     .on_text_changed(ctx.callback(move |text| {
                         Message::Files(FileAction::Search(
@@ -84,7 +93,7 @@ impl Panel {
                 button(
                     "Search",
                     Action::Run(serial),
-                    !files.busy() && valid_filename_query(&self.query),
+                    ready && valid_filename_query(&self.query),
                 )
             },
         ));
@@ -95,6 +104,13 @@ impl Panel {
                     .text(&files.status)
                     .text_wrapping(TextWrapping::Wrap),
             ));
+        }
+        if let Some([bar, bytes, cancel]) = files.transfer_controls(ctx) {
+            rows.extend([
+                KeyedView::new("progress-bar", bar),
+                KeyedView::new("transfer-bytes", bytes),
+                KeyedView::new("cancel-transfer", cancel),
+            ]);
         }
         if self.page_count() > 1 {
             rows.push(KeyedView::new(
@@ -125,10 +141,11 @@ impl Panel {
             .take(RESULTS_PER_PAGE)
             .map(|(index, hit)| {
                 let path = format!("{}/{}", hit.parent.trim_end_matches('/'), hit.name);
-                KeyedView::new(
-                    index,
+                let mut actions = vec![KeyedView::new(
+                    "reveal",
                     Button::new()
                         .automation_name(format!("Reveal {path}"))
+                        .is_enabled(ready)
                         .horizontal_alignment(HorizontalAlignment::Stretch)
                         .on_click({
                             let hit = hit.clone();
@@ -142,9 +159,39 @@ impl Panel {
                         })
                         .content(
                             TextBlock::new()
-                                .text(path)
+                                .text(&path)
                                 .text_wrapping(TextWrapping::Wrap),
                         ),
+                )];
+                if let Some(label) = match hit.kind {
+                    Some(EntryKind::File) => Some("Download…"),
+                    Some(EntryKind::Directory) => Some("Download folder…"),
+                    _ => None,
+                } {
+                    let hit = hit.clone();
+                    actions.push(KeyedView::new(
+                        "download",
+                        Button::new()
+                            .grid_column(1)
+                            .automation_name(format!("Download {path}"))
+                            .is_enabled(ready)
+                            .on_click(ctx.callback(move |_| {
+                                Message::Files(FileAction::Pick(
+                                    pane,
+                                    generation,
+                                    revision,
+                                    TransferPicker::DownloadSearch(serial, hit.clone()),
+                                ))
+                            }))
+                            .content(label),
+                    ));
+                }
+                KeyedView::new(
+                    index,
+                    Grid::new()
+                        .columns([GridLength::Star(1.0), GridLength::Auto])
+                        .column_spacing(6.0)
+                        .keyed_children(actions),
                 )
             });
         Border::new()
@@ -165,6 +212,30 @@ impl Panel {
 }
 
 impl FileDrawer {
+    pub(super) fn search_download_target<'a>(
+        &self,
+        serial: u64,
+        hit: &'a FilenameMatch,
+    ) -> Result<downloads::DownloadTarget<'a>> {
+        ensure!(
+            self.search
+                .as_ref()
+                .filter(|panel| panel.serial == serial)
+                .and_then(|panel| panel.result.as_ref())
+                .is_some_and(|result| result.matches.contains(hit)),
+            "The search results changed. Select the result again."
+        );
+        ensure!(
+            matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
+            "Choose a regular file or folder"
+        );
+        Ok(downloads::DownloadTarget {
+            remote: remote_child(&hit.parent, &hit.name)?,
+            name: &hit.name,
+            directory: hit.kind == Some(EntryKind::Directory),
+        })
+    }
+
     pub(super) fn close_search(&mut self) {
         if let Some(panel) = self.search.take() {
             if let Some(cancel) = panel.cancel {
@@ -240,7 +311,7 @@ impl FileDrawer {
             return Ok(());
         };
         match action {
-            Action::Query(serial, query) if serial == panel.serial && panel.cancel.is_none() => {
+            Action::Query(serial, query) if serial == panel.serial && !busy => {
                 if panel.query != query {
                     panel.query = query;
                     panel.result = None;
@@ -285,12 +356,72 @@ impl FileDrawer {
                 self.browse(pane, session, hit.parent, None, ctx)?;
                 self.reveal = Some(RevealTarget::Existing(hit.name));
             }
-            Action::Back(serial) if serial == panel.serial => {
+            Action::Back(serial) if serial == panel.serial && self.picking.is_none() => {
                 self.close_search();
                 self.status.clear();
             }
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_download_requires_the_current_result_and_downloadable_type() {
+        let file = FilenameMatch {
+            parent: "/project/logs".into(),
+            name: "build log.txt".into(),
+            kind: Some(EntryKind::File),
+        };
+        let folder = FilenameMatch {
+            name: "logs archive".into(),
+            kind: Some(EntryKind::Directory),
+            ..file.clone()
+        };
+        let link = FilenameMatch {
+            name: "log link".into(),
+            kind: Some(EntryKind::Symlink),
+            ..file.clone()
+        };
+        let drawer = FileDrawer {
+            search: Some(Panel {
+                serial: 2,
+                root: "/project".into(),
+                query: "log".into(),
+                result: Some(FilenameSearch {
+                    root: "/project".into(),
+                    matches: vec![file.clone(), folder.clone(), link.clone()],
+                    scanned_directories: 2,
+                    scanned_entries: 4,
+                    skipped_directories: 0,
+                    truncated: false,
+                    cancelled: false,
+                }),
+                page: 0,
+                cancel: None,
+            }),
+            ..FileDrawer::default()
+        };
+        assert_eq!(
+            drawer.search_download_target(2, &file).unwrap().remote,
+            "/project/logs/build log.txt"
+        );
+        let target = drawer.search_download_target(2, &folder).unwrap();
+        let (operation, _) = target
+            .operation(r"C:\Downloads".into(), false, None)
+            .unwrap();
+        assert!(matches!(operation, Operation::GetDir { remote, local }
+            if remote == "/project/logs/logs archive" && local == std::path::Path::new(r"C:\Downloads\logs archive")));
+        assert!(drawer.search_download_target(1, &file).is_err());
+        assert!(drawer.search_download_target(2, &link).is_err());
+        let forged = FilenameMatch {
+            kind: Some(EntryKind::Directory),
+            ..file
+        };
+        assert!(drawer.search_download_target(2, &forged).is_err());
     }
 }

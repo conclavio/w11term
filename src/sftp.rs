@@ -113,7 +113,8 @@ struct UploadOptions {
 }
 
 /// Directory entry types the drawer can delete with the SFTP v3 primitives.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EntryKind {
     File,
     Directory,
