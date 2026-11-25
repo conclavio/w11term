@@ -130,6 +130,27 @@ impl DownloadStaging {
 struct UploadOptions {
     overwrite: bool,
     atomic: bool,
+    preserve_times: bool,
+}
+
+fn upload_times(
+    metadata: &std::fs::Metadata,
+    preserve_times: bool,
+) -> Result<Option<FileAttributes>> {
+    if !preserve_times {
+        return Ok(None);
+    }
+    let seconds = |time: std::time::SystemTime| -> Result<u32> {
+        Ok(time.duration_since(UNIX_EPOCH)?.as_secs().try_into()?)
+    };
+    let atime = seconds(metadata.accessed()?).context("SFTP cannot represent the access time")?;
+    let mtime =
+        seconds(metadata.modified()?).context("SFTP cannot represent the modification time")?;
+    Ok(Some(FileAttributes {
+        atime: Some(atime),
+        mtime: Some(mtime),
+        ..FileAttributes::empty()
+    }))
 }
 
 /// Directory entry types the drawer can delete with the SFTP v3 primitives.
@@ -191,6 +212,8 @@ pub enum Operation {
     PutDir {
         local: PathBuf,
         remote: String,
+        #[serde(default)]
+        preserve_times: bool,
     },
     /// The source was chosen by a native Explorer drop on this connection.
     #[serde(skip)]
@@ -199,6 +222,7 @@ pub enum Operation {
         remote: String,
         overwrite: bool,
         atomic: bool,
+        preserve_times: bool,
     },
     /// A file selected once for several generation-bound native uploads.
     #[serde(skip)]
@@ -213,6 +237,8 @@ pub enum Operation {
         overwrite: bool,
         #[serde(default)]
         atomic: bool,
+        #[serde(default)]
+        preserve_times: bool,
     },
     Ls {
         path: String,
@@ -645,7 +671,7 @@ pub(crate) async fn run(
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
-            && let Operation::PutDir { local, remote } = &operation
+            && let Operation::PutDir { local, remote, .. } = &operation
         {
             let state = upload_directory::UploadState::new(remote.clone(), deadline);
             let _ = reply.send(Ok(state.cancelled(local)));
@@ -992,7 +1018,11 @@ impl Engine {
                 self.get_dir(remote, local, preserve_mtime, progress, cancel, stage)
                     .await?
             }
-            PutDir { local, .. } => {
+            PutDir {
+                local,
+                preserve_times,
+                ..
+            } => {
                 let JobStage::DirectoryUpload(state) = stage else {
                     unreachable!("directory upload job stage");
                 };
@@ -1001,13 +1031,15 @@ impl Engine {
                     Ok::<_, anyhow::Error>((local, dir))
                 })
                 .await??;
-                self.put_directory(source, progress, cancel, state).await?
+                self.put_directory(source, preserve_times, progress, cancel, state)
+                    .await?
             }
             PutDrop {
                 source,
                 remote,
                 overwrite,
                 atomic,
+                preserve_times,
             } => {
                 let (local, checked) =
                     tokio::task::spawn_blocking(move || source.open_confirmed(overwrite)).await??;
@@ -1016,7 +1048,7 @@ impl Engine {
                         upload_directory::Source::Directory(dir),
                         JobStage::DirectoryUpload(state),
                     ) => {
-                        self.put_directory((local, dir), progress, cancel, state)
+                        self.put_directory((local, dir), preserve_times, progress, cancel, state)
                             .await?
                     }
                     (
@@ -1026,7 +1058,11 @@ impl Engine {
                         self.put(
                             (local, tokio::fs::File::from_std(file)),
                             remote,
-                            UploadOptions { overwrite, atomic },
+                            UploadOptions {
+                                overwrite,
+                                atomic,
+                                preserve_times,
+                            },
                             progress,
                             cancel,
                             stage,
@@ -1084,6 +1120,7 @@ impl Engine {
                 remote,
                 overwrite,
                 atomic,
+                preserve_times,
             } => {
                 if cancel.is_some_and(TransferCancel::is_cancelled) {
                     return Ok(cancelled_transfer(&local, &remote, 0, false));
@@ -1095,7 +1132,11 @@ impl Engine {
                 self.put(
                     (local, source),
                     remote,
-                    UploadOptions { overwrite, atomic },
+                    UploadOptions {
+                        overwrite,
+                        atomic,
+                        preserve_times,
+                    },
                     progress,
                     cancel,
                     stage,
@@ -1562,14 +1603,7 @@ impl Engine {
     ) -> Result<Value> {
         if options.atomic {
             return self
-                .put_atomic(
-                    (local, file),
-                    remote,
-                    options.overwrite,
-                    progress,
-                    cancel,
-                    stage,
-                )
+                .put_atomic((local, file), remote, options, progress, cancel, stage)
                 .await;
         }
         let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
@@ -1578,6 +1612,7 @@ impl Engine {
         }
         let metadata = file.metadata().await?;
         ensure!(metadata.is_file(), "local source must be a regular file");
+        let times = upload_times(&metadata, options.preserve_times)?;
         let total = Some(metadata.len());
         report(progress, 0, total);
         let flags = OpenFlags::WRITE
@@ -1609,9 +1644,19 @@ impl Engine {
                 return Err(error.into());
             }
         };
-        let copied = self
-            .write_upload(&h, &mut file, total, progress, cancel, stage)
-            .await;
+        let copied = async {
+            let (bytes, complete) = self
+                .write_upload(&h, &mut file, total, progress, cancel, stage)
+                .await?;
+            if complete && times.is_some() {
+                if cancelled() {
+                    return Ok((bytes, false));
+                }
+                self.apply_upload_times(&h, times).await?;
+            }
+            Ok::<_, anyhow::Error>((bytes, complete))
+        }
+        .await;
         let closed = self.raw.close(h).await;
         let (bytes, complete) =
             copied.context("upload failed; remote destination may contain a partial file")?;
@@ -1620,6 +1665,16 @@ impl Engine {
             return Ok(cancelled_transfer(&local, &remote, bytes, true));
         }
         Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
+    }
+
+    async fn apply_upload_times(&self, handle: &str, times: Option<FileAttributes>) -> Result<()> {
+        if let Some(times) = times {
+            self.raw
+                .fsetstat(handle, times)
+                .await
+                .context("the server did not confirm the upload timestamps")?;
+        }
+        Ok(())
     }
 
     async fn write_upload(

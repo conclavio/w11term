@@ -1,5 +1,7 @@
 use super::*;
-use crate::upload_folder::{assert_uploaded_tree, seed_source};
+use crate::upload_folder::{
+    assert_uploaded_times, assert_uploaded_tree, seed_source, stamp_upload_source,
+};
 use w11term::sftp::CHUNK;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -15,6 +17,7 @@ async fn native_sftp_upload_folder_preserves_tree_collisions_and_both_shells() {
     let picker = state.path().join("picker");
     fs::create_dir(&picker).unwrap();
     seed_source(&picker);
+    let times = stamp_upload_source(&picker.join("release 雪/data 例/trace 日本.bin"));
     let interrupted = picker.join("interrupted/nested");
     fs::create_dir_all(&interrupted).unwrap();
     let payload: Vec<u8> = (0..4 * CHUNK).map(|n| (n % 251) as u8).collect();
@@ -37,6 +40,7 @@ async fn native_sftp_upload_folder_preserves_tree_collisions_and_both_shells() {
 
     drive_mixed_gui("upload-sftp-folder-ui.ps1", &ssh, state.path());
 
+    assert_uploaded_times(&dest.join("release 雪/data 例/trace 日本.bin"), times);
     assert_uploaded_tree(&dest.join("release 雪"));
     assert_eq!(
         fs::read(dest.join("interrupted/nested/payload.bin")).unwrap(),

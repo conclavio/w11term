@@ -113,6 +113,7 @@ pub enum FileAction {
     Replace(u64, u64, bool),
     PreserveMtime(u64, u64, bool),
     AtomicUploads(u64, u64, bool),
+    PreserveUploadTimes(u64, u64, bool),
     Pick(u64, u64, u64, TransferPicker),
     Picked(u64, u64, u64, TransferPicker, Result<Vec<PathBuf>, String>),
     Drop(DropTarget, Vec<PathBuf>),
@@ -160,6 +161,7 @@ pub(super) struct FileDrawer {
     replace: bool,
     preserve_mtime: bool,
     atomic_uploads: bool,
+    preserve_upload_times: bool,
     picking: Option<u64>,
     parsing: bool,
     pending: Option<Pending>,
@@ -972,6 +974,7 @@ impl FileDrawer {
             Operation::PutDir {
                 local,
                 remote: remote.clone(),
+                preserve_times: self.preserve_upload_times,
             },
             TransferFile::UploadFolder { remote },
         ))
@@ -1480,6 +1483,7 @@ impl FileDrawer {
             following: self.following,
             sort_order: self.sort_order,
             preserve_mtime: self.preserve_mtime,
+            preserve_upload_times: self.preserve_upload_times,
             dialog_serial: self.dialog_serial,
             editor,
             last_download,
@@ -1819,6 +1823,14 @@ impl FileDrawer {
                     context.callback(move |v| Message::Files(AtomicUploads(pane, generation, v))),
                 )
                 .content(TextBlock::new().text("Upload files atomically")),
+            CheckBox::new()
+                .automation_name("Preserve upload timestamps")
+                .is_enabled(ready)
+                .is_checked(self.preserve_upload_times)
+                .on_is_checked_changed(context.callback(move |enabled| {
+                    Message::Files(PreserveUploadTimes(pane, generation, enabled))
+                }))
+                .content(TextBlock::new().text("Preserve upload timestamps")),
         ];
         if let Some(editor) = &self.editor {
             controls.push(button(
@@ -2722,6 +2734,7 @@ impl TerminalApp {
             | Replace(id, ..)
             | PreserveMtime(id, ..)
             | AtomicUploads(id, ..)
+            | PreserveUploadTimes(id, ..)
             | Pick(id, ..)
             | Picked(id, ..)
             | Listed(id, ..)
@@ -2774,7 +2787,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2976,6 +2989,7 @@ impl TerminalApp {
                                 &parent,
                                 files.replace,
                                 files.atomic_uploads,
+                                files.preserve_upload_times,
                                 id,
                             )?;
                             files.transfer_next(pane, session, context)?;
@@ -3309,6 +3323,7 @@ impl TerminalApp {
                 Replace(_, _, replace) => files.replace = replace,
                 PreserveMtime(_, _, enabled) => files.preserve_mtime = enabled,
                 AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,
+                PreserveUploadTimes(_, _, enabled) => files.preserve_upload_times = enabled,
                 Drop(target, paths) => {
                     if drop_allowed {
                         files.classify_drop(target, paths, session, context);
@@ -4526,6 +4541,7 @@ mod tests {
             "/",
             false,
             false,
+            false,
             id,
         )
         .unwrap();
@@ -4672,7 +4688,7 @@ mod tests {
             .unwrap();
         assert_eq!(request_generation(&operation, 7), Some(7));
         assert!(
-            matches!(operation, Operation::PutDir { local: source, remote }
+            matches!(operation, Operation::PutDir { local: source, remote, .. }
             if source == local && remote == "/srv/logs/run 4 [雪]")
         );
         assert_eq!(drawer.status, "Uploading folder /srv/logs/run 4 [雪]…");
@@ -4845,6 +4861,7 @@ mod tests {
                 vec![r"C:\queued".into()],
                 "/old",
                 true,
+                false,
                 false,
                 TransferId {
                     pane: 1,

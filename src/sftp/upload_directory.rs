@@ -239,6 +239,7 @@ struct Upload<'a> {
     state: &'a mut UploadState,
     cancel: Option<&'a TransferCancel>,
     progress: Option<&'a watch::Sender<TransferProgress>>,
+    preserve_times: bool,
     entries: usize,
     name_bytes: usize,
 }
@@ -362,6 +363,14 @@ impl Upload<'_> {
             .checked_add(len)
             .context("folder upload size overflow")?;
         let mut file = tokio::fs::File::from_std(source);
+        let times = if self.preserve_times {
+            upload_times(&file.metadata().await?, true)?
+        } else {
+            None
+        };
+        if self.cancelled() {
+            return Ok(());
+        }
         let h = self
             .engine
             .raw
@@ -398,6 +407,12 @@ impl Upload<'_> {
                     file.metadata().await?.len() == len,
                     "local file changed while uploading {path}"
                 );
+                if !self.cancelled() {
+                    self.engine
+                        .apply_upload_times(&h, times)
+                        .await
+                        .with_context(|| format!("preserving times on {path}"))?;
+                }
             }
             Ok::<_, anyhow::Error>(offset == len)
         }
@@ -417,6 +432,7 @@ impl Engine {
     pub(super) async fn put_directory(
         &self,
         (local, dir): (PathBuf, Arc<File>),
+        preserve_times: bool,
         progress: Option<&watch::Sender<TransferProgress>>,
         cancel: Option<&TransferCancel>,
         state: &mut UploadState,
@@ -428,6 +444,7 @@ impl Engine {
             state,
             cancel,
             progress,
+            preserve_times,
             entries: 0,
             name_bytes: 0,
         };

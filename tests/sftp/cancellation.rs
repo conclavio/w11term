@@ -160,6 +160,7 @@ fn upload(local: &Path) -> Operation {
         remote: "/destination".into(),
         overwrite: true,
         atomic: false,
+        preserve_times: false,
     }
 }
 
@@ -169,6 +170,7 @@ fn atomic_upload(local: &Path, remote: &str, overwrite: bool) -> Operation {
         remote: remote.into(),
         overwrite,
         atomic: true,
+        preserve_times: false,
     }
 }
 
@@ -339,6 +341,7 @@ async fn cancelled_before_admission_never_opens_a_channel_or_changes_either_file
         Operation::PutDir {
             local: local.path().into(),
             remote: "/new tree".into(),
+            preserve_times: false,
         },
     ] {
         let reply = start(&pane, operation, &cancel).await.unwrap().unwrap();

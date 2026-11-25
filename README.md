@@ -434,6 +434,8 @@ must be available. The drawer counts skipped junctions and other reparse
 points and shows confirmed progress. If you cancel or disconnect after the
 remote folder is created, inspect the partial tree at the reported path.
 
+Enable **Preserve upload timestamps** to keep the Windows access and modification times of uploaded regular files. This applies to folder contents, Explorer drops, and atomic file uploads. Scripts can use `--preserve-times`. The SFTP server must accept both timestamps. [SFTP file attributes](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-5)
+
 An Explorer drop keeps the item order supplied by Windows. **Replace existing
 files** applies to individual files in that batch. Each dropped folder needs a
 new remote name. Dropping a junction or another reparse point as a top-level

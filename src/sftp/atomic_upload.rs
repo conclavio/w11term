@@ -6,7 +6,7 @@ impl Engine {
         &self,
         (local, mut file): (PathBuf, tokio::fs::File),
         remote: String,
-        overwrite: bool,
+        options: UploadOptions,
         progress: Option<&watch::Sender<TransferProgress>>,
         cancel: Option<&TransferCancel>,
         stage: &mut JobStage,
@@ -17,6 +17,7 @@ impl Engine {
         }
         let metadata = file.metadata().await?;
         ensure!(metadata.is_file(), "local source must be a regular file");
+        let times = upload_times(&metadata, options.preserve_times)?;
         let total = Some(metadata.len());
         report(progress, 0, total);
 
@@ -36,7 +37,7 @@ impl Engine {
         );
         let parent = parent.filename.trim_end_matches('/');
         let destination = format!("{parent}/{name}");
-        let original = if overwrite {
+        let original = if options.overwrite {
             self.atomic_upload_destination(&destination).await?
         } else {
             self.require_new_name(&destination).await?;
@@ -83,6 +84,7 @@ impl Engine {
                 .write_upload(&handle, &mut file, total, progress, cancel, stage)
                 .await?;
             if complete && !cancelled() {
+                self.apply_upload_times(&handle, times).await?;
                 if let Some(attrs) = &original {
                     // Match a normal write's removal of set-id bits.
                     self.apply_staged_attributes(&handle, attrs, 0o1777).await?;
