@@ -16,6 +16,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   find ROOT QUERY\n\
+  sha256 PATH [--max-bytes N]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -204,6 +205,12 @@ pub fn parse(
                 "Enter a filename fragment up to 256 bytes"
             );
             fields.insert("query".into(), json!(query));
+        }
+        "sha256" => {
+            fields.insert("path".into(), json!(path()?));
+            if let Some(limit) = opts.remove("--max-bytes") {
+                fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
+            }
         }
         "opendir" | "stat" | "lstat" | "setstat" | "mkdir" | "remove-file" | "remove-dir"
         | "realpath" | "readlink" | "statvfs" | "expand-path" | "open" => {

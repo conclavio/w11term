@@ -1052,6 +1052,8 @@ async fn guarded_job(
 
 #[path = "sftp/cancellation.rs"]
 mod cancellation;
+#[path = "sftp/checksum.rs"]
+mod checksum;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
 #[path = "sftp/find.rs"]

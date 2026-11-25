@@ -3,6 +3,8 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+$verifyClipboard = $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted'
+if ($verifyClipboard) { . (Join-Path $PSScriptRoot 'support/clipboard.ps1') }
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -33,6 +35,10 @@ function Open-Properties([string[]]$Expected) {
     $value = $null
     if ($field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$value) -and !$value.Current.IsReadOnly) { throw 'Properties exposed writable file metadata' }
     if (Find-Element 'Edit' $button) { throw 'Properties offered Edit' }
+    $checksum = Find-Element 'Calculate SHA-256' $button
+    if ([bool]$checksum -ne ($Expected -contains 'Type  Regular file')) {
+        throw 'The SHA-256 action must be available only for confirmed regular files'
+    }
     Click 'Close properties'
     $null = Wait-Until 'properties dialog dismissed' { !(Find-Element 'Close properties' $button) }
 }
@@ -83,6 +89,35 @@ try {
     Open-Properties @("Path  $parent/telemetry-link",'Type  Symbolic link',("Link target  ../archive/" + [char]0x822a + "/$snow"))
     Click 'sparse-meta'
     Open-Properties @("Path  $parent/sparse-meta",'Type  Not reported','Size  Not reported','Modified  Not reported','Accessed  Not reported','Permissions  Not reported','Owner UID  Not reported','Group GID  Not reported')
+    if ([IO.File]::ReadAllText((Join-Path $fixture 'transfer-trace')).Length -ne 0) {
+        throw 'Viewing properties opened a file before requesting its checksum'
+    }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $expectedDigest = -join ($hasher.ComputeHash([IO.File]::ReadAllBytes($disk)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $hasher.Dispose() }
+    Click $filename
+    Click $properties
+    Click 'Calculate SHA-256'
+    $digestField = Wait-Until 'selectable SHA-256 digest in the dialog' {
+        $b = Find-Element 'SHA-256 digest'
+        if ($b -and $b.Current.AutomationId -eq 'sftp-checksum-text') { $b }
+    }
+    $digestText = $digestField.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1).Trim()
+    if ($digestText -cne $expectedDigest) { throw 'The checksum dialog displayed the wrong digest' }
+    if ($verifyClipboard) {
+        $before = [FixtureClipboard]::GetClipboardSequenceNumber()
+        Click 'Copy SHA-256'
+        $null = Wait-Until 'exact SHA-256 digest copied' {
+            [FixtureClipboard]::ContainsNewText($before, $expectedDigest)
+        }
+    } elseif (!(Find-Element 'Copy SHA-256' $button)) {
+        throw 'The checksum dialog lacked a copy action'
+    }
+    Click 'Close checksum'
+    $sha = Control @('sftp','--pane',"$remote",'sha256',"$parent/$filename",'--max-bytes','57')
+    if ($sha.sftp.sha256 -cne $expectedDigest -or $sha.sftp.bytes -ne 57) {
+        throw 'The CLI returned an unexpected checksum or byte count'
+    }
     $actions = Find-Element 'SFTP actions'
     $close = [System.Windows.Automation.AndCondition]::new(
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Close'),
@@ -101,7 +136,9 @@ try {
     Wait-Focus $localPane
     if ((Shell-Pid 'properties-after') -ne $pidBefore) { throw 'Properties interrupted the neighboring PowerShell' }
 } catch {
-    throw "$($_.Exception.Message) at $($_.ScriptStackTrace)"
+    $packets = [IO.File]::ReadAllText((Join-Path $fixture 'transfer-trace'))
+    $metadata = [IO.File]::ReadAllText((Join-Path $fixture 'properties-trace'))
+    throw "$($_.Exception.Message) at $($_.ScriptStackTrace). Transfer packets: $packets Metadata packets: $metadata"
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

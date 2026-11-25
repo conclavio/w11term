@@ -97,6 +97,7 @@ pub enum FileAction {
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     Preview(u64, u64, ListedEntry, PreviewKind),
     ClosePreview(u64, u64, u64),
+    CopyChecksum(u64, u64, u64),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
@@ -2678,6 +2679,7 @@ impl TerminalApp {
             | CopyPath(id, ..)
             | Preview(id, ..)
             | ClosePreview(id, ..)
+            | CopyChecksum(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
@@ -2743,7 +2745,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2854,6 +2856,11 @@ impl TerminalApp {
                     outcome = TransferOutcome::Cancelled;
                 }
                 ClosePreview(_, _, serial) => files.close_preview(serial),
+                CopyChecksum(_, _, serial) => {
+                    if may_open_dialog {
+                        files.copy_checksum(serial);
+                    }
+                }
                 StartTextEditor(_, generation, serial) => {
                     if may_open_dialog && files.generation == generation {
                         files.start_editor(serial);
@@ -3096,9 +3103,11 @@ impl TerminalApp {
                         }
                     }
                 }
-                _ if files.busy() || !files.open => {}
                 Preview(_, _, entry, kind) => {
-                    if may_open_dialog {
+                    if may_open_dialog
+                        && files.open
+                        && (!files.busy() || matches!(kind, PreviewKind::Checksum(_)))
+                    {
                         let (serial, operation) = files.begin_preview(entry, kind)?;
                         if let Err(error) =
                             files.job(pane, session, operation, Step::Preview(serial), context)
@@ -3107,6 +3116,7 @@ impl TerminalApp {
                         }
                     }
                 }
+                _ if files.busy() || !files.open => {}
                 EditFilter(_, _, revision, enabled) => {
                     if enabled && files.directory.is_some() && may_open_dialog {
                         if !files.filter_editing() {

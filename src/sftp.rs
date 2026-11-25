@@ -37,6 +37,7 @@ mod find;
 pub use find::{FilenameMatch, FilenameSearch, valid_filename_query};
 mod resume_download;
 use resume_download::ResumeDownload;
+mod checksum;
 mod text_preview;
 mod transfer_status;
 pub use transfer_status::{
@@ -154,6 +155,11 @@ pub enum Operation {
         expected_sha256: Option<String>,
         #[serde(default)]
         resume: bool,
+    },
+    Sha256 {
+        path: String,
+        #[serde(default)]
+        max_bytes: Option<u64>,
     },
     GetDir {
         remote: String,
@@ -586,15 +592,14 @@ pub(crate) async fn run(
         if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
             continue;
         }
-        if matches!(
-            operation,
-            Operation::PreviewText { .. } | Operation::EntryProperties { .. }
-        ) && cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+            && let Some(message) = match operation {
+                Operation::PreviewText { .. } => Some("Text preview cancelled"),
+                Operation::EntryProperties { .. } => Some("File properties cancelled"),
+                Operation::Sha256 { .. } => Some("SHA-256 calculation cancelled"),
+                _ => None,
+            }
         {
-            let message = match operation {
-                Operation::EntryProperties { .. } => "File properties cancelled",
-                _ => "Text preview cancelled",
-            };
             let _ = reply.send(Err(message.into()));
             continue;
         }
@@ -677,6 +682,9 @@ pub(crate) async fn run(
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::Get { resume: true, .. } => JobStage::ResumableDownload,
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
+                Operation::Sha256 { .. } => {
+                    JobStage::Checking("SHA-256 calculation did not finish")
+                }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
                 Operation::GetDir { .. } => JobStage::DirectoryDownload {
                     staging: None,
@@ -1017,6 +1025,7 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            Sha256 { path, max_bytes } => self.remote_sha256(&path, max_bytes, cancel).await?,
             Find { path, query } => {
                 serde_json::to_value(self.find_filenames(&path, &query, cancel).await?)?
             }
