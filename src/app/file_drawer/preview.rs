@@ -3,6 +3,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::cell::OnceCell;
 use w11term::sftp::{FileTail, FileTextMatch, PermissionReview};
 
+const TAIL_POLL_MS: u32 = 1000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewKind {
     Text,
@@ -49,7 +51,7 @@ pub(super) struct EntryPreview {
     link_target: Option<String>,
     opening_link: bool,
     comparison: Option<LocalComparison>,
-    tail_refreshing: bool,
+    tail: Option<TailView>,
     status: Option<String>,
     pub(super) cancel: TransferCancel,
     // Terminal output can re-render the window while the user selects text.
@@ -62,6 +64,32 @@ enum Contents {
     Image(ImagePreview),
     Tail(FileTail),
     Error(String),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum TailRead {
+    Manual,
+    Follow,
+}
+
+#[derive(Default)]
+struct TailView {
+    timer: Option<crate::ui_timer::RetryTimer>,
+    read: Option<TailRead>,
+    end: ElementRef<Grid>,
+    scroll_pending: bool,
+}
+
+impl TailView {
+    fn following(&self) -> bool {
+        self.timer.is_some()
+    }
+
+    fn reveal_end(&mut self) {
+        if self.following() && self.scroll_pending && self.end.request_bring_into_view() {
+            self.scroll_pending = false;
+        }
+    }
 }
 
 struct ImagePreview {
@@ -308,21 +336,41 @@ impl EntryPreview {
                     "document".to_owned()
                 };
                 let mut fields = vec![KeyedView::new(body_key, body)];
-                if self.kind == PreviewKind::Tail {
+                if let Some(tail) = &self.tail {
+                    let following = tail.following();
+                    let manual = tail.read == Some(TailRead::Manual);
+                    let ready = !matches!(self.content, Contents::Loading);
                     fields.push(KeyedView::new(
-                        "refresh-tail",
-                        Button::new()
-                            .is_enabled(
-                                !self.tail_refreshing && !matches!(self.content, Contents::Loading),
-                            )
-                            .on_click(context.callback(move |_| {
-                                Message::Files(FileAction::RefreshTail(pane, generation, serial))
-                            }))
-                            .content(if self.tail_refreshing {
-                                "Refreshing tail…"
-                            } else {
-                                "Refresh tail"
-                            }),
+                        "tail-actions",
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(6.0)
+                            .children((
+                                Button::new()
+                                    .is_enabled(ready && !manual)
+                                    .on_click(context.callback(move |_| {
+                                        Message::Files(FileAction::SetTailFollow(
+                                            pane, generation, serial, !following,
+                                        ))
+                                    }))
+                                    .content(if following {
+                                        "Pause follow"
+                                    } else {
+                                        "Follow tail"
+                                    }),
+                                Button::new()
+                                    .is_enabled(ready && !manual && !following)
+                                    .on_click(context.callback(move |_| {
+                                        Message::Files(FileAction::RefreshTail(
+                                            pane, generation, serial,
+                                        ))
+                                    }))
+                                    .content(if manual {
+                                        "Refreshing tail…"
+                                    } else {
+                                        "Refresh tail"
+                                    }),
+                            )),
                     ));
                 }
                 if let Some(hits) = matches {
@@ -598,11 +646,26 @@ impl EntryPreview {
                 TextBlock::new().text("No complete text at the end of the file"),
             ));
         }
-        ScrollViewer::new()
+        if let Some(tail) = self.tail.as_ref().filter(|tail| tail.following()) {
+            fields.push(KeyedView::new(
+                "tail-end",
+                Grid::new()
+                    .element_ref(&tail.end)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .height(1.0)
+                    .width(1.0),
+            ));
+        }
+        let scroll = ScrollViewer::new()
             .max_height(420.0)
             .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
-            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-            .content(StackPanel::new().keyed_children(fields))
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto);
+        let scroll = if self.kind == PreviewKind::Tail {
+            scroll.automation_name("File tail scroll area")
+        } else {
+            scroll
+        };
+        scroll.content(StackPanel::new().keyed_children(fields))
     }
 }
 
@@ -679,7 +742,7 @@ impl FileDrawer {
             link_target: None,
             opening_link: false,
             comparison: None,
-            tail_refreshing: false,
+            tail: (kind == PreviewKind::Tail).then(TailView::default),
             status: None,
             cancel: TransferCancel::default(),
             view: OnceCell::new(),
@@ -737,12 +800,39 @@ impl FileDrawer {
                 .and_then(|sha256| normalize_sha256(sha256).map_err(|error| error.to_string()))
                 .map(Contents::Ready),
         });
-        if std::mem::take(&mut preview.tail_refreshing)
-            && matches!(preview.content, Contents::Tail(_))
-            && let Err(error) = &content
-        {
-            preview.status = Some(format!("Could not refresh the file tail. {error}"));
-            preview.view.take();
+        if let Some(tail) = &mut preview.tail {
+            let read = tail.read.take();
+            let previous_status = preview.status.take();
+            let changed = match content {
+                Ok(Contents::Tail(next)) => match &preview.content {
+                    Contents::Tail(previous) if *previous == next => false,
+                    _ => {
+                        preview.content = Contents::Tail(next);
+                        tail.scroll_pending = true;
+                        true
+                    }
+                },
+                Err(error) if matches!(preview.content, Contents::Tail(_)) => {
+                    preview.status = Some(format!("Could not refresh the file tail. {error}"));
+                    false
+                }
+                Err(error) => {
+                    if matches!(&preview.content, Contents::Error(previous) if *previous == error) {
+                        false
+                    } else {
+                        preview.content = Contents::Error(error);
+                        true
+                    }
+                }
+                Ok(content) => {
+                    preview.content = content;
+                    true
+                }
+            };
+            if changed || previous_status != preview.status || read == Some(TailRead::Manual) {
+                preview.view.take();
+            }
+            tail.reveal_end();
             return;
         }
         preview.content = match content {
@@ -765,22 +855,85 @@ impl FileDrawer {
         preview.view.take();
     }
 
-    pub(super) fn begin_tail_refresh(&mut self, serial: u64) -> Option<Operation> {
-        let preview = self.preview.as_ref().filter(|preview| {
-            preview.serial == serial
-                && preview.kind == PreviewKind::Tail
-                && !preview.tail_refreshing
-                && !matches!(preview.content, Contents::Loading)
+    pub(super) fn begin_tail_refresh(&mut self, serial: u64, read: TailRead) -> Option<Operation> {
+        let preview = self.preview.as_mut().filter(|preview| {
+            preview.serial == serial && !matches!(preview.content, Contents::Loading)
         })?;
+        let tail = preview.tail.as_mut()?;
+        if (read == TailRead::Follow) != tail.following() {
+            return None;
+        }
+        tail.reveal_end();
+        if tail.read.is_some() {
+            return None;
+        }
+        let target = preview.target.clone();
         if !self.open || self.pending.is_some() {
             return None;
         }
-        let path = self.checked_target_path(&preview.target).ok()?;
+        let path = self.checked_target_path(&target).ok()?;
         let preview = self.preview.as_mut().unwrap();
-        preview.tail_refreshing = true;
-        preview.status = None;
-        preview.view.take();
+        preview.tail.as_mut().unwrap().read = Some(read);
+        if read == TailRead::Manual {
+            preview.status = None;
+            preview.view.take();
+        }
         Some(Operation::PreviewTail { path })
+    }
+
+    pub(super) fn set_tail_follow(
+        &mut self,
+        pane: u64,
+        serial: u64,
+        enabled: bool,
+        context: &ComponentContext<TerminalApp>,
+    ) {
+        let Some(preview) = self.preview.as_mut().filter(|preview| {
+            self.open && preview.serial == serial && !matches!(preview.content, Contents::Loading)
+        }) else {
+            return;
+        };
+        let Some(tail) = preview.tail.as_mut() else {
+            return;
+        };
+        if enabled == tail.following() || tail.read == Some(TailRead::Manual) {
+            return;
+        }
+        if enabled {
+            let generation = self.generation;
+            let sender = context.sender();
+            let poll = move || {
+                sender.send(Message::Files(FileAction::PollTail(
+                    pane, generation, serial,
+                )));
+                TAIL_POLL_MS
+            };
+            match crate::ui_timer::RetryTimer::with_next_delay(TAIL_POLL_MS, poll) {
+                Ok(timer) => {
+                    tail.timer = Some(timer);
+                    tail.scroll_pending = true;
+                    context.sender().send(Message::Files(FileAction::PollTail(
+                        pane, generation, serial,
+                    )));
+                }
+                Err(error) => {
+                    preview.status = Some(format!("Could not follow the file tail. {error}"))
+                }
+            }
+        } else {
+            tail.timer = None;
+            tail.scroll_pending = false;
+            if tail.read.take() == Some(TailRead::Follow) {
+                preview.cancel.cancel();
+                preview.cancel = TransferCancel::default();
+                if self.pending.as_ref().is_some_and(
+                    |pending| matches!(pending.step, Step::Preview(current) if current == serial),
+                ) {
+                    self.pending.take();
+                }
+            }
+        }
+        preview.view.take();
     }
 
     pub(super) fn begin_link_target(&mut self, serial: u64) -> Option<Operation> {
@@ -1215,17 +1368,21 @@ mod tests {
         let Operation::PreviewTail { path } = operation else {
             panic!("expected the tail operation");
         };
-        assert!(files.begin_tail_refresh(serial).is_none());
+        assert!(files.begin_tail_refresh(serial, TailRead::Manual).is_none());
         files.finish_preview(
             serial,
             Ok(json!({"text":"old", "file_size":3, "omitted_prefix":false})),
         );
-        assert!(files.begin_tail_refresh(serial + 1).is_none());
+        assert!(
+            files
+                .begin_tail_refresh(serial + 1, TailRead::Manual)
+                .is_none()
+        );
         assert!(matches!(
-            files.begin_tail_refresh(serial),
+            files.begin_tail_refresh(serial, TailRead::Manual),
             Some(Operation::PreviewTail { path: target }) if target == path
         ));
-        assert!(files.begin_tail_refresh(serial).is_none());
+        assert!(files.begin_tail_refresh(serial, TailRead::Manual).is_none());
         files.finish_preview(serial, Err("File unavailable".into()));
         let preview = files.preview.as_ref().unwrap();
         assert!(matches!(&preview.content, Contents::Tail(tail) if tail.text == "old"));
@@ -1236,7 +1393,7 @@ mod tests {
                 .unwrap()
                 .contains("File unavailable")
         );
-        assert!(files.begin_tail_refresh(serial).is_some());
+        assert!(files.begin_tail_refresh(serial, TailRead::Manual).is_some());
         files.finish_preview(
             serial,
             Ok(json!({"text":"new", "file_size":3, "omitted_prefix":false})),
@@ -1245,7 +1402,7 @@ mod tests {
         assert!(matches!(&preview.content, Contents::Tail(tail) if tail.text == "new"));
         assert!(preview.status.is_none());
         files.close_preview(serial);
-        assert!(files.begin_tail_refresh(serial).is_none());
+        assert!(files.begin_tail_refresh(serial, TailRead::Manual).is_none());
     }
 
     fn selected(kind: ListedKind) -> (FileDrawer, ListedEntry) {

@@ -2616,6 +2616,27 @@ async fn native_sftp_tail_opens_from_the_listing_and_search_and_picks_up_rotatio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "follows an SFTP log in WinUI and verifies native scrolling, pause, and rotation"]
+async fn native_sftp_follow_tail_reveals_new_output_and_pauses_in_flight_reads() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let parent = root.join("shell directory");
+    fs::create_dir_all(&parent).unwrap();
+    let lines: String = (1..=80).map(|i| format!("seed-{i:03}\n")).collect();
+    let log = parent.join("engine.log");
+    fs::write(&log, format!("{}\n{lines}", "x".repeat(512 * 1024))).unwrap();
+    fs::write(root.join("transfer-trace"), []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    drive_mixed_gui("sftp-follow-tail-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(&log).unwrap(), b"rotated live\n");
+    assert_eq!(channels.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
 async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

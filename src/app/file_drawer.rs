@@ -127,6 +127,8 @@ pub enum FileAction {
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     Preview(u64, u64, FileTarget, PreviewKind),
     RefreshTail(u64, u64, u64),
+    SetTailFollow(u64, u64, u64, bool),
+    PollTail(u64, u64, u64),
     ClosePreview(u64, u64, u64),
     OpenLinkTarget(u64, u64, u64),
     LinkTargetListed(u64, u64, u64, Result<link_target::Listing, String>),
@@ -3542,6 +3544,8 @@ impl TerminalApp {
             | CopyPath(id, ..)
             | Preview(id, ..)
             | RefreshTail(id, ..)
+            | SetTailFollow(id, ..)
+            | PollTail(id, ..)
             | ClosePreview(id, ..)
             | OpenLinkTarget(id, ..)
             | LinkTargetListed(id, ..)
@@ -3680,6 +3684,7 @@ impl TerminalApp {
             && !matches!(
                 action,
                 Tick(_)
+                    | PollTail(..)
                     | EditName(..)
                     | FocusFilter(..)
                     | Search(_, _, find::Action::FocusQuery(..))
@@ -4223,10 +4228,20 @@ impl TerminalApp {
                         }
                     }
                 }
-                RefreshTail(_, generation, serial) => {
+                SetTailFollow(_, generation, serial, enabled) => {
+                    if may_open_dialog && generation == files.generation {
+                        files.set_tail_follow(pane, serial, enabled, context);
+                    }
+                }
+                action @ (RefreshTail(_, generation, serial) | PollTail(_, generation, serial)) => {
+                    let read = if matches!(action, PollTail(..)) {
+                        preview::TailRead::Follow
+                    } else {
+                        preview::TailRead::Manual
+                    };
                     if may_open_dialog
                         && generation == files.generation
-                        && let Some(operation) = files.begin_tail_refresh(serial)
+                        && let Some(operation) = files.begin_tail_refresh(serial, read)
                         && let Err(error) =
                             files.job(pane, session, operation, Step::Preview(serial), context)
                     {

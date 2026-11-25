@@ -413,6 +413,8 @@ Choose **Preview image…** on a PNG, JPEG or GIF in the SFTP listing or search 
 
 Choose **Tail text file…** in the listing or search results to read up to 200 lines from the last 64 KiB of a regular UTF-8 file. The drawer shows the file size and indicates when it omitted earlier text. **Refresh tail** reads the path again, so it picks up appended output or a log file replaced by rotation. You can select and copy the text.
 
+Choose **Follow tail** to refresh about once a second and keep new output in view. The last snapshot stays visible while the file is temporarily unavailable during rotation. **Pause follow** stops the automatic reads and keeps the snapshot available to select and copy. Closing the tail also stops the reads.
+
 Choose **Properties…** on a file, folder or symbolic link to read its current metadata. The dialog shows the remote path, entry type, size in bytes, octal permissions, numeric owner and group, and modification and access times in UTC. Unreported fields are marked **Not reported**. For a symbolic link, the dialog shows the link’s own attributes and asks the server for its target path. This also works for a dangling link.
 
 Choose **Open link target** in a symbolic link’s Properties to let the SFTP server resolve it. A directory opens in the drawer. A regular file is selected in its containing folder. If the server cannot resolve the link or list the destination, the drawer keeps the link’s Properties open and shows the error. If opening the target changes folders, **Back** returns to the source folder. **Back to search results** restores the search if you opened Properties from a result. [SFTP path resolution](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.11)

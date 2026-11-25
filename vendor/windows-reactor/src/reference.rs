@@ -252,6 +252,18 @@ impl<T: ReferenceControl> ElementRef<T> {
     pub(crate) fn binding(&self) -> NativeElementRef {
         NativeElementRef(Rc::clone(&self.target))
     }
+
+    /// Asks the current scrollable ancestors to reveal this element without moving focus.
+    #[must_use = "false means the element is unbound or the request could not be queued"]
+    pub fn request_bring_into_view(&self) -> bool {
+        let Some(binding) = self.target.borrow().binding.clone() else {
+            return false;
+        };
+        binding.endpoint.enqueue(NativeWork {
+            identity: binding.identity,
+            work: ImperativeRequest::BringIntoView { node: binding.node },
+        })
+    }
 }
 
 impl<T: FocusControl> ElementRef<T> {
@@ -807,6 +819,9 @@ impl Drop for ElementObservation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ImperativeRequest {
+    BringIntoView {
+        node: NodeId,
+    },
     Focus {
         node: NodeId,
         completion: Callback<Result<bool, RuntimeError>>,
@@ -871,7 +886,8 @@ impl ImperativeRequest {
             } => {
                 _ = completion.call(Err(RuntimeError::MissingNode(node)));
             }
-            Self::ObserveSwapChainPanel { .. }
+            Self::BringIntoView { .. }
+            | Self::ObserveSwapChainPanel { .. }
             | Self::ObserveImageScale { .. }
             | Self::ObserveCompositionHost { .. }
             | Self::RevokeObservation { .. } => {}

@@ -1487,6 +1487,15 @@ impl WinUiRuntime {
                 self.start_retirement(*root, nodes.clone(), *parent, *slot, *transition)?;
             }
 
+            Command::BringIntoView { node } => {
+                // The positions from the newest committed view may still need layout.
+                let _ = self.ui_element(*node).and_then(|element| {
+                    element
+                        .UpdateLayout()
+                        .and_then(|()| element.StartBringIntoView())
+                        .map_err(native_error)
+                });
+            }
             Command::Focus { node, completion } => {
                 let result = self.ui_element(*node).and_then(|element| {
                     element
