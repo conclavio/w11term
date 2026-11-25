@@ -168,6 +168,9 @@ impl Panel {
             run
         };
         rows.push(KeyedView::new("run", search_actions));
+        if let Some(resume) = files.resume_draft_button(pane, ctx) {
+            rows.push(KeyedView::new("resume-draft", resume));
+        }
         if !files.status.is_empty() {
             rows.push(KeyedView::new(
                 "status",
@@ -239,7 +242,26 @@ impl Panel {
                             .text(&path)
                             .text_wrapping(TextWrapping::Wrap),
                     );
-                let entry = if shell_ready
+                let mut entry_actions = vec![KeyedView::new("reveal", reveal)];
+                if hit.kind == Some(EntryKind::File) {
+                    let hit = hit.clone();
+                    entry_actions.push(KeyedView::new(
+                        "preview",
+                        Button::new()
+                            .automation_name(format!("Preview text {path}"))
+                            .is_enabled(ready)
+                            .on_click(ctx.callback(move |_| {
+                                Message::Files(FileAction::Preview(
+                                    pane,
+                                    generation,
+                                    FileTarget::Search(serial, hit.clone()),
+                                    PreviewKind::Text,
+                                ))
+                            }))
+                            .content("Preview text…"),
+                    ));
+                }
+                if shell_ready
                     && let Some(origin) =
                         directory_split::Origin::search(pane, generation, serial, hit)
                 {
@@ -253,10 +275,8 @@ impl Panel {
                             )
                         }))
                         .content("Shell in containing folder");
-                    StackPanel::new().spacing(4.0).children((reveal, shell))
-                } else {
-                    reveal
-                };
+                    entry_actions.push(KeyedView::new("shell", shell));
+                }
                 let mut actions = Vec::new();
                 if let Some(label) = match hit.kind {
                     Some(EntryKind::File) => Some("Download…"),
@@ -324,7 +344,7 @@ impl Panel {
                         .columns([GridLength::Star(1.0), GridLength::Auto])
                         .column_spacing(6.0)
                         .children((
-                            entry,
+                            StackPanel::new().spacing(4.0).keyed_children(entry_actions),
                             StackPanel::new()
                                 .grid_column(1)
                                 .spacing(4.0)
@@ -647,6 +667,69 @@ mod tests {
             ..file
         };
         assert!(drawer.search_download_target(2, &forged, false).is_err());
+    }
+
+    #[test]
+    fn search_text_editor_uses_the_current_hit_then_pins_the_draft_path() {
+        let hit = FilenameMatch {
+            parent: "/project/logs".into(),
+            name: "settings.txt".into(),
+            kind: Some(EntryKind::File),
+        };
+        let other = FilenameMatch {
+            parent: "/project".into(),
+            ..hit.clone()
+        };
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 3,
+            directory: Some("/project".into()),
+            search: Some(Panel {
+                serial: 4,
+                root: "/project".into(),
+                query: "settings".into(),
+                result: Some(FilenameSearch {
+                    root: "/project".into(),
+                    matches: vec![other, hit.clone()],
+                    scanned_directories: 2,
+                    scanned_entries: 2,
+                    skipped_directories: 0,
+                    truncated: false,
+                    cancelled: false,
+                }),
+                page: 0,
+                cancel: None,
+                copy_status: None,
+            }),
+            ..FileDrawer::default()
+        };
+        let path = "/project/logs/settings.txt";
+        let (preview, operation) = drawer
+            .begin_preview(FileTarget::Search(4, hit.clone()), PreviewKind::Text)
+            .unwrap();
+        assert!(matches!(operation, Operation::PreviewText { path: remote } if remote == path));
+        drawer.finish_preview(preview, Ok(json!({"text": "original"})));
+
+        drawer.search.as_mut().unwrap().serial = 5;
+        drawer.start_editor(preview);
+        assert!(drawer.editor.is_none());
+        drawer.close_preview(preview);
+        let (preview, _) = drawer
+            .begin_preview(FileTarget::Search(5, hit), PreviewKind::Text)
+            .unwrap();
+        drawer.finish_preview(preview, Ok(json!({"text": "original"})));
+        drawer.start_editor(preview);
+        let serial = drawer.dialog_serial;
+        drawer.editor_action(serial, editor::Action::Mounted);
+        drawer.editor_action(serial, editor::Action::Text("edited".into()));
+        let (save, operation) = drawer.editor_action(serial, editor::Action::Save).unwrap();
+        assert!(
+            matches!(operation, Operation::SaveText { path: remote, original: Some(original), text }
+            if remote == path && original == "original" && text == "edited")
+        );
+        assert!(drawer.finish_save(save, Ok(json!({}))).is_none());
+        assert_eq!(drawer.directory.as_deref(), Some("/project"));
+        assert_eq!(drawer.search.unwrap().query, "settings");
     }
 
     #[test]

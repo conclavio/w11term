@@ -231,6 +231,20 @@ impl FileTarget {
             Self::Search(_, hit) => &hit.name,
         }
     }
+
+    fn is_regular_file(&self) -> bool {
+        match self {
+            Self::Listed(entry) => entry.kind == ListedKind::Known(EntryKind::File),
+            Self::Search(_, hit) => hit.kind == Some(EntryKind::File),
+        }
+    }
+
+    fn into_location(self) -> (String, String) {
+        match self {
+            Self::Listed(entry) => (entry.parent, entry.name),
+            Self::Search(_, hit) => (hit.parent, hit.name),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1895,13 +1909,7 @@ impl FileDrawer {
                 }))
                 .content(TextBlock::new().text("Preserve upload timestamps")),
         ];
-        if let Some(editor) = &self.editor {
-            controls.push(button(
-                "Resume draft",
-                !self.entry_dialog_open(),
-                ResumeTextEditor(pane, editor.serial()),
-            ));
-        }
+        controls.extend(self.resume_draft_button(pane, context));
         let sort_button = |order, label: &str, name: &str| {
             RadioButton::new()
                 .group_name(format!("sftp-sort-{pane}"))

@@ -183,25 +183,22 @@ impl EntryPreview {
 }
 
 impl FileDrawer {
-    pub(super) fn take_preview_for_edit(&mut self, serial: u64) -> Option<(ListedEntry, String)> {
+    pub(super) fn take_preview_for_edit(&mut self, serial: u64) -> Option<(FileTarget, String)> {
         let preview = self.preview.as_ref()?;
-        let FileTarget::Listed(entry) = &preview.target else {
-            return None;
-        };
         if !self.open
             || preview.serial != serial
-            || self.check_selected(entry).is_err()
             || !preview.editable()
+            || self.checked_target_path(&preview.target).is_err()
         {
             return None;
         }
-        let entry = entry.clone();
+        let target = preview.target.clone();
         let mut preview = self.preview.take()?;
         let Contents::Ready(text) = std::mem::replace(&mut preview.content, Contents::Loading)
         else {
             unreachable!()
         };
-        Some((entry, text))
+        Some((target, text))
     }
     pub(super) fn begin_preview(
         &mut self,
@@ -221,11 +218,7 @@ impl FileDrawer {
         let path = self.checked_target_path(&target)?;
         let operation = match kind {
             PreviewKind::Text => {
-                ensure!(
-                    matches!(&target, FileTarget::Listed(entry)
-                        if entry.kind == ListedKind::Known(EntryKind::File)),
-                    "Select a regular file to preview"
-                );
+                ensure!(target.is_regular_file(), "Select a regular file to preview");
                 Operation::PreviewText { path }
             }
             PreviewKind::Properties => Operation::EntryProperties { path },

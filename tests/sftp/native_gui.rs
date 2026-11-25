@@ -3868,7 +3868,7 @@ async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "edits UTF-8 text in the SFTP drawer and saves a conflicting draft under a new name"]
+#[ignore = "edits UTF-8 text from the SFTP listing and search, and preserves conflicting drafts"]
 async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
         unreachable!()
@@ -3878,6 +3878,9 @@ async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() 
     let source = folder.join("pilot 雪.ini");
     let original = "\u{feff}pilot=one\r\nspeed=slow\nlabel=雪";
     fs::write(&source, original.as_bytes()).unwrap();
+    let generated = folder.join("generated");
+    fs::create_dir(&generated).unwrap();
+    fs::write(generated.join("pilot 雪.ini"), original.as_bytes()).unwrap();
     fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
     let keys = remote.path().join("keyboard-input.bin");
     fs::write(&keys, []).unwrap();
@@ -3897,8 +3900,13 @@ async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() 
         "\u{feff}pilot=two\r\nspeed=fast\nlabel=雪".as_bytes()
     );
     assert_eq!(
+        fs::read(generated.join("pilot 雪.ini")).unwrap(),
+        "\u{feff}pilot=one\r\nspeed=fast\nlabel=雪".as_bytes()
+    );
+    assert_eq!(fs::read_dir(&generated).unwrap().count(), 1);
+    assert_eq!(
         fs::read_dir(&folder).unwrap().count(),
-        2,
+        3,
         "editor left staging files behind"
     );
     assert_eq!(fs::read(keys).unwrap(), b"after-editor");

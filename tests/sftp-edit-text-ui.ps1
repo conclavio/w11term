@@ -138,6 +138,39 @@ try {
     Check-File $file $externalBytes
     Check-File (Join-Path $folder $copy) ($savedBytes.Replace('one','two'))
 
+    Click ('Find files' + [char]0x2026)
+    $search = Wait-Until 'recursive search query' {
+        Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $search.GetCurrentPattern($getValue).SetValue($name)
+    Click 'Search'
+    $remoteFile = "/shell directory/generated/$name"
+    $searchPreview = "Preview text $remoteFile"
+    $matched = Join-Path (Join-Path $folder 'generated') $name
+    Click $searchPreview
+    $readOnly = Wait-Until 'selectable search preview' { By-Id 'sftp-preview-text' }
+    $contents = $readOnly.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+    if (!$contents.Contains('speed=slow')) { throw 'The preview opened the same filename in the wrong folder' }
+    Click 'Close preview'
+    Click $searchPreview
+    Click 'Edit'
+    $null = Wait-Draft $original 'editable search result'
+    Replace-Word 'slow' 'fast'
+    $null = Wait-Draft $saved 'editing search result'
+    Click 'Close editor'
+    Check-File $matched $originalBytes
+    Click 'Resume draft'
+    $null = Wait-Draft $saved 'resuming draft from search'
+    Click 'Save'
+    $null = Wait-Until 'original search results after saving' {
+        $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+        $query -and $query.GetCurrentPattern($getValue).Current.Value -ceq $name -and
+            (Find-Element $searchPreview $button) -and (Find-Element "Saved $name") -and !(By-Id 'sftp-editor-text')
+    }
+    Check-File $matched $savedBytes
+    Check-File $file $externalBytes
+    Click 'Back to files'
+
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Find-Element $preview $button) }
     foreach ($ch in 'after-editor'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
