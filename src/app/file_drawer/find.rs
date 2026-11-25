@@ -255,7 +255,10 @@ impl Panel {
                                     pane,
                                     generation,
                                     revision,
-                                    TransferPicker::DownloadSearch(serial, hit.clone()),
+                                    TransferPicker::Download(
+                                        FileTarget::Search(serial, hit.clone()),
+                                        None,
+                                    ),
                                 ))
                             }))
                             .content(label),
@@ -277,6 +280,24 @@ impl Panel {
                             })
                         })
                         .content("Copy path"),
+                ));
+                actions.push(KeyedView::new(
+                    "properties",
+                    Button::new()
+                        .automation_name(format!("Properties {path}"))
+                        .is_enabled(ready)
+                        .on_click({
+                            let hit = hit.clone();
+                            ctx.callback(move |_| {
+                                Message::Files(FileAction::Preview(
+                                    pane,
+                                    generation,
+                                    FileTarget::Search(serial, hit.clone()),
+                                    PreviewKind::Properties,
+                                ))
+                            })
+                        })
+                        .content("Properties…"),
                 ));
                 KeyedView::new(
                     index,
@@ -310,11 +331,7 @@ impl Panel {
 }
 
 impl FileDrawer {
-    pub(super) fn search_download_target<'a>(
-        &self,
-        serial: u64,
-        hit: &'a FilenameMatch,
-    ) -> Result<downloads::DownloadTarget<'a>> {
+    pub(super) fn search_hit_path(&self, serial: u64, hit: &FilenameMatch) -> Result<String> {
         ensure!(
             self.search
                 .as_ref()
@@ -323,14 +340,24 @@ impl FileDrawer {
                 .is_some_and(|result| result.matches.contains(hit)),
             "The search results changed. Select the result again."
         );
+        remote_child(&hit.parent, &hit.name)
+    }
+
+    pub(super) fn search_download_target<'a>(
+        &self,
+        serial: u64,
+        hit: &'a FilenameMatch,
+        verify: bool,
+    ) -> Result<downloads::DownloadTarget<'a>> {
+        let remote = self.search_hit_path(serial, hit)?;
         ensure!(
-            matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
+            verify || matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
             "Choose a regular file or folder"
         );
         Ok(downloads::DownloadTarget {
-            remote: remote_child(&hit.parent, &hit.name)?,
+            remote,
             name: &hit.name,
-            directory: hit.kind == Some(EntryKind::Directory),
+            directory: !verify && hit.kind == Some(EntryKind::Directory),
         })
     }
 
@@ -491,6 +518,7 @@ impl FileDrawer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn restoring_search_keeps_the_query_and_page_and_rejects_old_actions() {
@@ -579,10 +607,13 @@ mod tests {
             ..FileDrawer::default()
         };
         assert_eq!(
-            drawer.search_download_target(2, &file).unwrap().remote,
+            drawer
+                .search_download_target(2, &file, false)
+                .unwrap()
+                .remote,
             "/project/logs/build log.txt"
         );
-        let target = drawer.search_download_target(2, &folder).unwrap();
+        let target = drawer.search_download_target(2, &folder, false).unwrap();
         let (operation, _) = target
             .operation(r"C:\Downloads".into(), false, true, None)
             .unwrap();
@@ -590,13 +621,93 @@ mod tests {
             matches!(operation, Operation::GetDir { remote, local, preserve_mtime: true }
             if remote == "/project/logs/logs archive" && local == std::path::Path::new(r"C:\Downloads\logs archive"))
         );
-        assert!(drawer.search_download_target(1, &file).is_err());
-        assert!(drawer.search_download_target(2, &link).is_err());
+        assert!(drawer.search_download_target(1, &file, false).is_err());
+        assert!(drawer.search_download_target(2, &link, false).is_err());
         let forged = FilenameMatch {
             kind: Some(EntryKind::Directory),
             ..file
         };
-        assert!(drawer.search_download_target(2, &forged).is_err());
+        assert!(drawer.search_download_target(2, &forged, false).is_err());
+    }
+
+    #[test]
+    fn search_properties_and_verified_download_follow_the_exact_result() {
+        let hit = FilenameMatch {
+            parent: "/project/logs".into(),
+            name: "build log.txt".into(),
+            kind: None,
+        };
+        let path = "/project/logs/build log.txt";
+        let target = FileTarget::Search(2, hit.clone());
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 1,
+            directory: Some("/project".into()),
+            search: Some(Panel {
+                serial: 2,
+                root: "/project".into(),
+                query: "log".into(),
+                result: Some(FilenameSearch {
+                    root: "/project".into(),
+                    matches: vec![hit],
+                    scanned_directories: 2,
+                    scanned_entries: 3,
+                    skipped_directories: 0,
+                    truncated: false,
+                    cancelled: false,
+                }),
+                page: 0,
+                cancel: None,
+                copy_status: None,
+            }),
+            ..FileDrawer::default()
+        };
+        assert!(drawer.download_target(&target, false).is_err());
+        let (serial, op) = drawer
+            .begin_preview(target.clone(), PreviewKind::Properties)
+            .unwrap();
+        assert!(matches!(op, Operation::EntryProperties { path: remote } if remote == path));
+        let metadata = json!({"attrs": {"permissions": 0o100600}});
+        drawer.finish_preview(serial, Ok(metadata.clone()));
+        let (checksum, op) = drawer
+            .begin_preview(target.clone(), PreviewKind::Checksum(serial))
+            .unwrap();
+        assert!(matches!(op, Operation::Sha256 { path: remote, .. } if remote == path));
+        let digest = "f1".repeat(32);
+        drawer.finish_preview(checksum, Ok(json!({"sha256": digest})));
+        drawer.verify_checksum(checksum).unwrap();
+        let serial = drawer.dialog.as_ref().unwrap().serial;
+        let (dialog, hash) = drawer
+            .finish_edit(serial, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        let EditAction::VerifyDownload(selected) = dialog.action else {
+            panic!("Expected a verified download from the search results");
+        };
+        let (op, _) = drawer
+            .download_operation(
+                &selected,
+                r"C:\Downloads\build log.txt".into(),
+                Some(DownloadVerification {
+                    sha256: hash,
+                    resume: true,
+                }),
+            )
+            .unwrap();
+        assert!(
+            matches!(op, Operation::Get { remote, expected_sha256: Some(hash), resume: true, .. }
+            if remote == path && hash == digest)
+        );
+        assert_eq!(drawer.directory.as_deref(), Some("/project"));
+        assert_eq!(drawer.search.as_ref().unwrap().query, "log");
+
+        let (serial, _) = drawer
+            .begin_preview(target.clone(), PreviewKind::Properties)
+            .unwrap();
+        drawer.search.as_mut().unwrap().serial += 1;
+        drawer.finish_preview(serial, Ok(metadata));
+        assert!(!drawer.entry_dialog_open());
+        assert!(drawer.download_target(&target, true).is_err());
     }
 
     #[test]

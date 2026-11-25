@@ -1,4 +1,3 @@
-use super::{ListedEntry, entry_path};
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use serde_json::Value;
@@ -27,14 +26,13 @@ fn timestamp(seconds: Option<u32>) -> String {
         .unwrap_or_else(|| UNREPORTED.into())
 }
 
-pub(super) fn display_text(entry: &ListedEntry, mut reply: Value) -> Result<String> {
+pub(super) fn display_text(path: &str, mut reply: Value) -> Result<String> {
     let data = reply
         .get_mut("attrs")
         .context("Missing SFTP file attributes")?
         .take();
     let attrs: Attributes =
         serde_json::from_value(data).context("Missing or invalid SFTP file attributes")?;
-    let path = entry_path(&entry.parent, &entry.name)?;
     let kind = entry_type(attrs.permissions);
     let size = match attrs.size {
         Some(1) => "1 byte".into(),
@@ -71,22 +69,14 @@ pub(super) fn display_text(entry: &ListedEntry, mut reply: Value) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::file_drawer::ListedKind;
     use serde_json::json;
 
-    fn entry() -> ListedEntry {
-        ListedEntry {
-            parent: "/srv/雪".into(),
-            name: "latest.log".into(),
-            revision: 1,
-            kind: ListedKind::Missing,
-        }
-    }
+    const PATH: &str = "/srv/雪/latest.log";
 
     #[test]
     fn properties_preserve_zero_ids_and_epoch_special_mode_bits_and_wide_sizes() {
         let text = display_text(
-            &entry(),
+            PATH,
             json!({"attrs":{
                 "size":u64::MAX,"permissions":0o104750,"uid":0,"gid":12,"mtime":0,"atime":u32::MAX
             }}),
@@ -109,11 +99,11 @@ mod tests {
 
     #[test]
     fn missing_attributes_and_partial_link_metadata_stay_distinct_from_zero() {
-        let text = display_text(&entry(), json!({"attrs":{}})).unwrap();
+        let text = display_text(PATH, json!({"attrs":{}})).unwrap();
         assert_eq!(text.matches(UNREPORTED).count(), 7);
-        assert!(display_text(&entry(), json!({})).is_err());
+        assert!(display_text(PATH, json!({})).is_err());
         let text = display_text(
-            &entry(),
+            PATH,
             json!({"attrs":{"permissions":0o120777,"size":1},
             "target_error":"Permission denied"}),
         )
@@ -121,7 +111,7 @@ mod tests {
         assert!(text.contains("Type  Symbolic link\r\nSize  1 byte"));
         assert!(text.ends_with("Link target unavailable. Permission denied"));
         let text = display_text(
-            &entry(),
+            PATH,
             json!({"attrs":{"permissions":0o120640},
             "target":"../archives/古い.log"}),
         )

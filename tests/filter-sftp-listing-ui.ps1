@@ -76,11 +76,22 @@ function Set-Filter([string]$Text) {
 }
 function Save-SearchResult([string]$Result, [string]$Destination) {
     Click $Result
+    Set-DownloadDestination $Destination
+}
+function Set-DownloadDestination([string]$Destination) {
     $dialog = Wait-Until 'owned download save dialog from the result' { Find-OwnedDialog 'Save As' }
     $null = Wait-Until 'enter download destination' {
         [FixtureDialog]::SetFilename($dialog, $Destination, 'nested-content.txt')
     }
     $null = Wait-Until 'accept download destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+function Read-SearchProperties([string]$Path, [string]$Type) {
+    Click "Properties $Path"
+    $field = Wait-Until 'fresh Properties from the search result' { Find-Element 'File properties' }
+    $text = $field.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
+    if ($text -cnotlike "*Path  $Path*" -or $text -cnotlike "*Type  $Type*") {
+        throw "Unexpected properties for $Path. $text"
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -167,6 +178,8 @@ try {
     }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('NESTED')
     Click 'Search'
+    Read-SearchProperties "$parent/nested" 'Directory'
+    Click 'Close properties'
     $fileResult = "Download $parent/nested/nested-content.txt"
     $destination = Join-Path $picker 'from-search.txt'
     [IO.File]::WriteAllBytes($readGate, [byte[]]@())
@@ -184,12 +197,32 @@ try {
         !(Button 'Cancel transfer') -and ![IO.File]::Exists($destination) -and
             (Button $fileResult).Current.IsEnabled
     }
-    Save-SearchResult $fileResult $destination
     $contents = 'f' * 70000
-    $null = Wait-Until 'file downloaded with search results still shown' {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $expectedDigest = -join ($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($contents)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $hasher.Dispose() }
+    Read-SearchProperties "$parent/nested/nested-content.txt" 'Regular file'
+    Click 'Calculate SHA-256'
+    $digest = Wait-Until 'SHA-256 from search result Properties' { Find-Element 'SHA-256 digest' }
+    if ($digest.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1).Trim() -cne $expectedDigest) {
+        throw 'Properties hashed the wrong search result'
+    }
+    Click 'Use for verified download'
+    $field = Wait-Until 'prefilled digest' { Find-Element 'Expected SHA-256' }
+    if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne $expectedDigest) {
+        throw 'Verified download did not reuse the search result digest'
+    }
+    Click 'Choose destination'
+    Set-DownloadDestination $destination
+    $null = Wait-Until 'verified file downloaded with search results still shown' {
         [IO.File]::Exists($destination) -and
             [IO.File]::ReadAllText($destination) -ceq $contents -and
             (Button "Reveal $parent/nested/nested-content.txt") -and (Button $fileResult).Current.IsEnabled
+    }
+    $null = Wait-Until 'verified search transfer recorded' {
+        $events = (Control @('events','--pane',"$remote",'--since','0','--timeout','0')).journal.events
+        $events | Where-Object { $_.kind -ceq 'sftp-transfer' -and
+            $_.data.outcome -ceq 'completed' -and $_.data.message -clike '*SHA-256 verified*' }
     }
     Click "Download $parent/nested"
     $dialog = Wait-Until 'owned folder picker from the result' {
