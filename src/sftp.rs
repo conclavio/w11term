@@ -38,6 +38,8 @@ pub use find::{FilenameMatch, FilenameSearch, valid_filename_query};
 mod resume_download;
 use resume_download::ResumeDownload;
 mod text_preview;
+mod transfer_status;
+pub use transfer_status::{TransferBatchProgress, TransferId, TransferOperation, TransferPhase};
 mod upload_directory;
 pub(crate) use directory::valid_component;
 pub use directory::{validate_download_name, validate_download_names};
@@ -374,7 +376,7 @@ pub fn open_flags(flags: &[String]) -> Result<OpenFlags> {
 
 /// Bytes written to the local file or acknowledged by the remote server.
 /// The total is a metadata estimate. Completion is reported by the job reply.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TransferProgress {
     pub bytes: u64,
     pub total: Option<u64>,

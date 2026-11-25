@@ -2,6 +2,11 @@ use super::{
     file_drawer::{TransferId, TransferView, transfer_progress_views},
     *,
 };
+use w11term::{
+    control::SftpTransferStatus,
+    options::SshOptions,
+    sftp::{TransferOperation, TransferPhase},
+};
 
 pub(super) const LABEL: &str = "SFTP transfers";
 
@@ -42,7 +47,7 @@ impl TerminalApp {
                 ) {
                     return;
                 }
-                let pane = transfer.pane();
+                let pane = transfer.pane;
                 let Some(id) = self.tab_for_pane(pane) else {
                     return;
                 };
@@ -70,27 +75,13 @@ impl TerminalApp {
 
     pub(super) fn sftp_transfers_view(&self, ctx: &ViewContext<Self>) -> View {
         let rows: Vec<_> = self
-            .tabs
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                let Page::Terminal(tab) = &entry.value.page else {
-                    return None;
-                };
-                let Source::Ssh(ssh) = &tab.source else {
-                    return None;
-                };
-                let generation = tab.session.frames.load().connection_generation;
-                let transfer = tab.files.active_transfer(generation)?;
+            .window_sftp_transfers()
+            .map(|(_, label, ssh, transfer)| {
                 let source = format!(
-                    "{} · Pane {} · {}@{}:{}",
-                    entry.value.label,
-                    transfer.id.pane(),
-                    ssh.user,
-                    ssh.host,
-                    ssh.port
+                    "{label} · Pane {} · {}@{}:{}",
+                    transfer.id.pane, ssh.user, ssh.host, ssh.port
                 );
-                Some(transfer_row(source, transfer, ctx))
+                transfer_row(source, transfer, ctx)
             })
             .collect();
         let content: View = if rows.is_empty() {
@@ -112,6 +103,42 @@ impl TerminalApp {
                 Border::new().grid_row(1).content(content),
             ))
     }
+
+    fn window_sftp_transfers(
+        &self,
+    ) -> impl Iterator<Item = (TabId, &str, &SshOptions, TransferView<'_>)> {
+        self.tabs.entries().iter().filter_map(|entry| {
+            let Page::Terminal(tab) = &entry.value.page else {
+                return None;
+            };
+            let Source::Ssh(ssh) = &tab.source else {
+                return None;
+            };
+            let generation = tab.session.frames.load().connection_generation;
+            let transfer = tab.files.active_transfer(generation)?;
+            Some((entry.id, entry.value.label.as_str(), ssh, transfer))
+        })
+    }
+
+    pub(super) fn control_sftp_transfers(&self, pane: Option<u64>) -> Vec<SftpTransferStatus> {
+        self.window_sftp_transfers()
+            .filter(|(_, _, _, transfer)| pane.is_none_or(|pane| transfer.id.pane == pane))
+            .filter_map(|(tab, label, _, transfer)| {
+                Some(SftpTransferStatus {
+                    transfer_id: transfer.id,
+                    pane: transfer.id.pane,
+                    window_id: self.registry.window_id(),
+                    tab_id: self.tabs.group_id(tab)?,
+                    label: label.into(),
+                    operation: transfer.operation,
+                    state: transfer.state,
+                    remote: transfer.remote.map(str::to_owned),
+                    progress: transfer.progress,
+                    batch: transfer.batch,
+                })
+            })
+            .collect()
+    }
 }
 
 fn transfer_row(
@@ -120,14 +147,21 @@ fn transfer_row(
     ctx: &ViewContext<TerminalApp>,
 ) -> KeyedView {
     let id = current.id;
-    let pane = id.pane();
-    let mut title = current.operation.to_owned();
+    let pane = id.pane;
+    let mut title = match current.operation {
+        TransferOperation::PrepareUpload => "Preparing upload",
+        TransferOperation::UploadFile => "Uploading",
+        TransferOperation::UploadFolder => "Uploading folder",
+        TransferOperation::DownloadFile => "Downloading",
+        TransferOperation::DownloadFolder => "Downloading folder",
+    }
+    .to_owned();
     if let Some(remote) = current.remote {
         title.push(' ');
         title.push_str(remote);
     }
-    if let Some((index, total)) = current.batch {
-        title.push_str(&format!(" · Item {index} of {total}"));
+    if let Some(batch) = current.batch {
+        title.push_str(&format!(" · Item {} of {}", batch.item, batch.total));
     }
     let mut details = vec![
         KeyedView::new(
@@ -148,7 +182,8 @@ fn transfer_row(
         details.push(KeyedView::new("progress", bar));
         details.push(KeyedView::new("bytes", bytes));
     }
-    let cancel_label = if current.cancelling {
+    let cancelling = current.state == TransferPhase::Cancelling;
+    let cancel_label = if cancelling {
         "Cancelling transfer…"
     } else {
         "Cancel transfer"
@@ -165,7 +200,7 @@ fn transfer_row(
                     .content("Open SFTP drawer"),
                 Button::new()
                     .automation_name(format!("Cancel transfer for Pane {pane}"))
-                    .is_enabled(!current.cancelling)
+                    .is_enabled(!cancelling)
                     .on_click(ctx.callback(move |_| Message::SftpTransfers(Action::Cancel(id))))
                     .content(cancel_label),
             )),

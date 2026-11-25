@@ -166,7 +166,7 @@ impl FileDrawer {
         if let Some(batch) = self.queue.batch_id {
             return batch;
         }
-        self.transfer_serial = self.transfer_serial.wrapping_add(1);
+        self.transfer_serial = self.transfer_serial.wrapping_add(1).max(1);
         TransferId {
             pane,
             generation: self.generation,

@@ -6,11 +6,13 @@ use std::{
     path::PathBuf,
 };
 use tokio::sync::{oneshot, watch};
+use w11term::control::SftpCancelState;
 use w11term::events::SavedDownload;
 use w11term::folder_grants::Authority;
+pub use w11term::sftp::TransferId;
 use w11term::sftp::{
-    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, TransferProgress, normalize_sha256,
-    validate_download_name,
+    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferBatchProgress, TransferCancel,
+    TransferOperation, TransferPhase, TransferProgress, normalize_sha256, validate_download_name,
 };
 
 mod bookmarks;
@@ -551,26 +553,13 @@ impl TransferFile {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub struct TransferId {
-    pane: u64,
-    generation: u64,
-    serial: u64,
-}
-
-impl TransferId {
-    pub(super) fn pane(self) -> u64 {
-        self.pane
-    }
-}
-
 pub(super) struct TransferView<'a> {
     pub(super) id: TransferId,
-    pub(super) operation: &'static str,
+    pub(super) operation: TransferOperation,
     pub(super) remote: Option<&'a str>,
     pub(super) progress: Option<TransferProgress>,
-    pub(super) batch: Option<(usize, usize)>,
-    pub(super) cancelling: bool,
+    pub(super) batch: Option<TransferBatchProgress>,
+    pub(super) state: TransferPhase,
 }
 
 pub(super) fn transfer_progress_views(p: TransferProgress) -> (View, View) {
@@ -1274,7 +1263,7 @@ impl FileDrawer {
         self.marked_downloads = None;
         self.close_search();
         if self.preparing_drop.take().is_some() {
-            self.status.clear();
+            self.status = "Cancelled before uploading any dropped items.".into();
         }
         self.bookmarks = None;
         self.cancel_entry_dialog();
@@ -1310,10 +1299,6 @@ impl FileDrawer {
         }
     }
 
-    fn transferring(&self) -> bool {
-        self.transfer_file().is_some()
-    }
-
     pub(super) fn active_transfer(&self, generation: u64) -> Option<TransferView<'_>> {
         if self.generation != generation {
             return None;
@@ -1321,29 +1306,71 @@ impl FileDrawer {
         if let Some(preparation) = &self.preparing_drop {
             return Some(TransferView {
                 id: preparation.id,
-                operation: "Preparing upload",
+                operation: TransferOperation::PrepareUpload,
                 remote: self.directory.as_deref(),
                 progress: None,
                 batch: None,
-                cancelling: false,
+                state: TransferPhase::Preparing,
             });
         }
         let file = self.transfer_file()?;
         let transfer = self.pending.as_ref()?.transfer.as_ref()?;
         let (operation, remote) = match file {
-            TransferFile::Upload { remote, .. } => ("Uploading", remote),
-            TransferFile::UploadFolder { remote } => ("Uploading folder", remote),
-            TransferFile::Download { remote, .. } => ("Downloading", remote),
-            TransferFile::DownloadFolder { remote, .. } => ("Downloading folder", remote),
+            TransferFile::Upload { remote, .. } => (TransferOperation::UploadFile, remote),
+            TransferFile::UploadFolder { remote } => (TransferOperation::UploadFolder, remote),
+            TransferFile::Download { remote, .. } => (TransferOperation::DownloadFile, remote),
+            TransferFile::DownloadFolder { remote, .. } => {
+                (TransferOperation::DownloadFolder, remote)
+            }
         };
         Some(TransferView {
             id: transfer.id,
             operation,
             remote: Some(remote),
             progress: Some(*transfer.progress.borrow()),
-            batch: (self.queue.total > 1).then(|| (self.queue.next_item(), self.queue.total)),
-            cancelling: transfer.cancel.is_cancelled(),
+            batch: (self.queue.total > 1).then(|| TransferBatchProgress {
+                item: self.queue.next_item(),
+                total: self.queue.total,
+            }),
+            state: if transfer.cancel.is_cancelled() {
+                TransferPhase::Cancelling
+            } else {
+                TransferPhase::Running
+            },
         })
+    }
+
+    fn transfer_stamp(&self) -> Option<(TransferId, bool)> {
+        if let Some(preparation) = &self.preparing_drop {
+            return Some((preparation.id, false));
+        }
+        let file = self.transfer_file()?;
+        let active = self.pending.as_ref()?.transfer.as_ref()?;
+        Some((active.id, file.is_download()))
+    }
+
+    fn cancel_transfer(&mut self, id: TransferId) -> Option<SftpCancelState> {
+        if self
+            .preparing_drop
+            .as_ref()
+            .is_some_and(|preparation| preparation.id == id)
+        {
+            self.preparing_drop = None;
+            self.status = "Cancelled before uploading any dropped items.".into();
+            self.cached.borrow_mut().take();
+            return Some(SftpCancelState::CancelledBeforeStart);
+        }
+        let active = self.pending.as_ref()?.transfer.as_ref()?;
+        if active.id != id {
+            return None;
+        }
+        if active.cancel(id, &mut self.queue) {
+            self.status = "Cancelling transfer…".into();
+            self.cached.borrow_mut().take();
+            Some(SftpCancelState::Cancelling)
+        } else {
+            Some(SftpCancelState::AlreadyCancelling)
+        }
     }
 
     fn finish_transfer_queue(&mut self) {
@@ -1352,16 +1379,32 @@ impl FileDrawer {
         }
     }
 
-    fn publish_transfer_result(&self, session: &Session, download: bool) {
-        let saved = self.last_download.as_ref().filter(|_| download).cloned();
-        session.events.sftp_transfer_finished(&self.status, saved);
+    fn publish_ended_transfer(
+        &self,
+        session: &Session,
+        previous: Option<(TransferId, bool)>,
+        background: bool,
+    ) {
+        if let Some((id, download)) = previous
+            && self
+                .transfer_stamp()
+                .is_none_or(|(current, _)| current != id)
+        {
+            let saved = self
+                .last_download
+                .as_ref()
+                .filter(|_| download && background)
+                .cloned();
+            session
+                .events
+                .sftp_transfer_finished(id, &self.status, saved, background);
+        }
     }
 
-    pub(super) fn observe_connection(&mut self, generation: u64) -> bool {
+    pub(super) fn observe_connection(&mut self, generation: u64) {
         if self.generation == generation {
-            return false;
+            return;
         }
-        let had_transfer = self.transferring();
         let mut last_download = self.last_download.take();
         let status = match self.pending.as_mut() {
             Some(Pending {
@@ -1387,6 +1430,9 @@ impl FileDrawer {
                     "{} before SSH reconnected. Refresh to browse.",
                     change.completed()
                 ),
+                _ if self.preparing_drop.is_some() => {
+                    "SSH reconnected before the dropped upload started.".into()
+                }
                 _ => "SSH connected. Refresh to browse.".into(),
             },
         };
@@ -1403,14 +1449,12 @@ impl FileDrawer {
             status,
             ..Self::default()
         };
-        had_transfer
     }
 
     fn observe_transfer_connection(&mut self, session: &Session, generation: u64, active: bool) {
-        let download = self.transfer_file().is_some_and(TransferFile::is_download);
-        if self.observe_connection(generation) && (!active || !self.open) {
-            self.publish_transfer_result(session, download);
-        }
+        let previous = self.transfer_stamp();
+        self.observe_connection(generation);
+        self.publish_ended_transfer(session, previous, !active || !self.open);
     }
 
     /// Sample only when ready to browse. A burst during a transfer or listing is
@@ -2393,6 +2437,29 @@ impl LiveTab {
 }
 
 impl TerminalApp {
+    pub(super) fn control_cancel_sftp_transfer(
+        &mut self,
+        transfer_id: TransferId,
+    ) -> Result<Value> {
+        let id = self
+            .tab_for_pane(transfer_id.pane)
+            .context("Unknown terminal pane")?;
+        let active = self.tabs.active_id() == Some(id);
+        let Some(Page::Terminal(tab)) = self.tabs.get_mut(id).map(|entry| &mut entry.page) else {
+            bail!("Unknown terminal pane");
+        };
+        let generation = tab.session.frames.load().connection_generation;
+        tab.observe_file_connection(generation, active);
+        let previous = tab.files.transfer_stamp();
+        let state = tab
+            .files
+            .cancel_transfer(transfer_id)
+            .context("SFTP transfer is no longer active on that connection")?;
+        tab.files
+            .publish_ended_transfer(&tab.session, previous, !active || !tab.files.open);
+        Ok(serde_json::json!({ "transfer_id": transfer_id, "state": state }))
+    }
+
     pub(super) fn browse_mounted_share(
         &mut self,
         authority: &Authority,
@@ -2664,10 +2731,14 @@ impl TerminalApp {
             &action,
             TextEditor(_, _, editor::Action::Text(_) | editor::Action::Name(_))
         );
-        let background_transfer =
-            matches!(action, Tick(_)) && (!visible || !files.open) && files.transferring();
-        let background_download =
-            background_transfer && files.transfer_file().is_some_and(TransferFile::is_download);
+        let previous_transfer = if matches!(
+            action,
+            Tick(_) | Toggle | Close(_) | CancelTransfer(_) | PreparedDrop(..)
+        ) {
+            files.transfer_stamp()
+        } else {
+            None
+        };
         let keep_directory = editor_typing
             || matches!(
                 &action,
@@ -2777,19 +2848,7 @@ impl TerminalApp {
                 }
                 Tick(_) => files.tick(pane, session, may_open_dialog, context)?,
                 CancelTransfer(target) => {
-                    if files
-                        .preparing_drop
-                        .as_ref()
-                        .is_some_and(|active| active.id == target)
-                    {
-                        files.preparing_drop = None;
-                        files.status = "Cancelled before uploading any dropped items.".into();
-                    } else if let Some(transfer) =
-                        files.pending.as_ref().and_then(|job| job.transfer.as_ref())
-                        && transfer.cancel(target, &mut files.queue)
-                    {
-                        files.status = "Cancelling transfer…".into();
-                    }
+                    files.cancel_transfer(target);
                 }
                 Listed(_, _, path, direction, result) if files.parsing => {
                     files.parsing = false;
@@ -2803,6 +2862,10 @@ impl TerminalApp {
                             result.map_err(anyhow::Error::msg)?,
                         )?;
                         files.transfer_next(pane, session, context)?;
+                    } else if previous_transfer.is_some_and(|(id, _)| id == token)
+                        && files.preparing_drop.is_none()
+                    {
+                        files.status = "Cancelled before uploading any dropped items.".into();
                     }
                 }
                 Picked(_, _, serial, picker, result) => {
@@ -3199,10 +3262,7 @@ impl TerminalApp {
             files.finish_transfer_queue();
             files.cached.borrow_mut().take();
         }
-        // A queued item installs the next transfer before the tick returns.
-        if background_transfer && !files.transferring() {
-            files.publish_transfer_result(session, background_download);
-        }
+        files.publish_ended_transfer(session, previous_transfer, !visible || !files.open);
         if visible {
             let return_to_terminal = finish_filter && !tab.files.filter_editing();
             if !keep_directory {

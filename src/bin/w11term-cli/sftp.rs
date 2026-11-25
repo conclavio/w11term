@@ -6,7 +6,9 @@ use w11term::{
     sftp::{Attributes, DEFAULT_TIMEOUT, Operation, normalize_sha256},
 };
 
-pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
+pub const HELP: &str = "w11term-cli [--pid PID] sftp list-transfers [--pane ID]\n\
+w11term-cli [--pid PID] sftp cancel-transfer TRANSFER_ID\n\
+w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
   get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX [--resume]]\n\
   put LOCAL REMOTE [--overwrite] [--atomic]\n\
@@ -81,6 +83,32 @@ pub fn parse(
         }
     }
     let command = command.context(HELP)?;
+    if matches!(command.as_str(), "list-transfers" | "cancel-transfer") {
+        ensure!(
+            opts.is_empty() && !overwrite && !atomic && !resume && !spec_order,
+            "Unexpected options for {command}"
+        );
+        let request = if command == "list-transfers" {
+            ensure!(
+                positional.is_empty(),
+                "list-transfers takes only an optional --pane"
+            );
+            ensure!(pane != Some(0), "--pane must be positive");
+            Request::ListSftpTransfers { pane }
+        } else {
+            ensure!(
+                pane.is_none(),
+                "The transfer ID already identifies its pane"
+            );
+            let [id] = positional.as_slice() else {
+                bail!("cancel-transfer requires one transfer ID from list-transfers");
+            };
+            Request::CancelSftpTransfer {
+                transfer_id: id.parse().context("Invalid SFTP transfer ID")?,
+            }
+        };
+        return Ok((pid, request));
+    }
     ensure!(!atomic || command == "put", "--atomic requires put");
     ensure!(
         !resume || (command == "get" && opts.contains_key("--sha256")),
@@ -253,6 +281,34 @@ mod tests {
     use super::*;
     fn p(s: &[&str]) -> Result<(Option<u32>, Request)> {
         parse(s.iter().map(|s| s.to_string()), None, None)
+    }
+
+    #[test]
+    fn transfer_commands_accept_only_a_pane_filter_or_an_exact_transfer_id() {
+        let (pid, list) = p(&["list-transfers", "--pid", "42", "--pane", "9"]).unwrap();
+        assert_eq!(pid, Some(42));
+        assert!(matches!(list, Request::ListSftpTransfers { pane: Some(9) }));
+        assert!(matches!(
+            p(&["list-transfers"]).unwrap().1,
+            Request::ListSftpTransfers { pane: None }
+        ));
+        let (_, cancel) = p(&["cancel-transfer", "9:2:11"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(cancel).unwrap(),
+            json!({"verb":"cancel-sftp-transfer", "transfer_id":"9:2:11"})
+        );
+        for invalid in [
+            &["list-transfers", "extra"][..],
+            &["list-transfers", "--pane", "0"],
+            &["list-transfers", "--timeout", "5"],
+            &["cancel-transfer", "9:2"],
+            &["cancel-transfer", "9:2:0"],
+            &["cancel-transfer", "9:2:11:3"],
+            &["cancel-transfer", "9:2:+1"],
+            &["cancel-transfer", "--pane", "9", "9:2:11"],
+        ] {
+            assert!(p(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

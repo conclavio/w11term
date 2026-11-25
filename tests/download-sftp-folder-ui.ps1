@@ -117,7 +117,7 @@ function Start-BlockedBatch([string]$Parent) {
 
 function Read-TransferEvents([uint64]$Since) {
     $journal = (Control @('events','--pane',"$pane",'--since',"$Since",'--timeout','0')).journal
-    $journal.events | Where-Object kind -ceq 'sftp-transfer'
+    $journal.events | Where-Object { $_.kind -ceq 'sftp-transfer' -and $_.data.background }
 }
 
 function Visit-TransferNotice([string]$Summary) {

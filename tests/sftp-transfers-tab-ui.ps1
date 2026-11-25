@@ -41,6 +41,16 @@ function Wait-BlockedRead([IO.BinaryReader]$Trace) {
 function Pane-ByLabel([string]$Label) {
     ((Control @('list')).sessions | Where-Object label -eq $Label).id
 }
+function Transfer-Result([uint64]$Pane, [string]$Id) {
+    $events = (Control @('events','--pane',"$Pane",'--since','0','--timeout','0')).journal.events
+    $events | Where-Object { $_.kind -ceq 'sftp-transfer' -and $_.data.transfer_id -ceq $Id }
+}
+function Reject-TransferId([string]$Id) {
+    $reply = & $Cli --pid $app.Id sftp cancel-transfer $Id | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $reply.ok -or $reply.error -notmatch 'no longer active') {
+        throw "Expected stale transfer ID to fail, got $($reply | ConvertTo-Json -Compress)"
+    }
+}
 
 $alphaTrace = $null
 $betaTrace = $null
@@ -92,7 +102,29 @@ try {
             (Find-Element "$alphaBytes / $alphaSize bytes" $text) -and
             (Find-Element "$betaBytes bytes" $text)
     }
-    Click $alphaCancel
+    $rows = @((Control @('sftp','list-transfers')).transfers)
+    $first = @($rows | Where-Object pane -eq $alpha)
+    $second = @($rows | Where-Object pane -eq $beta)
+    $filtered = @((Control @('sftp','list-transfers','--pane',"$beta")).transfers)
+    if ($rows.Count -ne 2 -or $first.Count -ne 1 -or $second.Count -ne 1 -or
+        $filtered.Count -ne 1 -or $filtered[0].transfer_id -cne $second[0].transfer_id -or
+        $first[0].transfer_id -ceq $second[0].transfer_id -or
+        $first[0].operation -cne 'download-file' -or $first[0].state -cne 'running' -or
+        $first[0].batch.item -ne 1 -or $first[0].batch.total -ne 2 -or
+        $first[0].progress.bytes -ne $alphaBytes -or $first[0].progress.total -ne $alphaSize -or
+        $second[0].operation -cne 'download-folder' -or $second[0].progress.bytes -ne $betaBytes) {
+        throw "Unexpected transfer snapshots: $($rows | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    $firstId = $first[0].transfer_id
+    $secondId = $second[0].transfer_id
+    $parts = $firstId.Split(':')
+    Reject-TransferId ('{0}:{1}:{2}' -f $parts[0], ([uint64]$parts[1] + 1), $parts[2])
+    $cancel = Control @('sftp','cancel-transfer',$firstId)
+    if ($cancel.transfer_id -cne $firstId -or $cancel.state -cne 'cancelling') {
+        throw 'Expected cancellation of the exact first transfer'
+    }
+    $repeated = Control @('sftp','cancel-transfer',$firstId)
+    if ($repeated.state -cne 'already-cancelling') { throw 'Repeated cancellation was not acknowledged' }
     $null = Wait-Until 'cancellation remains on the transfers tab' {
         $alphaRow = Find-Element $alphaCancel $button
         $betaRow = Find-Element $betaCancel $button
@@ -102,13 +134,26 @@ try {
     $null = Wait-Until 'only the unrelated transfer remains' {
         !(Find-Element $alphaCancel $button) -and (Find-Element $betaCancel $button)
     }
+    $cancelled = @(Transfer-Result $alpha $firstId)
+    if ($cancelled.Count -ne 1 -or !$cancelled[0].data.background -or
+        $cancelled[0].data.message -notmatch 'Cancelled download.*0 of 2 items completed') {
+        throw 'The pane journal did not report the cancelled batch by ID'
+    }
+    Reject-TransferId $firstId
 
     Click "Open SFTP drawer for Pane $beta"
     Wait-Focus $beta
     $null = Wait-Until 'second transfer is visible in the originating drawer' { Find-Element 'Cancel transfer' $button }
-    Run-Palette 'SFTP transfers'
     [IO.File]::Delete($betaGate)
+    $finished = Wait-Until 'foreground completion in the transfer journal' { Transfer-Result $beta $secondId }
+    if ($finished.data.background -or $finished.data.message -notmatch 'Downloaded /shell directory/beta folder') {
+        throw 'The pane journal did not report the foreground folder download'
+    }
+    Run-Palette 'SFTP transfers'
     $null = Wait-Until 'completed transfers leave the tab' { Find-Element $empty $text }
+    if (@((Control @('sftp','list-transfers')).transfers).Count -ne 0) {
+        throw 'The control pipe still lists an ended transfer'
+    }
 } catch {
     $alphaWire = if ($alphaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $alphaTrace)) }
     $betaWire = if ($betaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $betaTrace)) }

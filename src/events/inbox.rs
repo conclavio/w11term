@@ -168,7 +168,7 @@ impl Inbox {
                         .collect()
                 }
             }
-            "sftp-transfer" => {
+            "sftp-transfer" if event.data["background"] == true => {
                 let Some(message) = event.data["message"].as_str() else {
                     return;
                 };
@@ -721,9 +721,16 @@ mod tests {
         let second = Inbox::new(|| {});
         events.connect_inbox(12, "SSH", &first);
         let location = SavedDownload::BatchFolder(Arc::from(std::path::Path::new(r"C:\download")));
+        let id = crate::sftp::TransferId {
+            pane: 12,
+            generation: 1,
+            serial: 1,
+        };
         events.sftp_transfer_finished(
+            id,
             "Downloaded\nreport \u{202e} 2 of 2 items completed.",
             Some(location.clone()),
+            true,
         );
         let target = NoticeTarget::SftpTransfer {
             pane: 12,
@@ -755,6 +762,15 @@ mod tests {
         let event = serde_json::to_value(&batch.events[0]).unwrap();
         assert!(event.get("saved_download").is_none());
         assert!(event["data"].get("local").is_none());
+        assert_eq!(event["data"]["transfer_id"], "12:1:1");
+        events.sftp_transfer_finished(
+            crate::sftp::TransferId { serial: 2, ..id },
+            "Foreground result",
+            None,
+            false,
+        );
+        assert_eq!(second.rows().len(), 1);
+        assert_eq!(events.since(1).events[0].data["background"], false);
     }
 
     #[test]

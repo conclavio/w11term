@@ -827,13 +827,19 @@ impl Events {
         self.append(self.state.lock().unwrap(), kind, data, None);
     }
 
-    pub fn sftp_transfer_finished(&self, message: &str, saved_download: Option<SavedDownload>) {
+    pub fn sftp_transfer_finished(
+        &self,
+        transfer_id: crate::sftp::TransferId,
+        message: &str,
+        saved_download: Option<SavedDownload>,
+        background: bool,
+    ) {
         let message = inbox::sftp_transfer_text(message);
         let mut state = self.state.lock().unwrap();
         Self::append_locked(
             &mut state,
             "sftp-transfer",
-            serde_json::json!({ "message": message }),
+            serde_json::json!({ "transfer_id": transfer_id, "message": message, "background": background }),
             EventLinks {
                 saved_download,
                 ..EventLinks::default()

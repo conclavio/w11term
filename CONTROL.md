@@ -640,9 +640,10 @@ With **Notify for long commands** on, the same event also includes integer
 `duration_ms` for commands that ran for at least 10 seconds. If the one-shot
 watch is also armed, that completion produces a single event.
 
-When an SFTP drawer transfer or batch finishes with another pane active or with
-its drawer closed, the originating pane records one `sftp-transfer` event.
-Its `data.message` contains the outcome shown in the Attention inbox.
+When an SFTP drawer transfer or batch ends, the originating pane records one
+`sftp-transfer` event. The data includes `transfer_id`, the `message` describing
+the result, and a `background` flag. Results with `background: true` also appear
+in the Attention inbox.
 
 When a direct SSH shell or local program finishes, a restartable pane emits
 `pane-exited` with `{"exit_token":1}`. The top-level `restart_token` in the
@@ -771,6 +772,39 @@ of the capture.
 ## SFTP
 
 SFTP is available through a pane's **existing authenticated SSH connection**, on a separate, lazily opened subsystem channel. It never starts a local shell, opens a second SSH login, or changes window/tab focus. A server must offer the `sftp` subsystem; a rejected subsystem leaves the terminal usable. Remote paths are evaluated by the server, independently of the shell's current directory. Use `realpath .` to discover the SFTP working directory, and prefer absolute remote paths in scripts.
+
+### Control drawer transfers
+
+```powershell
+$active = & $ctl --pid 12345 sftp list-transfers | ConvertFrom-Json
+$active.result.transfers
+& $ctl --pid 12345 sftp list-transfers --pane 7
+& $ctl --pid 12345 sftp cancel-transfer $active.result.transfers[0].transfer_id
+```
+
+`list-transfers` samples active drawer transfers across the selected process.
+Each row has `transfer_id`, `pane`, `window_id`, `tab_id`, `label`, `operation`,
+`state`, `remote`, `progress`, and `batch`. Operations are `prepare-upload`,
+`upload-file`, `upload-folder`, `download-file`, and `download-folder`.
+A transfer is `preparing`, `running`, or `cancelling`. When available,
+`progress` has `bytes`, the estimated `total`,
+and the number of completed `files`. A multi-item batch has one-based `item`
+and `total` in `batch`. Progress and batch data can be `null`.
+
+Pass the exact `transfer_id` from the same process to `cancel-transfer`. The ID
+stays with the batch across items and pane moves. An accepted cancellation
+returns `cancelling`, `already-cancelling`, or `cancelled-before-start` in
+`result.state`. An in-flight transfer may still need to close its remote
+handle. Match the final `sftp-transfer` event by ID and read its message for the
+outcome. A finished transfer or one from an earlier connection on a live pane
+fails with a stale ID error. A closed pane returns an unknown-pane error.
+The commands leave the selected pane and window focus alone.
+
+Direct pipe clients send
+`{"verb":"list-sftp-transfers","pane":7}` or
+`{"verb":"cancel-sftp-transfer","transfer_id":"7:2:11"}`.
+
+### Run SFTP operations
 
 ```powershell
 & $ctl --pid 12345 sftp --pane $pane info
