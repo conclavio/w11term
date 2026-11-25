@@ -55,7 +55,7 @@ impl FileDrawer {
         &mut self,
         serial: u64,
         revision: u64,
-        index: usize,
+        row: comparison::Row,
     ) -> Option<Operation> {
         let panel = self.folder_report.as_mut()?;
         if !self.open
@@ -63,6 +63,7 @@ impl FileDrawer {
             || panel.serial != serial
             || panel.revision != revision
             || panel.reveal.checking()
+            || panel.verification.open
         {
             return None;
         }
@@ -72,13 +73,9 @@ impl FileDrawer {
         if self.directory.as_ref() != Some(&report.current_root) {
             return None;
         }
-        let item = report.differences.get(index)?;
+        let item = row.get(report)?;
         let expected = item.current?;
-        if item.path.split('/').any(|name| {
-            matches!(name, "" | "." | "..")
-                || name.contains('\\')
-                || name.chars().any(char::is_control)
-        }) {
+        if !w11term::sftp::valid_comparison_file_path(item.path) {
             return None;
         }
         let path = format!(
@@ -184,10 +181,18 @@ mod tests {
                 ],
                 ..Default::default()
             }))));
-        assert!(files.begin_compared_reveal(serial, 0, 0).is_none());
-        assert!(files.begin_compared_reveal(serial, 1, 1).is_none());
+        assert!(
+            files
+                .begin_compared_reveal(serial, 0, comparison::Row::Difference(0))
+                .is_none()
+        );
+        assert!(
+            files
+                .begin_compared_reveal(serial, 1, comparison::Row::Difference(1))
+                .is_none()
+        );
         assert!(matches!(
-            files.begin_compared_reveal(serial, 0, 1),
+            files.begin_compared_reveal(serial, 0, comparison::Row::Difference(1)),
             Some(Operation::RevealComparedEntry { path, expected })
                 if path == "/current/nested/live.txt" && expected == file
         ));

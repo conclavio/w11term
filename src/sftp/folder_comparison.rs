@@ -9,7 +9,9 @@ const WINDOWS_REPARSE: u32 = 1 << 31;
 const WINDOWS_SPECIAL: u32 = 1 << 30;
 
 mod local;
+mod verify;
 pub use local::capture_local_folder;
+pub use verify::{FILE_VERIFICATION_LIMIT, VerifiedFolderFile, valid_comparison_file_path};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FolderOrigin {
@@ -120,6 +122,13 @@ pub struct FolderDifference {
     pub current: Option<FolderEntry>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FolderMatchedFile {
+    pub path: String,
+    pub reference: FolderEntry,
+    pub current: FolderEntry,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct FolderComparison {
     pub reference_root: String,
@@ -133,6 +142,8 @@ pub struct FolderComparison {
     pub unknown: usize,
     pub matching: usize,
     pub differences: Vec<FolderDifference>,
+    #[serde(default)]
+    pub matching_files: Vec<FolderMatchedFile>,
 }
 
 fn entry_change(reference: FolderEntry, current: FolderEntry) -> Option<FolderChange> {
@@ -230,6 +241,15 @@ pub(super) fn compare(reference: &FolderInventory, current: FolderInventory) -> 
         };
         let Some(change) = change else {
             report.matching += 1;
+            if let (Some(reference), Some(current)) = (before, after)
+                && reference.is_file()
+            {
+                report.matching_files.push(FolderMatchedFile {
+                    path: path.clone(),
+                    reference,
+                    current,
+                });
+            }
             continue;
         };
         match change {
@@ -304,5 +324,38 @@ mod tests {
         assert_eq!(report.differences.len(), 250);
         assert_eq!(report.differences[0].path, "file000");
         assert_eq!(report.differences[249].path, "file249");
+    }
+
+    #[test]
+    fn matching_file_rows_include_only_regular_files_with_complete_metadata() {
+        let mut before = InventoryBuilder::default();
+        let mut after = InventoryBuilder::default();
+        let attrs = FileAttributes {
+            permissions: Some(REGULAR),
+            size: Some(4),
+            mtime: Some(10),
+            ..Default::default()
+        };
+        let directory = FileAttributes {
+            permissions: Some(DIRECTORY),
+            ..Default::default()
+        };
+        let missing = FileAttributes {
+            mtime: None,
+            ..attrs.clone()
+        };
+        for inventory in [&mut before, &mut after] {
+            inventory.insert("nested", &directory).unwrap();
+            inventory.insert("nested/known.txt", &attrs).unwrap();
+            inventory.insert("nested/unknown.txt", &missing).unwrap();
+        }
+        let report = compare(
+            &before.finish("/before".into(), FolderOrigin::Remote),
+            after.finish("/after".into(), FolderOrigin::Remote),
+        );
+        assert_eq!(report.matching, 2);
+        assert_eq!(report.matching_files.len(), 1);
+        assert_eq!(report.matching_files[0].path, "nested/known.txt");
+        assert_eq!(report.differences[0].change, FolderChange::Unknown);
     }
 }

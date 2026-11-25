@@ -3616,6 +3616,27 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
     }
     fs::write(archive.join("nested/data.txt"), b"old").unwrap();
     fs::write(live.join("nested/data.txt"), b"current!").unwrap();
+    let mtime = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+    for (folder, bytes) in [(&archive, b"old"), (&live, b"new")] {
+        let path = folder.join("same-metadata.txt");
+        fs::write(&path, bytes).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        for name in ["same-missing.txt", "same-other.txt"] {
+            let path = folder.join(name);
+            fs::write(&path, b"same").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        }
+    }
     fs::write(archive.join("removed.txt"), []).unwrap();
     fs::write(live.join("added.txt"), []).unwrap();
     for index in 0..240 {
@@ -3628,9 +3649,22 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
     drive_mixed_gui("sftp-compare-folders-ui.ps1", &ssh, state.path());
-    assert!(
-        fs::read(trace).unwrap().is_empty(),
-        "comparison read file data"
+    let packets = fs::read_to_string(trace).unwrap();
+    assert_eq!(
+        packets
+            .lines()
+            .filter(|line| line.starts_with("OPEN "))
+            .collect::<Vec<_>>(),
+        [
+            "OPEN /shell directory/archive/same-metadata.txt",
+            "OPEN /shell directory/live/same-metadata.txt",
+            "OPEN /shell directory/archive/same-metadata.txt",
+            "OPEN /shell directory/live/same-metadata.txt",
+            "OPEN /shell directory/archive/same-missing.txt",
+            "OPEN /shell directory/archive/same-other.txt",
+            "OPEN /shell directory/live/same-other.txt",
+        ],
+        "only explicit verification read file data"
     );
     let scans = fs::read_to_string(listing).unwrap();
     assert!(

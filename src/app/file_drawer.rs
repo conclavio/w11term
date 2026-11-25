@@ -625,6 +625,7 @@ enum Step {
     OpenLinkTarget(u64),
     FolderReport(u64),
     RevealCompared(u64, u64),
+    VerifyCompared(u64),
     Permissions(u64, u32),
     MoveDestination(u64, u64),
     FolderBatch(folder_batch::Batch),
@@ -3016,6 +3017,8 @@ impl FileDrawer {
                     self.folder_report
                         .as_ref()
                         .map(|panel| panel.cancel.clone())
+                } else if matches!(step, Step::VerifyCompared(_)) {
+                    self.comparison_verification_cancel()
                 } else if move_picker {
                     self.dialog
                         .as_ref()
@@ -3170,6 +3173,11 @@ impl FileDrawer {
             (Step::FolderReport(serial), reply) => self.finish_folder_report(serial, reply),
             (Step::RevealCompared(serial, revision), reply) => {
                 self.parse_compared_listing(id, serial, revision, reply, context);
+            }
+            (Step::VerifyCompared(serial), reply) => {
+                if let Some(operation) = self.finish_compared_verification(serial, reply) {
+                    self.queue_compared_verification(id, session, serial, operation, context);
+                }
             }
             (Step::OpenLinkTarget(serial), reply) => {
                 self.finish_link_target(id, serial, reply, context)
@@ -3932,10 +3940,18 @@ impl TerminalApp {
                 FolderReport(_, _, serial, folder_report::Action::Browse(action)) => {
                     files.browse_folder_comparison(serial, action);
                 }
-                FolderReport(_, _, serial, folder_report::Action::Reveal { revision, index }) => {
+                FolderReport(_, _, serial, folder_report::Action::Verify(action)) => {
                     if may_open_dialog
                         && let Some(operation) =
-                            files.begin_compared_reveal(serial, revision, index)
+                            files.comparison_verification_action(serial, action)
+                    {
+                        files
+                            .queue_compared_verification(pane, session, serial, operation, context);
+                    }
+                }
+                FolderReport(_, _, serial, folder_report::Action::Reveal { revision, row }) => {
+                    if may_open_dialog
+                        && let Some(operation) = files.begin_compared_reveal(serial, revision, row)
                         && let Err(error) = files.job(
                             pane,
                             session,
