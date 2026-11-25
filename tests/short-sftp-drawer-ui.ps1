@@ -63,26 +63,35 @@ function Drawer-Action($Actions, [string]$Label) {
 }
 function Check-NarrowNavigation {
     $resize.Resize([Math]::Round(540 * $scale), $root.Current.BoundingRectangle.Height)
-    $null = Wait-Until 'two complete navigation rows in a drawer narrower than 300 DIPs' {
-        $actions = Find-Element 'SFTP actions'
-        if (!$actions) { return }
-        $viewport = $actions.Current.BoundingRectangle
-        if ($viewport.IsEmpty -or $viewport.Width -ge 300 * $scale) { return }
-        $position = $actions.GetCurrentPattern($scroll).Current
-        if ($position.HorizontallyScrollable -and $position.HorizontalScrollPercent -gt 0) { return }
+    try { $null = Wait-Until 'complete navigation and transfer rows in a drawer narrower than 280 DIPs' {
+        $entries = Find-Element 'SFTP entries'
+        if (!$entries) { return }
+        $viewport = $entries.Current.BoundingRectangle
+        if ($viewport.IsEmpty -or $viewport.Width -ge 280 * $scale) { return }
         $bounds = @{}
-        foreach ($label in 'Back','Forward','Up','Refresh') {
-            $item = Drawer-Action $actions $label
+        $find = 'Find files' + [char]0x2026
+        $upload = 'Upload' + [char]0x2026
+        $download = 'Download' + [char]0x2026
+        foreach ($label in 'Back','Forward','Up','Refresh',$find,$upload,$download,'More folder actions') {
+            $item = Find-Element $label $button -Visible
             if (!$item -or $item.Current.IsOffscreen) { return }
             $rect = $item.Current.BoundingRectangle
             if ($rect.IsEmpty -or $rect.Width -lt 20 * $scale -or $rect.Height -lt 20 * $scale -or
                 $rect.Left -lt $viewport.Left - 1 -or $rect.Right -gt $viewport.Right + 1 -or
-                $rect.Top -lt $viewport.Top - 1 -or $rect.Bottom -gt $viewport.Bottom + 1) { return }
+                $rect.Bottom -gt $viewport.Top + 1) { return }
             $bounds[$label] = $rect
         }
         [Math]::Abs($bounds.Back.Top - $bounds.Forward.Top) -le 1 -and $bounds.Back.Right -le $bounds.Forward.Left -and
-            [Math]::Abs($bounds.Up.Top - $bounds.Refresh.Top) -le 1 -and $bounds.Up.Right -le $bounds.Refresh.Left -and
-            $bounds.Back.Bottom -le $bounds.Up.Top
+            [Math]::Abs($bounds.Back.Top - $bounds.Refresh.Top) -le 1 -and $bounds.Up.Right -le $bounds.Refresh.Left -and
+            [Math]::Abs($bounds[$find].Top - $bounds['More folder actions'].Top) -le 1 -and
+            $bounds.Refresh.Bottom -le $bounds[$find].Top
+    } } catch {
+        $entries = Find-Element 'SFTP entries'
+        $bounds = foreach ($label in 'Back','Forward','Up','Refresh','More folder actions') {
+            $element = Find-Element $label $button
+            "$label=$($element.Current.BoundingRectangle)"
+        }
+        throw "$_ Scale=$scale Window=$($root.Current.BoundingRectangle) Entries=$($entries.Current.BoundingRectangle) $($bounds -join ' ')"
     }
 }
 function Check-Actions {
@@ -90,11 +99,12 @@ function Check-Actions {
     $actionsScroll = $actions.GetCurrentPattern($scroll)
     $remaining = [Collections.Generic.HashSet[string]]::new()
     $ellipsis = [char]0x2026
-    foreach ($label in 'Close',"Go to folder$ellipsis",'Back','Forward','Up','Refresh',"Filesystem space$ellipsis","Folder contents$ellipsis","Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Move to folder$ellipsis","Delete$ellipsis",
-        'Open folder',"Download$ellipsis",'Open shell here','Copy directory path','Copy selected path','Follow shell directory',
+    foreach ($label in "Rename$ellipsis","Move to folder$ellipsis","Delete$ellipsis",
+        'Open folder',"Download and verify$ellipsis",'Open shell here','Copy selected path','Follow shell directory',
         'Replace existing files','Sort by name','Sort newest first','Sort largest first',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
     $horizontal = if ($actionsScroll.Current.HorizontallyScrollable) { 0,100 } else { -1 }
-    foreach ($percent in 0,20,40,60,80,100) {
+    $step = [Math]::Max(1, [Math]::Min(20, [Math]::Floor($actionsScroll.Current.VerticalViewSize / 2)))
+    for ($percent = 0; $percent -le 100; $percent += $step) {
         foreach ($across in $horizontal) {
             $down = if ($actionsScroll.Current.VerticallyScrollable) { $percent } else { -1 }
             $actionsScroll.SetScrollPercent($across, $down)
@@ -108,6 +118,7 @@ function Check-Actions {
             }
         }
         if (!$remaining.Count) { return }
+        if ($percent -lt 100 -and $percent + $step -gt 100) { $percent = 100 - $step }
     }
     if ($remaining.Count) { throw "Unreachable SFTP actions at minimum height: $($remaining -join ', ')" }
 }
@@ -127,12 +138,19 @@ try {
     $pane = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
     Run-Palette 'SFTP files'
-    $folder = Wait-Until 'first remote directory' { Find-Element 'projects/' $button }
-    $entries = Wait-Until 'SFTP entry viewport' { Find-Element 'SFTP entries' }
-    $tallOuterHeight = $root.Current.BoundingRectangle.Height
-    $tallHeight = $entries.Current.BoundingRectangle.Height
-    $rowHeight = $folder.Current.BoundingRectangle.Height
-    if ($rowHeight -lt 10 -or $tallHeight -lt 3 * $rowHeight) { throw 'Expected at least three visible rows in the tall window' }
+    $tall = Wait-Until 'at least three visible file rows in the tall window' {
+        $folder = Find-Element 'projects/' $button
+        $entries = Find-Element 'SFTP entries'
+        if (!$folder -or !$entries) { return }
+        $row = $folder.Current.BoundingRectangle.Height
+        $body = $entries.Current.BoundingRectangle.Height
+        if ($row -ge 10 -and $body -ge 3 * $row) {
+            @{ Row = $row; Entries = $body; Window = $root.Current.BoundingRectangle.Height }
+        }
+    }
+    $tallOuterHeight = $tall.Window
+    $tallHeight = $tall.Entries
+    $rowHeight = $tall.Row
 
     Check-NarrowNavigation
     # WinUI clamps this request to the current monitor's native minimum.

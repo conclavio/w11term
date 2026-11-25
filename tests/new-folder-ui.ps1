@@ -26,7 +26,7 @@ function Set-Name([string]$Name) {
     (Folder-Field).GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Name)
 }
 function Start-Folder([string]$Name) {
-    Click 'New folder'
+    Invoke-SftpFolderAction 'New folder'
     $null = Wait-Until 'folder name field' { Folder-Field }
     Set-Name $Name
 }
@@ -87,7 +87,7 @@ try {
     Click 'Open folder'
     $null = Wait-Until 'new folder opened at the exact canonical remote path' { Find-Element "$parent/$folder" }
     Run-Palette 'SFTP files'
-    $null = Wait-Until 'closed file drawer' { !(Button 'New folder') }
+    $null = Wait-Until 'closed file drawer' { !(Button 'More folder actions') }
     foreach ($c in 'folder-ssh-resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','folder-ssh-resumed')
     Picker-Query 'Palette PowerShell'

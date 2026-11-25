@@ -16,7 +16,7 @@ $upload = 'Upload folder' + [char]0x2026
 $release = 'release ' + [char]0x96ea
 
 function Pick-Folder([string]$Folder) {
-    Click $upload
+    Invoke-SftpFolderAction $upload
     $dialog = Wait-Until 'owned upload folder picker' { Find-OwnedDialog 'Choose a folder to upload' }
     Select-DialogItem $dialog $Folder
     $null = Wait-Until 'accept exact selected source folder' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -37,7 +37,10 @@ try {
             [int]$entry.Groups[1].Value
         }
     }
-    Click 'Cancel transfer'
+    Invoke-Button (Wait-Until 'visible cancel action in the drawer footer' {
+        $cancel = Find-Element 'Cancel transfer' $button -Visible
+        if ($cancel -and $cancel.Current.IsEnabled) { $cancel }
+    })
     $null = Wait-Until 'cancel accepted before the write reply' {
         $cancel = Find-Element 'Cancel transfer' $button
         $cancel -and !$cancel.Current.IsEnabled

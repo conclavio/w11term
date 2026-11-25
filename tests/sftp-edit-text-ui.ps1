@@ -172,7 +172,7 @@ try {
     Check-File $file $externalBytes
     Click 'Back to files'
 
-    Click $newTextFile
+    Invoke-SftpFolderAction $newTextFile
     $newDraft = Wait-Draft '' 'blank new file'
     $field = Wait-Until 'new file name editor' { By-Id 'sftp-editor-filename' }
     $field.GetCurrentPattern($getValue).SetValue($name)
@@ -208,7 +208,7 @@ try {
     }
     Check-File $newPath $newText
 
-    Click $newTextFile
+    Invoke-SftpFolderAction $newTextFile
     $null = Wait-Draft '' 'empty new file'
     $emptyName = 'empty.txt'
     $field = Wait-Until 'empty file name editor' { By-Id 'sftp-editor-filename' }

@@ -100,9 +100,13 @@ function Set-SearchChoice([string]$Control, [string]$Name) {
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 function Check-PathCopy([string]$ButtonName, [string]$Expected) {
-    $control = Wait-Until "available '$ButtonName' command" {
-        $b = Button $ButtonName
-        if ($b -and $b.Current.IsEnabled) { $b }
+    if ($ButtonName -ceq 'Copy directory path') {
+        $control = Get-SftpFolderAction $ButtonName
+    } else {
+        $control = Wait-Until "available '$ButtonName' command" {
+            $b = Button $ButtonName
+            if ($b -and $b.Current.IsEnabled) { $b }
+        }
     }
     if ($verifyClipboard) {
         $before = [FixtureClipboard]::GetClipboardSequenceNumber()

@@ -31,6 +31,7 @@ mod properties;
 mod rename_batch;
 mod sort;
 mod text_draft;
+mod toolbar;
 mod transfer_queue;
 mod uploads;
 
@@ -2235,192 +2236,38 @@ impl FileDrawer {
             name: entry.map_or_else(String::new, |e| e.name.clone()),
             kind: entry.map_or(ListedKind::Missing, |e| e.kind),
         };
-        let find_files = button(
-            "Find files…",
-            writable && generation != 0,
-            Search(pane, generation, find::Action::Show(revision)),
+        let toolbar = self.listing_toolbar(
+            pane,
+            ssh,
+            profile,
+            selected.map(|entry| listed(Some(entry))),
+            layout,
+            context,
         );
-        let search_actions = if let Some(saved) = &self.saved_search {
-            StackPanel::new().spacing(6.0).children((
-                button(
-                    "Back to search results",
-                    writable && generation != 0,
-                    Search(pane, generation, find::Action::Restore(saved.serial)),
-                ),
-                find_files,
-            ))
-        } else {
-            find_files
-        };
-        let mut controls: Vec<View> = vec![
-            Grid::new()
-                .width(layout.content_width())
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .columns([GridLength::Star(1.0), GridLength::Auto])
-                .children((
-                    TextBlock::new()
-                        .text(format!("{}@{}:{}", ssh.user, ssh.host, ssh.port))
-                        .text_wrapping(TextWrapping::Wrap),
-                    Border::new()
-                        .grid_column(1)
-                        .content(button("Close", true, Close(pane))),
-                )),
-            Grid::new()
-                .width(layout.content_width())
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .columns([GridLength::Star(1.0), GridLength::Auto])
-                .children((
-                    TextBlock::new()
-                        .text(folder)
-                        .text_wrapping(TextWrapping::Wrap),
-                    Border::new().grid_column(1).content(button(
-                        "Go to folder…",
-                        ready && generation != 0,
-                        GoToFolder(pane, generation, revision),
-                    )),
-                )),
-            self.reference_controls(pane, context)
-                .unwrap_or_else(View::empty),
-            search_actions,
-            StackPanel::new()
-                .orientation(if layout.content_width() >= 300.0 {
-                    Orientation::Horizontal
-                } else {
-                    Orientation::Vertical
-                })
-                .spacing(6.0)
-                .children((
-                    button_pair(
-                        button(
-                            "Back",
-                            writable && self.history.target(HistoryDirection::Back).is_some(),
-                            History(pane, generation, revision, HistoryDirection::Back),
-                        ),
-                        button(
-                            "Forward",
-                            writable && self.history.target(HistoryDirection::Forward).is_some(),
-                            History(pane, generation, revision, HistoryDirection::Forward),
-                        ),
-                    ),
-                    button_pair(
-                        button(
-                            "Up",
-                            writable && folder != "/",
-                            Browse(
-                                pane,
-                                generation,
-                                format!("{}/..", folder.trim_end_matches('/')),
-                            ),
-                        ),
-                        button("Refresh", ready, Browse(pane, generation, folder.into())),
-                    ),
-                )),
-            button(
-                "Filesystem space…",
+        let mut controls = Vec::new();
+        controls.extend(self.reference_controls(pane, context));
+        if let Some(reference) = &self.folder_reference {
+            controls.push(
+                TextBlock::new()
+                    .automation_id("sftp-folder-reference")
+                    .text(format!(
+                        "{}  {}",
+                        folder_report::reference_label(reference.origin, false),
+                        reference.root
+                    ))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            );
+        }
+        if let Some(saved) = &self.saved_search {
+            controls.push(button(
+                "Back to search results",
                 writable && generation != 0,
-                ShowFolderReport(pane, generation, revision, folder_report::Kind::Space),
-            ),
-            button(
-                "Folder contents…",
-                writable && generation != 0,
-                ShowFolderReport(pane, generation, revision, folder_report::Kind::Contents),
-            ),
+                Search(pane, generation, find::Action::Restore(saved.serial)),
+            ));
+        }
+        controls.extend([
             StackPanel::new().spacing(6.0).children((
-                button(
-                    "Set folder as comparison reference…",
-                    writable && generation != 0,
-                    ShowFolderReport(pane, generation, revision, folder_report::Kind::Reference),
-                ),
-                button(
-                    "Set Windows folder as reference…",
-                    writable && generation != 0,
-                    Pick(
-                        pane,
-                        generation,
-                        revision,
-                        TransferPicker::LocalFolderReference(revision),
-                    ),
-                ),
-                self.folder_reference
-                    .as_ref()
-                    .map(|reference| {
-                        StackPanel::new().spacing(6.0).children((
-                            TextBlock::new()
-                                .automation_id("sftp-folder-reference")
-                                .text(format!(
-                                    "{}  {}",
-                                    folder_report::reference_label(reference.origin, false),
-                                    reference.root
-                                ))
-                                .text_wrapping(TextWrapping::Wrap),
-                            button(
-                                "Compare folder with reference…",
-                                writable,
-                                ShowFolderReport(
-                                    pane,
-                                    generation,
-                                    revision,
-                                    folder_report::Kind::Comparison,
-                                ),
-                            ),
-                            button(
-                                "Clear folder reference",
-                                ready,
-                                ClearFolderReference(pane, generation, revision),
-                            ),
-                        ))
-                    })
-                    .unwrap_or_else(View::empty),
-            )),
-            StackPanel::new()
-                .orientation(if layout.content_width() >= 320.0 {
-                    Orientation::Horizontal
-                } else {
-                    Orientation::Vertical
-                })
-                .spacing(6.0)
-                .children((
-                    button(
-                        "Bookmarks…",
-                        ready && profile.is_some(),
-                        Bookmarks(pane, generation, bookmarks::Action::Show),
-                    ),
-                    button_pair(
-                        button(
-                            "Upload…",
-                            writable,
-                            Pick(
-                                pane,
-                                generation,
-                                revision,
-                                TransferPicker::UploadFiles(folder.into()),
-                            ),
-                        ),
-                        button(
-                            "Upload folder…",
-                            writable,
-                            Pick(
-                                pane,
-                                generation,
-                                revision,
-                                TransferPicker::UploadFolder(folder.into()),
-                            ),
-                        ),
-                    ),
-                )),
-            StackPanel::new().spacing(6.0).children((
-                button_pair(
-                    button(
-                        "New folder",
-                        writable,
-                        NewFolder(pane, generation, folder.into()),
-                    ),
-                    button(
-                        "New text file…",
-                        self.can_start_new_editor(revision),
-                        NewTextFile(pane, generation, revision),
-                    ),
-                ),
                 button(
                     "Move to folder…",
                     writable
@@ -2494,40 +2341,16 @@ impl FileDrawer {
                 )),
             button_pair(
                 button(
-                    if download_folder {
-                        "Download folder…"
-                    } else {
-                        "Download…"
-                    },
-                    ready && selected.is_some(),
-                    Pick(
-                        pane,
-                        generation,
-                        revision,
-                        TransferPicker::Download(FileTarget::Listed(listed(selected)), None),
-                    ),
-                ),
-                button(
                     "Download and verify…",
                     ready && selected.is_some() && !download_folder,
                     VerifyDownload(pane, generation, listed(selected)),
                 ),
+                button(
+                    "Copy selected path",
+                    writable && selected.is_some(),
+                    CopyPath(pane, generation, revision, Some(listed(selected))),
+                ),
             ),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(6.0)
-                .children((
-                    button(
-                        "Copy directory path",
-                        writable,
-                        CopyPath(pane, generation, revision, None),
-                    ),
-                    button(
-                        "Copy selected path",
-                        writable && selected.is_some(),
-                        CopyPath(pane, generation, revision, Some(listed(selected))),
-                    ),
-                )),
             {
                 let regular =
                     selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File));
@@ -2617,7 +2440,7 @@ impl FileDrawer {
                     Message::Files(PreserveUploadTimes(pane, generation, enabled))
                 }))
                 .content(TextBlock::new().text("Preserve upload timestamps")),
-        ];
+        ]);
         controls.extend(self.resume_draft_button(pane, context));
         let sort_button = |order, label: &str, name: &str| {
             RadioButton::new()
@@ -2775,45 +2598,12 @@ impl FileDrawer {
                 SelectDownloads(pane, generation, revision, true),
             ));
         }
-        if let Some(transfer) = self.transfer_controls(context) {
-            controls.extend(transfer);
-        }
-        if let Some(stop) =
-            self.stop_folder_batch_button(pane, FolderBatchOrigin::Listing(revision), context)
-        {
-            controls.push(stop);
-        }
-        if let Some(preparation) = &self.preparing_drop {
-            controls.push(button(
-                "Cancel transfer",
-                true,
-                CancelTransfer(preparation.id),
-            ));
-        }
         #[cfg(feature = "ui-smoke")]
         if let Some(file) = std::env::var_os("W11TERM_SFTP_DROP_SMOKE_ITEMS") {
             controls.push(button(
                 "Drop fixture items",
                 writable,
                 SmokeDrop(drop_target.clone(), file.into()),
-            ));
-        }
-        if !self.status.is_empty() {
-            controls.push(
-                TextBlock::new()
-                    .automation_id("sftp-listing-status")
-                    .text(&self.status)
-                    .max_width(layout.content_width())
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .into(),
-            );
-        }
-        if let Some(download) = &self.last_download {
-            controls.push(button(
-                explorer::download_label(download),
-                ready,
-                ShowSavedDownload(pane, download.clone()),
             ));
         }
         let count = self.matching_entries().len();
@@ -2920,7 +2710,7 @@ impl FileDrawer {
             .collect();
         let actions = ScrollViewer::new()
             .automation_name("SFTP actions")
-            .max_height(layout.actions_max_height)
+            .max_height((layout.actions_max_height * 0.40).min(190.0))
             .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
@@ -2931,6 +2721,60 @@ impl FileDrawer {
                         .map(|(index, view)| KeyedView::new(index.to_string(), view)),
                 ),
             );
+        let mut activity = Vec::new();
+        if let Some(transfer) = self.transfer_controls(context) {
+            activity.extend(transfer);
+        }
+        activity.extend(self.stop_folder_batch_button(
+            pane,
+            FolderBatchOrigin::Listing(revision),
+            context,
+        ));
+        if let Some(preparation) = &self.preparing_drop {
+            activity.push(button(
+                "Cancel transfer",
+                true,
+                CancelTransfer(preparation.id),
+            ));
+        }
+        if !self.status.is_empty() {
+            activity.push(
+                TextBlock::new()
+                    .automation_id("sftp-listing-status")
+                    .text(&self.status)
+                    .max_width(layout.content_width())
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            );
+        }
+        if let Some(download) = &self.last_download {
+            activity.push(button(
+                explorer::download_label(download),
+                ready,
+                ShowSavedDownload(pane, download.clone()),
+            ));
+        }
+        let feedback = (!activity.is_empty()).then(|| {
+            KeyedView::new(
+                "activity",
+                ScrollViewer::new()
+                    .automation_name("SFTP activity")
+                    .max_height((layout.actions_max_height * 0.45).min(116.0))
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(
+                        StackPanel::new().spacing(4.0).keyed_children(
+                            activity
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, view)| KeyedView::new(index.to_string(), view)),
+                        ),
+                    ),
+            )
+        });
+        let footer = StackPanel::new()
+            .spacing(6.0)
+            .keyed_children(std::iter::once(KeyedView::new("actions", actions)).chain(feedback));
         let panel = Border::new()
             .padding(PANEL_PADDING)
             .background(Color::rgb(31, 32, 35))
@@ -2943,14 +2787,16 @@ impl FileDrawer {
             .on_drop(context.callback(move |data| Message::Files(drop_target.data(data))))
             .content(
                 Grid::new()
-                    .rows([GridLength::Auto, GridLength::Star(1.0)])
+                    .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+                    .row_spacing(6.0)
                     .children((
-                        actions,
+                        toolbar,
                         ScrollViewer::new()
                             .grid_row(1)
                             .automation_name("SFTP entries")
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                             .content(StackPanel::new().keyed_children(list)),
+                        Border::new().grid_row(2).content(footer),
                     )),
             );
         cache(panel)

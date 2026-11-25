@@ -37,7 +37,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
     Click 'payload.bin'
-    Click $contents
+    Invoke-SftpFolderAction $contents
     Wait-Row 'folder' '/shell directory'
     Wait-Row 'logical-bytes' '5 KiB (5120 bytes)'
     Wait-Row 'files' 'Regular files 2'

@@ -166,6 +166,30 @@ function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Typ
 function Invoke-Button($Element) {
     $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }
+function Get-SftpFolderAction([string]$Name, [switch]$Comparison, [switch]$AllowDisabled) {
+    $button = [System.Windows.Automation.ControlType]::Button
+    $menu = [System.Windows.Automation.ControlType]::MenuItem
+    Invoke-Button (Wait-Until 'More folder actions button' {
+        $trigger = Find-Element 'More folder actions' $button -Visible
+        if ($trigger -and $trigger.Current.IsEnabled) { $trigger }
+    })
+    if ($Comparison) {
+        $category = Wait-Until 'Compare folders submenu' { Find-Element 'Compare folders' $menu }
+        $category.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    }
+    try { Wait-Until "folder action '$Name'" {
+        $item = Find-Element $Name $menu
+        if ($item -and ($AllowDisabled -or $item.Current.IsEnabled)) { $item }
+    } } catch {
+        $item = Find-Element $Name $menu
+        $category = Find-Element 'Compare folders' $menu
+        $trigger = Find-Element 'More folder actions' $button
+        throw "$_ Item=$($item.Current.Name) Enabled=$($item.Current.IsEnabled) Comparison=$($category.Current.Name) Menu trigger enabled=$($trigger.Current.IsEnabled)"
+    }
+}
+function Invoke-SftpFolderAction([string]$Name, [switch]$Comparison) {
+    Invoke-Button (Get-SftpFolderAction $Name -Comparison:$Comparison)
+}
 function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$State) {
     Wait-Until "enabled checkbox '$Name' in state $State" {
         $element = Find-Element $Name ([System.Windows.Automation.ControlType]::CheckBox)

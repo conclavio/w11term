@@ -122,7 +122,7 @@ try {
     Run-Palette 'Open files here'
     Click 'archive/'
     Click 'Open folder'
-    Click ('Set folder as comparison reference' + [char]0x2026)
+    Invoke-SftpFolderAction ('Set folder as comparison reference' + [char]0x2026) -Comparison
     $null = Wait-Until 'the reference inventory is captured' {
         Find-Element "Captured folder reference $dot 7 entries"
     }
@@ -135,7 +135,7 @@ try {
     Click 'Back'
     Click 'live/'
     Click 'Open folder'
-    Click ('Compare folder with reference' + [char]0x2026)
+    Invoke-SftpFolderAction ('Compare folder with reference' + [char]0x2026) -Comparison
     $null = Wait-Until 'a comparison identifies both folders and the expected counts' {
         (Find-Element "Reference folder  $reference") -and (Find-Element $current) -and
             (Find-Element 'Only in reference  1') -and (Find-Element 'Only in current folder  241') -and
@@ -276,11 +276,14 @@ try {
     $null = Wait-Until 'Back reaches the folder that was compared, with the reference still available' {
         (Find-Element $current) -and (Find-Element "Folder reference  $reference")
     }
-    Click 'Clear folder reference'
+    Invoke-SftpFolderAction 'Clear folder reference' -Comparison
     $null = Wait-Until 'comparison actions are removed' {
-        !(Find-Element "Folder reference  $reference") -and
-            !(Find-Element ('Compare folder with reference' + [char]0x2026) $button)
+        !(Find-Element "Folder reference  $reference")
     }
+    $missingReference = Get-SftpFolderAction ('Compare folder with reference' + [char]0x2026) -Comparison -AllowDisabled
+    if ($missingReference.Current.IsEnabled) { throw 'Compare is enabled without a folder reference' }
+    Press-Key 0x1b
+    Press-Key 0x1b
     $session = (Control @('list')).sessions[0]
     if ($session.id -ne $paneId -or $session.connection_generation -ne $connection) {
         throw 'Comparing folders changed the SSH connection'

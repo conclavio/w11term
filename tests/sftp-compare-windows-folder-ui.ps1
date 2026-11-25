@@ -47,7 +47,7 @@ try {
     $pane = (Control @('list')).sessions[0]
     $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
-    Click $choose
+    Invoke-SftpFolderAction $choose -Comparison
     $dialog = Wait-Until 'owned Windows folder picker' { Find-OwnedDialog $pickerTitle }
     Select-DialogItem $dialog $name
     $null = Wait-Until 'accept the selected Windows folder' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -65,16 +65,15 @@ try {
     Click 'Close folder reference'
     $label = "Windows folder reference  $captured"
     $null = Wait-Until 'the drawer shows the captured Windows reference' { Find-Element $label $text }
-    Click $choose
+    Invoke-SftpFolderAction $choose -Comparison
     $dialog = Wait-Until 'folder picker reopened' { Find-OwnedDialog $pickerTitle }
     $null = Wait-Until 'cancel the second picker' { [FixtureDialog]::ClickButton($dialog, 2) }
     $null = Wait-Until 'picker cancellation keeps the current reference' {
-        $compareButton = Find-Element $compare $button
-        (Find-Element $label $text) -and $compareButton -and $compareButton.Current.IsEnabled
+        (Find-Element $label $text) -and !(Find-OwnedDialog $pickerTitle)
     }
 
     [IO.File]::WriteAllText((Join-Path $source 'nested/config.txt'), 'current!', [Text.UTF8Encoding]::new($false))
-    Click $compare
+    Invoke-SftpFolderAction $compare -Comparison
     $null = Wait-Until 'the comparison matches exact path case and reports the link as uncertain' {
         (Find-Element "Windows reference folder  $captured" $text) -and
             (Find-Element '/shell directory' $text) -and
