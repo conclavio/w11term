@@ -159,6 +159,9 @@ impl server::Handler for Peer {
                     "\x1b[1\"q\x1bP$q\"q\x1b\\\x1b8",
                     "\x1bP2$t4/12\x1b\\\x1b[2$w",
                     "\x1b7\x1b[6G\x1b[5;0W\x1b[2$w\x1b[?5W\x1b[2$w\x1b8",
+                    "\x1b[#P\x1b[#R\x1b[#Q\x1b[#R",
+                    "\x1b]21;cursor=#123456;cursor=?;x=?\x07",
+                    "\x1b]22;>pointer,ew-resize\x07\x1b]22;?__current__,wait,zoom-in\x07",
                 )
                 .as_bytes(),
             )?;
@@ -326,6 +329,12 @@ async fn roundtrip(
             next(&mut observed, &session).await,
             Observed::Data(format!("\x1bP2$u{default_stops}\x1b\\").into_bytes())
         );
+        for expected in [b"\x1b[?1;1#Q", b"\x1b[?0;1#Q"] {
+            assert_eq!(next(&mut observed, &session).await, Observed::Data(expected.to_vec()));
+        }
+        assert_eq!(next(&mut observed, &session).await,
+            Observed::Data(b"\x1b]21;cursor=rgb:12/34/56;unknown=eA\x1b\\".to_vec()));
+        assert_eq!(next(&mut observed, &session).await, Observed::Data(b"\x1b]22;ew-resize,1,0\x1b\\".to_vec()));
         let generation = session.events.shell_generation().expect("running shell");
         for (text, connection) in [
             ("stale input", generation + 1),
@@ -545,6 +554,20 @@ async fn roundtrip(
         assert_eq!(command.command.as_deref(), Some("git status"));
         assert_eq!(command.exit_code, Some(17));
         assert_eq!(command.output.as_deref(), Ok("vscode-output"));
+        let saved = echoed(&session, &mut output, b"\x1b]11;#123456\x07").await;
+        assert_eq!(saved.pointer_shape, Some(wezterm_term::PointerShape::EastWest));
+        let pushed = echoed(&session, &mut output, b"\x1b[#P").await;
+        assert_eq!(pushed.generation, saved.generation);
+        let unchanged = echoed(&session, &mut output, b"\x1b]21;background=red;background=#123456\x07").await;
+        assert_eq!(unchanged.generation, saved.generation);
+        let temporary = echoed(&session, &mut output, b"\x1b]21;background=#fedcba\x07").await;
+        assert_ne!(temporary.palette, saved.palette);
+        let held = echoed(&session, &mut output, b"\x1b[?2026h\x1b[#Q").await;
+        assert_eq!(held.generation, temporary.generation);
+        assert_eq!(held.palette, temporary.palette);
+        let restored = echoed(&session, &mut output, b"\x1b[?2026l").await;
+        assert_eq!(restored.generation, temporary.generation + 1);
+        assert_eq!(restored.palette, saved.palette);
         drop(session);
         tokio::time::timeout(Duration::from_secs(2), server)
             .await

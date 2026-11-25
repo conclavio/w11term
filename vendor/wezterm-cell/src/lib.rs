@@ -18,7 +18,7 @@ use wezterm_dynamic::{FromDynamic, ToDynamic};
 pub use wezterm_escape_parser::osc::Hyperlink;
 
 extern crate alloc;
-use crate::alloc::string::ToString;
+use crate::alloc::string::{String, ToString};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -101,6 +101,8 @@ struct FatAttributes {
     underline_color: ColorAttribute,
     foreground: ColorAttribute,
     background: ColorAttribute,
+    #[cfg_attr(feature = "use_serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    multicell_row: Option<Box<MulticellRow>>,
 }
 
 impl FatAttributes {
@@ -116,6 +118,9 @@ impl FatAttributes {
         self.underline_color.hash(hasher);
         self.foreground.hash(hasher);
         self.background.hash(hasher);
+        if let Some(row) = &self.multicell_row {
+            row.hash(hasher);
+        }
     }
 }
 
@@ -195,6 +200,109 @@ impl Default for SemanticType {
 
 pub use wezterm_escape_parser::csi::{Blink, Intensity, Underline, VerticalAlign};
 
+/// A row of a Kitty OSC 66 text rectangle. All rows share the text and
+/// dimensions so a viewport can draw a lower row even when its origin is offscreen.
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct MulticellRow {
+    run: Arc<MulticellText>,
+    row: u8,
+}
+
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct MulticellText {
+    text: String,
+    width: u8,
+    scale: u8,
+}
+
+impl MulticellText {
+    pub const MAX_COLUMNS: usize = 49;
+
+    pub fn new(text: &str, width: usize, scale: u8) -> Option<Arc<Self>> {
+        ((2..=7).contains(&scale) && (1..=7).contains(&width)).then(|| {
+            Arc::new(Self {
+                text: text.into(),
+                width: (width * usize::from(scale)) as u8,
+                scale,
+            })
+        })
+    }
+
+    pub fn columns(&self) -> usize {
+        usize::from(self.width)
+    }
+
+    pub fn scale(&self) -> u8 {
+        self.scale
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn row(self: &Arc<Self>, row: u8) -> MulticellRow {
+        assert!(row < self.scale);
+        MulticellRow { run: self.clone(), row }
+    }
+}
+
+impl MulticellRow {
+    pub fn run(&self) -> &Arc<MulticellText> {
+        &self.run
+    }
+
+    pub fn offset(&self) -> u8 {
+        self.row
+    }
+}
+
+/// Placement of a reduced text run inside its original cell area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FractionalTextScale {
+    numerator: u8,
+    denominator: u8,
+    horizontal: u8,
+    vertical: u8,
+}
+
+impl FractionalTextScale {
+    pub fn new(numerator: u8, denominator: u8, horizontal: u8, vertical: u8) -> Option<Self> {
+        (numerator != 0
+            && numerator < denominator
+            && denominator <= 15
+            && horizontal <= 2
+            && vertical <= 2)
+            .then_some(Self { numerator, denominator, horizontal, vertical })
+    }
+
+    pub fn factor(self) -> f32 {
+        f32::from(self.numerator) / f32::from(self.denominator)
+    }
+
+    pub fn horizontal_offset(self, extra: f32) -> f32 {
+        Self::offset(self.horizontal, extra)
+    }
+
+    pub fn vertical_offset(self, extra: f32) -> f32 {
+        Self::offset(self.vertical, extra)
+    }
+
+    fn offset(alignment: u8, extra: f32) -> f32 {
+        match alignment {
+            1 => extra,
+            2 => extra * 0.5,
+            _ => 0.0,
+        }
+    }
+}
+
+// Four bits each for the ratio and two each for the alignments fit in the
+// existing attributes word. An ordinary cell uses zero for the whole field.
+const FRACTIONAL_SCALE_SHIFT: u32 = 19;
+const FRACTIONAL_SCALE_MASK: u32 = 0xfff << FRACTIONAL_SCALE_SHIFT;
+
 impl Default for CellAttributes {
     fn default() -> Self {
         Self::blank()
@@ -214,6 +322,50 @@ impl CellAttributes {
     bitfield!(semantic_type, set_semantic_type, SemanticType, 0b11, 13);
     bitfield!(vertical_align, set_vertical_align, VerticalAlign, 0b11, 15);
     bitfield!(protected, set_protected, 17);
+    bitfield!(explicit_width, set_explicit_width, 18);
+
+    pub fn fractional_text_scale(&self) -> Option<FractionalTextScale> {
+        let bits = (self.attributes & FRACTIONAL_SCALE_MASK) >> FRACTIONAL_SCALE_SHIFT;
+        FractionalTextScale::new(
+            (bits & 15) as u8,
+            ((bits >> 4) & 15) as u8,
+            ((bits >> 8) & 3) as u8,
+            ((bits >> 10) & 3) as u8,
+        )
+    }
+
+    pub fn set_fractional_text_scale(&mut self, scale: Option<FractionalTextScale>) -> &mut Self {
+        let bits = scale.map_or(0, |scale| {
+            u32::from(scale.numerator)
+                | u32::from(scale.denominator) << 4
+                | u32::from(scale.horizontal) << 8
+                | u32::from(scale.vertical) << 10
+        });
+        self.attributes =
+            (self.attributes & !FRACTIONAL_SCALE_MASK) | bits << FRACTIONAL_SCALE_SHIFT;
+        self
+    }
+
+    pub fn clear_text_sizing(&mut self) -> &mut Self {
+        self.set_explicit_width(false)
+            .set_fractional_text_scale(None)
+            .set_multicell_row(None)
+    }
+
+    pub fn multicell_row(&self) -> Option<&MulticellRow> {
+        self.fat.as_ref()?.multicell_row.as_deref()
+    }
+
+    pub fn set_multicell_row(&mut self, row: Option<MulticellRow>) -> &mut Self {
+        if row.is_some() {
+            self.allocate_fat_attributes();
+        }
+        if let Some(fat) = &mut self.fat {
+            fat.multicell_row = row.map(Box::new);
+        }
+        self.deallocate_fat_attributes_if_none();
+        self
+    }
 
     pub const fn blank() -> Self {
         Self {
@@ -328,6 +480,7 @@ impl CellAttributes {
                 underline_color: ColorAttribute::Default,
                 foreground: ColorAttribute::Default,
                 background: ColorAttribute::Default,
+                multicell_row: None,
             }));
         }
     }
@@ -344,6 +497,7 @@ impl CellAttributes {
                     }
                 }
                 fat.hyperlink.is_none()
+                    && fat.multicell_row.is_none()
                     && fat.underline_color == ColorAttribute::Default
                     && fat.foreground == ColorAttribute::Default
                     && fat.background == ColorAttribute::Default
@@ -449,6 +603,7 @@ impl CellAttributes {
         // easier time in get_semantic_zones.
         res.set_semantic_type(SemanticType::default());
         res.set_protected(false);
+        res.clear_text_sizing();
         res.set_underline_color(self.underline_color());
 
         // Turn off underline because it can have surprising results
@@ -703,14 +858,14 @@ impl core::clone::Clone for TeenyString {
         if Self::is_marker_bit_set(self.0) {
             Self(self.0)
         } else {
-            Self::from_str(self.str(), None, None)
+            Self::from_str(self.str(), Some(self.width()), None)
         }
     }
 }
 
 impl core::cmp::PartialEq for TeenyString {
     fn eq(&self, rhs: &Self) -> bool {
-        self.as_bytes().eq(rhs.as_bytes())
+        self.width() == rhs.width() && self.as_bytes().eq(rhs.as_bytes())
     }
 }
 impl core::cmp::Eq for TeenyString {}

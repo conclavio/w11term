@@ -19,7 +19,8 @@ use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 use wezterm_bidi::ParagraphDirectionHint;
 use wezterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, FractionalTextScale,
+    MulticellText, SemanticType,
 };
 use wezterm_escape_parser::csi::{
     CharacterPath, CsiParam, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -128,7 +129,6 @@ impl Performer<'_> {
             return;
         }
 
-        let seqno = self.seqno;
         let mut p = std::mem::take(&mut self.print);
         let normalized: String;
         let text = if self.config.normalize_output_to_unicode_nfc()
@@ -139,7 +139,22 @@ impl Performer<'_> {
         } else {
             p.as_str()
         };
+        self.print_cells(text, None, None, 1);
+        std::mem::swap(&mut self.print, &mut p);
+        self.print.clear();
+    }
 
+    fn print_cells(
+        &mut self,
+        text: &str,
+        explicit_width: Option<usize>,
+        fraction: Option<FractionalTextScale>,
+        scale: u8,
+    ) {
+        if usize::from(scale) > self.screen().physical_rows {
+            return;
+        }
+        let seqno = self.seqno;
         let row_geometry = |state: &TerminalState| {
             let scale = state.screen().line_width_scale(state.cursor.y);
             (
@@ -152,11 +167,44 @@ impl Performer<'_> {
         };
         let (mut sized, mut right) = row_geometry(self.state);
         let track = self.track_primary_prints && !self.is_alt_screen_active();
+        let sized_text = explicit_width.is_some() || fraction.is_some() || scale > 1;
         let mut last_print = None;
-        for g in Graphemes::new(text) {
-            let g = self.remap_grapheme(g);
+        let mut text_run = explicit_width.map(|_| text);
+        let mut graphemes = Graphemes::new(if explicit_width.is_some() { "" } else { text });
+        'graphemes: while let Some(g) = text_run.take().or_else(|| graphemes.next()) {
+            let g = if explicit_width.is_some() {
+                g
+            } else {
+                self.remap_grapheme(g)
+            };
 
-            let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
+            let mut print_width = explicit_width
+                .unwrap_or_else(|| grapheme_column_width(g, Some(&self.unicode_version)));
+            if explicit_width.is_none()
+                && (print_width == 0 && !is_white_space_grapheme(g)
+                    || matches!(g, "\u{fe0e}" | "\u{fe0f}"))
+            {
+                let x = self.cursor.x;
+                let prior = if self.wrap_next {
+                    Some(x)
+                } else {
+                    x.checked_sub(1)
+                };
+                if let Some(prior) = prior {
+                    let y = self.cursor.y;
+                    let screen = self.screen_mut();
+                    if screen.append_multicell_text(y, prior, g, seqno) {
+                        continue;
+                    }
+                    let index = screen.phys_row(y);
+                    if screen
+                        .line_mut(index)
+                        .append_to_explicit_width(prior, g, seqno)
+                    {
+                        continue;
+                    }
+                }
+            }
             if print_width == 0 {
                 // We got a zero-width grapheme.
 
@@ -183,54 +231,57 @@ impl Performer<'_> {
                 }
             }
 
-            if sized
+            let cell_width = print_width;
+            print_width *= usize::from(scale);
+            let left = self.left_and_right_margins.start.min(right - 1);
+            if sized_text && print_width > right - left {
+                continue;
+            }
+            if (sized || sized_text)
                 && self.dec_auto_wrap
-                && self.cursor.x > self.left_and_right_margins.start.min(right - 1)
+                && self.cursor.x > left
                 && self.cursor.x.saturating_add(print_width) > right
             {
                 self.wrap_next = true;
             }
 
             if self.wrap_next {
-                // Since we're implicitly moving the cursor to the next
-                // line, we need to tag the current position as wrapped
-                // so that we can correctly reflow it if the window is
-                // resized.
-                {
-                    let y = self.cursor.y;
-                    let is_conpty = self.state.enable_conpty_quirks;
-                    let screen = self.screen_mut();
-                    let y = screen.phys_row(y);
-
-                    fn makes_sense_to_wrap(s: &str) -> bool {
-                        let len = s.len();
-                        match (len, s.chars().next()) {
-                            (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
-                            _ => true,
-                        }
-                    }
-
-                    let should_mark_wrapped = !is_conpty
-                        || screen
-                            .line_mut(y)
-                            .visible_cells()
-                            .last()
-                            .map(|cell| makes_sense_to_wrap(cell.str()))
-                            .unwrap_or(false);
-                    if should_mark_wrapped && !sized {
-                        screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
-                    }
-                }
-                self.new_line(true);
+                self.wrap_print_line(sized);
                 (sized, right) = row_geometry(self.state);
             }
 
-            let y = self.cursor.y;
-            let x = if sized {
+            let mut x = if sized_text {
+                if print_width > right - self.left_and_right_margins.start.min(right - 1) {
+                    continue;
+                }
+                self.cursor.x.min(right - print_width)
+            } else if sized {
                 self.cursor.x.min(right - 1)
             } else {
                 self.cursor.x
             };
+            let mut y = self.cursor.y;
+            while let Some(end) = self
+                .screen()
+                .multicell_continuation_end(y, x..x + print_width)
+            {
+                if end + print_width <= right {
+                    x = end;
+                    continue;
+                }
+                self.cursor.x = right - 1;
+                let at_bottom = y == self.top_and_bottom_margins.end - 1;
+                self.wrap_print_line(sized);
+                if self.cursor.y <= y && !at_bottom {
+                    continue 'graphemes;
+                }
+                y = self.cursor.y;
+                (sized, right) = row_geometry(self.state);
+                x = self.cursor.x;
+                if x + print_width > right {
+                    continue 'graphemes;
+                }
+            }
             self.cursor.x = x;
             if sized && print_width > right - x {
                 // A wide grapheme cannot straddle the edge of a DEC-sized row.
@@ -238,7 +289,32 @@ impl Performer<'_> {
                 continue;
             }
 
-            let pen = self.pen.clone();
+            let mut pen = self.pen.clone();
+            if explicit_width.is_some() {
+                pen.set_explicit_width(true);
+            }
+            if fraction.is_some() {
+                pen.set_fractional_text_scale(fraction);
+            }
+
+            let block = MulticellText::new(g, cell_width, scale);
+            if block.is_some() {
+                let height = VisibleRowIndex::from(scale);
+                let margins = self.top_and_bottom_margins.clone();
+                if margins.contains(&y) && height <= margins.end - margins.start {
+                    let excess = (y + height - margins.end).max(0);
+                    if excess != 0 {
+                        self.scroll_up(excess as usize);
+                        y -= excess;
+                        self.set_cursor_position_absolute(x, y);
+                    }
+                }
+                if y + height > self.screen().physical_rows as VisibleRowIndex
+                    || (margins.contains(&y) && y + height > margins.end)
+                {
+                    continue;
+                }
+            }
 
             let wrappable = x + print_width >= right;
 
@@ -260,8 +336,17 @@ impl Performer<'_> {
                 g,
                 self.pen
             );
-            self.screen_mut()
-                .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            if let Some(block) = block {
+                if !self
+                    .screen_mut()
+                    .set_multicell_text(x, y, block, &pen, seqno)
+                {
+                    continue;
+                }
+            } else {
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            }
             if track && g != " " {
                 let screen = self.screen();
                 last_print = Some(PrimaryPrint {
@@ -277,14 +362,86 @@ impl Performer<'_> {
                 self.wrap_next = false;
             } else {
                 self.wrap_next = self.dec_auto_wrap;
+                if sized_text {
+                    self.cursor.x = right - 1;
+                }
             }
         }
 
         if last_print.is_some() {
             self.last_primary_print = last_print;
         }
-        std::mem::swap(&mut self.print, &mut p);
-        self.print.clear();
+    }
+
+    fn wrap_print_line(&mut self, sized: bool) {
+        let seqno = self.seqno;
+        // Since we're implicitly moving the cursor to the next
+        // line, we need to tag the current position as wrapped
+        // so that we can correctly reflow it if the window is
+        // resized.
+        {
+            let y = self.cursor.y;
+            let is_conpty = self.state.enable_conpty_quirks;
+            let screen = self.screen_mut();
+            let y = screen.phys_row(y);
+
+            fn makes_sense_to_wrap(s: &str) -> bool {
+                let len = s.len();
+                match (len, s.chars().next()) {
+                    (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
+                    _ => true,
+                }
+            }
+
+            let should_mark_wrapped = !is_conpty
+                || screen
+                    .line_mut(y)
+                    .visible_cells()
+                    .last()
+                    .map(|cell| makes_sense_to_wrap(cell.str()))
+                    .unwrap_or(false);
+            if should_mark_wrapped && !sized {
+                screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+            }
+        }
+        self.new_line(true);
+    }
+
+    fn kitty_text_size(&mut self, metadata: &[u8], payload: &[u8]) {
+        let Ok(metadata) = std::str::from_utf8(metadata) else {
+            return;
+        };
+        let Ok(text) = std::str::from_utf8(payload) else {
+            return;
+        };
+        if text.is_empty() || text.len() > 4096 || text.chars().any(char::is_control) {
+            return;
+        }
+        let mut width = 0;
+        let mut scale = 1;
+        let (mut numerator, mut denominator, mut horizontal, mut vertical) = (0, 0, 0, 0);
+        for field in metadata.split(':').filter(|field| !field.is_empty()) {
+            let Some((key, value)) = field.split_once('=') else {
+                return;
+            };
+            let Ok(number) = value.parse::<u8>() else {
+                return;
+            };
+            match key {
+                "w" if number <= 7 => width = usize::from(number),
+                "s" if (1..=7).contains(&number) => scale = number,
+                "n" if number <= 15 => numerator = number,
+                "d" if number <= 15 => denominator = number,
+                "h" if number <= 2 => horizontal = number,
+                "v" if number <= 2 => vertical = number,
+                _ => return,
+            }
+        }
+        if denominator != 0 && numerator >= denominator {
+            return;
+        }
+        let fraction = FractionalTextScale::new(numerator, denominator, horizontal, vertical);
+        self.print_cells(text, (width != 0).then_some(width), fraction, scale);
     }
 
     /// ConPTY, at the time of writing, does something horrible to rewrite
@@ -354,6 +511,16 @@ impl Performer<'_> {
                         // inverted; there's a note about this in the xterm
                         // ctlseqs docs.
                         match s.data.as_slice() {
+                            b">4m" | b">4f" => {
+                                let (level, csi_u) = self.xterm_other_keys();
+                                let (value, suffix) = if s.data.ends_with(b"m") {
+                                    (level, 'm')
+                                } else {
+                                    (u8::from(csi_u), 'f')
+                                };
+                                write!(self.writer, "{DCS}1$r>4;{value}{suffix}{ST}").ok();
+                                self.writer.flush().ok();
+                            }
                             b"m" => {
                                 let params = Rendition::from(&self.pen).parameters();
                                 write!(self.writer, "{DCS}1$r{params}m{ST}").ok();
@@ -587,6 +754,7 @@ impl Performer<'_> {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
             CSI::PushSgr(parameters) => self.state.sgr_stack.push(&parameters, &self.state.pen),
             CSI::PopSgr => self.state.sgr_stack.pop(&mut self.state.pen),
+            CSI::PaletteStack(operation) => self.state.perform_palette_stack(operation),
             CSI::Cursor(wezterm_escape_parser::csi::Cursor::Left(n)) => {
                 // We treat CUB (Cursor::Left) the same as Backspace as
                 // that is what xterm does.
@@ -753,6 +921,11 @@ impl Performer<'_> {
                     return;
                 }
                 let cols = self.screen.physical_cols;
+                if code != EscCode::DecSingleWidthLine {
+                    let y = self.cursor.y;
+                    self.screen_mut()
+                        .erase_multicell_text(y..y + 1, 0..cols, seqno);
+                }
                 let idx = self.screen.phys_row(self.cursor.y);
                 let line = self.screen.line_mut(idx);
                 match code {
@@ -804,6 +977,8 @@ impl Performer<'_> {
             // reset graphic rendition, erase all positions, move active position to first
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
+                self.application_cursor_guide = false;
+                self.pointer_shapes = Default::default();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.terminal_reset();
                 }
@@ -835,7 +1010,8 @@ impl Performer<'_> {
                 self.mouse_tracking = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;
-                self.modify_other_keys = None;
+                self.modify_other_keys = 0;
+                self.format_other_keys_csi_u = false;
                 self.sixel_scrolls_right = false;
                 self.any_event_mouse = false;
                 self.button_event_mouse = false;
@@ -1083,6 +1259,39 @@ impl Performer<'_> {
                 self.set_hyperlink(link);
             }
             OperatingSystemCommand::Unspecified(unspec) => {
+                match unspec.as_slice() {
+                    [selector, metadata, payload] if selector == b"66" => {
+                        self.kitty_text_size(metadata, payload);
+                        return;
+                    }
+                    [selector, body] if selector == b"22" => {
+                        self.perform_pointer_shape(body);
+                        return;
+                    }
+                    [selector] if selector == b"22" => {
+                        self.perform_pointer_shape(b"");
+                        return;
+                    }
+                    [selector, metadata, payload] if selector == b"99" => {
+                        if let Some(handler) = self.alert_handler.as_mut() {
+                            for reply in handler.kitty_notification(metadata, payload) {
+                                self.writer.write_all(reply.as_bytes()).ok();
+                            }
+                            self.writer.flush().ok();
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                if let [selector, body] = unspec.as_slice() {
+                    if selector == b"21" {
+                        self.perform_kitty_colors(body);
+                        return;
+                    }
+                }
+                if self.kitty_palette_stack(&unspec) {
+                    return;
+                }
                 if unspec.first().is_some_and(|part| part == b"440") {
                     if let Some(handler) = self.alert_handler.as_mut() {
                         handler.alert(Alert::W11termOsc440(unspec));
@@ -1120,6 +1329,7 @@ impl Performer<'_> {
                 }
             }
             OperatingSystemCommand::ITermProprietary(iterm) => match iterm {
+                ITermProprietary::HighlightCursorLine(show) => self.application_cursor_guide = show,
                 ITermProprietary::RequestCellSize => {
                     let screen = self.screen();
                     let height = screen.physical_rows;
@@ -1128,11 +1338,10 @@ impl Performer<'_> {
                     let scale = if screen.dpi == 0 {
                         1.0
                     } else {
-                        // Since iTerm2 is a macOS specific piece
-                        // of software, it uses the macOS default dpi
-                        // if 72 for the basis of its scale, regardless
-                        // of the host base dpi.
-                        screen.dpi as f32 / 72.
+                        // w11term measures its Windows text grid in device-
+                        // independent pixels. The wire scale converts those
+                        // logical units back to physical pixels.
+                        screen.dpi as f32 / 96.0
                     };
                     let width = (self.pixel_width as f32 / width as f32) / scale;
                     let height = (self.pixel_height as f32 / height as f32) / scale;
@@ -1313,7 +1522,9 @@ impl Performer<'_> {
                     };
                     match color {
                         ColorOrQuery::Query => {
-                            let value = *slot.field(&mut self.palette());
+                            let value = *slot
+                                .field(&mut self.palette())
+                                .expect("legacy dynamic color slot");
                             let response = OperatingSystemCommand::ChangeDynamicColors(
                                 number,
                                 vec![ColorOrQuery::Color(value)],

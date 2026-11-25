@@ -9,11 +9,7 @@ pub(super) const GROUP_JSON_LABEL: &str = "Save results as JSON…";
 pub(super) const GROUP_SHOWN_REPORT_LABEL: &str = "Save shown results…";
 pub(super) const GROUP_SHOWN_JSON_LABEL: &str = "Save shown results as JSON…";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupReportFormat {
-    Text,
-    Json,
-}
+pub use w11term::control::SshGroupReportFormat as GroupReportFormat;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {

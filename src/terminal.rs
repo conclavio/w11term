@@ -6,10 +6,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use wezterm_term::color::{ColorPalette, SrgbaTuple};
+use wezterm_term::color::{ColorPalette, SelectionColors, SrgbaTuple};
 use wezterm_term::config::NewlineCanon;
 use wezterm_term::{
-    CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
+    CellAttributes, CursorPosition, Line, PointerShape, Terminal, TerminalConfiguration,
+    TerminalSize,
 };
 
 mod color_scheme;
@@ -18,7 +19,9 @@ mod kitty;
 mod retained_rows;
 pub use retained_rows::RetainedRows;
 mod scrollback_view;
-pub use scrollback_view::{CommandContext, ScrollbackTarget, ScrollbackView};
+pub use scrollback_view::{
+    BookmarkEntry, BookmarkScreen, BookmarkTarget, CommandContext, ScrollbackTarget, ScrollbackView,
+};
 #[cfg(test)]
 mod program_status_tests;
 #[cfg(test)]
@@ -151,6 +154,7 @@ impl TransportInput {
 #[derive(Clone, Debug)]
 pub enum ScopedInput {
     Clipboard,
+    Notification,
     GroupCommand(crate::events::GroupWriteReceipt),
     GroupInterrupt(crate::events::GroupInterruptTarget),
 }
@@ -172,6 +176,7 @@ impl ScopedInput {
             Self::Clipboard => {
                 "The pane connection changed. Paste again to use the new connection."
             }
+            Self::Notification => "The terminal connection changed before the notification reply.",
             Self::GroupCommand(_) => "The host reconnected before the command was sent.",
             Self::GroupInterrupt(_) => "The host reconnected before Ctrl+C was sent.",
         }
@@ -263,6 +268,7 @@ pub(crate) fn configure_output_viewer(terminal: &mut Terminal, events: &crate::e
         }
     }
     events.command_stream(None);
+    events.notification_stream(None);
     terminal.clear_clipboard();
     terminal.set_notification_handler(Box::new(ViewerAlerts(events.clone())));
 }
@@ -339,7 +345,7 @@ pub fn send_key_event_detailed(
     repeat: bool,
     details: &KeyDetails,
 ) -> anyhow::Result<()> {
-    if let Some(encoded) = key_override(terminal, key, modifiers, down, repeat, details) {
+    if let Some(encoded) = key_override(terminal, key, modifiers, down, repeat, details)? {
         if !encoded.is_empty() {
             writer.send(TransportInput::Data(encoded.into_bytes()))?;
         }
@@ -359,13 +365,37 @@ fn key_override(
     down: bool,
     repeat: bool,
     details: &KeyDetails,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
     match terminal.get_keyboard_encoding() {
-        termwiz::input::KeyboardEncoding::Kitty(flags) => {
-            encode_kitty_key_event(flags, key, modifiers, down, repeat, details)
+        termwiz::input::KeyboardEncoding::Kitty(flags) => Ok(encode_kitty_key_event(
+            flags, key, modifiers, down, repeat, details,
+        )),
+        _ if down && details.text.is_some() => Ok(details.text.clone()),
+        termwiz::input::KeyboardEncoding::Xterm if down && terminal.xterm_other_keys().0 != 0 => {
+            let key = if repeat {
+                details
+                    .repeat_text
+                    .as_deref()
+                    .and_then(|text| {
+                        let mut chars = text.chars();
+                        let c = chars.next()?;
+                        chars
+                            .next()
+                            .is_none()
+                            .then_some(wezterm_term::KeyCode::Char(c))
+                    })
+                    .unwrap_or(key)
+            } else {
+                key
+            };
+            let encoded = if details.keypad.is_some() {
+                terminal.encode_keypad_key(key, modifiers, down)?
+            } else {
+                terminal.encode_key(key, modifiers, down)?
+            };
+            Ok(Some(encoded))
         }
-        _ if down => details.text.clone(),
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -377,7 +407,7 @@ pub(crate) fn encode_key_input(
     repeat: bool,
     details: &KeyDetails,
 ) -> anyhow::Result<String> {
-    match key_override(terminal, key, modifiers, down, repeat, details) {
+    match key_override(terminal, key, modifiers, down, repeat, details)? {
         Some(encoded) => Ok(encoded),
         None => terminal.encode_key(key, modifiers, down),
     }
@@ -649,14 +679,19 @@ pub struct Snapshot {
     /// Whether the last visible cell continues onto the following physical row.
     row_wraps: Vec<bool>,
     pub palette: ColorPalette,
+    pub selection_colors: SelectionColors,
+    pub visual_bell_color: Option<SrgbaTuple>,
     pub cursor: CursorPosition,
     pub cursor_visible: bool,
+    pub application_cursor_guide: bool,
+    pub pointer_shape: Option<PointerShape>,
     pub cols: usize,
     pub scroll_offset: usize,
     pub title: String,
     application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
     pub failed_command_rows: Arc<[isize]>,
+    pub scrollback_bookmarks: Arc<[isize]>,
     pub command_context: Option<CommandContext>,
     pub reported_directory: Option<Arc<str>>,
     pub status: String,
@@ -898,9 +933,13 @@ impl Snapshot {
             rows,
             row_wraps,
             palette,
+            selection_colors: terminal.selection_color_overrides(),
+            visual_bell_color: terminal.visual_bell_color(),
             cursor,
             cursor_visible: offset == 0
                 && cursor.visibility == termwiz::surface::CursorVisibility::Visible,
+            application_cursor_guide: terminal.application_cursor_guide(),
+            pointer_shape: terminal.application_pointer_shape(),
             cols: screen.physical_cols,
             scroll_offset: offset,
             title: terminal.get_title().to_owned(),
@@ -918,6 +957,7 @@ impl Snapshot {
             }),
             command_history: terminal.command_history().clone(),
             failed_command_rows: scrollback_view::failed_command_rows(terminal, previous),
+            scrollback_bookmarks: scrollback_view::bookmark_rows(screen, previous),
             command_context: scrollback_view::command_context(
                 terminal,
                 first_stable_row,
@@ -1001,6 +1041,8 @@ impl Snapshot {
             && self.alternate == old.alternate
             && self.bracketed_paste == old.bracketed_paste
             && self.cursor_visible == old.cursor_visible
+            && self.application_cursor_guide == old.application_cursor_guide
+            && self.pointer_shape == old.pointer_shape
             && self.mouse_grabbed == old.mouse_grabbed
             && (
                 self.cursor.x,
@@ -1014,10 +1056,13 @@ impl Snapshot {
                 old.cursor.visibility,
             )
             && self.palette == old.palette
+            && self.selection_colors == old.selection_colors
+            && self.visual_bell_color == old.visual_bell_color
             && self.title == old.title
             && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.failed_command_rows == old.failed_command_rows
+            && self.scrollback_bookmarks == old.scrollback_bookmarks
             && self.command_context == old.command_context
             && self.reported_directory == old.reported_directory
             && self.status == old.status
@@ -2296,6 +2341,532 @@ mod tests {
         assert_eq!(second.attrs().background(), ColorAttribute::PaletteIndex(4));
         assert_eq!(second.attrs().intensity(), Intensity::Normal);
         assert_eq!(second.attrs().underline(), Underline::None);
+    }
+
+    #[test]
+    fn kitty_fractional_text_keeps_ratios_local_and_preserves_grid_advance() {
+        use wezterm_term::FractionalTextScale;
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes(concat!(
+            "\x1b]66;n=1:d=2:h=1:v=2:w=1;ab\x07",
+            "\x1b]66;v=1:d=3:n=2;界x\x1b\\",
+            "\x1b]66;w=5:n=2:d=2;invalid\x07",
+            "\x1b]66;w=5:n=1:d=16;invalid\x07",
+            "\x1b]66;w=5:n=1:d=2:h=3;invalid\x07",
+            "\x1b]66;s=8:n=1:d=2;invalid\x07",
+            "Z\x1b[6n"
+        ));
+        assert_eq!(receive(&mut wire), b"\x1b[1;6R");
+        let check_frame = |frame: &Snapshot, tail_row: usize, tail_col: usize| {
+            let mut cells = frame.rows[0].visible_cells();
+            let cell = cells.next().unwrap();
+            assert_eq!((cell.str(), cell.width()), ("ab", 1));
+            assert_eq!(
+                cell.attrs().fractional_text_scale(),
+                FractionalTextScale::new(1, 2, 1, 2)
+            );
+            for (expected, width) in [("界", 2), ("x", 1)] {
+                let cell = cells.next().unwrap();
+                assert_eq!((cell.str(), cell.width()), (expected, width));
+                assert_eq!(
+                    cell.attrs().fractional_text_scale(),
+                    FractionalTextScale::new(2, 3, 0, 1)
+                );
+                assert!(!cell.attrs().explicit_width());
+            }
+            let tail = frame.rows[tail_row].get_cell(tail_col).unwrap();
+            assert_eq!(tail.str(), "Z");
+            assert_eq!(tail.attrs().fractional_text_scale(), None);
+        };
+        check_frame(
+            &Snapshot::capture(&terminal, None, 1, 0, String::new(), 0),
+            0,
+            4,
+        );
+        let rows = terminal.screen().physical_rows;
+        terminal.resize(TerminalSize {
+            cols: 4,
+            rows,
+            ..TerminalSize::default()
+        });
+        check_frame(
+            &Snapshot::capture(&terminal, None, 2, 0, String::new(), 0),
+            1,
+            0,
+        );
+
+        terminal.resize(TerminalSize {
+            cols: 6,
+            rows,
+            ..TerminalSize::default()
+        });
+        terminal.advance_bytes("\x1b[2J\x1b[H12345\x1b]66;n=1:d=2;界\x07Q\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[2;4R");
+        let frame = Snapshot::capture(&terminal, None, 3, 0, String::new(), 0);
+        let mut cells = frame.rows[1].visible_cells();
+        let wide = cells.next().unwrap();
+        assert_eq!((wide.cell_index(), wide.width(), wide.str()), (0, 2, "界"));
+        assert!(wide.attrs().fractional_text_scale().is_some());
+        assert_eq!(cells.next().unwrap().cell_index(), 2);
+    }
+
+    #[test]
+    fn kitty_text_width_places_literal_text_and_answers_the_width_probe() {
+        let (mut terminal, mut wire) = engine();
+        for bytes in [
+            b"\r\x1b[6n".as_slice(),
+            b"\x1b]66;w=2; \x07\x1b[6n",
+            b"\x1b]66;s=8; \x07\x1b[6n",
+        ] {
+            terminal.advance_bytes(bytes);
+        }
+        assert_eq!(receive(&mut wire), b"\x1b[1;1R");
+        assert_eq!(receive(&mut wire), b"\x1b[1;3R");
+        assert_eq!(receive(&mut wire), b"\x1b[1;3R");
+        for byte in "\x1b]66;w=7;字;a\x1b\\X".as_bytes() {
+            terminal.advance_bytes([*byte]);
+        }
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let cells: Vec<_> = frame.rows[0].visible_cells().take(3).collect();
+        assert_eq!((cells[0].cell_index(), cells[0].width()), (0, 2));
+        assert_eq!((cells[1].cell_index(), cells[1].width()), (2, 7));
+        assert_eq!(cells[1].str(), "字;a");
+        assert_eq!((cells[2].cell_index(), cells[2].str()), (9, "X"));
+        terminal.advance_bytes(b"\x1b[1;7H!");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert!(frame.rows[0].as_str().starts_with("     !  X"));
+    }
+
+    #[test]
+    fn kitty_text_width_survives_scrollback_and_reflow() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 8,
+            rows: 3,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"1234567\x1b]66;w=5;hello\x07X\r\nmore\r\nscroll\r\n");
+        let expect_width = |terminal: &Terminal| {
+            let screen = terminal.screen();
+            let line = screen
+                .physical_lines()
+                .find(|line| line.as_str().contains("hello"))
+                .expect("retained sized text");
+            let mut visible = line.visible_cells();
+            let block = visible.find(|cell| cell.str() == "hello").unwrap();
+            assert_eq!(block.width(), 5);
+            let next = visible.next().unwrap();
+            assert_eq!(next.cell_index(), block.cell_index() + 5);
+            assert_eq!(next.str(), "X");
+        };
+        assert!(terminal.screen().phys_row(0) >= 2);
+        expect_width(&terminal);
+        terminal.resize(TerminalSize { cols: 14, ..size });
+        expect_width(&terminal);
+        terminal.resize(TerminalSize { cols: 4, ..size });
+        assert!(terminal.screen().physical_lines().all(|line| {
+            !line.as_str().contains("hello")
+                && line
+                    .visible_cells()
+                    .all(|cell| cell.cell_index() + cell.width() <= 4)
+        }));
+    }
+
+    #[test]
+    fn kitty_text_width_preserves_combining_marks_and_edits_whole_cells() {
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes("\x1b]66;w=1;♥\x07\u{fe0f}\u{0301}\x1b[6n".as_bytes());
+        assert_eq!(receive(&mut wire), b"\x1b[1;2R");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let first = frame.rows[0].visible_cells().next().unwrap();
+        assert_eq!(first.str(), "♥\u{fe0f}\u{0301}");
+        assert_eq!(first.width(), 1);
+        for edit in ["@", "P", "X", "K"] {
+            terminal.advance_bytes(b"\x1b[2J\x1b[H[A\x1b]66;w=6;sized\x07Z");
+            terminal.advance_bytes(format!("\x1b[1;6H\x1b[{edit}").as_bytes());
+            let frame = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+            assert!(!frame.rows[0].as_str().contains("sized"), "{edit}");
+        }
+        terminal.advance_bytes(b"\x1b[2J\x1b[H\x1b[?7l\x1b[80G\x1b]66;w=5;end\x07\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[1;80R");
+        let frame = Snapshot::capture(&terminal, None, 3, 0, String::new(), 0);
+        let last = frame.rows[0].visible_cells().last().unwrap();
+        assert_eq!(
+            (last.cell_index(), last.width(), last.str()),
+            (75, 5, "end")
+        );
+    }
+
+    #[test]
+    fn kitty_multicell_text_keeps_rows_linked_during_print_and_edit() {
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes("\x1b]66;s=3:w=2:n=1:d=2;W\x07\u{0301}!\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[1;8R");
+        terminal.advance_bytes(b"\x1b[2;3H?\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[2;8R");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        for (offset, line) in frame.rows[..3].iter().enumerate() {
+            let cell = line.get_cell(0).unwrap();
+            let slice = cell.attrs().multicell_row().unwrap();
+            assert_eq!((cell.width(), slice.offset()), (6, offset as u8));
+            assert_eq!(slice.run().text(), "W\u{0301}");
+            assert_eq!(cell.str(), if offset == 0 { "W\u{0301}" } else { " " });
+        }
+        assert_eq!(frame.rows[1].get_cell(6).unwrap().str(), "?");
+        terminal.advance_bytes(b"\x1b[3;3H\x1b[X");
+        let frame = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+        assert!(
+            frame.rows[..3]
+                .iter()
+                .all(|line| !line.contains_multicell_text())
+        );
+        assert_eq!(frame.rows[0].get_cell(6).unwrap().str(), "!");
+        assert_eq!(frame.rows[1].get_cell(6).unwrap().str(), "?");
+    }
+
+    #[test]
+    fn kitty_multicell_text_wraps_past_its_lower_slice_with_autowrap_off() {
+        let (mut terminal, mut wire) = engine();
+        terminal.resize(TerminalSize {
+            cols: 8,
+            rows: 4,
+            ..TerminalSize::default()
+        });
+        terminal.advance_bytes(b"\x1b[?7l\x1b[1;3H\x1b]66;s=2:w=3;W\x07\x1b[2;8Hq\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[3;2R");
+        terminal.advance_bytes(b"\x1b[4;2H\x1b]66;s=7;Q\x07\x1b[6n");
+        assert_eq!(receive(&mut wire), b"\x1b[4;2R");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert!(
+            frame.rows[0]
+                .get_cell(2)
+                .unwrap()
+                .attrs()
+                .multicell_row()
+                .is_some()
+        );
+        assert_eq!(frame.rows[2].get_cell(0).unwrap().str(), "q");
+    }
+
+    #[test]
+    fn kitty_multicell_text_survives_scrollback_and_clears_if_it_no_longer_fits() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 10,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b[3;5H\x1b]66;s=3:w=2;W\x07\x1b[4;1H\r\n");
+        let slices = |terminal: &Terminal| {
+            terminal
+                .screen()
+                .physical_lines()
+                .filter_map(|line| {
+                    let cell = line.get_cell(4)?;
+                    cell.attrs().multicell_row().map(|slice| slice.offset())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slices(&terminal), [0, 1, 2]);
+        terminal.resize(TerminalSize { cols: 14, ..size });
+        assert_eq!(slices(&terminal), [0, 1, 2]);
+        terminal.resize(TerminalSize { cols: 5, ..size });
+        assert!(
+            terminal
+                .screen()
+                .physical_lines()
+                .all(|line| !line.contains_multicell_text())
+        );
+        terminal.resize(TerminalSize { cols: 8, ..size });
+
+        for edit in [
+            "\x1b[2;1H\x1b[L",
+            "\x1b[2;1H\x1b[M",
+            "\x1b[2;6H\x1b[P",
+            "\x1b[1;1H\x1b[2M",
+        ] {
+            terminal.advance_bytes(b"\x1b[2J\x1b[1;5H\x1b]66;s=2:w=2;A\x07");
+            assert_eq!(slices(&terminal), [0, 1]);
+            terminal.advance_bytes(edit);
+            assert!(slices(&terminal).is_empty(), "{edit:?}");
+        }
+    }
+
+    #[test]
+    fn kitty_multicell_reflow_keeps_a_tail_and_its_cursor_beside_the_lower_slice() {
+        use wezterm_term::color::ColorAttribute;
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 6,
+            rows: 5,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b]66;s=3;A\x07bc\x1b[31mX\x1b[0m\x1b[1;6H");
+        let before = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert!(before.bookmark_target().unwrap().toggle(&mut terminal, 0));
+        terminal.resize(TerminalSize { cols: 5, ..size });
+        let after = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        for (offset, line) in after.rows[..3].iter().enumerate() {
+            let cell = line.get_cell(0).unwrap();
+            assert_eq!(cell.attrs().multicell_row().unwrap().offset(), offset as u8);
+            assert_eq!(cell.width(), 3);
+        }
+        assert_eq!(after.rows[0].as_str().trim_end(), "Abc");
+        assert!(after.rows[0].last_cell_was_wrapped());
+        let tail = after.rows[1].get_cell(3).unwrap();
+        assert_eq!(tail.str(), "X");
+        assert_eq!(tail.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        assert_eq!((after.cursor.x, after.cursor.y), (3, 1));
+        assert_eq!(&*after.scrollback_bookmarks, &[after.first_stable_row + 1]);
+    }
+
+    #[test]
+    fn kitty_multicell_reflow_moves_fitting_rectangles_past_the_edge_and_back() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 8,
+            rows: 5,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"12345\x1b]66;s=2;W\x07q\x1b[1;8H");
+        terminal.resize(TerminalSize { cols: 6, ..size });
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "12345");
+        assert_eq!(frame.rows[1].as_str().trim_end(), "Wq");
+        assert_eq!(
+            frame.rows[2]
+                .get_cell(0)
+                .unwrap()
+                .attrs()
+                .multicell_row()
+                .unwrap()
+                .offset(),
+            1
+        );
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2, 1));
+        terminal.resize(size);
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "12345Wq");
+        assert_eq!(
+            frame.rows[1]
+                .get_cell(5)
+                .unwrap()
+                .attrs()
+                .multicell_row()
+                .unwrap()
+                .offset(),
+            1
+        );
+        assert_eq!((frame.cursor.x, frame.cursor.y), (7, 0));
+    }
+
+    #[test]
+    fn kitty_multicell_reflow_keeps_text_visible_when_an_oversized_rectangle_is_removed() {
+        let (mut terminal, _) = engine();
+        let size = TerminalSize {
+            cols: 7,
+            rows: 6,
+            ..TerminalSize::default()
+        };
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b]66;s=4;W\x07abc\x1b[1;7H");
+        terminal.resize(TerminalSize {
+            cols: 3,
+            rows: 3,
+            ..size
+        });
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "abc");
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2, 0));
+        assert!(
+            terminal
+                .screen()
+                .physical_lines()
+                .all(|line| !line.contains_multicell_text())
+        );
+
+        terminal.resize(size);
+        terminal.advance_bytes(b"\x1b[?1049h\x1b[1;5H\x1b]66;s=2;R\x07X");
+        terminal.resize(TerminalSize { cols: 5, ..size });
+        let frame = Snapshot::capture(&terminal, None, 0, 0, String::new(), 0);
+        assert!(frame.alternate);
+        assert!(
+            frame
+                .rows
+                .iter()
+                .all(|line| !line.contains_multicell_text())
+        );
+        assert!(frame.rows.iter().all(|line| !line.as_str().contains('X')));
+    }
+
+    #[test]
+    fn xterm_other_keys_settings_roundtrip_and_reset() {
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes(b"\x1b[?4m\x1b[?4g");
+        assert_eq!(receive(&mut wire), b"\x1b[>4;0m");
+        assert_eq!(receive(&mut wire), b"\x1b[>4;0f");
+        for byte in b"\x1b[>4;2m\x1b[>4;1f\x1b[?1;4m\x1b[?4g\x1bP$q>4m\x1b\\\x1bP$q>4f\x1b\\" {
+            terminal.advance_bytes([*byte]);
+        }
+        let report = b"\x1b[>4;2m\x1b[>4;1f";
+        assert_eq!(receive(&mut wire), b"\x1b[>4;2m");
+        assert_eq!(receive(&mut wire), b"\x1b[>4;1f");
+        assert_eq!(receive(&mut wire), b"\x1bP1$r>4;2m\x1b\\");
+        assert_eq!(receive(&mut wire), b"\x1bP1$r>4;1f\x1b\\");
+        terminal.advance_bytes(b"\x1b[>4;9m\x1b[>4;2f\x1b[>4;2;9m\x1b[>4;1:f\x1b[?4;bad");
+        assert_eq!(terminal.xterm_other_keys(), (2, true));
+        terminal.advance_bytes(b"\x1b[>4n");
+        assert_eq!(terminal.xterm_other_keys(), (0, true));
+        terminal.advance_bytes(report);
+        assert_eq!(terminal.xterm_other_keys(), (2, true));
+        let inspect = TerminalModes::read(&terminal).as_json();
+        assert_eq!(inspect["keyboard"]["modify_other_keys"], 2);
+        assert_eq!(inspect["keyboard"]["format_other_keys"], "csi-u");
+        terminal.advance_bytes(b"\x1b[>4m\x1b[>4f");
+        assert_eq!(terminal.xterm_other_keys(), (0, false));
+        for reset in [b"\x1b[>m\x1b[>f".as_slice(), b"\x1b[!p", b"\x1bc"] {
+            terminal.advance_bytes(report);
+            terminal.advance_bytes(reset);
+            assert_eq!(terminal.xterm_other_keys(), (0, false));
+        }
+        terminal.advance_bytes(report);
+        terminal.reset_connection();
+        assert_eq!(terminal.xterm_other_keys(), (0, false));
+    }
+
+    #[test]
+    fn xterm_other_keys_distinguishes_control_aliases_and_preserves_key_classes() {
+        use wezterm_term::{KeyCode as K, KeyModifiers as M};
+        let (mut terminal, mut wire) = engine();
+        for (level, cases) in [
+            (
+                1,
+                vec![
+                    (K::Char('i'), M::CTRL, "\t"),
+                    (K::Char('A'), M::CTRL | M::SHIFT, "\x01"),
+                    (K::Char('3'), M::CTRL, "\x1b"),
+                    (K::Char(','), M::CTRL, "\x1b[27;5;44~"),
+                    (K::Tab, M::SHIFT, "\x1b[Z"),
+                    (K::Tab, M::CTRL, "\x1b[27;5;9~"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (K::Char('i'), M::CTRL, "\x1b[27;5;105~"),
+                    (K::Char('I'), M::CTRL | M::SHIFT, "\x1b[27;6;73~"),
+                    (K::Char('É'), M::SHIFT, "\x1b[27;2;201~"),
+                    (K::Char('a'), M::ALT, "\x1b[27;3;97~"),
+                    (K::Char('a'), M::NONE, "a"),
+                    (K::Tab, M::NONE, "\t"),
+                    (K::Tab, M::SHIFT, "\x1b[27;2;9~"),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    (K::Char(' '), M::NONE, "\x1b[27;1;32~"),
+                    (K::Tab, M::NONE, "\x1b[27;1;9~"),
+                    (K::Backspace, M::NONE, "\x1b[27;1;127~"),
+                    (K::LeftArrow, M::CTRL, "\x1b[1;5D"),
+                    (K::Function(12), M::NONE, "\x1b[24~"),
+                    (K::Delete, M::NONE, "\x1b[3~"),
+                ],
+            ),
+        ] {
+            terminal.advance_bytes(format!("\x1b[>4;{level}m"));
+            for (key, mods, expected) in cases {
+                terminal.key_down(key, mods).unwrap();
+                terminal.key_up(key, mods).unwrap();
+                assert_eq!(
+                    receive(&mut wire),
+                    expected.as_bytes(),
+                    "{level} {key:?} {mods:?}"
+                );
+            }
+        }
+        terminal.advance_bytes(b"\x1b[>4;1f");
+        let keypad = KeyDetails {
+            keypad: Some(KeypadKey::Enter),
+            ..Default::default()
+        };
+        let composed = KeyDetails {
+            text: Some("´q".into()),
+            ..Default::default()
+        };
+        let held = KeyDetails {
+            repeat_text: Some("Q".into()),
+            ..Default::default()
+        };
+        for (key, mods, repeat, details, expected) in [
+            (K::Enter, M::NONE, false, &keypad, "\r"),
+            (K::Char('q'), M::NONE, false, &composed, "´q"),
+            (K::Char('q'), M::SHIFT, true, &held, "\x1b[81;2u"),
+        ] {
+            assert_eq!(
+                encode_key_input(&terminal, key, mods, true, repeat, details).unwrap(),
+                expected
+            );
+        }
+        terminal.advance_bytes(b"\x1b[>3u");
+        let no_details = KeyDetails::default();
+        assert_eq!(
+            encode_key_input(&terminal, K::Char('i'), M::CTRL, false, false, &no_details).unwrap(),
+            "\x1b[105;5:3u"
+        );
+        terminal.advance_bytes(b"\x1b[<u");
+        assert_eq!(
+            encode_key_input(&terminal, K::Char('i'), M::CTRL, true, false, &no_details).unwrap(),
+            "\x1b[105;5u"
+        );
+    }
+
+    #[test]
+    fn kitty_pointer_queries_and_stacks_follow_the_active_screen() {
+        let (mut term, mut out) = engine();
+        for byte in b"\x1b]22;hand2\x07\x1b]22;>help,crosshair\x1b\\" {
+            term.advance_bytes([*byte]);
+        }
+        term.advance_bytes(b"\x1b]22;?__current__,__default__,__grabbed__,text,copy,unknown\x07");
+        assert_eq!(
+            receive(&mut out),
+            b"\x1b]22;crosshair,default,default,1,0,0\x1b\\"
+        );
+        term.advance_bytes(b"\x1b]22;=ew-resize\x07\x1b]22;<ignored\x07");
+        assert_eq!(term.application_pointer_shape(), Some(PointerShape::Help));
+        term.advance_bytes(b"\x1b[?1049h");
+        assert_eq!(term.application_pointer_shape(), None);
+        term.advance_bytes(b"\x1b]22;wait\x07\x1b[?1049l");
+        assert_eq!(term.application_pointer_shape(), Some(PointerShape::Help));
+        term.advance_bytes(b"\x1b]22;\x07\x1b]22;?__current__\x07");
+        assert_eq!(receive(&mut out), b"\x1b]22;0\x1b\\");
+        term.advance_bytes(b"\x1b]22;<\x07\x1b[?1049h");
+        assert_eq!(term.application_pointer_shape(), Some(PointerShape::Wait));
+        term.advance_bytes(b"\x1b[!p\x1b[?1049l");
+        assert_eq!(term.application_pointer_shape(), None);
+        term.advance_bytes(b"\x1b]22;text\x07\x1bc");
+        assert_eq!(term.application_pointer_shape(), None);
+        term.advance_bytes(b"\x1b]22;text\x07");
+        term.reset_connection();
+        assert_eq!(term.application_pointer_shape(), None);
+    }
+
+    #[test]
+    fn kitty_pointer_eviction_and_invalid_requests_preserve_the_visible_shape() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b]22;pointer\x07");
+        term.advance_bytes(format!("\x1b]22;>{}wait\x07", "wait,".repeat(15)));
+        term.advance_bytes(format!("\x1b]22;>text,{}\x07", "x".repeat(4200)));
+        term.advance_bytes(b"\x1b]22;unknown\x07\x1b]22;?__current__\x07");
+        assert_eq!(receive(&mut out), b"\x1b]22;wait\x1b\\");
+        for _ in 0..16 {
+            term.advance_bytes(b"\x1b]22;<\x07");
+        }
+        assert_eq!(term.application_pointer_shape(), None);
     }
 
     #[test]
@@ -3630,6 +4201,57 @@ mod tests {
         terminal.reset_connection();
         terminal.advance_bytes(b"\x1b[?12$p");
         assert_eq!(receive(&mut replies), b"\x1b[?12;2$y");
+    }
+
+    #[test]
+    fn default_cursor_shape_is_inherited_by_cursor_reset_but_respects_application_overrides() {
+        use termwiz::surface::CursorShape::*;
+        let (mut terminal, mut replies) = engine();
+        assert!(terminal.set_default_cursor_shape(SteadyBar));
+        assert_eq!(terminal.cursor_pos().shape, SteadyBar);
+        terminal.advance_bytes(b"\x1b[?12h");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingBar);
+        terminal.advance_bytes(b"\x1b[?12l");
+        assert_eq!(terminal.cursor_pos().shape, SteadyBar);
+
+        terminal.advance_bytes(b"\x1b[2 q");
+        assert!(!terminal.set_default_cursor_shape(BlinkingUnderline));
+        assert_eq!(terminal.cursor_pos().shape, SteadyBlock);
+        terminal.advance_bytes(b"\x1b[0 q\x1b[?12$p");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+        assert_eq!(receive(&mut replies), b"\x1b[?12;1$y");
+
+        terminal.advance_bytes(b"\x1b7\x1b[6 q\x1b8");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+        terminal.advance_bytes(b"\x1b[2 q\x1bc");
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+        terminal.advance_bytes(b"\x1b[6 q");
+        terminal.reset_connection();
+        assert_eq!(terminal.cursor_pos().shape, BlinkingUnderline);
+    }
+
+    #[test]
+    fn iterm_cursor_guide_requests_update_the_snapshot_and_reset_with_the_session() {
+        let (mut terminal, mut replies) = engine();
+        let capture = |terminal: &Terminal, old: Option<&Snapshot>| {
+            Snapshot::capture(terminal, old, 1, 0, String::new(), 0)
+        };
+        let before = capture(&terminal, None);
+        assert!(!before.application_cursor_guide);
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=yes\x07");
+        let enabled = capture(&terminal, Some(&before));
+        assert!(enabled.application_cursor_guide);
+        assert!(!enabled.same_presentation(&before));
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=invalid\x07");
+        assert!(capture(&terminal, Some(&enabled)).same_presentation(&enabled));
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=no\x1b\\");
+        assert!(!capture(&terminal, None).application_cursor_guide);
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=yes\x07\x1bc");
+        assert!(!capture(&terminal, None).application_cursor_guide);
+        terminal.advance_bytes(b"\x1b]1337;HighlightCursorLine=yes\x07");
+        terminal.reset_connection();
+        assert!(!capture(&terminal, None).application_cursor_guide);
+        assert!(replies.try_recv().is_err());
     }
     fn text(t: &Terminal) -> String {
         let s = t.screen();

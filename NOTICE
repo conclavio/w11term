@@ -21,3 +21,7 @@ The vendored vtparse parser is from the same WezTerm revision and retains its MI
 The vendored wezterm-escape-parser is from the same WezTerm revision under
 the MIT license. See vendor/wezterm-escape-parser/LICENSE.md. The kitty
 placeholder diacritic indices are protocol data derived from Unicode 6.0.
+
+This project vendors Windows Reactor 0.100.0 from Microsoft windows-rs.
+The upstream MIT and Apache-2.0 license texts and the local cursor backport
+are documented in vendor/windows-reactor/PATCHES.md.

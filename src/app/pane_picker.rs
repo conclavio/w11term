@@ -1,5 +1,5 @@
 use super::*;
-use w11term::terminal::{FrameStore, Snapshot};
+use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
 mod text_search;
 pub use text_search::Action as TextAction;
 pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
@@ -23,7 +23,7 @@ impl Preview {
         let canvas = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         )
         .map(|renderer| {
             let renderer = RefCell::new(renderer);
@@ -246,12 +246,41 @@ pub(super) struct Picker {
     default_side: ElementRef<Button>,
     matches: Vec<Choice>,
     commands: Vec<command_palette::Row>,
+    bookmarks: Option<Result<Vec<BookmarkEntry>, &'static str>>,
     text: text_search::Results,
     selected: usize,
     preview: Option<Preview>,
 }
 
 impl Picker {
+    pub(super) fn bookmark_results_expired(&self, frame: &Snapshot) -> bool {
+        let Mode::Commands(command_palette::Search::Bookmarks(_, screen)) = self.mode else {
+            return false;
+        };
+        !self.commands.is_empty()
+            && (frame.bookmark_screen() != Some(screen)
+                || self.commands.iter().any(|choice| {
+                    matches!(
+                        choice.id,
+                        command_palette::CommandId::OpenScrollbackBookmark(_, _, row)
+                        if frame.scrollback_bookmarks.binary_search(&row).is_err()
+                    )
+                }))
+    }
+
+    pub(super) fn bookmark_status(&self, app: &TerminalApp) -> Option<&'static str> {
+        let Mode::Commands(command_palette::Search::Bookmarks(origin, screen)) = self.mode else {
+            return None;
+        };
+        if app.bookmark_frame(origin, screen).is_none() {
+            return Some("The pane changed. Reopen bookmark search.");
+        }
+        match &self.bookmarks {
+            None => Some("Loading scrollback bookmarks…"),
+            Some(Err(message)) => Some(message),
+            Some(Ok(_)) => None,
+        }
+    }
     pub(super) fn placement(&self) -> Option<(TabId, TabId)> {
         match self.mode {
             Mode::Placement { source, target } => Some((source, target)),
@@ -603,6 +632,141 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
+    pub(super) fn open_bookmark_search(
+        &mut self,
+        origin: clipboard_paste::Origin,
+        screen: BookmarkScreen,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.picker.is_some() || self.bookmark_frame(origin, screen).is_none() {
+            return;
+        }
+        let Some(Page::Terminal(tab)) = self.tabs.active().map(|tab| &tab.page) else {
+            return;
+        };
+        let sender = tab.session.input.clone();
+        self.start_picker(
+            Mode::Commands(command_palette::Search::Bookmarks(origin, screen)),
+            ctx,
+        );
+        let launch = self.picker.as_ref().unwrap().launch.clone();
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        if sender
+            .send(Command::ReadScrollbackBookmarks { screen, reply })
+            .is_err()
+        {
+            self.bookmarks_received(&launch, None);
+            return;
+        }
+        let rejected = Message::BookmarksRead(launch.clone(), None);
+        ctx.spawn_background_with_rejection(
+            move |_| Message::BookmarksRead(launch, receiver.blocking_recv().ok().flatten()),
+            rejected,
+        );
+    }
+
+    pub(super) fn bookmarks_received(
+        &mut self,
+        launch: &Arc<()>,
+        entries: Option<Vec<BookmarkEntry>>,
+    ) {
+        let Some(picker) = self
+            .picker
+            .as_mut()
+            .filter(|picker| Arc::ptr_eq(&picker.launch, launch))
+        else {
+            return;
+        };
+        picker.bookmarks =
+            Some(entries.ok_or("The bookmarks are unavailable. Reopen bookmark search."));
+        self.refresh_open_commands();
+    }
+
+    fn bookmark_frame(
+        &self,
+        origin: clipboard_paste::Origin,
+        screen: BookmarkScreen,
+    ) -> Option<Arc<Snapshot>> {
+        let Page::Terminal(tab) = &self.tabs.active()?.page else {
+            return None;
+        };
+        let frame = tab.session.frames.load();
+        (tab.session.pane_id == origin.pane
+            && self.tabs.active_group_id() == Some(origin.group)
+            && frame.connection_generation == origin.connection
+            && frame.bookmark_screen() == Some(screen))
+        .then_some(frame)
+    }
+
+    pub(super) fn reveal_bookmark(
+        &self,
+        origin: clipboard_paste::Origin,
+        screen: BookmarkScreen,
+        row: isize,
+    ) {
+        if self
+            .bookmark_frame(origin, screen)
+            .is_some_and(|frame| frame.scrollback_bookmarks.binary_search(&row).is_ok())
+            && let Some(Page::Terminal(tab)) = self.tabs.active().map(|tab| &tab.page)
+        {
+            let _ = tab
+                .session
+                .input
+                .send(Command::RevealScrollbackBookmark { screen, row });
+        }
+    }
+
+    fn bookmark_rows(
+        &self,
+        origin: clipboard_paste::Origin,
+        screen: BookmarkScreen,
+        query: &str,
+    ) -> Vec<command_palette::Row> {
+        let Some(frame) = self.bookmark_frame(origin, screen) else {
+            return Vec::new();
+        };
+        let Some(Ok(entries)) = self
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.bookmarks.as_ref())
+        else {
+            return Vec::new();
+        };
+        let query = query.trim().to_lowercase();
+        let live = frame
+            .first_stable_row
+            .saturating_add_unsigned(frame.scroll_offset);
+        entries
+            .iter()
+            .rev()
+            .filter(|entry| frame.scrollback_bookmarks.binary_search(&entry.row).is_ok())
+            .filter_map(|entry| {
+                let label = if entry.excerpt.is_empty() {
+                    "Blank line"
+                } else {
+                    &entry.excerpt
+                };
+                let chord = if entry.row < live {
+                    format!("{} lines back", live.abs_diff(entry.row))
+                } else {
+                    format!("Screen row {}", live.abs_diff(entry.row) + 1)
+                };
+                let text = format!("{label} {chord}").to_lowercase();
+                query
+                    .split_whitespace()
+                    .all(|word| text.contains(word))
+                    .then(|| command_palette::Row {
+                        id: command_palette::CommandId::OpenScrollbackBookmark(
+                            origin, screen, entry.row,
+                        ),
+                        label: label.to_owned(),
+                        chord,
+                        enabled: true,
+                    })
+            })
+            .collect()
+    }
+
     pub(super) fn open_group_recent_commands(
         &mut self,
         group: TabId,
@@ -621,9 +785,13 @@ impl TerminalApp {
         );
     }
 
-    pub(super) fn open_window_group_run_picker(&mut self, ctx: &ComponentContext<Self>) {
+    pub(super) fn open_window_group_run_picker(
+        &mut self,
+        scope: host_groups::WindowRunScope,
+        ctx: &ComponentContext<Self>,
+    ) {
         self.start_picker(
-            Mode::Commands(command_palette::Search::WindowGroupRuns),
+            Mode::Commands(command_palette::Search::WindowGroupRuns(scope)),
             ctx,
         );
         self.update_host_group_timer(ctx);
@@ -631,13 +799,19 @@ impl TerminalApp {
 
     pub(super) fn window_group_run_picker_open(&self) -> bool {
         self.picker.as_ref().is_some_and(|picker| {
-            picker.mode == Mode::Commands(command_palette::Search::WindowGroupRuns)
+            matches!(
+                picker.mode,
+                Mode::Commands(command_palette::Search::WindowGroupRuns(_))
+            )
         })
     }
 
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
+            Mode::Commands(command_palette::Search::Bookmarks(origin, screen)) => {
+                self.bookmark_rows(origin, screen, query)
+            }
             Mode::Commands(command_palette::Search::GroupLibrary(group)) => {
                 self.group_saved_command_rows(group, query)
             }
@@ -647,8 +821,8 @@ impl TerminalApp {
             Mode::Commands(command_palette::Search::GroupRuns(group)) => {
                 self.group_run_rows(group, query)
             }
-            Mode::Commands(command_palette::Search::WindowGroupRuns) => {
-                self.window_group_run_rows(query)
+            Mode::Commands(command_palette::Search::WindowGroupRuns(scope)) => {
+                self.window_group_run_rows(scope, query)
             }
             _ => self.command_rows(query),
         }
@@ -824,6 +998,7 @@ impl TerminalApp {
             query: String::new(),
             matches,
             commands,
+            bookmarks: None,
             text: text_search::Results::default(),
             selected,
             preview: None,
@@ -887,6 +1062,13 @@ impl TerminalApp {
             && index != picker.selected
         {
             picker.selected = index;
+            self.sync_picker_preview(ctx);
+        }
+    }
+
+    pub(super) fn refresh_picker_font(&mut self, ctx: &ComponentContext<Self>) {
+        if let Some(picker) = &mut self.picker {
+            picker.preview = None;
             self.sync_picker_preview(ctx);
         }
     }

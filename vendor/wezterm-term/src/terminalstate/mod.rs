@@ -34,9 +34,11 @@ mod image;
 mod iterm;
 mod keyboard;
 mod kitty;
+mod kitty_colors;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod pointer;
 mod program_status;
 mod rectangle;
 mod rendition;
@@ -46,6 +48,7 @@ mod sixel;
 mod title;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
+pub use pointer::PointerShape;
 pub use program_status::{ProgramBlockKind, ProgramState, ProgramStatus};
 
 #[derive(Default)]
@@ -369,6 +372,8 @@ pub struct TerminalState {
     /// The current cursor position, relative to the top left
     /// of the screen.  0-based index.
     cursor: CursorPosition,
+    default_cursor_shape: CursorShape,
+    application_cursor_guide: bool,
 
     /// if true, implicitly move to the next line on the next
     /// printed character
@@ -409,7 +414,8 @@ pub struct TerminalState {
     /// designated as cursor keys.  This includes various navigation
     /// keys.  The code in key_down() is responsible for interpreting this.
     application_cursor_keys: bool,
-    modify_other_keys: Option<i64>,
+    modify_other_keys: u8,
+    format_other_keys_csi_u: bool,
 
     dec_ansi_mode: bool,
 
@@ -465,6 +471,7 @@ pub struct TerminalState {
     progress_value: u8,
 
     palette: palette::PaletteOverrides,
+    palette_stack: palette::PaletteStack,
 
     pixel_width: usize,
     pixel_height: usize,
@@ -508,6 +515,7 @@ pub struct TerminalState {
     unscrolled_rows: usize,
     saved_private_modes: SavedPrivateModes,
     sgr_stack: sgr_stack::SgrStack,
+    pointer_shapes: [pointer::Stack; 2],
     attribute_extent: u8,
 
     /// The unicode version that is in effect
@@ -663,6 +671,7 @@ impl TerminalState {
         self.inactive_kitty_img = Default::default();
         self.image_cache.clear();
         self.sgr_stack = Default::default();
+        self.palette_stack = Default::default();
         self.screen.screen = primary;
         self.activate_screen(false);
     }
@@ -710,6 +719,8 @@ impl TerminalState {
             screen,
             pen: CellAttributes::default(),
             cursor: CursorPosition::default(),
+            default_cursor_shape: CursorShape::Default,
+            application_cursor_guide: false,
             top_and_bottom_margins: 0..size.rows as VisibleRowIndex,
             left_and_right_margins: 0..size.cols,
             left_and_right_margin_mode: false,
@@ -723,7 +734,8 @@ impl TerminalState {
             dec_origin_mode: false,
             insert: false,
             application_cursor_keys: false,
-            modify_other_keys: None,
+            modify_other_keys: 0,
+            format_other_keys_csi_u: false,
             dec_ansi_mode: false,
             sixel_display_mode: false,
             use_private_color_registers_for_each_graphic: false,
@@ -751,6 +763,7 @@ impl TerminalState {
             icon_title: None,
             saved_titles: Default::default(),
             palette: Default::default(),
+            palette_stack: Default::default(),
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,
             dpi: size.dpi,
@@ -781,6 +794,7 @@ impl TerminalState {
             unscrolled_rows: 0,
             saved_private_modes: SavedPrivateModes::default(),
             sgr_stack: Default::default(),
+            pointer_shapes: Default::default(),
             attribute_extent: 0,
             seqno,
             unicode_version,
@@ -1173,11 +1187,14 @@ impl TerminalState {
     /// sequences we'll fork a copy of the palette at that time
     /// so that we can start tracking those changes.
     pub fn palette(&self) -> ColorPalette {
-        self.palette
+        let mut palette = self
+            .palette
             .effective
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| self.config.color_palette())
+            .unwrap_or_else(|| self.config.color_palette());
+        self.palette.resolve_cursor_colors(&mut palette);
+        palette
     }
 
     /// Edit the effective palette directly. Changes made through this reference
@@ -1622,7 +1639,7 @@ impl TerminalState {
         CursorPosition {
             x: self.cursor.x,
             y: self.cursor.y,
-            shape: self.cursor.shape,
+            shape: self.effective_cursor_shape(),
             visibility: if self.cursor_visible {
                 CursorVisibility::Visible
             } else {
@@ -1630,6 +1647,25 @@ impl TerminalState {
             },
             seqno: self.cursor.seqno,
         }
+    }
+
+    fn effective_cursor_shape(&self) -> CursorShape {
+        if self.cursor.shape == CursorShape::Default {
+            self.default_cursor_shape
+        } else {
+            self.cursor.shape
+        }
+    }
+
+    /// Set the local fallback for a cursor with the default DECSCUSR style.
+    pub fn set_default_cursor_shape(&mut self, shape: CursorShape) -> bool {
+        let previous = self.effective_cursor_shape();
+        self.default_cursor_shape = shape;
+        previous != self.effective_cursor_shape()
+    }
+
+    pub fn application_cursor_guide(&self) -> bool {
+        self.application_cursor_guide
     }
 
     /// Returns the current cell attributes of the screen
@@ -1794,7 +1830,9 @@ impl TerminalState {
         let restored = count.min(history);
         if restored != 0 {
             let bottom = self.top_and_bottom_margins.end;
-            self.screen_mut().restore_scrollback_rows(bottom, restored);
+            let seqno = self.seqno;
+            self.screen_mut()
+                .restore_scrollback_rows(bottom, restored, seqno);
             self.unscrolled_rows = self.unscrolled_rows.wrapping_add(restored);
         }
         if count > restored {
@@ -1988,6 +2026,7 @@ impl TerminalState {
                 }
             }
             Device::SoftReset => {
+                self.pointer_shapes = Default::default();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.terminal_reset();
                 }
@@ -2000,7 +2039,8 @@ impl TerminalState {
                 // setting for dec_auto_wrap, so we do too
                 self.dec_auto_wrap = true;
                 self.application_cursor_keys = false;
-                self.modify_other_keys = None;
+                self.modify_other_keys = 0;
+                self.format_other_keys_csi_u = false;
                 self.application_keypad = false;
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as i64;
                 self.left_and_right_margins = 0..self.screen().physical_cols;
@@ -2169,7 +2209,7 @@ impl TerminalState {
             DecPrivateMode::Unspecified(2031) => self.report_color_scheme_changes,
             DecPrivateMode::Code(code) => match code {
                 InBandResize => self.report_text_area_resize,
-                StartBlinkingCursor => self.cursor.shape.is_blinking(),
+                StartBlinkingCursor => self.effective_cursor_shape().is_blinking(),
                 Win32InputMode => self.keyboard_encoding == KeyboardEncoding::Win32,
                 ReverseWraparound => self.reverse_wraparound_mode,
                 LeftRightMarginMode => self.left_and_right_margin_mode,
@@ -2314,7 +2354,7 @@ impl TerminalState {
             )) => {
                 use CursorShape::*;
                 let blinking = matches!(mode, Mode::SetDecPrivateMode(_));
-                self.cursor.shape = match (self.cursor.shape, blinking) {
+                self.cursor.shape = match (self.effective_cursor_shape(), blinking) {
                     (BlinkingBar | SteadyBar, true) => BlinkingBar,
                     (BlinkingBar | SteadyBar, false) => SteadyBar,
                     (BlinkingUnderline | SteadyUnderline, true) => BlinkingUnderline,
@@ -2729,12 +2769,13 @@ impl TerminalState {
                 resource: XtermKeyModifierResource::OtherKeys,
                 value,
             } => {
-                self.modify_other_keys = match value {
-                    Some(0) => None,
-                    _ => value,
-                };
-                log::debug!("XtermKeyMode OtherKeys -> {:?}", self.modify_other_keys);
+                let level = value.unwrap_or(0);
+                if (0..=3).contains(&level) {
+                    self.modify_other_keys = level as u8;
+                }
             }
+
+            Mode::XtermOtherKeys(operation) => self.perform_xterm_other_keys(operation),
 
             Mode::XtermKeyMode { resource, value } => {
                 if self.config.log_unknown_escape_sequences() {
@@ -3120,6 +3161,14 @@ impl TerminalState {
                         &left_and_right_margins,
                         true,
                     );
+                    let margin_rows = top_and_bottom_margins.end - top_and_bottom_margins.start;
+                    let count = (n as usize).min(margin_rows as usize);
+                    let removed = self.cursor.y..self.cursor.y + count as VisibleRowIndex;
+                    self.screen_mut().erase_multicell_text(
+                        removed,
+                        left_and_right_margins.clone(),
+                        seqno,
+                    );
                     self.screen_mut().scroll_up_within_margins(
                         &top_and_bottom_margins,
                         &left_and_right_margins,
@@ -3243,6 +3292,9 @@ impl TerminalState {
                     }
                 };
 
+                if cell.attrs().multicell_row().is_some() {
+                    return;
+                }
                 let max_repeat = self
                     .screen()
                     .physical_cols
@@ -3255,9 +3307,7 @@ impl TerminalState {
                     let sized = self.screen().line_width_scale(y) > 1;
                     let width = if sized { cell.width() } else { 1 };
                     if !sized || x.saturating_add(width) <= right {
-                        let screen = self.screen_mut();
-                        let line_idx = screen.phys_row(y);
-                        screen.line_mut(line_idx).set_cell(x, cell.clone(), seqno);
+                        self.screen_mut().set_cell(x, y, &cell, seqno);
                     }
                     x += width;
                     if x >= right {

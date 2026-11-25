@@ -1,5 +1,6 @@
 use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Result, ensure};
+use serde_json::{Value, json};
 
 mod definition;
 mod duplicate;
@@ -573,7 +574,7 @@ impl TerminalApp {
         feedback: String,
     ) {
         let defaults = self.catalog.ssh_roster_defaults(name);
-        if let Some(page) = self.host_group_mut(id) {
+        if let Some(page) = self.host_group_by_id_mut(id) {
             if page.roster.is_some() {
                 page.saved
                     .roster_update
@@ -703,6 +704,104 @@ impl TerminalApp {
             },
             ctx,
         )
+    }
+
+    pub(in crate::app) fn control_list_saved_host_groups(&self) -> Result<Value> {
+        let catalog = self.store.catalog()?;
+        let groups: Vec<_> = catalog
+            .ssh_host_groups
+            .iter()
+            .map(|(name, profiles)| {
+                let members: Vec<_> = profiles
+                    .iter()
+                    .map(|profile| {
+                        json!({
+                            "profile": profile,
+                            "available": catalog.ssh_host_group_member(profile).is_some(),
+                        })
+                    })
+                    .collect();
+                let launch_error = catalog
+                    .resolve_ssh_host_group_members(profiles)
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                json!({
+                    "name": name,
+                    "members": members,
+                    "launchable": launch_error.is_none(),
+                    "launch_error": launch_error,
+                    "defaults": catalog.ssh_roster_defaults(name),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "window_id": self.registry.window_id(),
+            "groups": groups,
+        }))
+    }
+
+    pub(in crate::app) fn control_open_saved_host_group(
+        &mut self,
+        name: &str,
+        ctx: &ComponentContext<Self>,
+    ) -> Result<Value> {
+        let catalog = self.store.catalog()?;
+        let profiles = catalog
+            .ssh_host_groups
+            .get(name)
+            .with_context(|| format!("Unknown saved SSH group {name:?}"))?
+            .clone();
+        let members = catalog
+            .resolve_ssh_host_group_members(&profiles)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let login_limit = catalog.ssh_roster_defaults(name).login_limit.concurrency();
+        if self.catalog != catalog || self.profile_error.is_some() {
+            self.use_group_catalog(catalog);
+        }
+
+        let previous = self.tabs.active_id();
+        let id = self.new_host_group_tab(Some(name));
+        let launched = self.install_host_group_panes(
+            id,
+            BTreeSet::new(),
+            profiles.iter().cloned().map(Some).zip(members),
+            PaneLaunch::Select,
+            login_limit,
+        );
+        self.remember_group_launch(
+            id,
+            name,
+            &profiles,
+            true,
+            format!("Opened {} SSH panes for {name}", launched.len()),
+        );
+        self.tabs.select(previous.unwrap_or(id));
+        self.sync_selection(ctx);
+        if previous.is_none() {
+            self.activate(ctx);
+        } else {
+            self.publish_panes();
+        }
+
+        let members: Vec<_> = launched
+            .into_iter()
+            .zip(profiles)
+            .map(|(pane, profile)| {
+                json!({
+                    "profile": profile,
+                    "pane_id": pane.pane_id,
+                    "tab_id": pane.tab_id,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "window_id": self.registry.window_id(),
+            "tab_id": id,
+            "name": name,
+            "members": members,
+        }))
     }
 
     pub(in crate::app) fn start_group_window(

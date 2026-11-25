@@ -98,6 +98,18 @@ The original MIT license is preserved in `LICENSE.md`.
 - XTPUSHSGR and XTPOPSGR use a bounded text-style stack with selective
   restoration. A new transport starts with an empty stack.
 
+- XTPUSHCOLORS, XTPOPCOLORS and XTREPORTCOLORS implement xterm's ten
+  indexed palette slots and report. The stack saves palette assignments so
+  restoring a slot keeps inheritance from the pane's current theme. A new
+  transport drops the previous stack.
+
+- Kitty OSC 21 processes batched palette assignments, resets and queries. The
+  sibling vtparse crate retains its literal body within 16 KiB so a batch can
+  reach every palette index. OSC 30001 and 30101 use the xterm stack.
+
+- Kitty OSC 22 tracks bounded pointer-shape stacks on both screens, replies to
+  capability queries, and exposes the selected shape to the embedding.
+
 - XTSAVE and XTRESTORE preserve supported DEC private modes, including the
   alternate-buffer selector and the mouse reporting and encoding modes. Saved
   values are scoped to the connection and cleared by full reset.
@@ -175,3 +187,11 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - SGR pixel mouse reporting encodes Kitty pointer departures and clears the
   last motion sample so the first re-entry motion is reported again.
+
+- OSC 99 forwards Kitty notification metadata and payload to the embedding's
+  alert handler. The handler can return protocol replies on the same terminal
+  stream. This keeps the notification lifecycle and UI in w11term.
+
+- Xterm resource 4 supports modifyOtherKeys levels 0 through 3 and the
+  formatOtherKeys switch. CSI and DECRQSS report the negotiated settings.
+  The legacy encoder continues to handle keys outside the negotiated class.

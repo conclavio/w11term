@@ -108,12 +108,7 @@ impl TerminalApp {
                     });
                 match result {
                     Ok(options) => {
-                        let policy = self
-                            .appearance
-                            .read()
-                            .unwrap()
-                            .interaction
-                            .remote_clipboard_policy();
+                        let policy = self.appearance.read().unwrap().pane_preferences();
                         let source = Source::Ssh(options);
                         *tab = live_tab(source_label(&source), source, policy);
                         self.sync_selection(context);

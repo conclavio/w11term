@@ -117,6 +117,8 @@ The reply includes `pane`, `connection_generation`, `cols`, `rows`, `pixel_width
 
 `mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
+When xterm modified-key reporting or its alternate format is enabled, `keyboard.modify_other_keys` is the active level from 0 through 3 and `keyboard.format_other_keys` is `xterm-27` or `csi-u`.
+
 ## Completed shell commands
 
 `list-commands --pane ID` reads the pane’s OSC 133 command history. It returns
@@ -181,6 +183,29 @@ each window. A group has `tab_id`, `label`, and `runs` in submission order,
 oldest first. A tab retains the eight newest runs. A group can have an empty
 run list.
 
+`list-saved-ssh-groups --window ID` reads the selected window's current
+profile catalog from disk and returns `window_id` and `groups`, ordered by
+saved name. Each group contains its exact `name`, the `members` in saved
+order, and the effective saved roster `defaults`. A member has `profile`
+and `available`. A group has `launchable: true` when its saved definition
+passes launch validation. Otherwise, `launch_error` explains the first
+problem. Discovery leaves the window and saved catalog in place.
+
+`open-ssh-group --window ID --name NAME` opens a fresh copy of a saved SSH
+group in an existing window from that list. Pass the exact saved name as one
+argument. The new SSH tabs follow the saved member order. The group applies
+its saved defaults, including the parallel login limit, and starts with all
+of its members checked. The current tab and window focus
+stay in place. An unknown group or a group with an unavailable profile is
+rejected before any tabs or sessions are created.
+
+The reply contains `window_id`, the new group's `tab_id`, its saved `name`,
+and a `members` array in saved order. Each member has `profile`, `pane_id`,
+and `tab_id`. A successful reply acknowledges the launch while connections
+may still be queued or in progress. Pass the group ID to
+`wait-ssh-group-ready` to wait for verified prompts. If the launch is
+unacknowledged, check `list-ssh-groups` before retrying.
+
 `get-ssh-group-roster --window ID --tab ID` returns the current roster for
 those IDs. The reply includes `window_id`, `tab_id`, and a `roster` object
 with `schema_version: 1`, `label`, `scope` (`group` or `window`), `sort`,
@@ -201,18 +226,99 @@ checked hosts meet the group's `require_all_ready` prompt rule. The Send
 button also depends on the current draft and review.
 The query leaves the group's selection and window focus in place.
 
-`wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]` returns the
-same roster snapshot when every initially checked, shown host has a verified
-prompt. It always requires all of those hosts, including when partial sends
-are enabled for the group. Use a roster filter that keeps the intended hosts
-shown as their state changes. A changed checked-and-shown set, empty scope,
-closed tab, or timeout returns an error. The wait defaults to 30 seconds and
-accepts 1 through 3600. It can complete with the roster in the background.
+`wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]`
+returns the roster once every selected recipient has a verified prompt.
+With repeated `--pane` flags, it waits for those distinct panes in the
+group's roster scope even if the UI hides or unchecks them. A pane outside
+the scope, including one that leaves during the wait, returns an error.
+The explicit reply adds `ready_pane_ids` in request order. The roster's
+selection fields still describe its current UI state.
+
+Omit `--pane` to wait for the initially checked, shown hosts. An empty or
+changed checked-and-shown set returns an error in this mode. Both modes
+require every requested prompt, including when the group allows partial
+sends. A closed tab or timeout returns an error. The wait defaults to
+30 seconds, accepts 1 through 3600, and works in the background.
 
 Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `recipient_count`, `settled_count`, and `outcomes` counts for `waiting`,
 `running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
 background tab or window without changing selection or keyboard focus.
+
+`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND`
+sends one shell line of up to 4,096 UTF-8 bytes to explicitly named panes.
+Pass the command as one quoted argument to preserve spaces. Use `--` before
+a command beginning with two hyphens. The panes must be distinct, belong
+to the group's current roster scope, and each have a fresh verified prompt.
+The host filter and checkboxes in the group UI have no bearing on this
+explicit recipient list. If a recipient fails validation, the entire request
+is rejected before dispatch. If a prompt changes after validation, the
+affected pane's run result records that delivery was withheld.
+
+The group applies its configured queue policy. Use `--canary PANE` to
+select the canary for this run. The pane must be one of the named
+recipients, and there must be at least one other ready recipient. If
+`--canary` is omitted, the group uses its configured canary, if any, with
+the same recipient requirements. Approve the canary after a verified
+successful exit to release the remaining hosts. The
+response returns `window_id`, `tab_id`, and a new `run_id` as soon as the
+run is accepted. Use the run ID below to confirm delivery, check shell exit
+status, or follow output. A background submission preserves the window focus,
+group draft, and roster selection. If the submission is unacknowledged, check
+the retained runs before retrying.
+
+Use `--parallel N` to set the maximum number of in-flight recipients for
+this submission. `N` must be a positive integer. In-flight commands hold
+their slots until execution settles. Other queue settings follow the
+group defaults and any explicit options in the same submission. Later
+runs keep their configured parallel limit.
+
+Use `--interval-ms MS` to set the minimum time between dispatches for
+this submission. The first eligible dispatch has no initial delay.
+`0` disables pacing for the run. Omit the option to use the group's
+configured interval.
+
+Use `--queue-expiry-ms MS` to expire unsent recipients after that many
+milliseconds from dispatch setup. The deadline continues while the queue
+is paused or waiting for canary approval. Already dispatched commands
+continue normally. Use `0` for no expiry or omit the option to use the
+group's configured deadline.
+
+Use `--on-failure stop` to withhold unsent commands after an unsuccessful
+host. If the run has no parallel limit or pacing interval, it dispatches
+one host at a time. `--on-failure continue` allows the queue to proceed
+after an ordinary recipient fails. A canary still requires a verified
+successful exit and approval under either policy. Omitting the option
+keeps the group's policy.
+
+Use `--dry-run` to validate the same request and return `window_id`,
+`tab_id`, and a `plan` containing the command, effective dispatch policy,
+and recipients in planned dispatch order. When a canary is configured
+for the run, it is first, followed by the other panes in argument order.
+A preview creates no run, recording, or output alert and sends no bytes.
+The real submission revalidates the live roster and prompt state and
+opens any requested recording file.
+
+Use `--expect-output TEXT` to check captured lines from each named pane.
+The check is armed before dispatch and defaults to case-insensitive literal
+matching. `--regex` and `--match-case` change how the pattern is matched.
+The pattern must be nonempty and at most 4,096 UTF-8 bytes. An invalid
+pattern rejects the request before any command is sent. The settled run
+reports each pane as matched, missing, or unverified. Missing or unverified
+output also appears in the Attention inbox.
+
+Use `--record-output PATH` to create a UTF-8 transcript with host labels,
+output, and final outcomes. The CLI resolves relative paths from its working
+directory. Raw requests require an absolute path. The destination must be a
+new file in an existing directory. If preparation fails, no command is sent.
+If the request expires or a recipient changes after the file is prepared,
+the file may contain only `[No command was sent]`.
+
+Run replies include an optional `recording` object for CLI-started recordings.
+It has `path`, `state` (`opening`, `recording`, `saved`, or `failed`), and
+`error`, which is null unless the writer failed. The recorder starts before
+dispatch and writes through settlement. Stopping it from the GUI or closing
+or retiring the run ends capture early and marks that in the file footer.
 
 `get-ssh-group-run --window ID --tab ID --run ID` takes the three IDs from
 the listing. An evicted run or closed tab or window returns a lookup error.
@@ -223,18 +329,119 @@ rows carry the same pane identity, delivery, execution, and interrupt
 statuses as saved group reports. Environment assignments appear in their
 recipient rows.
 
+`get-ssh-group-retry-plan --window ID --tab ID --run ID` returns the
+original shell command and recipients whose delivery was rejected before
+sending. Each row includes its original rejection reason, current
+readiness, and any blocker. `plan.ready_pane_ids` lists the currently
+eligible recipients in submission order. The plan excludes sent,
+unconfirmed, and deliberately skipped commands. It leaves the group
+draft and terminal sessions alone. Pass the reviewed command and panes
+to `submit-ssh-group-command`, which rechecks current prompt readiness
+and applies the effective queue policy.
+
+`retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]`
+submits the retained run's original command to explicitly chosen unsent
+recipients. It rejects the entire request if any pane is ineligible. Each
+pane must still be in the group, on the original SSH destination, and at
+a fresh prompt. A source run with an unapproved canary is ineligible.
+The new run uses the current group queue policy and returns
+`source_run_id` and `run_id`.
+
+Each source pane can be retried once with this command. Its plan row
+reports `retry_run_id` after acceptance. Check that field if a retry was
+unacknowledged. If the new run also withholds a host, inspect the new run's
+retry plan.
+
+`interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID`
+requests Ctrl+C for one verified running command on a named recipient.
+The target must still be running the command from that retained run on
+the same direct SSH connection. The terminal rechecks the connection,
+command identity, and input mode immediately before the write. The
+action works in background tabs and uses the explicit pane ID regardless
+of the roster selection. It returns a run snapshot. Check the recipient's
+`interrupt.state` for `pending`, `sent`, `rejected`, or `unconfirmed`.
+A `sent` receipt confirms delivery to the SSH channel. The command's
+final outcome is recorded separately under `execution`.
+
+When a per-recipient expected-output check resolves, `run.output_expectation`
+contains its `query`, `regex`, and `match_case` settings. Each checked
+recipient has its own `output_expectation` field with the value `matched`,
+`missing`, or `unverified`. Missing means capture completed with adequate
+coverage and no match. Unverified means delivery or capture could not establish
+whether the text appeared. Saved JSON reports use the same fields, with the
+check settings at the document root. An unresolved check has no result fields.
+
 The detail reply carries metadata. To read a completed recipient's retained
 output, use `get-command` with its `pane_id` and the
 `execution.command_id` and `execution.connection_generation` in the reply.
 The usual pane history retention rules apply.
 
-`wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]`
-returns the same detail reply once all recipients settle. It handles running,
-paused, and canary-gated queues in the background. The timeout defaults to
+`ssh-group-queue --window ID --tab ID --run ID pause|resume|stop`
+controls unsent commands in a retained run. Pause holds further dispatch.
+Resume allows dispatch under the run's existing limits and prompt checks.
+Stop marks the remaining queued commands cancelled before sending.
+Commands already dispatched to an SSH pane continue through delivery
+and execution. Pause and resume require an
+ungated queue. Stop is available while a canary is pending. Actions on
+an expired queue or a run with no unsent commands return an error.
+
+`ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID`
+releases the run's canary gate after that pane reports a verified exit
+code of zero. Read `queue.canary_pane_id` from the same run before
+approving. Approval requires the exact canary pane and a queue in
+`canary_approval`. Remaining recipients still pass the existing prompt
+checks, dispatch limits, and queue deadline.
+
+`ssh-group-queue --window ID --tab ID --run ID skip --pane ID` withholds
+one unsent recipient and reports its delivery state as `skipped`.
+The rest of the queue keeps its current dispatch policy. The pane must
+belong to the run and still be queued. An active canary cannot be skipped.
+
+The action returns the same detail reply as `get-ssh-group-run`. When a
+run uses a queue, the reply has a `queue` object with `unsent` and `state`.
+The state is `dispatching`, `paused`, `canary_running`, `canary_approval`, or
+`drained`. Both canary states include `canary_pane_id`. Drained means there
+are no unsent recipients. Check
+`queue_activity` and the recipient states for dispatch and cancellation
+outcomes. Queue actions work in a background tab or window.
+
+`save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH`
+saves the same full-run report available from the group results view. JSON
+is the default. Both formats include all recipients, their current status,
+and available captured output. Use `wait-ssh-group-run` before exporting
+if you need final outcomes. An unknown or evicted run returns an error
+before any file is created.
+
+The CLI resolves relative paths from its working directory. Raw requests
+require an absolute path. A completed report is published in one operation
+and requires `--overwrite` to replace an existing file. The reply returns
+`window_id`, `tab_id`, `run_id`, `path`, and `format`. The export works while
+the group is in the background.
+
+`wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]`
+returns the same detail reply once all recipients settle, including the result
+of any active per-recipient expected-output check. For CLI-started recordings,
+it also waits for the file writer's final status. It handles running, paused,
+and canary-gated queues in the background. The timeout defaults to
 30 seconds and accepts 1 through 3600. A settled run returns immediately.
-Check the recipient statuses and exit codes to decide whether the run succeeded.
 Timeout, a closed window or tab, or an evicted run returns an error. A timeout
 leaves the original run in progress.
+
+With `--require-success`, the CLI exits **0** when every recipient reports a
+verified exit code of zero and every configured output check matches. It
+exits **2** when the run settles with any other recipient outcome, including
+a skipped host or missing exit status. In either case the JSON reply still
+has `ok: true` and the full run. Request errors and timeouts exit **1**.
+Without the flag, any successfully retrieved run exits **0**.
+
+`wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]`
+returns the run snapshot when the canary reports a verified zero exit and
+unsent hosts are waiting for approval. Use `run.queue.canary_pane_id` with
+`ssh-group-queue ... approve-canary --pane ID` after reviewing the result.
+The wait leaves the gate in place and works from the background. A failed
+canary, drained or expired queue, previously approved run, or retired
+run returns an error. The timeout defaults to 30 seconds and accepts 1
+through 3600.
 
 `wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT`
 returns the first matching line from the selected run. It searches the retained
@@ -297,10 +504,31 @@ for recipient exit statuses.
 
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
+w11term-cli --pid 12345 list-saved-ssh-groups --window 1
+w11term-cli --pid 12345 open-ssh-group --window 1 --name "Fleet Ops"
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
+w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --pane 17 --pane 19 --timeout 60
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 -- "uname -a"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --canary 19 -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --canary 19 --dry-run -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --parallel 1 -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --interval-ms 1200 -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --queue-expiry-ms 1800 -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --on-failure stop -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --expect-output '^READY$' --regex --match-case -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
+w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 pause
+w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 approve-canary --pane 17
+w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 skip --pane 19
+w11term-cli --pid 12345 interrupt-ssh-group-command --window 1 --tab 9 --run 3 --pane 17
+w11term-cli --pid 12345 get-ssh-group-retry-plan --window 1 --tab 9 --run 3
+w11term-cli --pid 12345 retry-ssh-group-run --window 1 --tab 9 --run 3 --pane 19
+w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
+w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --require-success
+w11term-cli --pid 12345 wait-ssh-group-approval --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --regex '^ready for traffic$'
 w11term-cli --pid 12345 get-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --limit 20
@@ -311,10 +539,30 @@ Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-ssh-groups"}
+{"verb":"list-saved-ssh-groups","window_id":1}
+{"verb":"open-ssh-group","window_id":1,"name":"Fleet Ops"}
 {"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
+{"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"pane_ids":[17,19],"timeout_seconds":60}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"uname -a"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"canary_pane_id":19,"command":"check-service"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"canary_pane_id":19,"command":"check-service","dry_run":true}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"parallel_limit":1,"command":"check-service"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"interval_ms":1200,"command":"check-service"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"queue_expiry_ms":1800,"command":"check-service"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"stop_on_failure":true,"command":"check-service"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","expect_output":{"query":"^READY$","regex":true,"match_case":true}}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
+{"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":"pause"}
+{"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":{"approve_canary":{"pane_id":17}}}
+{"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":{"skip":{"pane_id":19}}}
+{"verb":"interrupt-ssh-group-command","window_id":1,"tab_id":9,"run_id":3,"pane_id":17}
+{"verb":"get-ssh-group-retry-plan","window_id":1,"tab_id":9,"run_id":3}
+{"verb":"retry-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"pane_ids":[19]}
+{"verb":"save-ssh-group-report","window_id":1,"tab_id":9,"run_id":3,"path":"C:\\Reports\\group report.json","format":"json","overwrite":false}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
+{"verb":"wait-ssh-group-approval","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"pattern":"^ready for traffic$","regex":true}
 {"verb":"get-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"limit":20}

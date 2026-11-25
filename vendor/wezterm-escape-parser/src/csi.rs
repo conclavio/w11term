@@ -122,6 +122,7 @@ pub enum CSI {
     /// Xterm's SGR stack. An empty list saves all supported attributes.
     PushSgr(Vec<i64>),
     PopSgr,
+    PaletteStack(PaletteStack),
 
     /// CSI codes that relate to the cursor
     Cursor(Cursor),
@@ -145,6 +146,32 @@ pub enum CSI {
     /// large, so it is boxed and kept outside of the enum
     /// body to help reduce space usage in the common cases.
     Unspecified(Box<Unspecified>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteStack {
+    Push(Vec<Option<i64>>),
+    Pop(Vec<Option<i64>>),
+    Report,
+}
+
+impl Display for PaletteStack {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), FmtError> {
+        let (params, final_char) = match self {
+            Self::Push(params) => (params, 'P'),
+            Self::Pop(params) => (params, 'Q'),
+            Self::Report => return write!(f, "#R"),
+        };
+        for (index, param) in params.iter().enumerate() {
+            if index > 0 {
+                write!(f, ";")?;
+            }
+            if let Some(value) = param {
+                write!(f, "{value}")?;
+            }
+        }
+        write!(f, "#{final_char}")
+    }
 }
 
 #[cfg(all(test, target_pointer_width = "64"))]
@@ -234,6 +261,7 @@ impl Display for CSI {
                 write!(f, "#{{")?;
             }
             CSI::PopSgr => write!(f, "#}}")?,
+            CSI::PaletteStack(palette) => palette.fmt(f)?,
             CSI::Cursor(c) => c.fmt(f)?,
             CSI::Edit(e) => e.fmt(f)?,
             CSI::Mode(mode) => mode.fmt(f)?,
@@ -930,6 +958,14 @@ impl XtermKeyModifierResource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XtermOtherKeys {
+    QueryLevel,
+    Disable,
+    SetFormat(bool),
+    QueryFormat,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     SetDecPrivateMode(DecPrivateMode),
@@ -940,6 +976,7 @@ pub enum Mode {
     SetMode(TerminalMode),
     ResetMode(TerminalMode),
     QueryMode(TerminalMode),
+    XtermOtherKeys(XtermOtherKeys),
     XtermKeyMode {
         resource: XtermKeyModifierResource,
         value: Option<i64>,
@@ -983,6 +1020,12 @@ impl Display for Mode {
                 write!(f, "?{}$p", mode.to_u16().ok_or_else(|| FmtError)?)
             }
             Mode::QueryMode(TerminalMode::Unspecified(mode)) => write!(f, "?{}$p", mode),
+            Mode::XtermOtherKeys(operation) => match operation {
+                XtermOtherKeys::QueryLevel => write!(f, "?4m"),
+                XtermOtherKeys::Disable => write!(f, ">4n"),
+                XtermOtherKeys::SetFormat(csi_u) => write!(f, ">4;{}f", u8::from(*csi_u)),
+                XtermOtherKeys::QueryFormat => write!(f, "?4g"),
+            },
             Mode::XtermKeyMode { resource, value } => {
                 write!(
                     f,
@@ -2095,6 +2138,27 @@ impl<'a> CSIParser<'a> {
                 Ok(CSI::PushSgr(parameters))
             }
             ('q' | '}', [CsiParam::P(b'#')]) if !self.parameters_truncated => Ok(CSI::PopSgr),
+            ('P' | 'Q' | 'R', [parameters @ .., CsiParam::P(b'#')])
+                if !self.parameters_truncated =>
+            {
+                let parameters = if parameters.is_empty() {
+                    Vec::new()
+                } else {
+                    parameters
+                        .split(|param| *param == CsiParam::P(b';'))
+                        .map(|param| match param {
+                            [CsiParam::Integer(value)] => Ok(Some(*value)),
+                            [] => Ok(None),
+                            _ => Err(()),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(CSI::PaletteStack(match self.control {
+                    'P' => PaletteStack::Push(parameters),
+                    'Q' => PaletteStack::Pop(parameters),
+                    _ => PaletteStack::Report,
+                }))
+            }
             ('|', [parameters @ .., CsiParam::P(b'#')])
             | ('{' | 'z' | 'x', [parameters @ .., CsiParam::P(b'$')])
                 if !self.parameters_truncated =>
@@ -2204,7 +2268,38 @@ impl<'a> CSIParser<'a> {
             ('s', [CsiParam::P(b'?'), ..]) => self
                 .dec(self.focus(params, 1, 0))
                 .map(|mode| CSI::Mode(Mode::SaveDecPrivateMode(mode))),
-            ('m', [CsiParam::P(b'>'), ..]) => self.xterm_key_modifier(params),
+            ('m', [CsiParam::P(b'>')]) if !self.parameters_truncated => {
+                Ok(CSI::Mode(Mode::XtermKeyMode {
+                    resource: XtermKeyModifierResource::OtherKeys,
+                    value: None,
+                }))
+            }
+            ('m', [CsiParam::P(b'>'), ..]) if !self.parameters_truncated => {
+                self.xterm_key_modifier(params)
+            }
+            ('m' | 'g', [CsiParam::P(b'?'), ..]) if !self.parameters_truncated => {
+                let resources = Cracked::parse(&params[1..])?;
+                if !resources.params.iter().any(|p| matches!(p, Some(CsiParam::Integer(4)))) {
+                    return Err(());
+                }
+                let operation = if self.control == 'm' {
+                    XtermOtherKeys::QueryLevel
+                } else {
+                    XtermOtherKeys::QueryFormat
+                };
+                Ok(CSI::Mode(Mode::XtermOtherKeys(operation)))
+            }
+            ('n', [CsiParam::P(b'>'), CsiParam::Integer(4)]) if !self.parameters_truncated => {
+                Ok(CSI::Mode(Mode::XtermOtherKeys(XtermOtherKeys::Disable)))
+            }
+            ('f', [CsiParam::P(b'>'), ..]) if !self.parameters_truncated => {
+                let csi_u = match &params[1..] {
+                    [] | [CsiParam::Integer(4)] | [CsiParam::Integer(4), CsiParam::P(b';')] => false,
+                    [CsiParam::Integer(4), CsiParam::P(b';'), CsiParam::Integer(n @ 0..=1)] => *n == 1,
+                    _ => return Err(()),
+                };
+                Ok(CSI::Mode(Mode::XtermOtherKeys(XtermOtherKeys::SetFormat(csi_u))))
+            }
 
             ('p', [CsiParam::P(b'!')]) => Ok(CSI::Device(Box::new(Device::SoftReset))),
             ('u', [CsiParam::P(b'='), CsiParam::Integer(flags)]) => {

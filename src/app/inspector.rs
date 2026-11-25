@@ -45,8 +45,13 @@ impl Drop for Inspection {
     }
 }
 
-fn keyboard_label(encoding: KeyboardEncoding) -> String {
-    match encoding {
+fn keyboard_label(modes: TerminalModes) -> String {
+    match modes.keyboard {
+        KeyboardEncoding::Xterm if modes.xterm_other_keys != (0, false) => {
+            let (level, csi_u) = modes.xterm_other_keys;
+            let format = if csi_u { "CSI u" } else { "CSI 27" };
+            format!("Xterm · modifyOtherKeys {level} · {format}")
+        }
         KeyboardEncoding::Xterm => "Xterm".into(),
         KeyboardEncoding::CsiU => "CSI u".into(),
         KeyboardEncoding::Win32 => "Win32".into(),
@@ -160,7 +165,7 @@ impl Inspection {
                     text_area_label(modes.pixel_width, modes.pixel_height, modes.dpi),
                     format!("Screen   {screen}"),
                     format!("Mouse reporting   {}", mouse_label(modes)),
-                    format!("Keyboard   {}", keyboard_label(modes.keyboard)),
+                    format!("Keyboard   {}", keyboard_label(modes)),
                     format!("Bracketed paste   {}", on_off(modes.bracketed_paste)),
                     format!("Synchronized output   {}", on_off(modes.synchronized)),
                     format!("In-band resize   {}", on_off(modes.in_band_resize)),
@@ -367,6 +372,7 @@ mod tests {
             mouse_motion: false,
             mouse_encoding: MouseEncoding::X10,
             keyboard: KeyboardEncoding::Xterm,
+            xterm_other_keys: (0, false),
             bracketed_paste: false,
             synchronized: false,
             in_band_resize: false,

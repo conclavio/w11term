@@ -12,13 +12,17 @@ $menuItemType = [System.Windows.Automation.ControlType]::MenuItem
 $editType = [System.Windows.Automation.ControlType]::Edit
 $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
 
-function Open-TitleEditor([string]$Stage) {
+function Open-TitleEditor([string]$Stage, [switch]$FromPalette) {
     $rename = 'Rename tab' + [char]0x2026
-    Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' $buttonType -Visible })
-    Invoke-Button (Wait-Until "visible rename menu item ($Stage)" {
-        $item = Find-Element $rename $menuItemType -Visible
-        if ($item -and $item.Current.IsEnabled) { $item }
-    })
+    if ($FromPalette) {
+        Run-Palette $rename
+    } else {
+        Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' $buttonType -Visible })
+        Invoke-Button (Wait-Until "visible rename menu item ($Stage)" {
+            $item = Find-Element $rename $menuItemType -Visible
+            if ($item -and $item.Current.IsEnabled) { $item }
+        })
+    }
     try {
         return (Wait-Until "tab name field ($Stage)" { Find-Element 'Tab name' $editType -Visible }).GetCurrentPattern($valuePattern)
     } catch {
@@ -58,7 +62,8 @@ $field.SetValue('Ignore this edit')
 Invoke-Button (Wait-Until 'cancel rename' { Find-Element 'Cancel' })
 Wait-TitleEditorClosed $activePane
 Wait-Title 'Build console'
-$field = Open-TitleEditor 'save'
+$field = Open-TitleEditor 'save' -FromPalette
+if ($field.Current.Value -ne 'Build console') { throw 'Reopening the editor reused the cancelled title' }
 $field.SetValue(('x' * 129))
 $null = Wait-Until 'invalid title disabled Save' {
     $button = Find-Element 'Save'

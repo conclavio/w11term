@@ -520,7 +520,7 @@ fn indexed_images_follow_palette_changes_and_keep_old_snapshots_intact() {
     };
     check(&old, [1, 2, 3], [34, 51, 68], [85, 102, 119]);
 
-    t.advance_bytes(b"\x1b]4;1;#040608\x07\x1b]11;#102030\x07\x1b]10;#abcdef\x07");
+    t.advance_bytes(b"\x1b[#P\x1b]4;1;#040608\x07\x1b]11;#102030\x07\x1b]10;#abcdef\x07");
     let updated = frame(&t, Some(&old), 0);
     check(&updated, [4, 6, 8], [16, 32, 48], [171, 205, 239]);
     check(&old, [1, 2, 3], [34, 51, 68], [85, 102, 119]);
@@ -532,6 +532,14 @@ fn indexed_images_follow_palette_changes_and_keep_old_snapshots_intact() {
         [171, 205, 239],
         [16, 32, 48],
     );
+    t.advance_bytes(b"\x1b[?5l\x1b[#Q");
+    check(
+        &frame(&t, Some(&updated), 0),
+        [1, 2, 3],
+        [34, 51, 68],
+        [85, 102, 119],
+    );
+    check(&updated, [4, 6, 8], [16, 32, 48], [171, 205, 239]);
 }
 
 #[tokio::test]

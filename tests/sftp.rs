@@ -51,10 +51,16 @@ impl server::Handler for Peer {
     ) -> anyhow::Result<()> {
         self.opens.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "ui-smoke")]
-        if self.root.join("withhold-session-open").is_file() {
-            // Keep the SSH connection responsive while leaving the request unanswered.
-            self.withheld_session_open = Some(reply);
-            return Ok(());
+        {
+            let gate = self.root.join("hold-session-open");
+            while gate.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if self.root.join("withhold-session-open").is_file() {
+                // Keep the SSH connection responsive while leaving the request unanswered.
+                self.withheld_session_open = Some(reply);
+                return Ok(());
+            }
         }
         self.channels.insert(channel.id(), channel);
         reply.accept().await;
@@ -269,6 +275,16 @@ impl server::Handler for Peer {
                     .append(true)
                     .open(self.root.join("split-inputs").join(c.to_string()))?
                     .write_all(data)?;
+                if self.root.join("notification-fixture").is_file() {
+                    if let Some(outbound) = data.strip_prefix(b"notification-fixture:") {
+                        s.data(c, outbound.to_vec())?;
+                        return Ok(());
+                    }
+                    if data.starts_with(b"\x1b]99;") {
+                        // Record real terminal replies without reflecting them back as requests.
+                        return Ok(());
+                    }
+                }
                 let report: Option<&[u8]> = match data {
                     b"report-foreign" => Some(b"\x1b]7;file://unrelated.invalid/srv/foreign\x1b\\\r\nforeign-reported\r\n"),
                     b"report-current" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-reported\r\n"),
@@ -1038,6 +1054,8 @@ mod in_band_resize;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
+#[path = "sftp/kitty_text_width.rs"]
+mod kitty_text_width;
 #[path = "sftp/local_forward.rs"]
 mod local_forward;
 #[cfg(feature = "ui-smoke")]
@@ -1058,6 +1076,8 @@ mod text_preview;
 mod text_save;
 #[path = "sftp/upload_folder.rs"]
 mod upload_folder;
+#[path = "sftp/xterm_other_keys.rs"]
+mod xterm_other_keys;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {

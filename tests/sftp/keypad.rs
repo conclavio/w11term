@@ -4,6 +4,7 @@ use super::*;
 enum Keys {
     Keypad,
     PhysicalLayout,
+    XtermLevelThree,
 }
 
 struct Captured {
@@ -40,8 +41,11 @@ async fn capture(mode: &[u8], keys: Keys) -> Captured {
         .arg(state.path())
         .arg("-Trace")
         .arg(&trace);
-    if !mode.is_empty() {
+    if !mode.is_empty() && !matches!(keys, Keys::XtermLevelThree) {
         driver.arg("-Kitty");
+    }
+    if matches!(keys, Keys::XtermLevelThree) {
+        driver.arg("-XtermOtherKeys");
     }
     if matches!(keys, Keys::PhysicalLayout) {
         driver.arg("-PhysicalLayout");
@@ -59,7 +63,7 @@ async fn capture(mode: &[u8], keys: Keys) -> Captured {
     assert_eq!(opens.load(Ordering::Relaxed), 1);
     server.abort();
     let logical = match keys {
-        Keys::Keypad => None,
+        Keys::Keypad | Keys::XtermLevelThree => None,
         Keys::PhysicalLayout => {
             let value = fs::read_to_string(state.path().join("logical-scalar.txt")).unwrap();
             Some(char::from_u32(value.trim().parse().unwrap()).unwrap())
@@ -153,4 +157,13 @@ async fn native_physical_layout_preserves_legacy_text() {
     let capture = capture(b"", Keys::PhysicalLayout).await;
     let key = capture.logical.unwrap();
     assert_eq!(capture.wire, format!("{key}{key}{key}\x1b[24~").as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "checks native main Enter, Tab, Space and keypad Enter in xterm report-all mode over SSH"]
+async fn native_xterm_other_keys_reports_only_ordinary_keys_in_level_three() {
+    let wire = capture(b"\x1b[>4;3m\x1b[>4;1f", Keys::XtermLevelThree)
+        .await
+        .wire;
+    assert_eq!(wire, b"\x1b[13;1u\r\x1b[9;1u\x1b[32;1u\x1b[24~");
 }

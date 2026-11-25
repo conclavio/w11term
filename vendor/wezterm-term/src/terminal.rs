@@ -94,6 +94,11 @@ pub struct ShellCommandCompletion<'a> {
 pub trait AlertHandler: Send + Sync {
     fn alert(&mut self, alert: Alert);
 
+    /// A Kitty OSC 99 request. The embedding decides how to display notifications.
+    fn kitty_notification(&mut self, _metadata: &[u8], _payload: &[u8]) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Live primary-screen markers and the command capture they opened or completed.
     fn semantic_prompt(
         &mut self,

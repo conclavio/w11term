@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    num::NonZeroUsize,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -89,6 +90,13 @@ pub enum Request {
     },
     List,
     ListSshGroups,
+    ListSavedSshGroups {
+        window_id: WindowId,
+    },
+    OpenSshGroup {
+        window_id: WindowId,
+        name: String,
+    },
     GetSshGroupRoster {
         window_id: WindowId,
         tab_id: u64,
@@ -96,15 +104,79 @@ pub enum Request {
     WaitSshGroupReady {
         window_id: WindowId,
         tab_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_ids: Option<Vec<u64>>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
+    },
+    SubmitSshGroupCommand {
+        window_id: WindowId,
+        tab_id: u64,
+        pane_ids: Vec<u64>,
+        command: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canary_pane_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parallel_limit: Option<NonZeroUsize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_expiry_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_on_failure: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect_output: Option<SshGroupExpectedOutput>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_output: Option<PathBuf>,
     },
     GetSshGroupRun {
         window_id: WindowId,
         tab_id: u64,
         run_id: u64,
     },
+    GetSshGroupRetryPlan {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+    },
+    RetrySshGroupRun {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane_ids: Vec<u64>,
+    },
+    SshGroupQueue {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        action: SshGroupQueueAction,
+    },
+    InterruptSshGroupCommand {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane_id: u64,
+    },
+    SaveSshGroupReport {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        path: PathBuf,
+        #[serde(default)]
+        format: SshGroupReportFormat,
+        #[serde(default)]
+        overwrite: bool,
+    },
     WaitSshGroupRun {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
+    WaitSshGroupApproval {
         window_id: WindowId,
         tab_id: u64,
         run_id: u64,
@@ -208,16 +280,59 @@ pub enum UiRequest {
     ListSshGroups {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    ListSavedSshGroups {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    OpenSshGroup {
+        name: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     GetSshGroupRoster {
         tab_id: u64,
-        wait_for_readiness: bool,
+        readiness: Option<SshGroupReadiness>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    SubmitSshGroupCommand {
+        tab_id: u64,
+        pane_ids: Vec<u64>,
+        command: String,
+        options: Box<SshGroupCommandOptions>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     GetSshGroupRun {
         tab_id: u64,
         run_id: u64,
-        wait_for_settlement: bool,
+        wait_for: Option<SshGroupRunWait>,
         reply: oneshot::Sender<Result<Value, String>>,
+    },
+    GetSshGroupRetryPlan {
+        tab_id: u64,
+        run_id: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    RetrySshGroupRun {
+        tab_id: u64,
+        run_id: u64,
+        pane_ids: Vec<u64>,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    SshGroupQueue {
+        tab_id: u64,
+        run_id: u64,
+        action: SshGroupQueueAction,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    InterruptSshGroupCommand {
+        tab_id: u64,
+        run_id: u64,
+        pane_id: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    CaptureSshGroupReport {
+        tab_id: u64,
+        run_id: u64,
+        format: SshGroupReportFormat,
+        reply: oneshot::Sender<Result<SshGroupReportWriter, String>>,
     },
     ReadSshGroupOutput {
         tab_id: u64,
@@ -246,9 +361,23 @@ impl UiRequest {
             Self::Open { reply, .. }
             | Self::Resize { reply, .. }
             | Self::ListSshGroups { reply }
+            | Self::ListSavedSshGroups { reply }
+            | Self::OpenSshGroup { reply, .. }
             | Self::GetSshGroupRoster { reply, .. }
-            | Self::GetSshGroupRun { reply, .. } => reply,
+            | Self::SubmitSshGroupCommand { reply, .. }
+            | Self::GetSshGroupRun { reply, .. }
+            | Self::GetSshGroupRetryPlan { reply, .. }
+            | Self::SshGroupQueue { reply, .. }
+            | Self::InterruptSshGroupCommand { reply, .. } => reply,
             Self::ReadSshGroupOutput { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
+            Self::RetrySshGroupRun { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
+            Self::CaptureSshGroupReport { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
                 return;
             }
@@ -257,7 +386,12 @@ impl UiRequest {
     }
 }
 
-pub use ssh_groups::SshGroupOutput;
+pub use ssh_groups::{
+    SshGroupCommandOptions, SshGroupDispatchOverrides, SshGroupExpectedOutput, SshGroupOutput,
+    SshGroupQueueAction, SshGroupReadiness, SshGroupReportFormat, SshGroupReportWriter,
+    SshGroupRunWait,
+};
+pub use ssh_groups::{validate_group_panes, validate_group_submission};
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -512,22 +646,34 @@ impl Registry {
             Request::WorkspaceIdentity => Ok(json!(self.legacy_workspace())),
             Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
             Request::ListSshGroups => self.list_ssh_groups().await,
+            Request::ListSavedSshGroups { window_id } => {
+                self.list_saved_ssh_groups(window_id).await
+            }
+            Request::OpenSshGroup { window_id, name } => self.open_ssh_group(window_id, name).await,
             Request::GetSshGroupRoster { window_id, tab_id } => {
                 self.query_ssh_group_roster(window_id, tab_id, None).await
             }
             Request::WaitSshGroupReady {
                 window_id,
                 tab_id,
+                pane_ids,
                 timeout_seconds,
             } => {
                 ensure!(
                     (1..=3600).contains(&timeout_seconds),
                     "SSH group wait timeout must be 1..=3600 seconds"
                 );
+                let readiness = match pane_ids {
+                    Some(panes) => {
+                        validate_group_panes(&panes)?;
+                        SshGroupReadiness::Panes(panes)
+                    }
+                    None => SshGroupReadiness::CheckedShown,
+                };
                 self.query_ssh_group_roster(
                     window_id,
                     tab_id,
-                    Some(Duration::from_secs(timeout_seconds)),
+                    Some((Duration::from_secs(timeout_seconds), readiness)),
                 )
                 .await
             }
@@ -539,21 +685,105 @@ impl Registry {
                 self.query_ssh_group_run(window_id, tab_id, run_id, None)
                     .await
             }
+            Request::GetSshGroupRetryPlan {
+                window_id,
+                tab_id,
+                run_id,
+            } => self.ssh_group_retry_plan(window_id, tab_id, run_id).await,
+            Request::RetrySshGroupRun {
+                window_id,
+                tab_id,
+                run_id,
+                pane_ids,
+            } => {
+                self.retry_ssh_group_run(window_id, tab_id, run_id, pane_ids)
+                    .await
+            }
+            Request::SshGroupQueue {
+                window_id,
+                tab_id,
+                run_id,
+                action,
+            } => {
+                self.change_ssh_group_queue(window_id, tab_id, run_id, action)
+                    .await
+            }
+            Request::InterruptSshGroupCommand {
+                window_id,
+                tab_id,
+                run_id,
+                pane_id,
+            } => {
+                ensure!(pane_id != 0, "pane IDs must be positive");
+                self.interrupt_ssh_group_command(window_id, tab_id, run_id, pane_id)
+                    .await
+            }
+            Request::SaveSshGroupReport {
+                window_id,
+                tab_id,
+                run_id,
+                path,
+                format,
+                overwrite,
+            } => {
+                self.save_ssh_group_report(window_id, tab_id, run_id, path, format, overwrite)
+                    .await
+            }
+            Request::SubmitSshGroupCommand {
+                window_id,
+                tab_id,
+                pane_ids,
+                command,
+                dry_run,
+                canary_pane_id,
+                parallel_limit,
+                interval_ms,
+                queue_expiry_ms,
+                stop_on_failure,
+                expect_output,
+                record_output,
+            } => {
+                validate_group_submission(&pane_ids, &command, canary_pane_id)?;
+                let options = SshGroupCommandOptions::prepare(
+                    dry_run,
+                    SshGroupDispatchOverrides {
+                        canary_pane_id,
+                        parallel_limit,
+                        interval_ms,
+                        queue_expiry_ms,
+                        stop_on_failure,
+                    },
+                    expect_output,
+                    record_output,
+                )?;
+                self.submit_ssh_group_command(window_id, tab_id, pane_ids, command, options)
+                    .await
+            }
             Request::WaitSshGroupRun {
                 window_id,
                 tab_id,
                 run_id,
                 timeout_seconds,
             } => {
-                ensure!(
-                    (1..=3600).contains(&timeout_seconds),
-                    "SSH group wait timeout must be 1..=3600 seconds"
-                );
                 self.query_ssh_group_run(
                     window_id,
                     tab_id,
                     run_id,
-                    Some(Duration::from_secs(timeout_seconds)),
+                    Some((SshGroupRunWait::Settlement, timeout_seconds)),
+                )
+                .await
+            }
+            Request::WaitSshGroupApproval {
+                window_id,
+                tab_id,
+                run_id,
+                timeout_seconds,
+            } => {
+                self.query_ssh_group_run(
+                    window_id,
+                    tab_id,
+                    run_id,
+                    Some((SshGroupRunWait::CanaryApproval, timeout_seconds)),
                 )
                 .await
             }
@@ -948,6 +1178,7 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitSshGroupRun { .. }
+                        | Request::WaitSshGroupApproval { .. }
                         | Request::WaitSshGroupOutput { .. }
                         | Request::FollowSshGroupOutput { .. }
                         | Request::WaitSshGroupReady { .. }
@@ -1294,6 +1525,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupRun {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshGroupApproval {
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupOutput {

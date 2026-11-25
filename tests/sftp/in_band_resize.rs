@@ -8,7 +8,7 @@ pub(super) enum Wire {
     Input(ChannelId, Vec<u8>),
 }
 
-struct WireReader(mpsc::UnboundedReceiver<Wire>);
+pub(super) struct WireReader(pub(super) mpsc::UnboundedReceiver<Wire>);
 
 impl WireReader {
     async fn next(&mut self) -> Wire {
@@ -18,14 +18,14 @@ impl WireReader {
             .expect("SSH peer closed")
     }
 
-    async fn shell(&mut self) -> (ChannelId, server::Handle) {
+    pub(super) async fn shell(&mut self) -> (ChannelId, server::Handle) {
         let Wire::Shell(id, handle) = self.next().await else {
             panic!("expected a new SSH shell")
         };
         (id, handle)
     }
 
-    async fn window(&mut self, channel: ChannelId, expected: [u32; 4]) {
+    pub(super) async fn window(&mut self, channel: ChannelId, expected: [u32; 4]) {
         match self.next().await {
             Wire::Window(id, dimensions) => {
                 assert_eq!(id, channel);
@@ -36,7 +36,7 @@ impl WireReader {
         }
     }
 
-    async fn input(&mut self, channel: ChannelId, expected: &[u8]) {
+    pub(super) async fn input(&mut self, channel: ChannelId, expected: &[u8]) {
         // Replies are byte streams; SSH may fragment a single reply.
         let mut actual = Vec::new();
         while actual.len() < expected.len() {
@@ -66,6 +66,65 @@ fn size(cols: usize, rows: usize, pixel_width: usize, pixel_height: usize) -> Te
         pixel_height,
         dpi: 96,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cell_size_queries_report_logical_and_physical_geometry_at_fractional_dpi() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (source, _temp, _, server) = fixture_with_wire(false, 1, Arc::default(), Some(tx)).await;
+    let session = Session::start_sized(
+        source,
+        TerminalSize {
+            dpi: 120,
+            ..size(80, 24, 880, 552)
+        },
+    );
+    let mut wire = WireReader(rx);
+    let (channel, peer) = wire.shell().await;
+    for (request, reply) in [
+        (
+            b"\x1b]1337;ReportCellSize\x07\x1b[16t\x1b[14t".as_slice(),
+            b"\x1b]1337;ReportCellSize=18.4;8.8;1.25\x1b\\\x1b[6;23;11t\x1b[4;552;880t".as_slice(),
+        ),
+        (
+            b"\x1b[H\x1b]1337;ReportCellSize=18.4;8.8;1.25\x1b\\\x1b[6n".as_slice(),
+            b"\x1b[1;1R".as_slice(),
+        ),
+    ] {
+        peer.data(channel, request).await.unwrap();
+        wire.input(channel, reply).await;
+    }
+
+    session
+        .input
+        .send(Command::Resize(TerminalSize {
+            dpi: 144,
+            ..size(80, 24, 960, 576)
+        }))
+        .unwrap();
+    wire.window(channel, [80, 24, 960, 576]).await;
+    peer.data(
+        channel,
+        b"\x1b]1337;ReportCellSize\x1b\\\x1b[16t".as_slice(),
+    )
+    .await
+    .unwrap();
+    wire.input(
+        channel,
+        b"\x1b]1337;ReportCellSize=16.0;8.0;1.5\x1b\\\x1b[6;24;12t",
+    )
+    .await;
+    session
+        .input
+        .send(Command::Resize(size(80, 24, 800, 480)))
+        .unwrap();
+    wire.window(channel, [80, 24, 800, 480]).await;
+    peer.data(channel, b"\x1b]1337;ReportCellSize\x07".as_slice())
+        .await
+        .unwrap();
+    wire.input(channel, b"\x1b]1337;ReportCellSize=20.0;10.0;1.0\x1b\\")
+        .await;
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2,6 +2,8 @@ use crate::input::*;
 use crate::TerminalState;
 use std::io::Write;
 use termwiz::input::{KeyCodeEncodeModes, KeyboardEncoding};
+use wezterm_escape_parser::csi::XtermOtherKeys;
+use wezterm_input_types::ctrl_mapping;
 
 impl TerminalState {
     /// Encoding used to send key events, including the configured CSI u fallback.
@@ -11,6 +13,27 @@ impl TerminalState {
                 KeyboardEncoding::CsiU
             }
             enc => enc,
+        }
+    }
+
+    /// Current xterm modified-key level and whether it uses CSI u.
+    pub fn xterm_other_keys(&self) -> (u8, bool) {
+        (self.modify_other_keys, self.format_other_keys_csi_u)
+    }
+
+    pub(super) fn perform_xterm_other_keys(&mut self, operation: XtermOtherKeys) {
+        let (level, csi_u) = self.xterm_other_keys();
+        match operation {
+            XtermOtherKeys::Disable => self.modify_other_keys = 0,
+            XtermOtherKeys::SetFormat(csi_u) => self.format_other_keys_csi_u = csi_u,
+            XtermOtherKeys::QueryLevel => {
+                write!(self.writer, "\x1b[>4;{level}m").ok();
+                self.writer.flush().ok();
+            }
+            XtermOtherKeys::QueryFormat => {
+                write!(self.writer, "\x1b[>4;{}f", u8::from(csi_u)).ok();
+                self.writer.flush().ok();
+            }
         }
     }
 
@@ -48,13 +71,29 @@ impl TerminalState {
         mods: KeyModifiers,
         is_down: bool,
     ) -> anyhow::Result<String> {
+        if is_down && self.effective_keyboard_encoding() == KeyboardEncoding::Xterm {
+            let (level, csi_u) = self.xterm_other_keys();
+            if let Some(encoded) = encode_xterm_other_key(key, mods, level, csi_u) {
+                return Ok(encoded);
+            }
+        }
+        self.encode_keypad_key(key, mods, is_down)
+    }
+
+    /// The keypad follows the usual cursor and keyboard modes independently of modifyOtherKeys.
+    pub fn encode_keypad_key(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        is_down: bool,
+    ) -> anyhow::Result<String> {
         Ok(key.encode(
             mods,
             KeyCodeEncodeModes {
                 encoding: self.effective_keyboard_encoding(),
                 newline_mode: self.newline_mode,
                 application_cursor_keys: self.application_cursor_keys,
-                modify_other_keys: self.modify_other_keys,
+                modify_other_keys: None,
             },
             is_down,
         )?)
@@ -67,4 +106,52 @@ impl TerminalState {
     pub fn key_down(&mut self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
         self.key_up_down(key, mods, true)
     }
+}
+
+fn encode_xterm_other_key(
+    key: KeyCode,
+    mods: KeyModifiers,
+    level: u8,
+    csi_u: bool,
+) -> Option<String> {
+    if level == 0 {
+        return None;
+    }
+    let modifier = mods.encode_xterm();
+    let character = match key {
+        KeyCode::Char(c) if !c.is_control() => c,
+        KeyCode::Enter | KeyCode::Char('\r') => '\r',
+        KeyCode::Tab | KeyCode::Char('\t') => '\t',
+        KeyCode::Escape | KeyCode::Char('\x1b') => '\x1b',
+        KeyCode::Backspace | KeyCode::Char('\x08') => {
+            if mods.contains(KeyModifiers::CTRL) {
+                '\x08'
+            } else {
+                '\x7f'
+            }
+        }
+        _ => return None,
+    };
+    let report = match level {
+        // Preserve traditional control aliases, Backtab, and Windows Alt-prefix input.
+        1 if matches!(character, '\r' | '\t') => mods.contains(KeyModifiers::CTRL),
+        1 if !character.is_control() => {
+            mods.contains(KeyModifiers::CTRL) && ctrl_mapping(character).is_none()
+        }
+        2 if matches!(character, '\x08' | '\x7f') => {
+            mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        }
+        2 => modifier != 0,
+        3 => true,
+        _ => false,
+    };
+    report.then(|| {
+        let character = u32::from(character);
+        let modifier = modifier + 1;
+        if csi_u {
+            format!("\x1b[{character};{modifier}u")
+        } else {
+            format!("\x1b[27;{modifier};{character}~")
+        }
+    })
 }

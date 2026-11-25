@@ -384,6 +384,22 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches bookmarked SSH history using the native Windows command palette and UIA"]
+async fn native_bookmark_search_reveals_the_selected_history_and_restores_input() {
+    let mut history = String::from("Deploy Alpha checkpoint\r\nDeploy Omega checkpoint\r\n");
+    for row in 0..200 {
+        history.push_str(&format!("deploy-log-{row:03}\r\n"));
+    }
+    history.push_str("deploy-stream-ready");
+    run_palette_fixture(
+        "scrollback-bookmark-ui.ps1",
+        b"after-bookmark",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives pointer boundaries and capture across a live SSH and PowerShell split"]
 async fn native_pixel_mouse_leave_follows_the_pointer_and_preserves_capture() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
@@ -594,6 +610,50 @@ async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
     // shell quiet so only the requested VT sequences can move the test cursor.
     drive_mixed_gui("cursor-blink-ui.ps1", &ssh, state.path());
     assert_eq!(shells.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "samples the visual bell outline on a muted SSH split beside another focused pane"]
+async fn native_visual_bell_outlines_only_the_originating_pane() {
+    let (Source::Ssh(mut ssh), _remote, shells, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    ssh.player.mute = true;
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("visual-bell-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reads native pointer handles across two SSH splits and an alternate screen"]
+async fn native_pointer_shape_is_scoped_to_the_hovered_ssh_pane() {
+    let (Source::Ssh(ssh), _remote, shells, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("pointer-shape-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "activates Kitty notification buttons in a native inbox with two loopback SSH panes"]
+async fn native_kitty_notifications_use_the_originating_ssh_pane() {
+    let (Source::Ssh(ssh), remote, shells, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::create_dir(remote.path().join("split-inputs")).unwrap();
+    fs::write(remote.path().join("notification-fixture"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("kitty-notification-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
     server.abort();
 }
 
@@ -1024,8 +1084,8 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
     .unwrap();
     drive_gui("ssh-host-group-ui.ps1", state.path());
     let expected: [&[u8]; 2] = [
-        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\rrecord-fast\rrecord-one\r",
-        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\ralt",
+        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\rrecord-fast\rrecord-one\rcheck-expected\rcheck-each-host\rcli-expect\r",
+        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\raltprompt\x1b[200~check-each-host\x1b[201~\raltprompt\x1b[200~cli-only  west\x1b[201~\r\x1b[200~cli-expect\x1b[201~\r",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
         assert_eq!(
@@ -1456,6 +1516,56 @@ async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens saved SSH groups in the background with the real CLI and WinUI"]
+async fn native_cli_opens_saved_ssh_groups_without_switching_tabs() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["West", "East"] {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (Source::Ssh(ssh), root, _, server) =
+            fixture_counting_accepts(false, 2, accepted.clone()).await
+        else {
+            unreachable!()
+        };
+        fs::write(
+            root.path().join("copy-history.vt"),
+            b"\x1b]133;A\x07ready$ \x1b]133;B\x07",
+        )
+        .unwrap();
+        let gate = root.path().join("hold-session-open");
+        fs::write(&gate, b"").unwrap();
+        fs::write(
+            state.path().join(format!("{name}-gate")),
+            gate.to_str().unwrap(),
+        )
+        .unwrap();
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((root, accepted, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {
+                "Fleet Ops": ["West", "East"],
+                "Broken Ops": ["West", "not-in-catalog"],
+            },
+            "ssh_host_group_defaults": {
+                "Fleet Ops": {"login_limit":"one", "require_all_ready":true},
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-cli-open-ui.ps1", state.path());
+    for (_, accepted, server) in peers {
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens a saved group in a second native window and closes just its sessions"]
 async fn native_saved_ssh_group_opens_in_an_independent_window() {
     let state = tempfile::tempdir().unwrap();
@@ -1577,11 +1687,16 @@ async fn native_ssh_group_bounds_parallel_commands() {
                         let Some(line) = input.strip_suffix('\r') else {
                             continue;
                         };
-                        if line == "pace" {
+                        let paced = match line {
+                            "pace" => Some("pace"),
+                            "verify-pacing" => Some("verify-pacing"),
+                            _ => None,
+                        };
+                        if let Some(command) = paced {
                             arrivals
                                 .lock()
                                 .unwrap()
-                                .insert(name, std::time::Instant::now());
+                                .insert((command, name), std::time::Instant::now());
                         }
                         if name == "East" && line == "inspect" {
                             assert!(
@@ -1596,6 +1711,18 @@ async fn native_ssh_group_bounds_parallel_commands() {
                                 "West received the command without approval"
                             );
                         }
+                        if name == "East" && line == "verify-override" {
+                            assert!(
+                                fixtures.join("approve-verify-override").is_file(),
+                                "East received the override before West was approved"
+                            );
+                        }
+                        if name == "East" && line == "verify-parallel" {
+                            assert!(
+                                fixtures.join("release-verify-parallel").is_file(),
+                                "East received the command while the serial West slot was occupied"
+                            );
+                        }
                         let handle = peer.as_ref().unwrap();
                         handle
                             .data(
@@ -1605,7 +1732,7 @@ async fn native_ssh_group_bounds_parallel_commands() {
                             )
                             .await
                             .unwrap();
-                        if name == "West" && line != "pace" {
+                        if name == "West" && paced.is_none() {
                             let gate = fixtures.join(format!("release-{line}"));
                             while !gate.is_file() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1618,9 +1745,12 @@ async fn native_ssh_group_bounds_parallel_commands() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }
-                        let status = match line {
-                            "halt-on-failure" | "canary-fails" => ";17",
-                            "canary-unknown" => "",
+                        let status = match (name, line) {
+                            (_, "halt-on-failure" | "canary-fails")
+                            | ("West", "policy-stop" | "policy-continue" | "policy-canary") => {
+                                ";17"
+                            }
+                            (_, "canary-unknown") => "",
                             _ => ";0",
                         };
                         let end = format!("{name} finished {line}\r\n\x1b]133;D{status}\x07");
@@ -1647,21 +1777,25 @@ async fn native_ssh_group_bounds_parallel_commands() {
     .unwrap();
     drive_gui("ssh-host-group-command-limit-ui.ps1", state.path());
     let arrivals = paced_arrivals.lock().unwrap();
-    let elapsed = arrivals["East"].saturating_duration_since(arrivals["West"]);
-    // Allow for SSH packet delivery jitter. The queue deadline itself has an exact unit test.
-    assert!(
-        elapsed >= Duration::from_millis(4750),
-        "paced sends arrived {elapsed:?} apart"
-    );
+    for (command, minimum_ms) in [("pace", 4_750), ("verify-pacing", 950)] {
+        let east = arrivals[&(command, "East")];
+        let west = arrivals[&(command, "West")];
+        let elapsed = east.saturating_duration_since(west);
+        // Allow for SSH packet delivery jitter. The queue interval has an exact unit test.
+        assert!(
+            elapsed >= Duration::from_millis(minimum_ms),
+            "{command} reached East {elapsed:?} after West"
+        );
+    }
     drop(arrivals);
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
             "West" => {
-                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\r"
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\rverify-pacing\rverify-expiry\rpolicy-stop\rpolicy-continue\rpolicy-canary\r"
                     .as_slice()
             }
             "East" => {
-                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\r"
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\rverify-pacing\rpolicy-stop\rpolicy-continue\r"
             }
             _ => b"xrestore-promptskip-middle\r",
         };

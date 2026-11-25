@@ -4,7 +4,9 @@ use super::{
 };
 use anyhow::{Context, Result};
 use std::{fmt::Write as _, io, sync::Arc, time::Instant};
-use w11term::events::{GroupCommandResult, GroupQueueActivity};
+use w11term::events::{
+    GroupCommandResult, GroupOutputExpectation, GroupOutputExpectationState, GroupQueueActivity,
+};
 use wezterm_term::CompletedCommand;
 
 mod json;
@@ -14,12 +16,21 @@ const OUTPUT_END: &str = "\r\n";
 const OUTPUT_SHORTENED: &str = "[Output shortened to fit the clipboard]\r\n";
 const OUTPUT_PREVIEW: &str = "  Output preview · full output unavailable\r\n";
 
+pub(super) fn output_expectation_caption(state: GroupOutputExpectationState) -> &'static str {
+    match state {
+        GroupOutputExpectationState::Matched => "Expected output matched",
+        GroupOutputExpectationState::Missing => "Expected output missing",
+        GroupOutputExpectationState::Unverified => "Could not verify expected output",
+    }
+}
+
 pub(super) struct Report {
     id: u64,
     label: String,
     kind: json::Kind,
     dispatch_policy: Option<dispatch_policy::Policy>,
     queue_activity: GroupQueueActivity,
+    output_expectation: Option<Arc<GroupOutputExpectation>>,
     total_recipient_count: Option<usize>,
     sections: Vec<Section>,
 }
@@ -111,6 +122,7 @@ impl Report {
         rows: impl IntoIterator<Item = (&'a Delivery, Option<GroupExecution>)>,
         mut retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
     ) -> Self {
+        let output_expectation = submission.transcript.output_expectation();
         let sections: Vec<_> = rows
             .into_iter()
             .map(|(delivery, execution)| {
@@ -126,6 +138,13 @@ impl Report {
                 }
                 if let Some(interrupt) = delivery.interrupt_caption() {
                     let _ = writeln!(heading, "  {interrupt}\r");
+                }
+                let expected = output_expectation
+                    .as_ref()
+                    .and_then(|check| check.hosts.get(&delivery.target.pane))
+                    .map(|host| host.state);
+                if let Some(state) = expected {
+                    let _ = writeln!(heading, "  {}\r", output_expectation_caption(state));
                 }
                 let output = if let Some(GroupExecution::Finished(result)) = &execution {
                     match &result.output {
@@ -161,6 +180,7 @@ impl Report {
                         &submission.content,
                         execution.as_ref(),
                         now,
+                        expected,
                     ),
                     output,
                 }
@@ -173,6 +193,7 @@ impl Report {
             kind: json::Kind::of(&submission.content),
             dispatch_policy: submission.dispatch_policy.clone(),
             queue_activity: submission.transcript.queue_activity(),
+            output_expectation,
             total_recipient_count: (sections.len() < submission.results.len())
                 .then_some(submission.results.len()),
             sections,
@@ -190,6 +211,20 @@ impl Report {
             );
         }
         header.push_str(&queue_activity::text(&self.queue_activity));
+        if let Some(check) = &self.output_expectation {
+            let rule = &check.rule;
+            let pattern = if rule.regex { "Regex" } else { "Literal" };
+            let case = if rule.match_case {
+                "Match case"
+            } else {
+                "Ignore case"
+            };
+            let _ = writeln!(
+                header,
+                "Expected output · {} · {pattern} · {case}\r",
+                rule.query
+            );
+        }
         header
     }
 
@@ -253,9 +288,8 @@ impl Report {
 mod tests {
     use super::*;
     use crate::app::host_groups::{
-        CommandOffer, Delivery, DeliveryStatus, GroupInterruptTarget, SshGroupCommandInterval,
-        SshGroupParallelLimit, SshGroupQueueExpiry, SubmissionContent, Target, TargetState,
-        filter::Names,
+        CommandOffer, Delivery, DeliveryStatus, GroupInterruptTarget, SubmissionContent, Target,
+        TargetState, filter::Names,
     };
     use std::{collections::BTreeMap, time::Duration};
     use tokio::sync::{oneshot, watch};
@@ -301,11 +335,13 @@ mod tests {
             id: 1,
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
+            control_recording: None,
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
             control_waiters: Vec::new(),
+            unsent_retries: BTreeMap::new(),
             output_lifetime: None,
             transcript: Default::default(),
             results: vec![
@@ -322,9 +358,9 @@ mod tests {
                     .iter()
                     .map(|delivery| delivery.target.clone())
                     .collect(),
-                limit: SshGroupParallelLimit::Two,
-                interval: SshGroupCommandInterval::HalfSecond,
-                queue_expiry: SshGroupQueueExpiry::FiveSeconds,
+                parallel_limit: Some(2),
+                interval: Duration::from_millis(500),
+                queue_expiry: Some(Duration::from_secs(5)),
                 stop_queue_on_failure: true,
                 canary: Some(7),
                 notify_canary: false,
@@ -428,11 +464,13 @@ mod tests {
             id: 1,
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
+            control_recording: None,
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
             control_waiters: Vec::new(),
+            unsent_retries: BTreeMap::new(),
             output_lifetime: None,
             transcript: Default::default(),
             results: vec![
@@ -507,11 +545,13 @@ mod tests {
                 (9, "export POLYSH_RANK=2".into()),
             ])),
             recording: Default::default(),
+            control_recording: None,
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
             control_waiters: Vec::new(),
+            unsent_retries: BTreeMap::new(),
             output_lifetime: None,
             transcript: Default::default(),
             results: vec![captured(7, String::new(), false), running, pending],

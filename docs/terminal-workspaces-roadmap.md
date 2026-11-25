@@ -88,6 +88,8 @@ Add Windows IME composition and candidate positioning for the focused pane. Expo
 
 **Acceptance.** Compose and commit text with a Windows IME while switching between panes, read a terminal selection with Narrator, and compare representative text and image fixtures against reference renders. Check that idle panes stay idle and a continuously updating pane leaves its neighbor responsive.
 
+**Visual bell.** Offer a brief outline on the originating visible pane, independent of bell audio, with a per-pane rate limit and the same inbox history for hidden panes.
+
 ## Release 5 · Local PowerShell via ConPTY
 
 Add **Local PowerShell** to the same **+** and split menus as SSH profiles. A local profile identifies a Windows executable, its arguments and an optional starting directory. Offer PowerShell 7 (`pwsh.exe`) when installed and Windows PowerShell (`powershell.exe`) under its own label. A saved workspace records which executable to launch. Reopening it starts a fresh local process.
@@ -237,6 +239,37 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 121. **Resume group output waits from a line ID.** Wait for the next marker in the same run and report gaps in the combined or pane-specific retained feed.
 122. **Read retained group output in batches.** Return ordered host-labeled lines, retention gaps, and a cursor the next read or wait can use.
 123. **Follow group output from the CLI.** Stream retained and incoming lines in order over one connection, with a final settlement cursor and explicit history gaps or errors.
+124. **Notify on a live group output match.** Arm a one-shot alert using the current search and host filter. Show the matching host and a short excerpt in the window's Attention inbox, linked to the original run.
+125. **Review the output around an alert.** Open the exact matched line and nearby retained output from its source pane. Keep the saved alert excerpt available after the live history expires.
+126. **Review and cancel armed output alerts from run results.** Show the saved query, match options, and host scope in both live output and results, with a cancel action in each view.
+127. **Find armed output alerts across tabs.** Search the window by query, host scope, group title, command, or run number, and open the owning run without losing its active Live output view.
+128. **Arm an output alert before sending a command.** Review the recipients and search rule together, then attach the one-shot matcher before the first host can emit output.
+129. **Record a run and alert on its output.** Choose a file from the send-with-alert review and attach both the full recorder and the one-shot matcher before dispatch.
+130. **Save reusable output alert rules.** Name a query and its matching options from Live output or send review, then load it into a new run with the current host scope.
+131. **Alert on missing expected output.** Check a pre-armed query across all selected hosts until settlement. Distinguish confirmed absence from incomplete delivery or capture.
+132. **Require expected output from each recipient.** Track the hosts that match independently, and identify hosts with missing or unverified output in the run results.
+133. **Report per-recipient output checks.** Preserve matched, missing, and unverified outcomes in copied results, saved reports, and the CLI run detail.
+134. **Submit SSH group commands from the CLI.** Validate an explicit list of ready panes in an existing group, then return a run ID for settlement and output queries. Preserve the active tab and the group's draft and selection.
+135. **Arm output checks on CLI submissions.** Attach a literal or regular-expression expectation before dispatch and report whether each named host produced it.
+136. **Open saved SSH groups from the CLI.** Launch the saved roster in an explicit window with its own login limit and defaults. Return the new group's ID and ordered pane IDs while leaving the active tab in place.
+137. **Discover saved SSH groups from the CLI.** Read a window's current catalog and return exact group names, ordered profiles, saved defaults, and launch eligibility.
+138. **Record SSH group output from CLI submissions.** Prepare a new transcript before dispatch and surface the final writer status in the run reply.
+139. **Export retained SSH group reports from the CLI.** Save the full JSON or text run report, including captured output, from an explicit background group tab.
+140. **Wait for explicitly named SSH panes.** Use the same pane IDs for readiness and command submission so UI filters and checks can change independently.
+141. **Control SSH dispatch queues from the CLI.** Pause, resume, or stop unsent commands on a retained run and return its queue state and remaining count.
+142. **Approve SSH canary runs from the CLI.** Report the canary pane while the gate is active. Require explicit approval of that pane after a verified successful exit before releasing the remaining hosts.
+143. **Choose an SSH canary per CLI submission.** Select a named recipient as the canary for a single run. Apply the same approval gate to recorded and unrecorded commands.
+144. **Skip an unsent SSH host from the CLI.** Withhold a command from one pane in a retained run while the rest of the queue continues under its existing policy.
+145. **Preview SSH group commands from the CLI.** Validate a submission and show the planned recipients and dispatch policy before sending or opening a recording.
+146. **Interrupt a verified SSH group command from the CLI.** Address one running recipient by window, tab, run, and pane. Recheck the command and connection immediately before sending Ctrl+C and report the write separately from the shell's exit.
+147. **Report SSH group success through the CLI exit status.** Opt into a nonzero status for a completed run with any unsuccessful recipient while keeping its full JSON report.
+148. **Set SSH parallelism per CLI submission.** Apply a positive in-flight limit to one run while preserving group defaults, prompt checks, and existing queue controls.
+149. **Set the SSH dispatch interval per CLI submission.** Pace sends with millisecond resolution and keep the group's configured delay for other runs.
+150. **Set SSH queue expiry per CLI submission.** Give unsent recipients a run-specific deadline while allowing dispatched commands to finish.
+151. **Choose whether an SSH group run stops after failure.** Override the group's failure policy for a CLI submission while preserving the canary approval gate.
+152. **Wait for SSH canary approval from a script.** Return the pending gate and exact canary pane after a verified successful exit without approving the run.
+153. **Inspect unsent SSH retries from the CLI.** List only recipients whose commands were withheld, with the original command and the current readiness of each pane.
+154. **Retry reviewed unsent SSH commands from the CLI.** Resubmit the source command to explicitly named eligible panes and link the new run to each original recipient to prevent duplicate retries.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

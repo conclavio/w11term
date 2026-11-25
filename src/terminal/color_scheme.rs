@@ -344,4 +344,203 @@ mod tests {
         assert_eq!(term.palette().colors.0[2], light.colors.0[2]);
         assert_eq!(term.palette().split, light.split);
     }
+
+    #[test]
+    fn xterm_color_stack_restores_dynamic_and_indexed_overrides_over_the_live_theme() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        term.advance_bytes(concat!(
+            "\x1b]11;#282c34\x07\x1b]4;245;#123456\x07",
+            "\x1b[#P\x1b[?1049h\x1b]10;#223344;#556677;#8899aa\x07",
+            "\x1b]17;#abcdef\x07\x1b]19;#102030\x07\x1b]4;1;#334455\x07",
+            "\x1b[#P\x1b]111\x07\x1b]112\x07\x1b]104\x07\x1b[?1049l",
+        ));
+        set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfLight);
+        term.advance_bytes(b"\x1b[#Q");
+        for (slot, value) in [
+            ("10", 0x223344),
+            ("11", 0x556677),
+            ("12", 0x8899aa),
+            ("17", 0xabcdef),
+            ("19", 0x102030),
+            ("4;1", 0x334455),
+            ("4;245", 0x123456),
+        ] {
+            assert_query(&mut term, &mut replies, slot, value);
+        }
+        assert_eq!(term.palette().cursor_border, rgb(0x8899aa));
+        term.advance_bytes(b"\x1b[0#Q");
+        let mut restored = palette(ColorScheme::OneHalfLight);
+        // The explicit write matched the original dark theme, so it still owns
+        // the background slot. Unset slots inherit the newly selected theme.
+        restored.background = rgb(0x282c34);
+        restored.colors.0[245] = rgb(0x123456);
+        assert_eq!(term.palette(), restored);
+        term.advance_bytes(b"\x1b[#R");
+        assert_eq!(
+            crate::terminal::tests::receive(&mut replies),
+            b"\x1b[?0;2#Q"
+        );
+    }
+
+    #[test]
+    fn xterm_color_stack_numbered_slots_persist_after_pop_and_transport_reset_clears_them() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        let report = |term: &mut Terminal, replies: &mut _, expected: &[u8]| {
+            term.advance_bytes(b"\x1b[#R");
+            assert_eq!(crate::terminal::tests::receive(replies), expected);
+        };
+        report(&mut term, &mut replies, b"\x1b[?0;0#Q");
+        // Feed a numbered save one byte at a time, as with packet boundaries.
+        term.advance_bytes(b"\x1b]11;#112233\x07");
+        for byte in b"\x1b[2;10#P" {
+            term.advance_bytes([*byte]);
+        }
+        report(&mut term, &mut replies, b"\x1b[?10;0#Q");
+        term.advance_bytes(b"\x1b]11;#445566\x07\x1b[#P\x1b[11;999;6#Q");
+        report(&mut term, &mut replies, b"\x1b[?10;0#Q");
+        assert_eq!(term.palette().background, rgb(0x445566));
+        term.advance_bytes(b"\x1b[10;2#Q");
+        report(&mut term, &mut replies, b"\x1b[?1;0#Q");
+        assert_eq!(term.palette().background, rgb(0x112233));
+        term.advance_bytes(b"\x1bc\x1b[10#Q");
+        report(&mut term, &mut replies, b"\x1b[?9;0#Q");
+        assert_eq!(term.palette().background, rgb(0x112233));
+        term.reset_connection();
+        term.advance_bytes(b"\x1b[10;2#Q");
+        report(&mut term, &mut replies, b"\x1b[?0;0#Q");
+        assert_eq!(term.palette(), palette(ColorScheme::OneHalfDark));
+    }
+
+    #[test]
+    fn xterm_color_stack_distinguishes_an_omitted_parameter_from_zero_and_ignores_replies() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        term.advance_bytes(b"\x1b]11;#102030\x07\x1b[999;#P\x1b]11;#abcdef\x07\x1b[0#P");
+        term.advance_bytes(b"\x1b[?2;1#Q\x1b[1:2#Q\x1b[#Q\x1b[#R");
+        assert_eq!(
+            crate::terminal::tests::receive(&mut replies),
+            b"\x1b[?0;1#Q"
+        );
+        assert_eq!(term.palette().background, rgb(0xabcdef));
+        term.advance_bytes(b"\x1b[1#Q");
+        assert_eq!(term.palette().background, rgb(0x102030));
+        term.advance_bytes(b"\x1b[2#Q");
+        assert_eq!(term.palette().background, rgb(0xabcdef));
+    }
+
+    #[test]
+    fn selection_color_overrides_publish_even_when_the_resolved_palette_is_unchanged() {
+        let (mut term, _) = engine(ColorScheme::OneHalfLight);
+        let snapshot = |term: &Terminal| Snapshot::capture(term, None, 1, 0, String::new(), 0);
+        let base = snapshot(&term);
+        term.advance_bytes(b"\x1b]17;#383a42\x07\x1b]19;#fafafa\x07\x1b[#P");
+        let styled = snapshot(&term);
+        assert_eq!(styled.palette, base.palette);
+        let mut without_overrides = styled.clone();
+        without_overrides.selection_colors = Default::default();
+        assert!(!styled.same_presentation(&without_overrides));
+        assert_eq!(styled.selection_colors.background, Some(rgb(0x383a42)));
+        assert_eq!(styled.selection_colors.foreground, Some(rgb(0xfafafa)));
+        term.advance_bytes(b"\x1b]117\x07");
+        let partial = snapshot(&term);
+        assert_eq!(partial.selection_colors.background, None);
+        assert_eq!(
+            partial.selection_colors.foreground,
+            styled.selection_colors.foreground
+        );
+        term.advance_bytes(b"\x1b]119\x07");
+        let reset = snapshot(&term);
+        assert_eq!(reset.selection_colors, base.selection_colors);
+        assert_eq!(reset.palette, base.palette);
+        term.advance_bytes(b"\x1b[#Q");
+        assert_eq!(snapshot(&term).selection_colors, styled.selection_colors);
+    }
+
+    #[test]
+    fn kitty_color_control_processes_mixed_requests_in_order() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        let request = b"\x1b]21;foreground=#3a7;foreground=?;001=rgb:f/00/aa;1=?;background=rgbi:-1/.5/+2e0;unknown=ignored;odd key=?;visual_bell=red@0.5;visual_bell=?;background=?;background;foreground=rgb:g/00/ff;foreground=?\x07";
+        for chunk in request.chunks(3) {
+            term.advance_bytes(chunk);
+        }
+        assert_eq!(crate::terminal::tests::receive(&mut replies), concat!(
+            "\x1b]21;foreground=rgb:30/a0/70;1=rgb:ff/00/aa;unknown=b2RkIGtleQ",
+            ";visual_bell=rgb:ff/00/00@0.5;background=rgb:00/80/ff;foreground=rgb:30/a0/70\x1b\\",
+        ).as_bytes());
+        assert_eq!(
+            term.palette().background,
+            palette(ColorScheme::OneHalfDark).background
+        );
+        assert_query(&mut term, &mut replies, "10", 0x30a070);
+        assert_query(&mut term, &mut replies, "4;1", 0xff00aa);
+        assert_eq!(
+            term.visual_bell_color(),
+            Some(SrgbaTuple(1.0, 0.0, 0.0, 0.5))
+        );
+    }
+
+    #[test]
+    fn kitty_color_control_sets_and_queries_every_palette_index_in_one_batch() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        let sets = (0..=255)
+            .map(|n| format!(";{n}=#{n:02x}1234"))
+            .collect::<String>();
+        term.advance_bytes(format!("\x1b]21{sets}\x1b\\"));
+        for (n, color) in term.palette().colors.0.into_iter().enumerate() {
+            assert_eq!(color, rgb((n as u32) << 16 | 0x1234));
+        }
+        let queries = (0..=255).map(|n| format!(";{n}=?")).collect::<String>();
+        term.advance_bytes(format!("\x1b]21{queries}\x1b\\"));
+        let expected = (0..=255)
+            .map(|n| format!(";{n}=rgb:{n:02x}/12/34"))
+            .collect::<String>();
+        assert_eq!(
+            crate::terminal::tests::receive(&mut replies),
+            format!("\x1b]21{expected}\x1b\\").as_bytes()
+        );
+        let too_large = "q".repeat(18 * 1024);
+        term.advance_bytes(format!("\x1b]21;1=#ffffff;{too_large};2=#ffffff\x07"));
+        assert_eq!(term.palette().colors.0[1], rgb(0x011234));
+        assert_eq!(term.palette().colors.0[2], rgb(0x021234));
+        term.advance_bytes(b"\x1b]21;255=?\x07");
+        assert_eq!(
+            crate::terminal::tests::receive(&mut replies),
+            b"\x1b]21;255=rgb:ff/12/34\x1b\\"
+        );
+    }
+
+    #[test]
+    fn kitty_palette_stack_aliases_preserve_automatic_and_fixed_colors() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        term.advance_bytes(concat!(
+            "\x1b]21;foreground=white;background=#203040;cursor=;cursor_text=;selection_background=Cyan;selection_foreground=;visual_bell=red\x07",
+            "\x1b]30001\x1b\\\x1b]21;cursor=#010203;visual_bell;selection_background;cursor_text\x07\x1b[#Q",
+        ));
+        let colors = term.palette();
+        assert_eq!(colors.cursor_bg, colors.foreground);
+        assert_eq!(colors.cursor_border, colors.foreground);
+        assert_eq!(colors.cursor_fg, colors.background);
+        assert_eq!(
+            term.selection_color_overrides().background,
+            Some(rgb(0x00ffff))
+        );
+        assert_eq!(term.selection_color_overrides().foreground, None);
+        assert_eq!(term.visual_bell_color(), Some(rgb(0xff0000)));
+        term.advance_bytes(concat!(
+            "\x1b[#P\x1b]21;foreground=blue;cursor=#0000ff;selection_background=;visual_bell=\x07\x1b]30101;\x07",
+            "\x1b]21;cursor=?;cursor_text=?;selection_background=?;selection_foreground=?;visual_bell=?;transparent_background_color1=?\x07",
+        ));
+        assert_eq!(term.palette(), colors);
+        assert_eq!(crate::terminal::tests::receive(&mut replies), concat!(
+            "\x1b]21;cursor=;cursor_text=;selection_background=rgb:00/ff/ff;selection_foreground=;visual_bell=rgb:ff/00/00",
+            ";unknown=dHJhbnNwYXJlbnRfYmFja2dyb3VuZF9jb2xvcjE\x1b\\",
+        ).as_bytes());
+        term.advance_bytes(b"\x1b]21;foreground=blue;cursor\x07");
+        assert_eq!(
+            term.palette().cursor_bg,
+            palette(ColorScheme::OneHalfDark).cursor_bg
+        );
+        term.reset_connection();
+        assert_eq!(term.visual_bell_color(), None);
+        assert_eq!(term.palette(), palette(ColorScheme::OneHalfDark));
+    }
 }

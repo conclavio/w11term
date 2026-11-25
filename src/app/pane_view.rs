@@ -2,6 +2,28 @@ use super::*;
 use w11term::pane_layout::{Axis, Layout};
 
 const DIVIDER: f64 = 6.0;
+fn native_pointer_shape(
+    shape: wezterm_term::PointerShape,
+) -> windows_reactor::InputSystemCursorShape {
+    use wezterm_term::PointerShape::*;
+    use windows_reactor::InputSystemCursorShape as Native;
+    match shape {
+        Default => Native::Arrow,
+        Crosshair | Cell => Native::Cross,
+        Pointer | Grab => Native::Hand,
+        Help => Native::Help,
+        Text => Native::IBeam,
+        Move | Grabbing => Native::SizeAll,
+        Northeast | Southwest | NortheastSouthwest => Native::SizeNortheastSouthwest,
+        North | South | NorthSouth => Native::SizeNorthSouth,
+        Northwest | Southeast | NorthwestSoutheast => Native::SizeNorthwestSoutheast,
+        East | West | EastWest => Native::SizeWestEast,
+        NotAllowed | NoDrop => Native::UniversalNo,
+        Wait => Native::Wait,
+        Progress => Native::AppStarting,
+    }
+}
+
 type CanvasArea = Rc<Cell<Option<(f32, f32, f32)>>>;
 
 /// Locate a leaf using the measured canvases on both sides of every divider.
@@ -194,6 +216,8 @@ pub(super) struct PaneSurface {
     pub(super) invalidator: Invalidator,
     pub(super) scrollbar: Rc<scrollback_bar::ScrollBar>,
     cursor_blink: Rc<RefCell<crate::cursor_blink::CursorBlink>>,
+    cursor_guide: Rc<Cell<CursorGuide>>,
+    bell: Rc<Cell<visual_bell::Pulse>>,
     pub(super) area: Rc<Cell<Option<(f32, f32, f32)>>>,
     window_grid: Rc<Cell<WindowGrid>>,
     window_size: Rc<Cell<(f64, f64)>>,
@@ -208,6 +232,7 @@ impl PaneSurface {
 
     pub(super) fn release(&self) {
         self.pause_cursor();
+        self.update_bell(Instant::now(), false);
         self.scrollbar.configure(false, false, false);
         self.canvas.borrow_mut().take();
     }
@@ -216,6 +241,26 @@ impl PaneSurface {
         self.cursor_blink
             .borrow_mut()
             .set_focus(false, None, &self.invalidator);
+    }
+
+    pub(super) fn ring_bell(&self, received: Instant, now: Instant) -> bool {
+        let mut pulse = self.bell.get();
+        if !pulse.ring(received, now) {
+            return false;
+        }
+        self.bell.set(pulse);
+        self.invalidator.invalidate();
+        true
+    }
+
+    pub(super) fn update_bell(&self, now: Instant, enabled: bool) -> bool {
+        let mut pulse = self.bell.get();
+        if pulse.visible && (!enabled || pulse.elapsed(now)) {
+            pulse.visible = false;
+            self.bell.set(pulse);
+            self.invalidator.invalidate();
+        }
+        pulse.visible
     }
 
     pub(super) fn remeasure(&self, renderer: &mut Renderer) -> Option<TerminalSize> {
@@ -406,7 +451,7 @@ impl TerminalApp {
         let mut renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         )?;
         renderer.live_cursor = Some(surface.cursor_blink.clone());
         let renderer = RefCell::new(renderer);
@@ -423,8 +468,11 @@ impl TerminalApp {
         let area = surface.area.clone();
         let selection = tab.selection.clone();
         let read_only = tab.read_only.clone();
+        let cursor_guide = surface.cursor_guide.clone();
         let scrollbar = surface.scrollbar.clone();
         let scrollbar_brush = RefCell::new(None);
+        let bell = surface.bell.clone();
+        let bell_brush = RefCell::new(None);
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
         let copy_mode = self.copy_mode.clone();
@@ -445,17 +493,23 @@ impl TerminalApp {
                 .filter(|m| m.pane == id && m.state.valid(&frame));
             renderer.copy_cursor = mode.map(|m| m.state.cursor);
             renderer.read_only = read_only.get();
+            renderer.cursor_guide = cursor_guide.get();
             let marked = mode.and_then(|m| m.state.selection());
-            let measured = renderer.draw(ctx, &frame)?;
-            renderer.draw_interaction(
-                ctx,
-                &frame,
-                marked
+            let measured = {
+                let mouse_selection = selection.borrow();
+                let visible_selection = marked
                     .as_ref()
-                    .or(selection.borrow().as_ref())
-                    .filter(|selection| selection.survives_scrollback_clear(&frame)),
-                hover.borrow().as_ref(),
-            )?;
+                    .or(mouse_selection.as_ref())
+                    .filter(|selection| selection.survives_scrollback_clear(&frame));
+                let measured = renderer.draw(ctx, &frame, visible_selection)?;
+                renderer.draw_interaction(
+                    ctx,
+                    &frame,
+                    visible_selection,
+                    hover.borrow().as_ref(),
+                )?;
+                measured
+            };
             if let Some(hints) = hints {
                 renderer.draw_hint_labels(ctx, &frame, hints.visible_labels())?;
             }
@@ -474,6 +528,12 @@ impl TerminalApp {
                 let offset = renderer.draw_preedit(ctx, &frame, &preedit.text, preedit.cursor)?;
                 crate::input::ime::position_after_draw(offset, measured.scale);
             }
+            visual_bell::draw(
+                ctx,
+                bell.get().visible,
+                frame.visual_bell_color.map(w11term::terminal::rgba),
+                &mut bell_brush.borrow_mut(),
+            );
             let window_mode = window_grid.get();
             if matches!(window_mode, WindowGrid::Terminal) {
                 if initial_grid
@@ -534,15 +594,19 @@ impl TerminalApp {
                 .borrow()
                 .as_ref()
                 .is_some_and(|m| m.pane == id);
-        if tab.surface.scrollbar.configure(
-            show_scrollbar,
-            tab.find.open,
-            self.appearance
-                .read()
-                .unwrap()
-                .interaction
-                .failed_command_marks,
-        ) {
+        let (failed_marks, cursor_guide) = {
+            let appearance = self.appearance.read().unwrap();
+            (
+                appearance.interaction.failed_command_marks,
+                appearance.cursor_guide,
+            )
+        };
+        let scrollbar_changed =
+            tab.surface
+                .scrollbar
+                .configure(show_scrollbar, tab.find.open, failed_marks);
+        let guide_changed = tab.surface.cursor_guide.replace(cursor_guide) != cursor_guide;
+        if scrollbar_changed || guide_changed {
             tab.surface.invalidator.invalidate();
         }
         let focused = tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input);
@@ -578,30 +642,50 @@ impl TerminalApp {
         };
         let drop_target = self.pane_drop_target(id, tab);
         let content = match canvas {
-            Ok(canvas) => Border::new()
-                .background(Color::rgb(14, 16, 20))
-                .drop_policy(drop_target.map(|_| {
-                    DragDropPolicy::new().storage_items(
-                        DragDropAction::new(DragDropOperation::Copy).caption("Insert file paths"),
+            Ok(canvas) => {
+                let mut border = Border::new()
+                    .background(Color::rgb(14, 16, 20))
+                    .drop_policy(drop_target.map(|_| {
+                        DragDropPolicy::new().storage_items(
+                            DragDropAction::new(DragDropOperation::Copy)
+                                .caption("Insert file paths"),
+                        )
+                    }))
+                    .on_drop(context.callback(move |data| {
+                        drop_target.map_or(Message::ControlIdle, |target| target.data(data))
+                    }))
+                    .capture_pointer_on_press(true)
+                    .on_pointer_capture_lost(context.callback(move |_| Message::CaptureLost(id)))
+                    .on_pointer_entered(context.callback(move |_| Message::HoverPane(id)))
+                    .on_pointer_exited(context.callback(move |_| Message::PointerExit(id)))
+                    .on_pointer_pressed(
+                        context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Press)),
                     )
-                }))
-                .on_drop(context.callback(move |data| {
-                    drop_target.map_or(Message::ControlIdle, |target| target.data(data))
-                }))
-                .capture_pointer_on_press(true)
-                .on_pointer_capture_lost(context.callback(move |_| Message::CaptureLost(id)))
-                .on_pointer_entered(context.callback(move |_| Message::HoverPane(id)))
-                .on_pointer_exited(context.callback(move |_| Message::PointerExit(id)))
-                .on_pointer_pressed(
-                    context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Press)),
-                )
-                .on_pointer_released(
-                    context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Release)),
-                )
-                .on_pointer_moved(
-                    context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Move)),
-                )
-                .content(canvas),
+                    .on_pointer_released(
+                        context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Release)),
+                    )
+                    .on_pointer_moved(
+                        context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Move)),
+                    );
+                let local_pointer = tab.find.open
+                    || tab.hover.borrow().is_some()
+                    || tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
+                    || self
+                        .hints
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|mode| mode.pane == id)
+                    || self
+                        .copy_mode
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|mode| mode.pane == id);
+                if !local_pointer && let Some(shape) = tab.session.frames.load().pointer_shape {
+                    border = border.pointer_cursor(native_pointer_shape(shape));
+                }
+                border.content(canvas)
+            }
+
             Err(reason) => Border::new()
                 .on_pointer_pressed(context.callback(move |_| Message::PaneFocus(id)))
                 .content(

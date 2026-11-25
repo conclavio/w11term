@@ -12,18 +12,21 @@ use tokio::sync::Notify;
 mod group_command;
 mod group_transcript;
 mod inbox;
+mod kitty_notification;
 mod ssh_attempt;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
-    GroupCompletionState, GroupQueueActivity, GroupQueueEvent, GroupQueueEventKind,
-    GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
-    GroupTranscript, GroupTranscriptHistory, GroupTranscriptHost, GroupTranscriptLine,
-    GroupTranscriptOutput, GroupTranscriptRecording, GroupTranscriptSnapshot,
+    GroupCompletionState, GroupOutputAlert, GroupOutputAlertRule, GroupOutputAlertTrigger,
+    GroupOutputExpectation, GroupOutputExpectationState, GroupQueueActivity, GroupQueueEvent,
+    GroupQueueEventKind, GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome,
+    GroupRecordingSummary, GroupTranscript, GroupTranscriptHistory, GroupTranscriptHost,
+    GroupTranscriptLine, GroupTranscriptOutput, GroupTranscriptRecording, GroupTranscriptSnapshot,
     GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;
-pub use inbox::{Inbox, NoticeTarget, SshLoginResult};
+pub use inbox::{Inbox, InboxWake, NoticeTarget, SshLoginResult};
+pub use kitty_notification::{NotificationChoice, NotificationResponse};
 pub(crate) use ssh_attempt::AttemptGuard;
 pub use ssh_attempt::{PendingSshAttempt, SshAttemptCompletion, SshAttemptOutcome};
 
@@ -37,6 +40,8 @@ pub struct Event {
     pub data: Value,
     #[serde(skip)]
     pub(crate) command: Option<CommandLink>,
+    #[serde(skip)]
+    eviction: Option<Arc<Notify>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +93,7 @@ struct State {
     recording: Option<(u64, Arc<Path>)>,
     replay: Option<crate::session::ReplayState>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
+    kitty_notifications: kitty_notification::Notifications,
     command_watch: Option<CommandWatch>,
     group_run: Option<GroupRun>,
     group_prompt_pattern: Option<GroupPromptPattern>,
@@ -791,7 +797,11 @@ impl Events {
         } else {
             let label = Arc::from(label);
             for event in &state.events {
-                inbox.receive(pane, &label, event, false);
+                if event.data["protocol"] != "kitty"
+                    || state.is_kitty_notification_live(event.sequence)
+                {
+                    inbox.receive(pane, &label, event, false);
+                }
             }
             state.inbox = Some((pane, label, inbox.clone()));
         }
@@ -808,6 +818,9 @@ impl Events {
             let mut preview = serde_json::json!({"truncated":true,"preview":serialized.chars().take(1024).collect::<String>()});
             if kind == "notification" {
                 preview["summary"] = inbox::notification_text(&data).into();
+                if let Some(protocol) = data.get("protocol") {
+                    preview["protocol"] = protocol.clone();
+                }
             }
             if kind == "recording-error"
                 && let Some(reason) = data["error"].as_str()
@@ -839,12 +852,15 @@ impl Events {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let eviction = (kind == "notification" && data["protocol"] == "kitty")
+            .then(|| state.kitty_notifications.eviction.clone());
         let event = Event {
             sequence,
             timestamp_ms,
             kind: kind.into(),
             data,
             command,
+            eviction,
         };
         if let Some((pane, label, inbox)) = &state.inbox {
             inbox.receive(*pane, label, &event, true);
@@ -1005,7 +1021,7 @@ mod tests {
         assert_eq!(inbox.unread_count(), 0);
         let notice = moved_to.rows().pop().unwrap();
         assert_eq!(notice.message, "Recording failed · disk full on D:");
-        assert!(!moved_to.acknowledge_wake());
+        assert!(!moved_to.acknowledge_wake().flash_taskbar);
         let last = pane.since(0).events.pop().unwrap();
         assert_eq!(last.kind, "recording-error");
         assert_eq!(last.data["error"], reason);
