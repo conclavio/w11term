@@ -15,6 +15,7 @@ fn move_entry(from: &str, directory: &str, kind: w11term::sftp::EntryKind) -> Op
         from: from.into(),
         directory: directory.into(),
         kind: Some(kind),
+        destination_is_canonical: false,
     }
 }
 
@@ -273,6 +274,21 @@ async fn drawer_move_checks_both_folders_and_preserves_the_entry_name() {
         fs::read(root.join("to folder/entry")).unwrap(),
         b"collision"
     );
+    fs::write(root.join("tree-redirect"), []).unwrap();
+    let error = run(
+        &pane,
+        approved,
+        Operation::MoveEntry {
+            from: "/from/entry".into(),
+            directory: "/tree/data".into(),
+            kind: Some(File),
+            destination_is_canonical: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("destination folder changed"), "{error}");
+    assert!(trace(root).is_empty());
     fs::remove_file(root.join("to folder/entry")).unwrap();
 
     fs::write(root.join("race-next-rename"), []).unwrap();

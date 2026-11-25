@@ -428,7 +428,7 @@ try {
         (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
             !(Button "Reveal $fileOnPageTwo") -and !(Button "Reveal $newest")
     }
-    Click ('Select downloads' + [char]0x2026)
+    Click ('Select results' + [char]0x2026)
     Click 'Next results'
     $null = Wait-Until 'recursive results page two' {
         (Find-Element '2 / 2') -and (Button "Reveal $fileOnPageTwo")
@@ -617,7 +617,7 @@ try {
             [IO.File]::ReadAllText($folderItem) -ceq $contents -and
             (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled
     }
-    Click ('Select downloads' + [char]0x2026)
+    Click ('Select results' + [char]0x2026)
     (Wait-CheckBox "Mark $parent/nested/nested-content.txt" $off).Toggle()
     (Wait-CheckBox "Mark $parent/nested" $off).Toggle()
     Click "Reveal $parent/nested/nested-content.txt"
@@ -841,6 +841,77 @@ try {
     }
     if ([IO.File]::ReadAllText($fixtureText) -cne $contents) {
         throw 'Moving the entry changed its contents'
+    }
+    $archive = Join-Path $peerRoot 'move archive'
+    $null = New-Item -ItemType Directory -Path $archive
+    $movedFirst = Join-Path $archive 'build-00.log'
+    $collision = Join-Path $archive 'build-36.log'
+    $movedLast = Join-Path $archive 'build-37.log'
+    [IO.File]::WriteAllText($collision, 'keep the existing destination')
+    $sourceFirst = Join-Path $peerRoot 'shell directory/build-00.log'
+    $sourceSecond = Join-Path $peerRoot 'shell directory/build-36.log'
+    $sourceLast = Join-Path $peerRoot 'shell directory/build-37.log'
+    [IO.File]::WriteAllText($sourceFirst, 'first marked entry')
+    [IO.File]::WriteAllText($sourceSecond, 'second marked entry')
+    [IO.File]::WriteAllText($sourceLast, 'last marked entry')
+    Focus-FilenameSearch
+    $field = Wait-FilenameSearchFocus
+    $field.GetCurrentPattern($value).SetValue('build-')
+    Click 'Search'
+    $null = Wait-Until 'the marked move starts with paginated results' {
+        (Find-Element '38 matches in 2 folders') -and (Button "Reveal $parent/build-00.log")
+    }
+    Click ('Select results' + [char]0x2026)
+    (Wait-CheckBox "Mark $parent/build-00.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-00.log" $on
+    Click 'Next results'
+    (Wait-CheckBox "Mark $parent/build-36.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-36.log" $on
+    (Wait-CheckBox "Mark $parent/build-37.log" $off).Toggle()
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $on
+    $moveMarked = 'Move marked results' + [char]0x2026
+    Click $moveMarked
+    $destination = Wait-Until 'the reviewed batch contains all three marked files' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "3 entries on $($account.user)@$($account.host):$($account.port)")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click $browseDestination
+    $null = Wait-Until 'the batch picker opens the typed destination' { Find-Element '/move archive' -Visible }
+    Click 'Use this folder'
+    Click 'Move'
+    $partialStatus = "Moved 1 of 3 marked entries to /move archive. Stopped at $parent/build-36.log. SFTP: Move was not started: An entry with that name already exists. 37 matches in 2 folders"
+    $null = Wait-Until 'a partial move reports its confirmed count and stops at the collision' {
+        (Find-Element $partialStatus) -and [IO.File]::Exists($movedFirst) -and
+            ![IO.File]::Exists($sourceFirst) -and [IO.File]::Exists($sourceSecond) -and
+            [IO.File]::Exists($sourceLast) -and ![IO.File]::Exists($movedLast)
+    }
+    if ([IO.File]::ReadAllText($collision) -cne 'keep the existing destination' -or
+        [IO.File]::ReadAllText($movedFirst) -cne 'first marked entry') {
+        throw 'The batch changed an existing destination or failed to preserve the first file'
+    }
+    $null = Wait-CheckBox "Mark $parent/build-36.log" $on
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $on
+    [IO.File]::Delete($collision)
+    Click $moveMarked
+    $destination = Wait-Until 'only the remaining files are included in a fresh review' {
+        $inputField = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($inputField -and (Find-Element "2 entries on $($account.user)@$($account.host):$($account.port)")) {
+            $inputField
+        }
+    }
+    $destination.GetCurrentPattern($value).SetValue('/move archive')
+    Click 'Move'
+    $null = Wait-Until 'the second batch completes using the remaining marks' {
+        (Find-Element 'Moved 2 of 2 marked entries to /move archive. 35 matches in 2 folders') -and
+            ![IO.File]::Exists($sourceSecond) -and ![IO.File]::Exists($sourceLast) -and
+            [IO.File]::Exists($collision) -and [IO.File]::Exists($movedLast)
+    }
+    if ([IO.File]::ReadAllText($collision) -cne 'second marked entry' -or
+        [IO.File]::ReadAllText($movedLast) -cne 'last marked entry') {
+        throw 'Retrying the remaining marks changed their contents'
     }
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }

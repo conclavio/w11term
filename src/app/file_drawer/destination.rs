@@ -47,24 +47,6 @@ impl Picker {
             .map_or(0, |listing| listing.folders.len().div_ceil(PAGE_SIZE))
     }
 
-    fn can_choose(&self, destination: &str, entry: &EntryDialog) -> bool {
-        let EditAction::Move(target, kind) = &entry.action else {
-            return false;
-        };
-        let source = target.parent().trim_end_matches('/');
-        if destination.trim_end_matches('/') == source {
-            return false;
-        }
-        if *kind != Some(EntryKind::Directory) {
-            return true;
-        }
-        let path = format!("{source}/{}", target.name());
-        destination != path
-            && !destination
-                .strip_prefix(&path)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    }
-
     pub(super) fn dialog(
         &self,
         entry: &EntryDialog,
@@ -190,7 +172,7 @@ impl Picker {
             button(
                 "Use this folder",
                 Action::Choose(revision),
-                ready && directory.is_some_and(|path| self.can_choose(path, entry)),
+                ready && directory.is_some_and(|path| entry.check_move_folder(path).is_ok()),
             )
             .content("Use this folder"),
         ));
@@ -223,11 +205,13 @@ impl FileDrawer {
         session: &Session,
         ctx: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
-        let Some(entry) = self
-            .dialog
-            .as_mut()
-            .filter(|entry| entry.serial == serial && matches!(entry.action, EditAction::Move(..)))
-        else {
+        let Some(entry) = self.dialog.as_mut().filter(|entry| {
+            entry.serial == serial
+                && matches!(
+                    entry.action,
+                    EditAction::Move(..) | EditAction::MoveSearchBatch(..)
+                )
+        }) else {
             return Ok(());
         };
         let path = match action {
@@ -249,7 +233,7 @@ impl FileDrawer {
                     .as_ref()
                     .filter(|p| p.ready(revision))
                     && let Some(listing) = &picker.folders
-                    && picker.can_choose(&listing.directory, entry)
+                    && entry.check_move_folder(&listing.directory).is_ok()
                 {
                     entry.name = listing.directory.clone();
                     entry.destination_picker.take();
@@ -405,10 +389,9 @@ mod tests {
         files.finish_destination_listing(serial, 7, Ok(listing));
         assert!(!current(&files));
         let entry = files.dialog.as_ref().unwrap();
-        let picker = entry.destination_picker.as_ref().unwrap();
-        assert!(!picker.can_choose("/work", entry));
-        assert!(!picker.can_choose("/work/project/child", entry));
-        assert!(picker.can_choose("/work/project-old", entry));
+        assert!(entry.check_move_folder("/work").is_err());
+        assert!(entry.check_move_folder("/work/project/child").is_err());
+        assert!(entry.check_move_folder("/work/project-old").is_ok());
 
         let result = files
             .finish_edit(serial, ContentDialogResult::Primary)
