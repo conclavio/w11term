@@ -38,8 +38,9 @@ pub use file_tail::FileTail;
 mod find;
 mod folder_comparison;
 pub use folder_comparison::{
-    FolderChange, FolderComparison, FolderDifference, FolderEntry, FolderInventory, FolderOrigin,
-    capture_local_folder,
+    FILE_VERIFICATION_LIMIT, FolderChange, FolderComparison, FolderDifference, FolderEntry,
+    FolderInventory, FolderMatchedFile, FolderOrigin, VerifiedFolderFile, capture_local_folder,
+    valid_comparison_file_path,
 };
 mod image_preview;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
@@ -298,6 +299,18 @@ pub enum Operation {
     InventoryFolder {
         path: String,
         reference: Option<Arc<FolderInventory>>,
+    },
+    #[serde(skip)]
+    RevealComparedEntry {
+        path: String,
+        expected: FolderEntry,
+    },
+    #[serde(skip)]
+    VerifyComparedFile {
+        reference_root: String,
+        reference_origin: FolderOrigin,
+        current_root: String,
+        relative: String,
     },
     /// List folder choices for the drawer's move dialog on its existing connection.
     #[serde(skip)]
@@ -776,6 +789,12 @@ pub(crate) async fn run(
                 Operation::InventoryFolder { .. } => {
                     Some("Missing SSH connection for folder comparison")
                 }
+                Operation::RevealComparedEntry { .. } => {
+                    Some("Missing SSH connection for the compared entry")
+                }
+                Operation::VerifyComparedFile { .. } => {
+                    Some("Missing SSH connection for file comparison")
+                }
                 Operation::OpenLinkTarget { .. } => {
                     Some("Missing SSH connection for opening the link target")
                 }
@@ -919,6 +938,12 @@ pub(crate) async fn run(
                 Operation::MeasureFolder { .. } => JobStage::Checking("Folder scan did not finish"),
                 Operation::InventoryFolder { .. } => {
                     JobStage::Checking("Folder comparison scan did not finish")
+                }
+                Operation::RevealComparedEntry { .. } => {
+                    JobStage::Checking("Compared entry lookup did not finish")
+                }
+                Operation::VerifyComparedFile { .. } => {
+                    JobStage::Checking("File comparison did not finish")
                 }
                 Operation::GetDir { .. } | Operation::GetSearch { .. } => {
                     JobStage::DirectoryDownload {
@@ -1172,11 +1197,18 @@ impl Engine {
         &self,
         path: &str,
         cancel: Option<&TransferCancel>,
+        require_same_path: bool,
     ) -> Result<Vec<russh_sftp::protocol::File>> {
         let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
         ensure!(!cancelled(), "Directory listing cancelled");
         let handle = self.raw.opendir(path).await?.handle;
         let result = async {
+            if require_same_path {
+                ensure!(
+                    self.canonical_remote_path(path).await? == path,
+                    "The containing folder changed. Compare again"
+                );
+            }
             let mut entries = Vec::new();
             let mut bytes = 0;
             loop {
@@ -1217,7 +1249,7 @@ impl Engine {
             "SFTP returned control characters in the directory path"
         );
         let mut folders = Vec::new();
-        for entry in self.read_directory(&directory, cancel).await? {
+        for entry in self.read_directory(&directory, cancel, false).await? {
             ensure!(
                 !cancel.is_some_and(TransferCancel::is_cancelled),
                 "Directory listing cancelled"
@@ -1544,7 +1576,9 @@ impl Engine {
             PreviewTail { path } => {
                 serde_json::to_value(self.read_file_tail(&path, cancel).await?)?
             }
-            Sha256 { path, max_bytes } => self.remote_sha256(&path, max_bytes, cancel).await?,
+            Sha256 { path, max_bytes } => {
+                self.remote_sha256(&path, max_bytes, cancel, false).await?
+            }
             Find {
                 path,
                 query,
@@ -1601,6 +1635,24 @@ impl Engine {
                     serde_json::to_value(current)?
                 }
             }
+            RevealComparedEntry { path, expected } => {
+                self.reveal_compared_entry(&path, expected, cancel).await?
+            }
+            VerifyComparedFile {
+                reference_root,
+                reference_origin,
+                current_root,
+                relative,
+            } => serde_json::to_value(
+                self.verify_compared_file(
+                    &reference_root,
+                    reference_origin,
+                    &current_root,
+                    &relative,
+                    cancel,
+                )
+                .await?,
+            )?,
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
                 let mut result = json!({ "attrs": attrs });
@@ -1694,7 +1746,7 @@ impl Engine {
                         "SFTP resolves this mount to a different path"
                     );
                 }
-                json!({"entries":self.read_directory(&path, None).await?})
+                json!({"entries":self.read_directory(&path, None, false).await?})
             }
             BrowseMoveFolders { path } => self.browse_move_folders(&path, cancel).await?,
             Read {
