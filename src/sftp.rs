@@ -246,6 +246,10 @@ pub enum Operation {
     Find {
         path: String,
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        regex: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        match_case: bool,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -1088,9 +1092,15 @@ impl Engine {
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
             Sha256 { path, max_bytes } => self.remote_sha256(&path, max_bytes, cancel).await?,
-            Find { path, query } => {
-                serde_json::to_value(self.find_filenames(&path, &query, cancel).await?)?
-            }
+            Find {
+                path,
+                query,
+                regex,
+                match_case,
+            } => serde_json::to_value(
+                self.find_filenames(&path, &query, regex, match_case, cancel)
+                    .await?,
+            )?,
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
                 let mut result = json!({ "attrs": attrs });

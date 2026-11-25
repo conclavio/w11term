@@ -176,7 +176,26 @@ try {
     $field = Wait-Until 'recursive filename search field' {
         Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('NESTED')
+    $on = [System.Windows.Automation.ToggleState]::On
+    $off = [System.Windows.Automation.ToggleState]::Off
+    (Wait-CheckBox 'Regex' $off).Toggle()
+    (Wait-CheckBox 'Match case' $off).Toggle()
+    $null = Wait-CheckBox 'Regex' $on
+    $null = Wait-CheckBox 'Match case' $on
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern($value).SetValue('(')
+    Click 'Search'
+    $searchView = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $searchStatus = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-search-status')
+    $null = Wait-Until 'invalid filename regex reported' {
+        $status = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $searchStatus)
+        $status -and $status.Current.Name.Contains('Invalid filename regex')
+    }
+    $pattern = '^nested(?:-content\.txt)?$|^BUILD-00\.log$'
+    $field = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern($value).SetValue($pattern)
     Click 'Search'
     Read-SearchProperties "$parent/nested" 'Directory'
     Click 'Close properties'
@@ -247,9 +266,11 @@ try {
             $edit
         }
     }
-    if ($field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'NESTED') {
+    if ($field.GetCurrentPattern($value).Current.Value -cne $pattern) {
         throw 'Returning to results changed the search query'
     }
+    $null = Wait-CheckBox 'Regex' $on
+    $null = Wait-CheckBox 'Match case' $on
     Check-PathCopy "Copy path $parent/nested/nested-content.txt" "$parent/nested/nested-content.txt"
     Check-PathCopy 'Copy all paths' "$parent/nested`r`n$parent/nested/nested-content.txt"
     $null = Wait-Until 'result summary and copy confirmation share the panel' {
