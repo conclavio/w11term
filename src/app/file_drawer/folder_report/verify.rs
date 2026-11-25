@@ -282,6 +282,9 @@ impl FileDrawer {
                 }
                 view.open = false;
                 view.batch = None;
+                panel
+                    .comparison
+                    .refresh_verification_filter(report, &view.checks);
                 if self
                     .pending
                     .as_ref()

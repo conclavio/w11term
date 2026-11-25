@@ -571,7 +571,7 @@ impl FileDrawer {
                     .map_err(|error| format!("{error:#}"))
             }));
             if let State::Loaded(Ok(Report::Comparison(report))) = &panel.state {
-                panel.comparison.index(report);
+                panel.comparison.index(report, &panel.verification.checks);
             }
         }
     }
@@ -583,7 +583,9 @@ impl FileDrawer {
             .filter(|panel| panel.serial == serial)
             && let State::Loaded(Ok(Report::Comparison(report))) = &panel.state
         {
-            panel.comparison.update(report, action);
+            panel
+                .comparison
+                .update(report, &panel.verification.checks, action);
         }
     }
 

@@ -429,6 +429,8 @@ The comparison remembers the last completed SHA-256 check for each path until yo
 
 Choose **Verify files on this page…** to check every row on the current page that has a regular file on both sides. The dialog shows progress and any per-file errors. **Stop page verification** keeps completed checks and leaves the remaining files unchecked.
 
+Use the comparison filter’s **SHA-256** options to find paired files whose contents differ, whose contents match, or whose check has yet to complete. These options cover files with both matching and changed metadata and work with the relative path filter.
+
 Choose **Preview image…** on a PNG, JPEG or GIF in the SFTP listing or search results to see the image and its original dimensions. The preview reads a regular file over the pane’s existing connection and displays a scaled still image, including the first frame of an animated GIF. It accepts files up to 8 MiB with dimensions up to 4096 pixels per side and up to 8,388,608 pixels in total.
 
 Choose **Tail text file…** in the listing or search results to read up to 200 lines from the last 64 KiB of a regular UTF-8 file. The drawer shows the file size and indicates when it omitted earlier text. **Refresh tail** reads the path again, so it picks up appended output or a log file replaced by rotation. You can select and copy the text.

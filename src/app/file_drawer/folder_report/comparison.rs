@@ -1,9 +1,10 @@
+use super::verify::{Checks, CompletedCheck};
 use super::*;
 use w11term::sftp::{FolderChange, FolderEntry};
 
 const PAGE_SIZE: usize = 40;
 const MAX_QUERY_CHARS: usize = 4096;
-const FILTERS: [Filter; 7] = [
+const FILTERS: [Filter; 10] = [
     Filter::Differences(None),
     Filter::Differences(Some(FolderChange::ReferenceOnly)),
     Filter::Differences(Some(FolderChange::CurrentOnly)),
@@ -11,12 +12,34 @@ const FILTERS: [Filter; 7] = [
     Filter::Differences(Some(FolderChange::Metadata)),
     Filter::Differences(Some(FolderChange::Unknown)),
     Filter::MatchingFiles,
+    Filter::Verification(VerificationFilter::Different),
+    Filter::Verification(VerificationFilter::Matching),
+    Filter::Verification(VerificationFilter::Unchecked),
 ];
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Filter {
     Differences(Option<FolderChange>),
     MatchingFiles,
+    Verification(VerificationFilter),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum VerificationFilter {
+    Different,
+    Matching,
+    Unchecked,
+}
+
+impl VerificationFilter {
+    fn includes(self, check: Option<&CompletedCheck>) -> bool {
+        match (self, check) {
+            (Self::Different, Some(check)) => !check.digests.contents_match(),
+            (Self::Matching, Some(check)) => check.digests.contents_match(),
+            (Self::Unchecked, None) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Default for Filter {
@@ -30,6 +53,9 @@ impl Filter {
         match self {
             Self::Differences(change) => change_label(change),
             Self::MatchingFiles => "Files with matching metadata",
+            Self::Verification(VerificationFilter::Different) => "SHA-256: Contents differ",
+            Self::Verification(VerificationFilter::Matching) => "SHA-256: Contents match",
+            Self::Verification(VerificationFilter::Unchecked) => "SHA-256: Unchecked paired files",
         }
     }
 }
@@ -115,15 +141,15 @@ impl Browser {
             .collect()
     }
 
-    pub(super) fn update(&mut self, report: &FolderComparison, action: Action) {
+    pub(super) fn update(&mut self, report: &FolderComparison, checks: &Checks, action: Action) {
         match action {
             Action::Query(query) if self.query != query => {
                 self.query = query;
-                self.index(report);
+                self.index(report, checks);
             }
             Action::Filter(filter) if self.filter != filter => {
                 self.filter = filter;
-                self.index(report);
+                self.index(report, checks);
             }
             Action::Previous if self.page > 0 => {
                 self.page -= 1;
@@ -137,8 +163,25 @@ impl Browser {
         }
     }
 
-    pub(super) fn index(&mut self, report: &FolderComparison) {
+    pub(super) fn index(&mut self, report: &FolderComparison, checks: &Checks) {
         self.page = 0;
+        self.rebuild(report, checks);
+    }
+
+    pub(super) fn refresh_verification_filter(
+        &mut self,
+        report: &FolderComparison,
+        checks: &Checks,
+    ) {
+        if matches!(self.filter, Filter::Verification(_)) {
+            self.rebuild(report, checks);
+            self.page = self
+                .page
+                .min(self.matches.len().saturating_sub(1) / PAGE_SIZE);
+        }
+    }
+
+    fn rebuild(&mut self, report: &FolderComparison, checks: &Checks) {
         self.viewport_revision = self.viewport_revision.wrapping_add(1);
         self.matches.clear();
         // The walker bounds full paths to 4096 bytes. A longer query in Unicode
@@ -189,6 +232,21 @@ impl Browser {
                             }),
                     )
             }
+            Filter::Verification(status) => {
+                let mut files: Vec<_> = (0..report.differences.len())
+                    .map(Row::Difference)
+                    .chain((0..report.matching_files.len()).map(Row::MatchingFile))
+                    .filter_map(|row| {
+                        let item = row.get(report)?;
+                        (item.can_verify()
+                            && matches_path(item.path)
+                            && status.includes(checks.get(item.path)))
+                        .then_some((item.path, row))
+                    })
+                    .collect();
+                files.sort_unstable_by_key(|&(path, _)| path);
+                self.matches.extend(files.into_iter().map(|(_, row)| row));
+            }
         }
     }
 
@@ -199,7 +257,7 @@ impl Browser {
         message: impl Fn(super::Action) -> Message + Copy + 'static,
         revision: u64,
         reveal_enabled: bool,
-        checks: &super::verify::Checks,
+        checks: &Checks,
     ) -> Vec<KeyedView> {
         let mut rows = vec![
             KeyedView::new(
@@ -216,7 +274,7 @@ impl Browser {
             KeyedView::new(
                 "scope",
                 TextBlock::new()
-                    .text("Compares paths, entry types, and regular-file sizes and modification times. File contents and link targets are unchecked.")
+                    .text("Compares paths, entry types, and regular-file sizes and modification times. Use SHA-256 to check file contents separately.")
                     .text_wrapping(TextWrapping::Wrap),
             ),
             KeyedView::new("totals", totals(report)),
@@ -257,16 +315,16 @@ impl Browser {
                         })),
                 )),
         ));
-        let matching_files = self.filter == Filter::MatchingFiles;
         if self.matches.is_empty() {
             rows.push(KeyedView::new(
                 "empty",
-                TextBlock::new().text(if matching_files {
-                    "No files with matching metadata fit the path filter."
-                } else if report.differences.is_empty() {
-                    "No differences in the reported metadata."
-                } else {
-                    "No differences match these filters."
+                TextBlock::new().text(match self.filter {
+                    Filter::MatchingFiles => "No files with matching metadata fit the path filter.",
+                    Filter::Verification(_) => "No paired files match this verification filter.",
+                    Filter::Differences(_) if report.differences.is_empty() => {
+                        "No differences in the reported metadata."
+                    }
+                    Filter::Differences(_) => "No differences match these filters.",
                 }),
             ));
             return rows;
@@ -274,22 +332,28 @@ impl Browser {
         let start = self.page * PAGE_SIZE;
         let total = self.matches.len();
         let end = (start + PAGE_SIZE).min(total);
-        let (singular, plural, previous, next, list_name) = if matching_files {
-            (
+        let (singular, plural, previous, next, list_name) = match self.filter {
+            Filter::MatchingFiles => (
                 "file with matching metadata",
                 "files with matching metadata",
                 "Previous matching files",
                 "Next matching files",
                 "Files with matching metadata",
-            )
-        } else {
-            (
+            ),
+            Filter::Verification(_) => (
+                "paired file",
+                "paired files",
+                "Previous paired files",
+                "Next paired files",
+                "Paired files by SHA-256 result",
+            ),
+            Filter::Differences(_) => (
                 "difference",
                 "differences",
                 "Previous differences",
                 "Next differences",
                 "Folder differences",
-            )
+            ),
         };
         let status = match total {
             1 => format!("1 {singular}"),
@@ -445,7 +509,7 @@ fn result_row(
     item: RowDetails<'_>,
     reveal: Option<View>,
     verify: Option<View>,
-    check: Option<&super::verify::CompletedCheck>,
+    check: Option<&CompletedCheck>,
 ) -> KeyedView {
     let label = item
         .change
@@ -533,29 +597,36 @@ mod tests {
             current: None,
         });
         let mut browser = Browser::default();
-        browser.index(&report);
+        let checks = Checks::new();
+        browser.index(&report, &checks);
         assert_eq!(browser.matches.len(), last + 1);
         for _ in 0..10 {
-            browser.update(&report, Action::Next);
+            browser.update(&report, &checks, Action::Next);
         }
         assert_eq!(browser.page * PAGE_SIZE, last);
-        browser.update(&report, Action::Previous);
+        browser.update(&report, &checks, Action::Previous);
         assert_eq!(browser.page * PAGE_SIZE, last - PAGE_SIZE);
-        browser.update(&report, Action::Query("ä[SUMMARY]".into()));
+        browser.update(&report, &checks, Action::Query("ä[SUMMARY]".into()));
         assert_eq!(browser.matches, [Row::Difference(last)]);
         assert_eq!(browser.page, 0);
         browser.update(
             &report,
+            &checks,
             Action::Filter(Filter::Differences(Some(FolderChange::CurrentOnly))),
         );
         assert!(browser.matches.is_empty());
         browser.update(
             &report,
+            &checks,
             Action::Filter(Filter::Differences(Some(FolderChange::Metadata))),
         );
-        browser.index(&report);
+        browser.index(&report, &checks);
         assert_eq!(browser.matches, [Row::Difference(last)]);
-        browser.update(&report, Action::Query("x".repeat(MAX_QUERY_CHARS + 1)));
+        browser.update(
+            &report,
+            &checks,
+            Action::Query("x".repeat(MAX_QUERY_CHARS + 1)),
+        );
         assert!(browser.matches.is_empty());
     }
 
@@ -576,10 +647,11 @@ mod tests {
             ..Default::default()
         };
         let mut browser = Browser::default();
-        browser.index(&report);
+        let checks = Checks::new();
+        browser.index(&report, &checks);
         assert!(browser.matches.is_empty());
-        browser.update(&report, Action::Filter(Filter::MatchingFiles));
-        browser.update(&report, Action::Next);
+        browser.update(&report, &checks, Action::Filter(Filter::MatchingFiles));
+        browser.update(&report, &checks, Action::Next);
         assert_eq!(browser.matches.len(), 45);
         assert_eq!(browser.page, 1);
         let viewport = browser.viewport_revision;
@@ -593,12 +665,89 @@ mod tests {
                 "docs/44.txt"
             ],
         );
-        browser.update(&report, Action::Query("DOCS/44".into()));
+        browser.update(&report, &checks, Action::Query("DOCS/44".into()));
         assert!(browser.verification_paths(&report, viewport).is_empty());
         assert_eq!(browser.matches, [Row::MatchingFile(44)]);
         assert_eq!(browser.page, 0);
         let row = browser.matches[0].get(&report).unwrap();
         assert_eq!(row.path, "docs/44.txt");
         assert!(row.can_verify());
+    }
+
+    #[test]
+    fn verification_filters_cover_both_metadata_categories_and_update_paging() {
+        let file = serde_json::from_value(json!({
+            "kind": 0o100000, "size": 10, "mtime": 5,
+        }))
+        .unwrap();
+        let mut report = FolderComparison {
+            matching_files: (0..(PAGE_SIZE * 2))
+                .map(|index| FolderMatchedFile {
+                    path: format!("docs/{index:03}.txt"),
+                    reference: file,
+                    current: file,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        report.differences = vec![
+            FolderDifference {
+                path: "docs/-changed.txt".into(),
+                change: FolderChange::Metadata,
+                reference: Some(file),
+                current: Some(file),
+            },
+            FolderDifference {
+                path: "docs/only-here.txt".into(),
+                change: FolderChange::CurrentOnly,
+                reference: None,
+                current: Some(file),
+            },
+        ];
+        let check = |current: &str| CompletedCheck {
+            completed_at_unix_seconds: None,
+            digests: w11term::sftp::VerifiedFolderFile {
+                reference_sha256: "reference".into(),
+                current_sha256: current.into(),
+            },
+        };
+        let mut checks = Checks::new();
+        let mut browser = Browser::default();
+        browser.update(
+            &report,
+            &checks,
+            Action::Filter(Filter::Verification(VerificationFilter::Unchecked)),
+        );
+        assert_eq!(browser.matches.len(), PAGE_SIZE * 2 + 1);
+        assert_eq!(browser.matches[0], Row::Difference(0));
+        browser.update(&report, &checks, Action::Next);
+        browser.update(&report, &checks, Action::Next);
+        assert_eq!(browser.page, 2);
+        assert_eq!(browser.page_rows(), &[Row::MatchingFile(PAGE_SIZE * 2 - 1)]);
+        let old_viewport = browser.viewport_revision;
+        checks.insert("docs/-changed.txt".into(), check("different"));
+        checks.insert("docs/000.txt".into(), check("different"));
+        checks.insert("docs/001.txt".into(), check("reference"));
+        browser.refresh_verification_filter(&report, &checks);
+        assert_eq!(browser.page, 1);
+        assert_eq!(browser.matches.len(), PAGE_SIZE * 2 - 2);
+        assert!(browser.verification_paths(&report, old_viewport).is_empty());
+
+        browser.update(
+            &report,
+            &checks,
+            Action::Filter(Filter::Verification(VerificationFilter::Different)),
+        );
+        assert_eq!(browser.matches, [Row::Difference(0), Row::MatchingFile(0)]);
+        browser.update(&report, &checks, Action::Query("DOCS/000".into()));
+        assert_eq!(browser.matches, [Row::MatchingFile(0)]);
+        browser.update(
+            &report,
+            &checks,
+            Action::Filter(Filter::Verification(VerificationFilter::Matching)),
+        );
+        assert!(browser.matches.is_empty());
+        browser.update(&report, &checks, Action::Query(String::new()));
+        assert_eq!(browser.matches, [Row::MatchingFile(1)]);
     }
 }

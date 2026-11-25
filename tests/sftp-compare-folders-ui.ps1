@@ -206,6 +206,23 @@ try {
         (Find-Element 'Last SHA-256 check found matching contents') -and
             (Find-Element 'Last SHA-256 check found different contents')
     }
+    Select-DifferenceType 'SHA-256: Contents differ'
+    $null = Wait-Until 'the different-contents filter finds the verified mismatch' {
+        (Find-Element '1 paired file') -and (Find-Element 'Verify contents of same-metadata.txt' $button) -and
+            !(Find-Element 'Verify contents of same-other.txt' $button)
+    }
+    Select-DifferenceType 'SHA-256: Contents match'
+    $null = Wait-Until 'the matching-contents filter finds the verified match' {
+        (Find-Element '1 paired file') -and (Find-Element 'Verify contents of same-other.txt' $button) -and
+            !(Find-Element 'Verify contents of same-metadata.txt' $button)
+    }
+    Set-Query 'SAME-'
+    Select-DifferenceType 'SHA-256: Unchecked paired files'
+    $null = Wait-Until 'an unsuccessful check remains in the filtered unchecked files' {
+        (Find-Element '1 paired file') -and (Find-Element 'Verify contents of same-missing.txt' $button) -and
+            !(Find-Element 'Verify contents of same-other.txt' $button)
+    }
+    Set-Query ''
     [IO.File]::WriteAllBytes($missing, [Text.Encoding]::ASCII.GetBytes('same'))
     [IO.File]::SetLastWriteTimeUtc($missing, [DateTimeOffset]::FromUnixTimeSeconds(1700000100).UtcDateTime)
     Test-ComparisonExport
