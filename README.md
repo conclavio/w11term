@@ -459,6 +459,8 @@ Choose **Filter filenames…** and type part of a name to search the entire dire
 
 Choose **Find files…** to search the displayed directory and its subdirectories by filename. The default is a case-insensitive literal search. Use **Regex** for a regular expression or **Match case** to distinguish uppercase and lowercase. Select a result to open its containing folder with the entry selected, or use **Download…** or **Download folder…** beside a regular file or folder. Direct downloads use the drawer’s destination and overwrite rules, show cancellable progress, and keep the search results in place. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. Cancelling the first scan keeps the matches already collected.
 
+While a search runs, the drawer shows the folder being scanned and counts for inspected entries, completed folders, and matches found. Refreshing keeps the previous results visible until the new scan finishes.
+
 Enable **Match path** to search the path relative to the search folder. Paths use `/` separators and have no leading slash. For example, combine **Regex** and **Match path** with `^src/.*\.rs$` to find Rust files under `src`. The CLI equivalent is `w11term-cli sftp --pane 1 find /repo '^src/.*\.rs$' --regex --match-path`. Saved searches keep this option.
 
 Enter a regex in **Exclude folder paths** to skip matching folders and their contents. The regex uses paths relative to the search root and follows **Match case**. For example, `(^|/)(\.git|node_modules)$` skips those folder names at any depth. The CLI accepts the same pattern with `--exclude-dir-regex`. You can use exclusions on their own or with the other filters, and saved searches retain them.

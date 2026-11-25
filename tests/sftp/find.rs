@@ -695,6 +695,56 @@ async fn recursive_filename_search_caps_matches_and_closes_its_handle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "ui-smoke")]
+async fn ongoing_directory_pages_report_progress_and_cancel_with_partial_results() {
+    use tokio::sync::{oneshot, watch};
+    use w11term::sftp::{JobProgress, SearchProgress};
+
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let tree = remote.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    for index in 0..20 {
+        fs::write(tree.join(format!("file-{index:02}.log")), []).unwrap();
+    }
+    fs::write(remote.path().join("slow-search-page"), []).unwrap();
+    let (sender, mut progress) = watch::channel(SearchProgress::default());
+    let (reply, response) = oneshot::channel();
+    let cancel = TransferCancel::default();
+    pane.input
+        .send(Command::Sftp(Job {
+            expected_generation: None,
+            operation: search("/tree", ".log"),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+            reply,
+            progress: Some(JobProgress::Search(sender)),
+            cancel: Some(cancel.clone()),
+        }))
+        .unwrap();
+
+    let mid_scan = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            progress.changed().await.unwrap();
+            let current = progress.borrow_and_update().clone();
+            if current.scanned_entries > 0 {
+                break current;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(mid_scan.folder, "/tree");
+    assert_eq!(mid_scan.scanned_directories, 0);
+    assert_eq!(mid_scan.scanned_entries, mid_scan.matches);
+    assert!(mid_scan.matches < 20);
+    cancel.cancel();
+    let found: FilenameSearch = serde_json::from_value(response.await.unwrap().unwrap()).unwrap();
+    assert!(found.cancelled);
+    assert!(found.matches.len() >= mid_scan.matches);
+    assert!(found.matches.len() < 20);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recursive_filename_search_cancels_an_in_flight_directory_open() {
     let (pane, _, remote, _, server) = fixture(false).await;
     let root = remote.path();

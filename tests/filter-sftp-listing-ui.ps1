@@ -543,11 +543,18 @@ try {
         (Find-Element '2 matches in 2 folders') -and (Find-Element 'Copied 2 paths')
     }
     [IO.File]::WriteAllText((Join-Path $peerRoot 'shell directory/nested-added.txt'), 'added after search')
-    [IO.File]::WriteAllText($refreshGate, $parent)
+    $nestedPath = "$parent/nested"
+    [IO.File]::WriteAllText($refreshGate, $nestedPath)
     Click 'Refresh results'
-    $null = Wait-Until 'previous search results visible with actions disabled during refresh' {
+    $progressId = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-search-progress')
+    $null = Wait-Until 'scan progress and previous results are visible together' {
         $downloadMarked = Button 'Download marked results'
+        $progress = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $progressId)
         (Test-Path -LiteralPath (Join-Path $peerRoot 'opendir-paused')) -and
+            $progress -and $progress.Current.Name.Contains("Scanning $nestedPath") -and
+            $progress.Current.Name.Contains('43 entries scanned') -and
+            $progress.Current.Name.Contains('1 folder complete') -and $progress.Current.Name.Contains('2 matches') -and
             (Button "Reveal $parent/nested/nested-content.txt") -and
             $downloadMarked -and !$downloadMarked.Current.IsEnabled
     }
@@ -559,6 +566,7 @@ try {
     [IO.File]::Delete($refreshGate)
     $null = Wait-Until 'cancelled refresh keeps the original results' {
         (Find-Element 'Refresh cancelled. Showing previous results.') -and
+            !$searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $progressId) -and
             (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled -and
             !(Button "Reveal $parent/nested-added.txt")
     }

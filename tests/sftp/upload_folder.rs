@@ -234,7 +234,7 @@ async fn upload_folder_cancellation_reports_acknowledged_bytes_and_closes_the_pa
             operation: upload(local.path(), "/partial"),
             deadline: tokio::time::Instant::now() + Duration::from_secs(15),
             reply,
-            progress: Some(progress),
+            progress: Some(w11term::sftp::JobProgress::Transfer(progress)),
             cancel: Some(cancel.clone()),
         }))
         .unwrap();

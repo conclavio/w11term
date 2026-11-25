@@ -582,6 +582,34 @@ impl Panel {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
+        if let Some(progress) = files.search_progress(serial) {
+            let entries = if progress.scanned_entries == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            let folders = if progress.scanned_directories == 1 {
+                "folder"
+            } else {
+                "folders"
+            };
+            let matches = if progress.matches == 1 {
+                "match"
+            } else {
+                "matches"
+            };
+            let counts = format!(
+                "{} {entries} scanned · {} {folders} complete · {} {matches}",
+                progress.scanned_entries, progress.scanned_directories, progress.matches
+            );
+            rows.push(KeyedView::new(
+                "search-progress",
+                TextBlock::new()
+                    .automation_id("sftp-search-progress")
+                    .text(format!("Scanning {}\n{counts}", progress.folder))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         if let Some(status) = &self.copy_status {
             rows.push(KeyedView::new(
                 "copy-status",
@@ -850,6 +878,15 @@ impl Panel {
 }
 
 impl FileDrawer {
+    fn search_progress(&self, serial: u64) -> Option<SearchProgress> {
+        let pending = self.pending.as_ref()?;
+        if !matches!(pending.step, Step::Search(current, _) if current == serial) {
+            return None;
+        }
+        let progress = pending.search_progress.as_ref()?.borrow();
+        (!progress.folder.is_empty()).then(|| progress.clone())
+    }
+
     pub(super) fn search_serial(&self) -> Option<u64> {
         self.search.as_ref().map(|panel| panel.serial)
     }
