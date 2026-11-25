@@ -419,6 +419,8 @@ Choose **Set Windows folder as reference…** to capture a folder from the Windo
 
 Choose **Save comparison as JSON…** to write the captured report to a file. The versioned report includes the SSH account and endpoint, both folder paths and their origins, the comparison totals, and every difference in path order regardless of the current filters. File sizes are in bytes and modification times are Unix seconds. A missing side or unavailable metadata is represented by JSON `null`.
 
+Choose **Show in drawer** beside a difference with a current remote entry to open its containing folder and select it. The drawer selects symbolic links themselves. If the entry is gone or its type or containing path has changed, the comparison stays open so you can scan again. When the action opens a subfolder, **Back** returns to the folder you compared.
+
 Choose **Preview image…** on a PNG, JPEG or GIF in the SFTP listing or search results to see the image and its original dimensions. The preview reads a regular file over the pane’s existing connection and displays a scaled still image, including the first frame of an animated GIF. It accepts files up to 8 MiB with dimensions up to 4096 pixels per side and up to 8,388,608 pixels in total.
 
 Choose **Tail text file…** in the listing or search results to read up to 200 lines from the last 64 KiB of a regular UTF-8 file. The drawer shows the file size and indicates when it omitted earlier text. **Refresh tail** reads the path again, so it picks up appended output or a log file replaced by rotation. You can select and copy the text.

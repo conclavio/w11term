@@ -116,6 +116,13 @@ pub enum FileAction {
     ShowFolderReport(u64, u64, u64, folder_report::Kind),
     FolderReport(u64, u64, u64, folder_report::Action),
     LocalFolderCaptured(u64, u64, u64, Result<Arc<FolderInventory>, String>),
+    ComparedEntryListed(
+        u64,
+        u64,
+        u64,
+        u64,
+        Result<folder_report::ComparedListing, String>,
+    ),
     ClearFolderReference(u64, u64, u64),
     OpenEntry(u64, u64, ListedEntry),
     EditFilter(u64, u64, u64, bool),
@@ -617,6 +624,7 @@ enum Step {
     CompareReference(u64, u64),
     OpenLinkTarget(u64),
     FolderReport(u64),
+    RevealCompared(u64, u64),
     Permissions(u64, u32),
     MoveDestination(u64, u64),
     FolderBatch(folder_batch::Batch),
@@ -3004,7 +3012,7 @@ impl FileDrawer {
                     batch.preflight_cancel()
                 } else if matches!(step, Step::Search(..)) {
                     self.search.as_ref().and_then(|p| p.cancel.clone())
-                } else if matches!(step, Step::FolderReport(_)) {
+                } else if matches!(step, Step::FolderReport(_) | Step::RevealCompared(..)) {
                     self.folder_report
                         .as_ref()
                         .map(|panel| panel.cancel.clone())
@@ -3160,6 +3168,9 @@ impl FileDrawer {
                 }
             }
             (Step::FolderReport(serial), reply) => self.finish_folder_report(serial, reply),
+            (Step::RevealCompared(serial, revision), reply) => {
+                self.parse_compared_listing(id, serial, revision, reply, context);
+            }
             (Step::OpenLinkTarget(serial), reply) => {
                 self.finish_link_target(id, serial, reply, context)
             }
@@ -3627,6 +3638,7 @@ impl TerminalApp {
             | ShowFolderReport(id, ..)
             | FolderReport(id, ..)
             | LocalFolderCaptured(id, ..)
+            | ComparedEntryListed(id, ..)
             | ClearFolderReference(id, ..)
             | OpenEntry(id, ..)
             | EditFilter(id, ..)
@@ -3919,6 +3931,26 @@ impl TerminalApp {
                 }
                 FolderReport(_, _, serial, folder_report::Action::Browse(action)) => {
                     files.browse_folder_comparison(serial, action);
+                }
+                FolderReport(_, _, serial, folder_report::Action::Reveal { revision, index }) => {
+                    if may_open_dialog
+                        && let Some(operation) =
+                            files.begin_compared_reveal(serial, revision, index)
+                        && let Err(error) = files.job(
+                            pane,
+                            session,
+                            operation,
+                            Step::RevealCompared(serial, revision),
+                            context,
+                        )
+                    {
+                        files.finish_compared_reveal(serial, revision, Err(format!("{error:#}")));
+                    }
+                }
+                ComparedEntryListed(_, generation, serial, revision, reply) => {
+                    if generation == files.generation {
+                        files.finish_compared_reveal(serial, revision, reply);
+                    }
                 }
                 LocalFolderCaptured(_, generation, serial, result) => {
                     if generation == files.generation {

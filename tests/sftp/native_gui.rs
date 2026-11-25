@@ -3644,8 +3644,8 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
             .lines()
             .filter(|line| *line == "OPENDIR /shell directory/live/nested")
             .count(),
-        2,
-        "the initial comparison and explicit Compare again each scanned once"
+        3,
+        "only the two scans and the successful reveal list the nested folder"
     );
     assert_eq!(opens.load(Ordering::Relaxed), 2);
     server.abort();

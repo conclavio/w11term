@@ -161,6 +161,52 @@ fn entry_change(reference: FolderEntry, current: FolderEntry) -> Option<FolderCh
     }
 }
 
+impl Engine {
+    pub(super) async fn reveal_compared_entry(
+        &self,
+        path: &str,
+        expected: FolderEntry,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<Value> {
+        ensure!(
+            !cancel.is_some_and(TransferCancel::is_cancelled),
+            "Compared entry lookup cancelled"
+        );
+        ensure!(
+            path.len() <= find::MAX_PATH_BYTES,
+            "The compared entry path is too long"
+        );
+        let (parent, name) = self.checked_source_folder(path).await?;
+        let live = self
+            .raw
+            .lstat(path)
+            .await
+            .context("The remote entry is no longer available. Compare again")?;
+        ensure!(
+            live.attrs
+                .permissions
+                .is_some_and(|mode| mode & TYPE_MASK == expected.kind),
+            "The remote entry type changed or could not be verified. Compare again"
+        );
+        let entries = self.read_directory(parent, cancel, true).await?;
+        let mut matches = entries.iter().filter(|entry| entry.filename == name);
+        ensure!(
+            matches.next().is_some_and(|entry| {
+                entry.attrs.permissions.is_none_or(|mode| {
+                    let kind = mode & TYPE_MASK;
+                    kind == 0 || kind == expected.kind
+                })
+            }) && matches.next().is_none(),
+            "The remote entry changed while listing its folder. Compare again"
+        );
+        ensure!(
+            self.canonical_remote_path(parent).await? == parent,
+            "The containing folder changed. Compare again"
+        );
+        Ok(json!({"directory": parent, "selected": name, "entries": entries}))
+    }
+}
+
 pub(super) fn compare(reference: &FolderInventory, current: FolderInventory) -> FolderComparison {
     let mut report = FolderComparison {
         reference_root: reference.root.clone(),

@@ -151,8 +151,36 @@ try {
     Wait-Range 1 1 1
     Select-DifferenceType 'All differences'
     Wait-Range 1 40 244
-    Click 'Close folder comparison'
-    $null = Wait-Until 'the comparison dialog is closed' { !(Find-Element 'Close folder comparison' $button) }
+    Set-Query 'removed.txt'
+    Wait-Range 1 1 1
+    if (Find-Element 'Show remote entry removed.txt' $button) {
+        throw 'The report offered to reveal a reference-only file'
+    }
+    Set-Query 'nested/data.txt'
+    Wait-Range 1 1 1
+    $remoteFile = Join-Path $fixture 'shell directory/live/nested/data.txt'
+    [IO.File]::Delete($remoteFile)
+    Click 'Show remote entry nested/data.txt'
+    $null = Wait-Until 'a missing entry leaves the comparison open with an error' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $byId = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-comparison-reveal-status')
+        $status = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)
+        $status -and $status.Current.Name.StartsWith('Could not show remote entry.') -and
+            $status.Current.Name.Contains('The remote entry is no longer available') -and
+            (Find-Element 'Close folder comparison' $button)
+    }
+    [IO.File]::WriteAllText($remoteFile, 'current!', [Text.UTF8Encoding]::new($false))
+    Click 'Show remote entry nested/data.txt'
+    $null = Wait-Until 'the drawer shows the containing folder and has the file selected' {
+        $preview = Find-Element ('Preview text' + [char]0x2026) $button
+        !(Find-Element 'Close folder comparison' $button) -and (Find-Element "$current/nested") -and
+            (Find-Element 'data.txt' $button) -and $preview -and $preview.Current.IsEnabled
+    }
+    Click 'Back'
+    $null = Wait-Until 'Back reaches the folder that was compared, with the reference still available' {
+        (Find-Element $current) -and (Find-Element "Folder reference  $reference")
+    }
     Click 'Clear folder reference'
     $null = Wait-Until 'comparison actions are removed' {
         !(Find-Element "Folder reference  $reference") -and

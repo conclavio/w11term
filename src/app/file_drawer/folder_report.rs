@@ -4,6 +4,8 @@ use w11term::sftp::{FolderComparison, FolderContents, FolderOrigin, capture_loca
 
 mod comparison;
 mod export;
+mod reveal;
+pub(super) use reveal::Listing as ComparedListing;
 
 const READ_ONLY: u64 = 1;
 
@@ -13,6 +15,7 @@ pub enum Action {
     Stop,
     Close,
     Browse(comparison::Action),
+    Reveal { revision: u64, index: usize },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,6 +88,7 @@ pub(super) struct Panel {
     kind: Kind,
     state: State,
     comparison: comparison::Browser,
+    reveal: reveal::State,
     pub(super) cancel: TransferCancel,
 }
 
@@ -288,7 +292,22 @@ impl Panel {
                 ));
             }
             State::Loaded(Ok(Report::Comparison(comparison))) => {
-                rows.extend(self.comparison.rows(comparison, context, message));
+                rows.extend(self.comparison.rows(
+                    comparison,
+                    context,
+                    message,
+                    self.revision,
+                    !self.reveal.checking(),
+                ));
+                if let Some(status) = self.reveal.text() {
+                    rows.push(KeyedView::new(
+                        "reveal-status",
+                        TextBlock::new()
+                            .automation_id("sftp-comparison-reveal-status")
+                            .text(status)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
                 let target = text_export::FolderComparisonTarget {
                     pane,
                     generation,
@@ -303,7 +322,7 @@ impl Panel {
                 "refresh",
                 Button::new()
                     .automation_name(refresh)
-                    .is_enabled(!matches!(self.state, State::Loading))
+                    .is_enabled(!matches!(self.state, State::Loading) && !self.reveal.checking())
                     .on_click(context.callback(move |_| message(Action::Refresh)))
                     .content(refresh),
             ));
@@ -437,6 +456,7 @@ impl FileDrawer {
             kind,
             state: State::Loading,
             comparison: comparison::Browser::default(),
+            reveal: reveal::State::default(),
             cancel: TransferCancel::default(),
         });
         serial
@@ -504,6 +524,7 @@ impl FileDrawer {
             || self.directory.as_ref() != Some(&panel.directory)
             || self.pending.is_some()
             || matches!(panel.state, State::Loading)
+            || panel.reveal.checking()
         {
             return None;
         }
@@ -511,6 +532,7 @@ impl FileDrawer {
             .kind
             .operation(panel.directory.clone(), self.folder_reference.as_ref())?;
         panel.state = State::Loading;
+        panel.reveal = reveal::State::default();
         panel.revision = panel.revision.wrapping_add(1);
         panel.cancel = TransferCancel::default();
         Some(operation)
@@ -571,7 +593,7 @@ impl FileDrawer {
         if self.folder_report.take().is_some() {
             if matches!(
                 self.pending.as_ref().map(|pending| &pending.step),
-                Some(Step::FolderReport(_))
+                Some(Step::FolderReport(_) | Step::RevealCompared(..))
             ) {
                 self.pending.take();
             }

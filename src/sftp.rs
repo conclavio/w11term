@@ -299,6 +299,11 @@ pub enum Operation {
         path: String,
         reference: Option<Arc<FolderInventory>>,
     },
+    #[serde(skip)]
+    RevealComparedEntry {
+        path: String,
+        expected: FolderEntry,
+    },
     /// List folder choices for the drawer's move dialog on its existing connection.
     #[serde(skip)]
     BrowseMoveFolders {
@@ -776,6 +781,9 @@ pub(crate) async fn run(
                 Operation::InventoryFolder { .. } => {
                     Some("Missing SSH connection for folder comparison")
                 }
+                Operation::RevealComparedEntry { .. } => {
+                    Some("Missing SSH connection for the compared entry")
+                }
                 Operation::OpenLinkTarget { .. } => {
                     Some("Missing SSH connection for opening the link target")
                 }
@@ -919,6 +927,9 @@ pub(crate) async fn run(
                 Operation::MeasureFolder { .. } => JobStage::Checking("Folder scan did not finish"),
                 Operation::InventoryFolder { .. } => {
                     JobStage::Checking("Folder comparison scan did not finish")
+                }
+                Operation::RevealComparedEntry { .. } => {
+                    JobStage::Checking("Compared entry lookup did not finish")
                 }
                 Operation::GetDir { .. } | Operation::GetSearch { .. } => {
                     JobStage::DirectoryDownload {
@@ -1172,11 +1183,18 @@ impl Engine {
         &self,
         path: &str,
         cancel: Option<&TransferCancel>,
+        require_same_path: bool,
     ) -> Result<Vec<russh_sftp::protocol::File>> {
         let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
         ensure!(!cancelled(), "Directory listing cancelled");
         let handle = self.raw.opendir(path).await?.handle;
         let result = async {
+            if require_same_path {
+                ensure!(
+                    self.canonical_remote_path(path).await? == path,
+                    "The containing folder changed. Compare again"
+                );
+            }
             let mut entries = Vec::new();
             let mut bytes = 0;
             loop {
@@ -1217,7 +1235,7 @@ impl Engine {
             "SFTP returned control characters in the directory path"
         );
         let mut folders = Vec::new();
-        for entry in self.read_directory(&directory, cancel).await? {
+        for entry in self.read_directory(&directory, cancel, false).await? {
             ensure!(
                 !cancel.is_some_and(TransferCancel::is_cancelled),
                 "Directory listing cancelled"
@@ -1601,6 +1619,9 @@ impl Engine {
                     serde_json::to_value(current)?
                 }
             }
+            RevealComparedEntry { path, expected } => {
+                self.reveal_compared_entry(&path, expected, cancel).await?
+            }
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
                 let mut result = json!({ "attrs": attrs });
@@ -1694,7 +1715,7 @@ impl Engine {
                         "SFTP resolves this mount to a different path"
                     );
                 }
-                json!({"entries":self.read_directory(&path, None).await?})
+                json!({"entries":self.read_directory(&path, None, false).await?})
             }
             BrowseMoveFolders { path } => self.browse_move_folders(&path, cancel).await?,
             Read {

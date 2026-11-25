@@ -151,3 +151,74 @@ async fn folder_inventory_refuses_entries_it_cannot_classify() {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reveal_compared_file_requires_the_original_folder_and_entry_type() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    fs::create_dir_all(root.join("tree/data")).unwrap();
+    let file = root.join("tree/data/test.txt");
+    fs::write(&file, b"baseline").unwrap();
+    directory_junction(&root.join("tree"), "shortcut", "data");
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let generation = pane.frames.load().connection_generation;
+    let generation = Some(generation);
+    let inventory: FolderInventory = serde_json::from_value(
+        guarded_job(
+            &pane,
+            generation,
+            Operation::InventoryFolder {
+                path: "/tree".into(),
+                reference: None,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let reveal = |relative: &str| Operation::RevealComparedEntry {
+        path: format!("/tree/{relative}"),
+        expected: inventory.entries[relative],
+    };
+    let selected = guarded_job(&pane, generation, reveal("data/test.txt"))
+        .await
+        .unwrap();
+    assert_eq!(selected["directory"], "/tree/data");
+    assert_eq!(selected["selected"], "test.txt");
+    let selected = guarded_job(&pane, generation, reveal("shortcut"))
+        .await
+        .unwrap();
+    assert_eq!(selected["directory"], "/tree");
+    assert_eq!(selected["selected"], "shortcut");
+    assert!(
+        guarded_job(&pane, None, reveal("data/test.txt"))
+            .await
+            .is_err()
+    );
+
+    fs::write(root.join("tree-redirect"), []).unwrap();
+    let error = guarded_job(&pane, generation, reveal("data/test.txt"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("containing folder changed") || error.contains("source folder changed"),
+        "{error}"
+    );
+    fs::remove_file(root.join("tree-redirect")).unwrap();
+    fs::remove_file(&file).unwrap();
+    let error = guarded_job(&pane, generation, reveal("data/test.txt"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("no longer available"), "{error}");
+    fs::create_dir(&file).unwrap();
+    let error = guarded_job(&pane, generation, reveal("data/test.txt"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("type changed"), "{error}");
+    assert!(
+        fs::read(trace).unwrap().is_empty(),
+        "revealing an entry opened file data"
+    );
+    server.abort();
+}

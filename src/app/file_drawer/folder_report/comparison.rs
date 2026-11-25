@@ -92,6 +92,8 @@ impl Browser {
         report: &FolderComparison,
         context: &ViewContext<TerminalApp>,
         message: impl Fn(super::Action) -> Message + Copy + 'static,
+        revision: u64,
+        reveal_enabled: bool,
     ) -> Vec<KeyedView> {
         let mut rows = vec![
             KeyedView::new(
@@ -176,13 +178,23 @@ impl Browser {
                 .automation_name("Folder differences")
                 .max_height(154.0)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(
-                    StackPanel::new().spacing(6.0).keyed_children(
-                        self.matches[start..end]
-                            .iter()
-                            .map(|&index| difference_row(&report.differences[index])),
-                    ),
-                ),
+                .content(StackPanel::new().spacing(6.0).keyed_children(
+                    self.matches[start..end].iter().map(|&index| {
+                        let item = &report.differences[index];
+                        let reveal = item.current.map(|_| {
+                            Button::new()
+                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Top)
+                                .automation_name(format!("Show remote entry {}", item.path))
+                                .is_enabled(reveal_enabled)
+                                .on_click(context.callback(move |_| {
+                                    message(super::Action::Reveal { revision, index })
+                                }))
+                                .content("Show in drawer")
+                        });
+                        difference_row(item, reveal)
+                    }),
+                )),
         ));
         if total > PAGE_SIZE {
             rows.push(KeyedView::new(
@@ -263,7 +275,7 @@ fn change_label(kind: Option<FolderChange>) -> &'static str {
     }
 }
 
-fn difference_row(item: &FolderDifference) -> KeyedView {
+fn difference_row(item: &FolderDifference, reveal: Option<View>) -> KeyedView {
     let label = change_label(Some(item.change));
     let detail = match (item.reference, item.current) {
         (Some(reference), Some(current)) => format!(
@@ -276,9 +288,15 @@ fn difference_row(item: &FolderDifference) -> KeyedView {
     };
     KeyedView::new(
         item.path.as_str(),
-        TextBlock::new()
-            .text(format!("{label} · {}\n{detail}", item.path))
-            .text_wrapping(TextWrapping::Wrap),
+        Grid::new()
+            .columns([GridLength::Star(1.0), GridLength::Auto])
+            .column_spacing(6.0)
+            .children((
+                TextBlock::new()
+                    .text(format!("{label} · {}\n{detail}", item.path))
+                    .text_wrapping(TextWrapping::Wrap),
+                reveal.unwrap_or_else(View::empty),
+            )),
     )
 }
 
