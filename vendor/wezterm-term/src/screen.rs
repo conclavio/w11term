@@ -10,9 +10,12 @@ use termwiz::input::KeyboardEncoding;
 use wezterm_surface::SequenceNo;
 
 mod live_command_output;
+mod multicell_reflow;
+mod multicell_text;
 pub use live_command_output::{
     LiveCommandOutput, LiveOutputBatch, LiveOutputCursor, LiveOutputLine,
 };
+use multicell_reflow::{multicell_regions, reflow_multicell_rows, ReflowPoint};
 
 /// Horizontal scale of a DEC line rendition relative to the terminal grid.
 pub fn line_width_scale(line: &Line) -> usize {
@@ -75,6 +78,7 @@ pub struct Screen {
     pub(crate) command_start: Option<(StableRowIndex, usize)>,
     // One anchor per retained completed command whose output can be located.
     command_outputs: Vec<CommandOutput>,
+    scrollback_bookmarks: Vec<(StableRowIndex, usize)>,
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
@@ -106,9 +110,11 @@ struct CommandOutput {
 }
 
 #[derive(Clone, Copy)]
-enum CommandAnchor {
+enum ReflowAnchor {
     Start(usize),
     End(usize),
+    Bookmark,
+    Cursor,
 }
 
 impl Screen {
@@ -145,6 +151,7 @@ impl Screen {
             history_clear_count: 0,
             command_start: None,
             command_outputs: Vec::new(),
+            scrollback_bookmarks: Vec::new(),
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
@@ -156,6 +163,7 @@ impl Screen {
         self.keyboard_stack.clear();
         self.command_start = None;
         self.command_outputs.clear();
+        self.scrollback_bookmarks.clear();
         self.saved_cursor = None;
     }
 
@@ -250,6 +258,8 @@ impl Screen {
     fn discard_output_rows(&mut self, rows: Range<PhysRowIndex>) {
         let start = self.phys_to_stable_row_index(rows.start);
         let end = self.phys_to_stable_row_index(rows.end);
+        self.scrollback_bookmarks
+            .retain(|&(row, _)| !(start..end).contains(&row));
         self.command_outputs.retain_mut(|command| {
             if command.start.0 < end && command.end.is_some_and(|p| (start, 0) < p) {
                 command.end = None;
@@ -261,6 +271,8 @@ impl Screen {
     pub(crate) fn discard_erased_output(&mut self, row: PhysRowIndex, cols: &Range<usize>) {
         let row = self.phys_to_stable_row_index(row);
         let max_col = self.physical_cols - 1;
+        self.scrollback_bookmarks
+            .retain(|&(mark, col)| mark != row || !cols.contains(&col.min(max_col)));
         self.command_outputs.retain_mut(|command| {
             if cols.start < cols.end
                 && (row, cols.end) > command.start
@@ -279,6 +291,43 @@ impl Screen {
             command.end = command.end.filter(|p| (start..end).contains(&p.0));
             (start..end).contains(&command.start.0)
         });
+    }
+
+    fn retain_bookmark_rows(&mut self) {
+        let start = self.phys_to_stable_row_index(0);
+        let end = self.phys_to_stable_row_index(self.lines.len());
+        self.scrollback_bookmarks
+            .retain(|&(row, _)| (start..end).contains(&row));
+    }
+
+    pub fn scrollback_bookmark_rows(&self) -> impl Iterator<Item = StableRowIndex> + '_ {
+        self.scrollback_bookmarks
+            .iter()
+            .filter_map(move |&(row, _)| self.stable_row_to_phys(row).map(|_| row))
+    }
+
+    pub fn toggle_scrollback_bookmark(&mut self, row: StableRowIndex, col: usize) -> bool {
+        const MAX_BOOKMARKS: usize = 256;
+        if !self.allow_scrollback || self.stable_row_to_phys(row).is_none() {
+            return false;
+        }
+        self.retain_bookmark_rows();
+        let first = self
+            .scrollback_bookmarks
+            .partition_point(|&(mark, _)| mark < row);
+        let last = self
+            .scrollback_bookmarks
+            .partition_point(|&(mark, _)| mark <= row);
+        if first != last {
+            self.scrollback_bookmarks.drain(first..last);
+        } else {
+            self.scrollback_bookmarks
+                .insert(first, (row, col.min(self.physical_cols - 1)));
+            if self.scrollback_bookmarks.len() > MAX_BOOKMARKS {
+                self.scrollback_bookmarks.remove(0);
+            }
+        }
+        true
     }
 
     pub(crate) fn take_command_text(
@@ -368,12 +417,17 @@ impl Screen {
         let mut outputs = Vec::new();
         for (index, command) in commands.iter().enumerate() {
             if let Some(row) = self.stable_row_to_phys(command.start.0) {
-                outputs.push((row, CommandAnchor::Start(index), command.start.1));
+                outputs.push((row, ReflowAnchor::Start(index), command.start.1));
                 if let Some((end, col)) = command.end {
                     if let Some(row) = self.stable_row_to_phys(end) {
-                        outputs.push((row, CommandAnchor::End(index), col));
+                        outputs.push((row, ReflowAnchor::End(index), col));
                     }
                 }
+            }
+        }
+        for (row, col) in std::mem::take(&mut self.scrollback_bookmarks) {
+            if let Some(row) = self.stable_row_to_phys(row) {
+                outputs.push((row, ReflowAnchor::Bookmark, col));
             }
         }
         outputs.sort_unstable_by_key(|&(row, _, _)| row);
@@ -383,8 +437,63 @@ impl Screen {
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
         let num_rows = self.lines.len();
+        let mut multicell_regions = multicell_regions(&self.lines).into_iter().peekable();
         let mut lines = self.lines.drain(..).enumerate().peekable();
         while let Some((phys_idx, mut line)) = lines.next() {
+            if let Some(region) = multicell_regions.next_if(|region| region.start == phys_idx) {
+                let base = discarded + rewrapped.len();
+                let mut tracked = Vec::new();
+                if let Some((row, col)) = marker.filter(|(row, _)| region.contains(row)) {
+                    tracked.push((None, ReflowPoint::new(row, col)));
+                }
+                if region.contains(&cursor_y) {
+                    tracked.push((
+                        Some(ReflowAnchor::Cursor),
+                        ReflowPoint::new(cursor_y, cursor_x),
+                    ));
+                }
+                while let Some((row, anchor, col)) =
+                    outputs.next_if(|(row, _, _)| region.contains(row))
+                {
+                    tracked.push((Some(anchor), ReflowPoint::new(row, col)));
+                }
+                tracked.sort_unstable_by_key(|(_, point)| point.source);
+                let mut points: Vec<_> = tracked.iter().map(|(_, point)| *point).collect();
+                let first = std::iter::once((phys_idx, line));
+                let (removed, new_lines) = reflow_multicell_rows(
+                    first.chain(lines.by_ref().take(region.len() - 1)),
+                    physical_cols,
+                    physical_rows,
+                    capacity,
+                    seqno,
+                    &mut points,
+                );
+                if removed != 0 {
+                    discarded += rewrapped.len() + removed;
+                    rewrapped.clear();
+                }
+                rewrapped.extend(new_lines);
+                for ((anchor, _), point) in tracked.into_iter().zip(points) {
+                    let (row, col) = point.target;
+                    let row = base + row;
+                    let stable = (self.stable_row_index_offset + row) as StableRowIndex;
+                    match anchor {
+                        Some(ReflowAnchor::Start(index)) => remapped[index].0 = Some((stable, col)),
+                        Some(ReflowAnchor::End(index)) => remapped[index].1 = Some((stable, col)),
+                        Some(ReflowAnchor::Bookmark) => {
+                            self.scrollback_bookmarks.push((stable, col))
+                        }
+                        Some(ReflowAnchor::Cursor) => {
+                            adjusted_cursor = (col.min(physical_cols - 1), row)
+                        }
+                        None => self.command_start = Some((stable, col)),
+                    }
+                }
+                let excess = rewrapped.len().saturating_sub(capacity);
+                rewrapped.drain(..excess);
+                discarded += excess;
+                continue;
+            }
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
             let sized = line_width_scale(&line) == 2;
@@ -489,10 +598,14 @@ impl Screen {
                         let row =
                             (self.stable_row_index_offset + discarded + row) as StableRowIndex;
                         match anchor {
-                            Some(CommandAnchor::Start(index)) => {
+                            Some(ReflowAnchor::Start(index)) => {
                                 remapped[index].0 = Some((row, col))
                             }
-                            Some(CommandAnchor::End(index)) => remapped[index].1 = Some((row, col)),
+                            Some(ReflowAnchor::End(index)) => remapped[index].1 = Some((row, col)),
+                            Some(ReflowAnchor::Bookmark) => {
+                                self.scrollback_bookmarks.push((row, col))
+                            }
+                            Some(ReflowAnchor::Cursor) => unreachable!(),
                             None => self.command_start = Some((row, col)),
                         }
                         break;
@@ -523,6 +636,7 @@ impl Screen {
         drop(lines);
         self.lines = rewrapped;
         self.stable_row_index_offset += discarded;
+        self.scrollback_bookmarks.sort_unstable();
         self.command_outputs = commands
             .into_iter()
             .zip(remapped)
@@ -563,6 +677,12 @@ impl Screen {
         self.dpi = size.dpi;
         if physical_cols != self.physical_cols || physical_rows != self.physical_rows {
             self.invalidate_row_coordinates();
+            let primary_reflow = self.allow_scrollback && physical_cols != self.physical_cols;
+            if !primary_reflow
+                && (physical_cols < self.physical_cols || physical_rows < self.physical_rows)
+            {
+                self.clip_multicell_text(physical_cols, physical_rows, seqno);
+            }
         }
 
         // pre-prune blank lines that range from the cursor position to the end of the display;
@@ -687,6 +807,7 @@ impl Screen {
         }
         self.physical_rows = physical_rows;
         self.physical_cols = physical_cols;
+        self.retain_bookmark_rows();
         CursorPosition {
             x: cursor_x,
             y: new_cursor_y.clamp(0, physical_rows as VisibleRowIndex - 1),
@@ -763,6 +884,7 @@ impl Screen {
         right_margin: usize,
         seqno: SequenceNo,
     ) {
+        self.erase_multicell_text(y..y + 1, x..right_margin, seqno);
         let phys_cols = self.physical_cols;
 
         let line_idx = self.phys_row(y);
@@ -794,6 +916,7 @@ impl Screen {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
+        self.erase_multicell_text(y..y + 1, x..right_margin, seqno);
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         line.erase_cell_with_margin(x, right_margin, seqno, blank_attr);
@@ -803,6 +926,7 @@ impl Screen {
     /// origin.  0,0 is the top left.
     pub fn set_cell(&mut self, x: usize, y: VisibleRowIndex, cell: &Cell, seqno: SequenceNo) {
         let line_idx = self.phys_row(y);
+        self.erase_multicell_text_in_row(line_idx, x..x + cell.width().max(1), seqno);
         //debug!("set_cell x={} y={} phys={} {:?}", x, y, line_idx, cell);
 
         let line = self.line_mut(line_idx);
@@ -831,6 +955,7 @@ impl Screen {
         seqno: SequenceNo,
     ) {
         let line_idx = self.phys_row(y);
+        self.erase_multicell_text_in_row(line_idx, x..x + width, seqno);
         let line = self.line_mut(line_idx);
         line.set_cell_grapheme(x, text, width, attr, seqno);
     }
@@ -855,6 +980,7 @@ impl Screen {
         seqno: SequenceNo,
         bidi_mode: BidiMode,
     ) {
+        self.erase_multicell_text(y..y + 1, cols.clone(), seqno);
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         if cols.start == 0 {
@@ -989,6 +1115,14 @@ impl Screen {
         let region_height = phys_scroll.end - phys_scroll.start;
         let num_rows = num_rows.min(region_height);
         let rows_to_copy = region_height - num_rows;
+        if num_rows != 0 {
+            self.prepare_multicell_partial_scroll(
+                phys_scroll.clone(),
+                left_and_right_margins,
+                phys_scroll.start + num_rows..phys_scroll.end,
+                seqno,
+            );
+        }
 
         if rows_to_copy > 0 {
             for dest_row in phys_scroll.start..phys_scroll.start + rows_to_copy {
@@ -1007,6 +1141,12 @@ impl Screen {
 
                 // and place them into the dest
                 let dest_row = self.line_mut(dest_row);
+                if cells
+                    .iter()
+                    .any(|cell| cell.attrs().multicell_row().is_some())
+                {
+                    dest_row.mark_multicell_text();
+                }
                 dest_row.update_last_change_seqno(seqno);
                 let dest_range =
                     left_and_right_margins.start..left_and_right_margins.start + cells.len();
@@ -1072,6 +1212,13 @@ impl Screen {
         self.placement_rows_changed();
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
         let insert_at_end = scroll_region.end as usize == self.physical_rows;
+        if num_rows != 0 {
+            self.split_multicell_text_at(phys_scroll.end, seqno);
+            if !scrollback_ok {
+                self.split_multicell_text_at(phys_scroll.start, seqno);
+                self.split_multicell_text_at(phys_scroll.start + num_rows, seqno);
+            }
+        }
         if num_rows != 0 && (!scrollback_ok || !insert_at_end) {
             let end = if scrollback_ok {
                 self.lines.len()
@@ -1198,14 +1345,22 @@ impl Screen {
                 self.stable_row_index_offset += 1;
             }
         }
+        self.retain_bookmark_rows();
     }
 
     /// Draw the newest history rows into a full-width region starting at row 0.
-    pub(crate) fn restore_scrollback_rows(&mut self, bottom: VisibleRowIndex, count: usize) {
+    pub(crate) fn restore_scrollback_rows(
+        &mut self,
+        bottom: VisibleRowIndex,
+        count: usize,
+        seqno: SequenceNo,
+    ) {
         // History and the live display share one buffer. Removing rows at the
         // region's bottom shifts the live boundary back by the same amount.
         let end = self.phys_row(bottom);
         let removed = end - count..end;
+        self.split_multicell_text_at(removed.start, seqno);
+        self.split_multicell_text_at(removed.end, seqno);
         let start_row = self.phys_to_stable_row_index(removed.start);
         let end_row = self.phys_to_stable_row_index(removed.end);
         let surviving_row = |row: StableRowIndex| {
@@ -1234,6 +1389,14 @@ impl Screen {
         self.command_start = self
             .command_start
             .and_then(|(row, col)| Some((surviving_row(row)?, col)));
+        self.scrollback_bookmarks
+            .retain_mut(|(row, _)| match surviving_row(*row) {
+                Some(survivor) => {
+                    *row = survivor;
+                    true
+                }
+                None => false,
+            });
         self.lines.drain(removed);
         // Previously discarded coordinates can be reused by later output.
         self.invalidate_row_coordinates();
@@ -1268,6 +1431,11 @@ impl Screen {
         }
 
         let middle = phys_scroll.end - num_rows;
+        if num_rows != 0 {
+            for boundary in [phys_scroll.start, middle, phys_scroll.end] {
+                self.split_multicell_text_at(boundary, seqno);
+            }
+        }
 
         // dirty the rows in the region
         for y in phys_scroll.start..middle {
@@ -1319,6 +1487,14 @@ impl Screen {
             self.discard_output_rows(phys_scroll.clone());
         }
         let rows_to_copy = region_height - num_rows;
+        if num_rows != 0 {
+            self.prepare_multicell_partial_scroll(
+                phys_scroll.clone(),
+                left_and_right_margins,
+                phys_scroll.start..phys_scroll.end - num_rows,
+                seqno,
+            );
+        }
 
         if rows_to_copy > 0 {
             for src_row in (phys_scroll.start..phys_scroll.start + rows_to_copy).rev() {
@@ -1337,6 +1513,12 @@ impl Screen {
 
                 // and place them into the dest
                 let dest_row = self.line_mut(dest_row);
+                if cells
+                    .iter()
+                    .any(|cell| cell.attrs().multicell_row().is_some())
+                {
+                    dest_row.mark_multicell_text();
+                }
                 dest_row.update_last_change_seqno(seqno);
                 let dest_range =
                     left_and_right_margins.start..left_and_right_margins.start + cells.len();

@@ -58,6 +58,11 @@ impl TerminalState {
     ) {
         let seqno = self.seqno;
         let screen = self.screen_mut();
+        screen.erase_multicell_text(
+            rows.start as VisibleRowIndex..rows.end as VisibleRowIndex,
+            columns.clone(),
+            seqno,
+        );
         let is_default_blank = *cell == Cell::blank();
         for row in rows {
             let row = row as VisibleRowIndex;
@@ -137,6 +142,7 @@ impl TerminalState {
                 from_width,
                 &mut buffer,
             );
+            screen.erase_multicell_text(to..to + 1, target_col..target_col + count, seqno);
             let dest = screen.phys_row(to);
             let line = screen.line_mut(dest);
             let wrapped = line.last_cell_was_wrapped();
@@ -183,7 +189,7 @@ fn read_rectangle_row(
         if attrs.hyperlink().is_some_and(|link| link.is_implicit()) {
             attrs.set_hyperlink(None);
         }
-        if start >= columns.start && next <= end {
+        if start >= columns.start && next <= end && attrs.multicell_row().is_none() {
             buffer.push(Cell::new_grapheme_with_width(
                 cell.str(),
                 cell.width().max(1),
@@ -191,7 +197,7 @@ fn read_rectangle_row(
             ));
         } else {
             // A left or right cut through a grapheme copies styled blanks.
-            attrs.set_hyperlink(None);
+            attrs.set_hyperlink(None).clear_text_sizing();
             buffer.extend((first..next.min(end)).map(|_| Cell::blank_with_attrs(attrs.clone())));
         }
         column = next.min(end);

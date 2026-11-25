@@ -32,7 +32,45 @@ pub(super) enum WriterStatus {
     Finished(Result<(), String>),
 }
 
+pub(super) struct ControlRecording {
+    path: PathBuf,
+    worker: watch::Receiver<WriterStatus>,
+}
+
+impl ControlRecording {
+    pub(super) fn finished(&self) -> bool {
+        matches!(*self.worker.borrow(), WriterStatus::Finished(_))
+            || self.worker.has_changed().is_err()
+    }
+
+    pub(super) fn snapshot(&self) -> serde_json::Value {
+        use serde_json::json;
+
+        let status = self.worker.borrow();
+        let (state, error) = match &*status {
+            WriterStatus::Finished(Ok(())) => ("saved", None),
+            WriterStatus::Finished(Err(error)) => ("failed", Some(error.as_str())),
+            _ if self.worker.has_changed().is_err() => {
+                ("failed", Some("The file writer stopped unexpectedly"))
+            }
+            WriterStatus::Opening => ("opening", None),
+            WriterStatus::Recording => ("recording", None),
+        };
+        json!({ "path": self.path.to_string_lossy(), "state": state, "error": error })
+    }
+}
+
 impl State {
+    pub(super) fn control_watcher(&self) -> Option<ControlRecording> {
+        let Self::Writing { path, worker, .. } = self else {
+            return None;
+        };
+        Some(ControlRecording {
+            path: path.clone(),
+            worker: worker.clone(),
+        })
+    }
+
     pub(super) fn start(
         path: PathBuf,
         transcript: &GroupTranscript,

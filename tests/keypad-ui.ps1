@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State, [Parameter(Mandatory)][string]$Trace,
-      [switch]$Kitty, [switch]$PhysicalLayout)
+      [switch]$Kitty, [switch]$PhysicalLayout, [switch]$XtermOtherKeys)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
@@ -36,7 +36,12 @@ try {
     }
     $pane = (Control @('list')).sessions[0].id
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','keypad-fixture-ready')
-    if ($PhysicalLayout) {
+    if ($XtermOtherKeys) {
+        Tap 0x0D 0x1C $false # main Enter
+        Tap 0x0D 0x1C $true  # keypad Enter
+        Tap 0x09 0x0F $false # Tab
+        Tap 0x20 0x39 $false # Space
+    } elseif ($PhysicalLayout) {
         Add-Type -Path (Join-Path $PSScriptRoot 'support/physical-layout.cs')
         $key = [PhysicalLayoutFixture]::Printable($window, $app.Id)
         [IO.File]::WriteAllText((Join-Path $State 'logical-scalar.txt'), [string]$key[1])

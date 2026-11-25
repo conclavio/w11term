@@ -16,6 +16,7 @@ pub struct TerminalModes {
     pub mouse_motion: bool,
     pub mouse_encoding: MouseEncoding,
     pub keyboard: KeyboardEncoding,
+    pub xterm_other_keys: (u8, bool),
     pub bracketed_paste: bool,
     pub synchronized: bool,
     pub in_band_resize: bool,
@@ -36,6 +37,7 @@ impl TerminalModes {
             mouse_motion: terminal.any_event_mouse_enabled(),
             mouse_encoding: terminal.get_mouse_encoding(),
             keyboard: terminal.effective_keyboard_encoding(),
+            xterm_other_keys: terminal.xterm_other_keys(),
             bracketed_paste: terminal.bracketed_paste_enabled(),
             synchronized: terminal.synchronized_output(),
             in_band_resize: terminal.in_band_resize_enabled(),
@@ -55,6 +57,12 @@ impl TerminalModes {
             KeyboardEncoding::Win32 => ("win32", 0),
             KeyboardEncoding::Kitty(flags) => ("kitty", flags.bits()),
         };
+        let mut keyboard_json = json!({ "encoding": keyboard, "flags": flags });
+        let (level, csi_u) = self.xterm_other_keys;
+        if self.keyboard == KeyboardEncoding::Xterm && (level != 0 || csi_u) {
+            keyboard_json["modify_other_keys"] = level.into();
+            keyboard_json["format_other_keys"] = if csi_u { "csi-u" } else { "xterm-27" }.into();
+        }
         json!({
             "cols": self.cols,
             "rows": self.rows,
@@ -71,7 +79,7 @@ impl TerminalModes {
                 "motion": self.mouse_motion,
                 "encoding": mouse,
             },
-            "keyboard": { "encoding": keyboard, "flags": flags },
+            "keyboard": keyboard_json,
         })
     }
 }

@@ -147,6 +147,13 @@ function Click([string]$Name) {
     $invoke.Invoke()
 }
 
+function Wait-ArmedOutputAlert([string]$Summary, [string]$Query) {
+    $null = Wait-Until "armed output alert for '$Query'" {
+        (Find-Element $Summary) -and (Find-Element 'Cancel output alert' $button) -and
+            (Find-Element "Armed output search${dot}$Query")
+    }
+}
+
 function Wait-RecordingStatus([string]$Prefix, [string]$Path, [switch]$PassThru) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $text = [System.Windows.Automation.PropertyCondition]::new(
@@ -175,6 +182,7 @@ $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $readyJob = $null
+$explicitReadyJob = $null
 $outputJob = $null
 $followJob = $null
 $followReader = $null
@@ -257,7 +265,85 @@ try {
     $null = Wait-Until 'the wildcard exclusion removes West from the send scope' {
         (Find-Element "Focus pane $east" $button) -and !(Find-Element "Focus pane $west" $button)
     }
-    Submit 'one' 'Send to 1 host'
+    (Command-Editor).SetValue('one')
+    $alertedSend = 'Send with alert' + [char]0x2026
+    $alertSearch = 'Search for the output alert'
+    Click $alertedSend
+    $null = Wait-Until 'an empty alert rule cannot send the command' {
+        $confirm = Find-Element 'Send with alert' $button
+        $confirm -and !$confirm.Current.IsEnabled
+    }
+    (Wait-CheckBox 'Regular expression' Off).Toggle()
+    $null = Wait-CheckBox 'Regular expression' On
+    (Command-Editor $alertSearch).SetValue('(')
+    $null = Wait-Until 'an invalid pattern cannot send the command' {
+        $confirm = Find-Element 'Send with alert' $button
+        $confirm -and !$confirm.Current.IsEnabled -and (Find-Element 'unclosed group')
+    }
+    Click 'Cancel'
+    $null = Wait-Until 'cancelling the alert review preserves the unsent draft' {
+        (Find-Element 'Send to 1 host' $button) -and !(Find-Element "Submitted${dot}one")
+    }
+    Click $alertedSend
+    $savedAlertRules = 'Saved alert rules' + [char]0x2026
+    $ruleName = 'Fast success'
+    $ruleQuery = '^east-accepted one$'
+    (Wait-CheckBox 'Regular expression' Off).Toggle()
+    $null = Wait-CheckBox 'Regular expression' On
+    (Wait-CheckBox 'Match case' Off).Toggle()
+    $null = Wait-CheckBox 'Match case' On
+    (Command-Editor $alertSearch).SetValue($ruleQuery)
+    Click $savedAlertRules
+    (Command-Editor 'Output alert rule name').SetValue($ruleName)
+    Click 'Save current rule'
+    $null = Wait-Until 'the named rule appears after saving' { Find-Element "Use alert rule $ruleName" $button }
+    $storedRule = Get-Content -LiteralPath (Join-Path $env:W11TERM_DATA_DIR 'output-alert-rules.json') -Raw | ConvertFrom-Json
+    if ($storedRule.name -cne $ruleName -or $storedRule.query -cne $ruleQuery -or !$storedRule.regex -or !$storedRule.match_case) {
+        throw 'The named rule lost its query or matching options'
+    }
+    Click 'Close saved rules'
+    $chooseRecording = 'Choose recording file' + [char]0x2026
+    (Wait-CheckBox 'Record full output' Off).Toggle()
+    Click $chooseRecording
+    $dialog = Wait-Until 'the combined send opens a recording destination' { Find-OwnedDialog 'Record SSH group output' }
+    if (Find-Element "Submitted${dot}one") { throw 'The command was sent before the file was chosen' }
+    $null = Wait-Until 'cancel the recorded alert' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'cancelling the file picker keeps the command unsent' {
+        !(Find-OwnedDialog 'Record SSH group output') -and
+            (Find-Element $alertedSend $button) -and !(Find-Element "Submitted${dot}one")
+    }
+    Click $alertedSend
+    Click $savedAlertRules
+    Click "Use alert rule $ruleName"
+    $null = Wait-Until 'loading the saved rule restores the exact review query' {
+        (Command-Editor $alertSearch).Current.Value -ceq $ruleQuery
+    }
+    $null = Wait-CheckBox 'Regular expression' On
+    $null = Wait-CheckBox 'Match case' On
+    (Wait-CheckBox 'Record full output' Off).Toggle()
+    Click $chooseRecording
+    $dialog = Wait-Until 'reopen the recording destination for the alert' { Find-OwnedDialog 'Record SSH group output' }
+    $firstAlertRecording = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'first-alert-run.txt'
+    $null = Wait-Until 'set the destination for the recorded alert' {
+        [FixtureDialog]::SetFilename($dialog, $firstAlertRecording, 'ssh-group-output-1.txt')
+    }
+    $null = Wait-Until 'approve the recording destination and send' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the first output of the quick run triggers its pre-armed alert' {
+        (Find-Element "Submitted${dot}one") -and (Find-Element 'Attention inbox, 1 unread' $button)
+    }
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}SSH host group${dot}Run 1${dot}Matched output${dot}$eastName${dot}east-accepted one"
+    $null = Wait-Until 'the pre-armed alert opens its original run' {
+        (Find-Element "Submitted${dot}one") -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Wait-RecordingStatus 'Saved live output to ' $firstAlertRecording
+    $firstRecording = [IO.File]::ReadAllLines($firstAlertRecording)
+    if ($firstRecording[0] -cne "Submitted${dot}one" -or
+        "$eastName${dot}east-accepted one" -cnotin $firstRecording -or
+        "$eastName${dot}Sent to SSH channel${dot}Exit 0" -cnotin $firstRecording -or
+        $firstRecording[-1] -cne '[Group run settled]') {
+        throw 'The recorded alert omitted the matching output or final result'
+    }
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
     $showLastOutput = 'Show last command output'
@@ -1304,14 +1390,29 @@ try {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
     }
+    $interruptRun = ((Control @('list-ssh-groups')).windows.groups.runs | Where-Object label -ceq 'interrupt-pair').run_id
+    $interruptArgs = @('interrupt-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$interruptRun")
+    $outside = & $Cli --pid $app.Id @interruptArgs --pane $local | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $outside.ok -or $outside.error -notlike '*not a recipient in this run*') {
+        throw 'An SSH group interrupt accepted a pane that was outside the run'
+    }
+    $interrupted = Control ($interruptArgs + @('--pane',"$east"))
+    $eastReceipt = $interrupted.run.recipients | Where-Object pane_id -eq $east
+    if ($interrupted.window_id -ne $groupWindow -or $interrupted.tab_id -ne $groupTab -or
+        $eastReceipt.interrupt.state -notin @('pending','sent')) {
+        throw 'The scoped interrupt did not report delivery state for East'
+    }
     (Wait-CheckBox $eastName Off).Toggle()
     $null = Wait-CheckBox $eastName On
-    Click 'Interrupt selected'
     Outcome $eastName 'Ctrl+C sent'
     Outcome $eastName 'Exit 130'
     Submit 'interrupt-both' 'Send to 2 hosts'
     Outcome $eastName 'Running'
     Outcome $westName 'Running'
+    $stale = & $Cli --pid $app.Id @interruptArgs --pane $east | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $stale.ok -or $stale.error -notlike '*no verified running command*') {
+        throw 'An interrupt for the previous run reached a newer command on the same pane'
+    }
     Click 'Interrupt selected'
     Outcome $eastName 'Exit 130'
     Outcome $westName 'Exit 130'
@@ -1574,6 +1675,53 @@ try {
         $captured = [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader))
         $captured.Contains("$eastName$($dot)east record row 79") -and !$captured.Contains('[Group run settled]')
     }
+    Click $liveButton
+    $null = Wait-Until 'retained burst output is shown before arming an alert' {
+        Find-Element 'east record row 79'
+    }
+    Click $savedAlertRules
+    Click "Use alert rule $ruleName"
+    $null = Wait-Until 'the live output view can load the same named rule' {
+        (Command-Editor $outputSearch).Current.Value -ceq $ruleQuery
+    }
+    $null = Wait-CheckBox $outputRegex On
+    $null = Wait-CheckBox $outputCase On
+    Click 'Clear output filters'
+    $null = Wait-CheckBox $outputRegex Off
+    $null = Wait-CheckBox $outputCase Off
+    Click 'Pause output'
+    (Command-Editor $outputSearch).SetValue('record row')
+    $null = Wait-Until 'the paused view has a valid search for a live alert' {
+        $armAlert = Find-Element 'Notify on next match' $button
+        $armAlert -and $armAlert.Current.IsEnabled
+    }
+    Click 'Notify on next match'
+    $literalRule = "Output alert armed${dot}Literal text${dot}Ignore case${dot}All output hosts"
+    Wait-ArmedOutputAlert $literalRule 'record row'
+    $null = Wait-Until 'the alert arms without matching the retained East rows' {
+        Find-Element 'Attention inbox, 0 unread' $button
+    }
+    Click 'Clear output filters'
+    Wait-ArmedOutputAlert $literalRule 'record row'
+    Click 'Back to results'
+    $null = Wait-Until 'return to results with the alert still armed' { Find-Element "Submitted${dot}record-fast" }
+    Wait-ArmedOutputAlert $literalRule 'record row'
+    Click 'Cancel output alert'
+    $null = Wait-Until 'cancelling the alert removes its rule from the run results' {
+        !(Find-Element $literalRule) -and !(Find-Element 'Cancel output alert' $button)
+    }
+    Click $liveButton
+    (Wait-CheckBox $outputRegex Off).Toggle()
+    $null = Wait-CheckBox $outputRegex On
+    (Wait-CheckBox $outputCase Off).Toggle()
+    $null = Wait-CheckBox $outputCase On
+    Select-ComboValue $outputHosts $westName
+    (Command-Editor $outputSearch).SetValue('^west record row')
+    Click 'Notify on next match'
+    $regexRule = "Output alert armed${dot}Regular expression${dot}Match case${dot}$westName"
+    Wait-ArmedOutputAlert $regexRule '^west record row'
+    Click 'Back to results'
+    Wait-ArmedOutputAlert $regexRule '^west record row'
     Click "Focus pane $west"
     Wait-Focus $west
     $followPath = Join-Path $State 'follow-burst.jsonl'
@@ -1612,7 +1760,33 @@ try {
     }
     $logReader.Dispose()
     $logReader = $null
-    Run-Palette 'SSH host group'
+    Click 'Attention inbox, 1 unread'
+    $outputNotice = "Unread${dot}SSH host group${dot}Run $burstRunId${dot}Matched output${dot}$westName${dot}west record row 00"
+    $null = Wait-Until 'the unread alert identifies the matching host and line' { Find-Element $outputNotice $button }
+    $matchedLine = $streamedLines | Where-Object text -CEQ 'west record row 00'
+    $viewMatch = "View matching output for SSH host group, run $burstRunId, line $($matchedLine.line_id)"
+    Click $viewMatch
+    $null = Wait-Until 'the alert opens the match and two nearby lines from its source host' {
+        $match = Find-Element 'west record row 00'
+        $next = Find-Element 'west record row 01'
+        $last = Find-Element 'west record row 02'
+        (Find-Element 'SSH group output match') -and (Find-Element 'Matched line') -and
+            (Find-Element "Run $burstRunId${dot}$westName") -and
+            $match -and $next -and $last -and
+            $match.Current.BoundingRectangle.Top -lt $next.Current.BoundingRectangle.Top -and
+            $next.Current.BoundingRectangle.Top -lt $last.Current.BoundingRectangle.Top -and
+            !(Find-Element 'east record row 79') -and !(Find-Element 'west record row 03') -and
+            (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Click 'Back to inbox'
+    $readOutputNotice = $outputNotice -creplace '^Unread', 'Read'
+    $null = Wait-Until 'returning from the excerpt keeps the notice read' { Find-Element $readOutputNotice $button }
+    Click $viewMatch
+    Click 'Open run results'
+    $null = Wait-Until 'the match view opens its original run' {
+        (Find-Element "Submitted${dot}record-fast") -and (Find-Element 'Attention inbox, 0 unread' $button) -and
+            !(Find-Element $regexRule) -and !(Find-Element 'Cancel output alert' $button)
+    }
     Outcome $westName 'Exit 17'
     Wait-RecordingStatus 'Saved live output to ' $burstPath
     $burst = [IO.File]::ReadAllLines($burstPath)
@@ -1753,6 +1927,251 @@ try {
         $outcomes[-1] -cne '[Group run settled]') {
         throw "The recording footer omitted the rejected host: $($outcomes -join ' | ')"
     }
+    Set-HostFilter 'east'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-Until 'the missing-output check has only East in scope' {
+        Find-Element 'Send to 1 host' $button
+    }
+    (Command-Editor).SetValue('check-expected')
+    Click $alertedSend
+    (Command-Editor $alertSearch).SetValue('ready marker')
+    (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()
+    $null = Wait-CheckBox 'Alert if expected output is missing' On
+    Click 'Send with alert'
+    $null = Wait-Until 'the verified run reports a missing match only after settling' {
+        (Find-Element "Submitted${dot}check-expected") -and
+            (Find-Element "$eastName${dot}Exit 0") -and (Find-Element 'Attention inbox, 1 unread' $button)
+    }
+    Click 'Attention inbox, 1 unread'
+    $missingRun = $burstRunId + 2
+    Click "Unread${dot}SSH host group${dot}Run $missingRun${dot}Expected output missing${dot}ready marker"
+    $null = Wait-Until 'the missing-output notice opens the settled run and marks it read' {
+        (Find-Element "Submitted${dot}check-expected") -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Send-Raw $west 'prompt'
+    Set-HostFilter ''
+    Pane-Status $west "Connected${dot}Ready"
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
+    (Command-Editor).SetValue('check-each-host')
+    Click $alertedSend
+    $expectedLine = 'east-accepted check-each-host'
+    (Command-Editor $alertSearch).SetValue($expectedLine)
+    (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()
+    $null = Wait-CheckBox 'Alert if expected output is missing' On
+    (Wait-CheckBox 'Require a match from every host' Off).Toggle()
+    $null = Wait-CheckBox 'Require a match from every host' On
+    Click 'Send with alert'
+    $everyHostRun = $missingRun + 1
+    $runArgs = @('--window',"$groupWindow",'--tab',"$groupTab",'--run',"$everyHostRun")
+    $finished = (Control (@('wait-ssh-group-run') + $runArgs + @('--timeout','15'))).run
+    $details = (Control (@('get-ssh-group-run') + $runArgs)).run
+    foreach ($result in @($finished, $details)) {
+        $check = $result.output_expectation
+        $matched = $result.recipients | Where-Object pane_id -eq $east
+        $missing = $result.recipients | Where-Object pane_id -eq $west
+        if ($check.query -cne $expectedLine -or $check.regex -ne $false -or
+            $check.match_case -ne $false -or $matched.output_expectation -cne 'matched' -or
+            $missing.output_expectation -cne 'missing') {
+            throw "The run reply lost the resolved check: $($result | ConvertTo-Json -Depth 8 -Compress)"
+        }
+    }
+    $null = Wait-Until 'a match on East leaves West under its own check' {
+        (Find-Element "Submitted${dot}check-each-host") -and (Find-Element 'Attention inbox, 1 unread' $button)
+    }
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}SSH host group${dot}Run $everyHostRun${dot}Expected output missing on 1 host${dot}$expectedLine"
+    $null = Wait-Until 'run results identify West as the host missing expected output' {
+        (Find-Element "Submitted${dot}check-each-host") -and
+            (Find-Element "Expected output missing${dot}$westName") -and
+            !(Find-Element "Expected output missing${dot}$eastName") -and
+            (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Click 'Copy results'
+    $null = Wait-Until 'the text report includes the expected output check and both outcomes' {
+        $text = Read-ClipboardFixture
+        $text -and $text.Contains("Expected output${dot}$expectedLine") -and
+            $text.Contains("  Expected output matched`r`n") -and $text.Contains("  Expected output missing`r`n")
+    }
+    $expectedJson = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'output check.json'
+    Click ('Save results as JSON' + [char]0x2026)
+    $dialog = Wait-Until 'owned expected output JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
+    $null = Wait-Until 'enter the expected output JSON destination' {
+        [FixtureDialog]::SetFilename($dialog, $expectedJson, "ssh-group-submission-$everyHostRun.json")
+    }
+    $null = Wait-Until 'save the expected output JSON report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the expected output JSON report is published' { [IO.File]::Exists($expectedJson) }
+    $saved = [IO.File]::ReadAllText($expectedJson) | ConvertFrom-Json
+    $matched = $saved.recipients | Where-Object pane_id -eq $east
+    $missing = $saved.recipients | Where-Object pane_id -eq $west
+    if ($saved.schema_version -ne 1 -or $saved.output_expectation.query -cne $expectedLine -or
+        $matched.output_expectation -cne 'matched' -or $missing.output_expectation -cne 'missing' -or
+        $missing.output.state -cne 'complete' -or !$missing.output.text.Contains('west-accepted check-each-host')) {
+        throw 'The JSON export lost the expected output check, its recipient outcomes, or the captured output'
+    }
+    $submitArgs = @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab")
+    $badScope = & $Cli --pid $app.Id @submitArgs --pane $west --pane $local 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $badScope.ok -or $badScope.error -notlike "*SSH pane $local*outside*") {
+        throw 'The CLI accepted a local pane as an SSH group recipient'
+    }
+    Send-Raw $west 'alt'
+    Pane-Status $west "Connected${dot}Alternate screen"
+    $notReady = & $Cli --pid $app.Id @submitArgs --pane $east --pane $west 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $notReady.ok -or $notReady.error -notlike "*SSH pane $west*not ready*") {
+        throw 'The CLI accepted a submission while one of its explicitly named SSH panes was unready'
+    }
+    $outsideReady = & $Cli --pid $app.Id @readyArgs --pane $local --timeout 15 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $outsideReady.ok -or $outsideReady.error -notlike "*Requested SSH pane $local*outside*") {
+        throw 'The explicit readiness wait accepted a pane outside the SSH roster'
+    }
+    $explicitOutput = Join-Path $State 'wait-explicit-group-ready.json'
+    $explicitArgs = $readyArgs + @('--pane',"$west",'--pane',"$east",'--timeout','15')
+    $explicitReadyJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $explicitArgs) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $explicitOutput
+    (Wait-CheckBox $westName On).Toggle()
+    Set-HostFilter 'east'
+    $null = Wait-Until 'the roster hides and unchecks West while a CLI wait is pending' {
+        $hidden = (Roster-Snapshot).hosts | Where-Object pane_id -eq $west
+        $hidden -and !$hidden.shown -and !$hidden.checked -and $hidden.state -ceq 'alternate'
+    }
+    if ($explicitReadyJob.HasExited) { throw 'The explicit wait ended while a requested pane was unready' }
+    Send-Raw $west 'prompt'
+    if (!$explicitReadyJob.WaitForExit(10000)) { throw 'The explicit readiness wait did not finish' }
+    $explicit = [IO.File]::ReadAllText($explicitOutput) | ConvertFrom-Json
+    $hiddenReady = $explicit.result.roster.hosts | Where-Object pane_id -eq $west
+    if (!$explicit.ok -or ($explicit.result.ready_pane_ids -join ',') -cne "$west,$east" -or
+        $hiddenReady.shown -or $hiddenReady.checked -or $hiddenReady.state -cne 'ready') {
+        throw 'The explicit readiness wait followed the UI selection or lost its requested pane order'
+    }
+    Set-HostFilter ''
+    Pane-Status $west "Connected${dot}Ready"
+    (Wait-CheckBox $westName Off).Toggle()
+    $null = Wait-CheckBox $westName On
+    (Command-Editor).SetValue('untouched command draft')
+    Set-HostFilter 'east'
+    $beforeSubmit = Wait-Until 'the East filter is committed before leaving the group' {
+        $roster = Roster-Snapshot
+        if (($roster.hosts | Where-Object shown).pane_id -eq $east -and $roster.counts.shown -eq 1) { $roster }
+    }
+    $null = Wait-Until 'the command draft is committed before leaving the group' {
+        (Command-Editor).Current.Value -ceq 'untouched command draft'
+    }
+    Press-Key 0x77
+    Wait-Focus $east
+    $submitForeground = [FixtureMessages]::GetForegroundWindow()
+    $badPattern = & $Cli --pid $app.Id @submitArgs --pane $west --expect-output '[' --regex 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $badPattern.ok -or $badPattern.error -notlike '*invalid expected output*') {
+        throw 'The CLI accepted an invalid expected-output regex'
+    }
+    $existingRecording = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'recording exists.txt'
+    [IO.File]::WriteAllText($existingRecording, 'existing recording')
+    $badRecording = & $Cli --pid $app.Id @submitArgs --pane $west --record-output $existingRecording 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $badRecording.ok -or $badRecording.error -notlike '*Could not prepare the recording*' -or
+        [IO.File]::ReadAllText($existingRecording) -cne 'existing recording') {
+        throw 'The CLI accepted an existing recording destination or changed its contents'
+    }
+    $launched = Control ($submitArgs + @('--pane',"$west",'cli-only  west'))
+    if ($launched.window_id -ne $groupWindow -or $launched.tab_id -ne $groupTab -or $launched.run_id -ne ($everyHostRun + 1)) {
+        throw 'The CLI did not create exactly one retained run for the accepted request'
+    }
+    $verified = (Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($launched.run_id)",'--timeout','15')).run
+    if ($verified.command -cne 'cli-only  west' -or $verified.recipients.Count -ne 1 -or
+        $null -ne $verified.output_expectation -or $null -ne $verified.recording -or
+        $verified.recipients[0].pane_id -ne $west -or $verified.recipients[0].delivery.state -cne 'sent' -or
+        $verified.recipients[0].execution.exit_code -ne 17 -or
+        [FixtureMessages]::GetForegroundWindow() -ne $submitForeground) {
+        throw 'The CLI submission changed focus or lost its recipient, command, or outcome'
+    }
+    $null = Wait-Until 'both SSH panes are ready for the checked CLI run' {
+        ((Roster-Snapshot).hosts | Where-Object state -ceq 'ready' | Measure-Object).Count -eq 2
+    }
+    $cliPattern = '^west-accepted cli-expect$'
+    $cliRecording = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'cli output.txt'
+    $checked = Control ($submitArgs + @('--pane',"$west",'--pane',"$east",
+        '--expect-output',$cliPattern,'--regex','--match-case','--record-output',$cliRecording,'cli-expect'))
+    $cliCheck = (Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($checked.run_id)",'--timeout','15')).run
+    $first, $second = $cliCheck.recipients
+    if ($checked.run_id -ne ($launched.run_id + 1) -or $cliCheck.recipients.Count -ne 2 -or
+        $cliCheck.output_expectation.query -cne $cliPattern -or !$cliCheck.output_expectation.regex -or
+        !$cliCheck.output_expectation.match_case -or $first.pane_id -ne $west -or $second.pane_id -ne $east -or
+        $first.output_expectation -cne 'matched' -or $second.output_expectation -cne 'missing') {
+        throw "The checked CLI submission lost its rule, recipient order, or per-pane outcomes: $($cliCheck | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    if ($cliCheck.recording.state -cne 'saved' -or $cliCheck.recording.path -cne $cliRecording -or
+        $null -ne $cliCheck.recording.error) {
+        throw "The CLI run settled before its recording finished: $($cliCheck.recording | ConvertTo-Json -Compress)"
+    }
+    $cliLines = [IO.File]::ReadAllLines($cliRecording)
+    if ("$westName${dot}west-accepted cli-expect" -cnotin $cliLines -or
+        "$eastName${dot}east-accepted cli-expect" -cnotin $cliLines -or
+        "$westName${dot}Sent to SSH channel${dot}Exit 17" -cnotin $cliLines -or
+        "$eastName${dot}Sent to SSH channel${dot}Exit 0" -cnotin $cliLines -or
+        $cliLines[-1] -cne '[Group run settled]') {
+        throw 'The completed CLI transcript lost output, host outcomes, or its settlement footer'
+    }
+    $reportArgs = @('save-ssh-group-report','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $cliReportPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'CLI group report.json'
+    $retiredReport = & $Cli --pid $app.Id @reportArgs 99999 $cliReportPath | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $retiredReport.ok -or $retiredReport.error -notlike '*is not retained*' -or
+        [IO.File]::Exists($cliReportPath)) {
+        throw 'Exporting an unknown run created a destination or gave an ambiguous reply'
+    }
+    $reportRun = "$($checked.run_id)"
+    $savedReport = Control ($reportArgs + @($reportRun,$cliReportPath))
+    $jsonText = [IO.File]::ReadAllText($cliReportPath)
+    $cliDoc = $jsonText | ConvertFrom-Json
+    $docWest, $docEast = $cliDoc.recipients
+    if ($savedReport.window_id -ne $groupWindow -or $savedReport.tab_id -ne $groupTab -or
+        $savedReport.run_id -ne $checked.run_id -or $savedReport.path -cne $cliReportPath -or
+        $savedReport.format -cne 'json' -or $cliDoc.schema_version -ne 1 -or $cliDoc.submission_id -ne $checked.run_id -or
+        $cliDoc.output_expectation.query -cne $cliPattern -or $docWest.pane_id -ne $west -or
+        $docWest.output_expectation -cne 'matched' -or $docWest.output.state -cne 'complete' -or
+        $docWest.output.text -notlike '*west-accepted cli-expect*' -or $docEast.pane_id -ne $east -or
+        $docEast.output_expectation -cne 'missing' -or $docEast.output.state -cne 'complete' -or
+        $docEast.output.text -notlike '*east-accepted cli-expect*') {
+        throw 'The CLI JSON report lost output, recipient order, or the output check'
+    }
+    $conflict = & $Cli --pid $app.Id @reportArgs $reportRun --format text $cliReportPath | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $conflict.ok -or [IO.File]::ReadAllText($cliReportPath) -cne $jsonText) {
+        throw 'The CLI report replaced an existing destination without permission'
+    }
+    $textReport = Control ($reportArgs + @($reportRun,'--format','text','--overwrite',$cliReportPath))
+    $reportText = [IO.File]::ReadAllText($cliReportPath)
+    if ($textReport.format -cne 'text' -or !$reportText.StartsWith("Submitted${dot}cli-expect") -or
+        !$reportText.Contains('Expected output matched') -or !$reportText.Contains('Expected output missing') -or
+        !$reportText.Contains('east-accepted cli-expect') -or !$reportText.Contains('west-accepted cli-expect') -or
+        [FixtureMessages]::GetForegroundWindow() -ne $submitForeground) {
+        throw 'The background text export lost output or moved focus'
+    }
+    Wait-Focus $east
+    Run-Palette 'SSH host group'
+    $null = Wait-Until 'background submission preserved the displayed results' {
+        Find-Element "Submitted${dot}check-each-host"
+    }
+    $draft = (Command-Editor).Current.Value
+    if ($draft -cne 'untouched command draft') { throw "The background send changed the draft to '$draft'" }
+    $afterSubmit = Roster-Snapshot
+    if (($afterSubmit.hosts | Where-Object shown).pane_id -ne $east -or $afterSubmit.counts.shown -ne 1 -or
+        $afterSubmit.counts.checked -ne $beforeSubmit.counts.checked) {
+        throw 'The background send changed the roster filter or checked hosts'
+    }
+    Set-HostFilter ''
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}SSH host group${dot}Run $($checked.run_id)${dot}Expected output missing on 1 host${dot}$cliPattern"
+    $null = Wait-Until 'the CLI check links back to its own results in the group' {
+        (Find-Element "Submitted${dot}cli-expect") -and (Find-Element "Expected output missing${dot}$eastName")
+    }
+    Click 'Previous submission'
+    $null = Wait-Until 'return to the command submitted without a check' { Find-Element "Submitted${dot}cli-only  west" }
+    Click 'Previous submission'
+    $null = Wait-Until 'return to the previous UI output check' { Find-Element "Submitted${dot}check-each-host" }
+    Click 'Previous submission'
+    $null = Wait-Until 'move back to the earlier missing-output check' { Find-Element "Submitted${dot}check-expected" }
+    Click 'Previous submission'
+    $null = Wait-Until 'return to the partially delivered recording' { Find-Element "Submitted${dot}record-one" }
+    Wait-RecordingStatus 'Saved live output to ' $withheldPath
     try {
         $explorer = New-Object -ComObject Shell.Application
         $priorExplorerWindows = @($explorer.Windows() | ForEach-Object { $_.HWND })
@@ -1769,6 +2188,32 @@ try {
     if ($trace.hresult -ge 0) {
         $null = Wait-Until 'recording selection was acknowledged' { Find-Element 'Selected in File Explorer' }
     }
+    # Explorer can activate asynchronously after Shell32 acknowledges the selection.
+    # Invoke the group tab's close button directly, then wait for the app to retire it.
+    $closeId = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'CloseButton')
+    $closeGroup = Wait-Until 'the SSH group tab close button' {
+        $tab = Find-Element 'SSH host group' ([System.Windows.Automation.ControlType]::TabItem)
+        if ($tab) { $tab.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $closeId) }
+    }
+    Invoke-Button $closeGroup
+    $null = Wait-Until "SSH group tab $groupTab to close" {
+        $owner = (Control @('list-ssh-groups')).windows | Where-Object window_id -eq $groupWindow
+        $owner -and ($groupTab -notin $owner.groups.tab_id)
+    }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the saved alert remains available after closing the group tab' {
+        $expiredNotice = $readOutputNotice.Replace("Run $burstRunId${dot}", "Run $burstRunId (results unavailable)${dot}")
+        $entry = Find-Element $expiredNotice $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    Click $viewMatch
+    $null = Wait-Until 'the expired run shows its saved alert excerpt and disables results navigation' {
+        $results = Find-Element 'Open run results' $button
+        (Find-Element "Run $burstRunId${dot}Saved alert excerpt") -and
+            (Find-Element "Matched output${dot}$westName${dot}west record row 00") -and
+            $results -and !$results.Current.IsEnabled
+    }
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
@@ -1784,6 +2229,10 @@ try {
     if ($readyJob) {
         if (!$readyJob.HasExited) { $readyJob.Kill(); $readyJob.WaitForExit() }
         $readyJob.Dispose()
+    }
+    if ($explicitReadyJob) {
+        if (!$explicitReadyJob.HasExited) { $explicitReadyJob.Kill(); $explicitReadyJob.WaitForExit() }
+        $explicitReadyJob.Dispose()
     }
     if ($logReader) { $logReader.Dispose() }
     if ($explorer) {

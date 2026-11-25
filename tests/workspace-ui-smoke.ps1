@@ -64,7 +64,7 @@ $duplicate = $null
 try {
     $env:W11TERM_DATA_DIR = $data
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
-    [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"workspaces":"F8"}}', $encoding)
+    [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"command_palette":"F7","workspaces":"F8"}}', $encoding)
     Remove-Item -LiteralPath Env:W11TERM_UI_SMOKE, Env:W11TERM_WORKSPACE_SMOKE -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($profiles, '{"profiles":{}}', $encoding)
     $fixture = @'

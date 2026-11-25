@@ -11,6 +11,8 @@ use w11term::options::{
 };
 use w11term::prompts::Question;
 mod address;
+mod alert_rule_presets;
+mod alerted_send;
 mod close_ended;
 mod command_order;
 mod command_queue;
@@ -45,6 +47,7 @@ mod save_command;
 mod saved;
 mod transfer;
 
+pub(super) use live_output::displayed_line;
 pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffer};
 pub(super) use reconnect::FailedLogin;
 pub use reuse::Offer as LaunchReviewOffer;
@@ -54,8 +57,12 @@ pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
 pub(super) const RECENT_COMMANDS_LABEL: &str = "Recent group commands…";
 pub(super) const FIND_RUN_LABEL: &str = "Find group run…";
-pub(super) use run_search::WINDOW_RUN_SEARCH_LABEL;
+pub(super) use run_search::{
+    WINDOW_OUTPUT_ALERT_SEARCH_LABEL, WINDOW_RUN_SEARCH_LABEL, WindowRunScope,
+};
 const REQUIRE_READY: &str = "Require all recipients ready";
+const REVIEW_CHANGED: &str =
+    "The command, hosts or prompts changed. Review them before sending again.";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;
 
@@ -79,6 +86,7 @@ pub(super) struct HostGroup {
     focus_loaded_command: bool,
     command_save: save_command::State,
     recorded_send: recorded_send::State,
+    alerted_send: alerted_send::State,
     submissions: VecDeque<Submission>,
     recent_commands: recent_commands::RecentCommands,
     viewing: u64,
@@ -113,6 +121,11 @@ enum PaneLaunch {
     Add,
 }
 
+struct LaunchedGroupPane {
+    pane_id: u64,
+    tab_id: TabId,
+}
+
 pub(super) struct WindowGroup {
     pub(super) name: String,
     pub(super) profiles: Vec<String>,
@@ -136,24 +149,38 @@ struct Submission {
     results: Vec<Delivery>,
     transcript: GroupTranscript,
     recording: output_recording::State,
+    control_recording: Option<output_recording::ControlRecording>,
     saved_recordings: output_recording::saved::State,
     command_queue: Option<command_queue::Queue>,
     dispatch_policy: Option<dispatch_policy::Policy>,
     show_queue_activity: bool,
-    control_waiters: Vec<control_api::ControlReply>,
+    control_waiters: Vec<control_api::ControlRunWait>,
+    unsent_retries: BTreeMap<u64, u64>,
     output_lifetime: Option<watch::Sender<()>>,
+}
+
+impl Drop for Submission {
+    fn drop(&mut self) {
+        self.transcript.cancel_output_alert();
+    }
 }
 
 #[derive(Clone)]
 pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
-    limit: SshGroupParallelLimit,
-    interval: SshGroupCommandInterval,
-    queue_expiry: SshGroupQueueExpiry,
+    parallel_limit: Option<usize>,
+    interval: Duration,
+    queue_expiry: Option<Duration>,
     stop_queue_on_failure: bool,
     canary: Option<u64>,
     notify_canary: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmissionOrigin {
+    Interactive,
+    Control,
 }
 
 enum SubmissionContent {
@@ -591,39 +618,82 @@ impl HostGroup {
         })
     }
 
+    fn command_offer(
+        &self,
+        text: Arc<str>,
+        targets: Vec<Target>,
+        canary: Option<u64>,
+    ) -> CommandOffer {
+        CommandOffer {
+            text,
+            targets,
+            parallel_limit: self.roster_preferences.command_limit.concurrency(),
+            interval: self.roster_preferences.command_interval.duration(),
+            queue_expiry: self.roster_preferences.command_queue_expiry.duration(),
+            stop_queue_on_failure: self.roster_preferences.stop_command_queue_on_failure,
+            canary,
+            notify_canary: canary.is_some() && self.notify_canary,
+        }
+    }
+
     fn submit(
         &mut self,
         content: SubmissionContent,
         results: Vec<Delivery>,
         transcript: GroupTranscript,
     ) -> &mut Submission {
+        self.retain_submission(content, results, transcript, SubmissionOrigin::Interactive)
+    }
+
+    fn retain_submission(
+        &mut self,
+        content: SubmissionContent,
+        results: Vec<Delivery>,
+        transcript: GroupTranscript,
+        origin: SubmissionOrigin,
+    ) -> &mut Submission {
         transcript.finish_dispatch();
-        self.preview_command_order = false;
         self.next_submission += 1;
-        self.viewing = self.next_submission;
-        self.result_filter = progress::Filter::All;
-        self.recipient_search.clear();
-        if let SubmissionContent::Command(command) = &content {
-            self.recent_commands.record(self.viewing, command.clone());
-            self.previous_draft = None;
+        let id = self.next_submission;
+        if origin == SubmissionOrigin::Interactive {
+            self.preview_command_order = false;
+            self.viewing = id;
+            self.result_filter = progress::Filter::All;
+            self.recipient_search.clear();
+            self.copy_feedback.clear();
+            self.retry_feedback.clear();
         }
-        self.copy_feedback.clear();
-        self.retry_feedback.clear();
+        if let SubmissionContent::Command(command) = &content {
+            self.recent_commands.record(id, command.clone());
+            if origin == SubmissionOrigin::Interactive {
+                self.previous_draft = None;
+            }
+        }
         self.submissions.push_back(Submission {
-            id: self.viewing,
+            id,
             content,
             results,
             transcript,
             recording: Default::default(),
+            control_recording: None,
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
             control_waiters: Vec::new(),
+            unsent_retries: BTreeMap::new(),
             output_lifetime: None,
         });
-        if self.submissions.len() > SUBMISSION_LIMIT {
-            self.submissions.pop_front();
+        if self.submissions.len() > SUBMISSION_LIMIT
+            && self
+                .submissions
+                .pop_front()
+                .is_some_and(|old| old.id == self.viewing)
+        {
+            self.viewing = self.submissions[0].id;
+            self.result_filter = progress::Filter::All;
+            self.copy_feedback.clear();
+            self.retry_feedback.clear();
         }
         self.submissions
             .back_mut()
@@ -709,6 +779,7 @@ pub enum Action {
         members: Vec<String>,
     },
     ReviewNamedGroup(LaunchReviewOffer),
+    ControlRecordingPrepared(Box<control_api::PreparedControlRecording>),
     Saved(TabId, saved::Action),
     Tick,
     Edit(TabId, String),
@@ -732,9 +803,11 @@ pub enum Action {
     ViewSubmission(TabId, u64),
     OpenRunPicker(TabId),
     NotifyCompletion(TabId, u64, bool),
+    CancelOutputAlert(TabId, u64),
     LiveOutput(TabId, u64, live_output::Action),
     RecordOutput(TabId, u64, output_recording::Action),
     RecordedSend(TabId, recorded_send::Action),
+    AlertedSend(TabId, alerted_send::Action),
     Compare(TabId, u64, compare::Action),
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
@@ -849,25 +922,36 @@ impl TerminalApp {
     fn start_host_group_panes(
         &mut self,
         id: TabId,
-        mut opened: BTreeSet<u64>,
+        opened: BTreeSet<u64>,
         targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
         mode: PaneLaunch,
         login_limit: Option<usize>,
         ctx: &ComponentContext<Self>,
     ) {
+        self.install_host_group_panes(id, opened, targets, mode, login_limit);
+        self.tabs.select(id);
+        self.sync_selection(ctx);
+        self.activate(ctx);
+    }
+
+    fn install_host_group_panes(
+        &mut self,
+        id: TabId,
+        mut opened: BTreeSet<u64>,
+        targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
+        mode: PaneLaunch,
+        login_limit: Option<usize>,
+    ) -> Vec<LaunchedGroupPane> {
         let launch_gate = self
-            .host_group_mut(id)
+            .host_group_by_id_mut(id)
             .and_then(|page| page.login_permits(login_limit));
+        let mut launched = Vec::new();
         for (profile, ssh) in targets {
             let session = launch_gate.as_ref().map(|gate| {
                 Session::start_group_ssh(
                     ssh.clone(),
                     TerminalSize::default(),
-                    self.appearance
-                        .read()
-                        .unwrap()
-                        .interaction
-                        .remote_clipboard_policy(),
+                    self.appearance.read().unwrap().pane_preferences(),
                     gate.clone(),
                 )
             });
@@ -877,13 +961,12 @@ impl TerminalApp {
                 Some(session) => live_tab_for_session(label, source, session).with_profile(profile),
                 None => self.make_live_tab(label, source, profile),
             };
-            if let Some(pane) = tab.pane_id() {
-                opened.insert(pane);
-            }
-            self.tabs.insert(tab);
+            let pane_id = tab.pane_id().expect("an SSH tab has a terminal pane");
+            opened.insert(pane_id);
+            let tab_id = self.tabs.insert(tab);
+            launched.push(LaunchedGroupPane { pane_id, tab_id });
         }
-        self.tabs.select(id);
-        if let Some(page) = self.host_group_mut(id) {
+        if let Some(page) = self.host_group_by_id_mut(id) {
             if let Some(roster) = &mut page.roster {
                 roster.panes.extend(opened.iter().copied());
             }
@@ -895,8 +978,7 @@ impl TerminalApp {
                 page.reconnect_feedback.clear();
             }
         }
-        self.sync_selection(ctx);
-        self.activate(ctx);
+        launched
     }
 
     pub(super) fn update_host_group_timer(&mut self, ctx: &ComponentContext<Self>) {
@@ -936,6 +1018,10 @@ impl TerminalApp {
         if self.tabs.active_id() != Some(id) {
             return None;
         }
+        self.host_group_by_id_mut(id)
+    }
+
+    fn host_group_by_id_mut(&mut self, id: TabId) -> Option<&mut HostGroup> {
         match &mut self.tabs.get_mut(id)?.page {
             Page::HostGroup(page) => Some(page),
             _ => None,
@@ -1084,7 +1170,7 @@ impl TerminalApp {
         let CommandOffer {
             text,
             targets,
-            limit,
+            parallel_limit,
             interval,
             queue_expiry,
             stop_queue_on_failure,
@@ -1103,9 +1189,9 @@ impl TerminalApp {
                 .iter()
                 .map(|target| target.pane)
                 .eq(targets.iter().map(|target| target.pane))
-            && page.roster_preferences.command_limit == *limit
-            && page.roster_preferences.command_interval == *interval
-            && page.roster_preferences.command_queue_expiry == *queue_expiry
+            && page.roster_preferences.command_limit.concurrency() == *parallel_limit
+            && page.roster_preferences.command_interval.duration() == *interval
+            && page.roster_preferences.command_queue_expiry.duration() == *queue_expiry
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
             && page.canary == *canary
@@ -1128,22 +1214,31 @@ impl TerminalApp {
         offer: CommandOffer,
         transcript: GroupTranscript,
         recording: output_recording::State,
-    ) {
+        origin: SubmissionOrigin,
+    ) -> Result<u64, String> {
+        if !matches!(
+            self.tabs.get(id).map(|tab| &tab.page),
+            Some(Page::HostGroup(_))
+        ) {
+            return Err(format!("unknown SSH group tab {id} in this window"));
+        }
+        let deadline = offer.queue_deadline(Instant::now())?;
         let policy = offer.dispatch_policy();
         let CommandOffer {
             text,
             targets,
+            interval,
             canary,
             notify_canary,
             ..
         } = offer;
-        let interval = Duration::from_millis(policy.interval_ms);
-        let deadline = policy
-            .queue_expiry_ms
-            .map(|ms| Instant::now() + Duration::from_millis(ms));
-        let slots = policy.parallel_limit.or_else(|| {
-            (canary.is_some() || !interval.is_zero() || deadline.is_some()).then_some(targets.len())
-        });
+        let slots = policy
+            .parallel_limit
+            .map(|limit| limit.min(targets.len()))
+            .or_else(|| {
+                (canary.is_some() || !interval.is_zero() || deadline.is_some())
+                    .then_some(targets.len())
+            });
         let results = targets
             .into_iter()
             .map(|target| {
@@ -1160,23 +1255,36 @@ impl TerminalApp {
                 }
             })
             .collect();
-        if let Some(page) = self.host_group_mut(id) {
+        let page = self
+            .host_group_by_id_mut(id)
+            .expect("the group remains open during dispatch");
+        if origin == SubmissionOrigin::Interactive {
             page.manual_command_order.clear();
-            let submission = page.submit(SubmissionContent::Command(text), results, transcript);
-            submission.recording = recording;
-            submission.command_queue = slots.map(|slots| {
-                command_queue::Queue::new(
-                    slots,
-                    policy.stop_on_failure,
-                    canary,
-                    notify_canary,
-                    interval,
-                    deadline,
-                )
-            });
-            submission.dispatch_policy = Some(policy);
         }
+        let submission = page.retain_submission(
+            SubmissionContent::Command(text),
+            results,
+            transcript,
+            origin,
+        );
+        if origin == SubmissionOrigin::Control {
+            submission.control_recording = recording.control_watcher();
+        }
+        submission.recording = recording;
+        submission.command_queue = slots.map(|slots| {
+            command_queue::Queue::new(
+                slots,
+                policy.stop_on_failure,
+                canary,
+                notify_canary,
+                interval,
+                deadline,
+            )
+        });
+        submission.dispatch_policy = Some(policy);
+        let run = submission.id;
         self.poll_command_queues();
+        Ok(run)
     }
 
     fn interrupt_hosts(
@@ -1209,31 +1317,7 @@ impl TerminalApp {
             .collect();
         let mut outcomes: BTreeMap<_, _> = selected
             .into_iter()
-            .map(|(pane, link)| {
-                let status = match self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) {
-                    Some(AppTab {
-                        page: Page::Terminal(live),
-                        ..
-                    }) if live.session.is_direct_ssh_shell() => {
-                        let (reply, received) = oneshot::channel();
-                        if live
-                            .session
-                            .input
-                            .send(Command::InterruptGroupCommand {
-                                target: link,
-                                reply,
-                            })
-                            .is_ok()
-                        {
-                            DeliveryStatus::Pending(Instant::now(), received)
-                        } else {
-                            DeliveryStatus::Rejected("The pane closed.".into())
-                        }
-                    }
-                    _ => DeliveryStatus::Rejected("The SSH shell is no longer available.".into()),
-                };
-                (pane, status)
-            })
+            .map(|(pane, link)| (pane, self.dispatch_group_interrupt(pane, link)))
             .collect();
         if let Some(run) = self
             .host_group_mut(id)
@@ -1245,6 +1329,26 @@ impl TerminalApp {
                 }
             }
         }
+    }
+
+    fn dispatch_group_interrupt(&self, pane: u64, target: GroupInterruptTarget) -> DeliveryStatus {
+        let live = match self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) {
+            Some(AppTab {
+                page: Page::Terminal(live),
+                ..
+            }) if live.session.is_direct_ssh_shell() => live,
+            _ => return DeliveryStatus::Rejected("The SSH shell is no longer available.".into()),
+        };
+        let (reply, received) = oneshot::channel();
+        if live
+            .session
+            .input
+            .send(Command::InterruptGroupCommand { target, reply })
+            .is_err()
+        {
+            return DeliveryStatus::Rejected("The pane closed.".into());
+        }
+        DeliveryStatus::Pending(Instant::now(), received)
     }
 
     fn focus_host_group_pane(&mut self, id: TabId, pane: u64, ctx: &ComponentContext<Self>) {
@@ -1289,6 +1393,9 @@ impl TerminalApp {
                 self.open_host_group_from_palette(&name, &members, ctx);
             }
             Action::ReviewNamedGroup(offer) => self.review_host_group_from_palette(offer, ctx),
+            Action::ControlRecordingPrepared(prepared) => {
+                self.finish_control_recording(*prepared, ctx);
+            }
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Import(id, action) => self.handle_host_import(id, action, ctx),
             Action::Membership(id, action) => self.handle_group_membership(id, action),
@@ -1468,7 +1575,19 @@ impl TerminalApp {
             Action::NotifyCompletion(id, submission, armed) => {
                 self.set_group_run_completion_notice(id, submission, armed);
             }
+            Action::CancelOutputAlert(id, run) => {
+                if self.tabs.active_id() == Some(id)
+                    && let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page)
+                    && let Some(submission) = page.viewed_submission(run)
+                {
+                    submission.transcript.cancel_output_alert();
+                }
+            }
             Action::LiveOutput(id, submission, action) => {
+                if matches!(action, live_output::Action::ArmOutputAlert) {
+                    self.arm_group_output_alert(id, submission);
+                    return;
+                }
                 if matches!(
                     action,
                     live_output::Action::CopyShown | live_output::Action::SaveShown
@@ -1493,6 +1612,7 @@ impl TerminalApp {
             Action::RecordOutput(id, submission, action) => {
                 self.handle_group_output_recording(id, submission, action, ctx);
             }
+            Action::AlertedSend(id, action) => self.handle_alerted_send(id, action, ctx),
             Action::Compare(id, submission, action) => {
                 self.handle_host_group_comparison(id, submission, action, ctx);
             }
@@ -1694,15 +1814,23 @@ impl TerminalApp {
                 }
                 if let Some(page) = self.host_group_mut(id) {
                     page.recorded_send.clear_feedback();
+                    page.alerted_send.clear_feedback();
                 }
-                self.submit_group_command(
+                let _ = self.submit_group_command(
                     id,
                     offer,
                     GroupTranscript::default(),
                     Default::default(),
+                    SubmissionOrigin::Interactive,
                 );
             }
         }
+    }
+
+    fn capture_full_host_group_report(&self, submission: &Submission) -> report::Report {
+        report::Report::capture(submission, |pane, link| {
+            self.history_frame(pane)?.command_for_link(link).cloned()
+        })
     }
 
     fn capture_host_group_report(
@@ -1718,10 +1846,10 @@ impl TerminalApp {
             return None;
         };
         let submission = page.viewed_submission(submission_id)?;
-        let retained = |pane, link| self.history_frame(pane)?.command_for_link(link).cloned();
         let Some(offered) = offered else {
-            return Some(report::Report::capture(submission, retained));
+            return Some(self.capture_full_host_group_report(submission));
         };
+        let retained = |pane, link| self.history_frame(pane)?.command_for_link(link).cloned();
         let now = Instant::now();
         let (summary, rows) = page.result_rows(submission, now);
         if rows.is_empty()
@@ -1844,6 +1972,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &mut ViewContext<Self>,
     ) -> View {
+        if let Some(view) = page.alerted_send.view(id, ctx) {
+            return view;
+        }
         if let Some(view) = page.close_ended.review(id, ctx) {
             return view;
         }
@@ -2266,19 +2397,14 @@ impl TerminalApp {
             .placeholder_text("Enter one shell command")
             .text(&page.draft)
             .on_text_changed(ctx.callback(move |text| Message::HostGroup(Action::Edit(id, text))));
-        let offer = CommandOffer {
+        let offer = page.command_offer(
             text,
-            targets: command_order::recipients(page, shown.iter().copied())
+            command_order::recipients(page, shown.iter().copied())
                 .into_iter()
                 .cloned()
                 .collect(),
-            limit: page.roster_preferences.command_limit,
-            interval: page.roster_preferences.command_interval,
-            queue_expiry: page.roster_preferences.command_queue_expiry,
-            stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
-            canary: page.canary,
-            notify_canary: page.canary.is_some() && page.notify_canary,
-        };
+            page.canary,
+        );
         let (body_key, body) = if page.preview_command_order {
             (
                 "command-order",
@@ -2297,6 +2423,7 @@ impl TerminalApp {
             ctx,
         );
         let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
+        let send_alerted = alerted_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
             .style(ButtonStyle::Accent)
             .is_enabled(enabled)
@@ -2390,6 +2517,7 @@ impl TerminalApp {
                         .children((
                             send,
                             send_recorded,
+                            send_alerted,
                             recent_commands,
                             saved_commands,
                             save_command,
@@ -2397,6 +2525,7 @@ impl TerminalApp {
                         )),
                     page.command_save.view(id, ctx),
                     page.recorded_send.feedback(),
+                    page.alerted_send.feedback(),
                     retry::feedback(page),
                     hidden_selection,
                     Grid::new()
@@ -2601,7 +2730,16 @@ impl TerminalApp {
                 TextBlock::new()
                     .text(summary.caption())
                     .text_wrapping(TextWrapping::Wrap),
-                output_recording::status_view(id, submission, ctx),
+                StackPanel::new().spacing(4.0).children((
+                    output_recording::status_view(id, submission, ctx),
+                    submission
+                        .transcript
+                        .output_alert_rule()
+                        .as_deref()
+                        .map_or_else(View::empty, |rule| {
+                            live_output::armed_alert_view(id, submission_id, rule, ctx)
+                        }),
+                )),
                 ProgressBar::new()
                     .automation_name("SSH group submission progress")
                     .maximum(summary.total().max(1) as f64)
@@ -2714,6 +2852,11 @@ impl TerminalApp {
                 },
             )),
         ));
+        if let Some(expectation) = submission.transcript.output_expectation()
+            && let Some(view) = live_output::output_expectation_view(&expectation)
+        {
+            details.push(KeyedView::new("output-expectation", view));
+        }
         if shown.is_empty() {
             details.push(KeyedView::new(
                 "results-empty",

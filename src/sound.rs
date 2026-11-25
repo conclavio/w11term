@@ -26,7 +26,12 @@ impl wezterm_term::AlertHandler for Alerts {
         self.events.semantic_prompt(marker, started, completed);
     }
 
+    fn kitty_notification(&mut self, metadata: &[u8], payload: &[u8]) -> Vec<String> {
+        self.events.kitty_notification(metadata, payload)
+    }
+
     fn terminal_reset(&mut self) {
+        self.events.reset_notifications();
         self.events.reset_command_watch();
     }
 

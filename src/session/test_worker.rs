@@ -7,6 +7,39 @@ pub(super) async fn capture(input: &mpsc::UnboundedSender<Command>) -> Snapshot 
     receive.await.unwrap().0
 }
 
+#[tokio::test]
+async fn session_uses_the_configured_cursor_before_publishing_its_first_frame() {
+    use termwiz::surface::CursorShape::*;
+    let session = Session::start_configured(
+        Source::Demo,
+        TerminalSize::default(),
+        PanePreferences {
+            clipboard_policy: RemoteClipboardPolicy::Disabled,
+            default_cursor_shape: SteadyBar,
+        },
+    );
+    assert_eq!(session.frames.load().cursor.shape, SteadyBar);
+    assert_eq!(
+        feed(&session.input, "\x1b[2 q").await.cursor.shape,
+        SteadyBlock
+    );
+    session
+        .input
+        .send(Command::SetDefaultCursorShape(SteadyUnderline))
+        .unwrap();
+    assert_eq!(capture(&session.input).await.cursor.shape, SteadyBlock);
+    assert_eq!(
+        feed(&session.input, "\x1b[0 q").await.cursor.shape,
+        SteadyUnderline
+    );
+    session
+        .input
+        .send(Command::SetDefaultCursorShape(SteadyBar))
+        .unwrap();
+    assert_eq!(capture(&session.input).await.cursor.shape, SteadyBar);
+    assert_eq!(session.frames.load().cursor.shape, SteadyBar);
+}
+
 #[tokio::test(start_paused = true)]
 async fn select_all_waits_for_a_committed_screen_and_keeps_the_scrolled_read_only_view() {
     let size = TerminalSize {

@@ -1,7 +1,10 @@
 use super::*;
+use host_groups::WindowRunScope;
 use w11term::shortcuts::BINDINGS;
+use w11term::terminal::BookmarkScreen;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
+pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Search {
@@ -10,7 +13,8 @@ pub(super) enum Search {
     GroupLibrary(TabId),
     GroupRecent(TabId),
     GroupRuns(TabId),
-    WindowGroupRuns,
+    WindowGroupRuns(WindowRunScope),
+    Bookmarks(clipboard_paste::Origin, BookmarkScreen),
 }
 
 impl Search {
@@ -18,10 +22,14 @@ impl Search {
         match self {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
+            Self::Bookmarks(..) => "Search scrollback bookmarks",
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
             Self::GroupRuns(_) => "Search group runs",
-            Self::WindowGroupRuns => "Search group runs across tabs",
+            Self::WindowGroupRuns(WindowRunScope::All) => "Search group runs across tabs",
+            Self::WindowGroupRuns(WindowRunScope::ArmedOutputAlerts) => {
+                "Search armed SSH output alerts"
+            }
         }
     }
 
@@ -32,8 +40,16 @@ impl Search {
                 "Commands submitted in this tab will appear here."
             }
             Self::GroupRecent(_) => "No matching recent commands",
-            Self::GroupRuns(_) | Self::WindowGroupRuns => "No matching group runs",
+            Self::WindowGroupRuns(WindowRunScope::ArmedOutputAlerts) if query.is_empty() => {
+                "No armed SSH output alerts"
+            }
+            Self::WindowGroupRuns(WindowRunScope::ArmedOutputAlerts) => {
+                "No matching armed SSH output alerts"
+            }
+            Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
+            Self::Bookmarks(..) if query.is_empty() => "No retained scrollback bookmarks",
+            Self::Bookmarks(..) => "No matching scrollback bookmarks",
             _ => "No matching commands",
         }
     }
@@ -51,6 +67,10 @@ pub enum CommandId {
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
     ScrollFailedCommand(Option<clipboard_paste::Origin>, bool),
+    ToggleScrollbackBookmark(Option<clipboard_paste::Origin>),
+    ScrollToBookmark(Option<clipboard_paste::Origin>, bool),
+    FindScrollbackBookmark(clipboard_paste::Origin, BookmarkScreen),
+    OpenScrollbackBookmark(clipboard_paste::Origin, BookmarkScreen, isize),
     SelectAll(Option<clipboard_paste::Origin>),
     PaneFind(Option<clipboard_paste::Origin>, Shortcut),
     CopySelection(Option<clipboard_paste::Origin>),
@@ -69,8 +89,8 @@ pub enum CommandId {
     GroupRecentCommand(TabId, u64),
     SearchGroupRuns(TabId),
     GroupRun(TabId, u64),
-    SearchWindowGroupRuns,
-    WindowGroupRun(TabId, u64),
+    SearchWindowGroupRuns(WindowRunScope),
+    WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(TabId),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
@@ -414,6 +434,35 @@ impl TerminalApp {
             enabled: pane.is_some() && self.export.pending.is_none(),
         });
         let frame = live.map(|tab| tab.session.frames.load());
+        if let Some(origin) = origin
+            && let Some(frame) = &frame
+            && let Some(screen) = frame.bookmark_screen()
+        {
+            rows.push(Row {
+                id: CommandId::FindScrollbackBookmark(origin, screen),
+                label: FIND_BOOKMARK_LABEL.into(),
+                chord: String::new(),
+                enabled: !frame.scrollback_bookmarks.is_empty(),
+            });
+        }
+        rows.push(Row {
+            id: CommandId::ToggleScrollbackBookmark(origin),
+            label: "Toggle scrollback bookmark".into(),
+            chord: String::new(),
+            enabled: frame
+                .as_ref()
+                .is_some_and(|frame| frame.bookmark_target().is_some()),
+        });
+        for (older, label) in [(true, "Previous bookmark"), (false, "Next bookmark")] {
+            rows.push(Row {
+                id: CommandId::ScrollToBookmark(origin, older),
+                label: label.into(),
+                chord: String::new(),
+                enabled: frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.adjacent_bookmark(older).is_some()),
+            });
+        }
         for (older, label) in [
             (true, "Previous failed command"),
             (false, "Next failed command"),
@@ -565,12 +614,22 @@ impl TerminalApp {
             });
         }
         if self.has_window_group_runs() {
-            rows.push(Row {
-                id: CommandId::SearchWindowGroupRuns,
-                label: host_groups::WINDOW_RUN_SEARCH_LABEL.into(),
-                chord: String::new(),
-                enabled: true,
-            });
+            rows.extend(
+                [
+                    (WindowRunScope::All, host_groups::WINDOW_RUN_SEARCH_LABEL),
+                    (
+                        WindowRunScope::ArmedOutputAlerts,
+                        host_groups::WINDOW_OUTPUT_ALERT_SEARCH_LABEL,
+                    ),
+                ]
+                .into_iter()
+                .map(|(scope, label)| Row {
+                    id: CommandId::SearchWindowGroupRuns(scope),
+                    label: label.into(),
+                    chord: String::new(),
+                    enabled: true,
+                }),
+            );
         }
         if let Some(group) = self.host_group_command_target() {
             rows.extend(self.group_saved_rows(group));
@@ -703,12 +762,12 @@ impl TerminalApp {
             CommandId::GroupRun(group, run) => {
                 Message::HostGroup(host_groups::Action::ViewSubmission(group, run))
             }
-            CommandId::SearchWindowGroupRuns => {
-                self.open_window_group_run_picker(ctx);
+            CommandId::SearchWindowGroupRuns(scope) => {
+                self.open_window_group_run_picker(scope, ctx);
                 return;
             }
-            CommandId::WindowGroupRun(group, run) => {
-                self.open_window_group_run(group, run, ctx);
+            CommandId::WindowGroupRun(scope, group, run) => {
+                self.open_window_group_run(scope, group, run, ctx);
                 return;
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
@@ -757,6 +816,16 @@ impl TerminalApp {
             CommandId::ScrollFailedCommand(origin, older) => {
                 Message::ScrollFailedCommand(origin, older)
             }
+            CommandId::ToggleScrollbackBookmark(origin) => {
+                Message::ToggleScrollbackBookmark(origin)
+            }
+            CommandId::ScrollToBookmark(origin, older) => Message::ScrollToBookmark(origin, older),
+            CommandId::FindScrollbackBookmark(origin, screen) => {
+                return self.open_bookmark_search(origin, screen, ctx);
+            }
+            CommandId::OpenScrollbackBookmark(origin, screen, row) => {
+                return self.reveal_bookmark(origin, screen, row);
+            }
             CommandId::SelectAll(origin) => Message::SelectAll(origin),
             CommandId::PaneFind(origin, shortcut) => Message::PaneFind(origin, shortcut),
             CommandId::CopySelection(origin) => Message::CopySelection(origin),
@@ -798,7 +867,11 @@ pub(super) fn view(
     let search_label = mode.placeholder();
     let trimming = if matches!(
         mode,
-        Search::Tabs | Search::GroupRecent(_) | Search::GroupRuns(_) | Search::WindowGroupRuns
+        Search::Tabs
+            | Search::GroupRecent(_)
+            | Search::GroupRuns(_)
+            | Search::WindowGroupRuns(_)
+            | Search::Bookmarks(..)
     ) {
         TextTrimming::CharacterEllipsis
     } else {
@@ -816,10 +889,10 @@ pub(super) fn view(
             Button::new()
                 .grid_column(1)
                 .style(ButtonStyle::Subtle)
-                .automation_name(if mode == Search::Tabs {
-                    "Close tab search"
-                } else {
-                    "Close command palette"
+                .automation_name(match mode {
+                    Search::Tabs => "Close tab search",
+                    Search::Bookmarks(..) => "Close bookmark search",
+                    _ => "Close command palette",
                 })
                 .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerCancel)))
                 .content(TextBlock::new().text("×")),
@@ -859,7 +932,12 @@ pub(super) fn view(
     if rows.is_empty() {
         results.push(KeyedView::new(
             "empty",
-            TextBlock::new().text(mode.empty(query)),
+            TextBlock::new().text(
+                app.picker
+                    .as_ref()
+                    .and_then(|picker| picker.bookmark_status(app))
+                    .unwrap_or_else(|| mode.empty(query)),
+            ),
         ));
     } else if rows.len() > page {
         let last = (first + page).min(rows.len());

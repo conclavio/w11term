@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     io::{Read, Write},
     path::PathBuf,
+    process::ExitCode,
 };
 use w11term::control::{self, Reply, Request};
 #[path = "w11term-cli/automation.rs"]
@@ -13,7 +14,24 @@ mod sftp_args;
 
 const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-text --pane ID --no-paste [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
-fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request)> {
+#[derive(Debug)]
+struct Invocation {
+    pid: Option<u32>,
+    request: Request,
+    require_success: bool,
+}
+
+impl Invocation {
+    fn new(pid: Option<u32>, request: Request) -> Self {
+        Self {
+            pid,
+            request,
+            require_success: false,
+        }
+    }
+}
+
+fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation> {
     let mut args = args.into_iter();
     let mut pid = None;
     let mut verb = None;
@@ -40,9 +58,18 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "inspect"
             | "playback"
             | "list-ssh-groups"
+            | "list-saved-ssh-groups"
+            | "open-ssh-group"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
+            | "get-ssh-group-retry-plan"
+            | "retry-ssh-group-run"
+            | "interrupt-ssh-group-command"
+            | "ssh-group-queue"
+            | "save-ssh-group-report"
+            | "submit-ssh-group-command"
             | "wait-ssh-group-run"
+            | "wait-ssh-group-approval"
             | "wait-ssh-group-output"
             | "get-ssh-group-output"
             | "follow-ssh-group-output"
@@ -60,7 +87,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
                     payload.is_none() && path.is_none() && !no_paste,
                     "sftp accepts only --pid and --pane before the command"
                 );
-                return sftp_args::parse(args, pid, pane);
+                return sftp_args::parse(args, pid, pane)
+                    .map(|(pid, request)| Invocation::new(pid, request));
             }
             "--pid" => pid = Some(value(&mut args)?.parse()?),
             "--pane" => pane = Some(value(&mut args)?.parse()?),
@@ -143,7 +171,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         }
         _ => bail!("unknown command {verb}\n{HELP}"),
     };
-    Ok((pid, request))
+    Ok(Invocation::new(pid, request))
 }
 fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -154,19 +182,24 @@ fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
         println!("{HELP}\n\n{}\n\n{}", sftp_args::HELP, automation::HELP);
-        return;
+        return ExitCode::SUCCESS;
     }
+    let mut require_success = false;
     let result = if args == ["instances"] {
         control::discover().await.map(|instances| {
             Reply::from_result(serde_json::to_value(instances).map_err(Into::into))
         })
     } else {
-        match parse(args) {
-            Ok((pid, request @ Request::FollowSshGroupOutput { .. })) => {
+        match parse_invocation(args) {
+            Ok(Invocation {
+                pid,
+                request: request @ Request::FollowSshGroupOutput { .. },
+                ..
+            }) => {
                 match control::follow(pid, &request, |reply| {
                     let mut stdout = std::io::stdout().lock();
                     let bytes = serde_json::to_vec(reply)?;
@@ -177,32 +210,414 @@ async fn main() {
                 })
                 .await
                 {
-                    Ok(true) => return,
-                    Ok(false) => std::process::exit(1),
+                    Ok(true) => return ExitCode::SUCCESS,
+                    Ok(false) => return ExitCode::FAILURE,
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             error.kind() == std::io::ErrorKind::BrokenPipe
                         }) =>
                     {
-                        return;
+                        return ExitCode::SUCCESS;
                     }
                     Err(error) => Err(error),
                 }
             }
-            Ok((pid, request)) => control::call(pid, &request).await,
+            Ok(invocation) => {
+                require_success = invocation.require_success;
+                control::call(invocation.pid, &invocation.request).await
+            }
             Err(e) => Err(e),
         }
     };
     let reply = result.unwrap_or_else(|e| Reply::from_result(Err(e)));
     println!("{}", serde_json::to_string(&reply).unwrap());
+    cli_exit_code(&reply, require_success)
+}
+
+fn cli_exit_code(reply: &Reply, require_success: bool) -> ExitCode {
     if !reply.ok {
-        std::process::exit(1);
+        return ExitCode::FAILURE;
+    }
+    if !require_success {
+        return ExitCode::SUCCESS;
+    }
+    let Some(run) = reply.result.as_ref().and_then(|result| result.get("run")) else {
+        return ExitCode::FAILURE;
+    };
+    let Some(recipients) = run.get("recipients").and_then(serde_json::Value::as_array) else {
+        return ExitCode::FAILURE;
+    };
+    let has_expected_output = run.get("output_expectation").is_some();
+    let all_succeeded = !recipients.is_empty()
+        && recipients.iter().all(|recipient| {
+            recipient["delivery"]["state"] == "sent"
+                && recipient["execution"]["state"] == "completed"
+                && recipient["execution"]["exit_code"].as_i64() == Some(0)
+                && (!has_expected_output || recipient["output_expectation"] == "matched")
+        });
+    if all_succeeded {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request)> {
+        let invocation = parse_invocation(args)?;
+        Ok((invocation.pid, invocation.request))
+    }
+
+    #[test]
+    fn require_success_is_a_cli_option_for_the_group_wait() {
+        let invocation = parse_invocation(
+            "wait-ssh-group-run --window 2 --tab 3 --run 4 --require-success"
+                .split_ascii_whitespace()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(invocation.require_success);
+        assert_eq!(
+            serde_json::to_value(invocation.request).unwrap(),
+            serde_json::json!({
+                "verb":"wait-ssh-group-run","window_id":2,"tab_id":3,"run_id":4,"timeout_seconds":30,
+            })
+        );
+        assert!(
+            parse_invocation(
+                "get-ssh-group-run --window 2 --tab 3 --run 4 --require-success"
+                    .split_ascii_whitespace()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_wait_requires_verified_zero_exits_and_checked_output() {
+        use serde_json::{Value, json};
+
+        let success = json!({
+            "delivery":{"state":"sent"},
+            "execution":{"state":"completed","exit_code":0},
+            "output_expectation":"matched",
+        });
+        let outcome = |recipient: Value| {
+            Reply::from_result(Ok(json!({
+                "run":{"recipients":[success.clone(), recipient],"output_expectation":{"query":"ready"}},
+            })))
+        };
+        assert_eq!(
+            cli_exit_code(&outcome(success.clone()), true),
+            ExitCode::SUCCESS
+        );
+        for (field, bad) in [
+            ("delivery", json!({"state":"skipped"})),
+            ("execution", json!({"state":"completed","exit_code":17})),
+            ("execution", json!({"state":"completed","exit_code":null})),
+            ("output_expectation", json!("missing")),
+            ("output_expectation", json!("unverified")),
+        ] {
+            let mut recipient = success.clone();
+            recipient[field] = bad;
+            let reply = outcome(recipient);
+            assert!(reply.ok);
+            assert_eq!(cli_exit_code(&reply, true), ExitCode::from(2));
+            assert_eq!(cli_exit_code(&reply, false), ExitCode::SUCCESS);
+        }
+        assert_eq!(
+            cli_exit_code(&Reply::from_result(Err(anyhow::anyhow!("timeout"))), true),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn parses_ssh_group_submission_without_rewriting_the_command() {
+        let base = [
+            "--pid",
+            "7",
+            "submit-ssh-group-command",
+            "--window",
+            "2",
+            "--tab",
+            "3",
+        ];
+        let submit = |extra: &[&str]| {
+            parse(
+                base.into_iter()
+                    .chain(extra.iter().copied())
+                    .map(str::to_owned),
+            )
+        };
+        let (pid, request) =
+            submit(&["--pane", "9", "--pane", "5", "--", "show  status; pwd"]).unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb":"submit-ssh-group-command", "window_id":2, "tab_id":3,
+                "pane_ids":[9,5], "command":"show  status; pwd",
+            }),
+        );
+        let (_, checked) = submit(&[
+            "--pane",
+            "9",
+            "--pane",
+            "5",
+            "--canary",
+            "5",
+            "--parallel",
+            "3",
+            "--interval-ms",
+            "0",
+            "--queue-expiry-ms",
+            "1750",
+            "--on-failure",
+            "continue",
+            "--dry-run",
+            "--expect-output",
+            "^READY [0-9]+$",
+            "--regex",
+            "--match-case",
+            "--record-output",
+            "capture output.txt",
+            "--",
+            "show  status",
+        ])
+        .unwrap();
+        let checked = serde_json::to_value(checked).unwrap();
+        assert_eq!(checked["dry_run"], true);
+        assert_eq!(checked["canary_pane_id"], 5);
+        assert_eq!(checked["parallel_limit"], 3);
+        assert_eq!(checked["interval_ms"], 0);
+        assert_eq!(checked["queue_expiry_ms"], 1750);
+        assert_eq!(checked["stop_on_failure"], false);
+        let (_, stop) = submit(&["--pane", "5", "--on-failure", "stop", "show"]).unwrap();
+        assert_eq!(serde_json::to_value(stop).unwrap()["stop_on_failure"], true);
+        assert_eq!(
+            checked["expect_output"],
+            serde_json::json!({ "query":"^READY [0-9]+$", "regex":true, "match_case":true }),
+        );
+        assert_eq!(
+            checked["record_output"],
+            serde_json::to_value(std::path::absolute("capture output.txt").unwrap()).unwrap()
+        );
+        for invalid in [
+            &["show"][..],
+            &["--pane", "0", "show"],
+            &["--pane", "5", "--pane", "5", "show"],
+            &["--pane", "5", "show\rstatus"],
+            &["--pane", "5", "--run", "1", "show"],
+            &["--pane", "5", "show", "status"],
+            &["--pane", "5", "--regex", "show"],
+            &["--pane", "5", "--match-case", "show"],
+            &["--pane", "9", "--pane", "5", "--canary", "8", "show"],
+            &["--pane", "5", "--canary", "5", "show"],
+            &["--pane", "5", "--parallel", "0", "show"],
+            &["--pane", "5", "--parallel", "-1", "show"],
+            &["--pane", "5", "--parallel", "1", "--parallel", "4", "show"],
+            &["--pane", "5", "--interval-ms", "-1", "show"],
+            &["--pane", "5", "--queue-expiry-ms", "-1", "show"],
+            &["--pane", "5", "--on-failure", "ignore", "show"],
+            &[
+                "--pane",
+                "5",
+                "--on-failure",
+                "stop",
+                "--on-failure",
+                "continue",
+                "show",
+            ],
+            &[
+                "--pane",
+                "5",
+                "--queue-expiry-ms",
+                "0",
+                "--queue-expiry-ms",
+                "4",
+                "show",
+            ],
+            &[
+                "--pane",
+                "5",
+                "--interval-ms",
+                "1",
+                "--interval-ms",
+                "4",
+                "show",
+            ],
+            &[
+                "--pane", "5", "--pane", "9", "--canary", "5", "--canary", "9", "show",
+            ],
+            &["--pane", "5", "--expect-output"],
+            &["--pane", "5", "--record-output"],
+            &[
+                "--pane",
+                "5",
+                "--record-output",
+                "a",
+                "--record-output",
+                "b",
+                "show",
+            ],
+            &[
+                "--pane",
+                "5",
+                "--expect-output",
+                "a",
+                "--expect-output",
+                "b",
+                "show",
+            ],
+        ] {
+            assert!(submit(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn parses_explicit_ssh_group_queue_actions() {
+        let parse_queue = |action: &[&str]| {
+            parse(
+                [
+                    "ssh-group-queue",
+                    "--window",
+                    "2",
+                    "--tab",
+                    "3",
+                    "--run",
+                    "4",
+                ]
+                .into_iter()
+                .chain(action.iter().copied())
+                .map(str::to_owned),
+            )
+        };
+        for action in ["pause", "resume", "stop"] {
+            let (_, request) = parse_queue(&[action]).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                serde_json::json!({"verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,"action":action})
+            );
+        }
+        for (command, wire) in [("approve-canary", "approve_canary"), ("skip", "skip")] {
+            let (_, targeted) = parse_queue(&[command, "--pane", "5"]).unwrap();
+            assert_eq!(
+                serde_json::to_value(targeted).unwrap(),
+                serde_json::json!({
+                    "verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,
+                    "action":{(wire):{"pane_id":5}}
+                })
+            );
+            assert!(parse_queue(&[command]).is_err());
+            assert!(parse_queue(&[command, "--pane", "0"]).is_err());
+            assert!(parse_queue(&[command, "--pane", "5", "--pane", "6"]).is_err());
+        }
+        assert!(parse_queue(&["cancel"]).is_err());
+        assert!(parse_queue(&["pause", "--pane", "5"]).is_err());
+        assert!(
+            parse(["ssh-group-queue", "--window", "2", "--tab", "3", "pause"].map(str::to_owned))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_report_exports_and_defaults_to_json_without_overwriting() {
+        use w11term::control::SshGroupReportFormat;
+
+        let base = [
+            "save-ssh-group-report",
+            "--window",
+            "2",
+            "--tab",
+            "3",
+            "--run",
+            "4",
+        ];
+        let save = |extra: &[&str]| {
+            parse(
+                base.into_iter()
+                    .chain(extra.iter().copied())
+                    .map(str::to_owned),
+            )
+        };
+        assert!(matches!(
+            save(&["report file.json"]).unwrap().1,
+            Request::SaveSshGroupReport {
+                window_id: 2, tab_id: 3, run_id: 4, path, format: SshGroupReportFormat::Json, overwrite: false,
+            } if path == std::path::absolute("report file.json").unwrap()
+        ));
+        assert!(matches!(
+            save(&["--format", "text", "--overwrite", "--", "--report.txt"])
+                .unwrap()
+                .1,
+            Request::SaveSshGroupReport {
+                format: SshGroupReportFormat::Text,
+                overwrite: true,
+                ..
+            }
+        ));
+        for invalid in [
+            &[][..],
+            &["--format", "yaml", "report.txt"],
+            &["--format", "json", "--format", "text", "report.txt"],
+            &["--pane", "1", "report.txt"],
+            &["one.json", "two.json"],
+        ] {
+            assert!(save(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn parses_saved_ssh_group_launch_with_an_explicit_window() {
+        let (pid, catalog) =
+            parse(["--pid", "7", "list-saved-ssh-groups", "--window", "3"].map(str::to_owned))
+                .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(catalog).unwrap(),
+            serde_json::json!({"verb":"list-saved-ssh-groups", "window_id":3}),
+        );
+        let (pid, request) = parse(
+            [
+                "--pid",
+                "7",
+                "open-ssh-group",
+                "--name",
+                "Fleet Ops",
+                "--window",
+                "3",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"open-ssh-group", "window_id":3, "name":"Fleet Ops"}),
+        );
+        for invalid in [
+            "list-saved-ssh-groups",
+            "list-saved-ssh-groups --window 0",
+            "list-saved-ssh-groups --window 3 --name Fleet",
+            "list-saved-ssh-groups --window 3 --pane 4",
+            "open-ssh-group --name Fleet",
+            "open-ssh-group --window 3",
+            "open-ssh-group --window 0 --name Fleet",
+            "open-ssh-group --window 3 --name Fleet --name Other",
+            "open-ssh-group --window 3 --window 4 --name Fleet",
+            "open-ssh-group --window 3 --name Fleet --tab 4",
+            "open-ssh-group --window 3 --name Fleet --pane 4",
+        ] {
+            assert!(
+                parse(invalid.split_whitespace().map(str::to_owned)).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     #[test]
     fn parses_ssh_group_discovery_and_scoped_run_ids() {
@@ -228,6 +643,7 @@ mod tests {
                 Request::WaitSshGroupReady {
                     window_id: 11,
                     tab_id: 12,
+                    pane_ids: None,
                     timeout_seconds: 4
                 }
             )
@@ -241,6 +657,11 @@ mod tests {
                     ..
                 }
             )
+        ));
+        assert!(matches!(
+            parse_line("wait-ssh-group-ready --window 11 --tab 12 --pane 8 --pane 3 --timeout 4").unwrap(),
+            (None, Request::WaitSshGroupReady { window_id: 11, tab_id: 12, pane_ids: Some(panes), timeout_seconds: 4 })
+                if panes == [8, 3]
         ));
         assert!(matches!(
             parse_line("wait-ssh-group-run --window 11 --tab 12 --run 4 --timeout 7").unwrap(),
@@ -282,6 +703,34 @@ mod tests {
             ) if pattern == "--ready"
         ));
         assert!(matches!(
+            parse_line("get-ssh-group-retry-plan --window 11 --tab 12 --run 4").unwrap(),
+            (
+                None,
+                Request::GetSshGroupRetryPlan {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4
+                }
+            )
+        ));
+        assert!(matches!(
+            parse_line("retry-ssh-group-run --window 11 --tab 12 --run 4 --pane 8 --pane 5").unwrap(),
+            (None, Request::RetrySshGroupRun { window_id: 11, tab_id: 12, run_id: 4, pane_ids })
+                if pane_ids == [8, 5]
+        ));
+        assert!(matches!(
+            parse_line("wait-ssh-group-approval --window 11 --tab 12 --run 4 --timeout 8").unwrap(),
+            (
+                None,
+                Request::WaitSshGroupApproval {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4,
+                    timeout_seconds: 8
+                }
+            )
+        ));
+        assert!(matches!(
             parse_line("--pid 7 get-ssh-group-run --tab 12 --run 4 --window 11").unwrap(),
             (
                 Some(7),
@@ -292,6 +741,19 @@ mod tests {
                 }
             )
         ));
+        assert!(matches!(
+            parse_line("interrupt-ssh-group-command --window 11 --tab 12 --run 4 --pane 8")
+                .unwrap(),
+            (
+                None,
+                Request::InterruptSshGroupCommand {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4,
+                    pane_id: 8,
+                }
+            )
+        ));
         for invalid in [
             "--pane 7 list-ssh-groups",
             "list-ssh-groups --window 2",
@@ -299,6 +761,8 @@ mod tests {
             "get-ssh-group-roster --window 2 --tab 3 --run 1",
             "get-ssh-group-roster --window 2 --tab 3 --pane 1",
             "wait-ssh-group-ready --window 2 --tab 3 --run 1",
+            "wait-ssh-group-ready --window 2 --tab 3 --pane 0",
+            "wait-ssh-group-ready --window 2 --tab 3 --pane 8 --pane 8",
             "wait-ssh-group-ready --window 2 --tab 3 --timeout 0",
             "wait-ssh-group-ready --window 2 --tab 3 --timeout 3601",
             "get-ssh-group-run --window 2 --tab 3",
@@ -306,8 +770,18 @@ mod tests {
             "get-ssh-group-run --window 2 --tab 3 --run 4 --run 5",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --pane 7",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --timeout 1",
+            "get-ssh-group-retry-plan --window 2 --tab 3",
+            "get-ssh-group-retry-plan --window 2 --tab 3 --run 4 --pane 7",
+            "retry-ssh-group-run --window 2 --tab 3 --run 4",
+            "retry-ssh-group-run --window 2 --tab 3 --run 4 --pane 7 --pane 7",
+            "interrupt-ssh-group-command --window 2 --tab 3 --run 4",
+            "interrupt-ssh-group-command --window 2 --tab 3 --run 4 --pane 0",
+            "interrupt-ssh-group-command --window 2 --tab 3 --pane 7",
+            "interrupt-ssh-group-command --window 2 --tab 3 --run 4 --pane 7 --pane 8",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 0",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 3601",
+            "wait-ssh-group-approval --window 2 --tab 3 --run 4 --timeout 3601",
+            "wait-ssh-group-approval --window 2 --tab 3 --run 4 --require-success",
             "wait-ssh-group-output --window 2 --tab 3 --run 4",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --pane 0 ready",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --timeout 3601 ready",

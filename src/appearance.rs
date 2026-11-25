@@ -13,12 +13,77 @@ use windows::{
     core::{BOOL, w},
 };
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultCursorStyle {
+    #[default]
+    SteadyBlock,
+    SteadyBar,
+    SteadyUnderline,
+    BlinkingBlock,
+    BlinkingBar,
+    BlinkingUnderline,
+}
+
+impl DefaultCursorStyle {
+    pub const CHOICES: [(Self, &'static str); 6] = [
+        (Self::SteadyBlock, "Steady block"),
+        (Self::SteadyBar, "Steady bar"),
+        (Self::SteadyUnderline, "Steady underline"),
+        (Self::BlinkingBlock, "Blinking block"),
+        (Self::BlinkingBar, "Blinking bar"),
+        (Self::BlinkingUnderline, "Blinking underline"),
+    ];
+
+    pub fn shape(self) -> termwiz::surface::CursorShape {
+        use termwiz::surface::CursorShape;
+        match self {
+            Self::SteadyBlock => CursorShape::Default,
+            Self::SteadyBar => CursorShape::SteadyBar,
+            Self::SteadyUnderline => CursorShape::SteadyUnderline,
+            Self::BlinkingBlock => CursorShape::BlinkingBlock,
+            Self::BlinkingBar => CursorShape::BlinkingBar,
+            Self::BlinkingUnderline => CursorShape::BlinkingUnderline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorGuide {
+    #[default]
+    Off,
+    On,
+    FollowApplications,
+}
+
+impl CursorGuide {
+    pub const CHOICES: [(Self, &'static str); 3] = [
+        (Self::Off, "Off"),
+        (Self::On, "On"),
+        (Self::FollowApplications, "Follow applications"),
+    ];
+
+    pub fn shown(self, application_requested: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => true,
+            Self::FollowApplications => application_requested,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
     pub font_family: String,
     pub ligatures: bool,
     pub font_size: f32,
+    pub follow_windows_text_size: bool,
+    pub default_cursor_style: DefaultCursorStyle,
+    pub cursor_guide: CursorGuide,
+    #[serde(skip, default = "default_text_scale")]
+    windows_text_scale: f32,
     pub interaction: crate::interaction::Interaction,
     pub shortcuts: crate::shortcuts::Shortcuts,
     #[serde(skip_serializing_if = "crate::hints::Patterns::is_empty")]
@@ -32,6 +97,10 @@ impl Default for Appearance {
             font_family: "Cascadia Mono".into(),
             ligatures: true,
             font_size: 16.0,
+            follow_windows_text_size: true,
+            default_cursor_style: DefaultCursorStyle::default(),
+            cursor_guide: CursorGuide::default(),
+            windows_text_scale: default_text_scale(),
             interaction: crate::interaction::Interaction::default(),
             shortcuts: Default::default(),
             hint_patterns: Default::default(),
@@ -40,6 +109,29 @@ impl Default for Appearance {
     }
 }
 impl Appearance {
+    pub fn pane_preferences(&self) -> crate::session::PanePreferences {
+        crate::session::PanePreferences {
+            clipboard_policy: self.interaction.remote_clipboard_policy(),
+            default_cursor_shape: self.default_cursor_style.shape(),
+        }
+    }
+
+    pub fn set_windows_text_scale(&mut self, factor: f64) {
+        self.windows_text_scale = if (1.0..=2.25).contains(&factor) {
+            factor as f32
+        } else {
+            default_text_scale()
+        };
+    }
+
+    pub fn terminal_font_size(&self) -> f32 {
+        if self.follow_windows_text_size {
+            self.font_size * self.windows_text_scale
+        } else {
+            self.font_size
+        }
+    }
+
     pub fn path() -> Result<PathBuf> {
         if let Some(path) = std::env::var_os("W11TERM_SETTINGS_PATH") {
             return std::path::absolute(path).context("Resolving settings path");
@@ -73,6 +165,10 @@ impl Appearance {
         file.persist(path).context("Saving appearance settings")?;
         Ok(())
     }
+}
+
+fn default_text_scale() -> f32 {
+    1.0
 }
 
 fn family_order(name: &str) -> Option<usize> {
@@ -125,6 +221,30 @@ pub fn installed_fonts() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_text_size_combines_with_zoom_and_only_saves_the_preference() {
+        let mut appearance: Appearance = serde_json::from_str(r#"{"font_size":20.0}"#).unwrap();
+        assert!(appearance.follow_windows_text_size);
+        assert_eq!(appearance.terminal_font_size(), 20.0);
+        appearance.set_windows_text_scale(1.5);
+        assert_eq!(appearance.terminal_font_size(), 30.0);
+        appearance.font_size = 16.0;
+        assert_eq!(appearance.terminal_font_size(), 24.0);
+        appearance.follow_windows_text_size = false;
+        assert_eq!(appearance.terminal_font_size(), 16.0);
+        let saved = serde_json::to_value(&appearance).unwrap();
+        assert!(!saved["follow_windows_text_size"].as_bool().unwrap());
+        assert!(saved.get("windows_text_scale").is_none());
+        let mut restored: Appearance = serde_json::from_value(saved).unwrap();
+        restored.follow_windows_text_size = true;
+        assert_eq!(restored.terminal_font_size(), 16.0);
+        restored.set_windows_text_scale(2.25);
+        assert_eq!(restored.terminal_font_size(), 36.0);
+        restored.set_windows_text_scale(f64::NAN);
+        assert_eq!(restored.terminal_font_size(), 16.0);
+    }
+
     #[test]
     fn curated_families_include_aliases_and_monaspace_variants_only() {
         for name in [
@@ -165,12 +285,14 @@ mod tests {
         assert!(!appearance.interaction.application_tab_titles);
         assert!(appearance.interaction.failed_command_marks);
         assert!(appearance.interaction.sticky_command_context);
+        assert!(!appearance.interaction.visual_bell);
         assert!(!appearance.interaction.copy_on_select);
         appearance.font_family = "Fira Code".into();
         appearance.ligatures = false;
         appearance.interaction.application_tab_titles = true;
         appearance.interaction.failed_command_marks = false;
         appearance.interaction.sticky_command_context = false;
+        appearance.interaction.visual_bell = true;
         appearance.save(&path).unwrap();
         let saved = Appearance::load(&path).unwrap();
         assert_eq!(saved.font_family, "Fira Code");
@@ -178,6 +300,7 @@ mod tests {
         assert!(saved.interaction.application_tab_titles);
         assert!(!saved.interaction.failed_command_marks);
         assert!(!saved.interaction.sticky_command_context);
+        assert!(saved.interaction.visual_bell);
         assert!(!saved.interaction.copy_on_select);
         assert_eq!(saved.extra["other_setting"], 42);
     }

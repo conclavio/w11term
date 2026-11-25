@@ -1,13 +1,17 @@
+use super::Invocation;
 use anyhow::{Context, Result, bail, ensure};
-use w11term::control::{CommandStatus, Request};
+use w11term::control::{
+    CommandStatus, Request, SshGroupExpectedOutput, SshGroupQueueAction, SshGroupReportFormat,
+    validate_group_panes, validate_group_submission,
+};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
-pub fn parse(
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub(super) fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
     mut pid: Option<u32>,
     mut pane: Option<u64>,
-) -> Result<(Option<u32>, Request)> {
+) -> Result<Invocation> {
     let mut args = args.peekable();
     let mut cols = None;
     let mut rows = None;
@@ -17,6 +21,7 @@ pub fn parse(
     let mut regex = false;
     let mut match_case = false;
     let mut timeout = None;
+    let mut require_success = false;
     let mut since = None;
     let mut after_line = None;
     let mut limit = None;
@@ -32,6 +37,17 @@ pub fn parse(
     let mut window_id = None;
     let mut tab_id = None;
     let mut run_id = None;
+    let mut pane_ids = Vec::new();
+    let mut dry_run = false;
+    let mut canary_pane_id = None;
+    let mut parallel_limit = None;
+    let mut interval_ms = None;
+    let mut queue_expiry_ms = None;
+    let mut stop_on_failure = None;
+    let mut expected_query = None;
+    let mut record_output = None;
+    let mut group_name = None;
+    let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
             args.next()
@@ -39,7 +55,75 @@ pub fn parse(
         };
         match arg.as_str() {
             "--pid" => pid = Some(value(&mut args)?.parse()?),
+            "--pane"
+                if matches!(
+                    verb,
+                    "submit-ssh-group-command" | "wait-ssh-group-ready" | "retry-ssh-group-run"
+                ) =>
+            {
+                pane_ids.push(value(&mut args)?.parse()?);
+            }
+            "--pane" if matches!(verb, "ssh-group-queue" | "interrupt-ssh-group-command") => {
+                ensure!(pane.is_none(), "specify --pane only once");
+                pane = Some(value(&mut args)?.parse()?);
+            }
             "--pane" => pane = Some(value(&mut args)?.parse()?),
+            "--dry-run" if verb == "submit-ssh-group-command" => dry_run = true,
+            "--canary" if verb == "submit-ssh-group-command" => {
+                ensure!(canary_pane_id.is_none(), "specify --canary only once");
+                canary_pane_id = Some(value(&mut args)?.parse()?);
+            }
+            "--parallel" if verb == "submit-ssh-group-command" => {
+                ensure!(parallel_limit.is_none(), "specify --parallel only once");
+                parallel_limit = Some(
+                    value(&mut args)?
+                        .parse()
+                        .context("--parallel requires a positive integer")?,
+                );
+            }
+            "--interval-ms" if verb == "submit-ssh-group-command" => {
+                ensure!(interval_ms.is_none(), "specify --interval-ms only once");
+                interval_ms = Some(
+                    value(&mut args)?
+                        .parse()
+                        .context("--interval-ms requires nonnegative milliseconds")?,
+                );
+            }
+            "--queue-expiry-ms" if verb == "submit-ssh-group-command" => {
+                ensure!(
+                    queue_expiry_ms.is_none(),
+                    "specify --queue-expiry-ms only once"
+                );
+                queue_expiry_ms = Some(
+                    value(&mut args)?
+                        .parse()
+                        .context("--queue-expiry-ms requires nonnegative milliseconds")?,
+                );
+            }
+            "--on-failure" if verb == "submit-ssh-group-command" => {
+                ensure!(stop_on_failure.is_none(), "specify --on-failure only once");
+                stop_on_failure = Some(match value(&mut args)?.as_str() {
+                    "stop" => true,
+                    "continue" => false,
+                    _ => bail!("--on-failure requires stop or continue"),
+                });
+            }
+            "--expect-output" if verb == "submit-ssh-group-command" => {
+                ensure!(
+                    expected_query.is_none(),
+                    "specify --expect-output only once"
+                );
+                expected_query = Some(value(&mut args)?);
+            }
+            "--record-output" if verb == "submit-ssh-group-command" => {
+                ensure!(record_output.is_none(), "specify --record-output only once");
+                let path = value(&mut args)?;
+                ensure!(
+                    !path.is_empty(),
+                    "--record-output requires a destination path"
+                );
+                record_output = Some(std::path::absolute(path)?);
+            }
             "--all-panes" if verb == "find-text" => all_panes = true,
             "--cols" if matches!(verb, "open" | "resize") => {
                 cols = Some(value(&mut args)?.parse()?)
@@ -48,24 +132,38 @@ pub fn parse(
                 rows = Some(value(&mut args)?.parse()?)
             }
             "--profile" if verb == "open" => profile = Some(value(&mut args)?),
+            "--name" if verb == "open-ssh-group" => {
+                ensure!(group_name.is_none(), "specify --name only once");
+                group_name = Some(value(&mut args)?);
+            }
             "--activate" if verb == "open" => activate = true,
             "--regex"
                 if matches!(
                     verb,
-                    "find-text" | "wait-for-text" | "wait-ssh-group-output"
+                    "find-text"
+                        | "wait-for-text"
+                        | "wait-ssh-group-output"
+                        | "submit-ssh-group-command"
                 ) =>
             {
                 regex = true
             }
-            "--match-case" if matches!(verb, "find-text" | "wait-ssh-group-output") => {
+            "--match-case"
+                if matches!(
+                    verb,
+                    "find-text" | "wait-ssh-group-output" | "submit-ssh-group-command"
+                ) =>
+            {
                 match_case = true
             }
+            "--require-success" if verb == "wait-ssh-group-run" => require_success = true,
             "--timeout"
                 if matches!(
                     verb,
                     "wait-for-text"
                         | "events"
                         | "wait-ssh-group-run"
+                        | "wait-ssh-group-approval"
                         | "wait-ssh-group-ready"
                         | "wait-ssh-group-output"
                         | "follow-ssh-group-output"
@@ -104,7 +202,17 @@ pub fn parse(
                     _ => ReplayAction::Step,
                 });
             }
-            "--overwrite" if verb == "save-text" => overwrite = true,
+            "--overwrite" if matches!(verb, "save-text" | "save-ssh-group-report") => {
+                overwrite = true
+            }
+            "--format" if verb == "save-ssh-group-report" => {
+                ensure!(report_format.is_none(), "specify --format only once");
+                report_format = Some(match value(&mut args)?.as_str() {
+                    "json" => SshGroupReportFormat::Json,
+                    "text" => SshGroupReportFormat::Text,
+                    _ => bail!("--format expects json or text"),
+                });
+            }
             "--exit-token" if verb == "restart" => exit_token = Some(value(&mut args)?.parse()?),
             "--id" if verb == "get-command" => command_id = Some(value(&mut args)?.parse()?),
             "--status" if verb == "list-commands" => {
@@ -118,20 +226,33 @@ pub fn parse(
                 connection_generation = Some(value(&mut args)?.parse()?)
             }
             "--window" | "--tab" | "--run"
-                if matches!(
-                    verb,
-                    "get-ssh-group-roster"
-                        | "get-ssh-group-run"
-                        | "get-ssh-group-output"
-                        | "follow-ssh-group-output"
-                        | "wait-ssh-group-run"
-                        | "wait-ssh-group-ready"
-                        | "wait-ssh-group-output"
-                ) =>
+                if (matches!(verb, "open-ssh-group" | "list-saved-ssh-groups")
+                    && arg == "--window")
+                    || matches!(
+                        verb,
+                        "get-ssh-group-roster"
+                            | "get-ssh-group-run"
+                            | "get-ssh-group-retry-plan"
+                            | "retry-ssh-group-run"
+                            | "interrupt-ssh-group-command"
+                            | "get-ssh-group-output"
+                            | "follow-ssh-group-output"
+                            | "wait-ssh-group-run"
+                            | "wait-ssh-group-approval"
+                            | "wait-ssh-group-ready"
+                            | "wait-ssh-group-output"
+                            | "submit-ssh-group-command"
+                            | "save-ssh-group-report"
+                            | "ssh-group-queue"
+                    ) =>
             {
                 ensure!(
-                    !matches!(verb, "get-ssh-group-roster" | "wait-ssh-group-ready")
-                        || arg != "--run",
+                    !matches!(
+                        verb,
+                        "get-ssh-group-roster"
+                            | "wait-ssh-group-ready"
+                            | "submit-ssh-group-command"
+                    ) || arg != "--run",
                     "{verb} does not accept --run"
                 );
                 let id: u64 = value(&mut args)?
@@ -144,6 +265,19 @@ pub fn parse(
                     _ => &mut run_id,
                 };
                 ensure!(slot.replace(id).is_none(), "specify {arg} only once");
+            }
+            "--" if verb == "submit-ssh-group-command" => {
+                ensure!(text.is_none(), "provide one quoted shell command line");
+                text = Some(args.next().context("missing shell command after --")?);
+                ensure!(
+                    args.next().is_none(),
+                    "provide one quoted shell command line"
+                );
+            }
+            "--" if verb == "save-ssh-group-report" => {
+                ensure!(text.is_none(), "provide one report destination");
+                text = Some(args.next().context("missing report destination after --")?);
+                ensure!(args.next().is_none(), "provide one report destination");
             }
             "--" if matches!(
                 verb,
@@ -162,6 +296,9 @@ pub fn parse(
                         | "wait-ssh-group-output"
                         | "record"
                         | "save-text"
+                        | "save-ssh-group-report"
+                        | "ssh-group-queue"
+                        | "submit-ssh-group-command"
                 ) =>
             {
                 ensure!(text.is_none(), "only one pattern/path is accepted");
@@ -237,11 +374,120 @@ pub fn parse(
             ensure!(pane.is_none(), "list-ssh-groups does not accept --pane");
             Request::ListSshGroups
         }
+        "list-saved-ssh-groups" => {
+            ensure!(
+                pane.is_none(),
+                "list-saved-ssh-groups does not accept --pane"
+            );
+            Request::ListSavedSshGroups {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+            }
+        }
+        "open-ssh-group" => {
+            ensure!(pane.is_none(), "open-ssh-group does not accept --pane");
+            let name = group_name.context("--name is required")?;
+            ensure!(!name.trim().is_empty(), "provide a saved SSH group name");
+            Request::OpenSshGroup {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                name,
+            }
+        }
+        "submit-ssh-group-command" => {
+            ensure!(
+                pane.is_none(),
+                "list recipient panes after submit-ssh-group-command"
+            );
+            let command = text.context("provide one quoted shell command line")?;
+            validate_group_submission(&pane_ids, &command, canary_pane_id)?;
+            ensure!(
+                expected_query.is_some() || (!regex && !match_case),
+                "--regex and --match-case require --expect-output for a group submission"
+            );
+            Request::SubmitSshGroupCommand {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                tab_id: tab_id.context("--tab is required (from list-ssh-groups)")?,
+                pane_ids,
+                command,
+                dry_run,
+                canary_pane_id,
+                parallel_limit,
+                interval_ms,
+                queue_expiry_ms,
+                stop_on_failure,
+                expect_output: expected_query.map(|query| SshGroupExpectedOutput {
+                    query,
+                    regex,
+                    match_case,
+                }),
+                record_output,
+            }
+        }
+        "save-ssh-group-report" => {
+            ensure!(
+                pane.is_none(),
+                "save-ssh-group-report does not accept --pane"
+            );
+            let path = text.context("save-ssh-group-report requires a destination path")?;
+            Request::SaveSshGroupReport {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                tab_id: tab_id.context("--tab is required (from list-ssh-groups)")?,
+                run_id: run_id.context("--run is required (from list-ssh-groups)")?,
+                path: std::path::absolute(path)?,
+                format: report_format.unwrap_or_default(),
+                overwrite,
+            }
+        }
+        "retry-ssh-group-run" => {
+            ensure!(pane.is_none(), "put --pane after retry-ssh-group-run");
+            validate_group_panes(&pane_ids)?;
+            Request::RetrySshGroupRun {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                tab_id: tab_id.context("--tab is required (from list-ssh-groups)")?,
+                run_id: run_id.context("--run is required (from list-ssh-groups)")?,
+                pane_ids,
+            }
+        }
+        "interrupt-ssh-group-command" => Request::InterruptSshGroupCommand {
+            window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+            tab_id: tab_id.context("--tab is required (from list-ssh-groups)")?,
+            run_id: run_id.context("--run is required (from list-ssh-groups)")?,
+            pane_id: pane
+                .filter(|pane| *pane != 0)
+                .context("--pane is required (from get-ssh-group-run)")?,
+        },
+        "ssh-group-queue" => {
+            let action = match (text.as_deref(), pane) {
+                (Some("pause"), None) => SshGroupQueueAction::Pause,
+                (Some("resume"), None) => SshGroupQueueAction::Resume,
+                (Some("stop"), None) => SshGroupQueueAction::Stop,
+                (Some("approve-canary"), Some(pane_id @ 1..)) => {
+                    SshGroupQueueAction::ApproveCanary { pane_id }
+                }
+                (Some("skip"), Some(pane_id @ 1..)) => SshGroupQueueAction::Skip { pane_id },
+                (Some(action @ ("approve-canary" | "skip")), _) => {
+                    bail!("{action} requires --pane with a positive pane ID")
+                }
+                (Some("pause" | "resume" | "stop"), Some(_)) => {
+                    bail!("--pane requires approve-canary or skip")
+                }
+                _ => bail!(
+                    "ssh-group-queue requires an action of pause, resume, stop, approve-canary, or skip"
+                ),
+            };
+            Request::SshGroupQueue {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                tab_id: tab_id.context("--tab is required (from list-ssh-groups)")?,
+                run_id: run_id.context("--run is required (from list-ssh-groups)")?,
+                action,
+            }
+        }
         "get-ssh-group-roster"
         | "get-ssh-group-run"
+        | "get-ssh-group-retry-plan"
         | "get-ssh-group-output"
         | "follow-ssh-group-output"
         | "wait-ssh-group-run"
+        | "wait-ssh-group-approval"
         | "wait-ssh-group-output"
         | "wait-ssh-group-ready" => {
             ensure!(
@@ -257,7 +503,10 @@ pub fn parse(
             let window_id = window_id.context("--window is required (from list-ssh-groups)")?;
             let tab_id = tab_id.context("--tab is required (from list-ssh-groups)")?;
             if verb == "get-ssh-group-roster" {
-                return Ok((pid, Request::GetSshGroupRoster { window_id, tab_id }));
+                return Ok(Invocation::new(
+                    pid,
+                    Request::GetSshGroupRoster { window_id, tab_id },
+                ));
             }
             let timeout_seconds = timeout.unwrap_or(30);
             ensure!(
@@ -265,11 +514,18 @@ pub fn parse(
                 "SSH group wait timeout must be 1..=3600 seconds"
             );
             if verb == "wait-ssh-group-ready" {
-                return Ok((
+                let pane_ids = if pane_ids.is_empty() {
+                    None
+                } else {
+                    validate_group_panes(&pane_ids)?;
+                    Some(pane_ids)
+                };
+                return Ok(Invocation::new(
                     pid,
                     Request::WaitSshGroupReady {
                         window_id,
                         tab_id,
+                        pane_ids,
                         timeout_seconds,
                     },
                 ));
@@ -328,6 +584,19 @@ pub fn parse(
                     run_id,
                     timeout_seconds,
                 }
+            } else if verb == "wait-ssh-group-approval" {
+                Request::WaitSshGroupApproval {
+                    window_id,
+                    tab_id,
+                    run_id,
+                    timeout_seconds,
+                }
+            } else if verb == "get-ssh-group-retry-plan" {
+                Request::GetSshGroupRetryPlan {
+                    window_id,
+                    tab_id,
+                    run_id,
+                }
             } else {
                 Request::GetSshGroupRun {
                     window_id,
@@ -356,7 +625,11 @@ pub fn parse(
         }
         _ => bail!("unknown automation command"),
     };
-    Ok((pid, request))
+    Ok(Invocation {
+        pid,
+        request,
+        require_success,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -365,7 +638,7 @@ mod tests {
     fn timed_recording_is_opt_in_and_old_record_requests_round_trip() {
         let record =
             |args: &[&str]| parse("record", args.iter().map(|s| s.to_string()), None, Some(7));
-        let (_, timed) = record(&["--timed", "my capture.vt"]).unwrap();
+        let timed = record(&["--timed", "my capture.vt"]).unwrap().request;
         assert!(
             matches!(timed, Request::Record { pane: 7, timed: true, path: Some(path) } if path.is_absolute())
         );
@@ -376,14 +649,17 @@ mod tests {
         assert!(matches!(decoded, Request::Record { timed: false, .. }));
         assert_eq!(serde_json::to_value(decoded).unwrap(), stop);
         assert_eq!(
-            serde_json::to_value(record(&["--stop"]).unwrap().1).unwrap(),
+            serde_json::to_value(record(&["--stop"]).unwrap().request).unwrap(),
             stop
         );
     }
 
     #[test]
     fn rejects_cross_command_flags_and_missing_values() {
-        let p = |v, a: &[&str]| parse(v, a.iter().map(|s| s.to_string()), None, None);
+        let p = |v, a: &[&str]| {
+            parse(v, a.iter().map(|s| s.to_string()), None, None)
+                .map(|invocation| (invocation.pid, invocation.request))
+        };
         assert!(matches!(
             p("wait-for-text", &["--pane", "1", "--regex", "fps: [0-9]+"])
                 .unwrap()

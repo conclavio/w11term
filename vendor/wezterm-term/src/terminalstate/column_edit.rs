@@ -55,6 +55,9 @@ impl TerminalState {
     }
 
     fn shift_columns_at(&mut self, x: usize, count: u32, shift: Shift) {
+        if count == 0 {
+            return;
+        }
         let rows = self.top_and_bottom_margins.clone();
         let right = self.left_and_right_margins.end;
         // A cut through a wide glyph can change the adjacent boundary cell.
@@ -62,6 +65,12 @@ impl TerminalState {
         let graphics = self.prepare_kitty_text_edit(&rows, &graphics_cols, false);
         let seqno = self.seqno;
         let screen = self.screen_mut();
+        let moved = (count as usize).min(right.saturating_sub(x));
+        let source = match shift {
+            Shift::Left => x + moved..right,
+            Shift::Right => x..right - moved,
+        };
+        screen.prepare_multicell_column_shift(rows.clone(), x..right, source, seqno);
         for row in rows {
             let end = right.min(screen.logical_cols(row));
             if x < end {

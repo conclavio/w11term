@@ -8,6 +8,7 @@ use crate::{
 };
 use anyhow::Context as _;
 use std::{sync::Arc, thread};
+use termwiz::surface::CursorShape;
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 #[cfg(test)]
@@ -47,8 +48,10 @@ pub enum Command {
     RestartExited(ClaimedRestart),
     /// Ordered with both native input and control-pipe writes on this pane.
     SetReadOnly(bool),
+    NotificationReply(crate::events::NotificationResponse),
     /// Change the local display defaults without sending input to the transport.
     SetColorScheme(ColorScheme),
+    SetDefaultCursorShape(CursorShape),
     /// Input method committed text has no corresponding physical key presses.
     Composed(String),
     Observe(tokio::sync::oneshot::Sender<tokio::sync::broadcast::Receiver<Vec<u8>>>),
@@ -131,6 +134,15 @@ pub enum Command {
         reply: tokio::sync::oneshot::Sender<Result<(), &'static str>>,
     },
     ScrollViewport(crate::terminal::ScrollbackTarget),
+    ToggleScrollbackBookmark(crate::terminal::BookmarkTarget),
+    ReadScrollbackBookmarks {
+        screen: crate::terminal::BookmarkScreen,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<crate::terminal::BookmarkEntry>>>,
+    },
+    RevealScrollbackBookmark {
+        screen: crate::terminal::BookmarkScreen,
+        row: isize,
+    },
     ScrollRange(RangeScrollRequest),
     CopyWord {
         screen: crate::copy_mode::ScreenId,
@@ -190,6 +202,7 @@ fn contain_worker_failure(
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         events.close_restart();
         events.command_stream(None);
+        events.notification_stream(None);
         events.set_terminal_activity(wezterm_term::Progress::None, None);
         // Never resume a possibly inconsistent terminal engine after unwinding.
         let mut frame = (*frames.load()).clone();
@@ -271,6 +284,27 @@ pub struct Session {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+pub struct PanePreferences {
+    pub clipboard_policy: RemoteClipboardPolicy,
+    pub default_cursor_shape: CursorShape,
+}
+
+impl From<RemoteClipboardPolicy> for PanePreferences {
+    fn from(clipboard_policy: RemoteClipboardPolicy) -> Self {
+        Self {
+            clipboard_policy,
+            default_cursor_shape: CursorShape::Default,
+        }
+    }
+}
+
+impl From<bool> for PanePreferences {
+    fn from(clipboard_enabled: bool) -> Self {
+        Self::from(RemoteClipboardPolicy::from(clipboard_enabled))
+    }
+}
+
 struct Services {
     colors: colors::PaneColors,
     prompts: crate::prompts::Prompts,
@@ -325,9 +359,9 @@ impl Session {
     pub fn start_configured(
         source: Source,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
-        Self::start_configured_with_connection(source, size, clipboard_policy, None)
+        Self::start_configured_with_connection(source, size, preferences, None)
     }
 
     /// Snapshot the authenticated connection of a ready SSH pane, for an
@@ -374,13 +408,13 @@ impl Session {
     pub fn start_configured_with_connection(
         source: Source,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
         Self::start_worker(
             source,
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             connection,
             None,
             None,
@@ -391,13 +425,13 @@ impl Session {
     pub fn start_group_ssh(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         launch_gate: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             None,
             None,
@@ -407,10 +441,22 @@ impl Session {
 
     /// A GUI pane can be created before layout assigns it a grid and pixel size.
     pub fn start_view_recording_pane(path: std::path::PathBuf, size: TerminalSize) -> Self {
+        Self::start_view_recording_pane_with_preferences(
+            path,
+            size,
+            RemoteClipboardPolicy::Disabled,
+        )
+    }
+
+    pub fn start_view_recording_pane_with_preferences(
+        path: std::path::PathBuf,
+        size: TerminalSize,
+        preferences: impl Into<PanePreferences>,
+    ) -> Self {
         Self::start_worker(
             Source::ViewRecording(path),
             has_cell_pixels(size).then_some(size),
-            RemoteClipboardPolicy::Disabled,
+            preferences.into(),
             None,
             None,
             None,
@@ -421,12 +467,12 @@ impl Session {
     pub fn start_replay_pane(
         path: std::path::PathBuf,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
         Self::start_worker(
             Source::Replay(path),
             has_cell_pixels(size).then_some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             None,
             None,
@@ -437,23 +483,23 @@ impl Session {
     pub fn start_workspace_ssh(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         startup: crate::workspace::SshStartup,
     ) -> Self {
-        Self::start_ssh_with_startup(options, size, clipboard_policy, startup, None)
+        Self::start_ssh_with_startup(options, size, preferences, startup, None)
     }
 
     pub fn start_ssh_with_startup(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         startup: crate::workspace::SshStartup,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             connection,
             None,
             Some(startup),
@@ -464,14 +510,14 @@ impl Session {
     pub fn start_durable(
         source: Source,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<crate::durable::DurableReference>,
     ) -> Self {
         Self::start_worker(
             source,
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             connection,
             Some(ssh::DurableStart::Attach(saved)),
             None,
@@ -483,13 +529,13 @@ impl Session {
     pub fn discover_durable(
         mut options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             Some(ssh::DurableStart::Discover),
             None,
@@ -501,13 +547,13 @@ impl Session {
     pub fn discover_herdr(
         mut options: crate::options::SshOptions,
         size: TerminalSize,
-        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        preferences: impl Into<PanePreferences>,
     ) -> Self {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            clipboard_policy.into(),
+            preferences.into(),
             None,
             Some(ssh::DurableStart::DiscoverHerdr),
             None,
@@ -540,7 +586,7 @@ impl Session {
     fn start_worker(
         source: Source,
         initial_grid: Option<TerminalSize>,
-        clipboard_policy: RemoteClipboardPolicy,
+        preferences: PanePreferences,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<ssh::DurableStart>,
         startup: Option<crate::workspace::SshStartup>,
@@ -578,6 +624,7 @@ impl Session {
             source.scrollback_lines(),
             colors.effective(),
         );
+        terminal.set_default_cursor_shape(preferences.default_cursor_shape);
         let output_viewer = matches!(
             source,
             Source::TimedReplay(_) | Source::PausedReplay(_) | Source::ViewRecording(_)
@@ -585,7 +632,7 @@ impl Session {
         let remote_clipboard = Arc::new(RemoteClipboardAccess::new(if output_viewer {
             RemoteClipboardPolicy::Disabled
         } else {
-            clipboard_policy
+            preferences.clipboard_policy
         }));
         match &source {
             Source::Local(shell) if shell.wsl_distribution().is_some() => {
@@ -694,6 +741,7 @@ impl Drop for Session {
             .set_policy(RemoteClipboardPolicy::Disabled);
         self.events.close_restart();
         self.events.command_stream(None);
+        self.events.notification_stream(None);
         let _ = self.input.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -820,6 +868,7 @@ async fn run(
     let mut replay_label = None;
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
+    let notification_evictions = events.notification_evictions();
     loop {
         if replay_ready && let Some(capture) = replay.take() {
             if let Some((cols, rows)) = capture.grid {
@@ -921,6 +970,7 @@ async fn run(
         if inspecting {
             frames.set_inspection(Some(terminal::TerminalModes::read(&terminal)));
         }
+        let notification_expiry = events.next_notification_expiry();
         let animation_deadline = presentation.animation_deadline(&terminal);
         let replay_deadline = animation_deadline
             .into_iter()
@@ -958,6 +1008,20 @@ async fn run(
                 }
             }
             _ = colors.changed() => {},
+            _ = notification_evictions.notified() => {
+                if let Some(response) = events.expire_notifications() {
+                    send_notification_reply(&writer, connection_generation, response);
+                }
+            },
+            _ = async {
+                if let Some(deadline) = notification_expiry {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if notification_expiry.is_some() => {
+                if let Some(response) = events.expire_notifications() {
+                    send_notification_reply(&writer, connection_generation, response);
+                }
+            },
             _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if !is_timed_replay && animation_deadline.is_some() => {
                 presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
             },
@@ -1008,6 +1072,7 @@ async fn run(
                         Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
+                        Some(Command::NotificationReply(_)) => continue,
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
                         Some(Command::Key {..} | Command::DetailedKey {..} | Command::Composed(_) | Command::Text(_) | Command::Paste(_) | Command::Mouse(_) | Command::MouseLeave { .. }) => continue,
                         Some(Command::Wheel(lines, _)) => Some(Command::Scroll(lines)),
@@ -1209,6 +1274,10 @@ async fn run(
                     Some(Command::Shutdown) | None => break,
                     Some(Command::SetColorScheme(scheme)) => {
                         colors.choose(scheme);
+                        Ok(())
+                    }
+                    Some(Command::SetDefaultCursorShape(shape)) => {
+                        presentation.dirty |= terminal.set_default_cursor_shape(shape);
                         Ok(())
                     }
                     Some(Command::SetReadOnly(enabled)) => {
@@ -1428,6 +1497,22 @@ async fn run(
                         }
                         Ok(())
                     }
+                    Some(Command::ToggleScrollbackBookmark(target)) => {
+                        presentation.dirty |= target.toggle(&mut terminal, connection_generation);
+                        Ok(())
+                    }
+                    Some(Command::ReadScrollbackBookmarks { screen, reply }) => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(screen.list(&terminal, connection_generation));
+                        }
+                        Ok(())
+                    }
+                    Some(Command::RevealScrollbackBookmark { screen, row }) => {
+                        if let Some(offset) = screen.offset(&terminal, connection_generation, row) {
+                            scroll_offset = offset;
+                        }
+                        Ok(())
+                    }
                     Some(Command::ScrollTo(top)) => {
                         if !terminal.is_alt_screen_active() {
                             scroll_offset = terminal.screen().visible_row_to_stable_row(0).saturating_sub(top).max(0) as usize;
@@ -1496,6 +1581,10 @@ async fn run(
                     Some(Command::MouseLeave { connection, modifiers }) => {
                         if connection == connection_generation { terminal.mouse_left(modifiers) } else { Ok(()) }
                     }
+                    Some(Command::NotificationReply(response)) => {
+                        send_notification_reply(&writer, connection_generation, response);
+                        Ok(())
+                    }
                     Some(Command::Focus(focused)) => { terminal.focus_changed(focused); Ok(()) }
                     Some(Command::ReloadDemo) => { if is_demo { scroll_offset = presentation.advance(&mut terminal,demo::bytes(),scroll_offset,&status,total_bytes); } Ok(()) }
                 };
@@ -1512,6 +1601,7 @@ async fn run(
                     let joined = transports.join_next().await;
                     prompts.cancel();
                     events.command_stream(None);
+                    events.notification_stream(None);
                     let program = if show_progress {
                         terminal.retire_running_program_statuses();
                         terminal.program_status().cloned()
@@ -1563,6 +1653,7 @@ async fn run(
                             terminal.clear_resize_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
                             events.command_stream(None);
+                            events.notification_stream(None);
                             let program = if show_progress {
                                 terminal.retire_running_program_statuses();
                                 terminal.program_status().cloned()
@@ -1643,6 +1734,7 @@ async fn run(
                             connection_generation = generation;
                             phase = Phase::Running;
                             events.command_stream(live_commands.then_some(generation));
+                            events.notification_stream(interactive.then_some(generation));
                             if is_ssh {
                                 events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connected);
                             }
@@ -1655,6 +1747,7 @@ async fn run(
         }
     }
     events.command_stream(None);
+    events.notification_stream(None);
     drop(output);
     transports.shutdown().await;
     if let Some(task) = asset_task {
@@ -1662,6 +1755,22 @@ async fn run(
     }
     if let Some(recorder) = recorder {
         let _ = finish_recording(recorder, &events);
+    }
+}
+
+fn send_notification_reply(
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    generation: u64,
+    response: crate::events::NotificationResponse,
+) {
+    if response.connection == generation && !response.wire.is_empty() {
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let _ = writer.send(TransportInput::Scoped {
+            connection: generation,
+            bytes: response.wire.concat().into_bytes(),
+            reply,
+            kind: terminal::ScopedInput::Notification,
+        });
     }
 }
 

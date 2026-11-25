@@ -548,6 +548,7 @@ impl TerminalApp {
             return;
         };
         let mut group = payload.tab;
+        let cursor_shape = self.appearance.read().unwrap().default_cursor_style.shape();
         let leaves: Vec<_> = group.entries().iter().map(|t| t.id).collect();
         for leaf in leaves {
             if let Some(AppTab {
@@ -556,6 +557,10 @@ impl TerminalApp {
             }) = group.get_mut(leaf)
             {
                 live.surface.window_hidden();
+                let _ = live
+                    .session
+                    .input
+                    .send(Command::SetDefaultCursorShape(cursor_shape));
                 live.surface = PaneSurface::default();
                 live.last_size = Default::default();
                 live.files.bind_window(ctx.sender());

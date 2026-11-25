@@ -1,6 +1,8 @@
 use super::{host_groups::FailedLogin, *};
 use std::{fmt::Write as _, io::Write as _};
-use w11term::events::{NoticeTarget, SshAttemptOutcome, SshLoginResult};
+use w11term::events::{NoticeTarget, NotificationChoice, SshAttemptOutcome, SshLoginResult};
+
+mod group_output;
 
 pub(super) const LONG_COMMANDS: &str = "Notify for long commands";
 
@@ -26,7 +28,13 @@ pub enum Action {
         pane: u64,
         sequence: u64,
     },
+    Notification {
+        pane: u64,
+        sequence: u64,
+        choice: NotificationChoice,
+    },
     VisitGroup(NoticeTarget),
+    ViewGroupOutput(NoticeTarget),
     ViewCommand {
         pane: u64,
         sequence: u64,
@@ -55,6 +63,7 @@ pub enum LoginReportAction {
 
 pub(super) enum AttentionPage {
     Inbox,
+    GroupOutput(group_output::MatchView),
     Logins {
         target: NoticeTarget,
         changed: bool,
@@ -125,11 +134,44 @@ impl TerminalApp {
                     self.find(true, None, ctx);
                 }
             }
+            Action::Notification {
+                pane,
+                sequence,
+                choice,
+            } => {
+                let Some(id) = self.tab_for_pane(pane) else {
+                    return;
+                };
+                let Some(Page::Terminal(tab)) = self.tabs.get(id).map(|tab| &tab.page) else {
+                    return;
+                };
+                let Some(response) = tab.session.events.act_on_notification(sequence, choice)
+                else {
+                    return;
+                };
+                let focus = response.focus;
+                if !response.wire.is_empty() {
+                    let _ = tab.session.input.send(Command::NotificationReply(response));
+                }
+                if !focus {
+                    return;
+                }
+                self.tabs.select(id);
+                if matches!(self.tabs.get(id), Some(AppTab { page: Page::Terminal(live), .. }) if live.find.open)
+                {
+                    self.find(true, None, ctx);
+                }
+            }
             Action::VisitGroup(target) => match target {
                 NoticeTarget::GroupRun { tab, submission }
                 | NoticeTarget::GroupCanary { tab, submission }
-                    if self.group_run_retained(tab, submission)
-                        && self.inbox.mark_target_read(target) =>
+                | NoticeTarget::GroupOutputMissing { tab, submission }
+                | NoticeTarget::GroupOutput {
+                    tab, submission, ..
+                } if self.group_run_retained(tab, submission)
+                    && (matches!(self.active_attention(), Some(AttentionPage::GroupOutput(output))
+                        if output.target == target)
+                        || self.inbox.mark_target_read(target)) =>
                 {
                     self.show_group_run(tab, submission);
                 }
@@ -143,6 +185,7 @@ impl TerminalApp {
                 }
                 _ => return,
             },
+            Action::ViewGroupOutput(target) => self.open_group_output_match(target),
             Action::ViewCommand { pane, sequence } => {
                 if let Some(link) = self.inbox.command_link(pane, sequence)
                     && self.open_command_history(pane, Some(link), ctx)
@@ -244,6 +287,7 @@ impl TerminalApp {
     pub(super) fn attention_view(&self, page: &AttentionPage, ctx: &ViewContext<Self>) -> View {
         match page {
             AttentionPage::Inbox => {}
+            AttentionPage::GroupOutput(output) => return self.group_output_match_view(output, ctx),
             AttentionPage::Logins { target, changed } => {
                 return self.login_results_view(*target, *changed, ctx);
             }
@@ -262,14 +306,21 @@ impl TerminalApp {
                         NoticeTarget::Pane { pane, sequence } => (pane, sequence),
                         target @ (NoticeTarget::GroupRun { tab, .. }
                         | NoticeTarget::GroupCanary { tab, .. }
+                        | NoticeTarget::GroupOutput { tab, .. }
+                        | NoticeTarget::GroupOutputMissing { tab, .. }
                         | NoticeTarget::GroupLogins { tab, .. }) => {
                             let (enabled, detail, key) = match target {
                                 NoticeTarget::GroupRun { submission, .. }
-                                | NoticeTarget::GroupCanary { submission, .. } => {
-                                    let kind = if matches!(target, NoticeTarget::GroupCanary { .. }) {
-                                        "canary"
-                                    } else {
-                                        "run"
+                                | NoticeTarget::GroupCanary { submission, .. }
+                                | NoticeTarget::GroupOutputMissing { submission, .. }
+                                | NoticeTarget::GroupOutput { submission, .. } => {
+                                    let key = match target {
+                                        NoticeTarget::GroupCanary { .. } => format!("group-canary-{tab}/{submission}"),
+                                        NoticeTarget::GroupOutputMissing { .. } => format!("group-output-missing-{tab}/{submission}"),
+                                        NoticeTarget::GroupOutput { line_id, .. } => {
+                                            format!("group-output-{tab}/{submission}/{line_id}")
+                                        }
+                                        _ => format!("group-run-{tab}/{submission}"),
                                     };
                                     let enabled = self.group_run_retained(tab, submission);
                                     let expired = if enabled {
@@ -280,7 +331,7 @@ impl TerminalApp {
                                     (
                                         enabled,
                                         format!(" · Run {submission}{expired}"),
-                                        format!("group-{kind}-{tab}/{submission}"),
+                                        key,
                                     )
                                 }
                                 NoticeTarget::GroupLogins { sequence, .. } => {
@@ -313,7 +364,20 @@ impl TerminalApp {
                                             .text(label)
                                             .text_wrapping(TextWrapping::Wrap),
                                     );
-                            let content = if let NoticeTarget::GroupLogins { sequence, .. } = target {
+                            let details = match target {
+                                NoticeTarget::GroupLogins { sequence, .. } => Some((
+                                    format!("View SSH login results for {source}, notice {sequence}"),
+                                    "View login results",
+                                    Action::ViewLoginResults as fn(NoticeTarget) -> Action,
+                                )),
+                                NoticeTarget::GroupOutput { submission, line_id, .. } => Some((
+                                    format!("View matching output for {source}, run {submission}, line {line_id}"),
+                                    "View matching output",
+                                    Action::ViewGroupOutput as fn(NoticeTarget) -> Action,
+                                )),
+                                _ => None,
+                            };
+                            let content = if let Some((name, label, action)) = details {
                                 Grid::new()
                                     .columns([GridLength::STAR, GridLength::Auto])
                                     .column_spacing(8.0)
@@ -322,9 +386,9 @@ impl TerminalApp {
                                         Button::new()
                                             .grid_column(1)
                                             .style(ButtonStyle::Subtle)
-                                            .automation_name(format!("View SSH login results for {source}, notice {sequence}"))
-                                            .on_click(ctx.callback(move |_| Message::Attention(Action::ViewLoginResults(target))))
-                                            .content("View login results"),
+                                            .automation_name(name)
+                                            .on_click(ctx.callback(move |_| Message::Attention(action(target))))
+                                            .content(label),
                                     ))
                             } else {
                                 visit
@@ -338,11 +402,20 @@ impl TerminalApp {
                         |tab| tab.label.clone(),
                     );
                     let label = format!("{status} · {source} · Pane {pane} · {}", row.message);
+                    let buttons = tab.and_then(|tab| match &tab.page {
+                        Page::Terminal(live) => live.session.events.notification_buttons(sequence),
+                        _ => None,
+                    });
+                    let kitty = buttons.is_some();
                     let visit = Button::new()
                         .automation_name(label.clone())
                         .is_enabled(tab.is_some())
                         .on_click(ctx.callback(move |_| {
-                            Message::Attention(Action::Visit { pane, sequence })
+                            Message::Attention(if kitty {
+                                Action::Notification { pane, sequence, choice: NotificationChoice::Activate(None) }
+                            } else {
+                                Action::Visit { pane, sequence }
+                            })
                         }))
                         .content(
                             TextBlock::new()
@@ -353,7 +426,31 @@ impl TerminalApp {
                         self.history_frame(pane)
                             .is_some_and(|frame| frame.has_command(link))
                     });
-                    let content: View = if let Some(command) = command {
+                    let content: View = if let Some(buttons) = buttons {
+                        let mut controls = Vec::new();
+                        for (index, label) in buttons.iter().enumerate().filter(|(_, label)| !label.is_empty()) {
+                            controls.push(KeyedView::new(format!("action-{index}"),
+                                Button::new()
+                                    .style(ButtonStyle::Subtle)
+                                    .automation_name(format!("{label} for Pane {pane}"))
+                                    .on_click(ctx.callback(move |_| Message::Attention(Action::Notification {
+                                        pane, sequence, choice: NotificationChoice::Activate(Some(index)),
+                                    })))
+                                    .content(label.clone())));
+                        }
+                        controls.push(KeyedView::new("dismiss",
+                            Button::new()
+                                .style(ButtonStyle::Subtle)
+                                .automation_name(format!("Dismiss notification for Pane {pane}"))
+                                .on_click(ctx.callback(move |_| Message::Attention(Action::Notification {
+                                    pane, sequence, choice: NotificationChoice::Dismiss,
+                                })))
+                                .content("Dismiss")));
+                        StackPanel::new().spacing(2.0).children((
+                            visit,
+                            StackPanel::new().spacing(4.0).keyed_children(controls),
+                        ))
+                    } else if let Some(command) = command {
                         Grid::new()
                             .columns([GridLength::STAR, GridLength::Auto])
                             .column_spacing(8.0)

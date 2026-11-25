@@ -328,6 +328,13 @@ pub const MAX_OSC_DIRECTORY_BYTES: usize = 128 * 1024;
 const MAX_OSC_REMOTE_HOST_BYTES: usize = 1024;
 // OSC 7501 has a 4096-byte wire limit including its introducer and ST.
 const MAX_OSC_PROGRAM_STATUS_BYTES: usize = 4096 - b"\x1b]7501;\x1b\\".len();
+// A single OSC 21 can carry all 256 palette entries and named colors.
+const MAX_OSC_KITTY_COLORS_BYTES: usize = 16 * 1024;
+const MAX_OSC_POINTER_NAMES_BYTES: usize = 4096;
+const MAX_OSC_TEXT_SIZE_METADATA: usize = 128;
+const MAX_OSC_TEXT_SIZE_BYTES: usize = 4096;
+const MAX_NOTIFICATION_METADATA: usize = 1024;
+const MAX_NOTIFICATION_WIRE_PAYLOAD: usize = 4096;
 pub const MAX_REPORTED_COMMAND_BYTES: usize = 4096;
 const MAX_OSC_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PARAMS: usize = 256;
@@ -359,6 +366,28 @@ impl OscState {
             self.discard_vscode();
             return;
         }
+        let notification_metadata = self.num_params == 2
+            && self.param_indices[0] == 2
+            && self.buffer.starts_with(b"99");
+        let text_size_metadata = self.num_params == 2
+            && self.param_indices[0] == 2
+            && self.buffer.starts_with(b"66");
+        if notification_metadata
+            && param != ';'
+            && (!param.is_ascii_graphic()
+                || self.buffer.len() + param.len_utf8() > 2 + MAX_NOTIFICATION_METADATA)
+        {
+            self.discard_osc();
+            return;
+        }
+        if text_size_metadata
+            && param != ';'
+            && (!param.is_ascii_graphic()
+                || self.buffer.len() + param.len_utf8() > 2 + MAX_OSC_TEXT_SIZE_METADATA)
+        {
+            self.discard_osc();
+            return;
+        }
         if param == ';' && self.literal_field.is_none() {
             self.command_field = None;
             if self.num_params == 1 && self.buffer.as_slice() == b"633" {
@@ -372,6 +401,18 @@ impl OscState {
             }
             if self.num_params == 1 && self.buffer.as_slice() == b"7501" {
                 self.literal_field = Some((4, MAX_OSC_PROGRAM_STATUS_BYTES));
+            }
+            if self.num_params == 1 && self.buffer.as_slice() == b"21" {
+                self.literal_field = Some((2, MAX_OSC_KITTY_COLORS_BYTES));
+            }
+            if self.num_params == 1 && self.buffer.as_slice() == b"22" {
+                self.literal_field = Some((2, MAX_OSC_POINTER_NAMES_BYTES));
+            }
+            if notification_metadata {
+                self.literal_field = Some((self.buffer.len(), MAX_NOTIFICATION_WIRE_PAYLOAD));
+            }
+            if text_size_metadata {
+                self.literal_field = Some((self.buffer.len(), MAX_OSC_TEXT_SIZE_BYTES));
             }
             if self.num_params == 2 && self.param_indices[0] == 1 && self.buffer.as_slice() == b"99"
             {
@@ -460,17 +501,28 @@ impl OscState {
 
     fn discard_vscode(&mut self) {
         if self.vscode_limit.is_some() {
-            self.buffer.clear();
-            self.num_params = 0;
-            self.full = true;
+            self.discard_osc();
         }
+    }
+
+    fn discard_osc(&mut self) {
+        self.buffer.clear();
+        self.num_params = 0;
+        self.full = true;
     }
 
     fn discard_literal(&mut self) {
         if let Some((prefix, _)) = self.literal_field {
-            // Dispatch the empty report at ST, never a usable prefix.
-            self.buffer.truncate(prefix);
-            self.full = true;
+            if self.num_params == 3 && self.param_indices[0] == 2 && self.buffer.starts_with(b"99")
+                || self.buffer.get(..prefix) == Some(b"22")
+            {
+                // Empty notifications and pointer requests can commit state.
+                self.discard_osc();
+            } else {
+                // Dispatch the empty report at ST, never a usable prefix.
+                self.buffer.truncate(prefix);
+                self.full = true;
+            }
         }
     }
 }

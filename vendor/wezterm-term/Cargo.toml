@@ -38,6 +38,7 @@ wezterm-bidi = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af1
 wezterm-dynamic = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb", features = ["std"] }
 wezterm-cell = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb", features = ["std", "use_image"] }
 wezterm-escape-parser = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb", features = ["std", "use_image"] }
+wezterm-input-types = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb" }
 wezterm-surface = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb", features = ["std", "appdata", "use_image"] }
 
 [dev-dependencies]

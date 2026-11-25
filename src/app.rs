@@ -11,8 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 use w11term::{
-    appearance::{Appearance, installed_fonts},
-    clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
+    appearance::{Appearance, CursorGuide, DefaultCursorStyle, installed_fonts},
+    clipboard::RemoteClipboardAccess,
     control::{Pane, Registry, Server},
     interaction::{
         Link, MultiLinePasteWarning, Point, Selection, TabSwitcherMode, link_at, safe_url,
@@ -24,7 +24,7 @@ use w11term::{
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
-    session::{Command, Session},
+    session::{Command, PanePreferences, Session},
     shortcuts::Action as KeyAction,
     tabs::{BalancedPanes, PaneBalance, PaneRotation, PaneSwap, TabId, Tabs},
 };
@@ -98,6 +98,8 @@ mod tab_title;
 mod tab_windows;
 mod taskbar;
 mod text_export;
+mod text_size;
+mod visual_bell;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
 use pane_view::PaneSurface;
@@ -113,6 +115,7 @@ struct LiveTab {
     discovery: Option<session_browser::Browser>,
     copy_output_unavailable: Option<&'static str>,
     failed_command_jumps: [bool; 2],
+    bookmark_actions: [bool; 4],
     can_clear_scrollback: bool,
     split_directory_report: Option<Arc<str>>,
     confirm_end: bool,
@@ -359,6 +362,7 @@ struct TabSwitcher {
 }
 #[derive(Clone, Copy)]
 pub enum InteractionField {
+    VisualBell,
     ApplicationTabTitles,
     FailedCommandMarks,
     StickyCommandContext,
@@ -891,6 +895,7 @@ enum UiWork {
     FolderAuthority,
     Control(w11term::control::UiRequest),
     AttentionChanged,
+    TextSizeChanged,
 }
 
 struct CaretMenuBinding {
@@ -969,6 +974,7 @@ impl PaneArrangement {
 
 pub struct TerminalApp {
     caret_interval: Option<u32>,
+    visual_bell_timer: Option<crate::ui_timer::RetryTimer>,
     folder_wake: Arc<dyn Fn() + Send + Sync>,
     folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
     forward_watch: Option<crate::ui_timer::RetryTimer>,
@@ -1023,6 +1029,7 @@ pub struct TerminalApp {
     window_height: f64,
     initial_grid: Rc<crate::window_state::RequestedGrid>,
     appearance: Arc<RwLock<Appearance>>,
+    text_size: Option<text_size::Monitor>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
     saved_commands: w11term::saved_commands::Commands,
@@ -1060,16 +1067,20 @@ pub enum Message {
     Recording(recordings::Action),
     ClearScrollback(u64),
     ScrollFailedCommand(Option<clipboard_paste::Origin>, bool),
+    ToggleScrollbackBookmark(Option<clipboard_paste::Origin>),
+    ScrollToBookmark(Option<clipboard_paste::Origin>, bool),
     PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
+    VisualBellTick,
     ToggleInspector,
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
     PaneText(pane_picker::TextAction),
     PickerHover(u64),
     PickerFrame(u64, u64),
+    BookmarksRead(Arc<()>, Option<Vec<w11term::terminal::BookmarkEntry>>),
     PickerChoose(u64),
     PlacePane(TabId, TabId, Direction),
     PickerFocus(u8),
@@ -1166,7 +1177,11 @@ pub enum Message {
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
     Font(Option<usize>),
+    DefaultCursorStyle(Option<usize>),
+    CursorGuide(Option<usize>),
     Ligatures(bool),
+    FollowWindowsTextSize(bool),
+    WindowsTextSizeChanged,
     Interaction(InteractionField, bool),
     MultilinePasteWarning(MultiLinePasteWarning, bool),
     TabMode(Option<usize>),
@@ -1225,25 +1240,32 @@ pub enum Message {
     Smoke(u8),
 }
 
-fn live_tab(label: String, source: Source, osc52: impl Into<RemoteClipboardPolicy>) -> AppTab {
-    live_tab_sized(label, source, TerminalSize::default(), osc52, None, None)
+fn live_tab(label: String, source: Source, preferences: impl Into<PanePreferences>) -> AppTab {
+    live_tab_sized(
+        label,
+        source,
+        TerminalSize::default(),
+        preferences,
+        None,
+        None,
+    )
 }
 fn live_tab_sized(
     label: String,
     source: Source,
     size: TerminalSize,
-    osc52: impl Into<RemoteClipboardPolicy>,
+    preferences: impl Into<PanePreferences>,
     connection: Option<w11term::ssh::ConnectionShare>,
     saved: Option<w11term::durable::DurableReference>,
 ) -> AppTab {
     let session = if matches!(&source, Source::Ssh(ssh) if ssh.durable) {
-        Session::start_durable(source.clone(), size, osc52, connection, saved)
+        Session::start_durable(source.clone(), size, preferences, connection, saved)
     } else if let Source::Replay(path) = &source {
-        Session::start_replay_pane(path.clone(), size, osc52)
+        Session::start_replay_pane(path.clone(), size, preferences)
     } else if let Source::ViewRecording(path) = &source {
-        Session::start_view_recording_pane(path.clone(), size)
+        Session::start_view_recording_pane_with_preferences(path.clone(), size, preferences)
     } else {
-        Session::start_configured_with_connection(source.clone(), size, osc52, connection)
+        Session::start_configured_with_connection(source.clone(), size, preferences, connection)
     };
     live_tab_for_session(label, source, session)
 }
@@ -1261,6 +1283,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             discovery: None,
             copy_output_unavailable: Some("waiting for shell markers"),
             failed_command_jumps: [false; 2],
+            bookmark_actions: [false; 4],
             can_clear_scrollback: false,
             split_directory_report: None,
             color_scheme: source.color_scheme(),
@@ -1334,6 +1357,7 @@ impl TerminalApp {
                         Ok(UiWork::Control(request)) => return Message::Control(request),
                         Ok(UiWork::AttentionChanged) => return Message::AttentionChanged,
                         Ok(UiWork::FolderAuthority) => return Message::FolderAuthority,
+                        Ok(UiWork::TextSizeChanged) => return Message::WindowsTextSizeChanged,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(_) => return Message::ControlIdle,
                     }
@@ -1842,11 +1866,18 @@ impl TerminalApp {
             && tab.surface.scrollbar.pointer(
                 pointer,
                 kind,
-                |marked_row| {
+                |mark| {
                     let frame = tab.session.frames.load();
-                    if let Some(row) = marked_row
-                        && !frame.failed_command_rows.contains(&row)
-                    {
+                    let retained = match mark {
+                        Some(scrollback_bar::ScrollMark::FailedCommand(row)) => {
+                            frame.failed_command_rows.contains(&row)
+                        }
+                        Some(scrollback_bar::ScrollMark::Bookmark(row)) => {
+                            frame.scrollback_bookmarks.binary_search(&row).is_ok()
+                        }
+                        None => true,
+                    };
+                    if !retained {
                         return None;
                     }
                     frame.scrollback_view()
@@ -2107,6 +2138,8 @@ impl TerminalApp {
         }
     }
     fn save_preferences(&mut self, appearance: Appearance) {
+        let cursor_changed =
+            self.appearance.read().unwrap().default_cursor_style != appearance.default_cursor_style;
         self.keyboard
             .set_preferences(appearance.interaction.clone());
         for entry in self.tabs.entries() {
@@ -2114,6 +2147,11 @@ impl TerminalApp {
                 tab.session
                     .remote_clipboard
                     .set_policy(appearance.interaction.remote_clipboard_policy());
+                if cursor_changed {
+                    let _ = tab.session.input.send(Command::SetDefaultCursorShape(
+                        appearance.default_cursor_style.shape(),
+                    ));
+                }
             }
         }
         *self.appearance.write().unwrap() = appearance.clone();
@@ -2123,16 +2161,16 @@ impl TerminalApp {
             .err()
             .map(|e| format!("Settings could not be saved: {e:#}"));
     }
-    fn apply_appearance(&mut self, appearance: Appearance) {
+    fn remeasure_terminal_font(&mut self, appearance: &Appearance) -> bool {
         let mut renderer = match Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         ) {
             Ok(renderer) => renderer,
             Err(e) => {
                 self.appearance_error = Some(format!("Unable to use font: {e}"));
-                return;
+                return false;
             }
         };
         for entry in self.tabs.entries() {
@@ -2148,8 +2186,28 @@ impl TerminalApp {
             }
         }
         self.keyboard.set_selection(false);
-        self.save_preferences(appearance);
         self.invalidator.invalidate();
+        true
+    }
+
+    fn apply_appearance(&mut self, appearance: Appearance, context: &ComponentContext<Self>) {
+        if self.remeasure_terminal_font(&appearance) {
+            self.save_preferences(appearance);
+            self.refresh_picker_font(context);
+        }
+    }
+
+    fn update_windows_text_size(&mut self, factor: f64, context: &ComponentContext<Self>) {
+        let mut appearance = self.appearance.read().unwrap().clone();
+        let previous_size = appearance.terminal_font_size();
+        appearance.set_windows_text_scale(factor);
+        let remeasure = previous_size != appearance.terminal_font_size();
+        if !remeasure || self.remeasure_terminal_font(&appearance) {
+            *self.appearance.write().unwrap() = appearance;
+            if remeasure {
+                self.refresh_picker_font(context);
+            }
+        }
     }
 
     fn settings_view(&self, context: &ViewContext<Self>) -> View {
@@ -2165,6 +2223,19 @@ impl TerminalApp {
             TextBlock::new().text("Programming ligatures").into(),
             ToggleSwitch::new().automation_name("Programming ligatures").is_on(appearance.ligatures).on_toggled(context.callback(Message::Ligatures)).into(),
             TextBlock::new().text("Used by fonts with ligature support, such as Cascadia Code, JetBrains Mono and Fira Code.").text_wrapping(TextWrapping::Wrap).into(),
+            TextBlock::new().text("Follow Windows text size").into(),
+            ToggleSwitch::new().automation_name("Follow Windows text size").is_on(appearance.follow_windows_text_size)
+                .on_toggled(context.callback(Message::FollowWindowsTextSize)).into(),
+            TextBlock::new().text("Default cursor style").into(),
+            ComboBox::new().width(260.0).automation_name("Default cursor style")
+                .items_source(DefaultCursorStyle::CHOICES.iter().map(|(_, label)| *label))
+                .selected_index(DefaultCursorStyle::CHOICES.iter().position(|(style, _)| *style == appearance.default_cursor_style))
+                .on_selection_changed(context.callback(Message::DefaultCursorStyle)).into(),
+            TextBlock::new().text("Cursor guide").into(),
+            ComboBox::new().width(260.0).automation_name("Cursor guide")
+                .items_source(CursorGuide::CHOICES.iter().map(|(_, label)| *label))
+                .selected_index(CursorGuide::CHOICES.iter().position(|(mode, _)| *mode == appearance.cursor_guide))
+                .on_selection_changed(context.callback(Message::CursorGuide)).into(),
             TextBlock::new().text("Applies to all tabs. Changes are saved automatically.").into(),
         ];
         let mut profiles: Vec<View> =
@@ -2370,6 +2441,11 @@ impl TerminalApp {
                 InteractionField::StickyCommandContext,
                 "Show command context in scrollback",
                 appearance.interaction.sticky_command_context,
+            ),
+            (
+                InteractionField::VisualBell,
+                "Show a visual bell",
+                appearance.interaction.visual_bell,
             ),
             (
                 InteractionField::ScrollZoom,
@@ -2627,6 +2703,27 @@ impl TerminalApp {
         }
     }
 
+    fn refresh_notification_visibility(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, IsIconic, IsWindowVisible,
+        };
+        let (foreground, shown) = self.keyboard.hwnd().map_or((false, false), |hwnd| unsafe {
+            (
+                GetForegroundWindow() == hwnd,
+                IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool(),
+            )
+        });
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(tab) = &entry.value.page {
+                let visible = shown && self.tabs.visible(entry.id);
+                let focused = visible && foreground && self.tabs.active_id() == Some(entry.id);
+                tab.session
+                    .events
+                    .set_notification_visibility(focused, visible);
+            }
+        }
+    }
+
     fn refresh_remote_clipboard_focus(&mut self) {
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -2658,6 +2755,7 @@ impl TerminalApp {
         self.pane_drop.cancel();
         self.cancel_directory_copy();
         self.refresh_remote_clipboard_focus();
+        self.refresh_notification_visibility();
         self.tabs.record_pane_focus(AppTab::visited_terminal);
         self.clipboard.input_origin.set(self.paste_origin());
         self.discard_inactive_paste();
@@ -2892,11 +2990,7 @@ impl TerminalApp {
         live_tab(
             label,
             source,
-            self.appearance
-                .read()
-                .unwrap()
-                .interaction
-                .remote_clipboard_policy(),
+            self.appearance.read().unwrap().pane_preferences(),
         )
         .with_profile(profile)
     }
@@ -2951,11 +3045,7 @@ impl TerminalApp {
             label,
             source,
             TerminalSize::default(),
-            self.appearance
-                .read()
-                .unwrap()
-                .interaction
-                .remote_clipboard_policy(),
+            self.appearance.read().unwrap().pane_preferences(),
             connection,
             None,
         )
@@ -3241,11 +3331,7 @@ impl TerminalApp {
                 *tab = live_tab(
                     source_label(&source),
                     source,
-                    self.appearance
-                        .read()
-                        .unwrap()
-                        .interaction
-                        .remote_clipboard_policy(),
+                    self.appearance.read().unwrap().pane_preferences(),
                 );
                 self.sync_selection(context);
                 self.activate(context);
@@ -3319,11 +3405,7 @@ impl TerminalApp {
                         *tab = live_tab(
                             name.clone(),
                             Source::Ssh(options.clone()),
-                            self.appearance
-                                .read()
-                                .unwrap()
-                                .interaction
-                                .remote_clipboard_policy(),
+                            self.appearance.read().unwrap().pane_preferences(),
                         )
                         .with_profile(Some(name));
                     } else if let Page::NewProfile(editor) = &mut tab.page {
@@ -4631,10 +4713,17 @@ impl Component for TerminalApp {
             appearance.font_size = 16.0;
         }
         appearance.font_size = appearance.font_size.clamp(6.0, 72.0);
+        let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
+        let text_size = text_size::Monitor::open(control_sender.clone())
+            .inspect_err(|error| log::warn!("Opening Windows text size settings: {error}"))
+            .ok();
+        if let Some(factor) = text_size.as_ref().and_then(text_size::Monitor::current) {
+            appearance.set_windows_text_scale(factor);
+        }
         let renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.font_size,
+            appearance.terminal_font_size(),
         )
         .expect("creating DirectWrite formats");
         keyboard.set_shortcuts(
@@ -4669,11 +4758,7 @@ impl Component for TerminalApp {
                 )
             })
             .unwrap_or((1120.0, 760.0));
-        let osc52 = appearance
-            .read()
-            .unwrap()
-            .interaction
-            .remote_clipboard_policy();
+        let osc52 = appearance.read().unwrap().pane_preferences();
         if let Some(workspace) = opening.as_ref().map(|window| &window.layout) {
             workspace_view::append_resolved_workspace(
                 &mut tabs,
@@ -4719,7 +4804,6 @@ impl Component for TerminalApp {
             || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
             |window| window.registry.clone(),
         );
-        let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
         let folder_messages = control_sender.clone();
         let folder_wake = Arc::new(move || {
@@ -4765,6 +4849,7 @@ impl Component for TerminalApp {
         });
         let mut app = Self {
             caret_interval: crate::cursor_blink::system_interval(),
+            visual_bell_timer: None,
             folder_wake,
             inbox,
             taskbar: RefCell::default(),
@@ -4816,6 +4901,7 @@ impl Component for TerminalApp {
             client_size,
             initial_grid: Rc::new(crate::window_state::RequestedGrid::new(grid)),
             appearance,
+            text_size,
             fonts,
             appearance_error,
             saved_commands: Default::default(),
@@ -4928,6 +5014,7 @@ impl Component for TerminalApp {
                 | Message::HostGroup(host_groups::Action::Tick | host_groups::Action::Edit(..))
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
+                | Message::BookmarksRead(..)
                 | Message::PickerFocus(..)
                 | Message::PickerFocusAfterMenu(..)
                 | Message::PaneRatio(..)
@@ -4939,18 +5026,31 @@ impl Component for TerminalApp {
                 | Message::Pointer(..)
                 | Message::CaptureLost(..)
                 | Message::FinalizeCapture(..)
+                | Message::VisualBellTick
         ) {
             self.header.borrow_mut().take();
         }
         if matches!(
             &message,
-            Message::Control(_) | Message::AttentionChanged | Message::FolderAuthority
+            Message::Control(_)
+                | Message::AttentionChanged
+                | Message::FolderAuthority
+                | Message::WindowsTextSizeChanged
         ) {
-            if self.inbox.acknowledge_wake()
+            if let Some(scale) = self
+                .text_size
+                .as_ref()
+                .and_then(text_size::Monitor::take_change)
+            {
+                self.update_windows_text_size(scale, context);
+            }
+            let wake = self.inbox.acknowledge_wake();
+            if wake.flash_taskbar
                 && let Some(hwnd) = self.keyboard.hwnd()
             {
                 attention::flash_background_window(hwnd);
             }
+            self.ring_visual_bells(wake.bells, context);
             self.refresh_open_commands();
             self.watch_control(context);
         }
@@ -4994,6 +5094,33 @@ impl Component for TerminalApp {
                         tab.session.frames.load().adjacent_failed_command(older)
                 {
                     let _ = tab.session.input.send(view.scroll_to(Some(row)));
+                }
+            }
+            Message::ToggleScrollbackBookmark(origin) => {
+                if origin.is_some()
+                    && origin == self.paste_origin()
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.active()
+                    && let Some(target) = tab.session.frames.load().bookmark_target()
+                {
+                    let _ = tab
+                        .session
+                        .input
+                        .send(Command::ToggleScrollbackBookmark(target));
+                }
+            }
+            Message::ScrollToBookmark(origin, older) => {
+                if origin.is_some()
+                    && origin == self.paste_origin()
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.active()
+                    && let Some(target) = tab.session.frames.load().adjacent_bookmark(older)
+                {
+                    let _ = tab.session.input.send(Command::ScrollViewport(target));
                 }
             }
             Message::ClearScrollback(pane) => {
@@ -5072,6 +5199,7 @@ impl Component for TerminalApp {
             Message::TabTitle(action) => self.edit_tab_title(action, context),
             Message::Attention(action) => self.handle_attention(action, context),
             Message::AttentionChanged | Message::FolderAuthority => {}
+            Message::VisualBellTick => self.expire_visual_bells(),
             Message::ToggleInspector => {
                 self.show_inspector = !self.show_inspector;
                 self.sync_inspector();
@@ -5102,6 +5230,7 @@ impl Component for TerminalApp {
             Message::PaneText(action) => self.pane_text_action(action, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
+            Message::BookmarksRead(launch, entries) => self.bookmarks_received(&launch, entries),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
             Message::PlacePane(source, target, side) => {
                 self.place_pane(source, target, side, context)
@@ -5384,14 +5513,27 @@ impl Component for TerminalApp {
                     let _ = reply.send(Ok(self.control_ssh_groups()));
                 }
             }
+            Message::Control(w11term::control::UiRequest::OpenSshGroup { name, reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_open_saved_host_group(&name, context);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::ListSavedSshGroups { reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_list_saved_host_groups();
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::GetSshGroupRoster {
                 tab_id,
-                wait_for_readiness,
+                readiness,
                 reply,
             }) => {
                 if !reply.is_closed() {
-                    self.control_ssh_group_roster(tab_id, wait_for_readiness, reply);
-                    if wait_for_readiness {
+                    let waiting = readiness.is_some();
+                    self.control_ssh_group_roster(tab_id, readiness, reply);
+                    if waiting {
                         self.update_host_group_timer(context);
                     }
                 }
@@ -5399,14 +5541,81 @@ impl Component for TerminalApp {
             Message::Control(w11term::control::UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,
-                wait_for_settlement,
+                wait_for,
                 reply,
             }) => {
                 if !reply.is_closed() {
-                    self.control_ssh_group_run(tab_id, run_id, wait_for_settlement, reply);
-                    if wait_for_settlement {
+                    self.control_ssh_group_run(tab_id, run_id, wait_for, reply);
+                    if wait_for.is_some() {
                         self.update_host_group_timer(context);
                     }
+                }
+            }
+            Message::Control(w11term::control::UiRequest::GetSshGroupRetryPlan {
+                tab_id,
+                run_id,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_ssh_group_retry_plan(tab_id, run_id));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::RetrySshGroupRun {
+                tab_id,
+                run_id,
+                pane_ids,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_retry_ssh_group_run(tab_id, run_id, &pane_ids));
+                    self.update_host_group_timer(context);
+                }
+            }
+            Message::Control(w11term::control::UiRequest::SshGroupQueue {
+                tab_id,
+                run_id,
+                action,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_ssh_group_queue(tab_id, run_id, action));
+                    self.update_host_group_timer(context);
+                }
+            }
+            Message::Control(w11term::control::UiRequest::InterruptSshGroupCommand {
+                tab_id,
+                run_id,
+                pane_id,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply
+                        .send(self.control_interrupt_ssh_group_command(tab_id, run_id, pane_id));
+                    self.update_host_group_timer(context);
+                }
+            }
+            Message::Control(w11term::control::UiRequest::CaptureSshGroupReport {
+                tab_id,
+                run_id,
+                format,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ =
+                        reply.send(self.control_capture_ssh_group_report(tab_id, run_id, format));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::SubmitSshGroupCommand {
+                tab_id,
+                pane_ids,
+                command,
+                options,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    self.control_submit_ssh_group_command(
+                        tab_id, &pane_ids, command, *options, reply, context,
+                    );
                 }
             }
             Message::Control(w11term::control::UiRequest::ReadSshGroupOutput {
@@ -5454,11 +5663,7 @@ impl Component for TerminalApp {
                         profile.clone(),
                         source,
                         size,
-                        self.appearance
-                            .read()
-                            .unwrap()
-                            .interaction
-                            .remote_clipboard_policy(),
+                        self.appearance.read().unwrap().pane_preferences(),
                         None,
                         None,
                     )
@@ -5770,6 +5975,24 @@ impl Component for TerminalApp {
                         if tab.failed_command_jumps != jumps {
                             tab.failed_command_jumps = jumps;
                             pane_actions_changed |= active;
+                        }
+                        let bookmarks = [
+                            frame.bookmark_target().is_some(),
+                            frame.adjacent_bookmark(true).is_some(),
+                            frame.adjacent_bookmark(false).is_some(),
+                            !frame.scrollback_bookmarks.is_empty(),
+                        ];
+                        if tab.bookmark_actions != bookmarks {
+                            tab.bookmark_actions = bookmarks;
+                            pane_actions_changed |= active;
+                        }
+                        if active
+                            && self
+                                .picker
+                                .as_ref()
+                                .is_some_and(|picker| picker.bookmark_results_expired(&frame))
+                        {
+                            pane_actions_changed = true;
                         }
                         let can_clear = !frame.alternate
                             && (frame.scroll_offset > 0
@@ -6112,6 +6335,7 @@ impl Component for TerminalApp {
                     self.taskbar.borrow_mut().shell_restarted();
                 }
                 Shortcut::CaretPresentationChanged => {
+                    self.refresh_notification_visibility();
                     self.caret_interval = crate::cursor_blink::system_interval();
                 }
                 Shortcut::DrawerFocusChanged => {}
@@ -6141,12 +6365,12 @@ impl Component for TerminalApp {
                 Shortcut::Zoom(delta) => {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     appearance.font_size = (appearance.font_size + delta as f32).clamp(6.0, 72.0);
-                    self.apply_appearance(appearance);
+                    self.apply_appearance(appearance, context);
                 }
                 Shortcut::ResetZoom => {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     appearance.font_size = 16.0;
-                    self.apply_appearance(appearance);
+                    self.apply_appearance(appearance, context);
                 }
                 Shortcut::CommitTab => self.finish_switcher(true, context),
                 Shortcut::CancelTab => self.finish_switcher(false, context),
@@ -6247,6 +6471,7 @@ impl Component for TerminalApp {
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
+                self.refresh_notification_visibility();
                 if let Some(access) = self.focused_osc52.take() {
                     access.set_focused_window(None);
                 }
@@ -6259,6 +6484,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::WindowActivation(true) => {
+                self.refresh_notification_visibility();
                 self.refresh_remote_clipboard_focus();
                 self.header.borrow_mut().take();
                 self.refresh_open_commands();
@@ -6375,6 +6601,7 @@ impl Component for TerminalApp {
                     InteractionField::StickyCommandContext => {
                         &mut appearance.interaction.sticky_command_context
                     }
+                    InteractionField::VisualBell => &mut appearance.interaction.visual_bell,
                     InteractionField::DetectUrls => &mut appearance.interaction.detect_urls,
                     InteractionField::Osc52 => &mut appearance.interaction.osc52,
                     InteractionField::Osc52ForegroundOnly => {
@@ -6498,18 +6725,51 @@ impl Component for TerminalApp {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     if appearance.font_family != *font {
                         appearance.font_family = font.clone();
-                        self.apply_appearance(appearance);
+                        self.apply_appearance(appearance, context);
                     }
                 }
             }
             Message::Font(None) => {}
+            Message::DefaultCursorStyle(index) => {
+                if let Some(&(style, _)) =
+                    index.and_then(|index| DefaultCursorStyle::CHOICES.get(index))
+                {
+                    let mut appearance = self.appearance.read().unwrap().clone();
+                    if appearance.default_cursor_style != style {
+                        appearance.default_cursor_style = style;
+                        self.save_preferences(appearance);
+                    }
+                }
+            }
+            Message::CursorGuide(index) => {
+                if let Some(&(mode, _)) = index.and_then(|index| CursorGuide::CHOICES.get(index)) {
+                    let mut appearance = self.appearance.read().unwrap().clone();
+                    if appearance.cursor_guide != mode {
+                        appearance.cursor_guide = mode;
+                        self.save_preferences(appearance);
+                    }
+                }
+            }
             Message::Ligatures(enabled) => {
                 let mut appearance = self.appearance.read().unwrap().clone();
                 if appearance.ligatures != enabled {
                     appearance.ligatures = enabled;
-                    self.apply_appearance(appearance);
+                    self.apply_appearance(appearance, context);
                 }
             }
+            Message::FollowWindowsTextSize(enabled) => {
+                let mut appearance = self.appearance.read().unwrap().clone();
+                if appearance.follow_windows_text_size != enabled {
+                    let previous_size = appearance.terminal_font_size();
+                    appearance.follow_windows_text_size = enabled;
+                    if previous_size == appearance.terminal_font_size() {
+                        self.save_preferences(appearance);
+                    } else {
+                        self.apply_appearance(appearance, context);
+                    }
+                }
+            }
+            Message::WindowsTextSizeChanged => {}
             Message::WindowSize(size) => {
                 self.width = size.width;
                 self.window_height = size.height;

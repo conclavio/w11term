@@ -110,8 +110,8 @@ pub(super) fn preview(
     offer: &CommandOffer,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
-    let limit = offer.limit.concurrency();
-    let interval = offer.interval.duration();
+    let limit = offer.parallel_limit;
+    let interval = offer.interval;
     let canary = offer.canary.is_some();
     let ordered = page.orders_commands();
     let summary = match (canary, limit) {
@@ -229,14 +229,11 @@ pub(super) fn preview(
                 .text(format!("Dispatch interval · {interval:?}"))
                 .into()
         },
-        offer
-            .queue_expiry
-            .duration()
-            .map_or_else(View::empty, |expiry| {
-                TextBlock::new()
-                    .text(format!("Unsent commands expire after {expiry:?}"))
-                    .into()
-            }),
+        offer.queue_expiry.map_or_else(View::empty, |expiry| {
+            TextBlock::new()
+                .text(format!("Unsent commands expire after {expiry:?}"))
+                .into()
+        }),
         hold.map_or_else(View::empty, |text| {
             TextBlock::new()
                 .text(text)

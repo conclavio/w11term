@@ -3,11 +3,15 @@ use crate::{
     native_drawing::{GpuImage, NativeDrawing, Typography},
 };
 use std::collections::{HashMap, HashSet};
-use std::{cell::RefCell, rc::Rc, time::Instant};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Instant};
 use termwiz::surface::CursorShape;
-use w11term::terminal::{Snapshot, colors, rgba};
+use w11term::{
+    appearance::CursorGuide,
+    interaction::Selection,
+    terminal::{Rgba, Snapshot, colors, rgba},
+};
 use wezterm_term::{
-    Intensity, Underline,
+    CellAttributes, FractionalTextScale, Intensity, Underline,
     image::{ImageCell, ImageDataType},
 };
 use windows_canvas::{
@@ -16,6 +20,7 @@ use windows_canvas::{
 
 pub const PADDING: f32 = 12.0;
 pub const STATUS_HEIGHT: f32 = 26.0;
+const SELECTION_BG: Rgba = [0.25, 0.53, 0.90, 0.4];
 #[cfg(test)]
 const FONT_SIZE: f32 = 16.0;
 
@@ -71,6 +76,7 @@ impl CellHit {
 /// The engine/transport boundary allows an atlas renderer to replace this independently.
 pub struct Renderer {
     pub live_cursor: Option<Rc<RefCell<CursorBlink>>>,
+    pub cursor_guide: CursorGuide,
     pub read_only: bool,
     pub copy_cursor: Option<w11term::interaction::Point>,
     normal: TextFormat,
@@ -110,12 +116,103 @@ struct TextStyle {
 struct TextRun<'a> {
     text: &'a str,
     style: TextStyle,
-    x: f32,
-    y: f32,
     cols: usize,
-    fg: [f32; 4],
     shape: bool,
+    explicit_width: bool,
+    fraction: Option<FractionalTextScale>,
+    text_scale: f32,
     scale: (f32, f32),
+}
+
+struct ShapedRun<'a> {
+    layout: &'a TextLayout,
+    origin: (f32, f32),
+    scale: (f32, f32),
+    ink: Rgba,
+}
+
+#[derive(Clone, Copy)]
+struct GridRow {
+    top: f32,
+    cw: f32,
+    ch: f32,
+}
+
+impl GridRow {
+    fn rect(self, span: Range<usize>) -> Rect {
+        Rect::from_xywh(
+            PADDING + span.start as f32 * self.cw,
+            self.top,
+            span.len() as f32 * self.cw,
+            self.ch,
+        )
+    }
+}
+
+impl ShapedRun<'_> {
+    fn draw(
+        &self,
+        native: &NativeDrawing,
+        row: GridRow,
+        run: Range<usize>,
+        selection: Option<(Rgba, &[Range<usize>])>,
+    ) -> windows_canvas::Result<()> {
+        let draw_original = || {
+            native.text(
+                self.layout,
+                self.origin.0,
+                self.origin.1,
+                self.ink,
+                self.scale,
+            )
+        };
+        let Some((ink, spans)) = selection else {
+            return draw_original();
+        };
+        // Clip the complete shaped run so a selection boundary never splits a
+        // ligature or changes the shaping of neighboring glyphs.
+        let mut next = run.start;
+        for span in spans {
+            let start = span.start.max(run.start);
+            let end = span.end.min(run.end);
+            if start >= end {
+                continue;
+            }
+            if next < start {
+                native.with_clip(row.rect(next..start), draw_original)?;
+            }
+            native.with_clip(row.rect(start..end), || {
+                native.cursor_text(self.layout, self.origin, ink, self.scale)
+            })?;
+            next = end;
+        }
+        if next == run.start {
+            draw_original()?;
+        } else if next < run.end {
+            native.with_clip(row.rect(next..run.end), draw_original)?;
+        }
+        Ok(())
+    }
+}
+
+fn selection_span(
+    selection: &Selection,
+    frame: &Snapshot,
+    row: usize,
+    cols: usize,
+) -> Option<Range<usize>> {
+    let mut span = selection.span(frame.first_stable_row + row as isize, cols)?;
+    for cell in frame.rows[row].visible_cells() {
+        let start = cell.cell_index();
+        let end = start + cell.width();
+        if start < span.start && end > span.start {
+            span.start = start;
+        }
+        if start < span.end && end > span.end {
+            span.end = end;
+        }
+    }
+    Some(span)
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +235,9 @@ enum RunKind {
 }
 
 fn run_kind(cell: &wezterm_term::CellRef<'_>, ligatures: bool, rtl: bool) -> Option<RunKind> {
+    if cell.attrs().explicit_width() || cell.attrs().fractional_text_scale().is_some() {
+        return None;
+    }
     let text = cell.str();
     if text.is_ascii() {
         return (ligatures && cell.width() == 1 && text.len() == 1).then_some(RunKind::Ascii);
@@ -211,6 +311,27 @@ fn glyph_row(line: &wezterm_term::Line, top: f32, cell_height: f32) -> (f32, f32
     } else {
         (top, 1.0)
     }
+}
+
+fn text_glyph_geometry(
+    attrs: &CellAttributes,
+    mut top: f32,
+    mut height: f32,
+    ch: f32,
+) -> (f32, f32) {
+    if let Some(slice) = attrs.multicell_row() {
+        top -= f32::from(slice.offset()) * ch;
+        height = f32::from(slice.run().scale()) * ch;
+    }
+    attrs
+        .fractional_text_scale()
+        .map_or((top, height), |fraction| {
+            let reduced_height = height * fraction.factor();
+            (
+                top + fraction.vertical_offset(height - reduced_height),
+                reduced_height,
+            )
+        })
 }
 
 fn draw_ink_lines(
@@ -319,6 +440,7 @@ impl Renderer {
         Ok(Self {
             live_cursor: None,
             copy_cursor: None,
+            cursor_guide: CursorGuide::Off,
             read_only: false,
             normal,
             bold,
@@ -340,19 +462,18 @@ impl Renderer {
         })
     }
 
-    fn text(
+    fn shape_text(
         &mut self,
-        native: &NativeDrawing,
         run: TextRun<'_>,
-    ) -> windows_canvas::Result<Option<(&TextLayout, (f32, f32))>> {
+    ) -> windows_canvas::Result<Option<(&CachedLayout, (f32, f32))>> {
         let TextRun {
             text,
             style,
-            x,
-            y,
             cols,
-            fg,
             shape,
+            explicit_width,
+            fraction,
+            text_scale,
             mut scale,
         } = run;
         if text.trim_end_matches(' ').is_empty() {
@@ -382,25 +503,34 @@ impl Renderer {
         let cached = &self.layouts[&key];
         // Anchor each shaped run to its occupied grid columns even when DirectWrite
         // chose a proportional fallback font or the grid was snapped to physical pixels.
-        if shape && cached.natural_width > 0.0 {
-            scale.0 *= cols as f32 * self.metrics.cell_width / cached.natural_width;
+        let factor = text_scale * fraction.map_or(1.0, FractionalTextScale::factor);
+        if (shape || explicit_width || fraction.is_some()) && cached.natural_width > 0.0 {
+            let fit = cols as f32 * self.metrics.cell_width / cached.natural_width;
+            scale.0 *= if explicit_width || fraction.is_some() {
+                fit.min(factor)
+            } else {
+                fit
+            };
+        } else {
+            scale.0 *= factor;
         }
-        native.text(&cached.layout, x, y, fg, scale)?;
-        Ok(Some((&cached.layout, scale)))
+        scale.1 *= factor;
+        Ok(Some((cached, scale)))
     }
 
     pub fn draw(
         &mut self,
         ctx: &DrawContext<'_>,
         frame: &Snapshot,
+        selection: Option<&Selection>,
     ) -> windows_canvas::Result<Metrics> {
         self.paint(
             ctx,
-            ctx.width,
-            ctx.height,
+            (ctx.width, ctx.height),
             ctx.device_changed(),
             frame,
             CursorDisplay::Live,
+            selection,
         )
     }
 
@@ -510,12 +640,12 @@ impl Renderer {
         &self,
         ctx: &DrawContext<'_>,
         frame: &Snapshot,
-        selection: Option<&w11term::interaction::Selection>,
+        selection: Option<&Selection>,
         link: Option<&w11term::interaction::Link>,
     ) -> windows_canvas::Result<()> {
         let cw = self.metrics.cell_width;
         let ch = self.metrics.cell_height;
-        let brush = ctx.create_solid_brush(ColorF::new(0.25, 0.53, 0.90, 0.4))?;
+        let brush = ctx.create_solid_brush(color(SELECTION_BG))?;
         let highlight = |row: usize, span, top: f32, height: f32| {
             if let Some(map) = frame.cell_map(row) {
                 for visual in map.visual_ranges(span) {
@@ -549,26 +679,14 @@ impl Renderer {
                 }
             }
         }
-        brush.set_color(ColorF::new(0.25, 0.53, 0.90, 0.4));
-        if let Some(selection) =
-            selection.filter(|s| s.alternate == frame.alternate && s.cols == frame.cols)
-        {
+        brush.set_color(color(SELECTION_BG));
+        if let Some(selection) = selection.filter(|s| {
+            frame.selection_colors == Default::default()
+                && s.alternate == frame.alternate
+                && s.cols == frame.cols
+        }) {
             for y in 0..frame.rows.len().min(self.metrics.rows) {
-                if let Some(mut span) =
-                    selection.span(frame.first_stable_row + y as isize, self.metrics.cols)
-                {
-                    for cell in frame.rows[y].visible_cells() {
-                        if cell.cell_index() < span.start
-                            && cell.cell_index() + cell.width() > span.start
-                        {
-                            span.start = cell.cell_index();
-                        }
-                        if cell.cell_index() < span.end
-                            && cell.cell_index() + cell.width() > span.end
-                        {
-                            span.end = cell.cell_index() + cell.width();
-                        }
-                    }
+                if let Some(span) = selection_span(selection, frame, y, self.metrics.cols) {
                     highlight(y, span, 0.0, ch);
                 }
             }
@@ -655,22 +773,22 @@ impl Renderer {
     ) -> windows_canvas::Result<Metrics> {
         self.paint(
             ctx,
-            width,
-            height,
+            (width, height),
             device_changed,
             frame,
             CursorDisplay::Static,
+            None,
         )
     }
 
     fn paint(
         &mut self,
         ctx: &DrawingSession<'_>,
-        width: f32,
-        height: f32,
+        (width, height): (f32, f32),
         device_changed: bool,
         frame: &Snapshot,
         display: CursorDisplay,
+        selection: Option<&Selection>,
     ) -> windows_canvas::Result<Metrics> {
         let native = NativeDrawing::new(ctx)?;
         if device_changed {
@@ -756,21 +874,69 @@ impl Renderer {
             }
         }
         self.draw_images(&native, frame, &tiles[under_background..under_text])?;
+        let focused = display == CursorDisplay::Live
+            && self
+                .live_cursor
+                .as_ref()
+                .is_some_and(|blink| blink.borrow().is_focused());
+        if focused
+            && self.copy_cursor.is_none()
+            && frame.cursor_visible
+            && self.cursor_guide.shown(frame.application_cursor_guide)
+            && let Ok(row) = usize::try_from(frame.cursor.y)
+            && row < self.metrics.rows.min(frame.rows.len())
+        {
+            let mut guide = rgba(frame.palette.foreground);
+            guide[3] = 0.35;
+            brush.set_color(color(guide));
+            let bottom = ((PADDING + (row + 1) as f32 * ch) * scale).round();
+            ctx.fill_rect(
+                &Rect::from_xywh(
+                    PADDING,
+                    (bottom - 1.0) / scale,
+                    frame.cols.min(self.metrics.cols) as f32 * cw,
+                    1.0 / scale,
+                ),
+                &brush,
+            );
+        }
+        let selection = selection.filter(|s| {
+            frame.selection_colors != Default::default()
+                && s.alternate == frame.alternate
+                && s.cols == frame.cols
+        });
+        let selection_bg = frame.selection_colors.background.map_or(SELECTION_BG, rgba);
+        let selection_fg = frame.selection_colors.foreground.map(rgba);
         let cursor = self.visible_cursor(frame, display);
+        let cursor_slice = cursor.and_then(|cursor| {
+            let map = frame.cell_map(cursor.row)?;
+            let col = map.logical_at_grid(cursor.col);
+            let line = frame.rows.get(cursor.row)?;
+            if !line.has_multicell_text() {
+                return None;
+            }
+            let cell = line
+                .visible_cells()
+                .take_while(|cell| cell.cell_index() <= col)
+                .find(|cell| col < cell.cell_index() + cell.width())?;
+            let slice = cell.attrs().multicell_row()?;
+            Some((
+                map.visual_grid(cell.cell_index()),
+                cell.width(),
+                cursor.row as isize - isize::from(slice.offset()),
+                usize::from(slice.run().scale()),
+            ))
+        });
         let block = cursor.filter(|cursor| {
             self.copy_cursor.is_none()
-                && display == CursorDisplay::Live
-                && self
-                    .live_cursor
-                    .as_ref()
-                    .is_some_and(|blink| blink.borrow().is_focused())
+                && focused
                 && matches!(
                     cursor.shape,
                     CursorShape::Default | CursorShape::SteadyBlock | CursorShape::BlinkingBlock
                 )
         });
         let mut block_extent = None;
-        let mut block_decorations = (Underline::None, false, false);
+        let mut block_decorations = (Underline::None, false, false, 0.0, 0.0);
         let mut cursor_ink = None;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
@@ -780,6 +946,27 @@ impl Renderer {
             let width_scale = map.width_scale();
             let row_cw = cw * width_scale as f32;
             let row_top = PADDING + y as f32 * ch;
+            let row = GridRow {
+                top: row_top,
+                cw,
+                ch,
+            };
+            let selected = selection.and_then(|s| selection_span(s, frame, y, self.metrics.cols));
+            let visual_selection = selected
+                .as_ref()
+                .map_or_else(Vec::new, |span| map.visual_ranges(span.clone()));
+            if !visual_selection.is_empty() {
+                brush.set_color(color(selection_bg));
+                for span in &visual_selection {
+                    let end = span.end.min(self.metrics.cols);
+                    if span.start < end {
+                        ctx.fill_rect(&row.rect(span.start..end), &brush);
+                    }
+                }
+            }
+            let selected_ink = selection_fg
+                .filter(|_| !visual_selection.is_empty())
+                .map(|ink| (ink, visual_selection.as_slice()));
             let (glyph_top, height_scale) = glyph_row(line, row_top, ch);
             let glyph_height = ch * height_scale;
             let cells: Vec<_> = line
@@ -801,8 +988,14 @@ impl Renderer {
                     ));
                     if !cell.attrs().invisible() {
                         let attrs = cell.attrs();
-                        block_decorations =
-                            (attrs.underline(), attrs.overline(), attrs.strikethrough());
+                        let (top, height) = text_glyph_geometry(attrs, glyph_top, glyph_height, ch);
+                        block_decorations = (
+                            attrs.underline(),
+                            attrs.overline(),
+                            attrs.strikethrough(),
+                            top,
+                            height,
+                        );
                     }
                 }
             }
@@ -815,9 +1008,16 @@ impl Renderer {
                     if attrs.invisible() {
                         continue;
                     }
+                    let fraction = attrs.fractional_text_scale();
+                    let slice = attrs.multicell_row();
+                    let text_scale = slice.map_or(1.0, |slice| f32::from(slice.run().scale()));
+                    let (glyph_top, glyph_height) =
+                        text_glyph_geometry(attrs, glyph_top, glyph_height, ch);
                     let visual = map.visual(col);
                     let x = PADDING + visual as f32 * row_cw;
                     let (fg, _) = colors(attrs, &frame.palette);
+                    let decoration_ink = selection_fg
+                        .filter(|_| selected.as_ref().is_some_and(|span| span.contains(&col)));
                     // Kitty marks the image's placement in the text grid with U+10EEEE.
                     if index >= next_run && !cell.str().starts_with('\u{10eeee}') {
                         let rtl = map.rtl(col);
@@ -826,7 +1026,7 @@ impl Renderer {
                         let run_cells = &cells[index..next_run];
                         let mut joined = String::new();
                         let text = if run_cells.len() == 1 {
-                            cell.str()
+                            slice.map_or(cell.str(), |slice| slice.run().text())
                         } else {
                             for member in run_cells {
                                 joined.push_str(member.str());
@@ -843,70 +1043,95 @@ impl Renderer {
                         } else {
                             text
                         };
-                        let origin = (PADDING + left as f32 * row_cw, glyph_top);
-                        let layout = self.text(
-                            &native,
-                            TextRun {
-                                text,
-                                style: TextStyle {
-                                    bold: attrs.intensity() == Intensity::Bold,
-                                    italic: attrs.italic(),
-                                    rtl,
-                                },
-                                x: origin.0,
-                                y: origin.1,
-                                cols,
-                                fg,
-                                shape: kind.is_some(),
-                                scale: (width_scale as f32, height_scale),
+                        let layout = self.shape_text(TextRun {
+                            text,
+                            style: TextStyle {
+                                bold: attrs.intensity() == Intensity::Bold,
+                                italic: attrs.italic(),
+                                rtl,
                             },
-                        )?;
-                        if block_col
-                            .is_some_and(|col| (left..left + cols).contains(&(col / width_scale)))
-                            && let Some((layout, scale)) = layout
-                        {
-                            // Keep the complete shaped run at its original origin. Drawing the
-                            // cursor cell alone would break ligatures and joining scripts.
-                            cursor_ink = Some((layout.clone(), origin, scale));
+                            cols,
+                            shape: kind.is_some(),
+                            explicit_width: attrs.explicit_width(),
+                            fraction,
+                            text_scale,
+                            scale: (width_scale as f32, height_scale),
+                        })?;
+                        if let Some((cached, scale)) = layout {
+                            let inset = fraction.map_or(0.0, |fraction| {
+                                let extra = cols as f32 * row_cw - cached.natural_width * scale.0;
+                                fraction.horizontal_offset(extra.max(0.0))
+                            });
+                            let origin = (PADDING + left as f32 * row_cw + inset, glyph_top);
+                            let layout = &cached.layout;
+                            let run = ShapedRun {
+                                layout,
+                                origin,
+                                scale,
+                                ink: fg,
+                            };
+                            let columns = left * width_scale..(left + cols) * width_scale;
+                            if attrs.explicit_width() || fraction.is_some() {
+                                native.with_clip(row.rect(columns.clone()), || {
+                                    run.draw(&native, row, columns, selected_ink)
+                                })?;
+                            } else {
+                                run.draw(&native, row, columns, selected_ink)?;
+                            }
+                            if block_col.is_some_and(|col| {
+                                (left..left + cols).contains(&(col / width_scale))
+                            }) {
+                                cursor_ink = Some((layout.clone(), origin, scale));
+                            }
                         }
                     }
-                    if attrs.underline() != Underline::None {
-                        let underline = if attrs.underline_color()
-                            == wezterm_term::color::ColorAttribute::Default
-                        {
-                            fg
-                        } else {
-                            rgba(frame.palette.resolve_fg(attrs.underline_color()))
+                    if attrs.underline() != Underline::None
+                        || attrs.overline()
+                        || attrs.strikethrough()
+                    {
+                        let glyph_rect = Rect::from_xywh(
+                            x,
+                            glyph_top,
+                            cell.width() as f32 * row_cw,
+                            glyph_height,
+                        );
+                        let draw = || {
+                            if attrs.underline() != Underline::None {
+                                let underline = if attrs.underline_color()
+                                    == wezterm_term::color::ColorAttribute::Default
+                                {
+                                    fg
+                                } else {
+                                    rgba(frame.palette.resolve_fg(attrs.underline_color()))
+                                };
+                                brush.set_color(color(decoration_ink.unwrap_or(underline)));
+                                draw_underline(
+                                    ctx,
+                                    &brush,
+                                    attrs.underline(),
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                );
+                            }
+                            if attrs.overline() || attrs.strikethrough() {
+                                brush.set_color(color(decoration_ink.unwrap_or(fg)));
+                                draw_ink_lines(
+                                    ctx,
+                                    &brush,
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                    attrs.overline(),
+                                    attrs.strikethrough(),
+                                );
+                            }
                         };
-                        brush.set_color(color(underline));
-                        draw_underline(
-                            ctx,
-                            &brush,
-                            attrs.underline(),
-                            Rect::from_xywh(
-                                x,
-                                glyph_top,
-                                cell.width() as f32 * row_cw,
-                                glyph_height,
-                            ),
-                            self.metrics.scale,
-                        );
-                    }
-                    if attrs.overline() || attrs.strikethrough() {
-                        brush.set_color(color(fg));
-                        draw_ink_lines(
-                            ctx,
-                            &brush,
-                            Rect::from_xywh(
-                                x,
-                                glyph_top,
-                                row_cw * cell.width() as f32,
-                                glyph_height,
-                            ),
-                            self.metrics.scale,
-                            attrs.overline(),
-                            attrs.strikethrough(),
-                        );
+                        if slice.is_some() {
+                            let left = map.visual_grid(col);
+                            native
+                                .with_clip(row.rect(left..left + cell.width() * width_scale), draw);
+                        } else {
+                            draw();
+                        }
                     }
                 }
                 Ok(())
@@ -920,55 +1145,73 @@ impl Renderer {
         }
         self.draw_images(&native, frame, &tiles[under_text..])?;
         if let Some(cursor) = cursor {
-            let x = PADDING + cursor.col as f32 * cw;
-            let y = PADDING + cursor.row as f32 * ch;
             let width_scale = frame
                 .cell_map(cursor.row)
                 .map_or(1, |map| map.width_scale());
-            let cursor_width = cw * width_scale.min(self.metrics.cols - cursor.col) as f32;
+            let (left, cols, top, rows) = cursor_slice.unwrap_or_else(|| {
+                let (left, cols) = block_extent.unwrap_or((cursor.col, width_scale));
+                (left, cols, cursor.row as isize, 1)
+            });
+            let cols = cols.min(self.metrics.cols - left);
+            let x = PADDING + left as f32 * cw;
+            let y = PADDING + top as f32 * ch;
+            let w = cols as f32 * cw;
+            let h = rows as f32 * ch;
+            let rect = Rect::from_xywh(x, y, w, h);
+            let viewport = Rect::from_xywh(
+                PADDING,
+                PADDING,
+                self.metrics.cols as f32 * cw,
+                self.metrics.rows as f32 * ch,
+            );
             brush.set_color(color(rgba(frame.palette.cursor_bg)));
-            match cursor.shape {
-                CursorShape::SteadyBar | CursorShape::BlinkingBar => {
-                    ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, ch), &brush)
-                }
-                CursorShape::SteadyUnderline | CursorShape::BlinkingUnderline => {
-                    ctx.fill_rect(&Rect::from_xywh(x, y + ch - 2.0, cursor_width, 2.0), &brush)
-                }
-                _ if let Some((left, cols)) = block_extent => {
-                    let cols = cols.min(self.metrics.cols - left);
-                    let rect = Rect::from_xywh(PADDING + left as f32 * cw, y, cols as f32 * cw, ch);
-                    ctx.fill_rect(&rect, &brush);
-                    let ink = block_ink(frame);
-                    native.with_clip(rect, || -> windows_canvas::Result<()> {
-                        if let Some((layout, origin, scale)) = cursor_ink {
-                            native.cursor_text(&layout, origin, ink, scale)?;
-                        }
-                        let (underline, overline, strike) = block_decorations;
-                        if underline != Underline::None || overline || strike {
-                            brush.set_color(color(ink));
-                            let (glyph_top, height_scale) =
-                                glyph_row(&frame.rows[cursor.row], y, ch);
-                            let glyph_rect = Rect::from_xywh(
-                                PADDING + left as f32 * cw,
-                                glyph_top,
-                                cols as f32 * cw,
-                                ch * height_scale,
-                            );
-                            draw_underline(ctx, &brush, underline, glyph_rect, self.metrics.scale);
-                            draw_ink_lines(
-                                ctx,
-                                &brush,
-                                glyph_rect,
-                                self.metrics.scale,
-                                overline,
-                                strike,
-                            );
-                        }
+            native.with_clip(viewport, || -> windows_canvas::Result<()> {
+                match cursor.shape {
+                    CursorShape::SteadyBar | CursorShape::BlinkingBar => {
+                        ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, h), &brush);
                         Ok(())
-                    })?;
+                    }
+                    CursorShape::SteadyUnderline | CursorShape::BlinkingUnderline => {
+                        ctx.fill_rect(&Rect::from_xywh(x, y + h - 2.0, w, 2.0), &brush);
+                        Ok(())
+                    }
+                    _ if block_extent.is_some() => {
+                        ctx.fill_rect(&rect, &brush);
+                        let ink = block_ink(frame);
+                        native.with_clip(rect, || -> windows_canvas::Result<()> {
+                            if let Some((layout, origin, scale)) = cursor_ink {
+                                native.cursor_text(&layout, origin, ink, scale)?;
+                            }
+                            let (underline, overline, strike, glyph_top, glyph_height) =
+                                block_decorations;
+                            if underline != Underline::None || overline || strike {
+                                brush.set_color(color(ink));
+                                let glyph_rect = Rect::from_xywh(x, glyph_top, w, glyph_height);
+                                draw_underline(
+                                    ctx,
+                                    &brush,
+                                    underline,
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                );
+                                draw_ink_lines(
+                                    ctx,
+                                    &brush,
+                                    glyph_rect,
+                                    self.metrics.scale,
+                                    overline,
+                                    strike,
+                                );
+                            }
+                            Ok(())
+                        })
+                    }
+                    _ => {
+                        ctx.draw_rect(&rect, &brush, 1.0);
+                        Ok(())
+                    }
                 }
-                _ => ctx.draw_rect(&Rect::from_xywh(x, y, cursor_width, ch), &brush, 1.0),
-            }
+            })?;
         }
         brush.set_color(ColorF::new(0.09, 0.10, 0.12, 1.0));
         ctx.fill_rect(
@@ -1225,7 +1468,7 @@ pub fn screenshot_with_font(
     let mut renderer = Renderer::with_size(
         &appearance.font_family,
         appearance.ligatures,
-        appearance.font_size,
+        appearance.terminal_font_size(),
     )?;
     let scale = (size.dpi as f32 / 96.0).max(0.5);
     let cw = (renderer.base_cell.0 * scale).ceil();
@@ -1295,6 +1538,77 @@ mod tests {
     }
 
     #[test]
+    fn osc_selection_recolors_only_the_selected_cells_of_shaped_runs() {
+        use w11term::interaction::Point;
+
+        let _com = Apartment::new();
+        let mut renderer = Renderer::with_size("Cascadia Code", true, 18.0).unwrap();
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let (width, height) = (360_u32, 180_u32);
+        let target = device.create_render_target(width, height).unwrap();
+        let size = (width as f32, height as f32);
+        let metrics = renderer.measure(size.0, size.1, 1.0);
+        let (cw, ch) = (metrics.cell_width as usize, metrics.cell_height as usize);
+        let render = |renderer: &mut Renderer, frame: &Snapshot, selection: Option<&Selection>| {
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(96.0);
+                    renderer.paint(ctx, size, false, frame, CursorDisplay::Live, selection)?;
+                    Ok(())
+                })
+                .unwrap();
+            target.read_pixels().unwrap()
+        };
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(
+            wezterm_term::TerminalSize {
+                cols: metrics.cols,
+                rows: metrics.rows,
+                ..Default::default()
+            },
+            tx,
+        );
+        terminal.advance_bytes("\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07\x1b]17;#602000\x07\x1b]19;#00ff00\x07A->B界X\r\nسلام");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let normal = render(&mut renderer, &frame, None);
+        let mut reference = frame.clone();
+        reference.palette.background = frame.selection_colors.background.unwrap();
+        reference.palette.foreground = frame.selection_colors.foreground.unwrap();
+        let recolored = render(&mut renderer, &reference, None);
+        for (row, col, logical) in [(0, 2, 2..3), (0, 5, 4..6), (1, 1, 1..2)] {
+            let mut selection = Selection::new(
+                Point {
+                    row: frame.first_stable_row + row as isize,
+                    col,
+                },
+                false,
+                false,
+            );
+            selection.observe(&frame);
+            selection.active = true;
+            let selected = render(&mut renderer, &frame, Some(&selection));
+            let visual = frame.cell_map(row).unwrap().visual_ranges(logical);
+            let mut seen_ink = false;
+            let paper = [0, 32, 96, 255];
+            for y in 0..2 * ch {
+                for x in 0..metrics.cols * cw {
+                    let i = ((PADDING as usize + y) * width as usize + PADDING as usize + x) * 4;
+                    let inside =
+                        y / ch == row && visual.iter().any(|span| span.contains(&(x / cw)));
+                    let expected = if inside { &recolored } else { &normal };
+                    assert_eq!(
+                        &selected[i..i + 4],
+                        &expected[i..i + 4],
+                        "pixel {x},{y} with selection {row},{col}"
+                    );
+                    seen_ink |= inside && selected[i..i + 4] != paper;
+                }
+            }
+            assert!(seen_ink);
+        }
+    }
+
+    #[test]
     fn focused_block_recolors_the_original_shaped_run_only_inside_the_cursor() {
         let _com = Apartment::new();
         let mut renderer = Renderer::with_size("Cascadia Code", true, 18.0).unwrap();
@@ -1310,7 +1624,14 @@ mod tests {
             target
                 .draw(|ctx| {
                     NativeDrawing::new(ctx)?.set_dpi(96.0);
-                    renderer.paint(ctx, width as f32, height as f32, false, frame, display)?;
+                    renderer.paint(
+                        ctx,
+                        (width as f32, height as f32),
+                        false,
+                        frame,
+                        display,
+                        None,
+                    )?;
                     Ok(())
                 })
                 .unwrap();
@@ -1403,6 +1724,73 @@ mod tests {
     }
 
     #[test]
+    fn cursor_guide_is_one_physical_pixel_on_the_focused_live_row() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::with_size("Cascadia Mono", false, 16.0).unwrap();
+        let blink = Rc::new(RefCell::new(CursorBlink::default()));
+        let surface = windows_canvas::Invalidator::new();
+        renderer.live_cursor = Some(blink.clone());
+        blink.borrow_mut().set_focus(true, None, &surface);
+        let (width, height) = (330_u32, 210_u32);
+        let dpi = 120.0;
+        let scale = dpi / 96.0;
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(width, height).unwrap();
+        let metrics = renderer.measure(width as f32 / scale, height as f32 / scale, scale);
+        let render = |renderer: &mut Renderer, frame: &Snapshot, display| {
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(dpi);
+                    renderer.paint(
+                        ctx,
+                        (width as f32 / scale, height as f32 / scale),
+                        false,
+                        frame,
+                        display,
+                        None,
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            target.read_pixels().unwrap()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(wezterm_term::TerminalSize::default(), tx);
+        terminal.advance_bytes(b"\x1b[2;4H\x1b[6 q");
+        let mut frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let unmarked = render(&mut renderer, &frame, CursorDisplay::Live);
+        renderer.cursor_guide = CursorGuide::FollowApplications;
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), unmarked);
+        frame.application_cursor_guide = true;
+        let marked = render(&mut renderer, &frame, CursorDisplay::Live);
+        let changed_rows: Vec<_> = marked
+            .chunks_exact(width as usize * 4)
+            .zip(unmarked.chunks_exact(width as usize * 4))
+            .enumerate()
+            .filter_map(|(row, (marked, unmarked))| (marked != unmarked).then_some(row))
+            .collect();
+        assert_eq!(
+            changed_rows,
+            [((PADDING + 2.0 * metrics.cell_height) * scale).round() as usize - 1]
+        );
+
+        frame.application_cursor_guide = false;
+        renderer.cursor_guide = CursorGuide::On;
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), marked);
+        assert_eq!(
+            render(&mut renderer, &frame, CursorDisplay::Static),
+            unmarked
+        );
+        blink.borrow_mut().set_focus(false, None, &surface);
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), unmarked);
+        blink.borrow_mut().set_focus(true, None, &surface);
+        frame.cursor_visible = false;
+        let hidden = render(&mut renderer, &frame, CursorDisplay::Live);
+        renderer.cursor_guide = CursorGuide::Off;
+        assert_eq!(render(&mut renderer, &frame, CursorDisplay::Live), hidden);
+    }
+
+    #[test]
     fn cursor_timer_only_runs_for_a_blinking_application_caret_in_the_painted_grid() {
         let _com = Apartment::new();
         let mut renderer = Renderer::new().unwrap();
@@ -1432,7 +1820,14 @@ mod tests {
             });
             target
                 .draw(|ctx| {
-                    renderer.paint(ctx, 260.0, 180.0, false, &frame, CursorDisplay::Live)?;
+                    renderer.paint(
+                        ctx,
+                        (260.0, 180.0),
+                        false,
+                        &frame,
+                        CursorDisplay::Live,
+                        None,
+                    )?;
                     Ok(())
                 })
                 .unwrap();
@@ -1465,11 +1860,11 @@ mod tests {
                 NativeDrawing::new(ctx)?.set_dpi(96.0);
                 renderer.paint(
                     ctx,
-                    width as f32,
-                    height as f32,
+                    (width as f32, height as f32),
                     false,
                     &frame,
                     CursorDisplay::Static,
+                    None,
                 )?;
                 Ok(())
             })
@@ -2101,6 +2496,216 @@ mod tests {
         let cell = |col: u32| actual.get_pixel((2 * col + 1) * actual.width() / 6, y).0;
         assert_eq!(cell(0), [255, 0, 0], "default background shows the image");
         assert_eq!(cell(1), [0, 0, 0], "explicit RGB paints over the image");
+    }
+
+    #[test]
+    fn offscreen_kitty_fractional_text_scales_and_aligns_both_axes() {
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 4,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b]66;n=1:d=2:w=3;WW\x07\r\n",
+            "\x1b]66;n=1:d=2:w=3:h=2:v=2;WW\x07\r\n",
+            "\x1b]66;n=1:d=2:w=3:h=1:v=1;WW\x07\r\n",
+            "\x1b]66;w=3;WW\x07"
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kitty-fractional.png");
+        let (width, height) = screenshot(&frame, size, &path).unwrap();
+        let pixels = image::open(path).unwrap().into_rgb8();
+        let cw = width / 8;
+        let ch = height / 4;
+        let bounds = |row: u32| {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for y in 0..ch {
+                for x in 0..width {
+                    if pixels.get_pixel(x, row * ch + y).0 != [0, 0, 0] {
+                        assert!(x < 3 * cw, "ink escaped its three columns");
+                        xs.push(x);
+                        ys.push(y);
+                    }
+                }
+            }
+            (
+                *xs.iter().min().unwrap(),
+                *xs.iter().max().unwrap(),
+                *ys.iter().min().unwrap(),
+                *ys.iter().max().unwrap(),
+            )
+        };
+        let (top, middle, bottom, full) = (bounds(0), bounds(1), bounds(2), bounds(3));
+        assert!(
+            top.0 < middle.0 && middle.0 < bottom.0,
+            "{top:?} {middle:?} {bottom:?}"
+        );
+        assert!(
+            top.2 < middle.2 && middle.2 < bottom.2,
+            "{top:?} {middle:?} {bottom:?}"
+        );
+        assert!(top.1 - top.0 < full.1 - full.0);
+        assert!(top.3 - top.2 < full.3 - full.2);
+    }
+
+    #[test]
+    fn offscreen_kitty_multicell_text_renders_a_continuation_without_its_top_row() {
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 3,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b[1;3H\x1b]66;s=2:w=2;W\x07",
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let capture = |terminal: &wezterm_term::Terminal, name: &str| {
+            let frame = Snapshot::capture(terminal, None, 1, 0, String::new(), 0);
+            let path = directory.path().join(name);
+            screenshot(&frame, size, &path).unwrap();
+            image::open(path).unwrap().into_rgb8()
+        };
+        let before = capture(&terminal, "kitty-multicell-before.png");
+        let cw = before.width() / 8;
+        let ch = before.height() / 3;
+        for row in 0..3 {
+            let mut ink = 0;
+            for y in row * ch..(row + 1) * ch {
+                for x in 0..before.width() {
+                    if before.get_pixel(x, y).0 != [0, 0, 0] {
+                        assert!((2 * cw..6 * cw).contains(&x));
+                        ink += 1;
+                    }
+                }
+            }
+            assert_eq!(ink > 0, row < 2, "row {row}");
+        }
+        terminal.advance_bytes(b"\x1b[3;1H\r\n");
+        let after = capture(&terminal, "kitty-multicell-after.png");
+        for y in 0..ch {
+            for x in 0..before.width() {
+                assert_eq!(after.get_pixel(x, y), before.get_pixel(x, y + ch));
+            }
+        }
+    }
+
+    #[test]
+    fn offscreen_bidi_reorders_ink_on_both_sides_of_scaled_kitty_text() {
+        let size = wezterm_term::TerminalSize {
+            cols: 9,
+            rows: 2,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b[1;4H\x1b]66;s=2:w=1;W\x07",
+            "\x1b[1;1H\x1b[31mא\x1b[32mב\x1b[1;7H\x1b[31mג\x1b[32mד",
+            "\x1b[2;1H\x1b[31mה\x1b[32mו\x1b[2;7H\x1b[31mז\x1b[32mח",
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kitty-multicell-bidi.png");
+        let (width, height) = screenshot(&frame, size, &path).unwrap();
+        let pixels = image::open(path).unwrap().into_rgb8();
+        let cw = width / 9;
+        let ch = height / 2;
+        for row in 0..2 {
+            let mut columns = [0_u8; 9];
+            for (col, mask) in columns.iter_mut().enumerate() {
+                let x = col as u32 * cw;
+                for y in row * ch..(row + 1) * ch {
+                    for x in x..x + cw {
+                        let [r, g, b] = pixels.get_pixel(x, y).0;
+                        if r > g && r > b {
+                            *mask |= 1;
+                        } else if g > r && g > b {
+                            *mask |= 2;
+                        }
+                    }
+                }
+            }
+            assert_eq!(columns, [2, 1, 0, 0, 0, 0, 2, 1, 0], "row {row}");
+        }
+    }
+
+    #[test]
+    fn offscreen_kitty_multicell_bar_and_underline_follow_the_rectangle() {
+        let size = wezterm_term::TerminalSize {
+            cols: 6,
+            rows: 3,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b]11;#000000\x07\x1b]12;#ff0000\x07",
+            "\x1b[1;2H\x1b]66;s=2:w=2; \x07\x1b[2;4H",
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        for (shape, bar) in [("\x1b[6 q", true), ("\x1b[4 q", false)] {
+            terminal.advance_bytes(shape);
+            let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+            let path = directory
+                .path()
+                .join(if bar { "bar.png" } else { "underline.png" });
+            let (width, height) = screenshot(&frame, size, &path).unwrap();
+            let pixels = image::open(path).unwrap().into_rgb8();
+            let (cw, ch) = (width / 6, height / 3);
+            let red = |x, y| pixels.get_pixel(x, y).0 == [255, 0, 0];
+            assert_eq!(red(cw, 0), bar);
+            assert!(red(cw, 2 * ch - 1));
+            assert_eq!(red(5 * cw - 1, 2 * ch - 1), !bar);
+            assert!(!red(cw, 2 * ch));
+        }
+    }
+
+    #[test]
+    fn offscreen_kitty_text_width_keeps_ink_and_background_in_the_requested_cells() {
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 2,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07",
+            "\x1b[48;2;0;0;255m\x1b]66;w=5; \x07\x1b[49m",
+            "\x1b]66;w=1;WWWWWWW\x07"
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kitty-width.png");
+        let (width, _) = screenshot(&frame, size, &path).unwrap();
+        let pixels = image::open(path).unwrap().into_rgb8();
+        let cw = width / 8;
+        let mut ink = false;
+        for y in 2..15 {
+            for x in 0..width {
+                let color = pixels.get_pixel(x, y).0;
+                match x / cw {
+                    0..=4 => assert_eq!(color, [0, 0, 255]),
+                    5 => ink |= color != [0, 0, 0],
+                    _ => assert_eq!(color, [0, 0, 0], "ink overflow at {x}, {y}"),
+                }
+            }
+        }
+        assert!(ink);
     }
 
     #[test]

@@ -1,18 +1,43 @@
-use super::{CommandLink, Event, PendingSshAttempt, SshAttemptOutcome};
+use super::{CommandLink, Event, GroupTranscriptLine, PendingSshAttempt, SshAttemptOutcome};
 use std::{
     collections::VecDeque,
     fmt,
     sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
 };
+
+use tokio::sync::Notify;
 
 const CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeTarget {
-    Pane { pane: u64, sequence: u64 },
-    GroupRun { tab: u64, submission: u64 },
-    GroupCanary { tab: u64, submission: u64 },
-    GroupLogins { tab: u64, sequence: u64 },
+    Pane {
+        pane: u64,
+        sequence: u64,
+    },
+    GroupRun {
+        tab: u64,
+        submission: u64,
+    },
+    GroupCanary {
+        tab: u64,
+        submission: u64,
+    },
+    GroupOutput {
+        tab: u64,
+        submission: u64,
+        pane: u64,
+        line_id: u64,
+    },
+    GroupOutputMissing {
+        tab: u64,
+        submission: u64,
+    },
+    GroupLogins {
+        tab: u64,
+        sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -26,13 +51,28 @@ pub struct SshLoginResult {
 #[derive(Clone, Debug)]
 pub struct Notice {
     arrival: u64,
-    flash_pending: bool,
+    effect: Effect,
+    eviction: Option<Arc<Notify>>,
     pub target: NoticeTarget,
     pub source: Arc<str>,
     pub message: String,
     pub unread: bool,
     pub command: Option<CommandLink>,
     pub login_results: Option<Arc<[SshLoginResult]>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum Effect {
+    #[default]
+    None,
+    FlashTaskbar,
+    VisualBell(Instant),
+}
+
+#[derive(Default)]
+pub struct InboxWake {
+    pub flash_taskbar: bool,
+    pub bells: Vec<(u64, Instant)>,
 }
 
 #[derive(Default)]
@@ -124,7 +164,17 @@ impl Inbox {
             message,
             event.command,
             None,
-            live && event.kind == "command-finished",
+            (
+                match (live, event.kind.as_str()) {
+                    (true, "command-finished") => Effect::FlashTaskbar,
+                    (true, "notification") if event.data["protocol"] == "kitty" => {
+                        Effect::FlashTaskbar
+                    }
+                    (true, "bell") => Effect::VisualBell(Instant::now()),
+                    _ => Effect::None,
+                },
+                event.eviction.clone(),
+            ),
         );
     }
 
@@ -150,7 +200,7 @@ impl Inbox {
             message,
             None,
             None,
-            true,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -173,7 +223,7 @@ impl Inbox {
             format!("{result} · {}", display_field(host)),
             None,
             None,
-            true,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -199,7 +249,102 @@ impl Inbox {
             format!("SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"),
             None,
             Some(results.into()),
-            true,
+            (Effect::FlashTaskbar, None),
+        );
+    }
+
+    pub(super) fn group_output_matched(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        host: &str,
+        line: &GroupTranscriptLine,
+    ) {
+        let host = display_field(host);
+        let excerpt = display_field(&line.text);
+        let mut message = format!("Matched output · {host}");
+        if !excerpt.is_empty() {
+            message.push_str(&format!(" · {excerpt}"));
+        }
+        self.push(
+            NoticeTarget::GroupOutput {
+                tab,
+                submission,
+                pane: line.pane,
+                line_id: line.id,
+            },
+            display_field(source).into(),
+            message,
+            None,
+            None,
+            (Effect::FlashTaskbar, None),
+        );
+    }
+
+    pub(super) fn group_output_unmatched(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        query: &str,
+        confirmed: bool,
+    ) {
+        let status = if confirmed {
+            "Expected output missing"
+        } else {
+            "Could not verify expected output"
+        };
+        self.push_output_expectation(tab, submission, source, query, status);
+    }
+
+    pub(super) fn group_output_missing_by_host(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        query: &str,
+        missing: usize,
+        unverified: usize,
+    ) {
+        let count_hosts = |count| format!("{count} {}", if count == 1 { "host" } else { "hosts" });
+        let mut parts = Vec::new();
+        if missing > 0 {
+            parts.push(format!(
+                "Expected output missing on {}",
+                count_hosts(missing)
+            ));
+        }
+        if unverified > 0 {
+            parts.push(format!(
+                "Could not verify expected output on {}",
+                count_hosts(unverified)
+            ));
+        }
+        self.push_output_expectation(tab, submission, source, query, &parts.join(" · "));
+    }
+
+    fn push_output_expectation(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        query: &str,
+        status: &str,
+    ) {
+        let query = display_field(query);
+        let message = if query.is_empty() {
+            status.into()
+        } else {
+            format!("{status} · {query}")
+        };
+        self.push(
+            NoticeTarget::GroupOutputMissing { tab, submission },
+            display_field(source).into(),
+            message,
+            None,
+            None,
+            (Effect::FlashTaskbar, None),
         );
     }
 
@@ -210,11 +355,13 @@ impl Inbox {
         message: String,
         command: Option<CommandLink>,
         login_results: Option<Arc<[SshLoginResult]>>,
-        flash_pending: bool,
+        (effect, eviction): (Effect, Option<Arc<Notify>>),
     ) {
         let mut state = self.state.lock().unwrap();
-        if state.rows.len() == CAPACITY {
-            state.rows.pop_front();
+        if state.rows.len() == CAPACITY
+            && let Some(eviction) = state.rows.pop_front().and_then(|notice| notice.eviction)
+        {
+            eviction.notify_one();
         }
         state.rows.push_back(Notice {
             arrival: {
@@ -222,7 +369,8 @@ impl Inbox {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             target,
-            flash_pending,
+            effect,
+            eviction,
             source,
             message,
             unread: true,
@@ -255,18 +403,23 @@ impl Inbox {
         }
     }
 
-    /// Acknowledge this batch and consume its taskbar flash request, if any.
-    /// A notice can request a flash only once, even when moved between windows.
-    pub fn acknowledge_wake(&self) -> bool {
+    /// Consume transient UI effects once, keeping the notices for the inbox.
+    pub fn acknowledge_wake(&self) -> InboxWake {
         let mut state = self.state.lock().unwrap();
+        let mut wake = InboxWake::default();
         if !std::mem::take(&mut state.wake_pending) {
-            return false;
+            return wake;
         }
-        let mut flash = false;
         for item in &mut state.rows {
-            flash |= std::mem::take(&mut item.flash_pending) && item.unread;
+            match (std::mem::take(&mut item.effect), item.target) {
+                (Effect::FlashTaskbar, _) => wake.flash_taskbar |= item.unread,
+                (Effect::VisualBell(at), NoticeTarget::Pane { pane, .. }) => {
+                    wake.bells.push((pane, at));
+                }
+                _ => {}
+            }
         }
-        flash
+        wake
     }
 
     pub(super) fn same_window(&self, other: &Self) -> bool {
@@ -277,7 +430,11 @@ impl Inbox {
         let mut moved = Vec::new();
         self.state.lock().unwrap().rows.retain(|notice| {
             if matches!(notice.target, NoticeTarget::Pane { pane: from, .. } if from == pane) {
-                moved.push(notice.clone());
+                let mut notice = notice.clone();
+                if matches!(notice.effect, Effect::VisualBell(_)) {
+                    notice.effect = Effect::None;
+                }
+                moved.push(notice);
                 false
             } else {
                 true
@@ -293,7 +450,13 @@ impl Inbox {
             .make_contiguous()
             .sort_by_key(|notice| notice.arrival);
         let excess = dest.rows.len().saturating_sub(CAPACITY);
-        dest.rows.drain(..excess);
+        for eviction in dest
+            .rows
+            .drain(..excess)
+            .filter_map(|notice| notice.eviction)
+        {
+            eviction.notify_one();
+        }
         drop(dest);
         (self.wake)();
         (target.wake)();
@@ -340,8 +503,37 @@ impl Inbox {
             .cloned()
     }
 
+    pub(super) fn has_notification(&self, pane: u64, sequence: u64) -> bool {
+        let target = NoticeTarget::Pane { pane, sequence };
+        self.state
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.target == target)
+    }
+
+    pub(super) fn remove_notification(&self, pane: u64, sequence: u64) {
+        let target = NoticeTarget::Pane { pane, sequence };
+        let mut state = self.state.lock().unwrap();
+        if let Some(index) = state.rows.iter().position(|row| row.target == target) {
+            state.rows.remove(index);
+            self.wake_ui(state);
+        }
+    }
+
     pub fn mark_read(&self, pane: u64, sequence: u64) -> bool {
         self.mark_target_read(NoticeTarget::Pane { pane, sequence })
+    }
+
+    pub fn read_group_output_notice(&self, target: NoticeTarget) -> Option<String> {
+        let NoticeTarget::GroupOutput { .. } = target else {
+            return None;
+        };
+        let mut state = self.state.lock().unwrap();
+        let row = state.rows.iter_mut().find(|row| row.target == target)?;
+        row.unread = false;
+        Some(row.message.clone())
     }
 
     pub fn mark_target_read(&self, target: NoticeTarget) -> bool {
@@ -360,7 +552,10 @@ impl Inbox {
     }
 
     pub fn clear(&self) {
-        self.state.lock().unwrap().rows.clear();
+        let mut state = self.state.lock().unwrap();
+        for eviction in state.rows.drain(..).filter_map(|notice| notice.eviction) {
+            eviction.notify_one();
+        }
     }
 }
 
@@ -405,34 +600,34 @@ mod tests {
         let journal = Events::default();
         source.refresh();
         assert!(source.rows().is_empty());
-        assert!(!source.acknowledge_wake());
+        assert!(!source.acknowledge_wake().flash_taskbar);
         journal.push("command-finished", json!({"exit_code": null}));
         journal.connect_inbox(7, "SSH", &source);
         assert_eq!(
             source.rows()[0].message,
             "Command finished · exit status unavailable"
         );
-        assert!(!source.acknowledge_wake());
+        assert!(!source.acknowledge_wake().flash_taskbar);
 
         journal.push("bell", Value::Null);
         journal.push("notification", json!({"body":"command-finished"}));
-        assert!(!source.acknowledge_wake());
+        assert!(!source.acknowledge_wake().flash_taskbar);
         journal.push(
             "command-finished",
             json!({"exit_code": 17, "body":"private"}),
         );
         journal.push("command-finished", json!({"exit_code": 17}));
         journal.connect_inbox(7, "SSH", &target);
-        assert!(!source.acknowledge_wake());
+        assert!(!source.acknowledge_wake().flash_taskbar);
         assert_eq!(target.rows()[0].message, "Command finished · exit code 17");
-        assert!(target.acknowledge_wake());
-        assert!(!target.acknowledge_wake());
+        assert!(target.acknowledge_wake().flash_taskbar);
+        assert!(!target.acknowledge_wake().flash_taskbar);
 
         journal.connect_inbox(7, "SSH", &source);
-        assert!(!source.acknowledge_wake());
+        assert!(!source.acknowledge_wake().flash_taskbar);
         journal.push("command-finished", json!({"exit_code": 0}));
         source.mark_all_read();
-        assert!(!source.acknowledge_wake());
+        assert!(!source.acknowledge_wake().flash_taskbar);
     }
 
     #[test]
@@ -452,6 +647,15 @@ mod tests {
         b.push("bell", Value::Null);
         assert!(source.rows().is_empty());
         assert_eq!(target.unread_count(), 3);
+        let wake = target.acknowledge_wake();
+        assert!(!wake.flash_taskbar);
+        assert_eq!(
+            wake.bells.len(),
+            1,
+            "only the new bell travels to the new window"
+        );
+        assert_eq!(wake.bells[0].0, 2);
+        assert!(target.acknowledge_wake().bells.is_empty());
         let rows: Vec<_> = target.rows().into_iter().map(|n| n.target).collect();
         assert_eq!(
             rows,

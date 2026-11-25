@@ -3692,7 +3692,6 @@ dependencies = [
 [[package]]
 name = "wezterm-surface"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=e2a98e1b8af156988ad0ac778658ac27b60a55fb#e2a98e1b8af156988ad0ac778658ac27b60a55fb"
 dependencies = [
  "bitflags 2.13.2",
  "fancy-regex",
@@ -3739,6 +3738,7 @@ dependencies = [
  "wezterm-cell",
  "wezterm-dynamic",
  "wezterm-escape-parser",
+ "wezterm-input-types",
  "wezterm-surface",
 ]
 
@@ -3910,8 +3910,6 @@ dependencies = [
 [[package]]
 name = "windows-reactor"
 version = "0.100.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e3f0c06995fb2b791584562e32c76d4fed2241d0460a82c3fcdf30a32beadc3"
 dependencies = [
  "rustc-hash",
  "windows-collections 0.100.0",

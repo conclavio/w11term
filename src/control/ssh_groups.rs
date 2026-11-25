@@ -2,7 +2,10 @@ use super::*;
 use crate::events::{GroupTranscriptLine, GroupTranscriptOutput};
 use anyhow::bail;
 use regex::Regex;
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 use tokio::{
     sync::{broadcast::error::RecvError, watch},
     time::Instant,
@@ -13,6 +16,109 @@ pub struct SshGroupOutput {
     pub output: GroupTranscriptOutput,
     pub hosts: BTreeMap<u64, (String, String)>,
     pub retained: Option<watch::Receiver<()>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshGroupExpectedOutput {
+    pub query: String,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default)]
+    pub match_case: bool,
+}
+
+#[derive(Debug)]
+pub struct SshGroupCommandOptions {
+    pub dry_run: bool,
+    pub dispatch: SshGroupDispatchOverrides,
+    pub expect_output: Option<(SshGroupExpectedOutput, Regex)>,
+    pub record_output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SshGroupDispatchOverrides {
+    pub canary_pane_id: Option<u64>,
+    pub parallel_limit: Option<NonZeroUsize>,
+    pub interval_ms: Option<u64>,
+    pub queue_expiry_ms: Option<u64>,
+    pub stop_on_failure: Option<bool>,
+}
+
+impl SshGroupCommandOptions {
+    pub(super) fn prepare(
+        dry_run: bool,
+        dispatch: SshGroupDispatchOverrides,
+        expect_output: Option<SshGroupExpectedOutput>,
+        record_output: Option<PathBuf>,
+    ) -> Result<Self> {
+        ensure!(
+            record_output.as_ref().is_none_or(|path| path.is_absolute()),
+            "group output recording path must be absolute"
+        );
+        let expect_output = expect_output
+            .map(|rule| {
+                let pattern = output_pattern(&rule.query, rule.regex, rule.match_case)?;
+                Ok::<_, anyhow::Error>((rule, pattern))
+            })
+            .transpose()
+            .context("invalid expected output")?;
+        Ok(Self {
+            dry_run,
+            dispatch,
+            expect_output,
+            record_output,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum SshGroupReadiness {
+    CheckedShown,
+    Panes(Vec<u64>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshGroupRunWait {
+    Settlement,
+    CanaryApproval,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshGroupQueueAction {
+    Pause,
+    Resume,
+    Stop,
+    ApproveCanary { pane_id: u64 },
+    Skip { pane_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshGroupReportFormat {
+    #[default]
+    Json,
+    Text,
+}
+
+type ReportWrite = Box<dyn FnOnce(&mut std::fs::File) -> std::io::Result<()> + Send>;
+
+pub struct SshGroupReportWriter(ReportWrite);
+
+impl SshGroupReportWriter {
+    pub fn new(
+        write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(write))
+    }
+}
+
+impl std::fmt::Debug for SshGroupReportWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshGroupReportWriter")
+            .finish_non_exhaustive()
+    }
 }
 
 pub(super) struct GroupOutputQuery {
@@ -68,26 +174,198 @@ fn describe_output_line(line: &GroupTranscriptLine, label: &str, address: &str) 
     })
 }
 
+pub fn validate_group_submission(
+    pane_ids: &[u64],
+    command: &str,
+    canary_pane_id: Option<u64>,
+) -> Result<()> {
+    ensure!(
+        crate::saved_commands::valid_command_text(command),
+        "provide one nonempty shell command line of up to 4096 UTF-8 bytes"
+    );
+    validate_group_panes(pane_ids)?;
+    if let Some(canary) = canary_pane_id {
+        ensure!(
+            pane_ids.contains(&canary),
+            "canary pane {canary} must be one of the explicit recipient panes"
+        );
+        ensure!(
+            pane_ids.len() > 1,
+            "provide at least one other recipient pane with a canary"
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_group_panes(pane_ids: &[u64]) -> Result<()> {
+    ensure!(
+        !pane_ids.is_empty(),
+        "provide at least one explicit SSH pane ID"
+    );
+    let mut seen = BTreeSet::new();
+    for &pane in pane_ids {
+        ensure!(pane != 0, "pane IDs must be positive");
+        ensure!(
+            seen.insert(pane),
+            "pane ID {pane} was specified more than once"
+        );
+    }
+    Ok(())
+}
+
 impl Registry {
+    pub(super) async fn interrupt_ssh_group_command(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        pane: u64,
+    ) -> Result<Value> {
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::InterruptSshGroupCommand {
+            tab_id: tab,
+            run_id: run,
+            pane_id: pane,
+            reply,
+        });
+        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group interrupt was not acknowledged. Check the run before retrying");
+        };
+        Ok(json!({ "window_id": window, "tab_id": tab, "run": run.map_err(anyhow::Error::msg)? }))
+    }
+
+    pub(super) async fn change_ssh_group_queue(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        action: SshGroupQueueAction,
+    ) -> Result<Value> {
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::SshGroupQueue {
+            tab_id: tab,
+            run_id: run,
+            action,
+            reply,
+        });
+        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group queue action was not acknowledged. Check the run before retrying");
+        };
+        Ok(json!({ "window_id": window, "tab_id": tab, "run": run.map_err(anyhow::Error::msg)? }))
+    }
+
+    pub(super) async fn save_ssh_group_report(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        path: PathBuf,
+        format: SshGroupReportFormat,
+        overwrite: bool,
+    ) -> Result<Value> {
+        ensure!(path.is_absolute(), "SSH group report path must be absolute");
+        let deadline = Instant::now() + TIMEOUT;
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::CaptureSshGroupReport {
+            tab_id: tab,
+            run_id: run,
+            format,
+            reply,
+        });
+        let writer = receive(window, response, deadline).await?;
+        let path = tokio::task::spawn_blocking(move || {
+            crate::transcript::save_with(&path, overwrite, writer.0)?;
+            anyhow::Ok(path)
+        })
+        .await??;
+        Ok(
+            json!({ "window_id": window, "tab_id": tab, "run_id": run, "path": path, "format": format }),
+        )
+    }
+
+    pub(super) async fn list_saved_ssh_groups(&self, window: WindowId) -> Result<Value> {
+        let deadline = Instant::now() + TIMEOUT;
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::ListSavedSshGroups { reply });
+        receive(window, response, deadline).await
+    }
+
+    pub(super) async fn open_ssh_group(&self, window: WindowId, name: String) -> Result<Value> {
+        ensure!(!name.trim().is_empty(), "provide a saved SSH group name");
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::OpenSshGroup { name, reply });
+        let Ok(Ok(group)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group launch was not acknowledged. Check list-ssh-groups before retrying");
+        };
+        group.map_err(anyhow::Error::msg)
+    }
+
+    pub(super) async fn submit_ssh_group_command(
+        &self,
+        window: WindowId,
+        tab: u64,
+        pane_ids: Vec<u64>,
+        command: String,
+        options: SshGroupCommandOptions,
+    ) -> Result<Value> {
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        let dry_run = options.dry_run;
+        ui(UiRequest::SubmitSshGroupCommand {
+            tab_id: tab,
+            pane_ids,
+            command,
+            options: Box::new(options),
+            reply,
+        });
+        let Ok(Ok(result)) = tokio::time::timeout(TIMEOUT, response).await else {
+            if dry_run {
+                bail!("SSH group preview was not acknowledged");
+            }
+            bail!("SSH group submission was not acknowledged. Check retained runs before retrying");
+        };
+        let result = result.map_err(anyhow::Error::msg)?;
+        Ok(if dry_run {
+            json!({ "window_id": window, "tab_id": tab, "plan": result })
+        } else {
+            json!({ "window_id": window, "tab_id": tab, "run_id": result })
+        })
+    }
+
     pub(super) async fn query_ssh_group_roster(
         &self,
         window: WindowId,
         tab: u64,
-        wait_for: Option<Duration>,
+        wait_for: Option<(Duration, SshGroupReadiness)>,
     ) -> Result<Value> {
-        let deadline = Instant::now() + wait_for.unwrap_or(TIMEOUT);
+        let (timeout, readiness) =
+            wait_for.map_or((TIMEOUT, None), |(timeout, scope)| (timeout, Some(scope)));
+        let deadline = Instant::now() + timeout;
+        let waiting = readiness.is_some();
+        let panes = match &readiness {
+            Some(SshGroupReadiness::Panes(panes)) => Some(panes.clone()),
+            _ => None,
+        };
         let (reply, response) = oneshot::channel();
         self.window_ui(window)?(UiRequest::GetSshGroupRoster {
             tab_id: tab,
-            wait_for_readiness: wait_for.is_some(),
+            readiness,
             reply,
         });
-        let roster = if wait_for.is_some() {
+        let roster = if waiting {
+            let timeout_error = if panes.is_some() {
+                "wait-ssh-group-ready timed out before all requested SSH panes were ready"
+            } else {
+                "wait-ssh-group-ready timed out before all checked, shown hosts were ready"
+            };
             tokio::time::timeout_at(deadline, response)
                 .await
-                .context(
-                    "wait-ssh-group-ready timed out before all checked, shown hosts were ready",
-                )?
+                .context(timeout_error)?
                 .with_context(|| {
                     format!(
                         "SSH group tab {tab} in window {window} closed during the readiness wait"
@@ -97,7 +375,11 @@ impl Registry {
         } else {
             receive(window, response, deadline).await?
         };
-        Ok(json!({ "window_id": window, "tab_id": tab, "roster": roster }))
+        let mut result = json!({ "window_id": window, "tab_id": tab, "roster": roster });
+        if let Some(panes) = panes {
+            result["ready_pane_ids"] = json!(panes);
+        }
+        Ok(result)
     }
 
     pub(super) async fn list_ssh_groups(&self) -> Result<Value> {
@@ -119,25 +401,79 @@ impl Registry {
         Ok(json!({ "pid": std::process::id(), "windows": windows }))
     }
 
+    pub(super) async fn ssh_group_retry_plan(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + TIMEOUT;
+        let (reply, response) = oneshot::channel();
+        self.window_ui(window)?(UiRequest::GetSshGroupRetryPlan {
+            tab_id: tab,
+            run_id: run,
+            reply,
+        });
+        let plan = receive(window, response, deadline).await?;
+        Ok(json!({ "window_id": window, "tab_id": tab, "run_id": run, "plan": plan }))
+    }
+
+    pub(super) async fn retry_ssh_group_run(
+        &self,
+        window: WindowId,
+        tab: u64,
+        source: u64,
+        pane_ids: Vec<u64>,
+    ) -> Result<Value> {
+        validate_group_panes(&pane_ids)?;
+        let (reply, response) = oneshot::channel();
+        self.window_ui(window)?(UiRequest::RetrySshGroupRun {
+            tab_id: tab,
+            run_id: source,
+            pane_ids,
+            reply,
+        });
+        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group retry was not acknowledged. Check the retry plan before retrying");
+        };
+        let run = run.map_err(anyhow::Error::msg)?;
+        Ok(json!({ "window_id": window, "tab_id": tab, "source_run_id": source, "run_id": run }))
+    }
+
     pub(super) async fn query_ssh_group_run(
         &self,
         window: WindowId,
         tab: u64,
         run: u64,
-        wait_for: Option<Duration>,
+        wait_for: Option<(SshGroupRunWait, u64)>,
     ) -> Result<Value> {
-        let deadline = Instant::now() + wait_for.unwrap_or(TIMEOUT);
+        let (condition, timeout) = if let Some((condition, seconds)) = wait_for {
+            ensure!(
+                (1..=3600).contains(&seconds),
+                "SSH group wait timeout must be 1..=3600 seconds"
+            );
+            (Some(condition), Duration::from_secs(seconds))
+        } else {
+            (None, TIMEOUT)
+        };
+        let deadline = Instant::now() + timeout;
         let (reply, response) = oneshot::channel();
         self.window_ui(window)?(UiRequest::GetSshGroupRun {
             tab_id: tab,
             run_id: run,
-            wait_for_settlement: wait_for.is_some(),
+            wait_for: condition,
             reply,
         });
-        let run = if wait_for.is_some() {
+        let run = if let Some(condition) = condition {
+            let timeout_error = match condition {
+                SshGroupRunWait::Settlement => "wait-ssh-group-run timed out before settlement",
+                SshGroupRunWait::CanaryApproval => {
+                    "wait-ssh-group-approval timed out before the canary was ready"
+                }
+            };
             tokio::time::timeout_at(deadline, response)
                 .await
-                .context("wait-ssh-group-run timed out before settlement")?
+                .context(timeout_error)?
                 .with_context(|| {
                     format!(
                         "SSH group run {run} is no longer retained in tab {tab} of window {window}"
@@ -391,11 +727,11 @@ impl Registry {
     }
 }
 
-async fn receive(
+async fn receive<T>(
     window: WindowId,
-    response: oneshot::Receiver<Result<Value, String>>,
+    response: oneshot::Receiver<Result<T, String>>,
     deadline: Instant,
-) -> Result<Value> {
+) -> Result<T> {
     tokio::time::timeout_at(deadline, response)
         .await
         .with_context(|| format!("SSH group query timed out for window {window}"))?
@@ -406,6 +742,60 @@ async fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn report_export_captures_from_the_explicit_window_before_writing() {
+        use std::io::Write as _;
+
+        let owner = Registry::window(3, None);
+        let foreground = owner.register_window(5, None).unwrap();
+        foreground.activate();
+        owner.set_ui(|request| {
+            let UiRequest::CaptureSshGroupReport {
+                tab_id,
+                run_id,
+                format,
+                reply,
+            } = request
+            else {
+                panic!("unexpected control request");
+            };
+            assert_eq!((tab_id, run_id, format), (7, 2, SshGroupReportFormat::Text));
+            assert!(
+                reply
+                    .send(Ok(SshGroupReportWriter::new(
+                        |file| file.write_all(b"captured output")
+                    )))
+                    .is_ok()
+            );
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("group report.txt");
+        let saved = foreground
+            .save_ssh_group_report(3, 7, 2, path.clone(), SshGroupReportFormat::Text, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved,
+            json!({ "window_id":3, "tab_id":7, "run_id":2, "path":path, "format":"text" })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"captured output");
+        assert!(
+            foreground
+                .save_ssh_group_report(
+                    3,
+                    7,
+                    2,
+                    "relative.txt".into(),
+                    SshGroupReportFormat::Text,
+                    false
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("must be absolute")
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn output_wait_times_out_and_reports_retirement() {
@@ -476,24 +866,31 @@ mod tests {
         let registry = Registry::window(3, None);
         let (send, receive) = std::sync::mpsc::channel();
         registry.set_ui(move |request| send.send(request).unwrap());
-        let error = registry
-            .query_ssh_group_run(3, 9, 2, Some(Duration::from_secs(1)))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("timed out before settlement"));
-        let UiRequest::GetSshGroupRun {
-            wait_for_settlement,
-            reply,
-            ..
-        } = receive.try_recv().unwrap()
-        else {
-            panic!("wrong request");
-        };
-        assert!(wait_for_settlement && reply.is_closed());
+        for (condition, timeout_error) in [
+            (SshGroupRunWait::Settlement, "timed out before settlement"),
+            (
+                SshGroupRunWait::CanaryApproval,
+                "timed out before the canary was ready",
+            ),
+        ] {
+            let error = registry
+                .query_ssh_group_run(3, 9, 2, Some((condition, 1)))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(timeout_error));
+            let UiRequest::GetSshGroupRun {
+                wait_for, reply, ..
+            } = receive.try_recv().unwrap()
+            else {
+                panic!("wrong request");
+            };
+            assert_eq!(wait_for, Some(condition));
+            assert!(reply.is_closed());
+        }
 
         registry.set_ui(drop);
         let error = registry
-            .query_ssh_group_run(3, 9, 2, Some(Duration::from_secs(1)))
+            .query_ssh_group_run(3, 9, 2, Some((SshGroupRunWait::Settlement, 1)))
             .await
             .unwrap_err();
         assert!(
@@ -514,25 +911,115 @@ mod tests {
                     .send(Ok(json!([{ "tab_id": 9, "runs": [{ "run_id": 2 }] }])))
                     .unwrap();
             }
+            UiRequest::OpenSshGroup { name, reply } => {
+                assert_eq!(name, "East Fleet");
+                reply
+                    .send(Ok(json!({ "window_id": 3, "tab_id": 10 })))
+                    .unwrap();
+            }
+            UiRequest::ListSavedSshGroups { reply } => {
+                reply
+                    .send(Ok(json!({
+                        "window_id": 3,
+                        "groups": [{ "name": "East Fleet" }],
+                    })))
+                    .unwrap();
+            }
             UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,
-                wait_for_settlement,
+                wait_for,
                 reply,
             } => {
                 assert_eq!((tab_id, run_id), (9, 2));
-                assert!(!wait_for_settlement);
+                assert!(wait_for.is_none());
                 reply
                     .send(Ok(json!({ "summary": { "run_id": run_id } })))
                     .unwrap();
             }
-            UiRequest::GetSshGroupRoster {
+            UiRequest::GetSshGroupRetryPlan {
                 tab_id,
-                wait_for_readiness,
+                run_id,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id), (9, 2));
+                reply.send(Ok(json!({"ready_pane_ids":[7]}))).unwrap();
+            }
+            UiRequest::RetrySshGroupRun {
+                tab_id,
+                run_id,
+                pane_ids,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id, pane_ids), (9, 2, vec![7, 8]));
+                reply.send(Ok(4)).unwrap();
+            }
+            UiRequest::SshGroupQueue {
+                tab_id,
+                run_id,
+                action,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id, action), (9, 2, SshGroupQueueAction::Pause));
+                reply
+                    .send(Ok(json!({ "queue": {"state":"paused", "unsent":1} })))
+                    .unwrap();
+            }
+            UiRequest::InterruptSshGroupCommand {
+                tab_id,
+                run_id,
+                pane_id,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id, pane_id), (9, 2, 7));
+                reply
+                    .send(Ok(
+                        json!({"recipients":[{"pane_id":7,"interrupt":{"state":"pending"}}]}),
+                    ))
+                    .unwrap();
+            }
+            UiRequest::SubmitSshGroupCommand {
+                tab_id,
+                pane_ids,
+                command,
+                options,
                 reply,
             } => {
                 assert_eq!(tab_id, 9);
-                assert!(!wait_for_readiness);
+                assert_eq!(pane_ids, [8, 7]);
+                assert_eq!(command, "show  status");
+                assert_eq!(options.dispatch.canary_pane_id, Some(7));
+                assert_eq!(
+                    options.dispatch.parallel_limit.map(NonZeroUsize::get),
+                    Some(3)
+                );
+                assert_eq!(options.dispatch.interval_ms, Some(725));
+                assert_eq!(options.dispatch.queue_expiry_ms, Some(1_800));
+                assert_eq!(options.dispatch.stop_on_failure, Some(false));
+                assert_eq!(
+                    options.record_output,
+                    Some(PathBuf::from(r"C:\fixture\capture.txt"))
+                );
+                let (rule, pattern) = options.expect_output.unwrap();
+                assert_eq!(rule.query, "^READY [0-9]+$");
+                assert!(pattern.is_match("READY 2"));
+                assert!(!pattern.is_match("ready 2"));
+                let result = if options.dry_run {
+                    json!({"command": command, "recipients": [{"pane_id": 7}, {"pane_id": 8}]})
+                } else {
+                    json!(3)
+                };
+                reply.send(Ok(result)).unwrap();
+            }
+            UiRequest::GetSshGroupRoster {
+                tab_id,
+                readiness,
+                reply,
+            } => {
+                assert_eq!(tab_id, 9);
+                if let Some(scope) = readiness {
+                    assert!(matches!(scope, SshGroupReadiness::Panes(panes) if panes == [8, 7]));
+                }
                 reply
                     .send(Ok(json!({ "hosts": [{ "pane_id": 7 }] })))
                     .unwrap();
@@ -553,6 +1040,105 @@ mod tests {
         );
         let lookup = second.query_ssh_group_run(3, 9, 2, None).await.unwrap();
         assert_eq!(
+            second.ssh_group_retry_plan(3, 9, 2).await.unwrap(),
+            json!({ "window_id": 3, "tab_id": 9, "run_id": 2, "plan": {"ready_pane_ids":[7]} })
+        );
+        assert_eq!(
+            second
+                .retry_ssh_group_run(3, 9, 2, vec![7, 8])
+                .await
+                .unwrap(),
+            json!({ "window_id": 3, "tab_id": 9, "source_run_id": 2, "run_id": 4 })
+        );
+        let paused = second
+            .change_ssh_group_queue(3, 9, 2, SshGroupQueueAction::Pause)
+            .await
+            .unwrap();
+        assert_eq!(
+            paused,
+            json!({"window_id":3, "tab_id":9, "run":{"queue":{"state":"paused","unsent":1}}})
+        );
+        let interrupted = second
+            .interrupt_ssh_group_command(3, 9, 2, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            interrupted,
+            json!({"window_id":3,"tab_id":9,"run":{"recipients":[{"pane_id":7,"interrupt":{"state":"pending"}}]}})
+        );
+        let opened = second.open_ssh_group(3, "East Fleet".into()).await.unwrap();
+        assert_eq!(opened, json!({ "window_id": 3, "tab_id": 10 }));
+        let saved = second.list_saved_ssh_groups(3).await.unwrap();
+        assert_eq!(
+            saved,
+            json!({ "window_id": 3, "groups": [{ "name": "East Fleet" }] })
+        );
+        assert!(
+            second
+                .open_ssh_group(99, "East Fleet".into())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown window 99")
+        );
+        let submit = |mut wire: Value| {
+            wire["verb"] = json!("submit-ssh-group-command");
+            wire["tab_id"] = json!(9);
+            second.execute(
+                serde_json::from_value(wire).unwrap(),
+                Arc::new(|_, _, _| unreachable!()),
+            )
+        };
+        let submission = json!({
+            "window_id": 3,
+            "pane_ids": [8, 7],
+            "command": "show  status",
+            "canary_pane_id": 7,
+            "parallel_limit": 3,
+            "interval_ms": 725,
+            "queue_expiry_ms": 1800,
+            "stop_on_failure": false,
+            "expect_output": { "query": "^READY [0-9]+$", "regex": true, "match_case": true },
+            "record_output": r"C:\fixture\capture.txt",
+        });
+        let mut preview = submission.clone();
+        preview["dry_run"] = json!(true);
+        assert_eq!(
+            submit(preview).await.unwrap(),
+            json!({
+                "window_id": 3, "tab_id": 9,
+                "plan": {"command":"show  status","recipients":[{"pane_id":7},{"pane_id":8}]}
+            })
+        );
+        assert_eq!(
+            submit(submission).await.unwrap(),
+            json!({ "window_id": 3, "tab_id": 9, "run_id": 3 })
+        );
+        for (mut wire, message) in [
+            (json!({"pane_ids": [7, 7]}), "specified more than once"),
+            (
+                json!({"pane_ids": [7], "expect_output": {"query": "[", "regex": true}}),
+                "invalid expected output",
+            ),
+            (
+                json!({"pane_ids": [7], "record_output": "relative.txt"}),
+                "recording path must be absolute",
+            ),
+            (
+                json!({"pane_ids": [7, 8], "canary_pane_id": 6}),
+                "must be one of the explicit recipient panes",
+            ),
+            (
+                json!({"pane_ids": [7], "canary_pane_id": 7}),
+                "at least one other recipient pane",
+            ),
+        ] {
+            wire["window_id"] = json!(5);
+            wire["command"] = json!("show");
+            let error = submit(wire).await.unwrap_err().to_string();
+            assert!(error.contains(message), "{error}");
+        }
+        assert_eq!(
             lookup,
             json!({ "window_id": 3, "tab_id": 9, "run": { "summary": { "run_id": 2 } } })
         );
@@ -560,6 +1146,15 @@ mod tests {
             second.query_ssh_group_roster(3, 9, None).await.unwrap(),
             json!({ "window_id": 3, "tab_id": 9, "roster": { "hosts": [{ "pane_id": 7 }] } })
         );
+        let explicit = second
+            .query_ssh_group_roster(
+                3,
+                9,
+                Some((Duration::from_secs(1), SshGroupReadiness::Panes(vec![8, 7]))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit["ready_pane_ids"], json!([8, 7]));
         first.unregister().unwrap();
         assert_eq!(
             second

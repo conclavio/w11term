@@ -58,6 +58,14 @@ pub struct ColorPalette {
     pub split: SrgbaTuple,
 }
 
+/// Selection colors set by a terminal application. Missing values let the
+/// embedding retain its normal selection appearance.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SelectionColors {
+    pub foreground: Option<SrgbaTuple>,
+    pub background: Option<SrgbaTuple>,
+}
+
 impl fmt::Debug for Palette256 {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         // If we wanted to dump all of the entries, we'd use this:

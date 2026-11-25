@@ -37,6 +37,9 @@ function Set-Command([string]$Command) {
 function Run-Snapshot([uint64]$Run) {
     Control @('get-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$Run")
 }
+function Queue-Action([uint64]$Run, [string]$Action) {
+    Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$Run",$Action)
+}
 function Select-GroupOption([string]$Name, [string]$Label) {
     $combo = [System.Windows.Automation.ControlType]::ComboBox
     $listItem = [System.Windows.Automation.ControlType]::ListItem
@@ -72,6 +75,7 @@ function Select-GroupOption([string]$Name, [string]$Label) {
 $launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '--rows', '36')
 $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $waitJob = $null
+$approvalJob = $null
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
@@ -142,9 +146,9 @@ try {
         throw 'CLI discovery changed the visible page or did not summarize the background run'
     }
     $waitArgs = @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run','1')
-    $timedOut = & $Cli --pid $app.Id @waitArgs --timeout 1 | ConvertFrom-Json
-    if ($LASTEXITCODE -eq 0 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before settlement*') {
-        throw 'A held run did not return a wait timeout'
+    $timedOut = & $Cli --pid $app.Id @waitArgs --timeout 1 --require-success | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before settlement*') {
+        throw 'A strict wait did not distinguish timeout from a settled failure'
     }
     $waitOutput = Join-Path $State 'wait-run-1.json'
     $waitJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $waitArgs + @('--timeout','15')) `
@@ -181,6 +185,23 @@ try {
         [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
         throw 'Waiting again did not return the settled run or changed focus'
     }
+    $strict = & $Cli --pid $app.Id @waitArgs --require-success | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 2 -or !$strict.ok -or $strict.result.run.recipients[1].delivery.state -cne 'rejected') {
+        throw 'A settled failure did not preserve the JSON report with exit code 2'
+    }
+    $retryArgs = @('get-ssh-group-retry-plan','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $blockedRetry = Control ($retryArgs + @('1'))
+    if ($blockedRetry.plan.recipients.Count -ne 1 -or
+        $blockedRetry.plan.recipients[0].pane_id -ne $panes.North -or $blockedRetry.plan.recipients[0].ready -or
+        !$blockedRetry.plan.recipients[0].block_reason -or $blockedRetry.plan.ready_pane_ids.Count -ne 0 -or
+        !(Find-Element 'No bells or notifications') -or [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
+        throw 'The retry plan included delivered hosts, lost the reason for blocking North, or changed focus'
+    }
+    $sendRetryArgs = @('retry-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $blockedSend = & $Cli --pid $app.Id @sendRetryArgs 1 --pane $panes.North | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $blockedSend.ok -or $blockedSend.error -notlike '*cannot be retried*') {
+        throw 'The retry accepted an unsent host with an unverified prompt'
+    }
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
     $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'North was tried before East despite the new roster sort' {
@@ -210,7 +231,14 @@ try {
     $dialog = Wait-Until 'output recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the bounded recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started keep-first')
-    Click 'Cancel queued commands'
+    $stopped = (Queue-Action 2 'stop').run
+    $kept = $stopped.recipients | Where-Object pane_id -eq $panes.West
+    $withheld = $stopped.recipients | Where-Object pane_id -eq $panes.East
+    if ($stopped.queue.state -cne 'drained' -or $stopped.queue.unsent -ne 0 -or
+        $kept.execution.state -cne 'running' -or $withheld.delivery.state -cne 'rejected' -or
+        $withheld.delivery.reason -cne 'Cancelled before sending.') {
+        throw 'Stopping the CLI queue did not withhold the unsent host and leave the running host alone'
+    }
     $null = Wait-Until 'East was canceled before sending' {
         Find-Element "$($labels.East)${dot}Not sent${dot}Cancelled before sending."
     }
@@ -249,25 +277,35 @@ try {
     Set-Command 'inspect'
     Click 'Send to 2 hosts'
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started inspect')
-    Click 'Pause queue'
-    $null = Wait-Until 'the next run is paused' { Find-Element 'Command queue paused' }
     Click 'Attention inbox, 0 unread'
-    $null = Wait-Until 'the paused group is in the background' { Find-Element 'No bells or notifications' }
+    $null = Wait-Until 'the queue is controlled from the background' { Find-Element 'No bells or notifications' }
+    $queueFocus = [FixtureMessages]::GetForegroundWindow()
+    $paused = (Queue-Action 4 'pause').run
+    $pausedAgain = (Queue-Action 4 'pause').run
+    if ($paused.queue.state -cne 'paused' -or $paused.queue.unsent -ne 1 -or
+        $pausedAgain.queue_activity.events.Count -ne $paused.queue_activity.events.Count) {
+        throw 'The background queue did not pause or logged a duplicate pause'
+    }
     New-Item -ItemType File -Path (Join-Path $State 'release-inspect') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished inspect')
-    $tab = Wait-Until 'the group tab after pausing' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
-    $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'the queue remains paused with a free slot' {
-        (Find-Element 'Command queue paused') -and (Find-Element "$($labels.West)${dot}Exit 0") -and
-            (Find-Element "$($labels.East)${dot}Queued")
+        $run = (Run-Snapshot 4).run
+        $first = $run.recipients | Where-Object pane_id -eq $panes.West
+        $next = $run.recipients | Where-Object pane_id -eq $panes.East
+        $run.queue.state -ceq 'paused' -and $first.execution.exit_code -eq 0 -and $next.delivery.state -ceq 'queued'
     }
     New-Item -ItemType File -Path (Join-Path $State 'resume-inspect') | Out-Null
-    Click 'Resume queue'
-    $null = Wait-Until 'the queue resumed' { !(Find-Element 'Command queue paused') }
+    $resumed = (Queue-Action 4 'resume').run
+    if ($resumed.queue.state -ceq 'paused' -or
+        [FixtureMessages]::GetForegroundWindow() -ne $queueFocus -or !(Find-Element 'No bells or notifications')) {
+        throw 'Resuming the queue changed focus or left it paused'
+    }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
+    $tab = Wait-Until 'the group tab after resuming' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'East was sent the resumed command' {
         Find-Element "$($labels.East)${dot}Sent to SSH channel"
     }
-    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
     Click 'Show queue activity'
     $null = Wait-Until 'the completed run retains pause and resume events' {
         (Find-Element 'Paused queue') -and (Find-Element 'Resumed queue')
@@ -295,6 +333,20 @@ try {
     $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-ok')
+    $blocked = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 resume | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $blocked.ok -or $blocked.error -notlike '*while the canary is pending*') {
+        throw 'Resuming a command queue bypassed its canary gate'
+    }
+    $running = (Run-Snapshot 5).run.queue
+    $early = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 approve-canary --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $early.ok -or $early.error -notlike '*successful exit yet*' -or
+        $running.state -cne 'canary_running' -or $running.canary_pane_id -ne $panes.East) {
+        throw 'The CLI could not identify the running canary or accepted approval before its exit'
+    }
+    $cannotSkip = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 skip --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $cannotSkip.ok -or $cannotSkip.error -notlike '*active canary cannot be skipped*') {
+        throw 'The CLI let the running canary be skipped'
+    }
     $null = Wait-Until 'only East runs before a canary result' {
         (Find-Element "$($labels.West)${dot}Queued") -and
             (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
@@ -308,7 +360,25 @@ try {
     $null = Wait-Until 'the preview is open before leaving the group' { Find-Element 'Back to roster and results' $button }
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the canary group is in the background' { Find-Element 'No bells or notifications' }
+    $approvalArgs = @('wait-ssh-group-approval','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $approvalTimeout = & $Cli --pid $app.Id @approvalArgs 5 --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $approvalTimeout.ok -or $approvalTimeout.error -notlike '*timed out before the canary was ready*') {
+        throw 'Waiting for approval did not time out while East was held'
+    }
+    $approvalOutput = Join-Path $State 'wait-canary-approval.json'
+    $approvalJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $approvalArgs + @('5','--timeout','15')) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $approvalOutput
+    $waitFocus = [FixtureMessages]::GetForegroundWindow()
     New-Item -ItemType File -Path (Join-Path $State 'release-east-canary-ok') | Out-Null
+    if (!$approvalJob.WaitForExit(10000)) {
+        throw 'The background wait did not return when the canary became ready'
+    }
+    $approval = [IO.File]::ReadAllText($approvalOutput) | ConvertFrom-Json
+    if (!$approval.ok -or $approval.result.window_id -ne $groupWindow -or $approval.result.tab_id -ne $groupTab -or
+        $approval.result.run.queue.state -cne 'canary_approval' -or $approval.result.run.queue.canary_pane_id -ne $panes.East -or
+        $approval.result.run.queue.unsent -ne 1 -or [FixtureMessages]::GetForegroundWindow() -ne $waitFocus) {
+        throw 'The approval wait lost the pending gate, targeted the wrong host, or changed focus'
+    }
     $canaryNotice = "$group${dot}Run 5${dot}Canary ready for approval${dot}$($labels.East)"
     Click "Unread${dot}$canaryNotice"
     $null = Wait-Until 'the canary notice opens the run requiring approval' {
@@ -317,11 +387,31 @@ try {
             (Find-Element "$($labels.East)${dot}Canary succeeded. Review its result before continuing.") -and
             (Find-Element 'Approve remaining hosts' $button)
     }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the approved run will stay in the background' {
+        Find-Element "Read${dot}$canaryNotice" $button
+    }
+    $approvalFocus = [FixtureMessages]::GetForegroundWindow()
+    $wrong = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 approve-canary --pane $panes.West | ConvertFrom-Json
+    $waiting = (Run-Snapshot 5).run.queue
+    if ($wrong.ok -or $wrong.error -notlike '*not the canary for this run*' -or
+        $waiting.state -cne 'canary_approval' -or $waiting.canary_pane_id -ne $panes.East -or $waiting.unsent -ne 1) {
+        throw 'Approving a different pane changed the waiting canary gate'
+    }
     New-Item -ItemType File -Path (Join-Path $State 'release-canary-ok') | Out-Null
     New-Item -ItemType File -Path (Join-Path $State 'approve-canary-ok') | Out-Null
-    Click 'Approve remaining hosts'
+    $approved = (Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run','5',
+            'approve-canary','--pane',"$($panes.East)")).run.queue
+    if ($approved.state -notin @('dispatching','drained') -or $null -ne $approved.canary_pane_id -or
+        [FixtureMessages]::GetForegroundWindow() -ne $approvalFocus -or
+        !(Find-Element "Read${dot}$canaryNotice" $button)) {
+        throw 'Approving the correct canary left the gate in place or changed focus'
+    }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished canary-ok')
-    Click 'Attention inbox, 1 unread'
+    $completedGate = & $Cli --pid $app.Id @approvalArgs 5 --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $completedGate.ok -or $completedGate.error -notlike '*no canary awaiting approval*') {
+        throw 'A second approval wait accepted a gate that was already approved'
+    }
     $null = Wait-Until 'the canary notice stays read while the run completion is unread' {
         Find-Element "Read${dot}$canaryNotice" $button
     }
@@ -348,6 +438,10 @@ try {
     Click 'Run canary first'
     Click 'Attention inbox, 1 unread'
     Click "Unread${dot}$group${dot}Run 6${dot}Canary did not report a successful exit${dot}$($labels.East)"
+    $failedGate = & $Cli --pid $app.Id @approvalArgs 6 --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $failedGate.ok -or $failedGate.error -notlike '*canary gate closed before approval*') {
+        throw 'A failed canary did not resolve the approval wait as an error'
+    }
     $null = Wait-Until 'a failed canary notice opens the exact run that withheld West' {
         (Find-Element "$($labels.East)${dot}Exit 17") -and
             (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
@@ -420,7 +514,25 @@ try {
             (Find-Element "Skip queued pane $($panes.North)" $button) -and
             !(Find-Element "Skip queued pane $($panes.West)" $button)
     }
-    Click "Skip queued pane $($panes.East)"
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the skip is issued with the group in the background' { Find-Element "Read${dot}$canaryNotice" $button }
+    $skipFocus = [FixtureMessages]::GetForegroundWindow()
+    $runningSkip = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 10 skip --pane $panes.West | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $runningSkip.ok -or $runningSkip.error -notlike '*no queued command to skip*') {
+        throw 'The CLI let an already running host be skipped'
+    }
+    $skipped = (Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run','10',
+            'skip','--pane',"$($panes.East)")).run
+    $east = $skipped.recipients | Where-Object pane_id -eq $panes.East
+    $north = $skipped.recipients | Where-Object pane_id -eq $panes.North
+    $west = $skipped.recipients | Where-Object pane_id -eq $panes.West
+    if ($skipped.queue.unsent -ne 1 -or $east.delivery.state -cne 'skipped' -or
+        $north.delivery.state -cne 'queued' -or $west.execution.state -cne 'running' -or
+        [FixtureMessages]::GetForegroundWindow() -ne $skipFocus -or !(Find-Element "Read${dot}$canaryNotice" $button)) {
+        throw 'The CLI skip changed focus or modified a host other than East'
+    }
+    $tab = Wait-Until 'the group tab after skipping' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'East is skipped while North remains queued' {
         (Find-Element "$($labels.East)${dot}Skipped before sending") -and
             (Find-Element "$($labels.North)${dot}Queued") -and
@@ -491,9 +603,199 @@ try {
             (Find-Element "$($labels.North)${dot}Not sent${dot}Queue expired before sending.") -and
             !(Find-Element 'Approve remaining hosts' $button)
     }
+    Select-GroupOption 'Expire unsent commands' 'Never'
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.East)",'--pane',"$($panes.West)",'--timeout','10')
+    $overrideLog = Join-Path $State 'cli-canary-override.txt'
+    $submissionArgs = @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.East)",'--pane',"$($panes.West)",'--canary',"$($panes.West)",
+        '--record-output',$overrideLog,'--expect-output','finished verify-override')
+    $beforePreview = (Control @('list-ssh-groups')).windows.groups.runs.run_id -join ','
+    $preview = Control ($submissionArgs + @('--dry-run','--','verify-override'))
+    $afterPreview = (Control @('list-ssh-groups')).windows.groups.runs.run_id -join ','
+    if ($preview.window_id -ne $groupWindow -or $preview.tab_id -ne $groupTab -or $null -ne $preview.run_id -or
+        $preview.plan.command -cne 'verify-override' -or $preview.plan.dispatch_policy.canary.pane_id -ne $panes.West -or
+        ($preview.plan.recipients.pane_id -join ',') -cne "$($panes.West),$($panes.East)" -or
+        $beforePreview -cne $afterPreview -or (Test-Path -LiteralPath $overrideLog)) {
+        throw 'The dry run planned the wrong recipients or allocated a run or recording'
+    }
+    $submitted = Control ($submissionArgs + @('--','verify-override'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started verify-override')
+    $override = (Run-Snapshot $submitted.run_id).run
+    if (($override.dispatch_policy | ConvertTo-Json -Compress) -cne
+        ($preview.plan.dispatch_policy | ConvertTo-Json -Compress) -or
+        $override.queue.state -cne 'canary_running' -or $override.queue.canary_pane_id -ne $panes.West -or
+        $override.queue.unsent -ne 1) {
+        throw 'The recorded CLI submission did not run its requested canary first'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-verify-override') | Out-Null
+    $null = Wait-Until 'the selected West canary finished and needs approval' {
+        (Run-Snapshot $submitted.run_id).run.queue.state -ceq 'canary_approval'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'approve-verify-override') | Out-Null
+    $null = Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$($submitted.run_id)",
+        'approve-canary','--pane',"$($panes.West)")
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished verify-override')
+    $strictSuccess = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($submitted.run_id)",'--require-success','--timeout','10')
+    if ($strictSuccess.run.summary.outcomes.succeeded -ne 2 -or
+        ($strictSuccess.run.recipients.output_expectation -join ',') -cne 'matched,matched') {
+        throw 'Strict wait did not return a successful checked run'
+    }
+    $null = Wait-Until 'the recording contains the override and both verified outcomes' {
+        $recorded = Read-GroupRecording $overrideLog
+        $recorded -and $recorded.Contains("canary $($labels.West)") -and
+            $recorded.Contains('West finished verify-override') -and
+            $recorded.Contains('East finished verify-override') -and
+            $recorded.Contains('[Group run settled]')
+    }
+    Set-Command 'existing draft'
+    Click 'Preview send order'
+    $null = Wait-Until 'the draft still uses the configured East canary' {
+        Find-Element "Canary first${dot}$($labels.East)"
+    }
+    Click 'Back to roster and results'
+    Select-GroupOption 'Canary host' 'No canary'
+    Select-GroupOption 'Parallel SSH commands' 'Unlimited'
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $parallelLog = Join-Path $State 'cli-serial-output.txt'
+    $serialArgs = @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)")
+    $serial = Control ($serialArgs + @('--parallel','1','--record-output',$parallelLog,'--','verify-parallel'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started verify-parallel')
+    $queued = (Run-Snapshot $serial.run_id).run
+    if ($queued.dispatch_policy.parallel_limit -ne 1 -or $queued.queue.unsent -ne 1 -or
+        $queued.recipients[1].delivery.state -cne 'queued') {
+        throw 'The recorded CLI command did not honor its serial dispatch limit'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-verify-parallel') | Out-Null
+    $settledSerial = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($serial.run_id)",'--require-success','--timeout','10')
+    if ($settledSerial.run.recording.state -cne 'saved' -or
+        !(Read-GroupRecording $parallelLog).Contains('parallel limit 1')) {
+        throw 'The serial run did not preserve its policy in the saved recording'
+    }
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $default = Control ($serialArgs + @('--dry-run','--','verify-parallel'))
+    if ($null -ne $default.plan.dispatch_policy.parallel_limit) {
+        throw 'The per-run override changed the configured parallel limit'
+    }
+    Select-GroupOption 'Time between sends' '5 seconds'
+    $pacingLog = Join-Path $State 'cli-paced-output.txt'
+    $paced = Control ($serialArgs + @('--interval-ms','1200','--record-output',$pacingLog,'--','verify-pacing'))
+    $pacedResult = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($paced.run_id)",'--require-success','--timeout','15')
+    if ($pacedResult.run.dispatch_policy.interval_ms -ne 1200 -or
+        $pacedResult.run.recording.state -cne 'saved' -or !(Read-GroupRecording $pacingLog).Contains('1.2s between sends')) {
+        throw 'The recorded run lost its custom pacing interval'
+    }
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $default = Control ($serialArgs + @('--dry-run','--','verify-pacing'))
+    $noDelay = Control ($serialArgs + @('--dry-run','--interval-ms','0','--','verify-pacing'))
+    if ($default.plan.dispatch_policy.interval_ms -ne 5000 -or $noDelay.plan.dispatch_policy.interval_ms -ne 0) {
+        throw 'The pacing override changed the configured interval or failed to represent no delay'
+    }
+    Select-GroupOption 'Expire unsent commands' '5 seconds'
+    $expiryLog = Join-Path $State 'cli-expiry-output.txt'
+    $expiring = Control ($serialArgs + @('--parallel','1','--interval-ms','0',
+        '--queue-expiry-ms','1800','--record-output',$expiryLog,'--','verify-expiry'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started verify-expiry')
+    $null = Wait-Until 'expiry withholds East while West stays running' {
+        $run = (Run-Snapshot $expiring.run_id).run
+        $run.dispatch_policy.queue_expiry_ms -eq 1800 -and $run.queue.state -ceq 'drained' -and
+            $run.recipients[0].execution.state -ceq 'running' -and
+            $run.recipients[1].delivery.reason -ceq 'Queue expired before sending.'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-verify-expiry') | Out-Null
+    $expired = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($expiring.run_id)",'--timeout','10')
+    if ($expired.run.recipients[0].execution.exit_code -ne 0 -or $expired.run.recording.state -cne 'saved' -or
+        !(Read-GroupRecording $expiryLog).Contains('queue expires after 1.8s')) {
+        throw 'The expiring run interrupted West or lost its policy in the recording'
+    }
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $default = Control ($serialArgs + @('--dry-run','--','verify-expiry'))
+    $noExpiry = Control ($serialArgs + @('--dry-run','--queue-expiry-ms','0','--','verify-expiry'))
+    if ($default.plan.dispatch_policy.queue_expiry_ms -ne 5000 -or $null -ne $noExpiry.plan.dispatch_policy.queue_expiry_ms) {
+        throw 'The expiry override changed the configured deadline or failed to disable expiry'
+    }
+    Select-GroupOption 'Expire unsent commands' 'Never'
+    Select-GroupOption 'Time between sends' 'No delay'
+    $groupWait = @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--timeout','10','--run')
+    $stop = Control ($serialArgs + @('--on-failure','stop','--','policy-stop'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-stop')
+    New-Item -ItemType File -Path (Join-Path $State 'release-policy-stop') | Out-Null
+    $stopped = (Control ($groupWait + @("$($stop.run_id)"))).run
+    if (!$stopped.dispatch_policy.stop_on_failure -or $stopped.dispatch_policy.parallel_limit -ne 1 -or
+        $stopped.recipients[0].execution.exit_code -ne 17 -or
+        $stopped.recipients[1].delivery.reason -cne 'Queue stopped after an unsuccessful host.') {
+        throw 'Stop-on-failure did not keep East unsent after West failed'
+    }
+    $readyForPolicy = @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $null = Control $readyForPolicy
+    $retry = Control ($retryArgs + @("$($stop.run_id)"))
+    if ($retry.run_id -ne $stop.run_id -or $retry.plan.command -cne 'policy-stop' -or
+        $retry.plan.recipients.Count -ne 1 -or ($retry.plan.ready_pane_ids -join ',') -cne "$($panes.East)" -or
+        !$retry.plan.recipients[0].ready -or $retry.plan.recipients[0].pane_id -ne $panes.East -or
+        $null -ne $retry.plan.recipients[0].block_reason -or
+        $retry.plan.recipients[0].delivery_reason -cne 'Queue stopped after an unsuccessful host.') {
+        throw 'The retry plan did not isolate the ready, unsent host from the sent failure'
+    }
+    $mixed = & $Cli --pid $app.Id @sendRetryArgs $stop.run_id --pane $panes.East --pane $panes.West | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $mixed.ok -or $mixed.error -notlike '*no confirmed unsent command*') {
+        throw 'A retry accepted a mixed list containing a known sent command'
+    }
+    $newRun = Control ($sendRetryArgs + @("$($stop.run_id)",'--pane',"$($panes.East)"))
+    $retried = (Control ($groupWait + @("$($newRun.run_id)",'--require-success'))).run
+    if ($newRun.source_run_id -ne $stop.run_id -or $newRun.run_id -ne ($stop.run_id + 1) -or
+        $retried.command -cne 'policy-stop' -or $retried.recipients.Count -ne 1 -or
+        $retried.recipients[0].pane_id -ne $panes.East -or $retried.recipients[0].execution.exit_code -ne 0) {
+        throw 'The retry did not send the original command only to East'
+    }
+    $usedRetry = Control ($retryArgs + @("$($stop.run_id)"))
+    $duplicate = & $Cli --pid $app.Id @sendRetryArgs $stop.run_id --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $duplicate.ok -or $duplicate.error -notlike '*Already retried in run*' -or
+        $usedRetry.plan.recipients[0].retry_run_id -ne $newRun.run_id -or $usedRetry.plan.ready_pane_ids.Count -ne 0) {
+        throw 'The original plan did not prevent a duplicate retry'
+    }
+    $null = Control $readyForPolicy
+    $keepGoing = Control ($serialArgs + @('--parallel','1','--on-failure','continue','--','policy-continue'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-continue')
+    New-Item -ItemType File -Path (Join-Path $State 'release-policy-continue') | Out-Null
+    $continued = (Control ($groupWait + @("$($keepGoing.run_id)"))).run
+    if ($continued.dispatch_policy.stop_on_failure -or $continued.recipients[0].execution.exit_code -ne 17 -or
+        $continued.recipients[1].execution.exit_code -ne 0) {
+        throw 'Continue-on-failure did not send East after West failed'
+    }
+    $null = Control $readyForPolicy
+    $default = Control ($serialArgs + @('--parallel','1','--dry-run','--','policy-continue'))
+    if (!$default.plan.dispatch_policy.stop_on_failure) {
+        throw 'The per-run failure policy changed the group default'
+    }
+    $failedCanary = Control ($serialArgs + @('--canary',"$($panes.West)",'--on-failure','continue','--','policy-canary'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-canary')
+    New-Item -ItemType File -Path (Join-Path $State 'release-policy-canary') | Out-Null
+    $canaryResult = (Control ($groupWait + @("$($failedCanary.run_id)"))).run
+    if ($canaryResult.recipients[0].execution.exit_code -ne 17 -or
+        $canaryResult.recipients[1].delivery.reason -cne 'Canary did not report a successful exit.') {
+        throw 'Continue-on-failure bypassed the failed canary'
+    }
+    $gatedRetry = & $Cli --pid $app.Id @sendRetryArgs $failedCanary.run_id --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $gatedRetry.ok -or $gatedRetry.error -notlike '*canary was not approved*') {
+        throw 'An unsent retry bypassed the source run canary'
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {
+    if ($approvalJob) {
+        if (!$approvalJob.HasExited) { $approvalJob.Kill(); $approvalJob.WaitForExit() }
+        $approvalJob.Dispose()
+    }
     if ($waitJob) {
         if (!$waitJob.HasExited) { $waitJob.Kill(); $waitJob.WaitForExit() }
         $waitJob.Dispose()

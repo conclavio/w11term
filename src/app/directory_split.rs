@@ -398,11 +398,7 @@ impl TerminalApp {
             let child = live_tab(
                 label.clone(),
                 Source::Local(shell),
-                self.appearance
-                    .read()
-                    .unwrap()
-                    .interaction
-                    .remote_clipboard_policy(),
+                self.appearance.read().unwrap().pane_preferences(),
             )
             .with_profile(tab.profile_name.clone());
             return Some(child);
@@ -444,11 +440,7 @@ impl TerminalApp {
         let session = Session::start_ssh_with_startup(
             options.clone(),
             TerminalSize::default(),
-            self.appearance
-                .read()
-                .unwrap()
-                .interaction
-                .remote_clipboard_policy(),
+            self.appearance.read().unwrap().pane_preferences(),
             startup.clone(),
             Some(connection),
         );

@@ -1073,7 +1073,7 @@ fn key_command(
             }
         }
         if let Some((vk, scan)) = repeat_scan
-            && details.physical.is_some()
+            && (details.base.is_some() || details.physical.is_some())
             && details.text.is_none()
         {
             // The physical identity still belongs to the initial press, but typing
