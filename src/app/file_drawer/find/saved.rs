@@ -162,6 +162,21 @@ impl List {
             if let Some(size) = size {
                 rows.push(KeyedView::new("size", TextBlock::new().text(size)));
             }
+            let dates = &search.filter.modified_dates;
+            let date_summary = match (dates.from.trim(), dates.through.trim()) {
+                ("", "") => None,
+                ("", through) => Some(format!("Modified through {through} UTC")),
+                (from, "") => Some(format!("Modified from {from} UTC")),
+                (from, through) => Some(format!("Modified {from} through {through} UTC")),
+            };
+            if let Some(summary) = date_summary {
+                rows.push(KeyedView::new(
+                    "dates",
+                    TextBlock::new()
+                        .text(summary)
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
             rows.push(KeyedView::new(
                 "actions",
                 StackPanel::new()

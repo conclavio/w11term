@@ -54,6 +54,27 @@ function Focus-FilenameSearch {
     $query.SetFocus()
     $null = Wait-FilenameSearchFocus
 }
+function Get-AdvancedSearchSummary {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-search-filters-summary')
+    $summary = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    if ($summary) { $summary.Current.Name }
+}
+function Set-AdvancedSearchField([string]$Label, [string]$Value, [string]$ExpectedSummary) {
+    if (Button 'More filters') { Click 'More filters' }
+    $edit = Wait-Until "advanced search field '$Label'" {
+        Find-Element $Label ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $edit.SetFocus()
+    $null = Wait-Until "'$Label' owns keyboard focus" { $edit.Current.HasKeyboardFocus }
+    $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Value)
+    Click 'Hide filters'
+    $null = Wait-Until "collapsed search shows '$ExpectedSummary'" {
+        $summary = Get-AdvancedSearchSummary
+        $summary -and $summary.Contains($ExpectedSummary)
+    }
+}
 function Set-SearchChoice([string]$Control, [string]$Name) {
     $controlType = [System.Windows.Automation.ControlType]::ComboBox
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
@@ -234,7 +255,13 @@ try {
     }
     $value = [System.Windows.Automation.ValuePattern]::Pattern
     $excludeLabel = 'Exclude folder paths (regex)'
-    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    if (Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)) {
+        throw 'Advanced search filters started expanded'
+    }
+    Click 'More filters'
+    $excludeField = Wait-Until 'folder exclusion field is visible after expanding' {
+        Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    }
     $excludeField.GetCurrentPattern($value).SetValue('^nested$')
     $null = Wait-Until 'exclusion edit invalidates the previous results' {
         (Button 'Search') -and !(Button "Reveal $parent/nested")
@@ -274,6 +301,31 @@ try {
         $run = Button 'Search'
         $run -and !$run.Current.IsEnabled
     }
+    $fromLabel = 'Modified from (UTC)'
+    $throughLabel = 'Modified through (UTC)'
+    $fromField = Find-Element $fromLabel ([System.Windows.Automation.ControlType]::Edit)
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    $fromField.GetCurrentPattern($value).SetValue('2037-01-01')
+    $throughField.GetCurrentPattern($value).SetValue('2037-01-01')
+    $null = Wait-Until 'date bounds allow a search without a name' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
+    }
+    $throughField.SetFocus()
+    $null = Wait-Until 'modified through has keyboard focus' { $throughField.Current.HasKeyboardFocus }
+    $null = Press-FocusedKey 13
+    $null = Wait-Until 'date-only search returns the file for the selected UTC day' {
+        (Find-Element '1 matches in 2 folders') -and (Button "Reveal $parent/build-37.log") -and
+            !(Button "Reveal $parent/build-00.log") -and !(Button "Reveal $parent/nested")
+    }
+    $fromField = Find-Element $fromLabel ([System.Windows.Automation.ControlType]::Edit)
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    $fromField.GetCurrentPattern($value).SetValue('')
+    $throughField.GetCurrentPattern($value).SetValue('')
+    $null = Wait-Until 'clearing both dates disables the empty search' {
+        $run = Button 'Search'
+        $run -and !$run.Current.IsEnabled
+    }
     $on = [System.Windows.Automation.ToggleState]::On
     $off = [System.Windows.Automation.ToggleState]::Off
     (Wait-CheckBox 'Regex' $off).Toggle()
@@ -288,15 +340,15 @@ try {
     $newest = "$parent/build-37.log"
     $largeFilesPattern = '^build-[0-9]+\.log$|^nested/nested-content\.txt$'
     $savedExclusion = '^cache$'
+    $savedThrough = '2099-12-31'
     $field.GetCurrentPattern($value).SetValue($largeFilesPattern)
     $null = Wait-Until 'relative-path query is ready before adding exclusions' {
         $run = Button 'Search'
         $run -and $run.Current.IsEnabled
     }
-    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
-    $excludeField.GetCurrentPattern($value).SetValue($savedExclusion)
-    $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
-    $maximumSize.GetCurrentPattern($value).SetValue('1 MiB')
+    Set-AdvancedSearchField $excludeLabel $savedExclusion "Exclude folders $savedExclusion"
+    Set-AdvancedSearchField $maxSizeLabel '1 MiB' 'Max size 1 MiB'
+    Set-AdvancedSearchField $throughLabel $savedThrough "Modified through $savedThrough UTC"
     Click 'Search'
     $null = Wait-Until 'folder-sorted recursive results span two pages' {
         (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
@@ -322,16 +374,23 @@ try {
     }
     $presetName.GetCurrentPattern($value).SetValue('Large build files')
     Click 'Save current search'
-    $null = Wait-Until 'saved preset is written to the SSH profile' {
-        $data = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'.sftp_searches
-        if ($data) {
-            $entry = $data[0].searches.'Large build files'
-            $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
-                $entry.filter.regex -and $entry.filter.match_case -and $entry.filter.match_path -and
-                $entry.filter.exclude_dir_regex -ceq $savedExclusion -and
-                $entry.filter.file_size.maximum -eq 1048576 -and
-                $entry.sort -ceq 'largest'
+    try {
+        $null = Wait-Until 'saved preset is written to the SSH profile' {
+            $data = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'.sftp_searches
+            if ($data) {
+                $entry = $data[0].searches.'Large build files'
+                $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
+                    $entry.filter.regex -and $entry.filter.match_case -and $entry.filter.match_path -and
+                    $entry.filter.exclude_dir_regex -ceq $savedExclusion -and
+                    $entry.filter.file_size.maximum -eq 1048576 -and
+                    $entry.filter.modified_dates.through -ceq $savedThrough -and
+                    $entry.sort -ceq 'largest'
+            }
         }
+    } catch {
+        $data = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'.sftp_searches
+        $saved = $data | ConvertTo-Json -Depth 8 -Compress
+        throw "$_ Observed saved searches: $saved"
     }
     Click 'Hide saved searches'
     Set-SearchChoice 'Sort search results' 'Newest first'
@@ -362,13 +421,25 @@ try {
     $null = Wait-CheckBox 'Regex' $on
     $null = Wait-CheckBox 'Match case' $on
     $null = Wait-CheckBox 'Match path' $on
-    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $null = Wait-Until 'saved advanced filters shown while collapsed' {
+        $summary = Get-AdvancedSearchSummary
+        $summary -and $summary.Contains("Exclude folders $savedExclusion") -and
+            $summary.Contains('Max size 1048576') -and $summary.Contains("Modified through $savedThrough UTC")
+    }
+    Click 'More filters'
+    $excludeField = Wait-Until 'saved advanced fields are visible after expanding' {
+        Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    }
     if ($excludeField.GetCurrentPattern($value).Current.Value -cne $savedExclusion) {
         throw 'Saved search did not restore its folder exclusion'
     }
     $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
     if ($maximumSize.GetCurrentPattern($value).Current.Value -cne '1048576') {
         throw 'Saved search did not restore its maximum size'
+    }
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    if ($throughField.GetCurrentPattern($value).Current.Value -cne $savedThrough) {
+        throw 'Saved search did not restore its modified-through date'
     }
     Click $savedSearchesButton
     Click 'Remove saved search'
@@ -382,6 +453,8 @@ try {
     $excludeField.GetCurrentPattern($value).SetValue('')
     $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
     $maximumSize.GetCurrentPattern($value).SetValue('')
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    $throughField.GetCurrentPattern($value).SetValue('')
     (Wait-CheckBox 'Match path' $on).Toggle()
     $null = Wait-CheckBox 'Match path' $off
     $field = Wait-Until 'filename search field restored' {
@@ -498,11 +571,18 @@ try {
         (Find-Element '2 matches in 2 folders') -and (Find-Element 'Copied 2 paths')
     }
     [IO.File]::WriteAllText((Join-Path $peerRoot 'shell directory/nested-added.txt'), 'added after search')
-    [IO.File]::WriteAllText($refreshGate, $parent)
+    $nestedPath = "$parent/nested"
+    [IO.File]::WriteAllText($refreshGate, $nestedPath)
     Click 'Refresh results'
-    $null = Wait-Until 'previous search results visible with actions disabled during refresh' {
+    $progressId = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-search-progress')
+    $null = Wait-Until 'scan progress and previous results are visible together' {
         $downloadMarked = Button 'Download marked results'
+        $progress = $searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $progressId)
         (Test-Path -LiteralPath (Join-Path $peerRoot 'opendir-paused')) -and
+            $progress -and $progress.Current.Name.Contains("Scanning $nestedPath") -and
+            $progress.Current.Name.Contains('43 entries scanned') -and
+            $progress.Current.Name.Contains('1 folder complete') -and $progress.Current.Name.Contains('2 matches') -and
             (Button "Reveal $parent/nested/nested-content.txt") -and
             $downloadMarked -and !$downloadMarked.Current.IsEnabled
     }
@@ -514,6 +594,7 @@ try {
     [IO.File]::Delete($refreshGate)
     $null = Wait-Until 'cancelled refresh keeps the original results' {
         (Find-Element 'Refresh cancelled. Showing previous results.') -and
+            !$searchView.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $progressId) -and
             (Button "Reveal $parent/nested/nested-content.txt").Current.IsEnabled -and
             !(Button "Reveal $parent/nested-added.txt")
     }

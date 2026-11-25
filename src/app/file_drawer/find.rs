@@ -27,6 +27,7 @@ pub enum Action {
     FocusQuery(u64, u8),
     Query(u64, String),
     SetOption(u64, MatchOption),
+    ShowAdvanced(u64, bool),
     Run(u64),
     Cancel(u64),
     Sort(u64, ResultSort),
@@ -50,6 +51,8 @@ pub enum MatchOption {
     ExcludeDirs(String),
     MinimumSize(String),
     MaximumSize(String),
+    ModifiedFrom(String),
+    ModifiedThrough(String),
 }
 
 #[derive(Default)]
@@ -84,6 +87,7 @@ pub(super) struct Panel {
     input: ElementRef<TextBox>,
     filter: FilenameFilter,
     size: SizeFields,
+    advanced_open: bool,
     sort: ResultSort,
     saved: Option<saved::List>,
     result: Option<FilenameSearch>,
@@ -129,11 +133,39 @@ fn within<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
 }
 
 impl Panel {
+    fn advanced_summary(&self) -> Option<String> {
+        let parts: Vec<_> = [
+            (
+                "Exclude folders",
+                self.filter.exclude_dir_regex.as_str(),
+                "",
+            ),
+            ("Min size", self.size.minimum.trim(), ""),
+            ("Max size", self.size.maximum.trim(), ""),
+            (
+                "Modified from",
+                self.filter.modified_dates.from.trim(),
+                " UTC",
+            ),
+            (
+                "Modified through",
+                self.filter.modified_dates.through.trim(),
+                " UTC",
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, value, _)| !value.is_empty())
+        .map(|(label, value, suffix)| format!("{label} {value}{suffix}"))
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     fn query_optional(&self) -> bool {
         self.filter.kind.is_some()
             || !self.filter.exclude_dir_regex.is_empty()
             || !self.size.minimum.trim().is_empty()
             || !self.size.maximum.trim().is_empty()
+            || !self.filter.modified_dates.is_unrestricted()
     }
 
     fn can_search(&self) -> bool {
@@ -276,7 +308,6 @@ impl Panel {
         };
         let running = self.cancel.as_ref();
         let type_filter = ComboBox::new()
-            .grid_column(1)
             .vertical_alignment(VerticalAlignment::Top)
             .automation_name("Search result type")
             .is_enabled(ready)
@@ -326,53 +357,83 @@ impl Panel {
                     Action::Query(serial, text),
                 ))
             }));
-        let size_field =
-            |label: &str, placeholder: &str, text: &str, option: fn(String) -> MatchOption| {
-                TextBox::new()
-                    .min_width(0.0)
-                    .automation_name(label)
-                    .placeholder_text(placeholder)
-                    .is_enabled(ready)
-                    .text(text)
-                    .on_text_changed(ctx.callback(move |text| {
-                        Message::Files(FileAction::Search(
-                            pane,
-                            generation,
-                            Action::SetOption(serial, option(text)),
-                        ))
-                    }))
-            };
-        let sizes = Grid::new()
-            .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
-            .column_spacing(6.0)
-            .children((
-                size_field(
-                    "Minimum file size",
-                    "Min size",
-                    &self.size.minimum,
-                    MatchOption::MinimumSize,
+        let mut fields = vec![KeyedView::new("pattern", query)];
+        if self.advanced_open {
+            let bound_field =
+                |label: &str, placeholder: &str, text: &str, option: fn(String) -> MatchOption| {
+                    TextBox::new()
+                        .min_width(0.0)
+                        .automation_name(label)
+                        .placeholder_text(placeholder)
+                        .is_enabled(ready)
+                        .text(text)
+                        .on_text_changed(ctx.callback(move |text| {
+                            Message::Files(FileAction::Search(
+                                pane,
+                                generation,
+                                Action::SetOption(serial, option(text)),
+                            ))
+                        }))
+                };
+            let sizes = Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+                .column_spacing(6.0)
+                .children((
+                    bound_field(
+                        "Minimum file size",
+                        "Min size",
+                        &self.size.minimum,
+                        MatchOption::MinimumSize,
+                    ),
+                    bound_field(
+                        "Maximum file size",
+                        "Max size",
+                        &self.size.maximum,
+                        MatchOption::MaximumSize,
+                    )
+                    .grid_column(1),
+                ));
+            let dates = Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+                .column_spacing(6.0)
+                .children((
+                    bound_field(
+                        "Modified from (UTC)",
+                        "Modified from",
+                        &self.filter.modified_dates.from,
+                        MatchOption::ModifiedFrom,
+                    ),
+                    bound_field(
+                        "Modified through (UTC)",
+                        "Modified through",
+                        &self.filter.modified_dates.through,
+                        MatchOption::ModifiedThrough,
+                    )
+                    .grid_column(1),
+                ));
+            fields.extend([
+                KeyedView::new(
+                    "exclude",
+                    bound_field(
+                        "Exclude folder paths (regex)",
+                        "Exclude folder paths (regex)",
+                        &self.filter.exclude_dir_regex,
+                        MatchOption::ExcludeDirs,
+                    ),
                 ),
-                size_field(
-                    "Maximum file size",
-                    "Max size",
-                    &self.size.maximum,
-                    MatchOption::MaximumSize,
-                )
-                .grid_column(1),
-            ));
-        let exclude_dirs = TextBox::new()
-            .min_width(0.0)
-            .automation_name("Exclude folder paths (regex)")
-            .placeholder_text("Exclude folder paths (regex)")
-            .is_enabled(ready)
-            .text(&self.filter.exclude_dir_regex)
-            .on_text_changed(ctx.callback(move |text| {
-                Message::Files(FileAction::Search(
-                    pane,
-                    generation,
-                    Action::SetOption(serial, MatchOption::ExcludeDirs(text)),
-                ))
-            }));
+                KeyedView::new("sizes", sizes),
+                KeyedView::new("dates", dates),
+            ]);
+        }
+        let advanced_toggle = button(
+            if self.advanced_open {
+                "Hide filters"
+            } else {
+                "More filters"
+            },
+            Action::ShowAdvanced(serial, !self.advanced_open),
+            true,
+        );
         let mut rows = vec![
             KeyedView::new(
                 "back",
@@ -397,8 +458,11 @@ impl Panel {
                         StackPanel::new()
                             .automation_id(crate::input::file_search_tag(pane))
                             .spacing(6.0)
-                            .children((query, exclude_dirs, sizes)),
-                        type_filter,
+                            .keyed_children(fields),
+                        StackPanel::new()
+                            .grid_column(1)
+                            .spacing(6.0)
+                            .children((type_filter, advanced_toggle)),
                     )),
             ),
         ];
@@ -431,6 +495,17 @@ impl Panel {
                     check("Match path", self.filter.match_path, MatchOption::MatchPath),
                 )),
         ));
+        if !self.advanced_open
+            && let Some(summary) = self.advanced_summary()
+        {
+            rows.push(KeyedView::new(
+                "advanced-summary",
+                TextBlock::new()
+                    .automation_id("sftp-search-filters-summary")
+                    .text(summary)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         let run = if let Some(cancel) = running {
             button(
                 "Cancel search",
@@ -558,6 +633,34 @@ impl Panel {
                 TextBlock::new()
                     .automation_id("sftp-search-status")
                     .text(&files.status)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        if let Some(progress) = files.search_progress(serial) {
+            let entries = if progress.scanned_entries == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            let folders = if progress.scanned_directories == 1 {
+                "folder"
+            } else {
+                "folders"
+            };
+            let matches = if progress.matches == 1 {
+                "match"
+            } else {
+                "matches"
+            };
+            let counts = format!(
+                "{} {entries} scanned · {} {folders} complete · {} {matches}",
+                progress.scanned_entries, progress.scanned_directories, progress.matches
+            );
+            rows.push(KeyedView::new(
+                "search-progress",
+                TextBlock::new()
+                    .automation_id("sftp-search-progress")
+                    .text(format!("Scanning {}\n{counts}", progress.folder))
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -829,6 +932,15 @@ impl Panel {
 }
 
 impl FileDrawer {
+    fn search_progress(&self, serial: u64) -> Option<SearchProgress> {
+        let pending = self.pending.as_ref()?;
+        if !matches!(pending.step, Step::Search(current, _) if current == serial) {
+            return None;
+        }
+        let progress = pending.search_progress.as_ref()?.borrow();
+        (!progress.folder.is_empty()).then(|| progress.clone())
+    }
+
     pub(super) fn search_serial(&self) -> Option<u64> {
         self.search.as_ref().map(|panel| panel.serial)
     }
@@ -986,6 +1098,7 @@ impl FileDrawer {
             kind: filter.kind,
             exclude_dir_regex: filter.exclude_dir_regex,
             file_size: filter.file_size,
+            modified_dates: filter.modified_dates,
         };
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
@@ -1121,6 +1234,7 @@ impl FileDrawer {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 size: SizeFields::default(),
+                advanced_open: false,
                 sort: ResultSort::default(),
                 saved: None,
                 result: None,
@@ -1183,6 +1297,10 @@ impl FileDrawer {
                     MatchOption::ExcludeDirs(regex) => panel.filter.exclude_dir_regex = regex,
                     MatchOption::MinimumSize(value) => panel.size.minimum = value,
                     MatchOption::MaximumSize(value) => panel.size.maximum = value,
+                    MatchOption::ModifiedFrom(value) => panel.filter.modified_dates.from = value,
+                    MatchOption::ModifiedThrough(value) => {
+                        panel.filter.modified_dates.through = value
+                    }
                 }
                 if (&panel.filter, &panel.size.minimum, &panel.size.maximum)
                     != (&previous.0, &previous.1, &previous.2)
@@ -1190,6 +1308,9 @@ impl FileDrawer {
                     panel.clear_results();
                     self.status.clear();
                 }
+            }
+            Action::ShowAdvanced(serial, expanded) if serial == panel.serial => {
+                panel.advanced_open = expanded;
             }
             Action::Run(serial) if serial == panel.serial && !busy && panel.can_search() => {
                 self.start_filename_search(pane, session, ctx, None);
@@ -1288,6 +1409,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 size: SizeFields::default(),
+                advanced_open: false,
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(result),
@@ -1298,6 +1420,25 @@ mod tests {
             }),
             ..FileDrawer::default()
         }
+    }
+
+    #[test]
+    fn collapsed_advanced_summary_reflects_the_current_search_criteria() {
+        let mut drawer = search_drawer(search_result("/project", &[]));
+        let panel = drawer.search.as_mut().unwrap();
+        assert!(!panel.advanced_open);
+        assert_eq!(panel.advanced_summary(), None);
+        panel.filter.exclude_dir_regex = "^generated/".into();
+        panel.size.minimum = " 1 KiB ".into();
+        panel.size.maximum = "0".into();
+        panel.filter.modified_dates.from = "2025-01-01".into();
+        panel.filter.modified_dates.through = "2025-01-31".into();
+        assert_eq!(
+            panel.advanced_summary().as_deref(),
+            Some(
+                "Exclude folders ^generated/ · Min size 1 KiB · Max size 0 · Modified from 2025-01-01 UTC · Modified through 2025-01-31 UTC"
+            )
+        );
     }
 
     #[test]
@@ -1434,6 +1575,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 size: SizeFields::default(),
+                advanced_open: false,
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(before),
@@ -1506,8 +1648,10 @@ mod tests {
                     kind: Some(EntryKind::File),
                     exclude_dir_regex: String::new(),
                     file_size: FileSizeRange::default(),
+                    modified_dates: Default::default(),
                 },
                 size: SizeFields::default(),
+                advanced_open: false,
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1584,6 +1728,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 size: SizeFields::default(),
+                advanced_open: false,
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1651,6 +1796,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 size: SizeFields::default(),
+                advanced_open: false,
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1721,6 +1867,7 @@ mod tests {
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
                 size: SizeFields::default(),
+                advanced_open: false,
                 sort: ResultSort::default(),
                 saved: None,
                 result: Some(FilenameSearch {
@@ -1813,6 +1960,7 @@ mod tests {
             input: ElementRef::new(),
             filter: FilenameFilter::default(),
             size: SizeFields::default(),
+            advanced_open: false,
             sort: ResultSort::default(),
             saved: None,
             result: Some(FilenameSearch {
