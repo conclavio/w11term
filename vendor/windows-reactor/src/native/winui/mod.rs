@@ -38,6 +38,7 @@ mod element_factory;
 mod generated;
 pub use generated::*;
 mod framework;
+mod pointer_cursor;
 mod grid;
 #[cfg(feature = "test")]
 pub(crate) mod test;

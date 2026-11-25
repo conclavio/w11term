@@ -2,6 +2,28 @@ use super::*;
 use w11term::pane_layout::{Axis, Layout};
 
 const DIVIDER: f64 = 6.0;
+fn native_pointer_shape(
+    shape: wezterm_term::PointerShape,
+) -> windows_reactor::InputSystemCursorShape {
+    use wezterm_term::PointerShape::*;
+    use windows_reactor::InputSystemCursorShape as Native;
+    match shape {
+        Default => Native::Arrow,
+        Crosshair | Cell => Native::Cross,
+        Pointer | Grab => Native::Hand,
+        Help => Native::Help,
+        Text => Native::IBeam,
+        Move | Grabbing => Native::SizeAll,
+        Northeast | Southwest | NortheastSouthwest => Native::SizeNortheastSouthwest,
+        North | South | NorthSouth => Native::SizeNorthSouth,
+        Northwest | Southeast | NorthwestSoutheast => Native::SizeNorthwestSoutheast,
+        East | West | EastWest => Native::SizeWestEast,
+        NotAllowed | NoDrop => Native::UniversalNo,
+        Wait => Native::Wait,
+        Progress => Native::AppStarting,
+    }
+}
+
 type CanvasArea = Rc<Cell<Option<(f32, f32, f32)>>>;
 
 /// Locate a leaf using the measured canvases on both sides of every divider.
@@ -613,30 +635,50 @@ impl TerminalApp {
         };
         let drop_target = self.pane_drop_target(id, tab);
         let content = match canvas {
-            Ok(canvas) => Border::new()
-                .background(Color::rgb(14, 16, 20))
-                .drop_policy(drop_target.map(|_| {
-                    DragDropPolicy::new().storage_items(
-                        DragDropAction::new(DragDropOperation::Copy).caption("Insert file paths"),
+            Ok(canvas) => {
+                let mut border = Border::new()
+                    .background(Color::rgb(14, 16, 20))
+                    .drop_policy(drop_target.map(|_| {
+                        DragDropPolicy::new().storage_items(
+                            DragDropAction::new(DragDropOperation::Copy)
+                                .caption("Insert file paths"),
+                        )
+                    }))
+                    .on_drop(context.callback(move |data| {
+                        drop_target.map_or(Message::ControlIdle, |target| target.data(data))
+                    }))
+                    .capture_pointer_on_press(true)
+                    .on_pointer_capture_lost(context.callback(move |_| Message::CaptureLost(id)))
+                    .on_pointer_entered(context.callback(move |_| Message::HoverPane(id)))
+                    .on_pointer_exited(context.callback(move |_| Message::PointerExit(id)))
+                    .on_pointer_pressed(
+                        context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Press)),
                     )
-                }))
-                .on_drop(context.callback(move |data| {
-                    drop_target.map_or(Message::ControlIdle, |target| target.data(data))
-                }))
-                .capture_pointer_on_press(true)
-                .on_pointer_capture_lost(context.callback(move |_| Message::CaptureLost(id)))
-                .on_pointer_entered(context.callback(move |_| Message::HoverPane(id)))
-                .on_pointer_exited(context.callback(move |_| Message::PointerExit(id)))
-                .on_pointer_pressed(
-                    context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Press)),
-                )
-                .on_pointer_released(
-                    context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Release)),
-                )
-                .on_pointer_moved(
-                    context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Move)),
-                )
-                .content(canvas),
+                    .on_pointer_released(
+                        context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Release)),
+                    )
+                    .on_pointer_moved(
+                        context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Move)),
+                    );
+                let local_pointer = tab.find.open
+                    || tab.hover.borrow().is_some()
+                    || tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
+                    || self
+                        .hints
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|mode| mode.pane == id)
+                    || self
+                        .copy_mode
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|mode| mode.pane == id);
+                if !local_pointer && let Some(shape) = tab.session.frames.load().pointer_shape {
+                    border = border.pointer_cursor(native_pointer_shape(shape));
+                }
+                border.content(canvas)
+            }
+
             Err(reason) => Border::new()
                 .on_pointer_pressed(context.callback(move |_| Message::PaneFocus(id)))
                 .content(

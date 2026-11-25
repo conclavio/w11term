@@ -1105,6 +1105,9 @@ pub fn set_property(
                 .SetScaleTransition(&transition)
                 .map_err(native_error)
         }
+        (Handle::Border(control), PropertyId::BorderPointerCursor, PropertyValue::I32(shape)) => {
+            super::pointer_cursor::set(control, Some(*shape)).map_err(native_error)
+        }
         (Handle::Border(_), PropertyId::BorderCapturePointerOnPress, PropertyValue::Bool(_)) => {
             Err(RuntimeError::UnsupportedKind)
         }
@@ -3055,6 +3058,9 @@ pub fn clear_property(handle: &Handle, property: PropertyId) -> Result<(), Runti
             .map_err(native_error)?
             .SetScaleTransition(None::<&Vector3Transition>)
             .map_err(native_error),
+        (Handle::Border(control), PropertyId::BorderPointerCursor) => {
+            super::pointer_cursor::set(control, None).map_err(native_error)
+        }
         (Handle::Border(_), PropertyId::BorderCapturePointerOnPress) => {
             Err(RuntimeError::UnsupportedKind)
         }

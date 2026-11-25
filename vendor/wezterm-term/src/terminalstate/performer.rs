@@ -795,6 +795,7 @@ impl Performer<'_> {
             // reset graphic rendition, erase all positions, move active position to first
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
+                self.pointer_shapes = Default::default();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.terminal_reset();
                 }
@@ -1074,6 +1075,17 @@ impl Performer<'_> {
                 self.set_hyperlink(link);
             }
             OperatingSystemCommand::Unspecified(unspec) => {
+                match unspec.as_slice() {
+                    [selector, body] if selector == b"22" => {
+                        self.perform_pointer_shape(body);
+                        return;
+                    }
+                    [selector] if selector == b"22" => {
+                        self.perform_pointer_shape(b"");
+                        return;
+                    }
+                    _ => {}
+                }
                 if let [selector, body] = unspec.as_slice() {
                     if selector == b"21" {
                         self.perform_kitty_colors(body);

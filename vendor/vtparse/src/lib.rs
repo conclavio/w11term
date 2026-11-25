@@ -330,6 +330,7 @@ const MAX_OSC_REMOTE_HOST_BYTES: usize = 1024;
 const MAX_OSC_PROGRAM_STATUS_BYTES: usize = 4096 - b"\x1b]7501;\x1b\\".len();
 // A single OSC 21 can carry all 256 palette entries and named colors.
 const MAX_OSC_KITTY_COLORS_BYTES: usize = 16 * 1024;
+const MAX_OSC_POINTER_NAMES_BYTES: usize = 4096;
 pub const MAX_REPORTED_COMMAND_BYTES: usize = 4096;
 const MAX_PARAMS: usize = 256;
 
@@ -376,6 +377,9 @@ impl OscState {
             }
             if self.num_params == 1 && self.buffer.as_slice() == b"21" {
                 self.literal_field = Some((2, MAX_OSC_KITTY_COLORS_BYTES));
+            }
+            if self.num_params == 1 && self.buffer.as_slice() == b"22" {
+                self.literal_field = Some((2, MAX_OSC_POINTER_NAMES_BYTES));
             }
             if self.num_params == 2 && self.param_indices[0] == 1 && self.buffer.as_slice() == b"99"
             {
@@ -466,8 +470,15 @@ impl OscState {
 
     fn discard_literal(&mut self) {
         if let Some((prefix, _)) = self.literal_field {
-            // Dispatch the empty report at ST, never a usable prefix.
-            self.buffer.truncate(prefix);
+            if self.literal_field == Some((2, MAX_OSC_POINTER_NAMES_BYTES)) {
+                // An empty OSC 22 is a real pointer reset. Discard the entire
+                // command so a malformed request cannot perform that reset.
+                self.buffer.clear();
+                self.num_params = 0;
+            } else {
+                // Dispatch the empty report at ST, never a usable prefix.
+                self.buffer.truncate(prefix);
+            }
             self.full = true;
         }
     }

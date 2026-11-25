@@ -86,6 +86,28 @@ pub mod public {
         Warning,
         Error,
     }
+    /// A stock Windows cursor shown over a border and its child content.
+    #[non_exhaustive]
+    #[repr(i32)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum InputSystemCursorShape {
+        Arrow = 0,
+        Cross = 1,
+        Hand = 3,
+        Help = 4,
+        IBeam = 5,
+        SizeAll = 6,
+        SizeNortheastSouthwest = 7,
+        SizeNorthSouth = 8,
+        SizeNorthwestSoutheast = 9,
+        SizeWestEast = 10,
+        UniversalNo = 11,
+        UpArrow = 12,
+        Wait = 13,
+        Pin = 14,
+        Person = 15,
+        AppStarting = 16,
+    }
     #[non_exhaustive]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum ListViewSelectionMode {
@@ -708,6 +730,7 @@ pub mod public {
         scale: Property<f64>,
         scale_transition: Property<std::time::Duration>,
         capture_pointer_on_press: Property<bool>,
+        pointer_cursor: Property<InputSystemCursorShape>,
         drop_policy: Property<DragDropPolicy>,
         events: Option<std::rc::Rc<BorderEvents>>,
         element_state: Option<std::rc::Rc<ElementState>>,
@@ -832,6 +855,11 @@ pub mod public {
         pub fn capture_pointer_on_press(mut self, value: impl Into<Option<bool>>) -> Self {
             let value = value.into();
             self.capture_pointer_on_press = Property::from(value);
+            self
+        }
+        /// Applies a system pointer to this border. None inherits the native cursor.
+        pub fn pointer_cursor(mut self, value: impl Into<Option<InputSystemCursorShape>>) -> Self {
+            self.pointer_cursor = Property::from(value.into());
             self
         }
         pub fn drop_policy(mut self, value: impl Into<Option<DragDropPolicy>>) -> Self {
@@ -6520,6 +6548,7 @@ pub mod public {
                         scale,
                         scale_transition,
                         capture_pointer_on_press,
+                        pointer_cursor,
                         drop_policy,
                         events,
                         element_state,
@@ -6537,6 +6566,7 @@ pub mod public {
                             scale,
                             scale_transition,
                             capture_pointer_on_press,
+                            pointer_cursor,
                             drop_policy,
                             events,
                         })),
@@ -8264,6 +8294,7 @@ pub mod public {
                         && f64_property_eq(&value.scale, &mounted.scale)
                         && value.scale_transition == mounted.scale_transition
                         && value.capture_pointer_on_press == mounted.capture_pointer_on_press
+                        && value.pointer_cursor == mounted.pointer_cursor
                         && value.drop_policy == mounted.drop_policy
                         && value.events == mounted.events
                 }
@@ -9591,6 +9622,13 @@ impl MountedPropsExt for MountedProps {
                     match &values.capture_pointer_on_press {
                         Property::Inherited => None,
                         Property::Set(value) => Some(PropertyValueRef::Bool(*value)),
+                    },
+                );
+                visit(
+                    PropertyId::BorderPointerCursor,
+                    match values.pointer_cursor {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::I32(value as i32)),
                     },
                 );
                 visit(
@@ -12686,6 +12724,7 @@ pub(crate) struct BorderMountedProps {
     scale: Property<f64>,
     scale_transition: Property<std::time::Duration>,
     capture_pointer_on_press: Property<bool>,
+    pointer_cursor: Property<InputSystemCursorShape>,
     drop_policy: Property<DragDropPolicy>,
     events: Option<std::rc::Rc<BorderEvents>>,
 }
@@ -12700,6 +12739,7 @@ impl PartialEq for BorderMountedProps {
             && f64_property_eq(&self.scale, &other.scale)
             && self.scale_transition == other.scale_transition
             && self.capture_pointer_on_press == other.capture_pointer_on_press
+            && self.pointer_cursor == other.pointer_cursor
             && self.drop_policy == other.drop_policy
             && self.events == other.events
     }
@@ -13861,6 +13901,7 @@ pub enum PropertyId {
     BorderScale,
     BorderScaleTransition,
     BorderCapturePointerOnPress,
+    BorderPointerCursor,
     BorderAllowDrop,
     BreadcrumbBarItemsSource,
     StackPanelOrientation,
@@ -15053,6 +15094,17 @@ const BORDER_PROPERTIES: &[PropertyDescriptor] = &[
         field: "capture_pointer_on_press",
         value: "Bool",
         interface: "Microsoft.UI.Xaml.IUIElement",
+        clearable: true,
+        feedback: None,
+        feedback_contract: None,
+        observes_feedback: false,
+    },
+    PropertyDescriptor {
+        id: PropertyId::BorderPointerCursor,
+        name: "PointerCursor",
+        field: "pointer_cursor",
+        value: "InputSystemCursorShape",
+        interface: "Microsoft.UI.Xaml.IUIElementProtected",
         clearable: true,
         feedback: None,
         feedback_contract: None,

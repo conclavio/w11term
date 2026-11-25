@@ -38,6 +38,7 @@ mod kitty_colors;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod pointer;
 mod program_status;
 mod rectangle;
 mod rendition;
@@ -47,6 +48,7 @@ mod sixel;
 mod title;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
+pub use pointer::PointerShape;
 pub use program_status::{ProgramBlockKind, ProgramState, ProgramStatus};
 
 #[derive(Default)]
@@ -510,6 +512,7 @@ pub struct TerminalState {
     unscrolled_rows: usize,
     saved_private_modes: SavedPrivateModes,
     sgr_stack: sgr_stack::SgrStack,
+    pointer_shapes: [pointer::Stack; 2],
     attribute_extent: u8,
 
     /// The unicode version that is in effect
@@ -785,6 +788,7 @@ impl TerminalState {
             unscrolled_rows: 0,
             saved_private_modes: SavedPrivateModes::default(),
             sgr_stack: Default::default(),
+            pointer_shapes: Default::default(),
             attribute_extent: 0,
             seqno,
             unicode_version,
@@ -1984,6 +1988,7 @@ impl TerminalState {
                 }
             }
             Device::SoftReset => {
+                self.pointer_shapes = Default::default();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.terminal_reset();
                 }

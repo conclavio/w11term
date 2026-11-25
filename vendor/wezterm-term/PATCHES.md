@@ -107,6 +107,9 @@ The original MIT license is preserved in `LICENSE.md`.
   sibling vtparse crate retains its literal body within 16 KiB so a batch can
   reach every palette index. OSC 30001 and 30101 use the xterm stack.
 
+- Kitty OSC 22 tracks bounded pointer-shape stacks on both screens, replies to
+  capability queries, and exposes the selected shape to the embedding.
+
 - XTSAVE and XTRESTORE preserve supported DEC private modes, including the
   alternate-buffer selector and the mouse reporting and encoding modes. Saved
   values are scoped to the connection and cleared by full reset.

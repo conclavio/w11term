@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 use wezterm_term::color::{ColorPalette, SelectionColors, SrgbaTuple};
 use wezterm_term::config::NewlineCanon;
 use wezterm_term::{
-    CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
+    CellAttributes, CursorPosition, Line, PointerShape, Terminal, TerminalConfiguration,
+    TerminalSize,
 };
 
 mod color_scheme;
@@ -653,6 +654,7 @@ pub struct Snapshot {
     pub visual_bell_color: Option<SrgbaTuple>,
     pub cursor: CursorPosition,
     pub cursor_visible: bool,
+    pub pointer_shape: Option<PointerShape>,
     pub cols: usize,
     pub scroll_offset: usize,
     pub title: String,
@@ -905,6 +907,7 @@ impl Snapshot {
             cursor,
             cursor_visible: offset == 0
                 && cursor.visibility == termwiz::surface::CursorVisibility::Visible,
+            pointer_shape: terminal.application_pointer_shape(),
             cols: screen.physical_cols,
             scroll_offset: offset,
             title: terminal.get_title().to_owned(),
@@ -1005,6 +1008,7 @@ impl Snapshot {
             && self.alternate == old.alternate
             && self.bracketed_paste == old.bracketed_paste
             && self.cursor_visible == old.cursor_visible
+            && self.pointer_shape == old.pointer_shape
             && self.mouse_grabbed == old.mouse_grabbed
             && (
                 self.cursor.x,
@@ -2302,6 +2306,50 @@ mod tests {
         assert_eq!(second.attrs().background(), ColorAttribute::PaletteIndex(4));
         assert_eq!(second.attrs().intensity(), Intensity::Normal);
         assert_eq!(second.attrs().underline(), Underline::None);
+    }
+
+    #[test]
+    fn kitty_pointer_queries_and_stacks_follow_the_active_screen() {
+        let (mut term, mut out) = engine();
+        for byte in b"\x1b]22;hand2\x07\x1b]22;>help,crosshair\x1b\\" {
+            term.advance_bytes([*byte]);
+        }
+        term.advance_bytes(b"\x1b]22;?__current__,__default__,__grabbed__,text,copy,unknown\x07");
+        assert_eq!(
+            receive(&mut out),
+            b"\x1b]22;crosshair,default,default,1,0,0\x1b\\"
+        );
+        term.advance_bytes(b"\x1b]22;=ew-resize\x07\x1b]22;<ignored\x07");
+        assert_eq!(term.application_pointer_shape(), Some(PointerShape::Help));
+        term.advance_bytes(b"\x1b[?1049h");
+        assert_eq!(term.application_pointer_shape(), None);
+        term.advance_bytes(b"\x1b]22;wait\x07\x1b[?1049l");
+        assert_eq!(term.application_pointer_shape(), Some(PointerShape::Help));
+        term.advance_bytes(b"\x1b]22;\x07\x1b]22;?__current__\x07");
+        assert_eq!(receive(&mut out), b"\x1b]22;0\x1b\\");
+        term.advance_bytes(b"\x1b]22;<\x07\x1b[?1049h");
+        assert_eq!(term.application_pointer_shape(), Some(PointerShape::Wait));
+        term.advance_bytes(b"\x1b[!p\x1b[?1049l");
+        assert_eq!(term.application_pointer_shape(), None);
+        term.advance_bytes(b"\x1b]22;text\x07\x1bc");
+        assert_eq!(term.application_pointer_shape(), None);
+        term.advance_bytes(b"\x1b]22;text\x07");
+        term.reset_connection();
+        assert_eq!(term.application_pointer_shape(), None);
+    }
+
+    #[test]
+    fn kitty_pointer_eviction_and_invalid_requests_preserve_the_visible_shape() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b]22;pointer\x07");
+        term.advance_bytes(format!("\x1b]22;>{}wait\x07", "wait,".repeat(15)));
+        term.advance_bytes(format!("\x1b]22;>text,{}\x07", "x".repeat(4200)));
+        term.advance_bytes(b"\x1b]22;unknown\x07\x1b]22;?__current__\x07");
+        assert_eq!(receive(&mut out), b"\x1b]22;wait\x1b\\");
+        for _ in 0..16 {
+            term.advance_bytes(b"\x1b]22;<\x07");
+        }
+        assert_eq!(term.application_pointer_shape(), None);
     }
 
     #[test]
