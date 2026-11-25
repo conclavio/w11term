@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use w11term::{
     control::Request,
     sftp::{
-        Attributes, DEFAULT_TIMEOUT, EntryKind, FileSizeRange, FilenameFilter, Operation,
-        normalize_sha256,
+        Attributes, DEFAULT_TIMEOUT, EntryKind, FileSizeRange, FilenameFilter, ModifiedDateRange,
+        Operation, normalize_sha256,
     },
 };
 
@@ -21,6 +21,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   find ROOT [QUERY] [--regex] [--match-case] [--match-path] [--kind file|directory|symlink]\n\
        [--exclude-dir-regex PATTERN] [--min-size SIZE] [--max-size SIZE]\n\
+       [--modified-from YYYY-MM-DD] [--modified-through YYYY-MM-DD]\n\
   sha256 PATH [--max-bytes N]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -34,6 +35,7 @@ ATTRS: --size N --uid N --gid N --permissions OCTAL --atime UNIX_SECONDS --mtime
 Find matches filenames by default. --match-path matches slash-separated paths relative to ROOT.\n\
 --exclude-dir-regex skips matching relative folder paths and their contents.\n\
 Size limits are inclusive and accept whole bytes or binary units (for example 16MiB).\n\
+Modification date limits are inclusive UTC calendar dates.\n\
 Underscore spellings (remove_file, remove_dir) are accepted. Use -- before paths starting with --.\n\
 Transfers stream through the GUI's existing SSH connection. Folder transfers require a new\n\
 destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
@@ -264,7 +266,12 @@ pub fn parse(
                 kind,
                 exclude_dir_regex: opts.remove("--exclude-dir-regex").unwrap_or_default(),
                 file_size,
+                modified_dates: ModifiedDateRange {
+                    from: opts.remove("--modified-from").unwrap_or_default(),
+                    through: opts.remove("--modified-through").unwrap_or_default(),
+                },
             };
+            filter.modified_dates.validate()?;
             ensure!(
                 filter.valid_query(&query),
                 "Enter a search pattern up to 256 bytes or add a search filter"
@@ -283,6 +290,9 @@ pub fn parse(
             }
             if !file_size.is_unrestricted() {
                 fields.insert("file_size".into(), json!(file_size));
+            }
+            if !filter.modified_dates.is_unrestricted() {
+                fields.insert("modified_dates".into(), json!(filter.modified_dates));
             }
         }
         "sha256" => {
@@ -659,6 +669,74 @@ mod tests {
                 "directory",
             ],
             &["ls", "--pane", "2", "/repo", "--min-size", "4 KiB"],
+        ] {
+            assert!(p(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn find_accepts_utc_date_bounds_and_rejects_invalid_calendar_dates() {
+        let (_, request) = p(&[
+            "find",
+            "--pane",
+            "2",
+            "/repo",
+            "--modified-from",
+            "2024-02-29",
+            "--modified-through",
+            "2024-03-01",
+        ])
+        .unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { query, modified_dates, .. }, ..
+        } if query.is_empty() && modified_dates.from == "2024-02-29" && modified_dates.through == "2024-03-01"));
+        let (_, request) = p(&[
+            "find",
+            "--pane",
+            "2",
+            "/repo",
+            "--modified-through",
+            "1969-12-31",
+        ])
+        .unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { modified_dates, .. }, ..
+        } if modified_dates.from.is_empty() && modified_dates.through == "1969-12-31"));
+        for args in [
+            &[
+                "find",
+                "--pane",
+                "2",
+                "/repo",
+                "--modified-through",
+                "2025-02-29",
+            ][..],
+            &[
+                "find",
+                "--pane",
+                "2",
+                "/repo",
+                "--modified-from",
+                "2025-2-01",
+            ],
+            &[
+                "find",
+                "--pane",
+                "2",
+                "/repo",
+                "--modified-from",
+                "2025-03-01",
+                "--modified-through",
+                "2025-02-01",
+            ],
+            &[
+                "ls",
+                "--pane",
+                "2",
+                "/repo",
+                "--modified-from",
+                "2025-02-01",
+            ],
         ] {
             assert!(p(args).is_err(), "{args:?}");
         }

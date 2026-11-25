@@ -274,6 +274,31 @@ try {
         $run = Button 'Search'
         $run -and !$run.Current.IsEnabled
     }
+    $fromLabel = 'Modified from (UTC)'
+    $throughLabel = 'Modified through (UTC)'
+    $fromField = Find-Element $fromLabel ([System.Windows.Automation.ControlType]::Edit)
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    $fromField.GetCurrentPattern($value).SetValue('2037-01-01')
+    $throughField.GetCurrentPattern($value).SetValue('2037-01-01')
+    $null = Wait-Until 'date bounds allow a search without a name' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
+    }
+    $throughField.SetFocus()
+    $null = Wait-Until 'modified through has keyboard focus' { $throughField.Current.HasKeyboardFocus }
+    $null = Press-FocusedKey 13
+    $null = Wait-Until 'date-only search returns the file for the selected UTC day' {
+        (Find-Element '1 matches in 2 folders') -and (Button "Reveal $parent/build-37.log") -and
+            !(Button "Reveal $parent/build-00.log") -and !(Button "Reveal $parent/nested")
+    }
+    $fromField = Find-Element $fromLabel ([System.Windows.Automation.ControlType]::Edit)
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    $fromField.GetCurrentPattern($value).SetValue('')
+    $throughField.GetCurrentPattern($value).SetValue('')
+    $null = Wait-Until 'clearing both dates disables the empty search' {
+        $run = Button 'Search'
+        $run -and !$run.Current.IsEnabled
+    }
     $on = [System.Windows.Automation.ToggleState]::On
     $off = [System.Windows.Automation.ToggleState]::Off
     (Wait-CheckBox 'Regex' $off).Toggle()
@@ -288,6 +313,13 @@ try {
     $newest = "$parent/build-37.log"
     $largeFilesPattern = '^build-[0-9]+\.log$|^nested/nested-content\.txt$'
     $savedExclusion = '^cache$'
+    $savedThrough = '2099-12-31'
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    $throughField.GetCurrentPattern($value).SetValue($savedThrough)
+    $null = Wait-Until 'modified-through date is applied before the other saved criteria' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
+    }
     $field.GetCurrentPattern($value).SetValue($largeFilesPattern)
     $null = Wait-Until 'relative-path query is ready before adding exclusions' {
         $run = Button 'Search'
@@ -322,16 +354,23 @@ try {
     }
     $presetName.GetCurrentPattern($value).SetValue('Large build files')
     Click 'Save current search'
-    $null = Wait-Until 'saved preset is written to the SSH profile' {
-        $data = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'.sftp_searches
-        if ($data) {
-            $entry = $data[0].searches.'Large build files'
-            $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
-                $entry.filter.regex -and $entry.filter.match_case -and $entry.filter.match_path -and
-                $entry.filter.exclude_dir_regex -ceq $savedExclusion -and
-                $entry.filter.file_size.maximum -eq 1048576 -and
-                $entry.sort -ceq 'largest'
+    try {
+        $null = Wait-Until 'saved preset is written to the SSH profile' {
+            $data = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'.sftp_searches
+            if ($data) {
+                $entry = $data[0].searches.'Large build files'
+                $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
+                    $entry.filter.regex -and $entry.filter.match_case -and $entry.filter.match_path -and
+                    $entry.filter.exclude_dir_regex -ceq $savedExclusion -and
+                    $entry.filter.file_size.maximum -eq 1048576 -and
+                    $entry.filter.modified_dates.through -ceq $savedThrough -and
+                    $entry.sort -ceq 'largest'
+            }
         }
+    } catch {
+        $data = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'.sftp_searches
+        $saved = $data | ConvertTo-Json -Depth 8 -Compress
+        throw "$_ Observed saved searches: $saved"
     }
     Click 'Hide saved searches'
     Set-SearchChoice 'Sort search results' 'Newest first'
@@ -370,6 +409,10 @@ try {
     if ($maximumSize.GetCurrentPattern($value).Current.Value -cne '1048576') {
         throw 'Saved search did not restore its maximum size'
     }
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    if ($throughField.GetCurrentPattern($value).Current.Value -cne $savedThrough) {
+        throw 'Saved search did not restore its modified-through date'
+    }
     Click $savedSearchesButton
     Click 'Remove saved search'
     $null = Wait-Until 'removed preset disappears from picker and profile' {
@@ -382,6 +425,8 @@ try {
     $excludeField.GetCurrentPattern($value).SetValue('')
     $maximumSize = Find-Element $maxSizeLabel ([System.Windows.Automation.ControlType]::Edit)
     $maximumSize.GetCurrentPattern($value).SetValue('')
+    $throughField = Find-Element $throughLabel ([System.Windows.Automation.ControlType]::Edit)
+    $throughField.GetCurrentPattern($value).SetValue('')
     (Wait-CheckBox 'Match path' $on).Toggle()
     $null = Wait-CheckBox 'Match path' $off
     $field = Wait-Until 'filename search field restored' {

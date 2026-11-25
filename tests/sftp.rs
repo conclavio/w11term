@@ -691,6 +691,10 @@ impl russh_sftp::server::Handler for Files {
         if self.root.join("tree-unknown-size").is_file() {
             attrs.size = None;
         }
+        if self.root.join("tree-unknown-mtime").is_file() {
+            attrs.atime = None;
+            attrs.mtime = None;
+        }
         if path == "/tree/socket" {
             attrs.permissions = Some(0o140600);
         }
@@ -783,6 +787,7 @@ impl russh_sftp::server::Handler for Files {
         }
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
         let omit_size = fs::read_to_string(self.root.join("omit-listed-size")).ok();
+        let omit_mtime = fs::read_to_string(self.root.join("omit-listed-mtime")).ok();
         if path == "/tree"
             && let Ok(names) = fs::read_to_string(self.root.join("tree-test-names"))
         {
@@ -807,6 +812,12 @@ impl russh_sftp::server::Handler for Files {
                     || self.root.join("tree-unknown-size").is_file()
                 {
                     attrs.size = None;
+                }
+                if Some(name.as_ref()) == omit_mtime.as_deref()
+                    || self.root.join("tree-unknown-mtime").is_file()
+                {
+                    attrs.atime = None;
+                    attrs.mtime = None;
                 }
                 if Some(name.as_ref()) == omit_mode.as_deref() || name == "socket" {
                     attrs.permissions = None;

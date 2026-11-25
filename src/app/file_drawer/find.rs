@@ -50,6 +50,8 @@ pub enum MatchOption {
     ExcludeDirs(String),
     MinimumSize(String),
     MaximumSize(String),
+    ModifiedFrom(String),
+    ModifiedThrough(String),
 }
 
 #[derive(Default)]
@@ -134,6 +136,7 @@ impl Panel {
             || !self.filter.exclude_dir_regex.is_empty()
             || !self.size.minimum.trim().is_empty()
             || !self.size.maximum.trim().is_empty()
+            || !self.filter.modified_dates.is_unrestricted()
     }
 
     fn can_search(&self) -> bool {
@@ -326,7 +329,7 @@ impl Panel {
                     Action::Query(serial, text),
                 ))
             }));
-        let size_field =
+        let bound_field =
             |label: &str, placeholder: &str, text: &str, option: fn(String) -> MatchOption| {
                 TextBox::new()
                     .min_width(0.0)
@@ -346,17 +349,35 @@ impl Panel {
             .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
             .column_spacing(6.0)
             .children((
-                size_field(
+                bound_field(
                     "Minimum file size",
                     "Min size",
                     &self.size.minimum,
                     MatchOption::MinimumSize,
                 ),
-                size_field(
+                bound_field(
                     "Maximum file size",
                     "Max size",
                     &self.size.maximum,
                     MatchOption::MaximumSize,
+                )
+                .grid_column(1),
+            ));
+        let dates = Grid::new()
+            .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+            .column_spacing(6.0)
+            .children((
+                bound_field(
+                    "Modified from (UTC)",
+                    "Modified from",
+                    &self.filter.modified_dates.from,
+                    MatchOption::ModifiedFrom,
+                ),
+                bound_field(
+                    "Modified through (UTC)",
+                    "Modified through",
+                    &self.filter.modified_dates.through,
+                    MatchOption::ModifiedThrough,
                 )
                 .grid_column(1),
             ));
@@ -397,7 +418,7 @@ impl Panel {
                         StackPanel::new()
                             .automation_id(crate::input::file_search_tag(pane))
                             .spacing(6.0)
-                            .children((query, exclude_dirs, sizes)),
+                            .children((query, exclude_dirs, sizes, dates)),
                         type_filter,
                     )),
             ),
@@ -986,6 +1007,7 @@ impl FileDrawer {
             kind: filter.kind,
             exclude_dir_regex: filter.exclude_dir_regex,
             file_size: filter.file_size,
+            modified_dates: filter.modified_dates,
         };
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
@@ -1183,6 +1205,10 @@ impl FileDrawer {
                     MatchOption::ExcludeDirs(regex) => panel.filter.exclude_dir_regex = regex,
                     MatchOption::MinimumSize(value) => panel.size.minimum = value,
                     MatchOption::MaximumSize(value) => panel.size.maximum = value,
+                    MatchOption::ModifiedFrom(value) => panel.filter.modified_dates.from = value,
+                    MatchOption::ModifiedThrough(value) => {
+                        panel.filter.modified_dates.through = value
+                    }
                 }
                 if (&panel.filter, &panel.size.minimum, &panel.size.maximum)
                     != (&previous.0, &previous.1, &previous.2)
@@ -1506,6 +1532,7 @@ mod tests {
                     kind: Some(EntryKind::File),
                     exclude_dir_regex: String::new(),
                     file_size: FileSizeRange::default(),
+                    modified_dates: Default::default(),
                 },
                 size: SizeFields::default(),
                 sort: ResultSort::default(),

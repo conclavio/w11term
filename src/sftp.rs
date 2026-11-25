@@ -36,7 +36,7 @@ mod editor;
 mod find;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
-    FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch, FilenameSort,
+    FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch, FilenameSort, ModifiedDateRange,
     valid_filename_query,
 };
 mod resume_download;
@@ -268,6 +268,8 @@ pub enum Operation {
         exclude_dir_regex: String,
         #[serde(default, skip_serializing_if = "FileSizeRange::is_unrestricted")]
         file_size: FileSizeRange,
+        #[serde(default, skip_serializing_if = "ModifiedDateRange::is_unrestricted")]
+        modified_dates: ModifiedDateRange,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -1162,6 +1164,7 @@ impl Engine {
                 kind,
                 exclude_dir_regex,
                 file_size,
+                modified_dates,
             } => serde_json::to_value(
                 self.find_filenames(
                     &path,
@@ -1173,6 +1176,7 @@ impl Engine {
                         kind,
                         exclude_dir_regex,
                         file_size,
+                        modified_dates,
                     },
                     cancel,
                 )

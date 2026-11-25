@@ -465,6 +465,8 @@ Enter a regex in **Exclude folder paths** to skip matching folders and their con
 
 Use **Min size** or **Max size** to find regular files within inclusive size limits. Enter whole bytes or binary units such as `16 MiB`. Leave either bound blank for an open-ended range. Size filters apply before the result cap, and files whose size the server cannot report are omitted. The CLI offers `--min-size` and `--max-size`, and saved searches retain both limits.
 
+Use **Modified from** or **Modified through** with `YYYY-MM-DD` dates to filter by modification time. Both dates are inclusive UTC days. To search a single day, enter it in both fields. Date filters apply before the result cap, and entries whose modification time the server cannot report are omitted. Use `--modified-from` and `--modified-through` in the CLI. Saved searches retain these dates.
+
 Sort retained results by containing folder, filename, modification time, or file size. Sorting starts on page one, keeps marked downloads, and uses the scan’s existing metadata. Results without a reported modification time or regular file size sort last for that column. **Copy all paths** follows the displayed order across pages.
 
 On a saved SSH profile, open **Saved searches…**, enter a name, and choose **Save current search**. The preset records the remote folder, query, filters, and sort order. Choose **Run saved search** to scan that folder again from any folder in the drawer. Saved searches belong to the profile and the verified SSH endpoint. **Remove saved search** removes the preset from the profile.

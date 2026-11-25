@@ -2,6 +2,7 @@ use super::*;
 use std::{
     cmp::Ordering,
     collections::{HashSet, VecDeque},
+    ops::RangeInclusive,
 };
 
 const MAX_DIRECTORIES: usize = 128;
@@ -26,6 +27,68 @@ pub struct FilenameFilter {
     pub exclude_dir_regex: String,
     #[serde(skip_serializing_if = "FileSizeRange::is_unrestricted")]
     pub file_size: FileSizeRange,
+    #[serde(skip_serializing_if = "ModifiedDateRange::is_unrestricted")]
+    pub modified_dates: ModifiedDateRange,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModifiedDateRange {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub from: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub through: String,
+}
+
+impl ModifiedDateRange {
+    pub fn is_unrestricted(&self) -> bool {
+        self.from.trim().is_empty() && self.through.trim().is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.compile().map(|_| ())
+    }
+
+    fn compile(&self) -> Result<Option<RangeInclusive<i64>>> {
+        if self.is_unrestricted() {
+            return Ok(None);
+        }
+        let from = parse_utc_day(&self.from)
+            .context("Modified from")?
+            .unwrap_or(i64::MIN);
+        let through = parse_utc_day(&self.through)
+            .context("Modified through")?
+            .unwrap_or(i64::MAX);
+        ensure!(
+            from <= through,
+            "Modified from must be on or before Modified through"
+        );
+        Ok(Some(from..=through))
+    }
+}
+
+fn parse_utc_day(text: &str) -> Result<Option<i64>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        text.len() == 10
+            && text.bytes().enumerate().all(|(i, byte)| {
+                if matches!(i, 4 | 7) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_digit()
+                }
+            }),
+        "Use a UTC date in YYYY-MM-DD format"
+    );
+    let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .context("Use a valid UTC calendar date")?;
+    Ok(Some(
+        date.signed_duration_since(chrono::DateTime::UNIX_EPOCH.date_naive())
+            .num_days(),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,7 +189,8 @@ impl FilenameFilter {
             || (query.is_empty()
                 && (self.kind.is_some()
                     || !self.exclude_dir_regex.is_empty()
-                    || !self.file_size.is_unrestricted()))
+                    || !self.file_size.is_unrestricted()
+                    || !self.modified_dates.is_unrestricted()))
     }
 
     pub(crate) fn compile_excluded_dirs(&self) -> Result<Option<regex::Regex>> {
@@ -213,6 +277,7 @@ struct Search<'a> {
     kind: Option<EntryKind>,
     exclude_dirs: Option<regex::Regex>,
     file_size: FileSizeRange,
+    modified_days: Option<RangeInclusive<i64>>,
     cancel: Option<&'a TransferCancel>,
     queued: VecDeque<(String, usize)>,
     directories: HashSet<String>,
@@ -324,24 +389,36 @@ impl Search<'_> {
                         && self.pattern.matches(candidate)
                     {
                         let mut size = attrs.size.filter(|_| kind == Some(EntryKind::File));
-                        if !self.file_size.is_unrestricted()
+                        let need_size = !self.file_size.is_unrestricted()
                             && size.is_none()
-                            && kind == Some(EntryKind::File)
-                            && !missing_type
-                        {
+                            && kind == Some(EntryKind::File);
+                        let need_mtime = self.modified_days.is_some() && attrs.mtime.is_none();
+                        if !missing_type && (need_size || need_mtime) {
                             match self.engine.raw.lstat(&child).await {
                                 Ok(reply)
                                     if EntryKind::from_permissions(reply.attrs.permissions)
-                                        == Some(EntryKind::File) =>
+                                        == kind =>
                                 {
                                     attrs.mtime = reply.attrs.mtime.or(attrs.mtime);
-                                    size = reply.attrs.size;
+                                    size = reply
+                                        .attrs
+                                        .size
+                                        .filter(|_| kind == Some(EntryKind::File))
+                                        .or(size);
                                 }
                                 Err(error) if transport_error(&error) => return Err(error.into()),
                                 _ => {}
                             }
                         }
-                        if self.file_size.matches(size) && self.matched.insert(child.clone()) {
+                        let date_matches = self.modified_days.as_ref().is_none_or(|range| {
+                            attrs
+                                .mtime
+                                .is_some_and(|time| range.contains(&(i64::from(time) / 86_400)))
+                        });
+                        if date_matches
+                            && self.file_size.matches(size)
+                            && self.matched.insert(child.clone())
+                        {
                             self.result.matches.push(FilenameMatch {
                                 parent: path.to_owned(),
                                 name,
@@ -379,6 +456,7 @@ impl Engine {
     ) -> Result<FilenameSearch> {
         let pattern = FilenamePattern::new(query, &filter)?;
         filter.file_size.validate(filter.kind)?;
+        let modified_days = filter.modified_dates.compile()?;
         let exclude_dirs = filter.compile_excluded_dirs()?;
         let root = self.canonical_remote_path(path).await?;
         ensure!(
@@ -392,6 +470,7 @@ impl Engine {
             kind: filter.kind,
             exclude_dirs,
             file_size: filter.file_size,
+            modified_days,
             cancel,
             queued: VecDeque::from([(root.clone(), 0)]),
             directories: HashSet::from([root.clone()]),
