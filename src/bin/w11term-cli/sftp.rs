@@ -16,7 +16,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY [--preserve-mtime]\n\
   put-dir LOCAL NEW_REMOTE_DIRECTORY [--preserve-times]\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
-  find ROOT QUERY\n\
+  find ROOT QUERY [--regex] [--match-case]\n\
   sha256 PATH [--max-bytes N]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -79,6 +79,12 @@ pub fn parse(
             "--spec-order" => {
                 ensure!(!spec_order, "duplicate --spec-order");
                 spec_order = true;
+            }
+            "--regex" | "--match-case" => {
+                ensure!(
+                    opts.insert(arg.clone(), String::new()).is_none(),
+                    "duplicate option {arg}"
+                );
             }
             "--" => {
                 positional.extend(args);
@@ -230,12 +236,17 @@ pub fn parse(
         }
         "find" => {
             fields.insert("path".into(), json!(path()?));
-            let query = paths.next().context("missing filename fragment")?;
+            let query = paths.next().context("missing filename pattern")?;
             ensure!(
                 w11term::sftp::valid_filename_query(&query),
-                "Enter a filename fragment up to 256 bytes"
+                "Enter a filename pattern up to 256 bytes"
             );
             fields.insert("query".into(), json!(query));
+            fields.insert("regex".into(), json!(opts.remove("--regex").is_some()));
+            fields.insert(
+                "match_case".into(),
+                json!(opts.remove("--match-case").is_some()),
+            );
         }
         "sha256" => {
             fields.insert("path".into(), json!(path()?));
@@ -443,7 +454,13 @@ mod tests {
         let (
             _,
             Request::Sftp {
-                operation: Operation::Find { path, query },
+                operation:
+                    Operation::Find {
+                        path,
+                        query,
+                        regex: false,
+                        match_case: false,
+                    },
                 ..
             },
         ) = p(&["find", "--pane", "2", "/logs old", "[Ångström]"]).unwrap()
@@ -454,6 +471,38 @@ mod tests {
         assert_eq!(query, "[Ångström]");
         assert!(p(&["find", "--pane", "2", "/logs", " "]).is_err());
         assert!(p(&["find", "--pane", "2", "/logs"]).is_err());
+    }
+
+    #[test]
+    fn filename_search_takes_boolean_regex_and_match_case_flags() {
+        let (_, request) = p(&[
+            "find",
+            "--pane",
+            "2",
+            "--regex",
+            "/logs",
+            "^APP$",
+            "--match-case",
+        ])
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::Sftp {
+                operation: Operation::Find {
+                    regex: true,
+                    match_case: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(p(&["find", "--pane", "2", "--regex", "--regex", "/logs", "app"]).is_err());
+        assert!(p(&["ls", "--pane", "2", "--match-case", "/logs"]).is_err());
+        assert!(p(&["wait-transfer", "--regex", "9"]).is_err());
+        let (_, request) = p(&["find", "--pane", "2", "--", "/logs", "--regex"]).unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { query, regex: false, .. }, ..
+        } if query == "--regex"));
     }
 
     #[test]

@@ -5,7 +5,74 @@ fn search(path: &str, query: &str) -> Operation {
     Operation::Find {
         path: path.into(),
         query: query.into(),
+        regex: false,
+        match_case: false,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_before_scanning() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let folder = remote.path().join("logs");
+    fs::create_dir(&folder).unwrap();
+    let trace = remote.path().join("listing-trace");
+    fs::write(&trace, []).unwrap();
+    for name in [
+        "Report-01.log",
+        "report-02.log",
+        "Report-old.log",
+        "Report-03.txt",
+    ] {
+        fs::write(folder.join(name), []).unwrap();
+    }
+    let options = |query: &str, regex, match_case| Operation::Find {
+        path: "/logs".into(),
+        query: query.into(),
+        regex,
+        match_case,
+    };
+    let error = guarded_job(&pane, None, options("(", true, false))
+        .await
+        .unwrap_err();
+    assert!(error.contains("Invalid filename regex"), "{error}");
+    assert!(fs::read(&trace).unwrap().is_empty());
+    for (query, regex, match_case, names) in [
+        (
+            r"^Report-[0-9]+\.log$",
+            true,
+            false,
+            &["Report-01.log", "report-02.log"][..],
+        ),
+        (r"^Report-[0-9]+\.log$", true, true, &["Report-01.log"][..]),
+        ("report-", false, true, &["report-02.log"][..]),
+    ] {
+        let result: FilenameSearch = serde_json::from_value(
+            guarded_job(&pane, None, options(query, regex, match_case))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .matches
+                .iter()
+                .map(|hit| hit.name.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+    }
+    let legacy = serde_json::json!({"op":"find","path":"/logs","query":"report-"});
+    let parsed: Operation = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(
+        parsed,
+        Operation::Find {
+            regex: false,
+            match_case: false,
+            ..
+        }
+    ));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

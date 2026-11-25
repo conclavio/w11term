@@ -11,6 +11,39 @@ pub fn valid_filename_query(query: &str) -> bool {
     query.len() <= 256 && !query.trim().is_empty() && !query.chars().any(char::is_control)
 }
 
+enum FilenamePattern {
+    Literal(String),
+    Folded(String),
+    Regex(regex::Regex),
+}
+
+impl FilenamePattern {
+    fn new(query: &str, regex: bool, match_case: bool) -> Result<Self> {
+        ensure!(
+            valid_filename_query(query),
+            "Enter a filename pattern up to 256 bytes"
+        );
+        if regex {
+            return crate::search::compile_regex(query, match_case)
+                .map(Self::Regex)
+                .map_err(|error| anyhow::anyhow!("Invalid filename regex. {error}"));
+        }
+        Ok(if match_case {
+            Self::Literal(query.to_owned())
+        } else {
+            Self::Folded(query.to_lowercase())
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Literal(query) => name.contains(query),
+            Self::Folded(query) => name.to_lowercase().contains(query),
+            Self::Regex(regex) => regex.is_match(name),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FilenameMatch {
     pub parent: String,
@@ -32,7 +65,7 @@ pub struct FilenameSearch {
 
 struct Search<'a> {
     engine: &'a Engine,
-    query: String,
+    pattern: FilenamePattern,
     cancel: Option<&'a TransferCancel>,
     queued: VecDeque<(String, usize)>,
     directories: HashSet<String>,
@@ -111,9 +144,7 @@ impl Search<'_> {
                         },
                     };
                     let kind = EntryKind::from_permissions(mode);
-                    if name.to_lowercase().contains(&self.query)
-                        && self.matched.insert(child.clone())
-                    {
+                    if self.pattern.matches(&name) && self.matched.insert(child.clone()) {
                         self.result.matches.push(FilenameMatch {
                             parent: path.to_owned(),
                             name,
@@ -143,12 +174,11 @@ impl Engine {
         &self,
         path: &str,
         query: &str,
+        regex: bool,
+        match_case: bool,
         cancel: Option<&TransferCancel>,
     ) -> Result<FilenameSearch> {
-        ensure!(
-            valid_filename_query(query),
-            "Enter a filename fragment up to 256 bytes"
-        );
+        let pattern = FilenamePattern::new(query, regex, match_case)?;
         let root = self.canonical_remote_path(path).await?;
         ensure!(
             root.len() <= MAX_PATH_BYTES,
@@ -156,7 +186,7 @@ impl Engine {
         );
         let mut search = Search {
             engine: self,
-            query: query.to_lowercase(),
+            pattern,
             cancel,
             queued: VecDeque::from([(root.clone(), 0)]),
             directories: HashSet::from([root.clone()]),
