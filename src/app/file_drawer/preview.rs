@@ -43,6 +43,8 @@ pub(super) struct EntryPreview {
     full_text: bool,
     checksum_available: bool,
     permissions: Permissions,
+    link_target: Option<String>,
+    opening_link: bool,
     status: Option<String>,
     pub(super) cancel: TransferCancel,
     // Terminal output can re-render the window while the user selects text.
@@ -320,6 +322,21 @@ impl EntryPreview {
                 if let Some(controls) = self.permissions_controls(pane, generation, context) {
                     fields.push(KeyedView::new("permissions", controls));
                 }
+                if self.link_target.is_some() {
+                    fields.push(KeyedView::new(
+                        "open-link-target",
+                        Button::new()
+                            .is_enabled(!self.opening_link)
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::OpenLinkTarget(pane, generation, serial))
+                            }))
+                            .content(if self.opening_link {
+                                "Opening link target…"
+                            } else {
+                                "Open link target"
+                            }),
+                    ));
+                }
                 if let Some(status) = &self.status {
                     fields.push(KeyedView::new(
                         "preview-status",
@@ -497,6 +514,8 @@ impl FileDrawer {
             full_text: false,
             checksum_available: false,
             permissions: Permissions::Unavailable,
+            link_target: None,
+            opening_link: false,
             status: None,
             cancel: TransferCancel::default(),
             view: OnceCell::new(),
@@ -522,18 +541,28 @@ impl FileDrawer {
                 Some(Value::String(text)) => Ok(text),
                 _ => Err("Missing text in the SFTP preview reply".into()),
             },
-            PreviewKind::Properties => super::properties::display(&path, value)
-                .map(|(attrs, text)| {
-                    preview.checksum_available =
-                        EntryKind::from_permissions(attrs.permissions) == Some(EntryKind::File);
-                    if entry_path(preview.target.parent(), preview.target.name()).is_ok()
-                        && let Some(review) = PermissionReview::from_attributes(&attrs)
-                    {
-                        preview.permissions = Permissions::Ready(review);
-                    }
-                    text
-                })
-                .map_err(|error| format!("{error:#}")),
+            PreviewKind::Properties => {
+                let target = value
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                super::properties::display(&path, value)
+                    .map(|(attrs, text)| {
+                        let kind = EntryKind::from_permissions(attrs.permissions);
+                        preview.checksum_available = kind == Some(EntryKind::File);
+                        if entry_path(preview.target.parent(), preview.target.name()).is_ok() {
+                            if let Some(review) = PermissionReview::from_attributes(&attrs) {
+                                preview.permissions = Permissions::Ready(review);
+                            }
+                            if kind == Some(EntryKind::Symlink) {
+                                preview.link_target =
+                                    target.filter(|path| !path.is_empty() && !path.contains('\0'));
+                            }
+                        }
+                        text
+                    })
+                    .map_err(|error| format!("{error:#}"))
+            }
             PreviewKind::Checksum(_) => value["sha256"]
                 .as_str()
                 .ok_or_else(|| "Missing SHA-256 in the SFTP reply".to_owned())
@@ -556,6 +585,44 @@ impl FileDrawer {
             Err(error) => Contents::Error(error),
         };
         preview.view.take();
+    }
+
+    pub(super) fn begin_link_target(&mut self, serial: u64) -> Option<Operation> {
+        let preview = self.preview.as_ref()?;
+        if !self.open || preview.serial != serial || preview.opening_link || self.pending.is_some()
+        {
+            return None;
+        }
+        let expected_target = preview.link_target.clone()?;
+        let path = self.checked_target_path(&preview.target).ok()?;
+        let preview = self.preview.as_mut()?;
+        preview.opening_link = true;
+        preview.status = None;
+        preview.view.take();
+        Some(Operation::OpenLinkTarget {
+            path,
+            expected_target,
+        })
+    }
+
+    pub(super) fn opening_link_target(&self, serial: u64) -> bool {
+        self.open
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.serial == serial && preview.opening_link)
+    }
+
+    pub(super) fn link_target_error(&mut self, serial: u64, error: String) {
+        if let Some(preview) = self
+            .preview
+            .as_mut()
+            .filter(|p| p.serial == serial && p.opening_link)
+        {
+            preview.opening_link = false;
+            preview.status = Some(format!("Could not open link target. {error}"));
+            preview.view.take();
+        }
     }
 
     pub(super) fn permissions_action(
@@ -713,7 +780,7 @@ impl FileDrawer {
         if self.preview.take().is_some() {
             if matches!(
                 self.pending.as_ref().map(|p| &p.step),
-                Some(Step::Preview(_))
+                Some(Step::Preview(_) | Step::OpenLinkTarget(_))
             ) {
                 self.pending.take();
             }
@@ -1010,6 +1077,37 @@ mod tests {
             preview.status.as_deref(),
             Some("Server reports mode 0750 after applying 4750")
         );
+    }
+
+    #[test]
+    fn opening_a_link_uses_the_current_properties_and_keeps_them_on_error() {
+        let (mut drawer, entry) = selected(ListedKind::Known(EntryKind::Symlink));
+        let (serial, _) = drawer
+            .begin_preview(FileTarget::Listed(entry), PreviewKind::Properties)
+            .unwrap();
+        drawer.finish_preview(
+            serial,
+            Ok(json!({"attrs":{"permissions":0o120777},"target":"../payload $now.txt"})),
+        );
+        assert!(drawer.begin_link_target(serial + 1).is_none());
+        assert!(matches!(
+            drawer.begin_link_target(serial),
+            Some(Operation::OpenLinkTarget { expected_target, .. }) if expected_target == "../payload $now.txt"
+        ));
+        assert!(drawer.opening_link_target(serial));
+        assert!(drawer.begin_link_target(serial).is_none());
+        drawer.link_target_error(serial, "Missing target".into());
+        let preview = drawer.preview.as_ref().unwrap();
+        assert!(!preview.opening_link);
+        assert!(
+            matches!(&preview.content, Contents::Ready(text) if text.contains("../payload $now.txt"))
+        );
+        assert_eq!(
+            preview.status.as_deref(),
+            Some("Could not open link target. Missing target")
+        );
+        drawer.close_preview(serial);
+        assert!(!drawer.opening_link_target(serial));
     }
 
     #[test]
