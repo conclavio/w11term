@@ -2992,6 +2992,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
     let wire = remote.path().join("listing-trace");
     fs::write(&keyboard, []).unwrap();
     fs::write(&wire, []).unwrap();
+    fs::write(remote.path().join("delete-trace.jsonl"), []).unwrap();
 
     let state = tempfile::tempdir().unwrap();
     fs::write(
@@ -3033,9 +3034,15 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 6), // Rename refreshes the same search.
             ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // Delete refreshes after acknowledgement.
+            ("/shell directory/nested", 2),
             ("/shell directory/nested", 1), // Cancelled during the first page.
             ("/shell directory/nested", 2),
         ]
+    );
+    assert_eq!(
+        super::remove::trace(remote.path()),
+        [["REMOVE", "/shell directory/nested-renamed.txt"]]
     );
     assert_eq!(
         fs::read(keyboard).unwrap(),

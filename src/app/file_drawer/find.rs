@@ -23,6 +23,7 @@ pub enum Action {
     MarkDownload(u64, usize, bool),
     Reveal(u64, FilenameMatch),
     Rename(u64, FilenameMatch),
+    Delete(u64, FilenameMatch),
     CopyPaths(u64, Option<FilenameMatch>),
     Back(u64),
 }
@@ -568,6 +569,25 @@ impl Panel {
                             })
                             .content("Rename…"),
                     ));
+                    if delete_path(&hit.parent, &hit.name).is_ok() {
+                        actions.push(KeyedView::new(
+                            "delete",
+                            Button::new()
+                                .automation_name(format!("Delete {path}"))
+                                .is_enabled(ready)
+                                .on_click({
+                                    let hit = hit.clone();
+                                    ctx.callback(move |_| {
+                                        Message::Files(FileAction::Search(
+                                            pane,
+                                            generation,
+                                            Action::Delete(serial, hit.clone()),
+                                        ))
+                                    })
+                                })
+                                .content("Delete…"),
+                        ));
+                    }
                 }
                 KeyedView::new(
                     index,
@@ -754,7 +774,24 @@ impl FileDrawer {
         Ok(())
     }
 
-    pub(super) fn search_rename_completed(
+    fn begin_search_delete(&mut self, serial: u64, hit: FilenameMatch) -> Result<()> {
+        ensure!(
+            self.open && !self.busy(),
+            "Select a file, folder or link in the current search"
+        );
+        self.search_hit_path(serial, &hit)?;
+        let kind = hit
+            .kind
+            .context("The search result has no supported entry type")?;
+        delete_path(&hit.parent, &hit.name)?;
+        self.show_entry_dialog(
+            Some(hit.parent.clone()),
+            EditAction::Delete(FileTarget::Search(serial, hit), kind),
+        );
+        Ok(())
+    }
+
+    pub(super) fn search_change_completed(
         &mut self,
         pane: u64,
         session: &Session,
@@ -765,26 +802,38 @@ impl FileDrawer {
     ) -> Result<()> {
         let status = change.completed();
         let old_path = entry_path(&hit.parent, &hit.name)?;
-        let new_path = entry_path(&hit.parent, change.name())?;
         if let Some(directory) = self.directory.clone() {
             if directory == hit.parent {
                 let mut entries = std::mem::take(&mut self.entries);
-                entries.retain(|entry| entry.name != change.name());
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.name == hit.name) {
-                    entry.name = change.name().into();
-                } else if let Some(kind) = hit.kind {
-                    entries.push(Entry {
-                        name: change.name().into(),
-                        kind: ListedKind::Known(kind),
-                        mtime: None,
-                        size: None,
-                    });
+                match &change {
+                    EntryChange::Rename { to, .. } => {
+                        entries.retain(|entry| &entry.name != to);
+                        if let Some(entry) = entries.iter_mut().find(|entry| entry.name == hit.name)
+                        {
+                            entry.name = to.clone();
+                        } else if let Some(kind) = hit.kind {
+                            entries.push(Entry {
+                                name: to.clone(),
+                                kind: ListedKind::Known(kind),
+                                mtime: None,
+                                size: None,
+                            });
+                        }
+                        self.sort_order.sort(&mut entries);
+                    }
+                    _ => entries.retain(|entry| entry.name != hit.name),
                 }
-                self.sort_order.sort(&mut entries);
                 self.accept_listing(None, directory, entries);
             } else if let Some(suffix) = within(&directory, &old_path) {
-                let entries = std::mem::take(&mut self.entries);
-                self.accept_listing(None, format!("{new_path}{suffix}"), entries);
+                if let EntryChange::Rename { to, .. } = &change {
+                    let new_path = entry_path(&hit.parent, to)?;
+                    let entries = std::mem::take(&mut self.entries);
+                    self.accept_listing(None, format!("{new_path}{suffix}"), entries);
+                } else {
+                    // The cached listing was inside the removed path.
+                    self.accept_listing(None, directory, Vec::new());
+                    self.directory = None;
+                }
             }
         }
         self.status = status.clone();
@@ -794,9 +843,10 @@ impl FileDrawer {
         // Remove obsolete rows before refreshing, so an interrupted scan
         // cannot leave the old path (or old descendants) actionable.
         if let Some(mut previous) = panel.result.clone() {
-            previous
-                .matches
-                .retain(|entry| entry != &hit && within(&entry.parent, &old_path).is_none());
+            previous.matches.retain(|entry| {
+                (entry.parent != hit.parent || entry.name != hit.name)
+                    && within(&entry.parent, &old_path).is_none()
+            });
             panel.install_result(previous);
         }
         self.start_filename_search(pane, session, ctx, Some(status));
@@ -903,6 +953,7 @@ impl FileDrawer {
                 panel.mark_download(index, checked);
             }
             Action::Rename(serial, hit) if !busy => self.begin_search_rename(serial, hit)?,
+            Action::Delete(serial, hit) if !busy => self.begin_search_delete(serial, hit)?,
             Action::CopyPaths(serial, hit) if !busy => {
                 panel.copy_status = match panel.paths_to_copy(serial, hit.as_ref()) {
                     Ok(Some((paths, count))) => Some(match w11term::clipboard::write(&paths) {
@@ -963,18 +1014,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn search_rename_uses_the_hit_parent_and_rejects_an_expired_result() {
-        let result = search_result("/project", &[("old name", EntryKind::File)]);
-        let hit = result.matches[0].clone();
-        let mut drawer = FileDrawer {
+    fn search_drawer(result: FilenameSearch) -> FileDrawer {
+        FileDrawer {
             open: true,
             generation: 1,
             directory: Some("/project".into()),
             dialog_serial: 5,
             search: Some(Panel {
                 serial: 5,
-                root: "/project".into(),
+                root: result.root.clone(),
                 query: "name".into(),
                 input: ElementRef::new(),
                 filter: FilenameFilter::default(),
@@ -985,7 +1033,14 @@ mod tests {
                 marked_downloads: None,
             }),
             ..FileDrawer::default()
-        };
+        }
+    }
+
+    #[test]
+    fn search_rename_uses_the_hit_parent_and_rejects_an_expired_result() {
+        let result = search_result("/project", &[("old name", EntryKind::File)]);
+        let hit = result.matches[0].clone();
+        let mut drawer = search_drawer(result);
         drawer.begin_search_rename(5, hit.clone()).unwrap();
         let dialog = drawer.dialog.as_mut().unwrap();
         assert_eq!(dialog.name, "old name");
@@ -1005,6 +1060,39 @@ mod tests {
         assert!(
             drawer
                 .finish_edit(serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn search_delete_confirms_the_exact_entry_and_rejects_a_changed_result() {
+        let result = search_result("/project", &[("link name", EntryKind::Symlink)]);
+        let hit = result.matches[0].clone();
+        let mut drawer = search_drawer(result);
+        drawer.begin_search_delete(5, hit.clone()).unwrap();
+        let (dialog, path) = drawer
+            .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/project/nested/link name");
+        assert!(matches!(
+            dialog.action,
+            EditAction::Delete(FileTarget::Search(5, matched), EntryKind::Symlink) if matched == hit
+        ));
+
+        drawer.begin_search_delete(5, hit).unwrap();
+        drawer
+            .search
+            .as_mut()
+            .unwrap()
+            .result
+            .as_mut()
+            .unwrap()
+            .matches[0]
+            .kind = Some(EntryKind::Directory);
+        assert!(
+            drawer
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
                 .is_err()
         );
     }

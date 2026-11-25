@@ -340,7 +340,7 @@ enum EditAction {
     Rename(ListedEntry),
     RenameSearch(u64, FilenameMatch),
     VerifyDownload(FileTarget),
-    Delete(ListedEntry, EntryKind),
+    Delete(FileTarget, EntryKind),
 }
 
 impl EditAction {
@@ -349,8 +349,18 @@ impl EditAction {
             Self::GoToFolder { .. }
             | Self::Create
             | Self::VerifyDownload(_)
-            | Self::RenameSearch(..) => None,
-            Self::Rename(entry) | Self::Delete(entry, _) => Some(entry),
+            | Self::RenameSearch(..)
+            | Self::Delete(FileTarget::Search(..), _) => None,
+            Self::Rename(entry) | Self::Delete(FileTarget::Listed(entry), _) => Some(entry),
+        }
+    }
+
+    fn search_hit(&self) -> Option<(u64, &FilenameMatch)> {
+        match self {
+            Self::RenameSearch(serial, hit) | Self::Delete(FileTarget::Search(serial, hit), _) => {
+                Some((*serial, hit))
+            }
+            _ => None,
         }
     }
 }
@@ -380,7 +390,7 @@ impl EntryDialog {
             EditAction::RenameSearch(_, hit) if self.name == hit.name => {
                 bail!("Enter a different name")
             }
-            EditAction::Delete(original, _) => delete_path(parent()?, &original.name),
+            EditAction::Delete(target, _) => delete_path(parent()?, target.name()),
             EditAction::VerifyDownload(_) => normalize_sha256(&self.name),
             EditAction::Rename(_) | EditAction::RenameSearch(..) | EditAction::Create => {
                 entry_path(parent()?, &self.name)
@@ -1209,7 +1219,7 @@ impl FileDrawer {
             self.check_selected(entry)?;
             entry_path(&parent, &entry.name)?;
         }
-        if let EditAction::Delete(entry, kind) = &action {
+        if let EditAction::Delete(FileTarget::Listed(entry), kind) = &action {
             delete_path(&parent, &entry.name)?;
             ensure!(
                 entry.kind == ListedKind::Missing || entry.kind == ListedKind::Known(*kind),
@@ -1280,8 +1290,7 @@ impl FileDrawer {
         }
         ensure!(
             self.open
-                && (matches!(dialog.action, EditAction::RenameSearch(..))
-                    || self.directory == dialog.parent)
+                && (dialog.action.search_hit().is_some() || self.directory == dialog.parent)
                 && !matches!(dialog.action, EditAction::GoToFolder { revision } if revision != self.listing_revision),
             "The directory changed. Open the file action again."
         );
@@ -1291,8 +1300,12 @@ impl FileDrawer {
         if let EditAction::VerifyDownload(target) = &dialog.action {
             self.checked_target_path(target)?;
         }
-        if let EditAction::RenameSearch(serial, hit) = &dialog.action {
-            self.search_hit_path(*serial, hit)?;
+        if let Some((serial, hit)) = dialog.action.search_hit() {
+            ensure!(
+                !self.busy(),
+                "Wait for the current file operation to finish"
+            );
+            self.search_hit_path(serial, hit)?;
         }
         let path = dialog.destination()?;
         Ok(Some((dialog, path)))
@@ -2626,7 +2639,7 @@ impl FileDrawer {
                 },
                 Ok(_),
             ) => {
-                self.search_rename_completed(id, session, serial, hit, change, context)?;
+                self.search_change_completed(id, session, serial, hit, change, context)?;
             }
             (
                 Step::Change {
@@ -2668,7 +2681,10 @@ impl FileDrawer {
                 entry.name
             );
         };
-        self.begin_edit(entry.parent.clone(), EditAction::Delete(entry, kind))?;
+        self.begin_edit(
+            entry.parent.clone(),
+            EditAction::Delete(FileTarget::Listed(entry), kind),
+        )?;
         self.status.clear();
         Ok(())
     }
@@ -3298,6 +3314,9 @@ impl TerminalApp {
                         path,
                     )) = files.finish_edit(serial, result)?
                     {
+                        let search_origin = action
+                            .search_hit()
+                            .map(|(serial, hit)| (serial, hit.clone()));
                         let (change, operation) = match action {
                             EditAction::GoToFolder { .. } => {
                                 return files.browse_named(
@@ -3309,11 +3328,16 @@ impl TerminalApp {
                                     context,
                                 );
                             }
-                            EditAction::Delete(entry, kind) => {
-                                files.status = format!("Deleting {}…", entry.name);
+                            EditAction::Delete(target, kind) => {
+                                files.status = format!("Deleting {path}…");
+                                let (_, name) = target.into_location();
                                 (
-                                    EntryChange::Delete(entry.name),
-                                    Operation::RemoveEntry { path, kind },
+                                    EntryChange::Delete(name),
+                                    Operation::RemoveEntry {
+                                        path,
+                                        kind,
+                                        check_parent: search_origin.is_some(),
+                                    },
                                 )
                             }
                             EditAction::VerifyDownload(target) => {
@@ -3346,28 +3370,20 @@ impl TerminalApp {
                                     },
                                 )
                             }
-                            EditAction::RenameSearch(search, hit) => {
+                            EditAction::RenameSearch(_, hit) => {
                                 let from = entry_path(&hit.parent, &hit.name)?;
                                 files.status = format!("Renaming {from} to {name}…");
-                                let change = EntryChange::Rename {
-                                    from: hit.name.clone(),
-                                    to: name,
-                                };
-                                return files.job(
-                                    pane,
-                                    session,
+                                (
+                                    EntryChange::Rename {
+                                        from: hit.name,
+                                        to: name,
+                                    },
                                     Operation::RenameEntry {
                                         from,
                                         to: path,
                                         search_kind: hit.kind,
                                     },
-                                    Step::Change {
-                                        parent: hit.parent.clone(),
-                                        change,
-                                        search_origin: Some((search, hit)),
-                                    },
-                                    context,
-                                );
+                                )
                             }
                             EditAction::Create => {
                                 files.status = format!("Creating folder {name}…");
@@ -3381,7 +3397,8 @@ impl TerminalApp {
                             }
                         };
                         let parent = parent.context("Missing remote directory")?;
-                        let deleting = matches!(change, EntryChange::Delete(_));
+                        let deleting_listed =
+                            search_origin.is_none() && matches!(change, EntryChange::Delete(_));
                         files.job(
                             pane,
                             session,
@@ -3389,11 +3406,11 @@ impl TerminalApp {
                             Step::Change {
                                 parent,
                                 change,
-                                search_origin: None,
+                                search_origin,
                             },
                             context,
                         )?;
-                        if deleting {
+                        if deleting_listed {
                             files.listing_revision = files.listing_revision.wrapping_add(1);
                             files.selected = None;
                         }
@@ -3484,8 +3501,10 @@ impl TerminalApp {
                     files.end_filter_edit();
                     let path = delete_path(&entry.parent, &entry.name)?;
                     match entry.kind {
-                        ListedKind::Known(kind) => files
-                            .begin_edit(entry.parent.clone(), EditAction::Delete(entry, kind))?,
+                        ListedKind::Known(kind) => files.begin_edit(
+                            entry.parent.clone(),
+                            EditAction::Delete(FileTarget::Listed(entry), kind),
+                        )?,
                         ListedKind::Missing => {
                             files.status = format!("Checking {}…", entry.name);
                             files.job(
@@ -4116,7 +4135,7 @@ mod tests {
             drawer
                 .begin_edit(
                     entry.parent.clone(),
-                    EditAction::Delete(entry.clone(), EntryKind::File)
+                    EditAction::Delete(FileTarget::Listed(entry.clone()), EntryKind::File)
                 )
                 .is_err()
         );

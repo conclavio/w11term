@@ -19,6 +19,7 @@ $peerRoot = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $readGate = Join-Path $peerRoot 'hold-transfer-read'
 $refreshGate = Join-Path $peerRoot 'hold-opendir'
 $profiles = Join-Path $State 'profiles.json'
+$account = (Get-Content $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'
 $parent = '/shell directory'
 # Windows PowerShell 5.1 also reads this fixture on non-UTF-8 code pages.
 $word = ([char]0xc5).ToString() + 'ngstr' + [char]0xf6 + 'm'
@@ -383,6 +384,31 @@ try {
     $renamedFile = Join-Path $peerRoot 'shell directory/nested-renamed.txt'
     if ([IO.File]::ReadAllText($renamedFile) -cne 'added after search') {
         throw 'Rename changed the bytes of the search result'
+    }
+    $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
+    $null = Wait-CheckBox "Mark $parent/nested" $on
+    $deleteTarget = "$parent/nested-renamed.txt"
+    (Wait-CheckBox "Mark $deleteTarget" $off).Toggle()
+    $null = Wait-CheckBox "Mark $deleteTarget" $on
+    foreach ($confirm in @('Cancel', 'Delete')) {
+        Click "Delete $deleteTarget"
+        $null = Wait-Until 'exact host and path in the search result deletion confirmation' {
+            (Find-Element 'Delete remote file?') -and (Find-Element $deleteTarget) -and
+                (Find-Element "$($account.user)@$($account.host):$($account.port)") -and
+                (Button 'Delete') -and (Button 'Cancel')
+        }
+        Click $confirm
+        if ($confirm -ceq 'Cancel') {
+            $null = Wait-Until 'cancelling deletion preserves the file and its search result' {
+                !(Find-Element 'Delete remote file?') -and
+                    (Button "Reveal $deleteTarget") -and [IO.File]::Exists($renamedFile)
+            }
+            $null = Wait-CheckBox "Mark $deleteTarget" $on
+        }
+    }
+    $null = Wait-Until 'same search refreshes after deletion without the deleted row' {
+        (Find-Element 'Deleted nested-renamed.txt. 2 matches in 2 folders') -and
+            !(Button "Reveal $deleteTarget") -and ![IO.File]::Exists($renamedFile)
     }
     $null = Wait-CheckBox "Mark $parent/nested/nested-content.txt" $on
     $null = Wait-CheckBox "Mark $parent/nested" $on

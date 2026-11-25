@@ -473,6 +473,8 @@ Choose **Preview text…** on a regular file to read its UTF-8 contents, or choo
 
 Choose **Rename…** beside a file, folder, or symbolic link. The dialog shows the exact source path and renames it within the same remote folder. The search refreshes after success, so the renamed entry appears if its new name still matches.
 
+Choose **Delete…** beside a result and confirm its SSH destination, type, and full remote path. Only files, symbolic links, and empty folders can be deleted. Deleting a link leaves its target intact. After the server confirms deletion, w11term refreshes the current search and keeps marks on unrelated results.
+
 Choose **Shell in containing folder** to open a right split on the same authenticated SSH connection with that folder as its working directory. The search stays open in the source pane.
 
 Choose **Copy path** beside a search result for its absolute remote path, or **Copy all paths** for one path per line from every retained results page. Paths are plain text and keep their spaces, Unicode, and literal names. Copy paths containing line breaks individually.
