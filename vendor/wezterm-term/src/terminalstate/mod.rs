@@ -412,7 +412,8 @@ pub struct TerminalState {
     /// designated as cursor keys.  This includes various navigation
     /// keys.  The code in key_down() is responsible for interpreting this.
     application_cursor_keys: bool,
-    modify_other_keys: Option<i64>,
+    modify_other_keys: u8,
+    format_other_keys_csi_u: bool,
 
     dec_ansi_mode: bool,
 
@@ -729,7 +730,8 @@ impl TerminalState {
             dec_origin_mode: false,
             insert: false,
             application_cursor_keys: false,
-            modify_other_keys: None,
+            modify_other_keys: 0,
+            format_other_keys_csi_u: false,
             dec_ansi_mode: false,
             sixel_display_mode: false,
             use_private_color_registers_for_each_graphic: false,
@@ -2001,7 +2003,8 @@ impl TerminalState {
                 // setting for dec_auto_wrap, so we do too
                 self.dec_auto_wrap = true;
                 self.application_cursor_keys = false;
-                self.modify_other_keys = None;
+                self.modify_other_keys = 0;
+                self.format_other_keys_csi_u = false;
                 self.application_keypad = false;
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as i64;
                 self.left_and_right_margins = 0..self.screen().physical_cols;
@@ -2730,12 +2733,13 @@ impl TerminalState {
                 resource: XtermKeyModifierResource::OtherKeys,
                 value,
             } => {
-                self.modify_other_keys = match value {
-                    Some(0) => None,
-                    _ => value,
-                };
-                log::debug!("XtermKeyMode OtherKeys -> {:?}", self.modify_other_keys);
+                let level = value.unwrap_or(0);
+                if (0..=3).contains(&level) {
+                    self.modify_other_keys = level as u8;
+                }
             }
+
+            Mode::XtermOtherKeys(operation) => self.perform_xterm_other_keys(operation),
 
             Mode::XtermKeyMode { resource, value } => {
                 if self.config.log_unknown_escape_sequences() {

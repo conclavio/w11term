@@ -354,6 +354,16 @@ impl Performer<'_> {
                         // inverted; there's a note about this in the xterm
                         // ctlseqs docs.
                         match s.data.as_slice() {
+                            b">4m" | b">4f" => {
+                                let (level, csi_u) = self.xterm_other_keys();
+                                let (value, suffix) = if s.data.ends_with(b"m") {
+                                    (level, 'm')
+                                } else {
+                                    (u8::from(csi_u), 'f')
+                                };
+                                write!(self.writer, "{DCS}1$r>4;{value}{suffix}{ST}").ok();
+                                self.writer.flush().ok();
+                            }
                             b"m" => {
                                 let params = Rendition::from(&self.pen).parameters();
                                 write!(self.writer, "{DCS}1$r{params}m{ST}").ok();
@@ -827,7 +837,8 @@ impl Performer<'_> {
                 self.mouse_tracking = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;
-                self.modify_other_keys = None;
+                self.modify_other_keys = 0;
+                self.format_other_keys_csi_u = false;
                 self.sixel_scrolls_right = false;
                 self.any_event_mouse = false;
                 self.button_event_mouse = false;

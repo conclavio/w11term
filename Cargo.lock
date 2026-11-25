@@ -3739,6 +3739,7 @@ dependencies = [
  "wezterm-cell",
  "wezterm-dynamic",
  "wezterm-escape-parser",
+ "wezterm-input-types",
  "wezterm-surface",
 ]
 

@@ -117,6 +117,8 @@ The reply includes `pane`, `connection_generation`, `cols`, `rows`, `pixel_width
 
 `mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
+When xterm modified-key reporting or its alternate format is enabled, `keyboard.modify_other_keys` is the active level from 0 through 3 and `keyboard.format_other_keys` is `xterm-27` or `csi-u`.
+
 ## Completed shell commands
 
 `list-commands --pane ID` reads the pane’s OSC 133 command history. It returns

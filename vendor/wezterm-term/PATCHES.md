@@ -191,3 +191,7 @@ The original MIT license is preserved in `LICENSE.md`.
 - OSC 99 forwards Kitty notification metadata and payload to the embedding's
   alert handler. The handler can return protocol replies on the same terminal
   stream. This keeps the notification lifecycle and UI in w11term.
+
+- Xterm resource 4 supports modifyOtherKeys levels 0 through 3 and the
+  formatOtherKeys switch. CSI and DECRQSS report the negotiated settings.
+  The legacy encoder continues to handle keys outside the negotiated class.

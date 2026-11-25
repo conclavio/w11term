@@ -343,7 +343,7 @@ pub fn send_key_event_detailed(
     repeat: bool,
     details: &KeyDetails,
 ) -> anyhow::Result<()> {
-    if let Some(encoded) = key_override(terminal, key, modifiers, down, repeat, details) {
+    if let Some(encoded) = key_override(terminal, key, modifiers, down, repeat, details)? {
         if !encoded.is_empty() {
             writer.send(TransportInput::Data(encoded.into_bytes()))?;
         }
@@ -363,13 +363,37 @@ fn key_override(
     down: bool,
     repeat: bool,
     details: &KeyDetails,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
     match terminal.get_keyboard_encoding() {
-        termwiz::input::KeyboardEncoding::Kitty(flags) => {
-            encode_kitty_key_event(flags, key, modifiers, down, repeat, details)
+        termwiz::input::KeyboardEncoding::Kitty(flags) => Ok(encode_kitty_key_event(
+            flags, key, modifiers, down, repeat, details,
+        )),
+        _ if down && details.text.is_some() => Ok(details.text.clone()),
+        termwiz::input::KeyboardEncoding::Xterm if down && terminal.xterm_other_keys().0 != 0 => {
+            let key = if repeat {
+                details
+                    .repeat_text
+                    .as_deref()
+                    .and_then(|text| {
+                        let mut chars = text.chars();
+                        let c = chars.next()?;
+                        chars
+                            .next()
+                            .is_none()
+                            .then_some(wezterm_term::KeyCode::Char(c))
+                    })
+                    .unwrap_or(key)
+            } else {
+                key
+            };
+            let encoded = if details.keypad.is_some() {
+                terminal.encode_keypad_key(key, modifiers, down)?
+            } else {
+                terminal.encode_key(key, modifiers, down)?
+            };
+            Ok(Some(encoded))
         }
-        _ if down => details.text.clone(),
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -381,7 +405,7 @@ pub(crate) fn encode_key_input(
     repeat: bool,
     details: &KeyDetails,
 ) -> anyhow::Result<String> {
-    match key_override(terminal, key, modifiers, down, repeat, details) {
+    match key_override(terminal, key, modifiers, down, repeat, details)? {
         Some(encoded) => Ok(encoded),
         None => terminal.encode_key(key, modifiers, down),
     }
@@ -2309,6 +2333,128 @@ mod tests {
         assert_eq!(second.attrs().background(), ColorAttribute::PaletteIndex(4));
         assert_eq!(second.attrs().intensity(), Intensity::Normal);
         assert_eq!(second.attrs().underline(), Underline::None);
+    }
+
+    #[test]
+    fn xterm_other_keys_settings_roundtrip_and_reset() {
+        let (mut terminal, mut wire) = engine();
+        terminal.advance_bytes(b"\x1b[?4m\x1b[?4g");
+        assert_eq!(receive(&mut wire), b"\x1b[>4;0m");
+        assert_eq!(receive(&mut wire), b"\x1b[>4;0f");
+        for byte in b"\x1b[>4;2m\x1b[>4;1f\x1b[?1;4m\x1b[?4g\x1bP$q>4m\x1b\\\x1bP$q>4f\x1b\\" {
+            terminal.advance_bytes([*byte]);
+        }
+        let report = b"\x1b[>4;2m\x1b[>4;1f";
+        assert_eq!(receive(&mut wire), b"\x1b[>4;2m");
+        assert_eq!(receive(&mut wire), b"\x1b[>4;1f");
+        assert_eq!(receive(&mut wire), b"\x1bP1$r>4;2m\x1b\\");
+        assert_eq!(receive(&mut wire), b"\x1bP1$r>4;1f\x1b\\");
+        terminal.advance_bytes(b"\x1b[>4;9m\x1b[>4;2f\x1b[>4;2;9m\x1b[>4;1:f\x1b[?4;bad");
+        assert_eq!(terminal.xterm_other_keys(), (2, true));
+        terminal.advance_bytes(b"\x1b[>4n");
+        assert_eq!(terminal.xterm_other_keys(), (0, true));
+        terminal.advance_bytes(report);
+        assert_eq!(terminal.xterm_other_keys(), (2, true));
+        let inspect = TerminalModes::read(&terminal).as_json();
+        assert_eq!(inspect["keyboard"]["modify_other_keys"], 2);
+        assert_eq!(inspect["keyboard"]["format_other_keys"], "csi-u");
+        terminal.advance_bytes(b"\x1b[>4m\x1b[>4f");
+        assert_eq!(terminal.xterm_other_keys(), (0, false));
+        for reset in [b"\x1b[>m\x1b[>f".as_slice(), b"\x1b[!p", b"\x1bc"] {
+            terminal.advance_bytes(report);
+            terminal.advance_bytes(reset);
+            assert_eq!(terminal.xterm_other_keys(), (0, false));
+        }
+        terminal.advance_bytes(report);
+        terminal.reset_connection();
+        assert_eq!(terminal.xterm_other_keys(), (0, false));
+    }
+
+    #[test]
+    fn xterm_other_keys_distinguishes_control_aliases_and_preserves_key_classes() {
+        use wezterm_term::{KeyCode as K, KeyModifiers as M};
+        let (mut terminal, mut wire) = engine();
+        for (level, cases) in [
+            (
+                1,
+                vec![
+                    (K::Char('i'), M::CTRL, "\t"),
+                    (K::Char('A'), M::CTRL | M::SHIFT, "\x01"),
+                    (K::Char('3'), M::CTRL, "\x1b"),
+                    (K::Char(','), M::CTRL, "\x1b[27;5;44~"),
+                    (K::Tab, M::SHIFT, "\x1b[Z"),
+                    (K::Tab, M::CTRL, "\x1b[27;5;9~"),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (K::Char('i'), M::CTRL, "\x1b[27;5;105~"),
+                    (K::Char('I'), M::CTRL | M::SHIFT, "\x1b[27;6;73~"),
+                    (K::Char('É'), M::SHIFT, "\x1b[27;2;201~"),
+                    (K::Char('a'), M::ALT, "\x1b[27;3;97~"),
+                    (K::Char('a'), M::NONE, "a"),
+                    (K::Tab, M::NONE, "\t"),
+                    (K::Tab, M::SHIFT, "\x1b[27;2;9~"),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    (K::Char(' '), M::NONE, "\x1b[27;1;32~"),
+                    (K::Tab, M::NONE, "\x1b[27;1;9~"),
+                    (K::Backspace, M::NONE, "\x1b[27;1;127~"),
+                    (K::LeftArrow, M::CTRL, "\x1b[1;5D"),
+                    (K::Function(12), M::NONE, "\x1b[24~"),
+                    (K::Delete, M::NONE, "\x1b[3~"),
+                ],
+            ),
+        ] {
+            terminal.advance_bytes(format!("\x1b[>4;{level}m"));
+            for (key, mods, expected) in cases {
+                terminal.key_down(key, mods).unwrap();
+                terminal.key_up(key, mods).unwrap();
+                assert_eq!(
+                    receive(&mut wire),
+                    expected.as_bytes(),
+                    "{level} {key:?} {mods:?}"
+                );
+            }
+        }
+        terminal.advance_bytes(b"\x1b[>4;1f");
+        let keypad = KeyDetails {
+            keypad: Some(KeypadKey::Enter),
+            ..Default::default()
+        };
+        let composed = KeyDetails {
+            text: Some("´q".into()),
+            ..Default::default()
+        };
+        let held = KeyDetails {
+            repeat_text: Some("Q".into()),
+            ..Default::default()
+        };
+        for (key, mods, repeat, details, expected) in [
+            (K::Enter, M::NONE, false, &keypad, "\r"),
+            (K::Char('q'), M::NONE, false, &composed, "´q"),
+            (K::Char('q'), M::SHIFT, true, &held, "\x1b[81;2u"),
+        ] {
+            assert_eq!(
+                encode_key_input(&terminal, key, mods, true, repeat, details).unwrap(),
+                expected
+            );
+        }
+        terminal.advance_bytes(b"\x1b[>3u");
+        let no_details = KeyDetails::default();
+        assert_eq!(
+            encode_key_input(&terminal, K::Char('i'), M::CTRL, false, false, &no_details).unwrap(),
+            "\x1b[105;5:3u"
+        );
+        terminal.advance_bytes(b"\x1b[<u");
+        assert_eq!(
+            encode_key_input(&terminal, K::Char('i'), M::CTRL, true, false, &no_details).unwrap(),
+            "\x1b[105;5u"
+        );
     }
 
     #[test]

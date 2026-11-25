@@ -8,7 +8,7 @@ pub(super) enum Wire {
     Input(ChannelId, Vec<u8>),
 }
 
-struct WireReader(mpsc::UnboundedReceiver<Wire>);
+pub(super) struct WireReader(pub(super) mpsc::UnboundedReceiver<Wire>);
 
 impl WireReader {
     async fn next(&mut self) -> Wire {
@@ -18,7 +18,7 @@ impl WireReader {
             .expect("SSH peer closed")
     }
 
-    async fn shell(&mut self) -> (ChannelId, server::Handle) {
+    pub(super) async fn shell(&mut self) -> (ChannelId, server::Handle) {
         let Wire::Shell(id, handle) = self.next().await else {
             panic!("expected a new SSH shell")
         };
@@ -36,7 +36,7 @@ impl WireReader {
         }
     }
 
-    async fn input(&mut self, channel: ChannelId, expected: &[u8]) {
+    pub(super) async fn input(&mut self, channel: ChannelId, expected: &[u8]) {
         // Replies are byte streams; SSH may fragment a single reply.
         let mut actual = Vec::new();
         while actual.len() < expected.len() {

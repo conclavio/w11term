@@ -1074,6 +1074,8 @@ mod text_preview;
 mod text_save;
 #[path = "sftp/upload_folder.rs"]
 mod upload_folder;
+#[path = "sftp/xterm_other_keys.rs"]
+mod xterm_other_keys;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {
