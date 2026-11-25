@@ -38,6 +38,10 @@ impl PosixMetadata {
         }
     }
 
+    pub(super) fn set_permissions(&mut self, path: String, mode: u32) {
+        self.attrs.entry(path).or_insert((1701, 2048, 0o640)).2 = mode;
+    }
+
     pub(super) fn fstat(&self, handle: &str, attrs: &mut FileAttributes) -> Result<(), StatusCode> {
         self.stat(self.handles.get(handle).ok_or(StatusCode::Failure)?, attrs);
         Ok(())

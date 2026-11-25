@@ -35,7 +35,7 @@ pub enum Action {
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
     BulkMarks(u64, SelectionChange),
-    MoveMarked(u64),
+    StartFolderBatch(u64, FolderBatchKind),
     Reveal(u64, FilenameMatch),
     Rename(u64, FilenameMatch),
     Delete(u64, FilenameMatch),
@@ -668,7 +668,30 @@ impl Panel {
                     "move",
                     button(
                         "Move marked results…",
-                        Action::MoveMarked(serial),
+                        Action::StartFolderBatch(serial, FolderBatchKind::Move),
+                        ready && !marked.is_empty(),
+                    ),
+                ));
+                actions.push(KeyedView::new(
+                    "copy",
+                    button(
+                        "Copy marked files…",
+                        Action::StartFolderBatch(serial, FolderBatchKind::Copy),
+                        ready
+                            && !marked.is_empty()
+                            && marked.iter().all(|&index| {
+                                result
+                                    .matches
+                                    .get(index)
+                                    .is_some_and(|hit| hit.kind == Some(EntryKind::File))
+                            }),
+                    ),
+                ));
+                actions.push(KeyedView::new(
+                    "rename-marked",
+                    button(
+                        "Rename marked entries…",
+                        Action::StartFolderBatch(serial, FolderBatchKind::Rename),
                         ready && !marked.is_empty(),
                     ),
                 ));
@@ -720,8 +743,10 @@ impl Panel {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        if let Some(button) = files.stop_move_batch_button(pane, MoveOrigin::Search(serial), ctx) {
-            rows.push(KeyedView::new("stop-moves", button));
+        if let Some(button) =
+            files.stop_folder_batch_button(pane, FolderBatchOrigin::Search(serial), ctx)
+        {
+            rows.push(KeyedView::new("stop-batch", button));
         }
         if let Some(progress) = files.search_progress(serial) {
             let entries = if progress.scanned_entries == 1 {
@@ -1016,23 +1041,29 @@ impl Panel {
                     }
                 }
                 if hit.kind == Some(EntryKind::File) && entry_path(&hit.parent, &hit.name).is_ok() {
-                    actions.push(KeyedView::new(
-                        "copy-file",
-                        Button::new()
-                            .automation_name(format!("Copy to folder {path}"))
-                            .is_enabled(ready)
-                            .on_click({
-                                let hit = hit.clone();
-                                ctx.callback(move |_| {
-                                    Message::Files(FileAction::CopyEntry(
-                                        pane,
-                                        generation,
-                                        FileTarget::Search(serial, hit.clone()),
-                                    ))
+                    for (key, label, mode) in [
+                        ("copy-file", "Copy to folder", CopyFileMode::ToFolder),
+                        ("duplicate-file", "Duplicate as", CopyFileMode::Duplicate),
+                    ] {
+                        actions.push(KeyedView::new(
+                            key,
+                            Button::new()
+                                .automation_name(format!("{label} {path}"))
+                                .is_enabled(ready)
+                                .on_click({
+                                    let hit = hit.clone();
+                                    ctx.callback(move |_| {
+                                        Message::Files(FileAction::CopyEntry(
+                                            pane,
+                                            generation,
+                                            FileTarget::Search(serial, hit.clone()),
+                                            mode,
+                                        ))
+                                    })
                                 })
-                            })
-                            .content("Copy to folder…"),
-                    ));
+                                .content(format!("{label}…")),
+                        ));
+                    }
                 }
                 KeyedView::new(
                     index,
@@ -1091,7 +1122,10 @@ impl FileDrawer {
             .search_download_selection(serial)
     }
 
-    pub(super) fn marked_search_moves(&self, serial: u64) -> Result<(String, Vec<FilenameMatch>)> {
+    pub(super) fn marked_search_sources(
+        &self,
+        serial: u64,
+    ) -> Result<(String, Vec<FilenameMatch>)> {
         ensure!(self.open, "Open the file drawer");
         let (result, hits) = self
             .search
@@ -1322,18 +1356,7 @@ impl FileDrawer {
             size,
         } = change
         {
-            if self.directory.as_ref() == Some(directory) {
-                self.entries.retain(|entry| entry.name != *name);
-                self.entries.push(Entry {
-                    name: name.clone(),
-                    kind: ListedKind::Known(EntryKind::File),
-                    mtime: None,
-                    size: *size,
-                });
-                self.sort_order.sort(&mut self.entries);
-                self.update_matches();
-                self.listing_revision = self.listing_revision.wrapping_add(1);
-            }
+            self.accept_copied_entry(directory, name, *size);
             return Ok(());
         }
         let old_path = entry_path(&hit.parent, &hit.name)?;
@@ -1558,8 +1581,8 @@ impl FileDrawer {
             Action::BulkMarks(serial, change) if serial == panel.serial && !busy => {
                 panel.bulk_marks(change);
             }
-            Action::MoveMarked(serial) if !busy => {
-                self.begin_marked_move(MoveOrigin::Search(serial))?
+            Action::StartFolderBatch(serial, kind) if !busy => {
+                self.begin_folder_batch(kind, FolderBatchOrigin::Search(serial))?
             }
             Action::Rename(serial, hit) if !busy => self.begin_search_rename(serial, hit)?,
             Action::Delete(serial, hit) if !busy => self.begin_search_delete(serial, hit)?,

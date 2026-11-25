@@ -7,10 +7,33 @@ impl Engine {
     pub(super) async fn copy_entry(
         &self,
         from: &str,
-        directory: &str,
+        destination: CopyDestination,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        let (folder, destination) = self.cross_folder_paths(from, directory, false).await?;
+        let (folder, destination) = match destination {
+            CopyDestination::Folder {
+                directory,
+                is_canonical,
+            } => {
+                self.cross_folder_paths(from, &directory, is_canonical)
+                    .await?
+            }
+            CopyDestination::Sibling { name } => {
+                ensure!(
+                    !name.trim().is_empty()
+                        && !matches!(name.as_str(), "." | "..")
+                        && !name.contains(['/', '\\'])
+                        && !name.chars().any(char::is_control),
+                    "Enter one name without path separators or control characters"
+                );
+                let (parent, source_name) = self.checked_source_folder(from).await?;
+                ensure!(source_name != name, "Enter a different name");
+                (
+                    parent.to_owned(),
+                    format!("{}/{name}", parent.trim_end_matches('/')),
+                )
+            }
+        };
         self.require_destination_directory(&folder).await?;
         self.require_new_name(&destination).await?;
         let before = self.copy_source_attributes(from).await?;

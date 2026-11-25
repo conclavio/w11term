@@ -1,7 +1,50 @@
 use super::*;
-use w11term::sftp::Operation;
+use w11term::sftp::{Attributes, Operation, PermissionReview};
 
 impl Files {
+    pub(super) fn fixture_link(&self, path: &str) -> Option<(String, String)> {
+        let data = fs::read(self.root.join("fixture-links.json")).ok()?;
+        serde_json::from_slice::<HashMap<String, (String, String)>>(&data)
+            .ok()?
+            .remove(path)
+    }
+
+    pub(super) fn set_permissions(
+        &mut self,
+        opcode: &str,
+        path: String,
+        attrs: &FileAttributes,
+    ) -> Result<(), StatusCode> {
+        if !self.root.join("fixture-permissions").is_file() {
+            return Err(StatusCode::OpUnsupported);
+        }
+        self.trace_properties(opcode, &path)?;
+        if attrs.size.is_some()
+            || attrs.uid.is_some()
+            || attrs.gid.is_some()
+            || attrs.atime.is_some()
+            || attrs.mtime.is_some()
+        {
+            return Err(StatusCode::BadMessage);
+        }
+        let mode = attrs
+            .permissions
+            .filter(|&mode| mode <= 0o7777)
+            .ok_or(StatusCode::BadMessage)?;
+        let entry = entry_attrs(&self.path(&path))?;
+        if !matches!(
+            w11term::sftp::EntryKind::from_permissions(entry.permissions),
+            Some(w11term::sftp::EntryKind::File | w11term::sftp::EntryKind::Directory)
+        ) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        self.posix
+            .as_mut()
+            .ok_or(StatusCode::Failure)?
+            .set_permissions(path, mode);
+        Ok(())
+    }
+
     pub(super) fn trace_properties(&self, opcode: &str, path: &str) -> Result<(), StatusCode> {
         let trace = self.root.join("properties-trace");
         if trace.is_file() {
@@ -19,11 +62,15 @@ impl Files {
         if self.root.join("deny-readlink").is_file() {
             return Err(StatusCode::PermissionDenied);
         }
-        let target = fs::read_link(self.path(path)).map_err(io)?;
         // The marker represents the literal POSIX target carried by SSH_FXP_NAME.
         // A real junction supplies the link's LSTAT type on unprivileged Windows.
-        let target = fs::read_to_string(self.root.join("properties-link-target"))
-            .unwrap_or_else(|_| target.to_string_lossy().into_owned());
+        let target = if let Some((literal, _)) = self.fixture_link(path) {
+            literal
+        } else {
+            let target = fs::read_link(self.path(path)).map_err(io)?;
+            fs::read_to_string(self.root.join("properties-link-target"))
+                .unwrap_or_else(|_| target.to_string_lossy().into_owned())
+        };
         Ok(Name {
             id,
             files: vec![russh_sftp::protocol::File::dummy(target)],
@@ -31,8 +78,152 @@ impl Files {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_link_target_rechecks_the_link_and_lists_the_resolved_folder() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    fs::create_dir(root.join("files")).unwrap();
+    fs::write(root.join("files/payload.txt"), b"unchanged").unwrap();
+    for name in ["folder-link", "file-link", "broken", "loop"] {
+        directory_junction(root, name, "files");
+    }
+    fs::write(
+        root.join("fixture-links.json"),
+        json!({
+            "/folder-link":["files","/files"],
+            "/file-link":["files/payload.txt","/files/payload.txt"],
+            "/broken":["missing","/missing"],
+            "/loop":["loop","/loop"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let generation = pane.frames.load().connection_generation;
+    let open = |path: &str, expected_target: &str| Operation::OpenLinkTarget {
+        path: path.into(),
+        expected_target: expected_target.into(),
+    };
+    for expected in [None, Some(generation + 1)] {
+        assert!(
+            guarded_job(&pane, expected, open("/file-link", "files/payload.txt"))
+                .await
+                .is_err()
+        );
+    }
+    let generation = Some(generation);
+    let error = guarded_job(&pane, generation, open("/file-link", "previous name"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("symbolic link changed"), "{error}");
+    let error = guarded_job(&pane, generation, open("/files/payload.txt", "payload.txt"))
+        .await
+        .unwrap_err();
+    assert!(error.contains("symbolic link changed"), "{error}");
+    assert!(
+        guarded_job(&pane, generation, open("/broken", "missing"))
+            .await
+            .is_err()
+    );
+    assert!(
+        guarded_job(&pane, generation, open("/loop", "loop"))
+            .await
+            .is_err()
+    );
+    for (path, target, selected) in [
+        ("/file-link", "files/payload.txt", json!("payload.txt")),
+        ("/folder-link", "files", Value::Null),
+    ] {
+        let reply = guarded_job(&pane, generation, open(path, target))
+            .await
+            .unwrap();
+        assert_eq!(reply["directory"], "/files");
+        assert_eq!(reply["selected"], selected);
+        assert_eq!(reply["entries"][0]["filename"], "payload.txt");
+    }
+    assert_eq!(
+        fs::read(root.join("files/payload.txt")).unwrap(),
+        b"unchanged"
+    );
+    server.abort();
+}
+
 fn properties(path: &str) -> Operation {
     Operation::EntryProperties { path: path.into() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn updating_permissions_rechecks_the_review_and_uses_the_server_mode() {
+    for (capability, verb) in [("lsetstat", "LSETSTAT"), ("v3", "SETSTAT")] {
+        let (pane, _, remote, _, server) = fixture(false).await;
+        let root = remote.path();
+        fs::write(root.join("fixture-permissions"), capability).unwrap();
+        fs::write(root.join("regular"), b"keep the contents").unwrap();
+        fs::create_dir(root.join("folder")).unwrap();
+        directory_junction(root, "link", "folder");
+        let trace = root.join("properties-trace");
+        fs::write(&trace, []).unwrap();
+        let generation = pane.frames.load().connection_generation;
+        let snapshot = |reply: Value| {
+            let attrs: Attributes = serde_json::from_value(reply["attrs"].clone()).unwrap();
+            PermissionReview::from_attributes(&attrs)
+        };
+        let review = snapshot(
+            guarded_job(&pane, Some(generation), properties("/regular"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let edit = |path: &str, review, mode| Operation::SetEntryPermissions {
+            path: path.into(),
+            review,
+            mode,
+        };
+        for expected in [None, Some(generation + 1)] {
+            assert!(
+                guarded_job(&pane, expected, edit("/regular", review, 0o750))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            guarded_job(&pane, Some(generation), edit("/regular", review, 0o100750))
+                .await
+                .is_err()
+        );
+        assert!(
+            guarded_job(&pane, Some(generation), edit("/link", review, 0o750))
+                .await
+                .is_err()
+        );
+        assert!(
+            guarded_job(&pane, Some(generation), edit("/folder", review, 0o750))
+                .await
+                .is_err()
+        );
+        let reply = guarded_job(&pane, Some(generation), edit("/regular", review, 0o750))
+            .await
+            .unwrap();
+        assert_eq!(reply["attrs"]["uid"], 1701);
+        assert_eq!(reply["attrs"]["gid"], 2048);
+        assert_eq!(snapshot(reply).unwrap().mode(), 0o750);
+        let error = guarded_job(&pane, Some(generation), edit("/regular", review, 0o777))
+            .await
+            .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert_eq!(
+            fs::read(root.join("regular")).unwrap(),
+            b"keep the contents"
+        );
+        let requests = fs::read_to_string(trace).unwrap();
+        assert_eq!(
+            requests
+                .lines()
+                .filter(|line| line.contains("SETSTAT"))
+                .collect::<Vec<_>>(),
+            [format!("{verb} /regular")]
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
