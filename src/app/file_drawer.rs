@@ -118,6 +118,7 @@ pub enum FileAction {
     Choose(u64, u64, ListedEntry),
     SelectDownloads(u64, u64, u64, bool),
     MarkDownload(u64, u64, ListedEntry, bool),
+    BulkListingMarks(u64, u64, u64, SelectionChange),
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     Preview(u64, u64, FileTarget, PreviewKind),
     ClosePreview(u64, u64, u64),
@@ -158,6 +159,12 @@ pub enum FileAction {
         Result<Vec<Entry>, String>,
     ),
     Tick(u64),
+}
+
+#[derive(Clone, Copy)]
+pub enum SelectionChange {
+    MarkAll,
+    Clear,
 }
 
 #[derive(Default)]
@@ -2369,8 +2376,29 @@ impl FileDrawer {
                 )),
         );
         if let Some(marked) = &self.marked_downloads {
+            let (can_add, hidden) = self.listing_mark_summary(marked);
+            if hidden != 0 {
+                let noun = if hidden == 1 { "mark" } else { "marks" };
+                controls.push(
+                    TextBlock::new()
+                        .text(format!("{hidden} {noun} outside this filter"))
+                        .into(),
+                );
+            }
             controls.push(
                 StackPanel::new().spacing(6.0).children((
+                    button_pair(
+                        button(
+                            "Mark all matches",
+                            writable && can_add,
+                            BulkListingMarks(pane, generation, revision, SelectionChange::MarkAll),
+                        ),
+                        button(
+                            "Clear marks",
+                            writable && !marked.is_empty(),
+                            BulkListingMarks(pane, generation, revision, SelectionChange::Clear),
+                        ),
+                    ),
                     Button::new()
                         .automation_name("Download marked items")
                         .is_enabled(writable && !marked.is_empty())
@@ -3222,6 +3250,7 @@ impl TerminalApp {
             | Choose(id, ..)
             | SelectDownloads(id, ..)
             | MarkDownload(id, ..)
+            | BulkListingMarks(id, ..)
             | CopyPath(id, ..)
             | Preview(id, ..)
             | ClosePreview(id, ..)
@@ -3301,7 +3330,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | MoveMarked(_, g, ..) | StopMoves(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | MoveMarked(_, g, ..) | StopMoves(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3312,7 +3341,7 @@ impl TerminalApp {
             }
             return;
         }
-        if matches!(&action, Filter(_, _, r, _) | ClearFilter(_, _, r) | FocusFilter(_, _, r, _) | EditFilter(_, _, r, _) | Page(_, _, r, _) | Sort(_, _, r, _) | SelectDownloads(_, _, r, _) if *r != files.listing_revision)
+        if matches!(&action, Filter(_, _, r, _) | ClearFilter(_, _, r) | FocusFilter(_, _, r, _) | EditFilter(_, _, r, _) | Page(_, _, r, _) | Sort(_, _, r, _) | SelectDownloads(_, _, r, _) | BulkListingMarks(_, _, r, _) if *r != files.listing_revision)
         {
             return;
         }
@@ -3894,6 +3923,7 @@ impl TerminalApp {
                         files.set_download_mark(entry, checked);
                     }
                 }
+                BulkListingMarks(_, _, _, change) => files.bulk_listing_marks(change),
                 CopyPath(_, generation, revision, entry) => {
                     if generation == files.generation
                         && may_open_dialog

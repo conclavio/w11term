@@ -863,6 +863,13 @@ try {
         (Find-Element '38 matches in 2 folders') -and (Button "Reveal $parent/build-00.log")
     }
     Click ('Select results' + [char]0x2026)
+    Click 'Mark all results'
+    $null = Wait-CheckBox "Mark $parent/build-00.log" $on
+    Click 'Next results'
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $on
+    Click 'Clear marks'
+    $null = Wait-CheckBox "Mark $parent/build-37.log" $off
+    Click 'Previous results'
     (Wait-CheckBox "Mark $parent/build-00.log" $off).Toggle()
     $null = Wait-CheckBox "Mark $parent/build-00.log" $on
     Click 'Next results'
@@ -953,6 +960,32 @@ try {
     $null = Wait-CheckBox "Mark $parent/build-02.log" $on
     Click 'Back to files'
     Click ('Select entries' + [char]0x2026)
+    (Wait-CheckBox 'Mark nested/' $off).Toggle()
+    $null = Wait-CheckBox 'Mark nested/' $on
+    Click $filterAction
+    $field = Wait-Until 'the listing filter is ready for bulk marking' {
+        $inputField = Filter-Edit
+        if ($inputField -and $inputField.Current.HasKeyboardFocus) { $inputField }
+    }
+    $field.GetCurrentPattern($value).SetValue('build-')
+    $null = Wait-Until 'the listing reports the mark hidden by the filter' {
+        (Find-Element '1 mark outside this filter') -and !(Find-Element 'Mark nested/')
+    }
+    Click 'Mark all matches'
+    $null = Wait-CheckBox 'Mark build-04.log' $on
+    Click 'Next'
+    $null = Wait-CheckBox 'Mark build-35.log' $on
+    $null = Wait-Until 'mark all is disabled after marking every filtered entry' {
+        $markAll = Button 'Mark all matches'
+        $markAll -and !$markAll.Current.IsEnabled -and (Find-Element '1 mark outside this filter')
+    }
+    Click 'Clear marks'
+    $null = Wait-CheckBox 'Mark build-35.log' $off
+    Click 'Clear filter'
+    $null = Wait-CheckBox 'Mark nested/' $off
+    $null = Wait-Until 'clearing marks leaves selection mode open with no hidden marks' {
+        (Button 'Exit selection').Current.IsEnabled -and !(Find-Element '1 mark outside this filter')
+    }
     (Wait-CheckBox 'Mark build-03.log' $off).Toggle()
     $null = Wait-CheckBox 'Mark build-03.log' $on
     Click 'Next'

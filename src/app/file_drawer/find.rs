@@ -34,6 +34,7 @@ pub enum Action {
     Page(u64, usize),
     SelectDownloads(u64),
     MarkDownload(u64, usize, bool),
+    BulkMarks(u64, SelectionChange),
     MoveMarked(u64),
     Reveal(u64, FilenameMatch),
     Rename(u64, FilenameMatch),
@@ -140,6 +141,10 @@ fn result_status(result: &FilenameSearch) -> String {
 fn within<'a>(path: &'a str, ancestor: &str) -> Option<&'a str> {
     path.strip_prefix(ancestor)
         .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
+fn markable_result(hit: &FilenameMatch) -> bool {
+    matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory))
 }
 
 impl Panel {
@@ -256,7 +261,7 @@ impl Panel {
             .result
             .as_ref()
             .and_then(|result| result.matches.get(index));
-        if hit.is_some_and(|hit| matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)))
+        if hit.is_some_and(markable_result)
             && let Some(marked) = &mut self.marked_downloads
         {
             if checked {
@@ -264,6 +269,26 @@ impl Panel {
             } else {
                 marked.remove(&index);
             }
+        }
+    }
+
+    fn bulk_marks(&mut self, change: SelectionChange) {
+        let Some(marked) = &mut self.marked_downloads else {
+            return;
+        };
+        match change {
+            SelectionChange::MarkAll => {
+                if let Some(result) = &self.result {
+                    marked.extend(
+                        result
+                            .matches
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, hit)| markable_result(hit).then_some(index)),
+                    );
+                }
+            }
+            SelectionChange::Clear => marked.clear(),
         }
     }
 
@@ -590,12 +615,9 @@ impl Panel {
                 ));
             }
         }
-        if self.result.as_ref().is_some_and(|result| {
-            result
-                .matches
-                .iter()
-                .any(|hit| matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)))
-        }) {
+        if let Some(result) = self.result.as_ref()
+            && result.matches.iter().any(markable_result)
+        {
             let mode = if self.marked_downloads.is_some() {
                 "Exit selection"
             } else {
@@ -604,6 +626,29 @@ impl Panel {
             let select = button(mode, Action::SelectDownloads(serial), ready);
             let mut actions = vec![KeyedView::new("select", select)];
             if let Some(marked) = &self.marked_downloads {
+                let can_add = result
+                    .matches
+                    .iter()
+                    .enumerate()
+                    .any(|(index, hit)| markable_result(hit) && !marked.contains(&index));
+                actions.push(KeyedView::new(
+                    "bulk-marks",
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(6.0)
+                        .children((
+                            button(
+                                "Mark all results",
+                                Action::BulkMarks(serial, SelectionChange::MarkAll),
+                                ready && can_add,
+                            ),
+                            button(
+                                "Clear marks",
+                                Action::BulkMarks(serial, SelectionChange::Clear),
+                                ready && !marked.is_empty(),
+                            ),
+                        )),
+                ));
                 actions.push(KeyedView::new(
                     "download",
                     Button::new()
@@ -795,7 +840,7 @@ impl Panel {
                     ));
                 }
                 if let Some(marked) = &self.marked_downloads
-                    && matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory))
+                    && markable_result(hit)
                 {
                     entry_actions.push(KeyedView::new(
                         "mark",
@@ -1471,6 +1516,9 @@ impl FileDrawer {
             Action::MarkDownload(serial, index, checked) if serial == panel.serial && !busy => {
                 panel.mark_download(index, checked);
             }
+            Action::BulkMarks(serial, change) if serial == panel.serial && !busy => {
+                panel.bulk_marks(change);
+            }
             Action::MoveMarked(serial) if !busy => {
                 self.begin_marked_move(MoveOrigin::Search(serial))?
             }
@@ -1565,6 +1613,36 @@ mod tests {
             }),
             ..FileDrawer::default()
         }
+    }
+
+    #[test]
+    fn mark_all_results_spans_pages_and_skips_nontransferable_entries() {
+        let names: Vec<_> = (0..RESULTS_PER_PAGE + 2)
+            .map(|index| format!("{index:02}.txt"))
+            .collect();
+        let mut matches: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), EntryKind::File))
+            .collect();
+        matches.push(("subdir", EntryKind::Directory));
+        matches.push(("link", EntryKind::Symlink));
+        matches.push(("unknown", EntryKind::File));
+        let mut result = search_result("/project", &matches);
+        result.matches.last_mut().unwrap().kind = None;
+        let mut drawer = search_drawer(result);
+        let panel = drawer.search.as_mut().unwrap();
+        panel.bulk_marks(SelectionChange::MarkAll);
+        assert!(panel.marked_downloads.is_none());
+        panel.marked_downloads = Some(BTreeSet::new());
+        panel.bulk_marks(SelectionChange::MarkAll);
+        let marked = panel.marked_downloads.as_ref().unwrap();
+        assert_eq!(marked.len(), RESULTS_PER_PAGE + 3);
+        assert!(marked.contains(&(RESULTS_PER_PAGE + 2)));
+        assert!(!marked.contains(&(RESULTS_PER_PAGE + 3)));
+        assert!(!marked.contains(&(RESULTS_PER_PAGE + 4)));
+        panel.bulk_marks(SelectionChange::Clear);
+        assert_eq!(panel.marked_downloads, Some(BTreeSet::new()));
+        assert!(panel.result.is_some());
     }
 
     #[test]
