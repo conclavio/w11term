@@ -63,14 +63,29 @@ function Test-ComparisonExport {
     Click $save
     $dialog = Wait-Until 'owned comparison Save dialog reopened' { Find-OwnedDialog 'Save folder comparison as JSON' }
     $null = Wait-Until 'save the comparison JSON' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'an export status inside the comparison dialog confirms publication' {
+    $prefix = 'Saved folder comparison to '
+    $published = Wait-Until 'an export status inside the comparison dialog confirms publication' {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $byId = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-folder-comparison-export-status')
         $status = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)
-        $status -and $status.Current.Name -ceq "Saved folder comparison to $output" -and [IO.File]::Exists($output)
+        if ($status -and $status.Current.Name.StartsWith('Could not save folder comparison.')) {
+            throw $status.Current.Name
+        }
+        if ($status -and $status.Current.Name.StartsWith($prefix)) {
+            $status.Current.Name.Substring($prefix.Length)
+        }
     }
-    $report = [IO.File]::ReadAllText($output, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    # The shell picker can expand a short temporary-directory path to its long spelling.
+    if (![IO.File]::Exists($output) -or ![IO.File]::Exists($published)) {
+        throw "Expected the saved export at '$output'. The dialog reported '$published'"
+    }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $json = [IO.File]::ReadAllText($output, $encoding)
+    if ([IO.File]::ReadAllText($published, $encoding) -cne $json) {
+        throw "The export status refers to a different file: '$published'"
+    }
+    $report = $json | ConvertFrom-Json
     $modified = $report.differences | Where-Object path -ceq 'nested/data.txt'
     $later = $report.differences | Where-Object path -ceq 'bulk-239.txt'
     if ($report.schema_version -ne 1 -or $report.ssh.host -cne '127.0.0.1' -or $report.ssh.port -le 0 -or
