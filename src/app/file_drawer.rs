@@ -92,6 +92,7 @@ pub enum FileAction {
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
     Replace(u64, u64, bool),
+    AtomicUploads(u64, u64, bool),
     Pick(u64, u64, u64, TransferPicker),
     Picked(u64, u64, u64, TransferPicker, Result<Vec<PathBuf>, String>),
     Drop(DropTarget, Vec<PathBuf>),
@@ -134,6 +135,7 @@ pub(super) struct FileDrawer {
     editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
+    atomic_uploads: bool,
     picking: Option<u64>,
     parsing: bool,
     pending: Option<Pending>,
@@ -338,10 +340,19 @@ enum Step {
 }
 
 enum TransferFile {
-    Upload { name: String, remote: String },
-    UploadFolder { remote: String },
+    Upload {
+        name: String,
+        remote: String,
+        atomic: bool,
+    },
+    UploadFolder {
+        remote: String,
+    },
     Download(String),
-    DownloadFolder { remote: String, local: PathBuf },
+    DownloadFolder {
+        remote: String,
+        local: PathBuf,
+    },
 }
 
 fn counted(amount: u64, singular: &str) -> String {
@@ -353,9 +364,13 @@ impl TransferFile {
     fn outcome(&self, reply: &Value) -> String {
         let bytes = &reply["bytes_transferred"];
         match (self, reply["cancelled"].as_bool() == Some(true)) {
-            (Self::Upload { remote, .. }, true) => {
+            (Self::Upload { remote, atomic, .. }, true) => {
                 let path = reply["remote"].as_str().unwrap_or(remote);
-                if reply["remote_may_be_partial"] == true {
+                if *atomic {
+                    format!(
+                        "Cancelled atomic upload of {path} ({bytes} bytes acknowledged). The destination was left in place."
+                    )
+                } else if reply["remote_may_be_partial"] == true {
                     format!(
                         "Cancelled upload of {path} ({bytes} bytes acknowledged). The remote file may be incomplete."
                     )
@@ -410,6 +425,13 @@ impl TransferFile {
 
     fn interrupted(&self, bytes: u64) -> String {
         match self {
+            Self::Upload {
+                remote,
+                atomic: true,
+                ..
+            } => format!(
+                "Atomic upload of {remote} was interrupted after at least {bytes} bytes. Check the destination and any temporary upload before trying again."
+            ),
             Self::Upload { remote, .. } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote file may be incomplete."
             ),
@@ -1489,6 +1511,13 @@ impl FileDrawer {
                     context.callback(move |v| Message::Files(Replace(pane, generation, v))),
                 )
                 .content(TextBlock::new().text("Replace existing files")),
+            CheckBox::new()
+                .is_enabled(ready)
+                .is_checked(self.atomic_uploads)
+                .on_is_checked_changed(
+                    context.callback(move |v| Message::Files(AtomicUploads(pane, generation, v))),
+                )
+                .content(TextBlock::new().text("Upload files atomically")),
         ];
         if let Some(editor) = &self.editor {
             controls.push(button(
@@ -2275,6 +2304,7 @@ impl TerminalApp {
             | FinishEdit(id, ..)
             | Page(id, ..)
             | Replace(id, ..)
+            | AtomicUploads(id, ..)
             | Pick(id, ..)
             | Picked(id, ..)
             | Listed(id, ..)
@@ -2327,7 +2357,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2484,7 +2514,12 @@ impl TerminalApp {
                                 files.directory.as_ref() == Some(&parent),
                                 "The upload destination changed. Choose the files again."
                             );
-                            files.uploads = UploadQueue::files(paths, &parent, files.replace)?;
+                            files.uploads = UploadQueue::files(
+                                paths,
+                                &parent,
+                                files.replace,
+                                files.atomic_uploads,
+                            )?;
                             files.upload_next(pane, session, context)?;
                         }
                         TransferPicker::UploadFolder(parent) => {
@@ -2755,6 +2790,7 @@ impl TerminalApp {
                     files.set_page(page);
                 }
                 Replace(_, _, replace) => files.replace = replace,
+                AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,
                 Drop(target, paths) => {
                     if drop_allowed {
                         files.classify_drop(target, paths, context);
@@ -3966,6 +4002,7 @@ mod tests {
             vec![r"C:\second.txt".into(), r"C:\third.txt".into()],
             "/",
             false,
+            false,
         )
         .unwrap();
         for stale in [
@@ -3991,6 +4028,7 @@ mod tests {
         let upload = TransferFile::Upload {
             name: "large.bin".into(),
             remote: "/srv/uploads/large.bin".into(),
+            atomic: false,
         };
         let download = TransferFile::Download("/large.bin".into());
         let complete = json!({"bytes_transferred": 128});
@@ -4262,7 +4300,7 @@ mod tests {
             directory: Some("/old".into()),
             picking: Some(1),
             replace: true,
-            uploads: UploadQueue::files(vec![r"C:\queued".into()], "/old", true).unwrap(),
+            uploads: UploadQueue::files(vec![r"C:\queued".into()], "/old", true, false).unwrap(),
             ..Default::default()
         };
         drawer.observe_connection(2);

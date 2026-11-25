@@ -127,6 +127,15 @@ try {
     $null = Wait-Until 'next native download completes on that pane' {
         Find-Element 'Downloaded /shell directory/verified-download (17 bytes)'
     }
+    (Wait-CheckBox 'Upload files atomically' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox 'Upload files atomically' ([System.Windows.Automation.ToggleState]::On)
+    Click ('Upload' + [char]0x2026)
+    $open = Wait-Until 'owned atomic upload picker' { Find-OwnedDialog 'Choose files to upload' }
+    Select-DialogItem $open 'atomic-note'
+    Click-Dialog $open 1
+    $null = Wait-Until 'atomic file upload completes in the drawer' {
+        Find-Element 'Uploaded atomic-note (14 bytes)'
+    }
     Run-Palette 'SFTP files'
     foreach ($c in 'after-cancel'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-cancel')

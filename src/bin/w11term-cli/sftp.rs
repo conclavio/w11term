@@ -9,7 +9,7 @@ use w11term::{
 pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
   get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX]\n\
-  put LOCAL REMOTE [--overwrite]\n\
+  put LOCAL REMOTE [--overwrite] [--atomic]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
@@ -37,6 +37,7 @@ pub fn parse(
     let mut positional = Vec::new();
     let mut opts = BTreeMap::new();
     let mut overwrite = false;
+    let mut atomic = false;
     let mut spec_order = false;
     while let Some(arg) = args.next() {
         let value = |args: &mut std::iter::Peekable<_>| {
@@ -49,6 +50,10 @@ pub fn parse(
             "--overwrite" => {
                 ensure!(!overwrite, "duplicate --overwrite");
                 overwrite = true;
+            }
+            "--atomic" => {
+                ensure!(!atomic, "duplicate --atomic");
+                atomic = true;
             }
             "--spec-order" => {
                 ensure!(!spec_order, "duplicate --spec-order");
@@ -70,6 +75,7 @@ pub fn parse(
         }
     }
     let command = command.context(HELP)?;
+    ensure!(!atomic || command == "put", "--atomic requires put");
     let timeout = opts
         .remove("--timeout")
         .map(|s| s.parse::<u64>())
@@ -97,6 +103,9 @@ pub fn parse(
             if matches!(command.as_str(), "get" | "put") {
                 fields.insert("overwrite".into(), json!(overwrite));
                 overwrite = false;
+            }
+            if command == "put" && atomic {
+                fields.insert("atomic".into(), json!(true));
             }
             if command == "get"
                 && let Some(limit) = opts.remove("--max-bytes")
@@ -311,16 +320,28 @@ mod tests {
                         local,
                         remote,
                         overwrite,
+                        atomic,
                     },
                 ..
             },
-        ) = p(&["put", "--pane", "2", "a b", "/tmp/a b", "--overwrite"]).unwrap()
+        ) = p(&[
+            "put",
+            "--pane",
+            "2",
+            "a b",
+            "/tmp/a b",
+            "--overwrite",
+            "--atomic",
+        ])
+        .unwrap()
         else {
             panic!()
         };
         assert!(local.is_absolute());
         assert_eq!(remote, "/tmp/a b");
         assert!(overwrite);
+        assert!(atomic);
+        assert!(p(&["put-dir", "--pane", "2", "local", "/remote", "--atomic"]).is_err());
         let (
             _,
             Request::Sftp {

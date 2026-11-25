@@ -1800,6 +1800,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         local: destination.clone(),
         remote: "/upload".into(),
         overwrite: false,
+        atomic: false,
     };
     let fail = remote.path().join("fail-next-write");
     fs::write(&fail, []).unwrap();
@@ -1832,6 +1833,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
             local: destination.clone(),
             remote: "/upload".into(),
             overwrite: true,
+            atomic: false,
         },
     );
     assert_eq!(response.await.unwrap().unwrap()["bytes_transferred"], size);
@@ -1851,6 +1853,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
             local: destination,
             remote: "/dropped".into(),
             overwrite: false,
+            atomic: false,
         },
     );
     let error = response

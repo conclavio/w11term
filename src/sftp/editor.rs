@@ -1,7 +1,7 @@
 use super::*;
 use russh_sftp::protocol::Packet;
 
-const POSIX_RENAME: &str = "posix-rename@openssh.com";
+pub(super) const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
 impl Engine {
     pub(super) async fn save_text(
@@ -69,12 +69,7 @@ impl Engine {
             }
             if let JobStage::EditorSave { publishing, .. } = stage { *publishing = true; }
             if original.is_some() {
-                let payload = russh_sftp::ser::to_bytes(&(&temporary, path))?;
-                match self.raw.extended(POSIX_RENAME, payload.to_vec()).await? {
-                    Packet::Status(status) if status.status_code == StatusCode::Ok => {}
-                    Packet::Status(status) => return Err(Error::Status(status).into()),
-                    _ => return Err(Error::UnexpectedPacket.into()),
-                }
+                self.replace_staged_file(&temporary, path).await?;
             } else {
                 // Standard SFTP v3 RENAME requires that the new name is absent.
                 self.raw.rename(&temporary, path).await?;
@@ -94,7 +89,16 @@ impl Engine {
         published
     }
 
-    async fn require_new_name(&self, path: &str) -> Result<()> {
+    pub(super) async fn replace_staged_file(&self, temporary: &str, path: &str) -> Result<()> {
+        let payload = russh_sftp::ser::to_bytes(&(temporary, path))?;
+        match self.raw.extended(POSIX_RENAME, payload.to_vec()).await? {
+            Packet::Status(status) if status.status_code == StatusCode::Ok => Ok(()),
+            Packet::Status(status) => Err(Error::Status(status).into()),
+            _ => Err(Error::UnexpectedPacket.into()),
+        }
+    }
+
+    pub(super) async fn require_new_name(&self, path: &str) -> Result<()> {
         match self.raw.lstat(path).await {
             Err(Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => Ok(()),
             Err(error) => Err(error.into()),
@@ -131,38 +135,48 @@ impl Engine {
             offset += chunk.len() as u64;
         }
         if let Some(original) = attrs {
-            // Apply ownership before mode: chown can clear set-id bits.
-            let temp = self.raw.fstat(handle).await?.attrs;
-            if let (Some(uid), Some(gid)) = (original.uid, original.gid)
-                && (temp.uid != Some(uid) || temp.gid != Some(gid))
-            {
-                self.raw
-                    .fsetstat(
-                        handle,
-                        FileAttributes {
-                            uid: Some(uid),
-                            gid: Some(gid),
-                            ..FileAttributes::empty()
-                        },
-                    )
-                    .await
-                    .context("Preserving remote file ownership")?;
-            }
-            let permissions = original.permissions.map(|mode| mode & 0o7777);
-            self.raw
-                .fsetstat(
-                    handle,
-                    FileAttributes {
-                        permissions,
-                        ..FileAttributes::empty()
-                    },
-                )
-                .await
-                .context("Preserving remote file permissions")?;
+            self.apply_staged_attributes(handle, original, 0o7777)
+                .await?;
         }
         if self.extension(extensions::FSYNC, "1").is_ok() {
             self.raw.fsync(handle).await?;
         }
+        Ok(())
+    }
+
+    pub(super) async fn apply_staged_attributes(
+        &self,
+        handle: &str,
+        original: &FileAttributes,
+        mode_mask: u32,
+    ) -> Result<()> {
+        // Apply ownership before mode: chown can clear set-id bits.
+        let temp = self.raw.fstat(handle).await?.attrs;
+        if let (Some(uid), Some(gid)) = (original.uid, original.gid)
+            && (temp.uid != Some(uid) || temp.gid != Some(gid))
+        {
+            self.raw
+                .fsetstat(
+                    handle,
+                    FileAttributes {
+                        uid: Some(uid),
+                        gid: Some(gid),
+                        ..FileAttributes::empty()
+                    },
+                )
+                .await
+                .context("Preserving remote file ownership")?;
+        }
+        self.raw
+            .fsetstat(
+                handle,
+                FileAttributes {
+                    permissions: original.permissions.map(|mode| mode & mode_mask),
+                    ..FileAttributes::empty()
+                },
+            )
+            .await
+            .context("Preserving remote file permissions")?;
         Ok(())
     }
 }

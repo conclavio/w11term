@@ -37,7 +37,90 @@ fn upload(local: &Path) -> Operation {
         local: local.into(),
         remote: "/destination".into(),
         overwrite: true,
+        atomic: false,
     }
+}
+
+fn atomic_upload(local: &Path, remote: &str, overwrite: bool) -> Operation {
+    Operation::Put {
+        local: local.into(),
+        remote: remote.into(),
+        overwrite,
+        atomic: true,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn atomic_upload_cancellation_preserves_original_and_success_publishes_only_complete_file() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    let log = root.join("transfer-trace");
+    let gate = root.join("hold-transfer-write");
+    fs::write(&log, []).unwrap();
+    fs::write(&gate, []).unwrap();
+    let destination = root.join("destination");
+    fs::write(&destination, b"still live").unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let source = local.path().join("source");
+    let bytes = vec![69; CHUNK * 3 + 37];
+    fs::write(&source, &bytes).unwrap();
+    let cancel = TransferCancel::default();
+    let upload = start(&pane, atomic_upload(&source, "/destination", true), &cancel);
+    wait_for_packet(&log, &format!("WRITE {CHUNK}")).await;
+    assert_eq!(fs::read(&destination).unwrap(), b"still live");
+    cancel.cancel();
+    fs::remove_file(gate).unwrap();
+    let result = upload.await.unwrap().unwrap();
+    assert_eq!(result["cancelled"], true);
+    assert_eq!(result["remote_may_be_partial"], false);
+    assert_eq!(fs::read(&destination).unwrap(), b"still live");
+    assert!(fs::read_dir(root).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".w11term-upload-")
+    }));
+    assert!(!fs::read_to_string(&log).unwrap().contains("POSIX-RENAME"));
+
+    let result = guarded_job(&pane, None, atomic_upload(&source, "/destination", true))
+        .await
+        .unwrap();
+    assert_eq!(result["atomic"], true);
+    assert_eq!(fs::read(destination).unwrap(), bytes);
+    assert!(fs::read_to_string(log).unwrap().contains("POSIX-RENAME"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn atomic_upload_without_extension_creates_new_names_and_rejects_replacement() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let source = local.path().join("source");
+    fs::write(&source, b"new data").unwrap();
+    let destination = remote.path().join("destination");
+    assert_eq!(
+        guarded_job(&pane, None, atomic_upload(&source, "destination", false))
+            .await
+            .unwrap()["atomic"],
+        true
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"new data");
+    fs::write(&source, b"must not replace").unwrap();
+    for overwrite in [false, true] {
+        assert!(
+            guarded_job(
+                &pane,
+                None,
+                atomic_upload(&source, "/destination", overwrite)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"new data");
+    }
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

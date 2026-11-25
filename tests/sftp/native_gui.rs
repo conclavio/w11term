@@ -2685,6 +2685,9 @@ async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
     let bytes: Vec<u8> = (0..(4 * chunk + 7)).map(|i| (i % 251) as u8).collect();
     fs::write(picker.join("01-first-upload"), &bytes).unwrap();
     fs::write(picker.join("02-queued-upload"), b"must stay local").unwrap();
+    fs::write(picker.join("atomic-note"), b"new atomic one").unwrap();
+    fs::write(parent.join("atomic-note"), b"old atomic one").unwrap();
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
     fs::write(picker.join("retained-download"), b"keep these bytes").unwrap();
     fs::write(parent.join("retained-download"), &bytes).unwrap();
     fs::write(parent.join("verified-download"), b"same SFTP channel").unwrap();
@@ -2718,12 +2721,12 @@ async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
     );
     assert_eq!(
         fs::read_dir(&picker).unwrap().count(),
-        4,
+        5,
         "partial download left a temporary file"
     );
     let trace = fs::read_to_string(remote.path().join("transfer-trace")).unwrap();
     assert_eq!(
-        trace.lines().collect::<Vec<_>>(),
+        trace.lines().take(12).collect::<Vec<_>>(),
         [
             "OPEN /shell directory/01-first-upload",
             "WRITE 0",
@@ -2738,6 +2741,24 @@ async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
             "READ 17",
             "CLOSE",
         ]
+    );
+    assert_eq!(
+        fs::read(parent.join("atomic-note")).unwrap(),
+        b"new atomic one"
+    );
+    let atomic_trace: Vec<_> = trace.lines().skip(12).collect();
+    assert!(
+        atomic_trace
+            .first()
+            .is_some_and(|line| line.starts_with("OPEN /shell directory/.w11term-upload-")),
+        "{atomic_trace:?}"
+    );
+    assert!(
+        atomic_trace
+            .iter()
+            .any(|line| line.starts_with("POSIX-RENAME ")
+                && line.ends_with("/shell directory/atomic-note")),
+        "{atomic_trace:?}"
     );
     assert_eq!(
         fs::read(remote.path().join("keyboard-input.bin")).unwrap(),

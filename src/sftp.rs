@@ -25,6 +25,7 @@ use tokio::{
     time::Instant,
 };
 
+mod atomic_upload;
 mod directory;
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
@@ -55,6 +56,12 @@ pub fn normalize_sha256(value: &str) -> Result<String> {
 struct DownloadChecks {
     max_bytes: Option<u64>,
     sha256: Option<String>,
+}
+
+#[derive(Default)]
+struct UploadOptions {
+    overwrite: bool,
+    atomic: bool,
 }
 
 /// Directory entry types the drawer can delete with the SFTP v3 primitives.
@@ -111,6 +118,7 @@ pub enum Operation {
         source: DropSource,
         remote: String,
         overwrite: bool,
+        atomic: bool,
     },
     /// A file selected once for several generation-bound native uploads.
     #[serde(skip)]
@@ -123,6 +131,8 @@ pub enum Operation {
         remote: String,
         #[serde(default)]
         overwrite: bool,
+        #[serde(default)]
+        atomic: bool,
     },
     Ls {
         path: String,
@@ -392,6 +402,10 @@ enum JobStage {
         temporary: String,
         publishing: bool,
     },
+    AtomicUpload {
+        temporary: String,
+        publishing: bool,
+    },
     AwaitingStatus(&'static str),
 }
 
@@ -422,6 +436,14 @@ impl JobStage {
                     "destination was not replaced"
                 };
                 format!("Save interrupted; {state}. Temporary file may remain at {temporary}").into()
+            }
+            Self::AtomicUpload { temporary, publishing } => {
+                let state = if *publishing {
+                    "publication outcome unknown; refresh and check the destination"
+                } else {
+                    "destination was not replaced"
+                };
+                format!("Atomic upload interrupted; {state}. Temporary file may remain at {temporary}").into()
             }
             Self::Checking(message) | Self::AwaitingStatus(message) => (*message).into(),
         }
@@ -577,6 +599,9 @@ pub(crate) async fn run(
                         deadline,
                     ))
                 }
+                Operation::Put { atomic: true, .. } | Operation::PutDrop { atomic: true, .. } => {
+                    JobStage::Checking("Atomic upload did not open a temporary file")
+                }
                 Operation::PutDrop { remote, .. } | Operation::PutGroupFile { remote, .. } => {
                     JobStage::NativeUpload {
                         remote: remote.clone(),
@@ -647,6 +672,7 @@ pub(crate) async fn run(
                             JobStage::AwaitingStatus(_)
                                 | JobStage::NativeUpload { .. }
                                 | JobStage::EditorSave { .. }
+                                | JobStage::AtomicUpload { .. }
                         ))
                 {
                     result.with_context(|| reply.stage.interrupted())
@@ -665,6 +691,7 @@ pub(crate) async fn run(
                     JobStage::DirectoryDownload { .. }
                         | JobStage::DirectoryUpload(_)
                         | JobStage::EditorSave { .. }
+                        | JobStage::AtomicUpload { .. }
                         | JobStage::Checking(_)
                         | JobStage::AwaitingStatus(_)
                         | JobStage::NativeUpload { .. }
@@ -879,6 +906,7 @@ impl Engine {
                 source,
                 remote,
                 overwrite,
+                atomic,
             } => {
                 let (local, checked) =
                     tokio::task::spawn_blocking(move || source.open_confirmed(overwrite)).await??;
@@ -892,12 +920,12 @@ impl Engine {
                     }
                     (
                         upload_directory::Source::File(file, _),
-                        stage @ JobStage::NativeUpload { .. },
+                        stage @ (JobStage::NativeUpload { .. } | JobStage::Checking(_)),
                     ) => {
                         self.put(
                             (local, tokio::fs::File::from_std(file)),
                             remote,
-                            overwrite,
+                            UploadOptions { overwrite, atomic },
                             progress,
                             cancel,
                             stage,
@@ -914,7 +942,7 @@ impl Engine {
                 self.put(
                     (local, tokio::fs::File::from_std(file)),
                     remote,
-                    false,
+                    UploadOptions::default(),
                     progress,
                     cancel,
                     stage,
@@ -950,6 +978,7 @@ impl Engine {
                 local,
                 remote,
                 overwrite,
+                atomic,
             } => {
                 if cancel.is_some_and(TransferCancel::is_cancelled) {
                     return Ok(cancelled_transfer(&local, &remote, 0, false));
@@ -958,8 +987,15 @@ impl Engine {
                 let source = tokio::fs::File::open(&local)
                     .await
                     .context("opening local source")?;
-                self.put((local, source), remote, overwrite, progress, cancel, stage)
-                    .await?
+                self.put(
+                    (local, source),
+                    remote,
+                    UploadOptions { overwrite, atomic },
+                    progress,
+                    cancel,
+                    stage,
+                )
+                .await?
             }
             Opendir { path } => {
                 let h = self.raw.opendir(path).await?.handle;
@@ -1370,11 +1406,23 @@ impl Engine {
         &self,
         (local, mut file): (PathBuf, tokio::fs::File),
         remote: String,
-        overwrite: bool,
+        options: UploadOptions,
         progress: Option<&watch::Sender<TransferProgress>>,
         cancel: Option<&TransferCancel>,
         stage: &mut JobStage,
     ) -> Result<Value> {
+        if options.atomic {
+            return self
+                .put_atomic(
+                    (local, file),
+                    remote,
+                    options.overwrite,
+                    progress,
+                    cancel,
+                    stage,
+                )
+                .await;
+        }
         let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
         if cancelled() {
             return Ok(cancelled_transfer(&local, &remote, 0, false));
@@ -1385,7 +1433,7 @@ impl Engine {
         report(progress, 0, total);
         let flags = OpenFlags::WRITE
             | OpenFlags::CREATE
-            | if overwrite {
+            | if options.overwrite {
                 OpenFlags::TRUNCATE
             } else {
                 OpenFlags::EXCLUDE
@@ -1412,31 +1460,9 @@ impl Engine {
                 return Err(error.into());
             }
         };
-        let copied = async {
-            let mut buf = vec![0; self.write_size];
-            let mut offset = 0u64;
-            while !cancelled() {
-                let len = file.read(&mut buf).await?;
-                if cancelled() {
-                    break;
-                }
-                if len == 0 {
-                    // All writes are acknowledged. A late click during CLOSE
-                    // cannot turn a completed upload into a partial one.
-                    return Ok::<_, anyhow::Error>((offset, true));
-                }
-                self.raw.write(&h, offset, buf[..len].to_vec()).await?;
-                offset = offset
-                    .checked_add(len as u64)
-                    .context("file size overflow")?;
-                if let JobStage::NativeUpload { confirmed, .. } = stage {
-                    *confirmed = offset;
-                }
-                report(progress, offset, total);
-            }
-            Ok((offset, false))
-        }
-        .await;
+        let copied = self
+            .write_upload(&h, &mut file, total, progress, cancel, stage)
+            .await;
         let closed = self.raw.close(h).await;
         let (bytes, complete) =
             copied.context("upload failed; remote destination may contain a partial file")?;
@@ -1445,6 +1471,40 @@ impl Engine {
             return Ok(cancelled_transfer(&local, &remote, bytes, true));
         }
         Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
+    }
+
+    async fn write_upload(
+        &self,
+        handle: &str,
+        file: &mut tokio::fs::File,
+        total: Option<u64>,
+        progress: Option<&watch::Sender<TransferProgress>>,
+        cancel: Option<&TransferCancel>,
+        stage: &mut JobStage,
+    ) -> Result<(u64, bool)> {
+        let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
+        let mut buffer = vec![0; self.write_size];
+        let mut offset = 0u64;
+        while !cancelled() {
+            let len = file.read(&mut buffer).await?;
+            if cancelled() {
+                break;
+            }
+            if len == 0 {
+                return Ok((offset, true));
+            }
+            self.raw
+                .write(handle, offset, buffer[..len].to_vec())
+                .await?;
+            offset = offset
+                .checked_add(len as u64)
+                .context("file size overflow")?;
+            if let JobStage::NativeUpload { confirmed, .. } = stage {
+                *confirmed = offset;
+            }
+            report(progress, offset, total);
+        }
+        Ok((offset, false))
     }
 }
 /// Attach Windows Mark-of-the-Web (`Zone.Identifier`, ZoneId=3 / Internet) to a

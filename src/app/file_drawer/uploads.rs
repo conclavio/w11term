@@ -9,6 +9,7 @@ pub struct DropTarget {
     revision: u64,
     drawer_serial: u64,
     overwrite_files: bool,
+    atomic_files: bool,
 }
 
 impl DropTarget {
@@ -20,6 +21,7 @@ impl DropTarget {
             revision: files.listing_revision,
             drawer_serial: files.dialog_serial,
             overwrite_files: files.replace,
+            atomic_files: files.atomic_uploads,
         }
     }
 
@@ -83,7 +85,12 @@ pub(super) struct UploadQueue {
 }
 
 impl UploadQueue {
-    pub(super) fn files(paths: Vec<PathBuf>, parent: &str, overwrite: bool) -> Result<Self> {
+    pub(super) fn files(
+        paths: Vec<PathBuf>,
+        parent: &str,
+        overwrite: bool,
+        atomic: bool,
+    ) -> Result<Self> {
         let mut queue = Self {
             overwrite_files: overwrite,
             ..Self::default()
@@ -100,8 +107,13 @@ impl UploadQueue {
                     local,
                     remote: remote.clone(),
                     overwrite,
+                    atomic,
                 },
-                TransferFile::Upload { name, remote },
+                TransferFile::Upload {
+                    name,
+                    remote,
+                    atomic,
+                },
             ));
         }
         Ok(queue)
@@ -126,11 +138,19 @@ impl UploadQueue {
             let name = basename(source.path())?;
             let remote = entry_path(&target.parent, &name)?;
             let folder = source.is_directory();
-            let op = source.into_operation(remote.clone(), !folder && target.overwrite_files);
+            let op = source.into_operation(
+                remote.clone(),
+                !folder && target.overwrite_files,
+                !folder && target.atomic_files,
+            );
             let transfer = if folder {
                 TransferFile::UploadFolder { remote }
             } else {
-                TransferFile::Upload { name, remote }
+                TransferFile::Upload {
+                    name,
+                    remote,
+                    atomic: target.atomic_files,
+                }
             };
             queue.remaining.push_back((op, transfer));
         }
