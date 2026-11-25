@@ -19,7 +19,7 @@ use windows::{
 pub const MAX_TEXT: usize = 1024 * 1024;
 enum Request {
     Read(mpsc::SyncSender<Result<String>>),
-    Write(String, Option<u32>, mpsc::SyncSender<Result<()>>),
+    Write(String, Option<u32>, mpsc::SyncSender<Result<bool>>),
     WriteImage(Vec<u8>, u32, mpsc::SyncSender<Result<bool>>),
     RemoteWrite(String, Permission),
 }
@@ -114,7 +114,7 @@ pub fn read() -> Result<String> {
         .context("Clipboard read timed out")?
 }
 pub fn write(text: &str) -> Result<()> {
-    write_local(text, None)
+    write_local(text, None).map(|_| ())
 }
 
 pub fn sequence() -> u32 {
@@ -123,6 +123,11 @@ pub fn sequence() -> u32 {
 
 /// Complete a deferred local copy only if the clipboard is still current.
 pub fn write_if_sequence(text: &str, expected: u32) -> Result<()> {
+    try_write_if_sequence(text, expected).map(|_| ())
+}
+
+/// Returns false if another copy won while the text was being captured.
+pub fn try_write_if_sequence(text: &str, expected: u32) -> Result<bool> {
     write_local(text, Some(expected))
 }
 
@@ -169,14 +174,16 @@ fn image_dib(image: image::RgbaImage) -> Result<Vec<u8>> {
     Ok(dib)
 }
 
-fn write_local(text: &str, expected: Option<u32>) -> Result<()> {
+fn write_local(text: &str, expected: Option<u32>) -> Result<bool> {
     ensure!(text.len() <= MAX_TEXT, "Clipboard text exceeds 1 MiB");
     #[cfg(feature = "ui-smoke")]
     if let Some(path) = std::env::var_os("W11TERM_TEST_COPY_FILE") {
         if expected.is_some_and(|expected| sequence() != expected) {
-            return Ok(());
+            return Ok(false);
         }
-        return std::fs::write(path, text).context("Writing the clipboard test fixture");
+        return std::fs::write(path, text)
+            .context("Writing the clipboard test fixture")
+            .map(|()| true);
     }
     let (tx, rx) = mpsc::sync_channel(1);
     service()?
@@ -371,7 +378,7 @@ fn write_remote(hwnd: HWND, text: &str, permission: &Permission) -> Result<()> {
         }
         return Ok(());
     }
-    write_native(hwnd, text, WriteGuard::Remote(permission))
+    write_native(hwnd, text, WriteGuard::Remote(permission)).map(|_| ())
 }
 
 enum WriteGuard<'a> {
@@ -379,7 +386,7 @@ enum WriteGuard<'a> {
     Remote(&'a Permission),
 }
 
-fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<()> {
+fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<bool> {
     let units: Vec<u16> = text
         .split('\0')
         .next()
@@ -387,7 +394,7 @@ fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<()> {
         .encode_utf16()
         .chain(Some(0))
         .collect();
-    publish_native(hwnd, &units, u32::from(CF_UNICODETEXT.0), guard).map(|_| ())
+    publish_native(hwnd, &units, u32::from(CF_UNICODETEXT.0), guard)
 }
 
 fn publish_native<T: Copy>(

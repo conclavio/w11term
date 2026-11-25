@@ -64,6 +64,7 @@ pub enum CommandId {
     SaveLiveProfile(Option<clipboard_paste::Origin>),
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
+    CopyPaneText(Option<u64>),
     PaneImage(Option<u64>, text_export::ImageDestination),
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
@@ -307,6 +308,10 @@ impl TerminalApp {
             .and_then(AppTab::pane_id)
             .zip(self.tabs.active_group_id());
         for row in &mut rows {
+            if matches!(&row.id, CommandId::Menu(label) if label == text_export::COPY_VIEWPORT_LABEL)
+            {
+                row.id = CommandId::CopyPaneText(pane);
+            }
             if let CommandId::Menu(label) = &row.id
                 && let Some(destination) = text_export::ImageDestination::from_label(label)
             {
@@ -815,6 +820,9 @@ impl TerminalApp {
             CommandId::RestartExited(None) => return,
             CommandId::SaveScrollback(pane) => {
                 Message::Export(text_export::Action::StartScrollback(pane))
+            }
+            CommandId::CopyPaneText(pane) => {
+                Message::Export(text_export::Action::CopyPaneText(pane))
             }
             CommandId::PaneImage(pane, destination) => {
                 Message::Export(text_export::Action::StartPaneImage(pane, destination))

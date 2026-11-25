@@ -1,4 +1,5 @@
 use crate::interaction::{TextShape, plain_text};
+use crate::terminal::Snapshot;
 use wezterm_term::TerminalState;
 
 const MAX_TEXT: usize = 32 * 1024 * 1024;
@@ -51,6 +52,28 @@ pub(crate) fn export_text(terminal: &TerminalState) -> Result<String, &'static s
     capture(terminal, MAX_TEXT)
 }
 
+/// Copy the committed viewport using the same text rules as a linear selection.
+pub fn viewport_text(frame: &Snapshot) -> Result<String, &'static str> {
+    let cols = frame.cols;
+    let Some(last) = frame.rows.iter().rposition(|line| {
+        let row_cols = (cols / wezterm_term::line_width_scale(line)).max(cols.min(1));
+        line.visible_cells()
+            .take_while(|cell| cell.cell_index() < row_cols)
+            .any(|cell| !cell.str().trim_end().is_empty())
+    }) else {
+        return Ok(String::new());
+    };
+    plain_text(
+        frame.rows[..=last]
+            .iter()
+            .map(|line| (line.as_ref(), 0..cols)),
+        cols,
+        TextShape::Linear,
+        crate::clipboard::MAX_TEXT,
+        "Visible text exceeds the clipboard size limit",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +115,26 @@ mod tests {
         assert_eq!(export_text(&t).unwrap(), "alternate\r\n\r\n   z");
         t.advance_bytes("\x1b[?1049l");
         assert_eq!(export_text(&t).unwrap(), "one\r\n\r\nthree");
+    }
+
+    #[test]
+    fn viewport_text_joins_wraps_and_excludes_history_and_unused_rows() {
+        let mut t = engine(8, 5);
+        t.advance_bytes("archive\r\nlivewrapped\r\n\r\n  界e\u{301}   \r\n");
+        let scrolled = Snapshot::capture(&t, None, 1, 1, String::new(), 0);
+        let live = Snapshot::capture(&t, None, 2, 0, String::new(), 0);
+        assert_eq!(
+            viewport_text(&scrolled).as_deref(),
+            Ok("archive\r\nlivewrapped\r\n\r\n  界e\u{301}")
+        );
+        assert_eq!(
+            viewport_text(&live).as_deref(),
+            Ok("livewrapped\r\n\r\n  界e\u{301}")
+        );
+
+        t.advance_bytes("\x1b[?1049h\x1b[2J\x1b[H");
+        let empty = Snapshot::capture(&t, None, 3, 0, String::new(), 0);
+        assert_eq!(viewport_text(&empty), Ok(String::new()));
     }
 
     #[test]

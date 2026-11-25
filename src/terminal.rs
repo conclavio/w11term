@@ -28,6 +28,7 @@ mod program_status_tests;
 mod scrollback_tests;
 #[cfg(test)]
 mod vscode_shell_tests;
+pub use export::viewport_text;
 pub(crate) use export::{export_text, retained_text_rows};
 pub use kitty::KeypadKey;
 

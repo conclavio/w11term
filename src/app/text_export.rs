@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 pub(super) const SCROLLBACK_LABEL: &str = "Save scrollback as text…";
 pub(super) const COPY_PANE_IMAGE_LABEL: &str = "Copy pane as image";
 pub(super) const SAVE_PANE_IMAGE_LABEL: &str = "Save pane image…";
+pub(super) const COPY_VIEWPORT_LABEL: &str = "Copy visible pane text";
 pub(super) const COMMAND_OUTPUT_LABEL: &str = "Save output as text…";
 pub(super) const GROUP_REPORT_LABEL: &str = "Save results…";
 pub(super) const GROUP_JSON_LABEL: &str = "Save results as JSON…";
@@ -17,6 +18,7 @@ pub use w11term::control::SshGroupReportFormat as GroupReportFormat;
 pub enum Subject {
     Scrollback(u64),
     PaneImage(u64),
+    PaneText(u64),
     CommandOutput {
         pane: u64,
         command: u64,
@@ -51,6 +53,7 @@ impl Subject {
         match self {
             Self::Scrollback(pane) => format!("scrollback for pane {pane}"),
             Self::PaneImage(pane) => format!("image of pane {pane}"),
+            Self::PaneText(pane) => format!("visible text from pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
             Self::HostGroupResults { format, shown, .. } => {
                 let scope = if shown { "shown " } else { "" };
@@ -71,10 +74,11 @@ impl Subject {
         }
     }
 
-    fn picker(self) -> file_picker::Purpose {
-        match self {
+    fn picker(self) -> Option<file_picker::Purpose> {
+        Some(match self {
             Self::Scrollback(_) => file_picker::Purpose::Scrollback,
             Self::PaneImage(_) => file_picker::Purpose::PaneImage,
+            Self::PaneText(_) => return None,
             Self::CommandOutput { pane, command } => {
                 file_picker::Purpose::CommandOutput(format!("pane-{pane}-command-{command}.txt"))
             }
@@ -121,7 +125,7 @@ impl Subject {
             Self::SshLoginReport(sequence) => {
                 file_picker::Purpose::SshLoginReport(format!("ssh-login-results-{sequence}.txt"))
             }
-        }
+        })
     }
 }
 
@@ -134,7 +138,8 @@ pub(super) struct Export {
 pub enum Action {
     StartScrollback(Option<u64>),
     StartPaneImage(Option<u64>, ImageDestination),
-    CopiedPaneImage(Subject, Result<bool, String>),
+    CopyPaneText(Option<u64>),
+    CopiedPane(Subject, Result<bool, String>),
     Captured(u64, Result<String, String>),
     Finished(Subject, Result<Option<PathBuf>, String>),
     Dismiss,
@@ -156,17 +161,37 @@ impl ImageDestination {
     }
 }
 
+enum PaneClipboard {
+    Text(String),
+    Image(image::RgbaImage),
+}
+
 impl TerminalApp {
     pub(super) fn handle_text_export(&mut self, action: Action, context: &ComponentContext<Self>) {
         match action {
             Action::StartPaneImage(Some(pane), destination) if self.export.pending.is_none() => {
                 self.export_pane_image(pane, destination, context);
             }
-            Action::CopiedPaneImage(subject, result) if self.export.pending == Some(subject) => {
+            Action::CopyPaneText(Some(pane)) if self.export.pending.is_none() => {
+                let subject = Subject::PaneText(pane);
+                if let Some(frame) = self.export_frame(pane, subject) {
+                    self.copy_pane(
+                        subject,
+                        move || {
+                            let text = w11term::terminal::viewport_text(&frame)
+                                .map_err(anyhow::Error::msg)?;
+                            anyhow::ensure!(!text.is_empty(), "The viewport contains no text");
+                            Ok(PaneClipboard::Text(text))
+                        },
+                        context,
+                    );
+                }
+            }
+            Action::CopiedPane(subject, result) if self.export.pending == Some(subject) => {
                 self.export.pending = None;
                 self.export.status = Some(match result {
                     Ok(true) => format!("Copied {} to the clipboard", subject.label()),
-                    Ok(false) => "Clipboard changed while capturing the pane image".into(),
+                    Ok(false) => format!("Clipboard changed while capturing {}", subject.label()),
                     Err(error) => format!("Could not copy {}. {error}", subject.label()),
                 });
             }
@@ -233,16 +258,7 @@ impl TerminalApp {
         context: &ComponentContext<Self>,
     ) {
         let subject = Subject::PaneImage(pane);
-        let frame = self
-            .tab_for_pane(pane)
-            .and_then(|id| match &self.tabs.get(id)?.page {
-                Page::Terminal(tab) if !tab.browsing_sessions() && !tab.device_busy => {
-                    Some(tab.session.frames.load())
-                }
-                _ => None,
-            });
-        let Some(frame) = frame else {
-            self.export.status = Some(format!("The image of pane {pane} is unavailable"));
+        let Some(frame) = self.export_frame(pane, subject) else {
             return;
         };
         // Freeze the displayed viewport and appearance before showing the Save dialog.
@@ -257,33 +273,68 @@ impl TerminalApp {
                 context,
             ),
             ImageDestination::Clipboard => {
-                self.export.pending = Some(subject);
-                self.export.status = None;
-                let sequence = w11term::clipboard::sequence();
-                context.spawn_background_with_rejection(
-                    move |cancel| {
-                        let copy = || -> anyhow::Result<bool> {
-                            if cancel.is_cancelled() {
-                                return Ok(false);
-                            }
-                            let grid = render()?;
-                            if cancel.is_cancelled() {
-                                return Ok(false);
-                            }
-                            w11term::clipboard::write_image_if_sequence(grid, sequence)
-                        };
-                        Message::Export(Action::CopiedPaneImage(
-                            subject,
-                            copy().map_err(|error| format!("{error:#}")),
-                        ))
-                    },
-                    Message::Export(Action::CopiedPaneImage(
-                        subject,
-                        Err("Pane image capture is unavailable".into()),
-                    )),
-                );
+                self.copy_pane(subject, move || render().map(PaneClipboard::Image), context)
             }
         }
+    }
+
+    fn export_frame(
+        &mut self,
+        pane: u64,
+        subject: Subject,
+    ) -> Option<Arc<w11term::terminal::Snapshot>> {
+        let frame = self
+            .tab_for_pane(pane)
+            .and_then(|id| match &self.tabs.get(id)?.page {
+                Page::Terminal(tab) if !tab.browsing_sessions() && !tab.device_busy => {
+                    Some(tab.session.frames.load())
+                }
+                _ => None,
+            });
+        if frame.is_none() {
+            self.export.status = Some(format!("The {} is unavailable", subject.label()));
+        }
+        frame
+    }
+
+    fn copy_pane(
+        &mut self,
+        subject: Subject,
+        capture: impl FnOnce() -> anyhow::Result<PaneClipboard> + Send + 'static,
+        context: &ComponentContext<Self>,
+    ) {
+        self.export.pending = Some(subject);
+        self.export.status = None;
+        let sequence = w11term::clipboard::sequence();
+        context.spawn_background_with_rejection(
+            move |cancel| {
+                let copy = || -> anyhow::Result<bool> {
+                    if cancel.is_cancelled() {
+                        return Ok(false);
+                    }
+                    let contents = capture()?;
+                    if cancel.is_cancelled() {
+                        return Ok(false);
+                    }
+                    match contents {
+                        PaneClipboard::Text(text) => {
+                            w11term::clipboard::try_write_if_sequence(&text, sequence)
+                        }
+                        PaneClipboard::Image(grid) => {
+                            w11term::clipboard::write_image_if_sequence(grid, sequence)
+                        }
+                    }
+                };
+                Message::Export(Action::CopiedPane(
+                    subject,
+                    copy().map_err(|error| format!("{error:#}")),
+                ))
+            },
+            Message::Export(Action::CopiedPane(
+                subject,
+                Err("Pane capture is unavailable".into()),
+            )),
+        );
     }
 
     pub(super) fn export_command_output(
@@ -337,7 +388,10 @@ impl TerminalApp {
                     if cancel.is_cancelled() {
                         return Ok(None);
                     }
-                    let Some(file) = file_picker::pick(owner, subject.picker())? else {
+                    let purpose = subject
+                        .picker()
+                        .context("This capture does not use a file picker")?;
+                    let Some(file) = file_picker::pick(owner, purpose)? else {
                         return Ok(None);
                     };
                     if cancel.is_cancelled() {

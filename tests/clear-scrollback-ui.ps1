@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'visible-copy.txt'
 [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"clear_scrollback":"F6","command_palette":"F7"}}')
 $profiles = Join-Path $State 'profiles.json'
 $button = [System.Windows.Automation.ControlType]::Button
@@ -96,6 +97,16 @@ try {
     Wait-Viewport $archive
     $live = (Control @('get-text','--pane',"$sshPane")).text
     if ($live.Contains($archive) -or !$live.Contains('live-heading') -or !$live.Contains('pilot>')) { throw 'Expected the live prompt below the scrolled viewport' }
+
+    Run-Palette 'Copy visible pane text' -Enter
+    $copied = Wait-Until 'plain text from the scrolled pane' {
+        $value = Read-ClipboardFixture
+        if ($value) { return $value }
+    }
+    if (!$copied.Contains($archive) -or $copied.Contains('pilot>') -or $copied.Contains('neighbor-archive-42')) {
+        throw 'Copy visible pane text did not use the focused SSH viewport'
+    }
+    Wait-Viewport $archive
 
     Press-Key 0x75 # F6 invokes Clear scrollback from the scrolled SSH pane.
     Wait-Viewport 'pilot>'

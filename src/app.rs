@@ -3511,6 +3511,9 @@ impl TerminalApp {
             text_export::SCROLLBACK_LABEL => {
                 Message::Export(text_export::Action::StartScrollback(pane))
             }
+            text_export::COPY_VIEWPORT_LABEL => {
+                Message::Export(text_export::Action::CopyPaneText(pane))
+            }
             label if let Some(destination) = text_export::ImageDestination::from_label(label) => {
                 Message::Export(text_export::Action::StartPaneImage(pane, destination))
             }
@@ -4165,6 +4168,11 @@ impl TerminalApp {
             ));
             let can_capture =
                 self.export.pending.is_none() && !live.browsing_sessions() && !live.device_busy;
+            items.push(command_menu_item(
+                "copy-visible-text",
+                text_export::COPY_VIEWPORT_LABEL,
+                can_capture,
+            ));
             items.push(command_menu_item(
                 "copy-pane-image",
                 text_export::COPY_PANE_IMAGE_LABEL,
