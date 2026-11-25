@@ -3026,6 +3026,7 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory", fillers + 5),
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5), // Exclusion skips opening the nested directory.
             ("/shell directory", fillers + 5), // One scan for the paginated sort fixture.
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 2), // Enter another folder before using the saved search.

@@ -139,6 +139,17 @@ impl List {
                     .text(format!("{query}{scope} · {kind} · {sort}"))
                     .text_wrapping(TextWrapping::Wrap),
             ));
+            if !search.filter.exclude_dir_regex.is_empty() {
+                rows.push(KeyedView::new(
+                    "exclusions",
+                    TextBlock::new()
+                        .text(format!(
+                            "Exclude folders “{}”",
+                            search.filter.exclude_dir_regex
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
             rows.push(KeyedView::new(
                 "actions",
                 StackPanel::new()
@@ -216,7 +227,7 @@ impl FileDrawer {
                 let search = SavedSftpSearch {
                     root: panel.root.clone(),
                     query: panel.query.clone(),
-                    filter: panel.filter,
+                    filter: panel.filter.clone(),
                     sort: panel.sort,
                 };
                 list.entries = store.save_sftp_search(profile, &peer, &name, search)?;
@@ -247,7 +258,7 @@ impl FileDrawer {
                     .context("The saved search changed. Reopen saved searches.")?;
                 panel.root.clone_from(&search.root);
                 panel.query.clone_from(&search.query);
-                panel.filter = search.filter;
+                panel.filter.clone_from(&search.filter);
                 panel.sort = search.sort;
                 panel.saved = None;
                 panel.clear_results();

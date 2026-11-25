@@ -232,6 +232,21 @@ try {
         (Find-Element '1 matches in 2 folders') -and (Button "Reveal $parent/nested") -and
             !(Button "Reveal $parent/nested/nested-content.txt")
     }
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $excludeLabel = 'Exclude folder paths (regex)'
+    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $excludeField.GetCurrentPattern($value).SetValue('^nested$')
+    $null = Wait-Until 'exclusion edit invalidates the previous results' {
+        (Button 'Search') -and !(Button "Reveal $parent/nested")
+    }
+    $excludeField.SetFocus()
+    $null = Wait-Until 'folder exclusion field has keyboard focus' { $excludeField.Current.HasKeyboardFocus }
+    $null = Press-FocusedKey 13
+    $null = Wait-Until 'Enter searches without opening or listing the excluded folder' {
+        (Find-Element '0 matches in 1 folders. 1 folder excluded') -and !(Button "Reveal $parent/nested")
+    }
+    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $excludeField.GetCurrentPattern($value).SetValue('')
     Set-SearchChoice 'Search result type' 'All types'
     $on = [System.Windows.Automation.ToggleState]::On
     $off = [System.Windows.Automation.ToggleState]::Off
@@ -241,14 +256,20 @@ try {
     $null = Wait-CheckBox 'Regex' $on
     $null = Wait-CheckBox 'Match case' $on
     $null = Wait-CheckBox 'Match path' $on
-    $value = [System.Windows.Automation.ValuePattern]::Pattern
     $field = Wait-Until 'relative path search field' {
         Find-Element 'Relative path contains' ([System.Windows.Automation.ControlType]::Edit)
     }
     $fileOnPageTwo = "$parent/nested/nested-content.txt"
     $newest = "$parent/build-37.log"
     $largeFilesPattern = '^build-[0-9]+\.log$|^nested/nested-content\.txt$'
+    $savedExclusion = '^cache$'
     $field.GetCurrentPattern($value).SetValue($largeFilesPattern)
+    $null = Wait-Until 'relative-path query is ready before adding exclusions' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
+    }
+    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $excludeField.GetCurrentPattern($value).SetValue($savedExclusion)
     Click 'Search'
     $null = Wait-Until 'folder-sorted recursive results span two pages' {
         (Find-Element '1 / 2') -and (Button "Reveal $parent/build-00.log") -and
@@ -280,6 +301,7 @@ try {
             $entry = $data[0].searches.'Large build files'
             $entry.root -ceq $parent -and $entry.query -ceq $largeFilesPattern -and
                 $entry.filter.regex -and $entry.filter.match_case -and $entry.filter.match_path -and
+                $entry.filter.exclude_dir_regex -ceq $savedExclusion -and
                 $entry.sort -ceq 'largest'
         }
     }
@@ -312,6 +334,10 @@ try {
     $null = Wait-CheckBox 'Regex' $on
     $null = Wait-CheckBox 'Match case' $on
     $null = Wait-CheckBox 'Match path' $on
+    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    if ($excludeField.GetCurrentPattern($value).Current.Value -cne $savedExclusion) {
+        throw 'Saved search did not restore its folder exclusion'
+    }
     Click $savedSearchesButton
     Click 'Remove saved search'
     $null = Wait-Until 'removed preset disappears from picker and profile' {
@@ -320,6 +346,8 @@ try {
     }
     Click 'Hide saved searches'
     Set-SearchChoice 'Sort search results' 'Sort by folder'
+    $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
+    $excludeField.GetCurrentPattern($value).SetValue('')
     (Wait-CheckBox 'Match path' $on).Toggle()
     $null = Wait-CheckBox 'Match path' $off
     $field = Wait-Until 'filename search field restored' {

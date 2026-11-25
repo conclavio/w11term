@@ -11,6 +11,7 @@ fn search(path: &str, query: &str) -> Operation {
         match_case: false,
         match_path: false,
         kind: None,
+        exclude_dir_regex: String::new(),
     }
 }
 
@@ -171,6 +172,7 @@ async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_be
         match_case,
         match_path: false,
         kind: None,
+        exclude_dir_regex: String::new(),
     };
     let error = guarded_job(&pane, None, options("(", true, false))
         .await
@@ -244,6 +246,7 @@ async fn filename_type_limits_results_without_skipping_subdirectories() {
                     match_case: false,
                     match_path: false,
                     kind: Some(kind),
+                    exclude_dir_regex: String::new(),
                 },
             )
             .await
@@ -342,6 +345,7 @@ async fn relative_path_matching_uses_the_canonical_search_root_and_full_componen
                     match_case,
                     match_path,
                     kind: Some(EntryKind::File),
+                    exclude_dir_regex: String::new(),
                 },
             )
             .await
@@ -358,6 +362,128 @@ async fn relative_path_matching_uses_the_canonical_search_root_and_full_componen
             "{root} {query}"
         );
     }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn excluded_folders_are_neither_results_nor_opened_and_exclusions_respect_case() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    for path in ["tree/.GIT", "tree/src/node_modules", "tree/vendor"] {
+        fs::create_dir_all(root.join(path)).unwrap();
+    }
+    for path in [
+        "tree/.GIT/ignored.txt",
+        "tree/src/node_modules/ignored.txt",
+        "tree/src/keep.txt",
+        "tree/vendor/node_modules",
+    ] {
+        fs::write(root.join(path), []).unwrap();
+    }
+    let trace = root.join("listing-trace");
+    fs::write(&trace, []).unwrap();
+    let query = |pattern: &str, match_case| Operation::Find {
+        path: "/tree".into(),
+        query: String::new(),
+        regex: false,
+        match_case,
+        match_path: false,
+        kind: None,
+        exclude_dir_regex: pattern.into(),
+    };
+    let invalid = guarded_job(&pane, None, query("[", false))
+        .await
+        .unwrap_err();
+    assert!(
+        invalid.contains("Invalid folder exclusion regex"),
+        "{invalid}"
+    );
+    assert!(fs::read(&trace).unwrap().is_empty());
+
+    let found: FilenameSearch = serde_json::from_value(
+        guarded_job(&pane, None, query(r"(^|/)(\.git|node_modules)$", false))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        found
+            .matches
+            .iter()
+            .map(|hit| (hit.parent.as_str(), hit.name.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("/tree", "src"),
+            ("/tree", "vendor"),
+            ("/tree/src", "keep.txt"),
+            ("/tree/vendor", "node_modules")
+        ]
+    );
+    assert_eq!(found.excluded_directories, 2);
+    assert_eq!(found.scanned_directories, 3);
+    assert_eq!(found.skipped_directories, 0);
+    assert!(!found.truncated);
+    #[cfg(feature = "ui-smoke")]
+    {
+        let wire = fs::read_to_string(&trace).unwrap();
+        let opened: std::collections::BTreeSet<_> = wire
+            .lines()
+            .filter_map(|request| request.strip_prefix("OPENDIR "))
+            .collect();
+        assert_eq!(
+            opened,
+            std::collections::BTreeSet::from(["/tree", "/tree/src", "/tree/vendor"])
+        );
+    }
+    let sensitive: FilenameSearch = serde_json::from_value(
+        guarded_job(&pane, None, query(r"(^|/)(\.git|node_modules)$", true))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sensitive.excluded_directories, 1);
+    assert!(
+        sensitive
+            .matches
+            .iter()
+            .any(|hit| hit.parent == "/tree/.GIT" && hit.name == "ignored.txt")
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn excluded_folders_leave_directory_budget_for_the_rest_of_the_search() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let tree = remote.path().join("tree");
+    fs::create_dir_all(tree.join("keep")).unwrap();
+    fs::write(tree.join("keep/report.txt"), []).unwrap();
+    for index in 0..130 {
+        fs::create_dir(tree.join(format!("cache-{index:03}"))).unwrap();
+    }
+    let found: FilenameSearch = serde_json::from_value(
+        guarded_job(
+            &pane,
+            None,
+            Operation::Find {
+                path: "/tree".into(),
+                query: r"^keep/report\.txt$".into(),
+                regex: true,
+                match_case: false,
+                match_path: true,
+                kind: Some(EntryKind::File),
+                exclude_dir_regex: r"^cache-[0-9]+$".into(),
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(found.excluded_directories, 130);
+    assert_eq!(found.scanned_directories, 2);
+    assert!(!found.truncated);
+    assert_eq!(found.matches.len(), 1);
+    assert_eq!(found.matches[0].parent, "/tree/keep");
+    assert_eq!(found.matches[0].name, "report.txt");
     server.abort();
 }
 

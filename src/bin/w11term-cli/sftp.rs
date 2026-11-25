@@ -17,6 +17,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   put-dir LOCAL NEW_REMOTE_DIRECTORY [--preserve-times]\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   find ROOT [QUERY] [--regex] [--match-case] [--match-path] [--kind file|directory|symlink]\n\
+       [--exclude-dir-regex PATTERN]\n\
   sha256 PATH [--max-bytes N]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -28,6 +29,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   fstat --handle ID | fsetstat --handle ID [ATTRS] | fsync --handle ID\n\
 ATTRS: --size N --uid N --gid N --permissions OCTAL --atime UNIX_SECONDS --mtime UNIX_SECONDS\n\
 Find matches filenames by default. --match-path matches slash-separated paths relative to ROOT.\n\
+--exclude-dir-regex skips matching relative folder paths and their contents.\n\
 Underscore spellings (remove_file, remove_dir) are accepted. Use -- before paths starting with --.\n\
 Transfers stream through the GUI's existing SSH connection. Folder transfers require a new\n\
 destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
@@ -246,15 +248,16 @@ pub fn parse(
             let regex = opts.remove("--regex").is_some();
             let match_case = opts.remove("--match-case").is_some();
             let match_path = opts.remove("--match-path").is_some();
+            let filter = FilenameFilter {
+                regex,
+                match_case,
+                match_path,
+                kind,
+                exclude_dir_regex: opts.remove("--exclude-dir-regex").unwrap_or_default(),
+            };
             ensure!(
-                FilenameFilter {
-                    regex,
-                    match_case,
-                    match_path,
-                    kind
-                }
-                .valid_query(&query),
-                "Enter a filename pattern up to 256 bytes or use --kind"
+                filter.valid_query(&query),
+                "Enter a search pattern up to 256 bytes or use --kind or --exclude-dir-regex"
             );
             fields.insert("query".into(), json!(query));
             fields.insert("regex".into(), json!(regex));
@@ -264,6 +267,9 @@ pub fn parse(
             }
             if let Some(kind) = kind {
                 fields.insert("kind".into(), json!(kind));
+            }
+            if !filter.exclude_dir_regex.is_empty() {
+                fields.insert("exclude_dir_regex".into(), json!(filter.exclude_dir_regex));
             }
         }
         "sha256" => {
@@ -480,6 +486,7 @@ mod tests {
                         match_case: false,
                         match_path: false,
                         kind: None,
+                        ..
                     },
                 ..
             },
@@ -557,6 +564,28 @@ mod tests {
         assert!(matches!(request, Request::Sftp {
             operation: Operation::Find { query, match_path: false, .. }, ..
         } if query == "--match-path"));
+    }
+
+    #[test]
+    fn find_excludes_folders_with_or_without_a_positive_query() {
+        let pattern = r"(^|/)(\.git|node_modules)$";
+        for query in [None, Some("report")] {
+            let mut args = vec![
+                "find",
+                "--pane",
+                "2",
+                "/repo",
+                "--exclude-dir-regex",
+                pattern,
+            ];
+            args.extend(query);
+            let (_, request) = p(&args).unwrap();
+            assert!(matches!(request, Request::Sftp {
+                operation: Operation::Find { query: actual, exclude_dir_regex, .. }, ..
+            } if actual == query.unwrap_or_default() && exclude_dir_regex == pattern));
+        }
+        assert!(p(&["find", "--pane", "2", "/repo", "--exclude-dir-regex"]).is_err());
+        assert!(p(&["ls", "--pane", "2", "/repo", "--exclude-dir-regex", pattern]).is_err());
     }
 
     #[test]

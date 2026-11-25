@@ -44,6 +44,7 @@ pub enum MatchOption {
     MatchCase(bool),
     MatchPath(bool),
     Kind(Option<EntryKind>),
+    ExcludeDirs(String),
 }
 
 pub(super) struct Panel {
@@ -79,6 +80,14 @@ fn result_status(result: &FilenameSearch) -> String {
             ". {} unavailable folders skipped",
             result.skipped_directories
         );
+    }
+    match result.excluded_directories {
+        0 => {}
+        1 => status.push_str(". 1 folder excluded"),
+        count => {
+            use std::fmt::Write;
+            let _ = write!(status, ". {count} folders excluded");
+        }
     }
     status
 }
@@ -259,13 +268,14 @@ impl Panel {
         let query = TextBox::new()
             .min_width(0.0)
             .automation_name(input_label)
-            .automation_id(crate::input::file_search_tag(pane))
             .element_ref(&self.input)
-            .placeholder_text(if self.filter.kind.is_some() {
-                format!("{prompt} (optional)")
-            } else {
-                prompt.into()
-            })
+            .placeholder_text(
+                if self.filter.kind.is_some() || !self.filter.exclude_dir_regex.is_empty() {
+                    format!("{prompt} (optional)")
+                } else {
+                    prompt.into()
+                },
+            )
             .is_enabled(ready)
             .text(&self.query)
             .on_text_changed(ctx.callback(move |text| {
@@ -273,6 +283,19 @@ impl Panel {
                     pane,
                     generation,
                     Action::Query(serial, text),
+                ))
+            }));
+        let exclude_dirs = TextBox::new()
+            .min_width(0.0)
+            .automation_name("Exclude folder paths (regex)")
+            .placeholder_text("Exclude folder paths (regex)")
+            .is_enabled(ready)
+            .text(&self.filter.exclude_dir_regex)
+            .on_text_changed(ctx.callback(move |text| {
+                Message::Files(FileAction::Search(
+                    pane,
+                    generation,
+                    Action::SetOption(serial, MatchOption::ExcludeDirs(text)),
                 ))
             }));
         let mut rows = vec![
@@ -295,7 +318,13 @@ impl Panel {
                 Grid::new()
                     .columns([GridLength::Star(1.0), GridLength::Auto])
                     .column_spacing(8.0)
-                    .children((query, type_filter)),
+                    .children((
+                        StackPanel::new()
+                            .automation_id(crate::input::file_search_tag(pane))
+                            .spacing(6.0)
+                            .children((query, exclude_dirs)),
+                        type_filter,
+                    )),
             ),
         ];
         let check = |label, checked, option: fn(bool) -> MatchOption| {
@@ -873,6 +902,7 @@ impl FileDrawer {
             match_case: panel.filter.match_case,
             match_path: panel.filter.match_path,
             kind: panel.filter.kind,
+            exclude_dir_regex: panel.filter.exclude_dir_regex.clone(),
         };
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
@@ -1056,12 +1086,13 @@ impl FileDrawer {
                 }
             }
             Action::SetOption(serial, option) if serial == panel.serial && !busy => {
-                let previous = panel.filter;
+                let previous = panel.filter.clone();
                 match option {
                     MatchOption::Regex(enabled) => panel.filter.regex = enabled,
                     MatchOption::MatchCase(enabled) => panel.filter.match_case = enabled,
                     MatchOption::MatchPath(enabled) => panel.filter.match_path = enabled,
                     MatchOption::Kind(kind) => panel.filter.kind = kind,
+                    MatchOption::ExcludeDirs(regex) => panel.filter.exclude_dir_regex = regex,
                 }
                 if panel.filter != previous {
                     panel.clear_results();
@@ -1148,6 +1179,7 @@ mod tests {
             scanned_directories: 2,
             scanned_entries: entries.len(),
             skipped_directories: 0,
+            excluded_directories: 0,
             truncated: false,
             cancelled: false,
         }
@@ -1380,6 +1412,7 @@ mod tests {
                     match_case: true,
                     match_path: false,
                     kind: Some(EntryKind::File),
+                    exclude_dir_regex: String::new(),
                 },
                 sort: ResultSort::default(),
                 saved: None,
@@ -1389,6 +1422,7 @@ mod tests {
                     scanned_directories: 1,
                     scanned_entries: 30,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: true,
                     cancelled: false,
                 }),
@@ -1463,6 +1497,7 @@ mod tests {
                     scanned_directories: 2,
                     scanned_entries: 4,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1528,6 +1563,7 @@ mod tests {
                     scanned_directories: 2,
                     scanned_entries: 2,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1596,6 +1632,7 @@ mod tests {
                     scanned_directories: 2,
                     scanned_entries: 3,
                     skipped_directories: 0,
+                    excluded_directories: 0,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1686,6 +1723,7 @@ mod tests {
                 scanned_directories: 2,
                 scanned_entries: 2,
                 skipped_directories: 0,
+                excluded_directories: 0,
                 truncated: false,
                 cancelled: true,
             }),

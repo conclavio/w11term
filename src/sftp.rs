@@ -261,6 +261,8 @@ pub enum Operation {
         match_path: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<EntryKind>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        exclude_dir_regex: String,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -1153,6 +1155,7 @@ impl Engine {
                 match_case,
                 match_path,
                 kind,
+                exclude_dir_regex,
             } => serde_json::to_value(
                 self.find_filenames(
                     &path,
@@ -1162,6 +1165,7 @@ impl Engine {
                         match_case,
                         match_path,
                         kind,
+                        exclude_dir_regex,
                     },
                     cancel,
                 )

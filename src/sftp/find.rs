@@ -14,7 +14,7 @@ pub fn valid_filename_query(query: &str) -> bool {
     query.len() <= 256 && !query.trim().is_empty() && !query.chars().any(char::is_control)
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilenameFilter {
     pub regex: bool,
@@ -22,6 +22,8 @@ pub struct FilenameFilter {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub match_path: bool,
     pub kind: Option<EntryKind>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub exclude_dir_regex: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -49,8 +51,22 @@ impl FilenameSort {
 }
 
 impl FilenameFilter {
-    pub fn valid_query(self, query: &str) -> bool {
-        valid_filename_query(query) || (query.is_empty() && self.kind.is_some())
+    pub fn valid_query(&self, query: &str) -> bool {
+        valid_filename_query(query)
+            || (query.is_empty() && (self.kind.is_some() || !self.exclude_dir_regex.is_empty()))
+    }
+
+    pub(crate) fn compile_excluded_dirs(&self) -> Result<Option<regex::Regex>> {
+        if self.exclude_dir_regex.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            valid_filename_query(&self.exclude_dir_regex),
+            "Enter a folder exclusion regex up to 256 bytes without control characters"
+        );
+        crate::search::compile_regex(&self.exclude_dir_regex, self.match_case)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("Invalid folder exclusion regex. {error}"))
     }
 }
 
@@ -62,10 +78,10 @@ enum FilenamePattern {
 }
 
 impl FilenamePattern {
-    fn new(query: &str, filter: FilenameFilter) -> Result<Self> {
+    fn new(query: &str, filter: &FilenameFilter) -> Result<Self> {
         ensure!(
             filter.valid_query(query),
-            "Enter a filename pattern up to 256 bytes or select a result type"
+            "Enter a search pattern up to 256 bytes, select a result type, or exclude folders"
         );
         if query.is_empty() {
             return Ok(Self::All);
@@ -111,6 +127,8 @@ pub struct FilenameSearch {
     pub scanned_directories: usize,
     pub scanned_entries: usize,
     pub skipped_directories: usize,
+    #[serde(default)]
+    pub excluded_directories: usize,
     pub truncated: bool,
     pub cancelled: bool,
 }
@@ -120,6 +138,7 @@ struct Search<'a> {
     pattern: FilenamePattern,
     match_path: bool,
     kind: Option<EntryKind>,
+    exclude_dirs: Option<regex::Regex>,
     cancel: Option<&'a TransferCancel>,
     queued: VecDeque<(String, usize)>,
     directories: HashSet<String>,
@@ -202,11 +221,27 @@ impl Search<'_> {
                         }
                     }
                     let kind = EntryKind::from_permissions(attrs.permissions);
+                    let directory = kind == Some(EntryKind::Directory);
+                    let relative_path =
+                        if self.match_path || (directory && self.exclude_dirs.is_some()) {
+                            child
+                                .strip_prefix(self.result.root.trim_end_matches('/'))
+                                .and_then(|suffix| suffix.strip_prefix('/'))
+                                .context("SFTP search entry is outside the requested root")?
+                        } else {
+                            &name
+                        };
+                    if directory
+                        && self
+                            .exclude_dirs
+                            .as_ref()
+                            .is_some_and(|regex| regex.is_match(relative_path))
+                    {
+                        self.result.excluded_directories += 1;
+                        continue;
+                    }
                     let candidate = if self.match_path {
-                        child
-                            .strip_prefix(self.result.root.trim_end_matches('/'))
-                            .and_then(|suffix| suffix.strip_prefix('/'))
-                            .context("SFTP search entry is outside the requested root")?
+                        relative_path
                     } else {
                         &name
                     };
@@ -222,7 +257,7 @@ impl Search<'_> {
                             size: attrs.size.filter(|_| kind == Some(EntryKind::File)),
                         });
                     }
-                    if kind == Some(EntryKind::Directory) && !self.directories.contains(&child) {
+                    if directory && !self.directories.contains(&child) {
                         if depth == MAX_DEPTH || self.directories.len() == MAX_DIRECTORIES {
                             self.result.truncated = true;
                         } else {
@@ -248,7 +283,8 @@ impl Engine {
         filter: FilenameFilter,
         cancel: Option<&TransferCancel>,
     ) -> Result<FilenameSearch> {
-        let pattern = FilenamePattern::new(query, filter)?;
+        let pattern = FilenamePattern::new(query, &filter)?;
+        let exclude_dirs = filter.compile_excluded_dirs()?;
         let root = self.canonical_remote_path(path).await?;
         ensure!(
             root.len() <= MAX_PATH_BYTES,
@@ -259,6 +295,7 @@ impl Engine {
             pattern,
             match_path: filter.match_path,
             kind: filter.kind,
+            exclude_dirs,
             cancel,
             queued: VecDeque::from([(root.clone(), 0)]),
             directories: HashSet::from([root.clone()]),
@@ -269,6 +306,7 @@ impl Engine {
                 scanned_directories: 0,
                 scanned_entries: 0,
                 skipped_directories: 0,
+                excluded_directories: 0,
                 truncated: false,
                 cancelled: false,
             },

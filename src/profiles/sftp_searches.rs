@@ -28,12 +28,13 @@ impl SavedSftpSearch {
         );
         ensure!(
             self.filter.valid_query(&self.query),
-            "Enter a filename pattern or select a result type"
+            "Enter a search pattern, select a result type, or exclude folders"
         );
         if self.filter.regex && !self.query.is_empty() {
             crate::search::compile_regex(&self.query, self.filter.match_case)
                 .map_err(|error| anyhow::anyhow!("Invalid filename regex. {error}"))?;
         }
+        self.filter.compile_excluded_dirs()?;
         Ok(())
     }
 }
@@ -192,6 +193,7 @@ mod tests {
                 match_case: true,
                 match_path: true,
                 kind: Some(EntryKind::File),
+                exclude_dir_regex: r"(^|/)archive$".into(),
             },
             sort: FilenameSort::Newest,
         }
@@ -272,6 +274,7 @@ mod tests {
         .unwrap();
         assert!(old.filter.match_case);
         assert!(!old.filter.match_path);
+        assert!(old.filter.exclude_dir_regex.is_empty());
         assert!(
             serde_json::to_value(old).unwrap()["filter"]
                 .get("match_path")
