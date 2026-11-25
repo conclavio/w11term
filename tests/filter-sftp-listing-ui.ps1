@@ -759,13 +759,32 @@ try {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
     $move = 'Move to folder' + [char]0x2026
+    $browseDestination = 'Browse folders' + [char]0x2026
     $movedFile = Join-Path $peerRoot 'shell directory/nested-content.txt'
     Click $move
     $destination = Wait-Until 'the listed move shows the source and destination editor' {
         $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
         if ($field -and (Find-Element 'Remote move source')) { $field }
     }
-    $destination.GetCurrentPattern($value).SetValue($parent)
+    Click $browseDestination
+    $null = Wait-Until 'the picker starts in the containing folder without a move command' {
+        $use = Button 'Use this folder'
+        (Find-Element "$parent/nested" -Visible) -and (Find-Element 'No subfolders' -Visible) -and
+            $use -and !$use.Current.IsEnabled -and !(Button 'Move')
+    }
+    Click 'Parent folder'
+    $null = Wait-Until 'only folders appear in the parent destination listing' {
+        (Button 'Browse folder nested') -and !(Button 'Browse folder build-00.log') -and
+            (Button 'Use this folder').Current.IsEnabled
+    }
+    Click 'Use this folder'
+    $destination = Wait-Until 'the picked parent path can be reviewed before moving' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($field -and $field.GetCurrentPattern($value).Current.Value -ceq $parent) { $field }
+    }
+    if (![IO.File]::Exists($fixtureText) -or [IO.File]::Exists($movedFile)) {
+        throw 'Selecting the destination started a move before confirmation'
+    }
     Click 'Move'
     $null = Wait-Until 'the source listing refreshes without the moved entry' {
         (Find-Element "Moved nested-content.txt to $parent") -and !(Button 'nested-content.txt') -and
@@ -794,7 +813,26 @@ try {
     $destination = Wait-Until 'the search result offers its own destination editor' {
         Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
     }
-    $destination.GetCurrentPattern($value).SetValue('nested')
+    $destination.GetCurrentPattern($value).SetValue('missing destination')
+    Click $browseDestination
+    $null = Wait-Until 'a missing typed path keeps a way back to the move form' {
+        (Find-Element 'Destination browsing error' -Visible) -and
+            (Button 'Server root').Current.IsEnabled -and (Button 'Back to destination').Current.IsEnabled
+    }
+    Click 'Back to destination'
+    $destination = Wait-Until 'back preserves the typed path' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        if ($field -and $field.GetCurrentPattern($value).Current.Value -ceq 'missing destination') { $field }
+    }
+    $destination.GetCurrentPattern($value).SetValue('')
+    $null = Wait-Until 'clearing the typed path takes effect' { !(Button 'Move').Current.IsEnabled }
+    Click $browseDestination
+    Click 'Browse folder nested'
+    Click 'Use this folder'
+    $null = Wait-Until 'the picked child path is filled in for review' {
+        $field = Find-Element 'Destination folder' ([System.Windows.Automation.ControlType]::Edit)
+        $field -and $field.GetCurrentPattern($value).Current.Value -ceq "$parent/nested"
+    }
     Click 'Move'
     $null = Wait-Until 'the running search follows the entry to its new path' {
         (Find-Element "Moved nested-content.txt to $parent/nested. 1 matches in 2 folders") -and

@@ -23,6 +23,35 @@ fn trace(root: &std::path::Path) -> Vec<[String; 2]> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destination_picker_resolves_one_folder_and_filters_nonfolders() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let root = remote.path();
+    let parent = root.join("canonical-parent");
+    fs::create_dir_all(parent.join("z folder")).unwrap();
+    fs::create_dir(parent.join("Å archive")).unwrap();
+    fs::write(parent.join("file"), b"keep").unwrap();
+    directory_junction(&parent, "shortcut", "z folder");
+    fs::write(root.join("omit-listed-mode"), "Å archive").unwrap();
+    fs::write(root.join("rename-trace.jsonl"), []).unwrap();
+    let generation = pane.frames.load().connection_generation;
+    let operation = || Operation::BrowseMoveFolders {
+        path: "alias".into(),
+    };
+    let channels = opens.load(Ordering::Relaxed);
+    for missing in [None, Some(generation + 1)] {
+        assert!(run(&pane, missing, operation()).await.is_err());
+        assert_eq!(opens.load(Ordering::Relaxed), channels);
+    }
+    assert_eq!(
+        run(&pane, Some(generation), operation()).await.unwrap(),
+        json!({"directory":"/canonical-parent","folders":["z folder","Å archive"]})
+    );
+    assert_eq!(fs::read(parent.join("file")).unwrap(), b"keep");
+    assert!(trace(root).is_empty());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_rename_rechecks_the_source_kind_and_parent() {
     let (pane, _, remote, _, server) = fixture(false).await;
     let root = remote.path();

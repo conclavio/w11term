@@ -3052,10 +3052,15 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory/nested", 2),
             ("/shell directory/nested", 1), // Cancelled during the first page.
             ("/shell directory/nested", 2),
+            ("/shell directory/nested", 2), // Browse from the listed entry's containing folder.
+            ("/shell directory", fillers + 5), // The picker visits the parent.
             ("/shell directory/nested", 1), // The listed file moved up one folder.
             ("/shell directory", fillers + 6), // Browse to the destination.
             ("/shell directory", fillers + 6), // Find the moved file at its new path.
             ("/shell directory/nested", 1),
+            ("/shell directory/missing destination", 0), // The typed path is unavailable.
+            ("/shell directory", fillers + 6), // Reopen the picker at the search hit's parent.
+            ("/shell directory/nested", 1),    // The picker visits the child folder.
             ("/shell directory", fillers + 5), // Moving from search rescans the same root.
             ("/shell directory/nested", 2),
         ]
