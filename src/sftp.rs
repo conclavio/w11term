@@ -36,8 +36,8 @@ mod editor;
 mod find;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;
 pub use find::{
-    FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch, FilenameSort, ModifiedDateRange,
-    SearchProgress, valid_filename_query,
+    ContentMatch, ContentScan, FileSizeRange, FilenameFilter, FilenameMatch, FilenameSearch,
+    FilenameSort, ModifiedDateRange, SearchProgress, valid_filename_query,
 };
 mod resume_download;
 use resume_download::ResumeDownload;
@@ -270,6 +270,8 @@ pub enum Operation {
         file_size: FileSizeRange,
         #[serde(default, skip_serializing_if = "ModifiedDateRange::is_unrestricted")]
         modified_dates: ModifiedDateRange,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        content_query: String,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -774,6 +776,9 @@ pub(crate) async fn run(
                 Operation::Sha256 { .. } => {
                     JobStage::Checking("SHA-256 calculation did not finish")
                 }
+                Operation::Find { content_query, .. } if !content_query.is_empty() => {
+                    JobStage::Checking("File text search did not finish")
+                }
                 Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
                 Operation::GetDir { .. } | Operation::GetSearch { .. } => {
                     JobStage::DirectoryDownload {
@@ -1175,6 +1180,7 @@ impl Engine {
                 exclude_dir_regex,
                 file_size,
                 modified_dates,
+                content_query,
             } => serde_json::to_value(
                 self.find_filenames(
                     &path,
@@ -1187,6 +1193,7 @@ impl Engine {
                         exclude_dir_regex,
                         file_size,
                         modified_dates,
+                        content_query,
                     },
                     cancel,
                     match job_progress {

@@ -37,6 +37,7 @@ impl SavedSftpSearch {
                 .map_err(|error| anyhow::anyhow!("Invalid filename regex. {error}"))?;
         }
         self.filter.compile_excluded_dirs()?;
+        self.filter.compile_content_pattern()?;
         Ok(())
     }
 }
@@ -201,6 +202,7 @@ mod tests {
                     from: "2025-01-01".into(),
                     through: "2025-12-31".into(),
                 },
+                content_query: "request [id]".into(),
             },
             sort: FilenameSort::Newest,
         }
@@ -284,6 +286,7 @@ mod tests {
         assert!(old.filter.exclude_dir_regex.is_empty());
         assert!(old.filter.file_size.is_unrestricted());
         assert!(old.filter.modified_dates.is_unrestricted());
+        assert!(old.filter.content_query.is_empty());
         assert!(
             serde_json::to_value(old).unwrap()["filter"]
                 .get("match_path")

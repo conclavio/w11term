@@ -8,6 +8,7 @@ use std::{
 const MAX_DIRECTORIES: usize = 128;
 const MAX_ENTRIES: usize = 16_384;
 const MAX_RESULTS: usize = 200;
+const MAX_CONTENT_READS: usize = 256;
 const MAX_DEPTH: usize = 24;
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
 
@@ -29,6 +30,8 @@ pub struct FilenameFilter {
     pub file_size: FileSizeRange,
     #[serde(skip_serializing_if = "ModifiedDateRange::is_unrestricted")]
     pub modified_dates: ModifiedDateRange,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_query: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -190,7 +193,30 @@ impl FilenameFilter {
                 && (self.kind.is_some()
                     || !self.exclude_dir_regex.is_empty()
                     || !self.file_size.is_unrestricted()
-                    || !self.modified_dates.is_unrestricted()))
+                    || !self.modified_dates.is_unrestricted()
+                    || !self.content_query.is_empty()))
+    }
+
+    pub(crate) fn compile_content_pattern(&self) -> Result<Option<regex::Regex>> {
+        if self.content_query.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            valid_filename_query(&self.content_query),
+            "Enter a file text query up to 256 bytes without control characters"
+        );
+        ensure!(
+            matches!(self.kind, None | Some(EntryKind::File)),
+            "File text search requires Files or All types"
+        );
+        let pattern = if self.regex {
+            std::borrow::Cow::Borrowed(self.content_query.as_str())
+        } else {
+            std::borrow::Cow::Owned(regex::escape(&self.content_query))
+        };
+        crate::search::compile_regex(&pattern, self.match_case)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("Invalid file text regex. {error}"))
     }
 
     pub(crate) fn compile_excluded_dirs(&self) -> Result<Option<regex::Regex>> {
@@ -255,6 +281,20 @@ pub struct FilenameMatch {
     pub mtime: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_match: Option<ContentMatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContentMatch {
+    pub line: usize,
+    pub excerpt: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ContentScan {
+    pub inspected: usize,
+    pub skipped: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -266,6 +306,8 @@ pub struct FilenameSearch {
     pub skipped_directories: usize,
     #[serde(default)]
     pub excluded_directories: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_scan: Option<ContentScan>,
     pub truncated: bool,
     pub cancelled: bool,
 }
@@ -287,6 +329,9 @@ struct Search<'a> {
     exclude_dirs: Option<regex::Regex>,
     file_size: FileSizeRange,
     modified_days: Option<RangeInclusive<i64>>,
+    content_pattern: Option<regex::Regex>,
+    content_reads: usize,
+    content_limit_hit: bool,
     cancel: Option<&'a TransferCancel>,
     progress: Option<&'a watch::Sender<SearchProgress>>,
     next_progress: Instant,
@@ -302,6 +347,36 @@ fn unavailable(error: &anyhow::Error) -> bool {
         Some(Error::Status(status))
             if matches!(status.status_code, StatusCode::NoSuchFile | StatusCode::PermissionDenied)
     )
+}
+
+fn first_content_match(text: &str, pattern: &regex::Regex) -> Option<ContentMatch> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.lines().enumerate().find_map(|(index, line)| {
+        let matched = pattern.find(line)?;
+        let start = line[..matched.start()]
+            .char_indices()
+            .rev()
+            .nth(47)
+            .map_or(0, |(index, _)| index);
+        let mut excerpt = String::new();
+        if start > 0 {
+            excerpt.push('…');
+        }
+        let mut chars = line[start..].chars();
+        excerpt.extend(
+            chars
+                .by_ref()
+                .take(160)
+                .map(|ch| if ch.is_control() { ' ' } else { ch }),
+        );
+        if chars.next().is_some() {
+            excerpt.push('…');
+        }
+        Some(ContentMatch {
+            line: index + 1,
+            excerpt,
+        })
+    })
 }
 
 impl Search<'_> {
@@ -338,10 +413,54 @@ impl Search<'_> {
     }
 
     fn limit_reached(&mut self) -> bool {
-        let reached =
-            self.result.scanned_entries == MAX_ENTRIES || self.result.matches.len() == MAX_RESULTS;
+        let reached = self.content_limit_hit
+            || self.result.scanned_entries == MAX_ENTRIES
+            || self.result.matches.len() == MAX_RESULTS;
         self.result.truncated |= reached;
         reached
+    }
+
+    async fn search_file_text(
+        &mut self,
+        folder: &str,
+        path: &str,
+        size: Option<u64>,
+    ) -> Result<Option<ContentMatch>> {
+        if size.is_some_and(|size| size > TEXT_PREVIEW_MAX_BYTES as u64) {
+            self.result.content_scan.as_mut().unwrap().skipped += 1;
+            return Ok(None);
+        }
+        if self.content_reads == MAX_CONTENT_READS {
+            self.content_limit_hit = true;
+            self.result.truncated = true;
+            return Ok(None);
+        }
+        self.content_reads += 1;
+        self.report_progress(folder, false);
+        let read = async {
+            ensure!(
+                self.engine.canonical_remote_path(folder).await? == folder,
+                "The containing search folder changed"
+            );
+            self.engine.read_preview_text(path, self.cancel).await
+        }
+        .await;
+        match read {
+            Ok(text) => {
+                self.result.content_scan.as_mut().unwrap().inspected += 1;
+                Ok(first_content_match(
+                    &text,
+                    self.content_pattern.as_ref().unwrap(),
+                ))
+            }
+            Err(error) if error.downcast_ref::<Error>().is_some_and(transport_error) => Err(error),
+            Err(_) => {
+                if !self.cancelled() {
+                    self.result.content_scan.as_mut().unwrap().skipped += 1;
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn scan(&mut self, path: &str, depth: usize) -> Result<bool> {
@@ -427,6 +546,7 @@ impl Search<'_> {
                     };
                     if self.kind.is_none_or(|want| Some(want) == kind)
                         && self.pattern.matches(candidate)
+                        && (self.content_pattern.is_none() || kind == Some(EntryKind::File))
                     {
                         let mut size = attrs.size.filter(|_| kind == Some(EntryKind::File));
                         let need_size = !self.file_size.is_unrestricted()
@@ -457,14 +577,25 @@ impl Search<'_> {
                         });
                         if date_matches
                             && self.file_size.matches(size)
-                            && self.matched.insert(child.clone())
+                            && !self.matched.contains(&child)
                         {
+                            let content_match = if self.content_pattern.is_some() {
+                                match self.search_file_text(path, &child, size).await? {
+                                    Some(content) => Some(content),
+                                    None if self.content_limit_hit => break 'pages,
+                                    None => continue,
+                                }
+                            } else {
+                                None
+                            };
+                            self.matched.insert(child.clone());
                             self.result.matches.push(FilenameMatch {
                                 parent: path.to_owned(),
                                 name,
                                 kind,
                                 mtime: attrs.mtime,
                                 size,
+                                content_match,
                             });
                         }
                     }
@@ -499,6 +630,8 @@ impl Engine {
         filter.file_size.validate(filter.kind)?;
         let modified_days = filter.modified_dates.compile()?;
         let exclude_dirs = filter.compile_excluded_dirs()?;
+        let content_pattern = filter.compile_content_pattern()?;
+        let content_scan = content_pattern.as_ref().map(|_| ContentScan::default());
         let root = self.canonical_remote_path(path).await?;
         ensure!(
             root.len() <= MAX_PATH_BYTES,
@@ -512,6 +645,9 @@ impl Engine {
             exclude_dirs,
             file_size: filter.file_size,
             modified_days,
+            content_pattern,
+            content_reads: 0,
+            content_limit_hit: false,
             cancel,
             progress,
             next_progress: Instant::now(),
@@ -525,6 +661,7 @@ impl Engine {
                 scanned_entries: 0,
                 skipped_directories: 0,
                 excluded_directories: 0,
+                content_scan,
                 truncated: false,
                 cancelled: false,
             },

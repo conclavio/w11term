@@ -3027,6 +3027,8 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             ("/shell directory", fillers + 5),
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5), // Exclusion skips opening the nested directory.
+            ("/shell directory", fillers + 5), // Search file contents from the same root.
+            ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5), // File size alone can select files from subfolders.
             ("/shell directory/nested", 2),
             ("/shell directory", fillers + 5), // A date can be the only search filter.

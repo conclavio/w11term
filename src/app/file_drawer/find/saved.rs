@@ -177,6 +177,14 @@ impl List {
                         .text_wrapping(TextWrapping::Wrap),
                 ));
             }
+            if !search.filter.content_query.is_empty() {
+                rows.push(KeyedView::new(
+                    "content",
+                    TextBlock::new()
+                        .text(format!("File text “{}”", search.filter.content_query))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
             rows.push(KeyedView::new(
                 "actions",
                 StackPanel::new()

@@ -22,6 +22,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   find ROOT [QUERY] [--regex] [--match-case] [--match-path] [--kind file|directory|symlink]\n\
        [--exclude-dir-regex PATTERN] [--min-size SIZE] [--max-size SIZE]\n\
        [--modified-from YYYY-MM-DD] [--modified-through YYYY-MM-DD]\n\
+       [--contains TEXT]\n\
   sha256 PATH [--max-bytes N]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -36,6 +37,7 @@ Find matches filenames by default. --match-path matches slash-separated paths re
 --exclude-dir-regex skips matching relative folder paths and their contents.\n\
 Size limits are inclusive and accept whole bytes or binary units (for example 16MiB).\n\
 Modification date limits are inclusive UTC calendar dates.\n\
+--contains searches UTF-8 file lines. --regex and --match-case apply to both queries.\n\
 Underscore spellings (remove_file, remove_dir) are accepted. Use -- before paths starting with --.\n\
 Transfers stream through the GUI's existing SSH connection. Folder transfers require a new\n\
 destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
@@ -270,6 +272,7 @@ pub fn parse(
                     from: opts.remove("--modified-from").unwrap_or_default(),
                     through: opts.remove("--modified-through").unwrap_or_default(),
                 },
+                content_query: opts.remove("--contains").unwrap_or_default(),
             };
             filter.modified_dates.validate()?;
             ensure!(
@@ -293,6 +296,9 @@ pub fn parse(
             }
             if !filter.modified_dates.is_unrestricted() {
                 fields.insert("modified_dates".into(), json!(filter.modified_dates));
+            }
+            if !filter.content_query.is_empty() {
+                fields.insert("content_query".into(), json!(filter.content_query));
             }
         }
         "sha256" => {
@@ -740,6 +746,32 @@ mod tests {
         ] {
             assert!(p(args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn find_accepts_a_text_query_alone_or_with_a_filename_pattern() {
+        let (_, request) =
+            p(&["find", "--pane", "2", "/repo", "--contains", "request [id]"]).unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { query, content_query, regex: false, .. }, ..
+        } if query.is_empty() && content_query == "request [id]"));
+        let (_, request) = p(&[
+            "find",
+            "--pane",
+            "2",
+            "/repo",
+            "\\.log$",
+            "--contains",
+            "^Error",
+            "--regex",
+            "--match-case",
+        ])
+        .unwrap();
+        assert!(matches!(request, Request::Sftp {
+            operation: Operation::Find { query, content_query, regex: true, match_case: true, .. }, ..
+        } if query == "\\.log$" && content_query == "^Error"));
+        assert!(p(&["find", "--pane", "2", "/repo", "--contains"]).is_err());
+        assert!(p(&["ls", "--pane", "2", "/repo", "--contains", "Error"]).is_err());
     }
 
     #[test]

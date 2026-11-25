@@ -15,6 +15,7 @@ fn search(path: &str, query: &str) -> Operation {
         exclude_dir_regex: String::new(),
         file_size: FileSizeRange::default(),
         modified_dates: ModifiedDateRange::default(),
+        content_query: String::new(),
     }
 }
 
@@ -25,6 +26,7 @@ fn hit(parent: &str, name: &str, kind: EntryKind) -> FilenameMatch {
         kind: Some(kind),
         mtime: None,
         size: None,
+        content_match: None,
     }
 }
 
@@ -75,6 +77,7 @@ async fn file_size_bounds_apply_before_the_result_cap_and_lookup_omitted_sizes()
         exclude_dir_regex: String::new(),
         file_size: FileSizeRange { minimum, maximum },
         modified_dates: ModifiedDateRange::default(),
+        content_query: String::new(),
     };
     let invalid = guarded_job(&pane, None, bounded("", Some(32), Some(16)))
         .await
@@ -148,6 +151,7 @@ async fn modification_dates_include_the_whole_utc_day_before_the_result_cap() {
             from: from.into(),
             through: through.into(),
         },
+        content_query: String::new(),
     };
     let invalid = guarded_job(&pane, None, by_date("2025-01-02", "2025-01-01"))
         .await
@@ -175,6 +179,103 @@ async fn modification_dates_include_the_whole_utc_day_before_the_result_cap() {
     fs::write(root.join("tree-unknown-mtime"), []).unwrap();
     let unknown = guarded_job(&pane, None, scan()).await.unwrap();
     assert!(unknown["matches"].as_array().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_search_uses_filename_filters_and_finds_the_original_line_excerpt() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let tree = remote.path().join("tree");
+    fs::create_dir_all(tree.join("nested")).unwrap();
+    let text = format!("header\r\n{}[Résumé] found\r\nlast", "雪".repeat(170));
+    fs::write(tree.join("nested/report.log"), text).unwrap();
+    fs::write(tree.join("other.log"), "ordinary line\n").unwrap();
+    fs::write(tree.join("binary.log"), b"\0[Resume]").unwrap();
+    fs::write(
+        tree.join("large.log"),
+        vec![b'x'; w11term::sftp::TEXT_PREVIEW_MAX_BYTES + 1],
+    )
+    .unwrap();
+    fs::write(tree.join("unrelated.txt"), "[Résumé]").unwrap();
+    let request = |query: &str, content: &str, regex, match_case| Operation::Find {
+        path: "/tree".into(),
+        query: query.into(),
+        regex,
+        match_case,
+        match_path: false,
+        kind: None,
+        exclude_dir_regex: String::new(),
+        file_size: FileSizeRange::default(),
+        modified_dates: ModifiedDateRange::default(),
+        content_query: content.into(),
+    };
+    let invalid = guarded_job(&pane, None, request("", "[", true, false))
+        .await
+        .unwrap_err();
+    assert!(invalid.contains("Invalid file text regex"), "{invalid}");
+    let found: FilenameSearch = serde_json::from_value(
+        guarded_job(&pane, None, request(".log", "[résumé]", false, false))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let scan = found.content_scan.unwrap();
+    assert_eq!((scan.inspected, scan.skipped), (2, 2));
+    assert_eq!(found.matches.len(), 1);
+    let hit = &found.matches[0];
+    assert_eq!((&*hit.parent, &*hit.name), ("/tree/nested", "report.log"));
+    let matched = hit.content_match.as_ref().unwrap();
+    assert_eq!(matched.line, 2);
+    assert!(matched.excerpt.starts_with('…'));
+    assert!(matched.excerpt.contains("[Résumé] found"));
+    assert!(matched.excerpt.chars().count() <= 162);
+    let sensitive = guarded_job(&pane, None, request(".log", "[résumé]", false, true))
+        .await
+        .unwrap();
+    assert!(sensitive["matches"].as_array().unwrap().is_empty());
+    let regex = guarded_job(&pane, None, request("", r"\[Résumé\] found$", true, true))
+        .await
+        .unwrap();
+    assert_eq!(regex["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(regex["matches"][0]["content_match"]["line"], 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_search_reports_when_its_file_read_limit_leaves_more_to_scan() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let tree = remote.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    for index in 0..257 {
+        fs::write(tree.join(format!("file-{index:03}.log")), b"ordinary").unwrap();
+    }
+    let (reply, response) = tokio::sync::oneshot::channel();
+    pane.input
+        .send(Command::Sftp(Job {
+            expected_generation: None,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+            reply,
+            progress: None,
+            cancel: None,
+            operation: Operation::Find {
+                path: "/tree".into(),
+                query: String::new(),
+                regex: false,
+                match_case: false,
+                match_path: false,
+                kind: Some(EntryKind::File),
+                exclude_dir_regex: String::new(),
+                file_size: FileSizeRange::default(),
+                modified_dates: ModifiedDateRange::default(),
+                content_query: "no match".into(),
+            },
+        }))
+        .unwrap();
+    let response = response.await.unwrap().unwrap();
+    assert_eq!(response["truncated"], true);
+    assert_eq!(response["content_scan"]["inspected"], 256);
+    assert_eq!(response["content_scan"]["skipped"], 0);
+    assert!(response["matches"].as_array().unwrap().is_empty());
     server.abort();
 }
 
@@ -310,6 +411,7 @@ async fn filename_search_uses_regex_and_case_options_and_rejects_bad_patterns_be
         exclude_dir_regex: String::new(),
         file_size: FileSizeRange::default(),
         modified_dates: ModifiedDateRange::default(),
+        content_query: String::new(),
     };
     let error = guarded_job(&pane, None, options("(", true, false))
         .await
@@ -386,6 +488,7 @@ async fn filename_type_limits_results_without_skipping_subdirectories() {
                     exclude_dir_regex: String::new(),
                     file_size: FileSizeRange::default(),
                     modified_dates: ModifiedDateRange::default(),
+                    content_query: String::new(),
                 },
             )
             .await
@@ -487,6 +590,7 @@ async fn relative_path_matching_uses_the_canonical_search_root_and_full_componen
                     exclude_dir_regex: String::new(),
                     file_size: FileSizeRange::default(),
                     modified_dates: ModifiedDateRange::default(),
+                    content_query: String::new(),
                 },
             )
             .await
@@ -533,6 +637,7 @@ async fn excluded_folders_are_neither_results_nor_opened_and_exclusions_respect_
         exclude_dir_regex: pattern.into(),
         file_size: FileSizeRange::default(),
         modified_dates: ModifiedDateRange::default(),
+        content_query: String::new(),
     };
     let invalid = guarded_job(&pane, None, query("[", false))
         .await
@@ -617,6 +722,7 @@ async fn excluded_folders_leave_directory_budget_for_the_rest_of_the_search() {
                 exclude_dir_regex: r"^cache-[0-9]+$".into(),
                 file_size: FileSizeRange::default(),
                 modified_dates: ModifiedDateRange::default(),
+                content_query: String::new(),
             },
         )
         .await

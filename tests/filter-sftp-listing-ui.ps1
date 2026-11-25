@@ -275,6 +275,30 @@ try {
     $excludeField = Find-Element $excludeLabel ([System.Windows.Automation.ControlType]::Edit)
     $excludeField.GetCurrentPattern($value).SetValue('')
     Set-SearchChoice 'Search result type' 'All types'
+    $contentLabel = 'File text contains'
+    $fixtureText = Join-Path $peerRoot 'shell directory/nested/nested-content.txt'
+    [IO.File]::WriteAllText($fixtureText, "header`r`nFixture needle value`r`n")
+    $contentField = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
+    $contentField.GetCurrentPattern($value).SetValue('FIXTURE NEEDLE')
+    $null = Wait-Until 'a content query enables search without a filename' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
+    }
+    $contentField.SetFocus()
+    $null = Wait-Until 'file text field has keyboard focus' { $contentField.Current.HasKeyboardFocus }
+    $null = Press-FocusedKey 13
+    $excerpt = 'Line 2 ' + [char]0xb7 + ' Fixture needle value'
+    $null = Wait-Until 'content search displays the matching line and scan totals' {
+        (Find-Element '1 matches in 2 folders. 42 text files inspected') -and
+            (Find-Element $excerpt) -and (Button "Reveal $parent/nested/nested-content.txt")
+    }
+    $contentField = Find-Element $contentLabel ([System.Windows.Automation.ControlType]::Edit)
+    $contentField.GetCurrentPattern($value).SetValue('')
+    $null = Wait-Until 'clearing the content query disables the empty search' {
+        $run = Button 'Search'
+        $run -and !$run.Current.IsEnabled
+    }
+    [IO.File]::WriteAllText($fixtureText, ('f' * 70000))
     $minSizeLabel = 'Minimum file size'
     $maxSizeLabel = 'Maximum file size'
     $fileOnPageTwo = "$parent/nested/nested-content.txt"

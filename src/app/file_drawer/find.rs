@@ -53,6 +53,7 @@ pub enum MatchOption {
     MaximumSize(String),
     ModifiedFrom(String),
     ModifiedThrough(String),
+    ContentQuery(String),
 }
 
 #[derive(Default)]
@@ -124,6 +125,14 @@ fn result_status(result: &FilenameSearch) -> String {
             let _ = write!(status, ". {count} folders excluded");
         }
     }
+    if let Some(scan) = &result.content_scan {
+        use std::fmt::Write;
+        let suffix = if scan.inspected == 1 { "" } else { "s" };
+        let _ = write!(status, ". {} text file{suffix} inspected", scan.inspected);
+        if scan.skipped != 0 {
+            let _ = write!(status, ". {} skipped", scan.skipped);
+        }
+    }
     status
 }
 
@@ -166,6 +175,7 @@ impl Panel {
             || !self.size.minimum.trim().is_empty()
             || !self.size.maximum.trim().is_empty()
             || !self.filter.modified_dates.is_unrestricted()
+            || !self.filter.content_query.is_empty()
     }
 
     fn can_search(&self) -> bool {
@@ -357,35 +367,48 @@ impl Panel {
                     Action::Query(serial, text),
                 ))
             }));
-        let mut fields = vec![KeyedView::new("pattern", query)];
+        let option_field =
+            |label: &str, placeholder: &str, text: &str, option: fn(String) -> MatchOption| {
+                TextBox::new()
+                    .min_width(0.0)
+                    .automation_name(label)
+                    .placeholder_text(placeholder)
+                    .is_enabled(ready)
+                    .text(text)
+                    .on_text_changed(ctx.callback(move |text| {
+                        Message::Files(FileAction::Search(
+                            pane,
+                            generation,
+                            Action::SetOption(serial, option(text)),
+                        ))
+                    }))
+            };
+        let contents = option_field(
+            "File text contains",
+            if self.filter.regex {
+                "File text regex"
+            } else {
+                "File text contains"
+            },
+            &self.filter.content_query,
+            MatchOption::ContentQuery,
+        );
+        let mut fields = vec![
+            KeyedView::new("pattern", query),
+            KeyedView::new("contents", contents),
+        ];
         if self.advanced_open {
-            let bound_field =
-                |label: &str, placeholder: &str, text: &str, option: fn(String) -> MatchOption| {
-                    TextBox::new()
-                        .min_width(0.0)
-                        .automation_name(label)
-                        .placeholder_text(placeholder)
-                        .is_enabled(ready)
-                        .text(text)
-                        .on_text_changed(ctx.callback(move |text| {
-                            Message::Files(FileAction::Search(
-                                pane,
-                                generation,
-                                Action::SetOption(serial, option(text)),
-                            ))
-                        }))
-                };
             let sizes = Grid::new()
                 .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
                 .column_spacing(6.0)
                 .children((
-                    bound_field(
+                    option_field(
                         "Minimum file size",
                         "Min size",
                         &self.size.minimum,
                         MatchOption::MinimumSize,
                     ),
-                    bound_field(
+                    option_field(
                         "Maximum file size",
                         "Max size",
                         &self.size.maximum,
@@ -397,13 +420,13 @@ impl Panel {
                 .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
                 .column_spacing(6.0)
                 .children((
-                    bound_field(
+                    option_field(
                         "Modified from (UTC)",
                         "Modified from",
                         &self.filter.modified_dates.from,
                         MatchOption::ModifiedFrom,
                     ),
-                    bound_field(
+                    option_field(
                         "Modified through (UTC)",
                         "Modified through",
                         &self.filter.modified_dates.through,
@@ -414,7 +437,7 @@ impl Panel {
             fields.extend([
                 KeyedView::new(
                     "exclude",
-                    bound_field(
+                    option_field(
                         "Exclude folder paths (regex)",
                         "Exclude folder paths (regex)",
                         &self.filter.exclude_dir_regex,
@@ -731,6 +754,14 @@ impl Panel {
                             .text_wrapping(TextWrapping::Wrap),
                     );
                 let mut entry_actions = vec![KeyedView::new("reveal", reveal)];
+                if let Some(hit) = &hit.content_match {
+                    entry_actions.push(KeyedView::new(
+                        "content-match",
+                        TextBlock::new()
+                            .text(format!("Line {} · {}", hit.line, hit.excerpt))
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
                 let sort_detail = match self.sort {
                     ResultSort::Newest => hit.mtime.map(|time| properties::timestamp(Some(time))),
                     ResultSort::Largest => hit.size.map(listing_size_label),
@@ -1099,6 +1130,7 @@ impl FileDrawer {
             exclude_dir_regex: filter.exclude_dir_regex,
             file_size: filter.file_size,
             modified_dates: filter.modified_dates,
+            content_query: filter.content_query,
         };
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
@@ -1301,6 +1333,7 @@ impl FileDrawer {
                     MatchOption::ModifiedThrough(value) => {
                         panel.filter.modified_dates.through = value
                     }
+                    MatchOption::ContentQuery(value) => panel.filter.content_query = value,
                 }
                 if (&panel.filter, &panel.size.minimum, &panel.size.maximum)
                     != (&previous.0, &previous.1, &previous.2)
@@ -1385,12 +1418,14 @@ mod tests {
                     kind: Some(*kind),
                     mtime: None,
                     size: None,
+                    content_match: None,
                 })
                 .collect(),
             scanned_directories: 2,
             scanned_entries: entries.len(),
             skipped_directories: 0,
             excluded_directories: 0,
+            content_scan: None,
             truncated: false,
             cancelled: false,
         }
@@ -1631,6 +1666,7 @@ mod tests {
                 kind: Some(EntryKind::File),
                 mtime: None,
                 size: None,
+                content_match: None,
             })
             .collect();
         let mut drawer = FileDrawer {
@@ -1649,6 +1685,7 @@ mod tests {
                     exclude_dir_regex: String::new(),
                     file_size: FileSizeRange::default(),
                     modified_dates: Default::default(),
+                    content_query: String::new(),
                 },
                 size: SizeFields::default(),
                 advanced_open: false,
@@ -1661,6 +1698,7 @@ mod tests {
                     scanned_entries: 30,
                     skipped_directories: 0,
                     excluded_directories: 0,
+                    content_scan: None,
                     truncated: true,
                     cancelled: false,
                 }),
@@ -1709,6 +1747,7 @@ mod tests {
             kind: Some(EntryKind::File),
             mtime: None,
             size: None,
+            content_match: None,
         };
         let folder = FilenameMatch {
             name: "logs archive".into(),
@@ -1738,6 +1777,7 @@ mod tests {
                     scanned_entries: 4,
                     skipped_directories: 0,
                     excluded_directories: 0,
+                    content_scan: None,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1780,6 +1820,7 @@ mod tests {
             kind: Some(EntryKind::File),
             mtime: None,
             size: None,
+            content_match: None,
         };
         let other = FilenameMatch {
             parent: "/project".into(),
@@ -1806,6 +1847,7 @@ mod tests {
                     scanned_entries: 2,
                     skipped_directories: 0,
                     excluded_directories: 0,
+                    content_scan: None,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1853,6 +1895,7 @@ mod tests {
             kind: None,
             mtime: None,
             size: None,
+            content_match: None,
         };
         let path = "/project/logs/build log.txt";
         let target = FileTarget::Search(2, hit.clone());
@@ -1877,6 +1920,7 @@ mod tests {
                     scanned_entries: 3,
                     skipped_directories: 0,
                     excluded_directories: 0,
+                    content_scan: None,
                     truncated: false,
                     cancelled: false,
                 }),
@@ -1945,6 +1989,7 @@ mod tests {
             kind: Some(EntryKind::File),
             mtime: None,
             size: None,
+            content_match: None,
         };
         let link = FilenameMatch {
             parent: "/".into(),
@@ -1952,6 +1997,7 @@ mod tests {
             kind: Some(EntryKind::Symlink),
             mtime: None,
             size: None,
+            content_match: None,
         };
         let mut panel = Panel {
             serial: 4,
@@ -1970,6 +2016,7 @@ mod tests {
                 scanned_entries: 2,
                 skipped_directories: 0,
                 excluded_directories: 0,
+                content_scan: None,
                 truncated: false,
                 cancelled: true,
             }),
