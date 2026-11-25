@@ -101,6 +101,7 @@ mod taskbar;
 mod text_diff;
 mod text_export;
 mod text_size;
+mod title_tools;
 mod visual_bell;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
@@ -1090,6 +1091,7 @@ pub enum Message {
     PlacePane(TabId, TabId, Direction),
     PickerFocus(u8),
     PickerFromMenu(Shortcut),
+    SetTitleFiles(u64, bool),
     PickerFocusAfterMenu(Arc<()>),
     LocalProfile(local_profile::Action),
     Files(FileAction),
@@ -3621,12 +3623,10 @@ impl TerminalApp {
                 .fold(wezterm_term::Progress::None, taskbar::most_important);
             self.taskbar.borrow_mut().show(hwnd, state);
         }
+        let layout = title_tools::Layout::new(self.width, self.tabs.headers().len());
         let tab_strip = TabView::new()
             .height(44.0)
-            .width(
-                (self.tabs.headers().len() as f64 * 110.0 + 16.0)
-                    .min((self.width - 390.0).max(140.0)),
-            )
+            .width(layout.tab_width)
             .is_add_tab_button_visible(false)
             .can_reorder_tabs(true)
             .selected_index(if self.selection_pending {
@@ -3694,12 +3694,8 @@ impl TerminalApp {
                     )
                 }),
             );
-        let plus = Button::new()
-            .style(ButtonStyle::Subtle)
-            .width(40.0)
-            .height(36.0)
-            .automation_name("New tab")
-            .content(TextBlock::new().text("+").font_size(22.0))
+        let plus = title_tools::button("New tab")
+            .content(FontIcon::new().glyph("\u{e710}"))
             // Reactor 0.100 cannot currently nest a Menu owner under a Tooltip wrapper.
             .menu(Menu::new(
                 self.profile_items(),
@@ -3710,12 +3706,21 @@ impl TerminalApp {
         let directory_split = self.directory_split_origin();
         let previous = previous_pane::target(&self.tabs);
         let recordings = self.recording_choices();
-        let caret = Button::new()
-            .style(ButtonStyle::Subtle)
-            .width(44.0)
-            .height(36.0)
-            .automation_name("Tab menu")
-            .content(FontIcon::new().glyph("\u{e70d}"))
+        let menu_callback = self.caret_menu_callback(
+            context,
+            exited,
+            arrangement.clone(),
+            directory_split.clone(),
+            previous,
+            recordings,
+        );
+        let more = title_tools::button("Tab menu")
+            .automation_id("w11term-title-more")
+            .content(
+                FontIcon::new()
+                    .glyph("\u{e712}")
+                    .tooltip_with(title_tools::below("More actions")),
+            )
             .menu(Menu::new(
                 self.caret_items(
                     exited.is_some(),
@@ -3724,51 +3729,46 @@ impl TerminalApp {
                     previous,
                     recordings,
                 ),
-                self.caret_menu_callback(
-                    context,
-                    exited,
-                    arrangement,
-                    directory_split,
-                    previous,
-                    recordings,
-                ),
+                menu_callback.clone(),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
-            .slot(
-                TitleBarSlot::Content,
-                Grid::new()
-                    // TitleBar centers its Content by default. Occupy its available width so
-                    // tabs start at the left rather than sitting in the middle of the caption.
-                    .width((self.width - 180.0).max(400.0))
-                    .columns([
-                        GridLength::Auto,
-                        GridLength::Auto,
-                        GridLength::Auto,
-                        GridLength::Auto,
-                        GridLength::STAR,
-                    ])
-                    .children((
-                        tab_strip,
-                        Border::new().grid_column(1).content(plus),
-                        Border::new().grid_column(2).content(caret),
-                        Border::new()
-                            .grid_column(3)
-                            .content(self.inbox_button(context)),
-                        Border::new().grid_column(4).content(
-                            self.recording_indicator().map_or_else(
-                                || Border::new().into(),
-                                |message| -> View {
-                                    TextBlock::new()
-                                        .vertical_alignment(VerticalAlignment::Center)
-                                        .automation_name(&message)
-                                        .text(message)
-                                        .into()
-                                },
+            .slots([
+                SlotView::new(
+                    TitleBarSlot::Content,
+                    Grid::new()
+                        // Keep the tabs left aligned within the space beside the native RightHeader.
+                        .width(layout.content_width)
+                        .columns([
+                            GridLength::Auto,
+                            GridLength::Auto,
+                            GridLength::Auto,
+                            GridLength::STAR,
+                        ])
+                        .children((
+                            tab_strip,
+                            Border::new().grid_column(1).content(plus),
+                            Border::new().grid_column(2).content(more),
+                            Border::new().grid_column(3).content(
+                                self.recording_indicator().map_or_else(
+                                    || Border::new().into(),
+                                    |message| -> View {
+                                        TextBlock::new()
+                                            .vertical_alignment(VerticalAlignment::Center)
+                                            .automation_name(&message)
+                                            .text(&message)
+                                            .text_trimming(TextTrimming::CharacterEllipsis)
+                                            .tooltip_with(title_tools::below(message))
+                                    },
+                                ),
                             ),
-                        ),
-                    )),
-            )
+                        )),
+                ),
+                SlotView::new(
+                    TitleBarSlot::RightHeader,
+                    self.title_tools(&layout, menu_callback, context),
+                ),
+            ])
     }
 
     fn profile_items(&self) -> Vec<MenuItem> {
@@ -3826,6 +3826,12 @@ impl TerminalApp {
             _ => MenuItem::disabled("workspace-startup", "Workspace startup…"),
         };
         vec![
+            self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
+            MenuItem::item("ssh-host-group", host_groups::LABEL),
+            MenuItem::item("sftp-transfers", sftp_transfers::LABEL),
+            MenuItem::item("inbox", "Attention inbox"),
+            MenuItem::item("settings", "Settings"),
+            MenuItem::separator("window-actions"),
             self.binding_menu(
                 "command-palette",
                 "Command palette…",
@@ -3896,16 +3902,11 @@ impl TerminalApp {
                 pane_picker::FIND_TEXT_LABEL,
                 KeyAction::FindAllPanes,
             ),
-            MenuItem::item("inbox", "Attention inbox"),
-            MenuItem::item("sftp-transfers", sftp_transfers::LABEL),
-            MenuItem::item("ssh-host-group", host_groups::LABEL),
             MenuItem::item("new-ssh-group-tab", host_groups::NEW_TAB_LABEL),
             recordings.menu(),
             command_menu_item("paste", "Paste", can_paste),
             command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
             MenuItem::separator("paste-end"),
-            MenuItem::item("settings", "Settings"),
-            self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
             workspace_startup,
             self.discovery_menu(),
             state_menu_item(
@@ -4043,6 +4044,13 @@ impl TerminalApp {
         }
     }
 
+    fn split_items(&self) -> [MenuItem; 2] {
+        [
+            self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
+            self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+        ]
+    }
+
     fn pane_menu(
         &self,
         can_restart: bool,
@@ -4077,9 +4085,8 @@ impl TerminalApp {
             MenuItem::disabled(binding.id, binding.label)
         };
         let can_split_directory = directory.is_some();
-        let mut items = vec![
-            self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
-            self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+        let mut items = Vec::from(self.split_items());
+        items.extend([
             self.binding_menu_enabled(
                 "split-right-here",
                 "Split right in current directory",
@@ -4126,7 +4133,7 @@ impl TerminalApp {
             ),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
             self.broadcast_menu(),
-        ];
+        ]);
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
             items.push(MenuItem::item("files", "SFTP files"));
@@ -5275,6 +5282,13 @@ impl Component for TerminalApp {
             }
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::PickerFromMenu(shortcut) => self.open_picker_from_menu(shortcut, context),
+            Message::SetTitleFiles(pane, open) => {
+                if matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
+                    if live.session.pane_id == pane && live.files.open != open)
+                {
+                    self.file_action(FileAction::Toggle, context);
+                }
+            }
             Message::PickerFocusAfterMenu(launch) => self.focus_picker_after_menu(&launch),
             Message::Files(action) => self.file_action(action, context),
             Message::AccessibleSelection(request) => {

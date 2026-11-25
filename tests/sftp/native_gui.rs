@@ -740,6 +740,26 @@ async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens Files, Find, Commands, pane layout and Settings from native title-bar controls"]
+async fn native_title_tools_follow_the_active_ssh_and_powershell_panes() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    fs::write(remote.path().join("title-tools.txt"), []).unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("title-tools-ui.ps1", &ssh, state.path());
+    assert!(fs::read(trace).unwrap().is_empty());
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and SFTP"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
 async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
     run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
