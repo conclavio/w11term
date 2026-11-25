@@ -40,6 +40,17 @@ function Click([string]$Name) {
 function Filter-Edit {
     Find-Element 'Filter filenames' ([System.Windows.Automation.ControlType]::Edit)
 }
+function Wait-FilenameSearchFocus {
+    Wait-Until 'focused recursive filename field' {
+        $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+        if ($query -and $query.Current.HasKeyboardFocus) { $query }
+    }
+}
+function Focus-FilenameSearch {
+    $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    $query.SetFocus()
+    $null = Wait-FilenameSearchFocus
+}
 function Set-ResultType([string]$Name) {
     $controlType = [System.Windows.Automation.ControlType]::ComboBox
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
@@ -206,11 +217,14 @@ try {
     Click 'Back'
     $null = Wait-Until 'parent directory restored' { Find-Element $parent }
     Click ('Find files' + [char]0x2026)
-    $field = Wait-Until 'recursive filename search field' {
-        Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
-    }
+    $field = Wait-FilenameSearchFocus
     Set-ResultType 'Folders'
-    Click 'Search'
+    $null = Wait-Until 'type-only search enabled' {
+        $run = Button 'Search'
+        $run -and $run.Current.IsEnabled
+    }
+    Focus-FilenameSearch
+    $null = Press-FocusedKey 13
     $null = Wait-Until 'folder-only search omits files and still sees nested content' {
         (Find-Element '1 matches in 2 folders') -and (Button "Reveal $parent/nested") -and
             !(Button "Reveal $parent/nested/nested-content.txt")
@@ -303,6 +317,7 @@ try {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
     Click 'Back to search results'
+    $null = Wait-FilenameSearchFocus
     $field = Wait-Until 'original search restored with both matches' {
         $edit = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
         if ($edit -and (Button "Reveal $parent/nested") -and (Button "Reveal $parent/nested/nested-content.txt")) {
@@ -349,7 +364,8 @@ try {
     if ([IO.Directory]::GetFileSystemEntries($batch).Count -ne 1) {
         throw 'Batch downloaded something outside the marked folder'
     }
-    Click 'Back to files'
+    Focus-FilenameSearch
+    $null = Press-FocusedKey 27
     $null = Wait-Until 'listing remains at the revealed file after leaving the results' {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }

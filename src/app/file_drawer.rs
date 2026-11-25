@@ -19,7 +19,7 @@ use w11term::sftp::{
 mod bookmarks;
 mod downloads;
 mod editor;
-mod find;
+pub(super) mod find;
 mod history;
 mod preview;
 mod properties;
@@ -67,6 +67,27 @@ fn request_generation(operation: &Operation, generation: u64) -> Option<u64> {
     match (operation, generation) {
         (Operation::Realpath { .. } | Operation::Ls { .. }, 0) => None,
         _ => Some(generation),
+    }
+}
+
+fn focus_file_input(
+    input: &ElementRef<TextBox>,
+    attempt: u8,
+    next: FileAction,
+    context: &ComponentContext<TerminalApp>,
+) {
+    let sender = context.sender();
+    let retry = next.clone();
+    let queued = input.request_focus_result(move |result| {
+        if attempt < 4 && !result.unwrap_or(false) {
+            sender.send(Message::Files(retry.clone()));
+        }
+    });
+    if !queued && attempt < 4 {
+        context.spawn_background(move |_| {
+            std::thread::sleep(Duration::from_millis(20));
+            Message::Files(next)
+        });
     }
 }
 
@@ -864,6 +885,11 @@ fn dialog_filename(remote: &str) -> &str {
 }
 
 impl FileDrawer {
+    pub(super) fn keyboard_search(&self, pane: u64) -> Option<SearchField> {
+        self.search_serial()
+            .map(|serial| SearchField::Files(pane, self.generation, serial))
+    }
+
     pub(super) fn filter_editing(&self) -> bool {
         self.filter_input.is_some()
     }
@@ -2889,6 +2915,7 @@ impl TerminalApp {
                 && frame.prompt.is_none()
                 && session.prompts.current().is_none());
         let was_editing = files.filter_editing();
+        let search_before = files.search_serial();
         let finish_filter =
             may_open_dialog && was_editing && matches!(action, EditFilter(_, _, _, false));
         files.observe_transfer_connection(session, frame.connection_generation, visible);
@@ -2903,7 +2930,8 @@ impl TerminalApp {
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
-                    || was_editing != files.filter_editing())
+                    || was_editing != files.filter_editing()
+                    || search_before != files.search_serial())
             {
                 self.connection_ui(id);
             }
@@ -2940,7 +2968,15 @@ impl TerminalApp {
                 &action,
                 Filter(..) | ClearFilter(..) | FocusFilter(..) | Sort(..) | ShowTransfer(..)
             );
-        if !editor_typing && !matches!(action, Tick(_) | EditName(..) | FocusFilter(..)) {
+        if !editor_typing
+            && !matches!(
+                action,
+                Tick(_)
+                    | EditName(..)
+                    | FocusFilter(..)
+                    | Search(_, _, find::Action::FocusQuery(..))
+            )
+        {
             files.cached.borrow_mut().take();
         }
         let mut outcome = TransferOutcome::Failed;
@@ -3306,19 +3342,7 @@ impl TerminalApp {
                 FocusFilter(_, generation, revision, attempt) => {
                     if let Some(input) = &files.filter_input {
                         let next = FocusFilter(pane, generation, revision, attempt + 1);
-                        let sender = context.sender();
-                        let retry = next.clone();
-                        let queued = input.request_focus_result(move |r| {
-                            if attempt < 4 && !r.unwrap_or(false) {
-                                sender.send(Message::Files(retry.clone()));
-                            }
-                        });
-                        if !queued && attempt < 4 {
-                            context.spawn_background(move |_| {
-                                std::thread::sleep(Duration::from_millis(20));
-                                Message::Files(next)
-                            });
-                        }
+                        focus_file_input(input, attempt, next, context);
                     }
                 }
                 Filter(_, _, _, query) => {
@@ -3518,6 +3542,7 @@ impl TerminalApp {
             if drawer_was_open != tab.files.open
                 || dialog_was_open != tab.files.entry_dialog_open()
                 || was_editing != tab.files.filter_editing()
+                || search_before != tab.files.search_serial()
             {
                 self.connection_ui(id);
             }

@@ -3179,7 +3179,10 @@ async fn native_sftp_file_rows_own_keyboard_focus_until_the_canvas_is_clicked() 
     )
     .unwrap();
     drive_mixed_gui("sftp-drawer-focus-ui.ps1", &ssh, state.path());
-    assert_eq!(fs::read(keyboard).unwrap(), b"canvas-typed");
+    assert_eq!(
+        fs::read(keyboard).unwrap(),
+        b"canvas-typedsearch-canvas-typed"
+    );
     assert_eq!(channels.load(Ordering::Relaxed), 2);
     server.abort();
 }

@@ -101,8 +101,8 @@ struct State {
     modal: bool,
     drawer_pane: Option<u64>,
     drawer_focused: bool,
-    session_search: Option<(u64, u64, u64)>, // pane, listing revision, query revision
-    session_search_focused: bool,
+    search_field: Option<SearchField>,
+    search_field_focused: bool,
     // A native button or search field can disappear before key-up or WM_CHAR.
     native_keys: HashSet<KeySlot>,
     native_late_char: Option<KeySlot>,
@@ -192,6 +192,8 @@ pub enum Shortcut {
     CaretPresentationChanged,
     DrawerFocusChanged,
     SubmitSessionSearch(u64, u64, u64),
+    SubmitFileSearch(u64, u64, u64),
+    CloseFileSearch(u64, u64, u64),
     NextTab,
     PreviousTab,
     MoveTabLeft,
@@ -247,10 +249,50 @@ pub enum Shortcut {
     Workspaces,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchField {
+    Sessions(u64, u64, u64), // tab, listing revision, query revision
+    Files(u64, u64, u64),    // pane, connection generation, search serial
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchFieldOwner {
+    Sessions(u64),
+    Files(u64),
+}
+
+impl SearchField {
+    fn owner(self) -> SearchFieldOwner {
+        match self {
+            Self::Sessions(tab, ..) => SearchFieldOwner::Sessions(tab),
+            Self::Files(pane, ..) => SearchFieldOwner::Files(pane),
+        }
+    }
+
+    fn shortcut(self, vk: u32) -> Option<Shortcut> {
+        match (self, vk) {
+            (Self::Sessions(tab, listing, query), 0x0d) => {
+                Some(Shortcut::SubmitSessionSearch(tab, listing, query))
+            }
+            (Self::Files(pane, generation, search), 0x0d) => {
+                Some(Shortcut::SubmitFileSearch(pane, generation, search))
+            }
+            (Self::Files(pane, generation, search), 0x1b) => {
+                Some(Shortcut::CloseFileSearch(pane, generation, search))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub fn file_search_tag(pane: u64) -> String {
+    format!("w11term-sftp-query-{pane}")
+}
+
 pub struct KeyboardBridge {
     scope: WindowScope,
     drawer_watch: RefCell<Option<drawer_focus::Watch>>,
-    session_search_watch: RefCell<Option<drawer_focus::Watch>>,
+    search_field_watch: RefCell<Option<drawer_focus::Watch>>,
     bootstrap: String,
     _hooks: std::rc::Rc<ThreadHooks>,
 }
@@ -333,7 +375,7 @@ impl KeyboardBridge {
         Ok(Self {
             scope,
             drawer_watch: RefCell::default(),
-            session_search_watch: RefCell::default(),
+            search_field_watch: RefCell::default(),
             bootstrap: format!("w11term-window-{:032x}", rand::random::<u128>()),
             _hooks: window::install_hooks()?,
         })
@@ -605,44 +647,47 @@ impl KeyboardBridge {
         format!("{}-session-search-{pane}", self.bootstrap)
     }
 
-    pub fn watch_session_search(&self, query: Option<(u64, u64, u64)>) {
+    pub fn watch_search_field(&self, query: Option<SearchField>) {
         let _native = self.scope.enter();
         let hwnd = self.hwnd();
         if query.is_some() && hwnd.is_none() {
             return;
         }
-        let pane_changed = with_input_mut(|input| {
+        let owner = query.map(SearchField::owner);
+        let owner_changed = with_input_mut(|input| {
             let Some(state) = input else { return false };
-            let changed =
-                state.session_search.map(|(pane, ..)| pane) != query.map(|(pane, ..)| pane);
-            state.session_search = query;
+            let changed = state.search_field.map(SearchField::owner) != owner;
+            state.search_field = query;
             if changed {
-                state.session_search_focused = false;
+                state.search_field_focused = false;
             }
             changed
         });
-        if !pane_changed {
+        if !owner_changed {
             return;
         }
-        self.session_search_watch.borrow_mut().take();
-        if let (Some((pane, ..)), Some(hwnd)) = (query, hwnd) {
+        self.search_field_watch.borrow_mut().take();
+        if let (Some(owner), Some(hwnd)) = (owner, hwnd) {
             let hwnd = hwnd.0 as usize;
-            let tag = self.session_search_tag(pane);
+            let tag = match owner {
+                SearchFieldOwner::Sessions(tab) => self.session_search_tag(tab),
+                SearchFieldOwner::Files(pane) => file_search_tag(pane),
+            };
             match drawer_focus::Watch::new(tag, move |focused| {
                 if let Some(scope) = WindowScope::for_window(HWND(hwnd as *mut _)) {
                     let _guard = scope.enter();
                     with_input(|state| {
                         if let Ok(mut state) = state.try_borrow_mut()
                             && let Some(state) = state.as_mut()
-                            && state.session_search.is_some_and(|(id, ..)| id == pane)
+                            && state.search_field.map(SearchField::owner) == Some(owner)
                         {
-                            state.session_search_focused = focused;
+                            state.search_field_focused = focused;
                         }
                     });
                 }
             }) {
-                Ok(watch) => *self.session_search_watch.borrow_mut() = Some(watch),
-                Err(error) => log::warn!("Tracking remote session search focus: {error}"),
+                Ok(watch) => *self.search_field_watch.borrow_mut() = Some(watch),
+                Err(error) => log::warn!("Tracking search field focus: {error}"),
             }
         }
     }
@@ -736,7 +781,7 @@ impl Drop for KeyboardBridge {
     fn drop(&mut self) {
         let _guard = self.scope.enter();
         self.drawer_watch.get_mut().take();
-        self.session_search_watch.get_mut().take();
+        self.search_field_watch.get_mut().take();
         ime::uninstall();
         if let Some(mut state) = with_input_mut(Option::take) {
             state.release_keys();
@@ -1263,8 +1308,8 @@ impl State {
             modal: false,
             drawer_pane: None,
             drawer_focused: false,
-            session_search: None,
-            session_search_focused: false,
+            search_field: None,
+            search_field_focused: false,
             native_keys: HashSet::new(),
             native_late_char: None,
             game_mode: false,
@@ -1316,11 +1361,15 @@ impl State {
         self.report_focus();
     }
 
+    fn search_field_owns_keys(&self) -> bool {
+        matches!(self.search_field, Some(SearchField::Sessions(..))) || self.search_field_focused
+    }
+
     fn terminal_focused(&self) -> bool {
         window::active()
             && !self.search
             && !self.drawer_focused
-            && self.session_search.is_none()
+            && !self.search_field_owns_keys()
             && !self.modal
             && !self.switcher
             && self.picker.is_none()
@@ -1353,7 +1402,11 @@ impl State {
     }
 
     fn set_drawer_focus(&mut self, focused: bool) -> bool {
-        if self.drawer_focused == focused {
+        // The Win32 canvas can take focus without a WinUI focus event.
+        let left_search = !focused
+            && matches!(self.search_field, Some(SearchField::Files(..)))
+            && std::mem::take(&mut self.search_field_focused);
+        if self.drawer_focused == focused && !left_search {
             return false;
         }
         self.drawer_focused = focused;
@@ -1412,7 +1465,7 @@ impl State {
                         && self.search
                         && !self.modal
                         && !self.drawer_focused
-                        && self.session_search.is_none()
+                        && !self.search_field_owns_keys()
                         && self.picker.is_none()
                         && !self.switcher
                         && self.local_mode.is_none()
@@ -1504,7 +1557,7 @@ impl State {
                 WM_KEYUP | WM_SYSKEYUP => {
                     self.local_held.remove(&slot);
                     self.swallowed.remove(&slot);
-                    if vk == 0x0d {
+                    if matches!(vk, 0x0d | 0x1b) {
                         self.native_late_char = Some(slot);
                     }
                     return true;
@@ -1683,17 +1736,16 @@ impl State {
         if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&slot) {
             return true;
         }
-        if let Some((pane, listing, query)) = self.session_search
-            && self.session_search_focused
+        if self.search_field_focused
             && !self.search
             && message.message == WM_KEYDOWN
-            && vk == 0x0d
             && mods.is_empty()
+            && let Some(shortcut) = self.search_field.and_then(|field| field.shortcut(vk))
             && !ime::native_composing(message.hwnd)
         {
             self.local_held.insert(slot, false);
             if message.lParam.0 & (1 << 30) == 0 {
-                (self.shortcut)(Shortcut::SubmitSessionSearch(pane, listing, query));
+                (self.shortcut)(shortcut);
             }
             return true;
         }
@@ -1702,7 +1754,7 @@ impl State {
             let find_editor = self.search
                 && self.target.is_some()
                 && !self.drawer_focused
-                && self.session_search.is_none();
+                && !self.search_field_owns_keys();
             let shortcut = if find_editor {
                 match (vk, mods) {
                     (0x0d, KeyModifiers::NONE) => Some(Shortcut::FindNext),
@@ -1720,7 +1772,7 @@ impl State {
                         mods,
                         self.target.is_some()
                             && !self.drawer_focused
-                            && self.session_search.is_none(),
+                            && !self.search_field_owns_keys(),
                         right_alt,
                     )
                     .map(Shortcut::from)
@@ -1802,7 +1854,7 @@ impl State {
                 return true;
             }
         }
-        if (self.search || self.drawer_focused || self.session_search.is_some())
+        if (self.search || self.drawer_focused || self.search_field_owns_keys())
             && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL)
         {
             if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
@@ -2401,7 +2453,7 @@ mod tests {
         assert!(!state.handle(&f3(WM_KEYDOWN)));
         assert!(!state.handle(&f3(WM_KEYUP)));
         state.drawer_focused = false;
-        state.session_search = Some((1, 1, 1));
+        state.search_field = Some(SearchField::Sessions(1, 1, 1));
         assert!(!state.handle(&f3(WM_KEYDOWN)));
         assert!(!state.handle(&f3(WM_KEYUP)));
         assert!(input.try_recv().is_err());
@@ -3065,7 +3117,7 @@ mod tests {
                 sender,
                 frames: pane.frames.clone(),
             }),
-            session_search: Some((17, 3, 5)),
+            search_field: Some(SearchField::Sessions(17, 3, 5)),
             ..State::new(move |s| observed.borrow_mut().push(s))
         };
         let key = |message, vk, scan: u32, repeat: bool| MSG {
@@ -3078,14 +3130,14 @@ mod tests {
         assert!(!state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
         assert!(!state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
         assert!(actions.borrow().is_empty());
-        state.session_search_focused = true;
+        state.search_field_focused = true;
         assert!(!state.handle(&key(WM_KEYDOWN, 0x58, 0x2d, false)));
         assert!(!state.handle(&key(WM_CHAR, 'x' as usize, 0x2d, false)));
         assert!(!state.handle(&key(WM_KEYUP, 0x58, 0x2d, false)));
         assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
         // The application can attach and retarget its terminal before this key's repeat/release.
-        state.session_search = None;
-        state.session_search_focused = false;
+        state.search_field = None;
+        state.search_field_focused = false;
         assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, true)));
         assert!(state.handle(&key(WM_CHAR, 0x0d, 0x1c, false)));
         assert!(state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
@@ -3098,6 +3150,60 @@ mod tests {
         assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false))); // a fresh terminal Enter
         assert!(matches!(
             input.try_recv().unwrap(),
+            Command::Key { down: true, .. }
+        ));
+    }
+
+    #[test]
+    fn sftp_search_enter_and_escape_stay_local_through_repeat_and_release() {
+        let _window = WindowScope::default().enter();
+        window::activated(true);
+        let pane = Session::start(Source::Demo);
+        let (sender, mut terminal) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: pane.frames.clone(),
+            }),
+            drawer_focused: true,
+            search_field: Some(SearchField::Files(17, 3, 5)),
+            ..State::new(move |s| observed.borrow_mut().push(s))
+        };
+        let key = |message, vk, scan: u32, repeat: bool| MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(((scan << 16) | ((repeat as u32) << 30)) as isize),
+            ..Default::default()
+        };
+        // A focused native row button still handles Enter.
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
+        state.search_field_focused = true;
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, true)));
+        assert!(state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x1b, 0x01, false)));
+        assert!(state.set_drawer_focus(false));
+        assert!(!state.search_field_focused);
+        assert!(matches!(terminal.try_recv().unwrap(), Command::Focus(true)));
+        state.search_field = None;
+        assert!(state.handle(&key(WM_KEYDOWN, 0x1b, 0x01, true)));
+        assert!(state.handle(&key(WM_KEYUP, 0x1b, 0x01, false)));
+        assert!(!state.handle(&key(WM_CHAR, 0x1b, 0x01, false)));
+        assert_eq!(
+            *actions.borrow(),
+            [
+                Shortcut::SubmitFileSearch(17, 3, 5),
+                Shortcut::CloseFileSearch(17, 3, 5),
+                Shortcut::DrawerFocusChanged,
+            ]
+        );
+        assert!(terminal.try_recv().is_err());
+        assert!(state.handle(&key(WM_KEYDOWN, 0x1b, 0x01, false)));
+        assert!(matches!(
+            terminal.try_recv().unwrap(),
             Command::Key { down: true, .. }
         ));
     }
