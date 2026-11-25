@@ -705,6 +705,11 @@ impl RecordingRuntime {
                     },
                 );
             }
+            Command::BringIntoView { node } => {
+                self.nodes
+                    .get(node)
+                    .ok_or(RuntimeError::MissingNode(*node))?;
+            }
             Command::Focus { node, completion } => {
                 self.nodes
                     .get(node)
