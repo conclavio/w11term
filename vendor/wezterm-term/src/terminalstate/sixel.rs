@@ -58,20 +58,21 @@ impl TerminalState {
             match d {
                 SixelData::Data(d) => {
                     emit_sixel(d, &foreground_color, x, y);
-                    x += 1;
+                    x = x.saturating_add(1);
                 }
 
                 SixelData::Repeat { repeat_count, data } => {
-                    for _ in 0..*repeat_count {
+                    let count = (*repeat_count).min(width.saturating_sub(x));
+                    for _ in 0..count {
                         emit_sixel(data, &foreground_color, x, y);
-                        x += 1;
+                        x = x.saturating_add(1);
                     }
                 }
 
                 SixelData::CarriageReturn => x = 0,
                 SixelData::NewLine => {
                     x = 0;
-                    y += 6;
+                    y = y.saturating_add(6);
                 }
 
                 SixelData::DefineColorMapRGB { color_number, rgb } => {

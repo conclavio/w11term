@@ -1465,8 +1465,19 @@ impl TerminalState {
             self.config.canonicalize_pasted_newlines()
         };
 
-        let canon = canon.canonicalize(text);
-        let de_fanged = canon.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        let mut de_fanged = canon.canonicalize(text);
+        loop {
+            let next = de_fanged
+                .replace("\x1b[200~", "")
+                .replace("\x1b[201~", "")
+                .replace("\u{009b}200~", "")
+                .replace("\u{009b}201~", "");
+            if next.len() == de_fanged.len() {
+                break;
+            }
+            de_fanged = next;
+        }
+        de_fanged.retain(|c| c != '\x1b' && !('\u{0080}'..='\u{009f}').contains(&c));
         buf.push_str(&de_fanged);
 
         if self.bracketed_paste {
@@ -3162,7 +3173,8 @@ impl TerminalState {
                         .min(self.screen().logical_cols(y));
                     let graphics = self.prepare_kitty_text_edit(&(y..y + 1), &(x..margin), false);
                     let screen = self.screen_mut();
-                    for _ in 0..n as usize {
+                    let count = (n as usize).min(margin.saturating_sub(x));
+                    for _ in 0..count {
                         screen.insert_cell(x, y, margin, seqno);
                     }
                     self.finish_kitty_tile_update(graphics);
@@ -3231,7 +3243,11 @@ impl TerminalState {
                     }
                 };
 
-                for _ in 0..n {
+                let max_repeat = self
+                    .screen()
+                    .physical_cols
+                    .saturating_mul(self.screen().physical_rows);
+                for _ in 0..(n as usize).min(max_repeat) {
                     let right = left_and_right_margins
                         .end
                         .min(self.screen().logical_cols(y));

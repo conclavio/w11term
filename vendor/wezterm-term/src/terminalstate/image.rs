@@ -118,41 +118,81 @@ impl TerminalState {
             draw_height
         );
 
-        let (fullcells_width, remainder_width_cell, x_delta_divisor) = params
-            .columns
-            .map(|cols| {
-                (
-                    cols,
-                    0,
-                    (cols * cell_pixel_width) as u32 * params.image_width / draw_width,
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    draw_width as usize / cell_pixel_width,
-                    draw_width as usize % cell_pixel_width,
-                    params.image_width,
-                )
-            });
-        let (fullcells_height, remainder_height_cell, y_delta_divisor) = params
-            .rows
-            .map(|rows| {
-                (
-                    rows,
-                    0,
-                    (rows * cell_pixel_height) as u32 * params.image_height / draw_height,
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    draw_height as usize / cell_pixel_height,
-                    draw_height as usize % cell_pixel_height,
-                    params.image_height,
-                )
-            });
+        const MAX_PLACEMENT_COLS: usize = 2048;
+        const MAX_PLACEMENT_ROWS: usize = 1024;
+        const MAX_PLACEMENT_CELLS: usize = 131_072;
 
-        let target_pixel_width = fullcells_width * cell_pixel_width + remainder_width_cell;
-        let target_pixel_height = fullcells_height * cell_pixel_height + remainder_height_cell;
+        let (fullcells_width, remainder_width_cell, x_delta_divisor) = match params.columns {
+            Some(cols) => {
+                anyhow::ensure!(
+                    cols > 0 && cols <= MAX_PLACEMENT_COLS,
+                    "refusing to display image with invalid column span {cols}"
+                );
+                let divisor = (cols as f64) * (cell_pixel_width as f64) * (params.image_width as f64)
+                    / (draw_width as f64);
+                (cols, 0, divisor)
+            }
+            None => (
+                draw_width as usize / cell_pixel_width,
+                draw_width as usize % cell_pixel_width,
+                params.image_width as f64,
+            ),
+        };
+        let (fullcells_height, remainder_height_cell, y_delta_divisor) = match params.rows {
+            Some(rows) => {
+                anyhow::ensure!(
+                    rows > 0 && rows <= MAX_PLACEMENT_ROWS,
+                    "refusing to display image with invalid row span {rows}"
+                );
+                let divisor = (rows as f64) * (cell_pixel_height as f64) * (params.image_height as f64)
+                    / (draw_height as f64);
+                (rows, 0, divisor)
+            }
+            None => (
+                draw_height as usize / cell_pixel_height,
+                draw_height as usize % cell_pixel_height,
+                params.image_height as f64,
+            ),
+        };
+
+        anyhow::ensure!(
+            x_delta_divisor.is_finite()
+                && x_delta_divisor > 0.0
+                && y_delta_divisor.is_finite()
+                && y_delta_divisor > 0.0,
+            "refusing to display image with invalid scale divisor"
+        );
+
+        let width_in_cells = fullcells_width
+            .checked_add(one_or_zero::<usize>(remainder_width_cell > 0))
+            .context("image width in cells overflows")?;
+        let height_in_cells = fullcells_height
+            .checked_add(one_or_zero::<usize>(remainder_height_cell > 0))
+            .context("image height in cells overflows")?;
+        let height_in_cells = if params.do_not_move_cursor {
+            let remaining_rows = self.screen().physical_rows.saturating_sub(self.cursor.y.max(0) as usize);
+            height_in_cells.min(remaining_rows)
+        } else {
+            height_in_cells
+        };
+        anyhow::ensure!(
+            width_in_cells > 0
+                && width_in_cells <= MAX_PLACEMENT_COLS
+                && height_in_cells <= MAX_PLACEMENT_ROWS
+                && width_in_cells.saturating_mul(height_in_cells) <= MAX_PLACEMENT_CELLS,
+            "refusing to display image spanning {}x{} cells",
+            width_in_cells,
+            height_in_cells
+        );
+
+        let target_pixel_width = fullcells_width
+            .checked_mul(cell_pixel_width)
+            .and_then(|v| v.checked_add(remainder_width_cell))
+            .context("image target pixel width overflows")?;
+        let target_pixel_height = fullcells_height
+            .checked_mul(cell_pixel_height)
+            .and_then(|v| v.checked_add(remainder_height_cell))
+            .context("image target pixel height overflows")?;
         let first_row = self.screen().visible_row_to_stable_row(self.cursor.y);
 
         let mut ypos = NotNan::new(params.source_origin_y as f32 / params.image_height as f32)
@@ -161,14 +201,6 @@ impl TerminalState {
             .context("computing xpos")?;
 
         let cursor_x = self.cursor.x;
-
-        let width_in_cells = fullcells_width + one_or_zero::<usize>(remainder_width_cell > 0);
-        let height_in_cells = fullcells_height + one_or_zero::<usize>(remainder_height_cell > 0);
-        let height_in_cells = if params.do_not_move_cursor {
-            height_in_cells.min(self.screen().physical_rows - self.cursor.y as usize)
-        } else {
-            height_in_cells
-        };
 
         log::debug!(
             "image is {}x{} cells (cell is {}x{}), target pixel dims {}x{}, {:?}, (term is {}x{}@{}x{})",
@@ -188,7 +220,9 @@ impl TerminalState {
         let mut remain_y = target_pixel_height;
         for y in 0..height_in_cells {
             let padding_bottom = cell_pixel_height.saturating_sub(remain_y) as u16;
-            let y_delta = (remain_y.min(cell_pixel_height) as f32) / y_delta_divisor as f32;
+            let y_delta = ((remain_y.min(cell_pixel_height) as f64) / y_delta_divisor) as f32;
+            let next_ypos = NotNan::new(ypos.into_inner() + y_delta)
+                .context("computing next ypos")?;
             remain_y = remain_y.saturating_sub(cell_pixel_height);
 
             let mut xpos = start_xpos;
@@ -206,14 +240,16 @@ impl TerminalState {
             let mut remain_x = target_pixel_width;
             for x in 0..width_in_cells {
                 let padding_right = cell_pixel_width.saturating_sub(remain_x) as u16;
-                let x_delta = (remain_x.min(cell_pixel_width) as f32) / x_delta_divisor as f32;
+                let x_delta = ((remain_x.min(cell_pixel_width) as f64) / x_delta_divisor) as f32;
+                let next_xpos = NotNan::new(xpos.into_inner() + x_delta)
+                    .context("computing next xpos")?;
                 remain_x = remain_x.saturating_sub(cell_pixel_width);
                 log::debug!(
                     "x_delta {} ({} px), y_delta {} ({} px), padding_right={}, padding_bottom={}",
                     x_delta,
-                    x_delta * x_delta_divisor as f32,
+                    (x_delta as f64) * x_delta_divisor,
                     y_delta,
-                    y_delta * y_delta_divisor as f32,
+                    (y_delta as f64) * y_delta_divisor,
                     padding_right,
                     padding_bottom
                 );
@@ -224,7 +260,7 @@ impl TerminalState {
                     .unwrap_or_else(Cell::blank);
                 let img = Box::new(ImageCell::with_z_index(
                     TextureCoordinate::new(xpos, ypos),
-                    TextureCoordinate::new(xpos + x_delta, ypos + y_delta),
+                    TextureCoordinate::new(next_xpos, next_ypos),
                     params.data.clone(),
                     params.z_index,
                     cell_padding_left,
@@ -247,10 +283,10 @@ impl TerminalState {
                     &cell,
                     seqno,
                 );
-                xpos += x_delta;
+                xpos = next_xpos;
             }
-            ypos += y_delta;
-            if !params.do_not_move_cursor && y < height_in_cells - 1 {
+            ypos = next_ypos;
+            if !params.do_not_move_cursor && y + 1 < height_in_cells {
                 self.new_line(false);
             }
         }
@@ -318,9 +354,12 @@ impl TerminalState {
 }
 
 pub(crate) fn check_image_dimensions(width: u32, height: u32) -> anyhow::Result<()> {
-    const MAX_IMAGE_SIZE: u32 = 100_000_000;
-    let size = width.saturating_mul(height).saturating_mul(4);
-    if size > MAX_IMAGE_SIZE {
+    const MAX_IMAGE_DIM: u32 = 32_768;
+    const MAX_IMAGE_SIZE: u64 = 32 * 1024 * 1024;
+    let size = (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(4);
+    if width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM || size > MAX_IMAGE_SIZE {
         anyhow::bail!(
             "Ignoring image data for image with dimensions {}x{} \
              because required RAM {} > max allowed {}",

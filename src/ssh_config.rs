@@ -201,16 +201,7 @@ fn glob(pattern: &[u8], host: &[u8]) -> bool {
 }
 
 fn valid_host(host: &str) -> Result<()> {
-    ensure!(
-        !host.is_empty()
-            && host.len() <= 255
-            && !host.starts_with('-')
-            && !host
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || "/\\@?#[]".contains(c)),
-        "invalid SSH host {host:?}"
-    );
-    Ok(())
+    crate::options::validate_ssh_host(host)
 }
 
 #[derive(Default)]

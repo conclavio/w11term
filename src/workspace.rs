@@ -641,21 +641,52 @@ mod tests {
         let build = "printf '%s' \"$PWD\"";
         let recipe = |dir: &str, cmd: &str| SshStartup::new(&opts, dir.into(), cmd.into());
         assert_eq!(recipe("", build).unwrap().exec_request(), build);
-        assert_eq!(
-            recipe("/a'b/$user", "").unwrap().exec_request(),
-            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/a'\''b/$user'"#
-        );
-        assert_eq!(
-            recipe("/a b", build).unwrap().exec_request(),
-            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -c "$2"' w11term '/a b' 'printf '\''%s'\'' "$PWD"'"#
-        );
+
+        let decode_octal = |encoded: &str| -> String {
+            assert!(
+                !encoded.is_empty()
+                    && encoded.len() % 3 == 0
+                    && encoded.bytes().all(|b| (b'0'..=b'7').contains(&b)),
+                "argument must be pure octal triplets: {encoded:?}"
+            );
+            let bytes: Vec<u8> = encoded
+                .as_bytes()
+                .chunks_exact(3)
+                .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 8).unwrap())
+                .collect();
+            String::from_utf8(bytes).unwrap()
+        };
+
+        for dir in [
+            "/a'b/$user",
+            r"/tmp/\';id;#",
+            "/tmp/&whoami|calc",
+            "/srv/Pilot's 100%2F;#雪",
+        ] {
+            let exec = recipe(dir, "").unwrap().exec_request();
+            let (prefix, arg) = exec.rsplit_once(" w11term ").unwrap();
+            assert!(!prefix.contains(r"\\"), "script must not rely on \\\\ in single quotes");
+            assert!(prefix.contains(r#"cd -- "$a""#));
+            assert_eq!(decode_octal(arg), dir);
+        }
+
+        let exec_with_cmd = recipe("/a b", build).unwrap().exec_request();
+        let (_, args) = exec_with_cmd.rsplit_once(" w11term ").unwrap();
+        let mut parts = args.split(' ');
+        assert_eq!(decode_octal(parts.next().unwrap()), "/a b");
+        assert_eq!(decode_octal(parts.next().unwrap()), build);
+        assert!(parts.next().is_none());
+
         for (dir, command) in [
             ("", ""),
             ("relative/dir", build),
             ("/dir\0", ""),
+            ("/dir\nid", ""),
+            ("/dir\rid", ""),
+            ("/dir\x1b[31m", ""),
             ("", "a\0b"),
         ] {
-            assert!(recipe(dir, command).is_err());
+            assert!(recipe(dir, command).is_err(), "{dir:?} / {command:?}");
         }
     }
 

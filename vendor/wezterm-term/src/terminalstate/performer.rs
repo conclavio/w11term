@@ -449,7 +449,10 @@ impl Performer<'_> {
     fn print(&mut self, c: char) {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
         if let Some(title) = self.accumulating_title.as_mut() {
-            title.push(c);
+            const MAX_ACCUMULATING_TITLE_BYTES: usize = 4096;
+            if title.len().saturating_add(c.len_utf8()) <= MAX_ACCUMULATING_TITLE_BYTES {
+                title.push(c);
+            }
         } else {
             self.print.push(c);
         }
@@ -588,7 +591,14 @@ impl Performer<'_> {
                 // We treat CUB (Cursor::Left) the same as Backspace as
                 // that is what xterm does.
                 // <https://github.com/wezterm/wezterm/issues/1273>
-                for _ in 0..n {
+                let max_steps = if self.reverse_wraparound_mode {
+                    self.screen()
+                        .physical_cols
+                        .saturating_mul(self.screen().physical_rows)
+                } else {
+                    self.screen().physical_cols
+                };
+                for _ in 0..(n as usize).min(max_steps) {
                     self.control(ControlCode::Backspace);
                 }
             }
@@ -647,9 +657,9 @@ impl Performer<'_> {
                 }
             }
             CSI::Keyboard(Keyboard::PopKittyState(n)) => {
-                for _ in 0..n {
-                    self.screen_mut().keyboard_stack.pop();
-                }
+                let stack = &mut self.screen_mut().keyboard_stack;
+                let keep = stack.len().saturating_sub(n as usize);
+                stack.truncate(keep);
             }
             CSI::Keyboard(Keyboard::QueryKittySupport) => {
                 if self.config.enable_kitty_keyboard() {
@@ -1145,18 +1155,31 @@ impl Performer<'_> {
                 ITermProprietary::RemoteHost(report) => self.iterm_remote_host(&report),
                 ITermProprietary::CurrentDir(path) => self.iterm_current_dir(&path),
                 ITermProprietary::SetUserVar { name, value } => {
-                    self.user_vars.insert(name.clone(), value.clone());
-                    if let Some(handler) = self.alert_handler.as_mut() {
-                        handler.alert(Alert::SetUserVar { name, value });
+                    const MAX_USER_VARS: usize = 128;
+                    const MAX_USER_VAR_NAME_BYTES: usize = 256;
+                    const MAX_USER_VAR_VALUE_BYTES: usize = 4096;
+                    if name.len() <= MAX_USER_VAR_NAME_BYTES
+                        && value.len() <= MAX_USER_VAR_VALUE_BYTES
+                        && (self.user_vars.len() < MAX_USER_VARS
+                            || self.user_vars.contains_key(&name))
+                    {
+                        self.user_vars.insert(name.clone(), value.clone());
+                        if let Some(handler) = self.alert_handler.as_mut() {
+                            handler.alert(Alert::SetUserVar { name, value });
+                        }
                     }
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Set(n)) => {
                     self.unicode_version.version = n;
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Push(label)) => {
+                    const MAX_UNICODE_VERSION_STACK: usize = 128;
                     let vers = self.unicode_version.clone();
                     self.unicode_version_stack
                         .push(UnicodeVersionStackEntry { vers, label });
+                    if self.unicode_version_stack.len() > MAX_UNICODE_VERSION_STACK {
+                        self.unicode_version_stack.remove(0);
+                    }
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Pop(None)) => {
                     if let Some(entry) = self.unicode_version_stack.pop() {

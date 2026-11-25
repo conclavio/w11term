@@ -212,6 +212,19 @@ impl TerminalState {
             (Some(w), Some(h)) => (w, h),
         };
 
+        let Ok(display_width) = <u32 as std::convert::TryFrom<usize>>::try_from(width) else {
+            log::error!("Ignoring iTerm2 image with out-of-range display width {width}");
+            return;
+        };
+        let Ok(display_height) = <u32 as std::convert::TryFrom<usize>>::try_from(height) else {
+            log::error!("Ignoring iTerm2 image with out-of-range display height {height}");
+            return;
+        };
+        if let Err(err) = check_image_dimensions(display_width, display_height) {
+            log::error!("{err}");
+            return;
+        }
+
         let downscaled = (width < info.width as usize) || (height < info.height as usize);
         let data = match (downscaled, info.format) {
             (true, ImageFormat::Gif)
@@ -222,14 +235,31 @@ impl TerminalState {
                 // or things that don't need resampling
                 ImageDataType::EncodedFile(image.data)
             }
-            (true, _) => match ::image::load_from_memory(&image.data) {
-                Ok(im) => {
-                    let im = im.resize_exact(width as u32, height as u32, FilterType::CatmullRom);
-                    let data = im.into_rgba8().into_vec();
-                    ImageDataType::new_single_frame(width as u32, height as u32, data)
+            (true, _) => {
+                let decoded = ::image::ImageReader::new(std::io::Cursor::new(&image.data))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|mut reader| {
+                        let mut limits = ::image::Limits::default();
+                        limits.max_image_width = Some(info.width);
+                        limits.max_image_height = Some(info.height);
+                        limits.max_alloc = Some(32 * 1024 * 1024);
+                        reader.limits(limits);
+                        reader.decode().ok()
+                    });
+                match decoded {
+                    Some(im) => {
+                        let im = im.resize_exact(
+                            display_width,
+                            display_height,
+                            FilterType::CatmullRom,
+                        );
+                        let data = im.into_rgba8().into_vec();
+                        ImageDataType::new_single_frame(display_width, display_height, data)
+                    }
+                    None => ImageDataType::EncodedFile(image.data),
                 }
-                Err(_) => ImageDataType::EncodedFile(image.data),
-            },
+            }
         };
 
         let image_data = match self.raw_image_to_image_data(data) {

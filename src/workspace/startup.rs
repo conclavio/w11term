@@ -37,6 +37,7 @@ impl SshStartup {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
+        crate::options::validate_ssh_host(&self.host)?;
         if let Some(alias) = &self.host_key_alias {
             crate::options::validate_host_key_alias(alias)?;
         }
@@ -53,7 +54,11 @@ impl SshStartup {
             "Enter an absolute remote directory"
         );
         ensure!(
-            !self.directory.contains('\0') && !self.command.contains('\0'),
+            !self.directory.chars().any(char::is_control),
+            "Startup directory cannot contain control characters"
+        );
+        ensure!(
+            !self.command.contains('\0'),
             "Startup values cannot contain NUL"
         );
         Ok(())
@@ -75,22 +80,33 @@ impl SshStartup {
         Ok(())
     }
 
-    pub(crate) fn exec_request(&self) -> String {
+    pub fn exec_request(&self) -> String {
         if self.directory.is_empty() {
             return self.command.clone();
         }
-        // Pass the directory as a positional argument so whitespace, quotes
-        // and shell metacharacters remain literal even when launching a script.
-        fn quote(value: &str) -> String {
-            format!("'{}'", value.replace('\'', "'\\''"))
+        // Encode arguments as pure octal digits ([0-7]+) so the remote login
+        // shell (POSIX sh, bash, zsh, fish, csh, pwsh, or cmd.exe) never sees
+        // quotes, backslashes, or shell metacharacters in untrusted arguments.
+        // The fixed POSIX `sh -c` decoder contains neither embedded single
+        // quotes nor `\\`, so it is parsed identically by POSIX sh and fish.
+        fn encode_octal(value: &str) -> String {
+            use std::fmt::Write;
+            let mut out = String::with_capacity(value.len() * 3);
+            for byte in value.as_bytes() {
+                let _ = write!(out, "{byte:03o}");
+            }
+            out
         }
-        let dir = quote(&self.directory);
+        const DECODER: &str = r#"d(){ h=$1;o=;while [ -n "$h" ];do r=${h#???};o="$o\0${h%"$r"}";h=$r;done;printf %bx "$o"; };"#;
+        let dir = encode_octal(&self.directory);
         if self.command.is_empty() {
-            format!(r#"sh -c 'cd "$1" && exec "${{SHELL:-/bin/sh}}" -i' w11term {dir}"#)
-        } else {
             format!(
-                r#"sh -c 'cd "$1" && exec "${{SHELL:-/bin/sh}}" -c "$2"' w11term {dir} {}"#,
-                quote(&self.command)
+                r#"sh -c '{DECODER}a=$(d "$1");a=${{a%x}};cd -- "$a" && exec "${{SHELL:-/bin/sh}}" -i' w11term {dir}"#
+            )
+        } else {
+            let cmd = encode_octal(&self.command);
+            format!(
+                r#"sh -c '{DECODER}a=$(d "$1");a=${{a%x}};b=$(d "$2");b=${{b%x}};cd -- "$a" && exec "${{SHELL:-/bin/sh}}" -c "$b"' w11term {dir} {cmd}"#
             )
         }
     }

@@ -44,6 +44,167 @@ struct Identity {
     sid: String,
     integrity: u32,
 }
+pub(crate) const HIGH_INTEGRITY_RID: u32 = 0x3000;
+
+pub(crate) fn is_elevated() -> Result<bool> {
+    Ok(Identity::current()?.integrity >= HIGH_INTEGRITY_RID)
+}
+
+/// Create or verify a directory isolated to High-integrity (elevated) processes
+/// so Medium-integrity processes of the same user cannot tamper with elevated
+/// configs, discovery manifests, or logs, nor plant NTFS junctions.
+pub(crate) fn ensure_elevated_directory(path: &std::path::Path) -> Result<()> {
+    use std::os::windows::{
+        ffi::OsStrExt,
+        fs::OpenOptionsExt,
+        io::AsRawHandle,
+    };
+    use windows::Win32::{
+        Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS},
+        Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, GetFileInformationByHandle, READ_CONTROL,
+        },
+    };
+
+    let identity = Identity::current()?;
+    ensure!(
+        identity.integrity >= HIGH_INTEGRITY_RID,
+        "elevated directory requires High integrity"
+    );
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let sddl: Vec<u16> = format!(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})S:(ML;OICI;NWNR;;;S-1-16-{})",
+        identity.sid, identity.integrity
+    )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )?;
+    }
+    let _descriptor = LocalMemory(descriptor.0);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if let Err(error) = unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(&attributes)) } {
+        ensure!(
+            error.code() == ERROR_ALREADY_EXISTS.to_hresult(),
+            "creating elevated directory {}: {error}",
+            path.display()
+        );
+    }
+
+    // Open the leaf without following reparse points and verify both ownership
+    // and an unforgeable High-integrity mandatory label on the actual handle.
+    let dir = std::fs::OpenOptions::new()
+        .access_mode((FILE_READ_ATTRIBUTES | READ_CONTROL).0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)
+        .with_context(|| format!("opening elevated directory {}", path.display()))?;
+    let handle = HANDLE(dir.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(handle, &mut info)?;
+    }
+    ensure!(
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0
+            && (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) == 0,
+        "elevated directory {} must be a real directory, not a reparse point",
+        path.display()
+    );
+
+    let mut owner_sid = PSID::default();
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+            Some(&mut owner_sid),
+            None,
+            None,
+            Some(&mut sacl),
+            Some(&mut sd),
+        )
+    };
+    ensure!(
+        status == ERROR_SUCCESS,
+        "reading security descriptor of {}: {status:?}",
+        path.display()
+    );
+    let _sd = LocalMemory(sd.0);
+
+    let owner_text = unsafe {
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(owner_sid, &mut text)?;
+        let _text = LocalMemory(text.0.cast());
+        text.to_string()?
+    };
+    ensure!(
+        owner_text == identity.sid || owner_text == "S-1-5-18" || owner_text == "S-1-5-32-544",
+        "elevated directory {} has unexpected owner {owner_text}",
+        path.display()
+    );
+
+    let label_rid = unsafe { mandatory_label_rid(sacl)? };
+    ensure!(
+        label_rid >= HIGH_INTEGRITY_RID,
+        "elevated directory {} lacks a High-integrity mandatory label (found {label_rid})",
+        path.display()
+    );
+    Ok(())
+}
+
+unsafe fn mandatory_label_rid(sacl: *const ACL) -> Result<u32> {
+    if sacl.is_null() {
+        return Ok(0);
+    }
+    let mut size_info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            sacl,
+            (&mut size_info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )?;
+    }
+    for index in 0..size_info.AceCount {
+        let mut ace_ptr = std::ptr::null_mut();
+        unsafe {
+            GetAce(sacl, index, &mut ace_ptr)?;
+            let header = &*(ace_ptr as *const ACE_HEADER);
+            if header.AceType
+                == windows::Win32::System::SystemServices::SYSTEM_MANDATORY_LABEL_ACE_TYPE as u8
+            {
+                let ace = &*(ace_ptr as *const SYSTEM_MANDATORY_LABEL_ACE);
+                let sid = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+                let count = *GetSidSubAuthorityCount(sid);
+                ensure!(count > 0, "invalid mandatory label SID");
+                return Ok(*GetSidSubAuthority(sid, u32::from(count - 1)));
+            }
+        }
+    }
+    Ok(0)
+}
+
 pub(super) fn current_scope() -> Result<(String, u32, u32)> {
     let user = Identity::current()?;
     let mut session = 0;

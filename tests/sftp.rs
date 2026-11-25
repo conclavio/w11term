@@ -1154,6 +1154,7 @@ async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
         serde_json::to_vec(&json!({"profiles":{"guest":ssh}})).unwrap(),
     )
     .unwrap();
+    let expected_exec = startup.exec_request();
     let session = Session::start_workspace_ssh(ssh, Default::default(), false, startup);
     tokio::time::timeout(Duration::from_secs(10), async {
         while session.frames.load().connection_generation != 2 {
@@ -1165,7 +1166,7 @@ async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
     assert_eq!(opens.load(Ordering::Relaxed), 2);
     assert_eq!(
         fs::read_to_string(trace).unwrap(),
-        r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/work'"#.repeat(2)
+        expected_exec.repeat(2)
     );
     // The first connection failed before publishing a usable shell. Folder
     // actions and SFTP must still identify the same second SSH generation.

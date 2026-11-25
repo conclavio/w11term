@@ -262,7 +262,17 @@ fn quote_powershell(path: &str) -> String {
 }
 
 fn quote_wsl(path: &str) -> String {
-    format!("'{}'", path.replace('\'', "'\\''"))
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('\'');
+    for ch in path.chars() {
+        match ch {
+            '\'' => quoted.push_str("'\\''"),
+            '\\' => quoted.push_str("'\\\\'"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn wsl_path(

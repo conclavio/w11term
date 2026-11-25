@@ -24,16 +24,43 @@ fn message(error: &anyhow::Error, executable: Option<&Path>) -> String {
 }
 
 fn write_log(directory: &Path, text: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::{Error, ErrorKind, Seek, SeekFrom};
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
+        },
+    };
+
     std::fs::create_dir_all(directory)?;
     let path = directory.join("startup.log");
-    // Keep repeated bad launches from growing the diagnostic file indefinitely.
-    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 256 * 1024) {
-        std::fs::write(&path, [])?;
-    }
     let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
-        .append(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(&path)?;
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(handle, &mut info).map_err(Error::from)?;
+        if GetFileType(handle) != FILE_TYPE_DISK
+            || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
+        {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "refusing to write startup.log through a reparse point or non-disk handle",
+            ));
+        }
+    }
+    // Keep repeated bad launches from growing the diagnostic file indefinitely.
+    if file.metadata()?.len() > 256 * 1024 {
+        file.set_len(0)?;
+    }
+    file.seek(SeekFrom::End(0))?;
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()

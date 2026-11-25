@@ -227,7 +227,14 @@ impl PendingWrite {
         bytes: &[u8],
         offset: u64,
     ) -> io::Result<()> {
-        self.modify(root, |file, _| put(file, bytes, offset))
+        self.modify(root, |file, current_len| {
+            let end = offset.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
+            check_extension(current_len, end)?;
+            if offset > current_len {
+                zero_fill_gap(file, root, current_len, offset)?;
+            }
+            put(file, bytes, offset)
+        })
     }
     pub(in crate::ssh::folder_share) fn append(
         &mut self,
@@ -242,8 +249,44 @@ impl PendingWrite {
         len: u64,
     ) -> io::Result<()> {
         check_length(len)?;
-        self.modify(root, |file, _| file.set_len(len))
+        self.modify(root, |file, current_len| {
+            check_extension(current_len, len)?;
+            if len > current_len {
+                // Zero-fill in revocation-checked chunks so NTFS Valid Data Length
+                // advances incrementally without stalling Forget/Revoke locks or
+                // accumulating a deferred zero-fill bomb across SETSTAT calls.
+                zero_fill_gap(file, root, current_len, len)?;
+            } else {
+                file.set_len(len)?;
+            }
+            Ok(())
+        })
     }
+}
+/// Maximum bytes a single SFTP WRITE or SETSTAT/FSETSTAT request may extend a
+/// non-sparse NTFS file beyond its current Valid Data Length. Bounding each
+/// extension prevents a single tiny packet from forcing gigabytes of synchronous
+/// kernel zero-filling while holding the shared folder revocation lock.
+const MAX_VDL_EXTENSION: u64 = 32 * 1024 * 1024;
+fn check_extension(current_len: u64, target_len: u64) -> io::Result<()> {
+    check_length(target_len)?;
+    if target_len.saturating_sub(current_len) > MAX_VDL_EXTENSION {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "file extension exceeds the per-request NTFS allocation bound",
+        ));
+    }
+    Ok(())
+}
+fn zero_fill_gap(file: &File, root: &Root, mut offset: u64, target_len: u64) -> io::Result<()> {
+    const CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
+    while offset < target_len {
+        root.check_write()?;
+        let step = (target_len - offset).min(CHUNK.len() as u64) as usize;
+        put(file, &CHUNK[..step], offset)?;
+        offset += step as u64;
+    }
+    Ok(())
 }
 fn check_length(len: u64) -> io::Result<()> {
     if len > i64::MAX as u64 {
@@ -684,6 +727,31 @@ mod tests {
         assert!(read_only.list("/")?.is_empty());
         drop(read_only);
         fs::rename(&parent, temp.path().join("elsewhere"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn write_at_and_set_len_bound_single_request_ntfs_vdl_extension() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Root::open(temp.path())?.with_write_access(true);
+        let mut handle = root.open_write("bounded.bin", true, true, false)?;
+
+        // Extending far past EOF in a single WRITE or SETSTAT must fail cleanly.
+        let huge_offset = MAX_VDL_EXTENSION + 1;
+        assert_eq!(
+            handle.write_at(&root, b"x", huge_offset).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            handle.set_len(&root, huge_offset).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+
+        // Bounded extensions succeed and advance file size accurately.
+        handle.set_len(&root, 4096)?;
+        assert_eq!(fs::metadata(temp.path().join("bounded.bin"))?.len(), 4096);
+        handle.write_at(&root, b"ok", 4096)?;
+        assert_eq!(fs::metadata(temp.path().join("bounded.bin"))?.len(), 4098);
         Ok(())
     }
 }

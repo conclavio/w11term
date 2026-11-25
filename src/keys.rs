@@ -28,10 +28,15 @@ pub fn data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("W11TERM_DATA_DIR") {
         return Ok(std::path::absolute(path)?);
     }
-    Ok(
+    let base =
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA unavailable")?)
-            .join("w11term"),
-    )
+            .join("w11term");
+    if crate::control::security::is_elevated()? {
+        let elevated = base.join("elevated");
+        crate::control::security::ensure_elevated_directory(&elevated)?;
+        return Ok(elevated);
+    }
+    Ok(base)
 }
 pub fn profile_file(profile: &str) -> String {
     let stem: String = profile

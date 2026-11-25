@@ -3264,10 +3264,14 @@ async fn native_workspace_startup_is_sent_only_by_the_reopened_pane() {
         fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
     );
     assert_eq!(opens.load(Ordering::Relaxed), 2);
-    assert_eq!(
-        fs::read_to_string(trace).unwrap(),
-        r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -c "$2"' w11term '/srv/crew'\''s project' 'tail -f build.log'"#
-    );
+    let expected = w11term::workspace::SshStartup::new(
+        &ssh,
+        "/srv/crew's project".into(),
+        "tail -f build.log".into(),
+    )
+    .unwrap()
+    .exec_request();
+    assert_eq!(fs::read_to_string(trace).unwrap(), expected);
     server.abort();
 }
 
@@ -3432,10 +3436,11 @@ async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_t
     let users = fs::read_to_string(remote.path().join("authenticated-users")).unwrap();
     assert_eq!(users.lines().collect::<Vec<_>>(), ["test"]);
     let exec = fs::read_to_string(remote.path().join("workspace-exec.bin")).unwrap();
-    assert_eq!(
-        exec,
-        r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/Pilot'\''s Work'"#
-    );
+    let expected =
+        w11term::workspace::SshStartup::new(&ssh, "/Pilot's Work".into(), String::new())
+            .unwrap()
+            .exec_request();
+    assert_eq!(exec, expected);
     let trace = fs::read_to_string(remote.path().join("pty-trace")).unwrap();
     let ptys: Vec<_> = trace.lines().collect();
     assert_eq!(ptys.len(), 2);
@@ -3504,14 +3509,15 @@ async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
         2,
         "exactly one new session channel"
     );
-    assert_eq!(
-        fs::read_to_string(exec).unwrap(),
-        if iterm2 {
-            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s 100%2F;#雪'"#
-        } else {
-            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s Work'"#
-        },
-    );
+    let expected_dir = if iterm2 {
+        "/srv/Pilot's 100%2F;#雪"
+    } else {
+        "/srv/Pilot's Work"
+    };
+    let expected = w11term::workspace::SshStartup::new(&ssh, expected_dir.into(), String::new())
+        .unwrap()
+        .exec_request();
+    assert_eq!(fs::read_to_string(exec).unwrap(), expected);
     let mut streams: Vec<_> = fs::read_dir(inputs)
         .unwrap()
         .map(|f| fs::read_to_string(f.unwrap().path()).unwrap())
