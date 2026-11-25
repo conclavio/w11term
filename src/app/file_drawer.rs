@@ -925,6 +925,19 @@ impl FileDrawer {
         ))
     }
 
+    pub(super) fn search_shell_origin(
+        &self,
+        pane: u64,
+        serial: u64,
+        hit: &FilenameMatch,
+    ) -> Option<directory_split::Origin> {
+        if !self.open || self.busy() || self.entry_dialog_open() {
+            return None;
+        }
+        self.search_hit_path(serial, hit).ok()?;
+        directory_split::Origin::search(pane, self.generation, serial, hit)
+    }
+
     fn check_selected(&self, entry: &ListedEntry) -> Result<()> {
         ensure!(
             self.selected.as_ref() == Some(&entry.name) && self.has_entry(entry),
@@ -1584,7 +1597,7 @@ impl FileDrawer {
             view
         };
         if let Some(search) = &self.search {
-            return cache(search.view(self, pane, context));
+            return cache(search.view(self, pane, shell_ready, context));
         }
         if let Some(list) = &self.bookmarks
             && Some(list.profile.as_str()) == profile
