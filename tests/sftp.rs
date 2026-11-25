@@ -836,6 +836,10 @@ impl russh_sftp::server::Handler for Files {
         }
         #[cfg(feature = "ui-smoke")]
         self.trace_listing("READDIR")?;
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("slow-search-page").is_file() {
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
         match self.handles.get_mut(&h) {
             Some(Opened::Dir(entries)) if !entries.is_empty() => Ok(Name {
                 id,
@@ -1783,7 +1787,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
                 operation,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 reply,
-                progress: Some(sender),
+                progress: Some(w11term::sftp::JobProgress::Transfer(sender)),
                 cancel: None,
             }))
             .unwrap();

@@ -270,6 +270,15 @@ pub struct FilenameSearch {
     pub cancelled: bool,
 }
 
+/// A snapshot of a running scan. Totals are unknown until the search ends.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchProgress {
+    pub folder: String,
+    pub scanned_directories: usize,
+    pub scanned_entries: usize,
+    pub matches: usize,
+}
+
 struct Search<'a> {
     engine: &'a Engine,
     pattern: FilenamePattern,
@@ -279,6 +288,8 @@ struct Search<'a> {
     file_size: FileSizeRange,
     modified_days: Option<RangeInclusive<i64>>,
     cancel: Option<&'a TransferCancel>,
+    progress: Option<&'a watch::Sender<SearchProgress>>,
+    next_progress: Instant,
     queued: VecDeque<(String, usize)>,
     directories: HashSet<String>,
     matched: HashSet<String>,
@@ -294,6 +305,34 @@ fn unavailable(error: &anyhow::Error) -> bool {
 }
 
 impl Search<'_> {
+    fn report_progress(&mut self, folder: &str, new_folder: bool) {
+        let Some(progress) = self.progress else {
+            return;
+        };
+        let now = Instant::now();
+        if !new_folder && now < self.next_progress {
+            return;
+        }
+        self.next_progress = now + Duration::from_millis(100);
+        progress.send_if_modified(|current| {
+            let matches = self.result.matches.len();
+            let directories = self.result.scanned_directories;
+            let entries = self.result.scanned_entries;
+            if current.folder == folder
+                && current.matches == matches
+                && current.scanned_directories == directories
+                && current.scanned_entries == entries
+            {
+                return false;
+            }
+            folder.clone_into(&mut current.folder);
+            current.matches = matches;
+            current.scanned_directories = directories;
+            current.scanned_entries = entries;
+            true
+        });
+    }
+
     fn cancelled(&self) -> bool {
         self.cancel.is_some_and(TransferCancel::is_cancelled)
     }
@@ -322,6 +361,7 @@ impl Search<'_> {
                 return Ok(false);
             }
             'pages: while !self.cancelled() {
+                self.report_progress(path, false);
                 let page = match self.engine.raw.readdir(&handle).await {
                     Ok(reply) => reply.files,
                     Err(error) if eof(&error) => break,
@@ -453,6 +493,7 @@ impl Engine {
         query: &str,
         filter: FilenameFilter,
         cancel: Option<&TransferCancel>,
+        progress: Option<&watch::Sender<SearchProgress>>,
     ) -> Result<FilenameSearch> {
         let pattern = FilenamePattern::new(query, &filter)?;
         filter.file_size.validate(filter.kind)?;
@@ -472,6 +513,8 @@ impl Engine {
             file_size: filter.file_size,
             modified_days,
             cancel,
+            progress,
+            next_progress: Instant::now(),
             queued: VecDeque::from([(root.clone(), 0)]),
             directories: HashSet::from([root.clone()]),
             matched: HashSet::new(),
@@ -490,6 +533,7 @@ impl Engine {
             if search.cancelled() || search.limit_reached() {
                 break;
             }
+            search.report_progress(&path, true);
             match search.scan(&path, depth).await {
                 Ok(true) => search.result.scanned_directories += 1,
                 Ok(false) if depth == 0 && !search.cancelled() => {
