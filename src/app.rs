@@ -115,6 +115,7 @@ struct LiveTab {
     discovery: Option<session_browser::Browser>,
     copy_output_unavailable: Option<&'static str>,
     failed_command_jumps: [bool; 2],
+    bookmark_actions: [bool; 3],
     can_clear_scrollback: bool,
     split_directory_report: Option<Arc<str>>,
     confirm_end: bool,
@@ -1065,6 +1066,8 @@ pub enum Message {
     Recording(recordings::Action),
     ClearScrollback(u64),
     ScrollFailedCommand(Option<clipboard_paste::Origin>, bool),
+    ToggleScrollbackBookmark(Option<clipboard_paste::Origin>),
+    ScrollToBookmark(Option<clipboard_paste::Origin>, bool),
     PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
@@ -1269,6 +1272,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             discovery: None,
             copy_output_unavailable: Some("waiting for shell markers"),
             failed_command_jumps: [false; 2],
+            bookmark_actions: [false; 3],
             can_clear_scrollback: false,
             split_directory_report: None,
             color_scheme: source.color_scheme(),
@@ -1849,11 +1853,18 @@ impl TerminalApp {
             && tab.surface.scrollbar.pointer(
                 pointer,
                 kind,
-                |marked_row| {
+                |mark| {
                     let frame = tab.session.frames.load();
-                    if let Some(row) = marked_row
-                        && !frame.failed_command_rows.contains(&row)
-                    {
+                    let retained = match mark {
+                        Some(scrollback_bar::ScrollMark::FailedCommand(row)) => {
+                            frame.failed_command_rows.contains(&row)
+                        }
+                        Some(scrollback_bar::ScrollMark::Bookmark(row)) => {
+                            frame.scrollback_bookmarks.binary_search(&row).is_ok()
+                        }
+                        None => true,
+                    };
+                    if !retained {
                         return None;
                     }
                     frame.scrollback_view()
@@ -5074,6 +5085,33 @@ impl Component for TerminalApp {
                     let _ = tab.session.input.send(view.scroll_to(Some(row)));
                 }
             }
+            Message::ToggleScrollbackBookmark(origin) => {
+                if origin.is_some()
+                    && origin == self.paste_origin()
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.active()
+                    && let Some(target) = tab.session.frames.load().bookmark_target()
+                {
+                    let _ = tab
+                        .session
+                        .input
+                        .send(Command::ToggleScrollbackBookmark(target));
+                }
+            }
+            Message::ScrollToBookmark(origin, older) => {
+                if origin.is_some()
+                    && origin == self.paste_origin()
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.active()
+                    && let Some(target) = tab.session.frames.load().adjacent_bookmark(older)
+                {
+                    let _ = tab.session.input.send(Command::ScrollViewport(target));
+                }
+            }
             Message::ClearScrollback(pane) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -5928,6 +5966,15 @@ impl Component for TerminalApp {
                             .map(|older| frame.adjacent_failed_command(older).is_some());
                         if tab.failed_command_jumps != jumps {
                             tab.failed_command_jumps = jumps;
+                            pane_actions_changed |= active;
+                        }
+                        let bookmarks = [
+                            frame.bookmark_target().is_some(),
+                            frame.adjacent_bookmark(true).is_some(),
+                            frame.adjacent_bookmark(false).is_some(),
+                        ];
+                        if tab.bookmark_actions != bookmarks {
+                            tab.bookmark_actions = bookmarks;
                             pane_actions_changed |= active;
                         }
                         let can_clear = !frame.alternate

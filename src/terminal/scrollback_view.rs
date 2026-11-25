@@ -55,6 +55,43 @@ pub(super) fn failed_command_rows(
     }
 }
 
+pub(super) fn bookmark_rows(
+    screen: &wezterm_term::Screen,
+    previous: Option<&Snapshot>,
+) -> Arc<[isize]> {
+    let rows = || screen.scrollback_bookmark_rows();
+    if let Some(old) = previous.filter(|old| rows().eq(old.scrollback_bookmarks.iter().copied())) {
+        old.scrollback_bookmarks.clone()
+    } else {
+        rows().collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BookmarkTarget {
+    row: isize,
+    col: usize,
+    epoch: u64,
+    clear: u64,
+    connection: u64,
+}
+
+impl BookmarkTarget {
+    pub(crate) fn toggle(self, term: &mut Terminal, connection: u64) -> bool {
+        if !term.is_alt_screen_active()
+            && !term.synchronized_output()
+            && self.connection == connection
+            && self.epoch == term.screen().row_epoch()
+            && self.clear == term.screen().history_clear_count()
+        {
+            return term
+                .screen_mut()
+                .toggle_scrollback_bookmark(self.row, self.col);
+        }
+        false
+    }
+}
+
 /// The primary viewport in stable row coordinates, including the newest possible top row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScrollbackView {
@@ -69,6 +106,43 @@ pub struct ScrollbackView {
 }
 
 impl Snapshot {
+    pub fn bookmark_target(&self) -> Option<BookmarkTarget> {
+        (!self.alternate && !self.rows.is_empty()).then(|| {
+            let (row, col) = if self.scroll_offset == 0 {
+                (
+                    self.first_stable_row.saturating_add(self.cursor.y as isize),
+                    self.cursor.x,
+                )
+            } else {
+                (self.first_stable_row, 0)
+            };
+            BookmarkTarget {
+                row,
+                col,
+                epoch: self.row_epoch,
+                clear: self.history_clear_count,
+                connection: self.connection_generation,
+            }
+        })
+    }
+
+    pub fn adjacent_bookmark(&self, older: bool) -> Option<ScrollbackTarget> {
+        let view = self.scrollback_view()?;
+        let rows = &self.scrollback_bookmarks;
+        let row = if older {
+            let end = rows.partition_point(|&row| row < view.top);
+            *rows.get(end.checked_sub(1)?)?
+        } else {
+            (view.top < view.live).then_some(())?;
+            *rows.get(rows.partition_point(|&row| row <= view.top))?
+        };
+        Some(ScrollbackTarget {
+            view,
+            top: Some(row),
+            require_retained: true,
+        })
+    }
+
     pub fn command_context_target(&self) -> Option<ScrollbackTarget> {
         let start = self.command_context.as_ref()?.start;
         let view = self.scrollback_view()?;

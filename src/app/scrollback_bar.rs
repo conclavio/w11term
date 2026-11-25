@@ -53,6 +53,10 @@ impl Rail {
         (self.width - PADDING)..(self.width - PADDING + FAILURE_MARK_WIDTH)
     }
 
+    fn bookmark_lane(self) -> Range<f32> {
+        self.width - 2.0..self.width
+    }
+
     fn thumb(self) -> (f32, f32) {
         let history = (self.view.live - self.view.oldest) as f64;
         let rows = self.view.rows as f64;
@@ -178,10 +182,25 @@ pub(super) struct ScrollBar {
     find_open: Cell<bool>,
     show_failures: Cell<bool>,
     failure_rows: RefCell<Option<Arc<[isize]>>>,
+    bookmark_rows: RefCell<Option<Arc<[isize]>>>,
     marks: RefCell<Option<MarkBands>>,
     shown: Cell<Option<Rail>>,
     owns_press: Cell<bool>,
     drag: Cell<Option<Drag>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScrollMark {
+    FailedCommand(isize),
+    Bookmark(isize),
+}
+
+impl ScrollMark {
+    fn row(self) -> isize {
+        match self {
+            Self::FailedCommand(row) | Self::Bookmark(row) => row,
+        }
+    }
 }
 
 impl ScrollBar {
@@ -215,6 +234,7 @@ impl ScrollBar {
         }
         if rail.is_none() {
             self.failure_rows.borrow_mut().take();
+            self.bookmark_rows.borrow_mut().take();
         }
         self.shown.set(rail);
     }
@@ -264,7 +284,14 @@ impl ScrollBar {
             brush.set_color(ColorF::new(0.56, 0.60, 0.65, 1.0));
             ctx.fill_rect(&Rect::from_xywh(x, top, w, height), brush);
             if self.show_failures.get() && !frame.failed_command_rows.is_empty() {
-                self.paint_failures(ctx, rail, brush, &frame.failed_command_rows);
+                Self::paint_row_marks(
+                    ctx,
+                    rail,
+                    brush,
+                    &frame.failed_command_rows,
+                    rail.failure_lane(),
+                    ColorF::new(1.0, 104.0 / 255.0, 123.0 / 255.0, 1.0),
+                );
                 *self.failure_rows.borrow_mut() = Some(frame.failed_command_rows.clone());
             } else {
                 self.failure_rows.borrow_mut().take();
@@ -278,25 +305,45 @@ impl ScrollBar {
             } else {
                 self.marks.borrow_mut().take();
             }
+            if frame.scrollback_bookmarks.is_empty() {
+                self.bookmark_rows.borrow_mut().take();
+            } else {
+                Self::paint_row_marks(
+                    ctx,
+                    rail,
+                    brush,
+                    &frame.scrollback_bookmarks,
+                    rail.bookmark_lane(),
+                    ColorF::new(0.39, 0.81, 1.0, 1.0),
+                );
+                *self.bookmark_rows.borrow_mut() = Some(frame.scrollback_bookmarks.clone());
+            }
         } else {
             self.marks.borrow_mut().take();
         }
         Ok(())
     }
 
-    fn paint_failures(&self, ctx: &DrawingSession<'_>, rail: Rail, brush: &Brush, rows: &[isize]) {
+    fn paint_row_marks(
+        ctx: &DrawingSession<'_>,
+        rail: Rail,
+        brush: &Brush,
+        rows: &[isize],
+        lane: Range<f32>,
+        color: ColorF,
+    ) {
         let scale = MarkScale::new(rail);
         let pixel_top = (PADDING * rail.scale).round();
-        brush.set_color(ColorF::new(1.0, 104.0 / 255.0, 123.0 / 255.0, 1.0));
+        brush.set_color(color);
         for band in rows
             .iter()
             .filter_map(|&row| scale.band(row, scale.thickness))
         {
             ctx.fill_rect(
                 &Rect::from_xywh(
-                    rail.failure_lane().start,
+                    lane.start,
                     (pixel_top + band.start as f32) / rail.scale,
-                    FAILURE_MARK_WIDTH,
+                    lane.end - lane.start,
                     (band.end - band.start) as f32 / rail.scale,
                 ),
                 brush,
@@ -304,11 +351,21 @@ impl ScrollBar {
         }
     }
 
-    fn failed_command_at(&self, rail: Rail, x: f32, y: f32) -> Option<isize> {
-        if !rail.failure_lane().contains(&x) {
+    fn mark_at(&self, rail: Rail, x: f32, y: f32) -> Option<ScrollMark> {
+        let (rows, kind) = if rail.failure_lane().contains(&x) {
+            (
+                &self.failure_rows,
+                ScrollMark::FailedCommand as fn(isize) -> ScrollMark,
+            )
+        } else if rail.bookmark_lane().contains(&x) {
+            (
+                &self.bookmark_rows,
+                ScrollMark::Bookmark as fn(isize) -> ScrollMark,
+            )
+        } else {
             return None;
-        }
-        let rows = self.failure_rows.borrow();
+        };
+        let rows = rows.borrow();
         let scale = MarkScale::new(rail);
         let pixel = (y * rail.scale - (PADDING * rail.scale).round()).max(0.0);
         // The separate lane gives small marks a forgiving vertical target.
@@ -322,7 +379,7 @@ impl ScrollBar {
                 (distance <= 3.0_f32.max(scale.thickness as f32 / 2.0)).then_some((distance, row))
             })
             .min_by(|(a, first), (b, second)| a.total_cmp(b).then_with(|| second.cmp(first)))
-            .map(|(_, row)| row)
+            .map(|(_, row)| kind(row))
     }
 
     fn paint_marks(
@@ -366,7 +423,7 @@ impl ScrollBar {
         &self,
         pointer: PointerEventInfo,
         kind: MouseEventKind,
-        current: impl FnOnce(Option<isize>) -> Option<ScrollbackView>,
+        current: impl FnOnce(Option<ScrollMark>) -> Option<ScrollbackView>,
         mut scroll: impl FnMut(ScrollbackView, Option<isize>),
     ) -> bool {
         let x = pointer.x as f32;
@@ -376,13 +433,13 @@ impl ScrollBar {
             self.cancel();
             self.owns_press.set(hit.is_some());
             let Some(rail) = hit else { return false };
-            let failed = self.failed_command_at(rail, x, y);
+            let mark = self.mark_at(rail, x, y);
             if pointer.is_left_button_pressed
-                && current(failed).is_some_and(|view| rail.view.same_screen(&view))
+                && current(mark).is_some_and(|view| rail.view.same_screen(&view))
             {
                 let (top, height) = rail.thumb();
-                if let Some(row) = failed {
-                    scroll(rail.view, Some(row));
+                if let Some(mark) = mark {
+                    scroll(rail.view, Some(mark.row()));
                 } else if (top..top + height).contains(&y) {
                     if pointer.capture_succeeded {
                         self.drag.set(Some(Drag {
@@ -498,19 +555,54 @@ mod tests {
         *bar.failure_rows.borrow_mut() = Some(Arc::from([row]));
         let lane = rail.failure_lane();
         let x = (lane.start + lane.end) / 2.0;
-        assert_eq!(bar.failed_command_at(rail, x, y), Some(row));
-        assert_eq!(bar.failed_command_at(rail, WIDTH - 6.0, y), None);
+        assert_eq!(
+            bar.mark_at(rail, x, y),
+            Some(ScrollMark::FailedCommand(row))
+        );
+        assert_eq!(bar.mark_at(rail, WIDTH - 6.0, y), None);
         assert!(bar.pointer(
             point(x, y, true),
             MouseEventKind::Press,
             |target| {
-                assert_eq!(target, Some(row));
+                assert_eq!(target, Some(ScrollMark::FailedCommand(row)));
                 None // The output was erased after this mark was drawn.
             },
             |_, _| panic!("would scroll to a stale command")
         ));
         assert!(bar.configure(true, false, false));
-        assert_eq!(bar.failed_command_at(rail, x, y), None);
+        assert_eq!(bar.mark_at(rail, x, y), None);
+    }
+
+    #[test]
+    fn bookmark_marks_use_the_outer_lane_and_jump_to_the_drawn_row() {
+        let mut term = terminal();
+        term.advance_bytes(b"x\r\n".repeat(200));
+        let rail = rail(&term, 0);
+        let row = rail.view.oldest + 40;
+        let scale = MarkScale::new(rail);
+        let band = scale.band(row, scale.thickness).unwrap();
+        let y = PADDING + (band.start as f32 + band.end as f32) / 2.0 / rail.scale;
+        let bar = ScrollBar::default();
+        bar.configure(true, false, true);
+        bar.present(Some(rail));
+        *bar.failure_rows.borrow_mut() = Some(Arc::from([row]));
+        *bar.bookmark_rows.borrow_mut() = Some(Arc::from([row]));
+        assert_eq!(
+            bar.mark_at(rail, WIDTH - 1.0, y),
+            Some(ScrollMark::Bookmark(row))
+        );
+        assert_ne!(
+            bar.mark_at(rail, WIDTH - 11.0, y),
+            Some(ScrollMark::Bookmark(row))
+        );
+        let mut jumped = None;
+        assert!(bar.pointer(
+            point(WIDTH - 1.0, y, true),
+            MouseEventKind::Press,
+            |mark| (mark == Some(ScrollMark::Bookmark(row))).then_some(rail.view),
+            |_, row| jumped = row,
+        ));
+        assert_eq!(jumped, Some(row));
     }
 
     #[test]

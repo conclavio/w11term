@@ -34,6 +34,58 @@ fn frame(term: &Terminal, offset: usize) -> Snapshot {
 const LINES: &str = "A\r\nB\r\nC\r\nD\r\nE\r\nF";
 
 #[test]
+fn scrollback_bookmark_tracks_reflow_and_forgets_evicted_or_erased_rows() {
+    let mut term = terminal(8);
+    term.advance_bytes("abcdefghijklMNOP\r\nB\r\nC\r\nD\r\nE");
+    let old = frame(&term, 2);
+    old.bookmark_target().unwrap().toggle(&mut term, 0);
+    assert_eq!(&*frame(&term, 0).scrollback_bookmarks, &[0]);
+    let stale = old.bookmark_target().unwrap();
+    term.resize(TerminalSize { cols: 8, ..size() });
+    stale.toggle(&mut term, 0);
+    let live = frame(&term, 0);
+    assert_eq!(&*live.scrollback_bookmarks, &[0]);
+    let target = live.adjacent_bookmark(true).unwrap();
+    let marked = frame(&term, target.offset(&term, 0).unwrap());
+    assert_eq!(marked.rows[0].as_str().trim_end(), "abcdefgh");
+    marked.bookmark_target().unwrap().toggle(&mut term, 0);
+    assert!(frame(&term, 0).scrollback_bookmarks.is_empty());
+    marked.bookmark_target().unwrap().toggle(&mut term, 0);
+    term.advance_bytes("\r\nZ".repeat(16));
+    assert!(frame(&term, 0).scrollback_bookmarks.is_empty());
+    assert_eq!(target.offset(&term, 0), None);
+    frame(&term, 2)
+        .bookmark_target()
+        .unwrap()
+        .toggle(&mut term, 0);
+    assert_eq!(frame(&term, 0).scrollback_bookmarks.len(), 1);
+    term.advance_bytes("\x1b[3J");
+    assert!(frame(&term, 0).scrollback_bookmarks.is_empty());
+}
+
+#[test]
+fn scrollback_bookmark_uses_the_live_caret_column_and_refuses_stale_screen_requests() {
+    let mut term = terminal(8);
+    term.advance_bytes("abcdefghijklMN");
+    let req = frame(&term, 0).bookmark_target().unwrap();
+    req.toggle(&mut term, 1);
+    assert!(frame(&term, 0).scrollback_bookmarks.is_empty());
+    req.toggle(&mut term, 0);
+    term.advance_bytes("\r\nB\r\nC\r\nD\r\nE");
+    term.resize(TerminalSize { cols: 8, ..size() });
+    let frame_before = frame(&term, 0);
+    assert_eq!(&*frame_before.scrollback_bookmarks, &[1]);
+    let jump = frame_before.adjacent_bookmark(true).unwrap();
+    let marked = frame(&term, jump.offset(&term, 0).unwrap());
+    assert_eq!(marked.rows[0].as_str().trim_end(), "ijklMN");
+    term.advance_bytes("\x1b[?1049h");
+    assert!(frame(&term, 0).bookmark_target().is_none());
+    assert!(frame(&term, 0).scrollback_bookmarks.is_empty());
+    term.advance_bytes("\x1b[?1049l");
+    assert_eq!(&*frame(&term, 0).scrollback_bookmarks, &[1]);
+}
+
+#[test]
 fn drag_targets_keep_the_same_row_or_clamp_to_the_oldest_survivor() {
     let mut term = terminal(4);
     term.advance_bytes(LINES);
@@ -195,4 +247,43 @@ async fn worker_publishes_pointer_and_accessibility_scrolls_and_rejects_a_cleare
         true
     ));
     assert_eq!(session.frames.load().first_stable_row, current.oldest);
+}
+
+#[tokio::test]
+async fn worker_publishes_bookmark_toggles_and_jumps_in_a_read_only_pane() {
+    let session = Session::start_configured(Source::Demo, size(), false);
+    let barrier = async || {
+        let (tx, rx) = oneshot::channel();
+        session.input.send(Command::Capture(tx)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        session.frames.load()
+    };
+    session
+        .input
+        .send(Command::Paste("A\nB\nC\nD\nE\nF".into()))
+        .unwrap();
+    let view = barrier().await.scrollback_view().unwrap();
+    session.input.send(Command::SetReadOnly(true)).unwrap();
+    session
+        .input
+        .send(view.scroll_to(Some(view.oldest)))
+        .unwrap();
+    let mark = barrier().await.bookmark_target().unwrap();
+    session
+        .input
+        .send(Command::ToggleScrollbackBookmark(mark))
+        .unwrap();
+    assert_eq!(&*barrier().await.scrollback_bookmarks, &[view.oldest]);
+    session.input.send(view.scroll_to(None)).unwrap();
+    let jump = barrier().await.adjacent_bookmark(true).unwrap();
+    session.input.send(Command::ScrollViewport(jump)).unwrap();
+    assert_eq!(barrier().await.first_stable_row, view.oldest);
+    session
+        .input
+        .send(Command::ToggleScrollbackBookmark(mark))
+        .unwrap();
+    assert!(barrier().await.scrollback_bookmarks.is_empty());
 }

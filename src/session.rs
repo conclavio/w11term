@@ -132,6 +132,7 @@ pub enum Command {
         reply: tokio::sync::oneshot::Sender<Result<(), &'static str>>,
     },
     ScrollViewport(crate::terminal::ScrollbackTarget),
+    ToggleScrollbackBookmark(crate::terminal::BookmarkTarget),
     ScrollRange(RangeScrollRequest),
     CopyWord {
         screen: crate::copy_mode::ScreenId,
@@ -1446,6 +1447,10 @@ async fn run(
                         if let Some(offset) = target.offset(&terminal, connection_generation) {
                             scroll_offset = offset;
                         }
+                        Ok(())
+                    }
+                    Some(Command::ToggleScrollbackBookmark(target)) => {
+                        presentation.dirty |= target.toggle(&mut terminal, connection_generation);
                         Ok(())
                     }
                     Some(Command::ScrollTo(top)) => {

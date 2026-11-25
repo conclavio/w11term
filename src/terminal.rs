@@ -19,7 +19,7 @@ mod kitty;
 mod retained_rows;
 pub use retained_rows::RetainedRows;
 mod scrollback_view;
-pub use scrollback_view::{CommandContext, ScrollbackTarget, ScrollbackView};
+pub use scrollback_view::{BookmarkTarget, CommandContext, ScrollbackTarget, ScrollbackView};
 #[cfg(test)]
 mod program_status_tests;
 #[cfg(test)]
@@ -688,6 +688,7 @@ pub struct Snapshot {
     application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
     pub failed_command_rows: Arc<[isize]>,
+    pub scrollback_bookmarks: Arc<[isize]>,
     pub command_context: Option<CommandContext>,
     pub reported_directory: Option<Arc<str>>,
     pub status: String,
@@ -952,6 +953,7 @@ impl Snapshot {
             }),
             command_history: terminal.command_history().clone(),
             failed_command_rows: scrollback_view::failed_command_rows(terminal, previous),
+            scrollback_bookmarks: scrollback_view::bookmark_rows(screen, previous),
             command_context: scrollback_view::command_context(
                 terminal,
                 first_stable_row,
@@ -1055,6 +1057,7 @@ impl Snapshot {
             && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.failed_command_rows == old.failed_command_rows
+            && self.scrollback_bookmarks == old.scrollback_bookmarks
             && self.command_context == old.command_context
             && self.reported_directory == old.reported_directory
             && self.status == old.status

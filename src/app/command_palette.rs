@@ -61,6 +61,8 @@ pub enum CommandId {
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
     ScrollFailedCommand(Option<clipboard_paste::Origin>, bool),
+    ToggleScrollbackBookmark(Option<clipboard_paste::Origin>),
+    ScrollToBookmark(Option<clipboard_paste::Origin>, bool),
     SelectAll(Option<clipboard_paste::Origin>),
     PaneFind(Option<clipboard_paste::Origin>, Shortcut),
     CopySelection(Option<clipboard_paste::Origin>),
@@ -424,6 +426,24 @@ impl TerminalApp {
             enabled: pane.is_some() && self.export.pending.is_none(),
         });
         let frame = live.map(|tab| tab.session.frames.load());
+        rows.push(Row {
+            id: CommandId::ToggleScrollbackBookmark(origin),
+            label: "Toggle scrollback bookmark".into(),
+            chord: String::new(),
+            enabled: frame
+                .as_ref()
+                .is_some_and(|frame| frame.bookmark_target().is_some()),
+        });
+        for (older, label) in [(true, "Previous bookmark"), (false, "Next bookmark")] {
+            rows.push(Row {
+                id: CommandId::ScrollToBookmark(origin, older),
+                label: label.into(),
+                chord: String::new(),
+                enabled: frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.adjacent_bookmark(older).is_some()),
+            });
+        }
         for (older, label) in [
             (true, "Previous failed command"),
             (false, "Next failed command"),
@@ -777,6 +797,10 @@ impl TerminalApp {
             CommandId::ScrollFailedCommand(origin, older) => {
                 Message::ScrollFailedCommand(origin, older)
             }
+            CommandId::ToggleScrollbackBookmark(origin) => {
+                Message::ToggleScrollbackBookmark(origin)
+            }
+            CommandId::ScrollToBookmark(origin, older) => Message::ScrollToBookmark(origin, older),
             CommandId::SelectAll(origin) => Message::SelectAll(origin),
             CommandId::PaneFind(origin, shortcut) => Message::PaneFind(origin, shortcut),
             CommandId::CopySelection(origin) => Message::CopySelection(origin),
