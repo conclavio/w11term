@@ -91,6 +91,30 @@ pub(super) struct Browser {
 }
 
 impl Browser {
+    fn page_rows(&self) -> &[Row] {
+        let start = self.page * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(self.matches.len());
+        &self.matches[start..end]
+    }
+
+    pub(super) fn verification_paths(
+        &self,
+        report: &FolderComparison,
+        viewport_revision: u64,
+    ) -> Vec<String> {
+        if self.viewport_revision != viewport_revision {
+            return Vec::new();
+        }
+        self.page_rows()
+            .iter()
+            .filter_map(|row| {
+                row.get(report)
+                    .filter(RowDetails::can_verify)
+                    .map(|row| row.path.to_owned())
+            })
+            .collect()
+    }
+
     pub(super) fn update(&mut self, report: &FolderComparison, action: Action) {
         match action {
             Action::Query(query) if self.query != query => {
@@ -272,11 +296,36 @@ impl Browser {
             _ if end == start + 1 => format!("Showing {end} of {total} {plural}"),
             _ => format!("Showing {}–{end} of {total} {plural}", start + 1),
         };
+        let viewport_revision = self.viewport_revision;
+        let can_verify_page = self
+            .page_rows()
+            .iter()
+            .any(|row| row.get(report).is_some_and(|row| row.can_verify()));
         rows.push(KeyedView::new(
             "range",
-            TextBlock::new()
-                .automation_id("sftp-comparison-page")
-                .text(status),
+            Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Auto])
+                .column_spacing(8.0)
+                .children((
+                    TextBlock::new()
+                        .automation_id("sftp-comparison-page")
+                        .text(status)
+                        .text_wrapping(TextWrapping::Wrap),
+                    if can_verify_page {
+                        Button::new()
+                            .grid_column(1)
+                            .is_enabled(reveal_enabled)
+                            .on_click(context.callback(move |_| {
+                                message(super::Action::Verify(super::verify::Action::Page {
+                                    revision,
+                                    viewport_revision,
+                                }))
+                            }))
+                            .content("Verify files on this page…")
+                    } else {
+                        View::empty()
+                    },
+                )),
         ));
         rows.push(KeyedView::new(
             format!("differences-{}", self.viewport_revision),
@@ -285,7 +334,7 @@ impl Browser {
                 .max_height(154.0)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .content(StackPanel::new().spacing(6.0).keyed_children(
-                    self.matches[start..end].iter().filter_map(|&row| {
+                    self.page_rows().iter().filter_map(|&row| {
                         let item = row.get(report)?;
                         let reveal = item.current.map(|_| {
                             Button::new()
@@ -533,7 +582,19 @@ mod tests {
         browser.update(&report, Action::Next);
         assert_eq!(browser.matches.len(), 45);
         assert_eq!(browser.page, 1);
+        let viewport = browser.viewport_revision;
+        assert_eq!(
+            browser.verification_paths(&report, viewport),
+            [
+                "docs/40.txt",
+                "docs/41.txt",
+                "docs/42.txt",
+                "docs/43.txt",
+                "docs/44.txt"
+            ],
+        );
         browser.update(&report, Action::Query("DOCS/44".into()));
+        assert!(browser.verification_paths(&report, viewport).is_empty());
         assert_eq!(browser.matches, [Row::MatchingFile(44)]);
         assert_eq!(browser.page, 0);
         let row = browser.matches[0].get(&report).unwrap();
