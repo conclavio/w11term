@@ -91,6 +91,7 @@ pub enum FileAction {
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
     EditName(u64, u64, u64, String),
+    ResumeDownload(u64, u64, u64, bool),
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
     Replace(u64, u64, bool),
@@ -198,7 +199,13 @@ pub struct ListedEntry {
 pub enum TransferPicker {
     UploadFiles(String),
     UploadFolder(String),
-    Download(ListedEntry, Option<String>),
+    Download(ListedEntry, Option<DownloadVerification>),
+}
+
+#[derive(Clone)]
+pub struct DownloadVerification {
+    sha256: String,
+    resume: bool,
 }
 
 impl TransferPicker {
@@ -246,6 +253,7 @@ struct EntryDialog {
     serial: u64,
     parent: Option<String>,
     name: String,
+    resume_download: bool,
     action: EditAction,
 }
 
@@ -352,7 +360,10 @@ enum TransferFile {
     UploadFolder {
         remote: String,
     },
-    Download(String),
+    Download {
+        remote: String,
+        resume: bool,
+    },
     DownloadFolder {
         remote: String,
         local: PathBuf,
@@ -384,9 +395,14 @@ impl TransferFile {
                     )
                 }
             }
-            (Self::Download(name), true) => {
+            (Self::Download { remote, .. }, true) if reply["partial_file"].is_string() => {
                 format!(
-                    "Cancelled download of {name} ({bytes} bytes written to the temporary file)."
+                    "Cancelled download of {remote}. {bytes} bytes kept. Use the same destination and SHA-256 to resume."
+                )
+            }
+            (Self::Download { remote, .. }, true) => {
+                format!(
+                    "Cancelled download of {remote} ({bytes} bytes written to the temporary file)."
                 )
             }
             (Self::DownloadFolder { remote, .. }, true) => format!(
@@ -414,10 +430,18 @@ impl TransferFile {
                 reply["skipped"],
             ),
             (Self::Upload { name, .. }, false) => format!("Uploaded {name} ({bytes} bytes)"),
-            (Self::Download(name), false) if reply["sha256"].is_string() => {
-                format!("Downloaded {name} ({bytes} bytes). SHA-256 verified.")
+            (Self::Download { remote, .. }, false) if reply["sha256"].is_string() => {
+                if let Some(offset) = reply["resumed_from"].as_u64().filter(|offset| *offset > 0) {
+                    format!(
+                        "Downloaded {remote} ({bytes} bytes). SHA-256 verified. Resumed at byte {offset}."
+                    )
+                } else {
+                    format!("Downloaded {remote} ({bytes} bytes). SHA-256 verified.")
+                }
             }
-            (Self::Download(name), false) => format!("Downloaded {name} ({bytes} bytes)"),
+            (Self::Download { remote, .. }, false) => {
+                format!("Downloaded {remote} ({bytes} bytes)")
+            }
             (Self::DownloadFolder { remote, local }, false) => format!(
                 "Downloaded {remote} to {} ({} files, {bytes} bytes, {} links or special files skipped).",
                 local.display(),
@@ -442,7 +466,16 @@ impl TransferFile {
             Self::UploadFolder { remote } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote folder may be incomplete."
             ),
-            Self::Download(remote) => format!(
+            Self::Download {
+                remote,
+                resume: true,
+            } => format!(
+                "Download of {remote} interrupted. Check the destination, then use the same path and SHA-256 to resume."
+            ),
+            Self::Download {
+                remote,
+                resume: false,
+            } => format!(
                 "Download of {remote} was interrupted with at least {bytes} bytes written to the temporary file. The outcome is unknown. Check the local destination."
             ),
             Self::DownloadFolder { remote, local } => format!(
@@ -819,7 +852,7 @@ impl FileDrawer {
         &self,
         entry: &ListedEntry,
         destination: PathBuf,
-        expected_sha256: Option<String>,
+        verification: Option<DownloadVerification>,
     ) -> Result<(Operation, TransferFile)> {
         let remote = self.selected_path(entry)?;
         ensure!(
@@ -827,7 +860,7 @@ impl FileDrawer {
             "Choose an absolute download destination"
         );
         if entry.kind == ListedKind::Known(EntryKind::Directory) {
-            ensure!(expected_sha256.is_none(), "Choose a file to verify");
+            ensure!(verification.is_none(), "Choose a file to verify");
             validate_download_name(&entry.name)?;
             let local = destination.join(&entry.name);
             Ok((
@@ -838,15 +871,17 @@ impl FileDrawer {
                 TransferFile::DownloadFolder { remote, local },
             ))
         } else {
+            let resume = verification.as_ref().is_some_and(|options| options.resume);
             Ok((
                 Operation::Get {
                     local: destination,
                     remote: remote.clone(),
                     overwrite: self.replace,
                     max_bytes: None,
-                    expected_sha256,
+                    expected_sha256: verification.map(|options| options.sha256),
+                    resume,
                 },
-                TransferFile::Download(remote),
+                TransferFile::Download { remote, resume },
             ))
         }
     }
@@ -1011,6 +1046,7 @@ impl FileDrawer {
                     .original()
                     .map_or_else(String::new, |entry| entry.name.clone()),
             },
+            resume_download: false,
             action,
         });
     }
@@ -1118,6 +1154,18 @@ impl FileDrawer {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             );
+            fields.push(KeyedView::new(
+                "resume-download",
+                CheckBox::new()
+                    .automation_name("Resume interrupted download")
+                    .is_checked(dialog.resume_download)
+                    .on_is_checked_changed(context.callback(move |checked| {
+                        Message::Files(FileAction::ResumeDownload(
+                            pane, generation, serial, checked,
+                        ))
+                    }))
+                    .content(TextBlock::new().text("Resume interrupted download")),
+            ));
         }
         if !dialog.name.is_empty()
             && let Err(error) = &valid
@@ -2321,6 +2369,7 @@ impl TerminalApp {
             | Delete(id, ..)
             | NewFolder(id, ..)
             | EditName(id, ..)
+            | ResumeDownload(id, ..)
             | FinishEdit(id, ..)
             | Page(id, ..)
             | Replace(id, ..)
@@ -2377,7 +2426,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2562,12 +2611,12 @@ impl TerminalApp {
                                 context,
                             )?;
                         }
-                        TransferPicker::Download(entry, expected_sha256) => {
+                        TransferPicker::Download(entry, verification) => {
                             let [local] = paths
                                 .try_into()
                                 .map_err(|_| anyhow!("Choose one download destination"))?;
                             let (operation, transfer) =
-                                files.download_operation(&entry, local, expected_sha256)?;
+                                files.download_operation(&entry, local, verification)?;
                             files.status = format!("Downloading {}…", entry.name);
                             files.job(
                                 pane,
@@ -2586,6 +2635,13 @@ impl TerminalApp {
                         dialog.name = name;
                     }
                 }
+                ResumeDownload(_, _, serial, checked) => {
+                    if let Some(dialog) = files.dialog.as_mut().filter(|e| {
+                        e.serial == serial && matches!(e.action, EditAction::VerifyDownload(_))
+                    }) {
+                        dialog.resume_download = checked;
+                    }
+                }
                 FinishEdit(_, _, serial, result) => {
                     if !may_open_dialog {
                         files.cancel_entry_dialog();
@@ -2596,6 +2652,7 @@ impl TerminalApp {
                             parent,
                             name,
                             action,
+                            resume_download,
                             ..
                         },
                         path,
@@ -2624,7 +2681,13 @@ impl TerminalApp {
                                     pane,
                                     files.generation,
                                     files.listing_revision,
-                                    TransferPicker::Download(entry, Some(path)),
+                                    TransferPicker::Download(
+                                        entry,
+                                        Some(DownloadVerification {
+                                            sha256: path,
+                                            resume: resume_download,
+                                        }),
+                                    ),
                                 )));
                                 return Ok(());
                             }
@@ -4056,7 +4119,10 @@ mod tests {
             remote: "/srv/uploads/large.bin".into(),
             atomic: false,
         };
-        let download = TransferFile::Download("/large.bin".into());
+        let download = TransferFile::Download {
+            remote: "/large.bin".into(),
+            resume: false,
+        };
         let complete = json!({"bytes_transferred": 128});
         let cancelled = json!({"cancelled": true, "remote": "/srv/uploads/large.bin", "bytes_transferred": 64, "remote_may_be_partial": true});
         let unopened = json!({"cancelled": true, "remote": "/srv/uploads/large.bin", "bytes_transferred": 0, "remote_may_be_partial": false});

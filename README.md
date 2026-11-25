@@ -401,6 +401,8 @@ Before replacing a file, w11term compares its contents to the version you opened
 
 Choose **Download and verify…** on a file and paste its expected SHA-256 digest from a source you trust. w11term checks the downloaded bytes before saving to the chosen destination. If the digest differs, the temporary download is discarded and any existing destination is kept, even with **Replace existing files** enabled.
 
+Enable **Resume interrupted download** to keep a partial file beside the destination after a disconnect, cancellation, or restart. Repeat the download with the same destination and digest to continue. w11term checks the SHA-256 of the entire file before publishing it. To abandon an interrupted download, delete its `.w11term-download-*.part` file after the transfer stops.
+
 Choose **Download folder…** on a remote directory and select a Windows folder
 to receive it. For example, choosing `Downloads` for `/tmp/diagnostics`
 creates `Downloads\diagnostics`. The transfer preserves regular files, dotfiles

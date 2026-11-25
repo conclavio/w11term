@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::sync::oneshot;
 use w11term::sftp::{CHUNK, Job, Operation, TransferCancel};
@@ -29,7 +30,124 @@ fn download(local: &Path) -> Operation {
         overwrite: true,
         max_bytes: None,
         expected_sha256: None,
+        resume: false,
     }
+}
+
+fn verified_resume(local: &Path, digest: String) -> Operation {
+    Operation::Get {
+        local: local.into(),
+        remote: "/source".into(),
+        overwrite: true,
+        max_bytes: None,
+        expected_sha256: Some(digest),
+        resume: true,
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumable_download_uses_the_checkpoint_after_a_new_ssh_connection() {
+    let (source, remote, _, server) = fixture_connections(false, 2).await;
+    let log = remote.path().join("transfer-trace");
+    let disconnect = remote.path().join("disconnect-tree-read");
+    fs::write(&log, []).unwrap();
+    fs::write(&disconnect, []).unwrap();
+    let data: Vec<u8> = (0..CHUNK * 3 + 11)
+        .map(|index| (index % 241) as u8)
+        .collect();
+    fs::write(remote.path().join("source"), &data).unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let local = parent.path().join("saved.bin");
+    fs::write(&local, b"existing").unwrap();
+    let digest = sha256(&data);
+
+    let pane = Session::start(source.clone());
+    let connected = |pane: &Session| pane.frames.load().connection_generation > 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !connected(&pane) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let error = guarded_job(&pane, None, verified_resume(&local, digest.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.contains("Resumable download interrupted"), "{error}");
+    assert_eq!(fs::read(&local).unwrap(), b"existing");
+    assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 2);
+    drop(pane);
+    fs::remove_file(disconnect).unwrap();
+    fs::write(&log, []).unwrap();
+
+    let pane = Session::start(source);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !connected(&pane) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let result = guarded_job(&pane, None, verified_resume(&local, digest.clone()))
+        .await
+        .unwrap();
+    assert_eq!(result["sha256"], digest);
+    assert_eq!(result["resumed_from"], CHUNK);
+    assert_eq!(result["bytes_transferred"], data.len());
+    assert_eq!(fs::read(&local).unwrap(), data);
+    assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
+    let log = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        log.lines().find(|line| line.starts_with("READ ")),
+        Some(format!("READ {CHUNK}").as_str())
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumable_download_verifies_a_retained_prefix_and_discards_a_mismatch() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let log = remote.path().join("transfer-trace");
+    let hold = remote.path().join("hold-transfer-read");
+    fs::write(&log, []).unwrap();
+    fs::write(&hold, []).unwrap();
+    let data = vec![54; CHUNK * 2 + 1];
+    fs::write(remote.path().join("source"), &data).unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let local = parent.path().join("saved.bin");
+    fs::write(&local, b"existing").unwrap();
+    let digest = sha256(&data);
+    let cancel = TransferCancel::default();
+    let first = start(&pane, verified_resume(&local, digest.clone()), &cancel);
+    wait_for_packet(&log, &format!("READ {CHUNK}")).await;
+    cancel.cancel();
+    fs::remove_file(hold).unwrap();
+    let result = first.await.unwrap().unwrap();
+    assert_eq!(result["cancelled"], true);
+    assert_eq!(result["bytes_transferred"], CHUNK);
+    let partial = PathBuf::from(result["partial_file"].as_str().unwrap());
+    assert_eq!(fs::read(&partial).unwrap(), &data[..CHUNK]);
+    fs::write(&partial, vec![0; CHUNK]).unwrap();
+
+    let error = guarded_job(&pane, None, verified_resume(&local, digest.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.contains("SHA-256 mismatch"), "{error}");
+    assert_eq!(fs::read(&local).unwrap(), b"existing");
+    assert!(!partial.exists());
+    let result = guarded_job(&pane, None, verified_resume(&local, digest))
+        .await
+        .unwrap();
+    assert_eq!(result["resumed_from"], 0);
+    assert_eq!(fs::read(&local).unwrap(), data);
+    server.abort();
 }
 
 fn upload(local: &Path) -> Operation {

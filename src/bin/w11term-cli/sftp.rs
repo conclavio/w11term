@@ -8,7 +8,7 @@ use w11term::{
 
 pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
-  get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX]\n\
+  get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX [--resume]]\n\
   put LOCAL REMOTE [--overwrite] [--atomic]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
@@ -39,6 +39,7 @@ pub fn parse(
     let mut opts = BTreeMap::new();
     let mut overwrite = false;
     let mut atomic = false;
+    let mut resume = false;
     let mut spec_order = false;
     while let Some(arg) = args.next() {
         let value = |args: &mut std::iter::Peekable<_>| {
@@ -55,6 +56,10 @@ pub fn parse(
             "--atomic" => {
                 ensure!(!atomic, "duplicate --atomic");
                 atomic = true;
+            }
+            "--resume" => {
+                ensure!(!resume, "duplicate --resume");
+                resume = true;
             }
             "--spec-order" => {
                 ensure!(!spec_order, "duplicate --spec-order");
@@ -77,6 +82,10 @@ pub fn parse(
     }
     let command = command.context(HELP)?;
     ensure!(!atomic || command == "put", "--atomic requires put");
+    ensure!(
+        !resume || (command == "get" && opts.contains_key("--sha256")),
+        "--resume requires get with --sha256"
+    );
     let timeout = opts
         .remove("--timeout")
         .map(|s| s.parse::<u64>())
@@ -117,6 +126,7 @@ pub fn parse(
                 && let Some(sha256) = opts.remove("--sha256")
             {
                 fields.insert("expected_sha256".into(), json!(normalize_sha256(&sha256)?));
+                fields.insert("resume".into(), json!(resume));
             }
         }
         "rename" | "hardlink" => {
@@ -317,18 +327,23 @@ mod tests {
             Request::Sftp {
                 operation:
                     Operation::Get {
-                        expected_sha256, ..
+                        expected_sha256,
+                        resume,
+                        ..
                     },
                 ..
             },
         ) = p(&[
-            "get", "--pane", "2", "/remote", "local", "--sha256", &digest,
+            "get", "--pane", "2", "/remote", "local", "--sha256", &digest, "--resume",
         ])
         .unwrap()
         else {
             panic!("expected a single file download")
         };
         assert_eq!(expected_sha256, Some(digest.to_ascii_lowercase()));
+        assert!(resume);
+        assert!(p(&["get", "--pane", "2", "/remote", "local", "--resume"]).is_err());
+        assert!(p(&["put", "--pane", "2", "local", "/remote", "--resume"]).is_err());
         assert!(p(&["get", "--pane", "2", "/remote", "local", "--sha256", "abcd"]).is_err());
         assert!(
             p(&[

@@ -55,6 +55,7 @@ impl Engine {
             self.read_contents(
                 &handle,
                 &mut bytes,
+                0,
                 Some((
                     TEXT_PREVIEW_MAX_BYTES as u64,
                     "the 256 KiB text preview limit",

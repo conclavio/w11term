@@ -1684,6 +1684,7 @@ async fn verified_download_checks_every_chunk_before_replacing_the_destination()
                     overwrite: true,
                     max_bytes: Some(data.len() as u64),
                     expected_sha256: Some(expected_sha256),
+                    resume: false,
                 },
                 expected_generation: None,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(10),
@@ -1759,6 +1760,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         overwrite: true,
         max_bytes: None,
         expected_sha256: None,
+        resume: false,
     };
     let hold = remote.path().join("hold-next-chunk");
     fs::write(&hold, []).unwrap();

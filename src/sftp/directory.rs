@@ -296,6 +296,7 @@ impl Download<'_> {
                 .read_contents(
                     &h,
                     &mut file,
+                    0,
                     expected.map(|n| (n, "reported file size")),
                     self.cancel,
                     |n, _| {
