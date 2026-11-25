@@ -6,7 +6,9 @@ Terminal emulation is provided by **[wezterm-term](https://github.com/wezterm/we
 
 ## Run
 
-GitHub Releases provides a Windows x64 ZIP containing the GUI, `w11term-cli.exe` and the Windows App Runtime. Extract the entire ZIP into one folder and launch `w11term.exe`. Each release includes a SHA-256 checksum. [Download a release](https://github.com/conclavio/w11term/releases)
+[Download the latest Windows x64 ZIP](https://github.com/conclavio/w11term/releases/latest/download/w11term-windows-x64.zip)
+
+The ZIP contains the GUI, `w11term-cli.exe` and the Windows App Runtime. Extract the entire ZIP into one folder and launch `w11term.exe`. The latest release page includes the SHA-256 checksum. [Latest release](https://github.com/conclavio/w11term/releases/latest) · [Previous builds](https://github.com/conclavio/w11term/releases)
 
 Building from source requires Windows and the Rust MSVC toolchain with Visual Studio C++ Build Tools. The first build downloads Rust dependencies, a pinned WezTerm source revision, and Microsoft's runtime packages. The build stages the WinUI runtime beside the executable.
 
