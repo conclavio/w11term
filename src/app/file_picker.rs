@@ -20,6 +20,7 @@ pub(super) enum Purpose {
     UploadFiles,
     UploadFolder,
     CompareLocalFile,
+    CompareLocalFolder,
     SshConfig(PathBuf),
     OpenSshHostList,
     OpenSshGroupDefinition,
@@ -176,6 +177,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             Purpose::UploadFiles
                 | Purpose::UploadFolder
                 | Purpose::CompareLocalFile
+                | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
                 | Purpose::OpenSshHostList
@@ -275,10 +277,14 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 }
                 None
             }
-            Purpose::Folder | Purpose::DownloadFolder | Purpose::UploadFolder => {
+            Purpose::Folder
+            | Purpose::DownloadFolder
+            | Purpose::UploadFolder
+            | Purpose::CompareLocalFolder => {
                 dialog.SetTitle(match purpose {
                     Purpose::DownloadFolder => w!("Choose a download destination folder"),
                     Purpose::UploadFolder => w!("Choose a folder to upload"),
+                    Purpose::CompareLocalFolder => w!("Choose a Windows folder for comparison"),
                     _ => w!("Choose a folder to share"),
                 })?;
                 options |= FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;

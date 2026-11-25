@@ -3652,6 +3652,54 @@ async fn native_sftp_compares_two_folders_against_captured_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "compares a Windows folder selected in the native picker with a live SFTP inventory"]
+async fn native_sftp_compares_a_windows_folder_with_the_remote_listing() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let remote_folder = root.join("shell directory");
+    fs::create_dir_all(remote_folder.join("nested")).unwrap();
+    fs::write(remote_folder.join("nested/config.txt"), b"current!").unwrap();
+    fs::write(remote_folder.join("case.txt"), []).unwrap();
+    fs::write(remote_folder.join("remote-only.txt"), []).unwrap();
+    directory_junction(&remote_folder, "jump", "nested");
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let listing = root.join("listing-trace");
+    fs::write(&listing, []).unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let local = picker.join("Windows reference 雪");
+    let outside = picker.join("outside");
+    fs::create_dir_all(local.join("nested")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(local.join("nested/config.txt"), b"old").unwrap();
+    fs::write(local.join("CASE.txt"), []).unwrap();
+    fs::write(local.join("local-only.txt"), []).unwrap();
+    fs::write(outside.join("outside-only.txt"), b"outside the selection").unwrap();
+    directory_junction(&local, "jump", outside.to_str().unwrap());
+    drive_mixed_gui("sftp-compare-windows-folder-ui.ps1", &ssh, state.path());
+    assert!(
+        fs::read(trace).unwrap().is_empty(),
+        "comparison opened remote files"
+    );
+    assert!(
+        !fs::read_to_string(listing)
+            .unwrap()
+            .contains("OPENDIR /shell directory/jump"),
+        "comparison traversed the remote link"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "the terminal and its existing SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measures folder contents and retains a stopped scan in the native SFTP drawer"]
 async fn native_sftp_folder_contents_reports_and_stops_a_recursive_scan() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

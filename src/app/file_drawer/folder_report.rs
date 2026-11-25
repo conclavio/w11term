@@ -1,6 +1,6 @@
 use super::*;
 use russh_sftp::extensions::Statvfs;
-use w11term::sftp::{FolderComparison, FolderContents};
+use w11term::sftp::{FolderComparison, FolderContents, FolderOrigin, capture_local_folder};
 
 mod comparison;
 
@@ -19,6 +19,7 @@ pub enum Kind {
     Space,
     Contents,
     Reference,
+    LocalReference,
     Comparison,
 }
 
@@ -39,6 +40,7 @@ impl Kind {
                 path,
                 reference: Some(reference?.clone()),
             },
+            Self::LocalReference => return None,
         })
     }
 
@@ -53,7 +55,7 @@ impl Kind {
                     .context("Invalid folder size")?;
                 Ok(Report::Contents(counts, bytes))
             }
-            Self::Reference => {
+            Self::Reference | Self::LocalReference => {
                 let inventory: FolderInventory = serde_json::from_value(reply)?;
                 let count = inventory.entries.len();
                 *reference = Some(Arc::new(inventory));
@@ -63,6 +65,15 @@ impl Kind {
                 .map(Report::Comparison)
                 .map_err(Into::into),
         }
+    }
+}
+
+pub(super) fn reference_label(origin: FolderOrigin, report: bool) -> &'static str {
+    match (origin, report) {
+        (FolderOrigin::Remote, false) => "Folder reference",
+        (FolderOrigin::Remote, true) => "Reference folder",
+        (FolderOrigin::Windows, false) => "Windows folder reference",
+        (FolderOrigin::Windows, true) => "Windows reference folder",
     }
 }
 
@@ -144,16 +155,25 @@ impl Panel {
     ) -> View {
         let serial = self.serial;
         let (title, refresh, close) = match self.kind {
-            Kind::Space => ("Filesystem space", "Refresh space", "Close space report"),
-            Kind::Contents => ("Folder contents", "Measure again", "Close contents report"),
+            Kind::Space => (
+                "Filesystem space",
+                Some("Refresh space"),
+                "Close space report",
+            ),
+            Kind::Contents => (
+                "Folder contents",
+                Some("Measure again"),
+                "Close contents report",
+            ),
             Kind::Reference => (
                 "Folder reference",
-                "Capture again",
+                Some("Capture again"),
                 "Close folder reference",
             ),
+            Kind::LocalReference => ("Windows folder reference", None, "Close folder reference"),
             Kind::Comparison => (
                 "Folder comparison",
-                "Compare again",
+                Some("Compare again"),
                 "Close folder comparison",
             ),
         };
@@ -166,7 +186,7 @@ impl Panel {
                 .automation_id(match self.kind {
                     Kind::Space => "sftp-space-folder",
                     Kind::Contents => "sftp-contents-folder",
-                    Kind::Reference => "sftp-reference-folder",
+                    Kind::Reference | Kind::LocalReference => "sftp-reference-folder",
                     Kind::Comparison => "sftp-comparison-folder",
                 })
                 .text(&self.directory)
@@ -179,6 +199,7 @@ impl Panel {
                     _ if self.cancel.is_cancelled() => "Stopping folder scan…",
                     Kind::Contents => "Scanning folder contents…",
                     Kind::Reference => "Capturing folder reference…",
+                    Kind::LocalReference => "Capturing Windows folder reference…",
                     Kind::Comparison => "Scanning folder for comparison…",
                 };
                 rows.push(KeyedView::new("loading", TextBlock::new().text(loading)));
@@ -209,7 +230,7 @@ impl Panel {
                 let (id, prefix) = match self.kind {
                     Kind::Space => ("sftp-space-error", "Could not read filesystem space"),
                     Kind::Contents => ("sftp-contents-error", "Could not measure folder contents"),
-                    Kind::Reference => (
+                    Kind::Reference | Kind::LocalReference => (
                         "sftp-reference-error",
                         "Could not capture a folder reference",
                     ),
@@ -267,14 +288,16 @@ impl Panel {
                 rows.extend(self.comparison.rows(comparison, context, message));
             }
         }
-        rows.push(KeyedView::new(
-            "refresh",
-            Button::new()
-                .automation_name(refresh)
-                .is_enabled(!matches!(self.state, State::Loading))
-                .on_click(context.callback(move |_| message(Action::Refresh)))
-                .content(refresh),
-        ));
+        if let Some(refresh) = refresh {
+            rows.push(KeyedView::new(
+                "refresh",
+                Button::new()
+                    .automation_name(refresh)
+                    .is_enabled(!matches!(self.state, State::Loading))
+                    .on_click(context.callback(move |_| message(Action::Refresh)))
+                    .content(refresh),
+            ));
+        }
         ContentDialog::new()
             .title(title)
             .close_button_text(close)
@@ -374,29 +397,91 @@ impl FileDrawer {
         revision: u64,
         kind: Kind,
     ) -> Option<(u64, Operation)> {
-        if !self.open
-            || self.busy()
-            || self.generation == 0
-            || revision != self.listing_revision
-            || self.search.is_some()
-            || self.bookmarks.is_some()
-        {
+        if !self.can_report_folder(revision) {
             return None;
         }
         let directory = self.directory.clone()?;
         let operation = kind.operation(directory.clone(), self.folder_reference.as_ref())?;
+        let serial = self.begin_folder_report(kind, directory);
+        Some((serial, operation))
+    }
+
+    pub(super) fn can_report_folder(&self, revision: u64) -> bool {
+        self.open
+            && !self.busy()
+            && self.generation != 0
+            && revision == self.listing_revision
+            && self.directory.is_some()
+            && self.search.is_none()
+            && self.bookmarks.is_none()
+    }
+
+    fn begin_folder_report(&mut self, kind: Kind, directory: String) -> u64 {
         self.end_filter_edit();
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         let serial = self.dialog_serial;
         self.folder_report = Some(Panel {
             serial,
-            directory: directory.clone(),
+            directory,
             kind,
             state: State::Loading,
             comparison: comparison::Browser::default(),
             cancel: TransferCancel::default(),
         });
-        Some((serial, operation))
+        serial
+    }
+
+    pub(super) fn start_local_folder_reference(
+        &mut self,
+        pane: u64,
+        revision: u64,
+        path: PathBuf,
+        context: &ComponentContext<TerminalApp>,
+    ) {
+        if !self.can_report_folder(revision) {
+            return;
+        }
+        let serial = self.begin_folder_report(Kind::LocalReference, path.display().to_string());
+        let cancel = self.folder_report.as_ref().unwrap().cancel.clone();
+        let generation = self.generation;
+        let message = move |result| {
+            Message::Files(FileAction::LocalFolderCaptured(
+                pane, generation, serial, result,
+            ))
+        };
+        context.spawn_background_with_rejection(
+            move |_| {
+                message(
+                    capture_local_folder(&path, &cancel)
+                        .map(Arc::new)
+                        .map_err(|error| format!("{error:#}")),
+                )
+            },
+            message(Err("Folder capture worker unavailable. Try again.".into())),
+        );
+    }
+
+    pub(super) fn finish_local_folder_reference(
+        &mut self,
+        serial: u64,
+        result: Result<Arc<FolderInventory>, String>,
+    ) {
+        if let Some(panel) = self.folder_report.as_mut().filter(|panel| {
+            panel.serial == serial
+                && panel.kind == Kind::LocalReference
+                && matches!(panel.state, State::Loading)
+        }) {
+            let result = if panel.cancel.is_cancelled() {
+                Err("Windows folder capture stopped".into())
+            } else {
+                result.map(|inventory| {
+                    let count = inventory.entries.len();
+                    self.folder_reference = Some(inventory);
+                    Report::Saved(count)
+                })
+            };
+            panel.state = State::Loaded(result);
+        }
     }
 
     pub(super) fn refresh_folder_report(&mut self, serial: u64) -> Option<Operation> {
@@ -593,5 +678,48 @@ mod tests {
         drawer.close_folder_report(serial);
         drawer.observe_connection(8);
         assert!(drawer.folder_reference.is_none());
+    }
+
+    #[test]
+    fn stopping_or_closing_a_windows_capture_preserves_the_previous_reference() {
+        let original = Arc::new(FolderInventory {
+            root: "/previous".into(),
+            origin: FolderOrigin::Remote,
+            entries: Default::default(),
+        });
+        let replacement = Arc::new(FolderInventory {
+            root: r"C:\local".into(),
+            origin: FolderOrigin::Windows,
+            entries: Default::default(),
+        });
+        let mut drawer = FileDrawer {
+            folder_reference: Some(original.clone()),
+            ..Default::default()
+        };
+        let serial = drawer.begin_folder_report(Kind::LocalReference, replacement.root.clone());
+        drawer.stop_folder_report(serial);
+        drawer.finish_local_folder_reference(serial, Ok(replacement.clone()));
+        assert!(Arc::ptr_eq(
+            drawer.folder_reference.as_ref().unwrap(),
+            &original
+        ));
+        assert!(matches!(
+            &drawer.folder_report.as_ref().unwrap().state,
+            State::Loaded(Err(error)) if error.contains("stopped")
+        ));
+        drawer.close_folder_report(serial);
+        let serial = drawer.begin_folder_report(Kind::LocalReference, replacement.root.clone());
+        drawer.close_folder_report(serial);
+        drawer.finish_local_folder_reference(serial, Ok(replacement.clone()));
+        assert!(Arc::ptr_eq(
+            drawer.folder_reference.as_ref().unwrap(),
+            &original
+        ));
+        let serial = drawer.begin_folder_report(Kind::LocalReference, replacement.root.clone());
+        drawer.finish_local_folder_reference(serial, Ok(replacement.clone()));
+        assert!(Arc::ptr_eq(
+            drawer.folder_reference.as_ref().unwrap(),
+            &replacement
+        ));
     }
 }

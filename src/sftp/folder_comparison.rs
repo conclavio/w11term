@@ -5,6 +5,18 @@ const TYPE_MASK: u32 = 0o170000;
 const DIRECTORY: u32 = 0o040000;
 const REGULAR: u32 = 0o100000;
 const SYMBOLIC_LINK: u32 = 0o120000;
+const WINDOWS_REPARSE: u32 = 1 << 31;
+const WINDOWS_SPECIAL: u32 = 1 << 30;
+
+mod local;
+pub use local::capture_local_folder;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum FolderOrigin {
+    #[default]
+    Remote,
+    Windows,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FolderEntry {
@@ -23,6 +35,7 @@ impl FolderEntry {
             DIRECTORY => "Folder",
             REGULAR => "File",
             SYMBOLIC_LINK => "Symbolic link",
+            WINDOWS_REPARSE => "Windows reparse point",
             _ => "Special entry",
         }
     }
@@ -31,6 +44,8 @@ impl FolderEntry {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FolderInventory {
     pub root: String,
+    #[serde(default)]
+    pub origin: FolderOrigin,
     pub entries: BTreeMap<String, FolderEntry>,
 }
 
@@ -44,16 +59,20 @@ impl InventoryBuilder {
     pub(super) fn insert(&mut self, path: &str, attrs: &FileAttributes) -> Result<()> {
         let kind = attrs.permissions.unwrap_or_default() & TYPE_MASK;
         ensure!(kind != 0, "The server did not report the type of {path}");
-        self.path_bytes += path.len();
-        ensure!(
-            self.path_bytes <= directory::MAX_NAME_BYTES,
-            "The folder inventory exceeded the path size limit"
-        );
         let entry = FolderEntry {
             kind,
             size: attrs.size.filter(|_| kind == REGULAR),
             mtime: attrs.mtime.filter(|_| kind == REGULAR),
         };
+        self.insert_entry(path, entry)
+    }
+
+    fn insert_entry(&mut self, path: &str, entry: FolderEntry) -> Result<()> {
+        self.path_bytes += path.len();
+        ensure!(
+            self.path_bytes <= directory::MAX_NAME_BYTES,
+            "The folder inventory exceeded the path size limit"
+        );
         ensure!(
             self.entries.insert(path.to_owned(), entry).is_none(),
             "The server returned a duplicate folder entry for {path}"
@@ -61,9 +80,10 @@ impl InventoryBuilder {
         Ok(())
     }
 
-    pub(super) fn finish(self, root: String) -> FolderInventory {
+    pub(super) fn finish(self, root: String, origin: FolderOrigin) -> FolderInventory {
         FolderInventory {
             root,
+            origin,
             entries: self.entries,
         }
     }
@@ -89,6 +109,8 @@ pub struct FolderDifference {
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct FolderComparison {
     pub reference_root: String,
+    #[serde(default)]
+    pub reference_origin: FolderOrigin,
     pub current_root: String,
     pub reference_only: usize,
     pub current_only: usize,
@@ -100,6 +122,9 @@ pub struct FolderComparison {
 }
 
 fn entry_change(reference: FolderEntry, current: FolderEntry) -> Option<FolderChange> {
+    if reference.kind == WINDOWS_REPARSE && current.kind == SYMBOLIC_LINK {
+        return Some(FolderChange::Unknown);
+    }
     if reference.kind != current.kind {
         return Some(FolderChange::Type);
     }
@@ -125,6 +150,7 @@ fn entry_change(reference: FolderEntry, current: FolderEntry) -> Option<FolderCh
 pub(super) fn compare(reference: &FolderInventory, current: FolderInventory) -> FolderComparison {
     let mut report = FolderComparison {
         reference_root: reference.root.clone(),
+        reference_origin: reference.origin,
         current_root: current.root,
         ..Default::default()
     };
@@ -201,7 +227,7 @@ mod tests {
 
     #[test]
     fn comparison_keeps_every_difference_in_path_order() {
-        let reference = InventoryBuilder::default().finish("/a".into());
+        let reference = InventoryBuilder::default().finish("/a".into(), FolderOrigin::Remote);
         let mut builder = InventoryBuilder::default();
         let attrs = FileAttributes {
             permissions: Some(REGULAR),
@@ -210,7 +236,10 @@ mod tests {
         for index in 0..250 {
             builder.insert(&format!("file{index:03}"), &attrs).unwrap();
         }
-        let report = compare(&reference, builder.finish("/b".into()));
+        let report = compare(
+            &reference,
+            builder.finish("/b".into(), FolderOrigin::Remote),
+        );
         assert_eq!(report.current_only, 250);
         assert_eq!(report.differences.len(), 250);
         assert_eq!(report.differences[0].path, "file000");

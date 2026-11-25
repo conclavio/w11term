@@ -38,7 +38,8 @@ pub use file_tail::FileTail;
 mod find;
 mod folder_comparison;
 pub use folder_comparison::{
-    FolderChange, FolderComparison, FolderDifference, FolderEntry, FolderInventory,
+    FolderChange, FolderComparison, FolderDifference, FolderEntry, FolderInventory, FolderOrigin,
+    capture_local_folder,
 };
 mod image_preview;
 pub(crate) use find::MAX_PATH_BYTES as MAX_SEARCH_PATH_BYTES;

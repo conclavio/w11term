@@ -98,7 +98,11 @@ impl Browser {
                 "reference",
                 TextBlock::new()
                     .automation_id("sftp-folder-comparison-reference")
-                    .text(format!("Reference folder  {}", report.reference_root))
+                    .text(format!(
+                        "{}  {}",
+                        reference_label(report.reference_origin, true),
+                        report.reference_root,
+                    ))
                     .text_wrapping(TextWrapping::Wrap),
             ),
             KeyedView::new(

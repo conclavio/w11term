@@ -115,6 +115,7 @@ pub enum FileAction {
     GoToFolder(u64, u64, u64),
     ShowFolderReport(u64, u64, u64, folder_report::Kind),
     FolderReport(u64, u64, u64, folder_report::Action),
+    LocalFolderCaptured(u64, u64, u64, Result<Arc<FolderInventory>, String>),
     ClearFolderReference(u64, u64, u64),
     OpenEntry(u64, u64, ListedEntry),
     EditFilter(u64, u64, u64, bool),
@@ -329,6 +330,7 @@ pub enum TransferPicker {
     DownloadMarked,
     DownloadSearch(u64),
     ComparePreview(u64),
+    LocalFolderReference(u64),
 }
 
 #[derive(Clone)]
@@ -364,6 +366,13 @@ impl TransferPicker {
                 Ok(Purpose::SaveSearchResults)
             }
             Self::ComparePreview(_) => Ok(Purpose::CompareLocalFile),
+            Self::LocalFolderReference(revision) => {
+                ensure!(
+                    files.can_report_folder(*revision),
+                    "The remote folder listing changed"
+                );
+                Ok(Purpose::CompareLocalFolder)
+            }
         }
     }
 }
@@ -2312,13 +2321,27 @@ impl FileDrawer {
                     writable && generation != 0,
                     ShowFolderReport(pane, generation, revision, folder_report::Kind::Reference),
                 ),
+                button(
+                    "Set Windows folder as reference…",
+                    writable && generation != 0,
+                    Pick(
+                        pane,
+                        generation,
+                        revision,
+                        TransferPicker::LocalFolderReference(revision),
+                    ),
+                ),
                 self.folder_reference
                     .as_ref()
                     .map(|reference| {
                         StackPanel::new().spacing(6.0).children((
                             TextBlock::new()
                                 .automation_id("sftp-folder-reference")
-                                .text(format!("Folder reference  {}", reference.root))
+                                .text(format!(
+                                    "{}  {}",
+                                    folder_report::reference_label(reference.origin, false),
+                                    reference.root
+                                ))
                                 .text_wrapping(TextWrapping::Wrap),
                             button(
                                 "Compare folder with reference…",
@@ -3602,6 +3625,7 @@ impl TerminalApp {
             | GoToFolder(id, ..)
             | ShowFolderReport(id, ..)
             | FolderReport(id, ..)
+            | LocalFolderCaptured(id, ..)
             | ClearFolderReference(id, ..)
             | OpenEntry(id, ..)
             | EditFilter(id, ..)
@@ -3895,6 +3919,11 @@ impl TerminalApp {
                 FolderReport(_, _, serial, folder_report::Action::Browse(action)) => {
                     files.browse_folder_comparison(serial, action);
                 }
+                LocalFolderCaptured(_, generation, serial, result) => {
+                    if generation == files.generation {
+                        files.finish_local_folder_reference(serial, result);
+                    }
+                }
                 ClearFolderReference(_, generation, revision) => {
                     if generation == files.generation && may_open_dialog {
                         files.clear_folder_reference(revision);
@@ -4104,6 +4133,12 @@ impl TerminalApp {
                                 .try_into()
                                 .map_err(|_| anyhow!("Choose one local file to compare"))?;
                             files.compare_local(pane, preview, serial, local, context);
+                        }
+                        TransferPicker::LocalFolderReference(revision) => {
+                            let [local] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one Windows folder for comparison"))?;
+                            files.start_local_folder_reference(pane, revision, local, context);
                         }
                     }
                 }
