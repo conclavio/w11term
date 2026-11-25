@@ -728,6 +728,7 @@ mod tests {
         };
         events.sftp_transfer_finished(
             id,
+            crate::sftp::TransferOutcome::Completed,
             "Downloaded\nreport \u{202e} 2 of 2 items completed.",
             Some(location.clone()),
             true,
@@ -765,6 +766,7 @@ mod tests {
         assert_eq!(event["data"]["transfer_id"], "12:1:1");
         events.sftp_transfer_finished(
             crate::sftp::TransferId { serial: 2, ..id },
+            crate::sftp::TransferOutcome::Completed,
             "Foreground result",
             None,
             false,

@@ -706,6 +706,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waiting_for_a_transfer_distinguishes_pane_closure_from_a_recorded_result() {
+        use crate::events::Events;
+        use crate::sftp::{TransferId, TransferOutcome};
+        for finished in [false, true] {
+            let registry = Registry::default();
+            let (input, mut commands) = mpsc::unbounded_channel();
+            registry.replace([Pane { input, ..pane(7) }]);
+            let id = TransferId {
+                pane: 7,
+                generation: 1,
+                serial: 1,
+            };
+            let journal = Events::default();
+            journal.sftp_transfer_started(id);
+            let waiting = tokio::spawn(async move {
+                registry
+                    .execute(
+                        Request::WaitSftpTransfer {
+                            transfer_id: id,
+                            timeout_seconds: 10,
+                        },
+                        capture(),
+                    )
+                    .await
+            });
+            let Some(crate::session::Command::Events(reply)) = commands.recv().await else {
+                panic!("expected the wait to obtain the pane journal");
+            };
+            if finished {
+                journal.sftp_transfer_finished(id, TransferOutcome::Completed, "done", None, false);
+            }
+            reply.send(journal).unwrap();
+            drop(commands);
+            let response = waiting.await.unwrap();
+            if finished {
+                assert_eq!(response.unwrap()["transfer"]["outcome"], "completed");
+            } else {
+                assert!(
+                    response
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Pane closed before")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sftp_listing_uses_the_current_owners_across_windows() {
         use crate::control::SftpTransferStatus;
         use crate::sftp::{TransferId, TransferOperation, TransferPhase};

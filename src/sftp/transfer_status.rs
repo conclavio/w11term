@@ -78,6 +78,15 @@ pub enum TransferPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransferOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct TransferBatchProgress {
     /// One-based index of the current item.
     pub item: usize,

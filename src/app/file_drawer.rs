@@ -12,7 +12,8 @@ use w11term::folder_grants::Authority;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
     DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferBatchProgress, TransferCancel,
-    TransferOperation, TransferPhase, TransferProgress, normalize_sha256, validate_download_name,
+    TransferOperation, TransferOutcome, TransferPhase, TransferProgress, normalize_sha256,
+    validate_download_name,
 };
 
 mod bookmarks;
@@ -527,29 +528,45 @@ impl TransferFile {
         reply: &mut oneshot::Receiver<Result<Value, String>>,
         bytes: u64,
         queue: &mut TransferQueue,
-    ) -> (String, Option<SavedDownload>) {
-        let mut status = match reply.try_recv() {
+    ) -> (String, Option<SavedDownload>, TransferOutcome) {
+        use TransferOutcome::*;
+        let (mut status, outcome) = match reply.try_recv() {
             Ok(Ok(result)) => {
-                if result["cancelled"] != true {
+                let outcome = if result["cancelled"] == true {
+                    Cancelled
+                } else {
                     queue.completed_one();
                     queue.record_download(self);
-                }
-                format!(
-                    "{} SSH reconnected. Refresh to browse.",
-                    self.outcome(&result)
+                    if queue.completed >= queue.total {
+                        Completed
+                    } else if queue.remaining.is_empty() {
+                        Cancelled
+                    } else {
+                        Interrupted
+                    }
+                };
+                (
+                    format!(
+                        "{} SSH reconnected. Refresh to browse.",
+                        self.outcome(&result)
+                    ),
+                    outcome,
                 )
             }
             Ok(Err(error)) if let Self::UploadFolder { remote } = self => {
-                format!("Could not upload folder {remote}: {error}")
+                (format!("Could not upload folder {remote}: {error}"), Failed)
             }
-            Ok(Err(error)) => error,
-            Err(_) => format!(
-                "SSH reconnected. {} Refresh to browse.",
-                self.interrupted(bytes)
+            Ok(Err(error)) => (error, Failed),
+            Err(_) => (
+                format!(
+                    "SSH reconnected. {} Refresh to browse.",
+                    self.interrupted(bytes)
+                ),
+                Interrupted,
             ),
         };
         let saved = queue.finish(&mut status);
-        (status, saved)
+        (status, saved, outcome)
     }
 }
 
@@ -1384,6 +1401,7 @@ impl FileDrawer {
         session: &Session,
         previous: Option<(TransferId, bool)>,
         background: bool,
+        outcome: TransferOutcome,
     ) {
         if let Some((id, download)) = previous
             && self
@@ -1397,13 +1415,14 @@ impl FileDrawer {
                 .cloned();
             session
                 .events
-                .sftp_transfer_finished(id, &self.status, saved, background);
+                .sftp_transfer_finished(id, outcome, &self.status, saved, background);
         }
     }
 
-    pub(super) fn observe_connection(&mut self, generation: u64) {
+    pub(super) fn observe_connection(&mut self, generation: u64) -> TransferOutcome {
+        let mut outcome = TransferOutcome::Interrupted;
         if self.generation == generation {
-            return;
+            return outcome;
         }
         let mut last_download = self.last_download.take();
         let status = match self.pending.as_mut() {
@@ -1418,8 +1437,9 @@ impl FileDrawer {
                 transfer: Some(transfer),
                 ..
             }) => {
-                let (status, saved) =
+                let (status, saved, terminal) =
                     file.reconnect_status(reply, transfer.progress.borrow().bytes, &mut self.queue);
+                outcome = terminal;
                 if saved.is_some() {
                     last_download = saved;
                 }
@@ -1449,12 +1469,13 @@ impl FileDrawer {
             status,
             ..Self::default()
         };
+        outcome
     }
 
     fn observe_transfer_connection(&mut self, session: &Session, generation: u64, active: bool) {
         let previous = self.transfer_stamp();
-        self.observe_connection(generation);
-        self.publish_ended_transfer(session, previous, !active || !self.open);
+        let outcome = self.observe_connection(generation);
+        self.publish_ended_transfer(session, previous, !active || !self.open, outcome);
     }
 
     /// Sample only when ready to browse. A burst during a transfer or listing is
@@ -2113,6 +2134,9 @@ impl FileDrawer {
                 reply: tx,
             }))
             .map_err(|_| anyhow!("SSH session has closed"))?;
+        if let Some(transfer) = &transfer {
+            session.events.sftp_transfer_started(transfer.id);
+        }
         if matches!(&step, Step::Transfer(file) if file.is_download()) && self.queue.completed == 0
         {
             self.last_download = None;
@@ -2197,6 +2221,7 @@ impl FileDrawer {
         session: &Session,
         may_open_dialog: bool,
         context: &ComponentContext<TerminalApp>,
+        outcome: &mut TransferOutcome,
     ) -> Result<()> {
         let Some(pending) = &mut self.pending else {
             return Ok(());
@@ -2221,6 +2246,7 @@ impl FileDrawer {
                     (&pending.step, &pending.transfer)
                 {
                     let error = file.interrupted(transfer.progress.borrow().bytes);
+                    *outcome = TransferOutcome::Interrupted;
                     self.pending.take();
                     self.cached.borrow_mut().take();
                     bail!("{error}");
@@ -2334,17 +2360,24 @@ impl FileDrawer {
             (Step::Transfer(file), Ok(reply)) => {
                 self.status = file.outcome(&reply);
                 if reply["cancelled"] == true {
+                    *outcome = TransferOutcome::Cancelled;
                     self.finish_transfer_queue();
                     return Ok(());
                 }
                 let upload = !file.is_download();
                 self.queue.record_download(&file);
                 if !upload && self.queue.batch_id.is_none() {
+                    *outcome = TransferOutcome::Completed;
                     self.finish_transfer_queue();
                     return Ok(());
                 }
                 self.queue.completed_one();
                 if self.queue.remaining.is_empty() {
+                    *outcome = if self.queue.completed < self.queue.total {
+                        TransferOutcome::Cancelled
+                    } else {
+                        TransferOutcome::Completed
+                    };
                     self.finish_transfer_queue();
                     if upload {
                         let path = self.directory.clone().context("Missing upload directory")?;
@@ -2455,8 +2488,12 @@ impl TerminalApp {
             .files
             .cancel_transfer(transfer_id)
             .context("SFTP transfer is no longer active on that connection")?;
-        tab.files
-            .publish_ended_transfer(&tab.session, previous, !active || !tab.files.open);
+        tab.files.publish_ended_transfer(
+            &tab.session,
+            previous,
+            !active || !tab.files.open,
+            TransferOutcome::Cancelled,
+        );
         Ok(serde_json::json!({ "transfer_id": transfer_id, "state": state }))
     }
 
@@ -2747,6 +2784,7 @@ impl TerminalApp {
         if !editor_typing && !matches!(action, Tick(_) | EditName(..) | FocusFilter(..)) {
             files.cached.borrow_mut().take();
         }
+        let mut outcome = TransferOutcome::Failed;
         let result = (|| -> Result<()> {
             match action {
                 Search(_, generation, action)
@@ -2771,6 +2809,7 @@ impl TerminalApp {
                 Toggle => {
                     if files.open {
                         files.close();
+                        outcome = TransferOutcome::Cancelled;
                     } else {
                         files.open = true;
                     }
@@ -2807,7 +2846,10 @@ impl TerminalApp {
                         files.browse(pane, session, path, None, context)?;
                     }
                 }
-                Close(_) => files.close(),
+                Close(_) => {
+                    files.close();
+                    outcome = TransferOutcome::Cancelled;
+                }
                 ClosePreview(_, _, serial) => files.close_preview(serial),
                 StartTextEditor(_, generation, serial) => {
                     if may_open_dialog && files.generation == generation {
@@ -2846,9 +2888,10 @@ impl TerminalApp {
                         files.reveal = name.map(RevealTarget::Existing);
                     }
                 }
-                Tick(_) => files.tick(pane, session, may_open_dialog, context)?,
+                Tick(_) => files.tick(pane, session, may_open_dialog, context, &mut outcome)?,
                 CancelTransfer(target) => {
                     files.cancel_transfer(target);
+                    outcome = TransferOutcome::Cancelled;
                 }
                 Listed(_, _, path, direction, result) if files.parsing => {
                     files.parsing = false;
@@ -2866,6 +2909,7 @@ impl TerminalApp {
                         && files.preparing_drop.is_none()
                     {
                         files.status = "Cancelled before uploading any dropped items.".into();
+                        outcome = TransferOutcome::Cancelled;
                     }
                 }
                 Picked(_, _, serial, picker, result) => {
@@ -3203,7 +3247,7 @@ impl TerminalApp {
                 AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,
                 Drop(target, paths) => {
                     if drop_allowed {
-                        files.classify_drop(target, paths, context);
+                        files.classify_drop(target, paths, session, context);
                     }
                 }
                 #[cfg(feature = "ui-smoke")]
@@ -3262,7 +3306,7 @@ impl TerminalApp {
             files.finish_transfer_queue();
             files.cached.borrow_mut().take();
         }
-        files.publish_ended_transfer(session, previous_transfer, !visible || !files.open);
+        files.publish_ended_transfer(session, previous_transfer, !visible || !files.open, outcome);
         if visible {
             let return_to_terminal = finish_filter && !tab.files.filter_editing();
             if !keep_directory {
@@ -4471,9 +4515,10 @@ mod tests {
         assert!(message.contains("64 bytes written to the temporary file"));
 
         let (worker, mut reply) = oneshot::channel();
-        let (interrupted, saved) =
+        let (interrupted, saved, outcome) =
             upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default());
         assert!(saved.is_none());
+        assert_eq!(outcome, TransferOutcome::Interrupted);
         assert!(interrupted.contains("/srv/uploads/large.bin"));
         assert!(interrupted.contains("at least 32 bytes acknowledged"));
         assert!(interrupted.contains("remote file may be incomplete"));
@@ -4490,14 +4535,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default()),
-            ("WRITE timed out; outcome is unknown".into(), None)
+            (
+                "WRITE timed out; outcome is unknown".into(),
+                None,
+                TransferOutcome::Failed
+            )
         );
         let (worker, mut reply) = oneshot::channel();
         worker.send(Ok(complete)).unwrap();
-        let (status, saved) =
+        let (status, saved, outcome) =
             download.reconnect_status(&mut reply, 64, &mut TransferQueue::default());
         assert!(status.starts_with("Downloaded /large.bin (128 bytes)"));
         assert_eq!(saved, download.downloaded_item());
+        assert_eq!(outcome, TransferOutcome::Completed);
     }
 
     #[test]
@@ -4601,7 +4651,7 @@ mod tests {
                 .contains("remote folder was not created")
         );
         let (worker, mut reply) = oneshot::channel();
-        let (interrupted, _) =
+        let (interrupted, _, _) =
             folder.reconnect_status(&mut reply, 42, &mut TransferQueue::default());
         assert!(interrupted.contains("/reports/run"));
         assert!(interrupted.contains("at least 42 bytes acknowledged"));
@@ -4611,7 +4661,8 @@ mod tests {
             folder.reconnect_status(&mut reply, 0, &mut TransferQueue::default()),
             (
                 "Could not upload folder /reports/run: Permission denied".into(),
-                None
+                None,
+                TransferOutcome::Failed,
             )
         );
     }

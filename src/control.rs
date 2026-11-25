@@ -97,6 +97,11 @@ pub enum Request {
     CancelSftpTransfer {
         transfer_id: crate::sftp::TransferId,
     },
+    WaitSftpTransfer {
+        transfer_id: crate::sftp::TransferId,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     List,
     ListSshGroups,
     ListSavedSshGroups {
@@ -690,6 +695,10 @@ impl Registry {
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }
+            Request::WaitSftpTransfer {
+                transfer_id,
+                timeout_seconds,
+            } => self.wait_sftp_transfer(transfer_id, timeout_seconds).await,
             Request::WorkspaceIdentity => Ok(json!(self.legacy_workspace())),
             Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
             Request::ListSshGroups => self.list_ssh_groups().await,
@@ -1224,6 +1233,7 @@ async fn serve(
                 let pool = if matches!(
                     r,
                     Request::WaitForText { .. }
+                        | Request::WaitSftpTransfer { .. }
                         | Request::WaitSshGroupRun { .. }
                         | Request::WaitSshGroupApproval { .. }
                         | Request::WaitSshGroupOutput { .. }
@@ -1569,6 +1579,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,
             Request::WaitForText {
+                timeout_seconds, ..
+            }
+            | Request::WaitSftpTransfer {
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupRun {

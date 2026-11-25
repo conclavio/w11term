@@ -39,7 +39,9 @@ mod resume_download;
 use resume_download::ResumeDownload;
 mod text_preview;
 mod transfer_status;
-pub use transfer_status::{TransferBatchProgress, TransferId, TransferOperation, TransferPhase};
+pub use transfer_status::{
+    TransferBatchProgress, TransferId, TransferOperation, TransferOutcome, TransferPhase,
+};
 mod upload_directory;
 pub(crate) use directory::valid_component;
 pub use directory::{validate_download_name, validate_download_names};

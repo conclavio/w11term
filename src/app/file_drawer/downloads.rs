@@ -217,7 +217,8 @@ mod tests {
             sender
                 .send(Ok(serde_json::json!({"cancelled": true})))
                 .unwrap();
-            let (status, saved) = item.reconnect_status(&mut reply, 0, &mut queue);
+            let (status, saved, outcome) = item.reconnect_status(&mut reply, 0, &mut queue);
+            assert_eq!(outcome, TransferOutcome::Cancelled);
             assert!(status.ends_with(&format!("{completed} of 2 items completed.")));
             assert_eq!(
                 saved,

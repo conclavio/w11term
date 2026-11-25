@@ -2,7 +2,7 @@ use super::{Registry, TIMEOUT, UiRequest, WindowId};
 use crate::sftp::{
     TransferBatchProgress, TransferId, TransferOperation, TransferPhase, TransferProgress,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -31,6 +31,30 @@ pub enum SftpCancelState {
 }
 
 impl Registry {
+    pub(super) async fn wait_sftp_transfer(
+        &self,
+        id: TransferId,
+        timeout_seconds: u64,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=3600).contains(&timeout_seconds),
+            "wait timeout must be 1..=3600 seconds"
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        let pane = self.pane(id.pane)?;
+        let events = tokio::time::timeout_at(deadline, Self::pane_events(&pane))
+            .await
+            .context("Timed out while opening the pane's transfer journal")??;
+        let event = tokio::select! {
+            biased;
+            result = events.wait_sftp_transfer(id, deadline) => result?,
+            _ = pane.input.closed() => events.sftp_transfer_result(id)
+                .context("Pane closed before a final SFTP transfer result was recorded")?,
+        };
+        Ok(json!({ "pane": id.pane, "sequence": event.sequence,
+            "timestamp_ms": event.timestamp_ms, "transfer": event.data }))
+    }
+
     pub(super) async fn list_sftp_transfers(&self, pane: Option<u64>) -> Result<Value> {
         if let Some(pane) = pane {
             self.pane(pane)?;

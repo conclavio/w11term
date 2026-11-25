@@ -641,8 +641,8 @@ With **Notify for long commands** on, the same event also includes integer
 watch is also armed, that completion produces a single event.
 
 When an SFTP drawer transfer or batch ends, the originating pane records one
-`sftp-transfer` event. The data includes `transfer_id`, the `message` describing
-the result, and a `background` flag. Results with `background: true` also appear
+`sftp-transfer` event. The data includes `transfer_id`, `outcome`, the
+`message` describing the result, and a `background` flag. Results with `background: true` also appear
 in the Attention inbox.
 
 When a direct SSH shell or local program finishes, a restartable pane emits
@@ -780,6 +780,7 @@ $active = & $ctl --pid 12345 sftp list-transfers | ConvertFrom-Json
 $active.result.transfers
 & $ctl --pid 12345 sftp list-transfers --pane 7
 & $ctl --pid 12345 sftp cancel-transfer $active.result.transfers[0].transfer_id
+& $ctl --pid 12345 sftp wait-transfer $active.result.transfers[0].transfer_id --timeout 30
 ```
 
 `list-transfers` samples active drawer transfers across the selected process.
@@ -795,14 +796,22 @@ Pass the exact `transfer_id` from the same process to `cancel-transfer`. The ID
 stays with the batch across items and pane moves. An accepted cancellation
 returns `cancelling`, `already-cancelling`, or `cancelled-before-start` in
 `result.state`. An in-flight transfer may still need to close its remote
-handle. Match the final `sftp-transfer` event by ID and read its message for the
-outcome. A finished transfer or one from an earlier connection on a live pane
+handle. A finished transfer or one from an earlier connection on a live pane
 fails with a stale ID error. A closed pane returns an unknown-pane error.
 The commands leave the selected pane and window focus alone.
 
+`wait-transfer` takes the same ID and waits for that transfer's final journal
+result, or returns it immediately if retained. The reply's `result` contains
+`pane`, `sequence`, `timestamp_ms`, and `transfer` with the same fields as the
+`sftp-transfer` event data. Inspect `outcome` for `completed`, `cancelled`,
+`failed`, or `interrupted`. Any recorded outcome is a successful wait.
+The default timeout is 30 seconds. The transfer keeps running if the wait times
+out. A closed pane or an unknown or evicted ID returns an error.
+
 Direct pipe clients send
 `{"verb":"list-sftp-transfers","pane":7}` or
-`{"verb":"cancel-sftp-transfer","transfer_id":"7:2:11"}`.
+`{"verb":"cancel-sftp-transfer","transfer_id":"7:2:11"}`. To wait, send
+`{"verb":"wait-sftp-transfer","transfer_id":"7:2:11","timeout_seconds":30}`.
 
 ### Run SFTP operations
 

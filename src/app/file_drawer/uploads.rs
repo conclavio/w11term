@@ -192,11 +192,13 @@ impl FileDrawer {
         &mut self,
         target: DropTarget,
         paths: Vec<PathBuf>,
+        session: &Session,
         ctx: &ComponentContext<TerminalApp>,
     ) {
         let Some(id) = self.start_drop(&target) else {
             return;
         };
+        session.events.sftp_transfer_started(id);
         let cancel = self.preparing_drop.as_ref().unwrap().cancel.clone();
         let rejected = Message::Files(FileAction::PreparedDrop(
             target.clone(),
@@ -349,7 +351,7 @@ mod tests {
                     "directories":1, "skipped":0, "bytes_transferred":0})))
                     .unwrap();
             }
-            let (status, saved) = file.reconnect_status(&mut response, 0, &mut queue);
+            let (status, saved, _) = file.reconnect_status(&mut response, 0, &mut queue);
             assert!(saved.is_none());
             let completed = if reply_value == Some(false) { 2 } else { 1 };
             assert!(

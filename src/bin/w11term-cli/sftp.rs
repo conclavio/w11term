@@ -8,6 +8,7 @@ use w11term::{
 
 pub const HELP: &str = "w11term-cli [--pid PID] sftp list-transfers [--pane ID]\n\
 w11term-cli [--pid PID] sftp cancel-transfer TRANSFER_ID\n\
+w11term-cli [--pid PID] sftp wait-transfer TRANSFER_ID [--timeout SECONDS]\n\
 w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
   get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX [--resume]]\n\
@@ -83,7 +84,24 @@ pub fn parse(
         }
     }
     let command = command.context(HELP)?;
-    if matches!(command.as_str(), "list-transfers" | "cancel-transfer") {
+    if matches!(
+        command.as_str(),
+        "list-transfers" | "cancel-transfer" | "wait-transfer"
+    ) {
+        let wait_timeout = if command == "wait-transfer" {
+            let timeout = opts
+                .remove("--timeout")
+                .map(|value| value.parse::<u64>())
+                .transpose()?
+                .unwrap_or(30);
+            ensure!(
+                (1..=3600).contains(&timeout),
+                "timeout must be 1..=3600 seconds"
+            );
+            Some(timeout)
+        } else {
+            None
+        };
         ensure!(
             opts.is_empty() && !overwrite && !atomic && !resume && !spec_order,
             "Unexpected options for {command}"
@@ -101,10 +119,15 @@ pub fn parse(
                 "The transfer ID already identifies its pane"
             );
             let [id] = positional.as_slice() else {
-                bail!("cancel-transfer requires one transfer ID from list-transfers");
+                bail!("{command} requires one transfer ID from list-transfers");
             };
-            Request::CancelSftpTransfer {
-                transfer_id: id.parse().context("Invalid SFTP transfer ID")?,
+            let transfer_id = id.parse().context("Invalid SFTP transfer ID")?;
+            match wait_timeout {
+                Some(timeout_seconds) => Request::WaitSftpTransfer {
+                    transfer_id,
+                    timeout_seconds,
+                },
+                None => Request::CancelSftpTransfer { transfer_id },
             }
         };
         return Ok((pid, request));
@@ -297,6 +320,18 @@ mod tests {
             serde_json::to_value(cancel).unwrap(),
             json!({"verb":"cancel-sftp-transfer", "transfer_id":"9:2:11"})
         );
+        let (_, wait) = p(&["wait-transfer", "9:2:11", "--timeout", "42"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(wait).unwrap(),
+            json!({"verb":"wait-sftp-transfer", "transfer_id":"9:2:11", "timeout_seconds":42})
+        );
+        assert!(matches!(
+            p(&["wait-transfer", "9:2:11"]).unwrap().1,
+            Request::WaitSftpTransfer {
+                timeout_seconds: 30,
+                ..
+            }
+        ));
         for invalid in [
             &["list-transfers", "extra"][..],
             &["list-transfers", "--pane", "0"],
@@ -306,6 +341,9 @@ mod tests {
             &["cancel-transfer", "9:2:11:3"],
             &["cancel-transfer", "9:2:+1"],
             &["cancel-transfer", "--pane", "9", "9:2:11"],
+            &["wait-transfer", "9:2:11", "--timeout", "0"],
+            &["wait-transfer", "9:2:11", "--timeout", "3601"],
+            &["wait-transfer", "9:2:11", "extra"],
         ] {
             assert!(p(invalid).is_err(), "{invalid:?}");
         }

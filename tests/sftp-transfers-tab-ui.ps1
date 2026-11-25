@@ -54,6 +54,8 @@ function Reject-TransferId([string]$Id) {
 
 $alphaTrace = $null
 $betaTrace = $null
+$waiting = $null
+$waitPath = Join-Path $State 'wait-alpha.json'
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','first-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $alphaTrace = Open-PeerTraceReader (Join-Path $alphaRoot 'transfer-trace')
@@ -117,6 +119,12 @@ try {
     }
     $firstId = $first[0].transfer_id
     $secondId = $second[0].transfer_id
+    $timedOut = & $Cli --pid $app.Id sftp wait-transfer $firstId --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $timedOut.ok -or $timedOut.error -notmatch 'still active') {
+        throw "Expected the blocked transfer to outlast the wait: $($timedOut | ConvertTo-Json -Compress)"
+    }
+    $waiting = Start-Process -FilePath $Cli -ArgumentList @('--pid',"$($app.Id)",'sftp','wait-transfer',$firstId,'--timeout','30') -WindowStyle Hidden -PassThru -RedirectStandardOutput $waitPath
+    $null = $waiting.Handle
     $parts = $firstId.Split(':')
     Reject-TransferId ('{0}:{1}:{2}' -f $parts[0], ([uint64]$parts[1] + 1), $parts[2])
     $cancel = Control @('sftp','cancel-transfer',$firstId)
@@ -136,8 +144,17 @@ try {
     }
     $cancelled = @(Transfer-Result $alpha $firstId)
     if ($cancelled.Count -ne 1 -or !$cancelled[0].data.background -or
+        $cancelled[0].data.outcome -cne 'cancelled' -or
         $cancelled[0].data.message -notmatch 'Cancelled download.*0 of 2 items completed') {
         throw 'The pane journal did not report the cancelled batch by ID'
+    }
+    if (!$waiting.WaitForExit(15000)) { throw 'The named-pipe waiter did not return' }
+    $waitReply = [IO.File]::ReadAllText($waitPath) | ConvertFrom-Json
+    if ($waiting.ExitCode -ne 0 -or !$waitReply.ok -or
+        $waitReply.result.transfer.transfer_id -cne $firstId -or
+        $waitReply.result.transfer.outcome -cne 'cancelled' -or
+        $waitReply.result.sequence -ne $cancelled[0].sequence) {
+        throw "Wrong cancellation result from wait-transfer (exit $($waiting.ExitCode), expected ID $firstId and sequence $($cancelled[0].sequence)): $($waitReply | ConvertTo-Json -Depth 5 -Compress)"
     }
     Reject-TransferId $firstId
 
@@ -146,8 +163,13 @@ try {
     $null = Wait-Until 'second transfer is visible in the originating drawer' { Find-Element 'Cancel transfer' $button }
     [IO.File]::Delete($betaGate)
     $finished = Wait-Until 'foreground completion in the transfer journal' { Transfer-Result $beta $secondId }
-    if ($finished.data.background -or $finished.data.message -notmatch 'Downloaded /shell directory/beta folder') {
+    if ($finished.data.background -or $finished.data.outcome -cne 'completed' -or
+        $finished.data.message -notmatch 'Downloaded /shell directory/beta folder') {
         throw 'The pane journal did not report the foreground folder download'
+    }
+    $retained = Control @('sftp','wait-transfer',$secondId,'--timeout','1')
+    if ($retained.sequence -ne $finished.sequence -or $retained.transfer.outcome -cne 'completed') {
+        throw 'A late waiter did not receive the retained foreground result'
     }
     Run-Palette 'SFTP transfers'
     $null = Wait-Until 'completed transfers leave the tab' { Find-Element $empty $text }
@@ -159,6 +181,10 @@ try {
     $betaWire = if ($betaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $betaTrace)) }
     throw "$_ at $($_.ScriptStackTrace). First peer: $alphaWire Second peer: $betaWire"
 } finally {
+    if ($waiting) {
+        if (!$waiting.HasExited) { $waiting.Kill(); $waiting.WaitForExit() }
+        $waiting.Dispose()
+    }
     [IO.File]::Delete($alphaGate)
     [IO.File]::Delete($betaGate)
     if ($alphaTrace) { $alphaTrace.Dispose() }

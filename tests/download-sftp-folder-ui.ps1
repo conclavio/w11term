@@ -237,7 +237,14 @@ try {
     $null = Wait-Until 'drawer closed during the transfer' { !(Find-Element 'verified.bin' $button) }
     [IO.File]::Delete($readGate)
     Visit-TransferNotice 'Could not download /shell directory/verified\.bin.*destination.*exists.*1 of 2 items completed'
-    if (@(Read-TransferEvents $since).Count -ne 2) { throw 'Expected one additional notice for the failed batch' }
+    $results = @(Read-TransferEvents $since)
+    if ($results.Count -ne 2 -or $results[1].data.outcome -cne 'failed') {
+        throw 'Expected one additional notice for the failed batch'
+    }
+    $failed = Control @('sftp','wait-transfer',$results[1].data.transfer_id)
+    if ($failed.sequence -ne $results[1].sequence -or $failed.transfer.outcome -cne 'failed') {
+        throw 'Expected wait-transfer to return the retained failure'
+    }
     Assert-Explorer 'Open download folder' 'explore' (Join-Path $State 'picker/batch background conflict')
 
     Run-Palette 'SFTP files'
