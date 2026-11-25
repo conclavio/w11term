@@ -19,14 +19,17 @@ function Click([string]$Label) {
         if ($item -and $item.Current.IsEnabled) { $item }
     })
 }
-function Download-To([string]$RemoteName, [string]$LocalParent) {
-    Click "$RemoteName/"
-    Click $download
+function Choose-DownloadFolder([string]$LocalParent) {
     $dialog = Wait-Until 'owned download destination folder picker' {
         Find-OwnedDialog 'Choose a download destination folder'
     }
     Select-DialogItem $dialog $LocalParent
     $null = Wait-Until 'accept selected parent folder' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+function Download-To([string]$RemoteName, [string]$LocalParent) {
+    Click "$RemoteName/"
+    Click $download
+    Choose-DownloadFolder $LocalParent
 }
 function Wait-Status([string]$Pattern) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -55,6 +58,16 @@ function Download-Verified([string]$Digest, [string]$Destination, [switch]$Resum
         [FixtureDialog]::SetFilename($dialog, $Destination, 'verified.bin')
     }
     $null = Wait-Until 'accept verified file destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
+function Mark-Download([string]$Label) {
+    (Wait-CheckBox "Mark $Label for download" ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox "Mark $Label for download" ([System.Windows.Automation.ToggleState]::On)
+}
+
+function Download-Marked([string]$Parent) {
+    Click 'Download marked items'
+    Choose-DownloadFolder $Parent
 }
 
 $reader = $null
@@ -94,6 +107,48 @@ try {
     Wait-Status 'SHA-256 mismatch'
     Download-Verified $digest (Join-Path $State 'accepted.bin') -ResumeDownload
     Wait-Status 'SHA-256 verified'
+
+    Click ('Select downloads' + [char]0x2026)
+    Mark-Download 'snapshot/'
+    Click ('Filter filenames' + [char]0x2026)
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    $filter = Wait-Until 'filename filter for marked downloads' { Find-Element 'Filter filenames' $edit }
+    $filter.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('verified.bin')
+    $null = Wait-Until 'filtered single file' { Find-Element '1 match' }
+    Click 'Done'
+    Mark-Download 'verified.bin'
+    Download-Marked 'batch received'
+    Wait-Status '^Downloaded /shell directory/verified\.bin.*2 of 2 items completed'
+
+    Click 'Clear filter'
+    Click ('Select downloads' + [char]0x2026)
+    Mark-Download 'snapshot/'
+    Mark-Download 'verified.bin'
+    Mark-Download 'z-later.bin'
+    Download-Marked 'batch conflict'
+    Wait-Status '^Could not download /shell directory/verified\.bin.*destination.*exists.*1 of 3 items completed'
+
+    [IO.File]::WriteAllBytes($readGate, [byte[]]@())
+    $start = (Read-PeerTrace $reader).Length
+    Click ('Select downloads' + [char]0x2026)
+    Mark-Download 'interrupted/'
+    Mark-Download 'verified.bin'
+    Download-Marked 'batch cancelled'
+    $null = Wait-Until 'blocked SFTP read in the first marked item' {
+        $trace = Read-PeerTrace $reader
+        if ($trace.Length -gt $start) {
+            $wire = [Text.Encoding]::UTF8.GetString($trace, $start, $trace.Length - $start)
+            $wire.Contains('OPEN /shell directory/interrupted/nested/payload.bin') -and $wire -match '(?m)^READ [1-9][0-9]*\r?$'
+        }
+    }
+    Click 'Cancel transfer'
+    $null = Wait-Until 'batch cancel acknowledged' {
+        $cancel = Find-Element 'Cancel transfer' $button
+        $cancel -and !$cancel.Current.IsEnabled
+    }
+    [IO.File]::Delete($readGate)
+    Wait-Status '^Cancelled download of /shell directory/interrupted.*0 of 2 items completed'
+
     Run-Palette 'SFTP files'
     foreach ($c in 'folder-download-live'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','folder-download-live')

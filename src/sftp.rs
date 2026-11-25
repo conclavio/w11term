@@ -40,7 +40,7 @@ use resume_download::ResumeDownload;
 mod text_preview;
 mod upload_directory;
 pub(crate) use directory::valid_component;
-pub use directory::validate_download_name;
+pub use directory::{validate_download_name, validate_download_names};
 pub use drop_source::{DropSource, classify_drop};
 
 pub const CHUNK: usize = 32 * 1024;
@@ -1358,7 +1358,8 @@ impl Engine {
         if !overwrite {
             ensure!(
                 !local.try_exists()?,
-                "local destination exists; use --overwrite"
+                "The local destination already exists at {}",
+                local.display()
             );
         }
         let parent = local

@@ -2575,8 +2575,15 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let picker = state.path().join("picker");
     let received = picker.join("receive here");
     let conflict = picker.join("already exists");
+    let batch_received = picker.join("batch received");
+    let batch_conflict = picker.join("batch conflict");
+    let batch_cancelled = picker.join("batch cancelled");
     fs::create_dir_all(&received).unwrap();
     fs::create_dir_all(conflict.join("snapshot")).unwrap();
+    fs::create_dir_all(&batch_received).unwrap();
+    fs::create_dir_all(&batch_conflict).unwrap();
+    fs::create_dir_all(&batch_cancelled).unwrap();
+    fs::write(batch_conflict.join("verified.bin"), b"user data").unwrap();
     fs::write(received.join("neighbor.bin"), b"untouched sibling").unwrap();
     fs::write(conflict.join("snapshot/.manifest"), b"local manifest").unwrap();
 
@@ -2588,6 +2595,7 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     fs::write(source.join(".manifest"), b"remote manifest\n").unwrap();
     let verified = b"verify the downloaded bytes\x00\xff";
     fs::write(parent.join("verified.bin"), verified).unwrap();
+    fs::write(parent.join("z-later.bin"), b"later item").unwrap();
     {
         use sha2::{Digest, Sha256};
         fs::write(
@@ -2621,6 +2629,22 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
         verified
     );
     assert!(!state.path().join("rejected.bin").exists());
+    assert_eq!(
+        fs::read(batch_received.join("verified.bin")).unwrap(),
+        verified
+    );
+    for folder in [&batch_received, &batch_conflict] {
+        assert_eq!(
+            fs::read(folder.join("snapshot/data 雪/trace 例.bin")).unwrap(),
+            data
+        );
+    }
+    assert_eq!(
+        fs::read(batch_conflict.join("verified.bin")).unwrap(),
+        b"user data"
+    );
+    assert!(!batch_conflict.join("z-later.bin").exists());
+    assert_eq!(fs::read_dir(batch_cancelled).unwrap().count(), 0);
 
     let downloaded = received.join("snapshot");
     assert_eq!(

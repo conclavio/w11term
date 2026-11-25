@@ -389,6 +389,8 @@ Saved workspaces record the local executable, arguments and directory. Opening t
 
 On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files. You can also drag files and folders together from Explorer onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
 
+Choose **Select downloads…**, mark files or folders, and use **Download marked** to select one destination folder. Marks stay selected while you change pages, sort, or filter the listing. Files and folders keep their remote names. An existing destination, transfer error, or cancellation stops the batch and keeps items already saved.
+
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
 Choose **Properties…** on a file, folder or symbolic link to read its current metadata. The dialog shows the remote path, entry type, size in bytes, octal permissions, numeric owner and group, and modification and access times in UTC. Unreported fields are marked **Not reported**. For a symbolic link, the dialog shows the link’s own attributes and asks the server for its target path. This also works for a dangling link.
