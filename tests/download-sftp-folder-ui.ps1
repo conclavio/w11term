@@ -70,6 +70,43 @@ function Download-Marked([string]$Parent) {
     Choose-DownloadFolder $Parent
 }
 
+function Start-BlockedBatch([string]$Parent) {
+    [IO.File]::WriteAllBytes($readGate, [byte[]]@())
+    $start = (Read-PeerTrace $reader).Length
+    Click ('Select downloads' + [char]0x2026)
+    Mark-Download 'interrupted/'
+    Mark-Download 'verified.bin'
+    Download-Marked $Parent
+    $null = Wait-Until 'blocked SFTP read in the first marked item' {
+        $trace = Read-PeerTrace $reader
+        if ($trace.Length -gt $start) {
+            $wire = [Text.Encoding]::UTF8.GetString($trace, $start, $trace.Length - $start)
+            $wire.Contains('OPEN /shell directory/interrupted/nested/payload.bin') -and $wire -match '(?m)^READ [1-9][0-9]*\r?$'
+        }
+    }
+}
+
+function Read-TransferEvents([uint64]$Since) {
+    $journal = (Control @('events','--pane',"$pane",'--since',"$Since",'--timeout','0')).journal
+    $journal.events | Where-Object kind -ceq 'sftp-transfer'
+}
+
+function Visit-TransferNotice([string]$Summary) {
+    Click 'Attention inbox, 1 unread'
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
+    $row = Wait-Until "unread SFTP result matching '$Summary'" {
+        foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)) {
+            if ($item.Current.Name -match "^Unread.*SFTP transfer.*$Summary") { return $item }
+        }
+    }
+    Invoke-Button $row
+    Wait-Focus $pane
+    Wait-Status $Summary
+    $null = Wait-Until 'SFTP notice acknowledged' { Find-Element 'Attention inbox, 0 unread' $button }
+}
+
 $reader = $null
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -78,6 +115,7 @@ try {
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $pane = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','src/trace.rs')
+    $since = (Control @('events','--pane',"$pane",'--since','0','--timeout','0')).journal.next
     Run-Palette 'Open files here'
     $null = Wait-Until 'reported SSH directory' { (Find-Element '/shell directory') -and (Find-Element 'snapshot/' $button) }
 
@@ -128,19 +166,7 @@ try {
     Download-Marked 'batch conflict'
     Wait-Status '^Could not download /shell directory/verified\.bin.*destination.*exists.*1 of 3 items completed'
 
-    [IO.File]::WriteAllBytes($readGate, [byte[]]@())
-    $start = (Read-PeerTrace $reader).Length
-    Click ('Select downloads' + [char]0x2026)
-    Mark-Download 'interrupted/'
-    Mark-Download 'verified.bin'
-    Download-Marked 'batch cancelled'
-    $null = Wait-Until 'blocked SFTP read in the first marked item' {
-        $trace = Read-PeerTrace $reader
-        if ($trace.Length -gt $start) {
-            $wire = [Text.Encoding]::UTF8.GetString($trace, $start, $trace.Length - $start)
-            $wire.Contains('OPEN /shell directory/interrupted/nested/payload.bin') -and $wire -match '(?m)^READ [1-9][0-9]*\r?$'
-        }
-    }
+    Start-BlockedBatch 'batch cancelled'
     Click 'Cancel transfer'
     $null = Wait-Until 'batch cancel acknowledged' {
         $cancel = Find-Element 'Cancel transfer' $button
@@ -148,6 +174,33 @@ try {
     }
     [IO.File]::Delete($readGate)
     Wait-Status '^Cancelled download of /shell directory/interrupted.*0 of 2 items completed'
+    if (@(Read-TransferEvents $since).Count -ne 0) { throw 'Visible transfers produced a background notice' }
+
+    Start-BlockedBatch 'batch background'
+    $dot = ' ' + [char]0xb7 + ' '
+    Run-Palette "New tab with Palette PowerShell${dot}Local"
+    $local = Wait-Until 'PowerShell beside the background transfer' {
+        ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id
+    }
+    Wait-Focus $local
+    $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')
+    $foreground = [FixtureMessages]::GetForegroundWindow()
+    [IO.File]::Delete($readGate)
+    $null = Wait-Until 'one unread SFTP result while PowerShell is active' { Find-Element 'Attention inbox, 1 unread' $button }
+    Wait-Focus $local
+    if ([FixtureMessages]::GetForegroundWindow() -ne $foreground) { throw 'Transfer stole window focus' }
+    Visit-TransferNotice 'Downloaded /shell directory/verified\.bin.*2 of 2 items completed'
+    $events = @(Read-TransferEvents $since)
+    if ($events.Count -ne 1 -or $events[0].data.message -notmatch '2 of 2 items completed') {
+        throw 'Expected one final result for the entire batch'
+    }
+
+    Start-BlockedBatch 'batch background conflict'
+    Run-Palette 'SFTP files'
+    $null = Wait-Until 'drawer closed during the transfer' { !(Find-Element 'verified.bin' $button) }
+    [IO.File]::Delete($readGate)
+    Visit-TransferNotice 'Could not download /shell directory/verified\.bin.*destination.*exists.*1 of 2 items completed'
+    if (@(Read-TransferEvents $since).Count -ne 2) { throw 'Expected one additional notice for the failed batch' }
 
     Run-Palette 'SFTP files'
     foreach ($c in 'folder-download-live'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }

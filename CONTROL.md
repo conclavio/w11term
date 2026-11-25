@@ -640,6 +640,10 @@ With **Notify for long commands** on, the same event also includes integer
 `duration_ms` for commands that ran for at least 10 seconds. If the one-shot
 watch is also armed, that completion produces a single event.
 
+When an SFTP drawer transfer or batch finishes with another pane active or with
+its drawer closed, the originating pane records one `sftp-transfer` event.
+Its `data.message` contains the outcome shown in the Attention inbox.
+
 When a direct SSH shell or local program finishes, a restartable pane emits
 `pane-exited` with `{"exit_token":1}`. The top-level `restart_token` in the
 events result identifies its current exit, even if the event has aged out.

@@ -812,6 +812,11 @@ impl Events {
         self.append(self.state.lock().unwrap(), kind, data, None);
     }
 
+    pub fn sftp_transfer_finished(&self, message: &str) {
+        let message = inbox::sftp_transfer_text(message);
+        self.push("sftp-transfer", serde_json::json!({ "message": message }));
+    }
+
     fn bounded_data(kind: &str, data: Value) -> Value {
         let serialized = serde_json::to_string(&data).unwrap_or_default();
         if serialized.len() > 4096 {

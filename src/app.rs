@@ -1367,6 +1367,7 @@ impl TerminalApp {
         ));
     }
     fn connection_ui(&mut self, id: TabId) {
+        let active = self.tabs.active_id() == Some(id);
         let Some(AppTab {
             page: Page::Terminal(tab),
             ..
@@ -1375,7 +1376,7 @@ impl TerminalApp {
             return;
         };
         let frame = tab.session.frames.load();
-        tab.files.observe_connection(frame.connection_generation);
+        tab.observe_file_connection(frame.connection_generation, active);
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
         if self.hints.borrow().as_ref().is_some_and(|h| {
             h.pane == id
@@ -5988,7 +5989,7 @@ impl Component for TerminalApp {
                             );
                         }
                         tab.error = None;
-                        tab.files.observe_connection(frame.connection_generation);
+                        tab.observe_file_connection(frame.connection_generation, active);
                         if active {
                             tab.follow_shell_directory(&frame, context);
                         }

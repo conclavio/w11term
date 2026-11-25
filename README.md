@@ -391,6 +391,8 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 Choose **Select downloads…**, mark files or folders, and use **Download marked** to select one destination folder. Marks stay selected while you change pages, sort, or filter the listing. Files and folders keep their remote names. An existing destination, transfer error, or cancellation stops the batch and keeps items already saved.
 
+If a drawer transfer finishes while another pane is active or the drawer is closed, the **Attention inbox** gets one result for the transfer or batch. Select the result to open the originating pane’s SFTP drawer.
+
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
 Choose **Properties…** on a file, folder or symbolic link to read its current metadata. The dialog shows the remote path, entry type, size in bytes, octal permissions, numeric owner and group, and modification and access times in UTC. Unreported fields are marked **Not reported**. For a symbolic link, the dialog shows the link’s own attributes and asks the server for its target path. This also works for a dangling link.

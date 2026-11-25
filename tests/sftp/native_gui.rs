@@ -2578,11 +2578,16 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let batch_received = picker.join("batch received");
     let batch_conflict = picker.join("batch conflict");
     let batch_cancelled = picker.join("batch cancelled");
+    let batch_background = picker.join("batch background");
+    let batch_background_conflict = picker.join("batch background conflict");
     fs::create_dir_all(&received).unwrap();
     fs::create_dir_all(conflict.join("snapshot")).unwrap();
     fs::create_dir_all(&batch_received).unwrap();
     fs::create_dir_all(&batch_conflict).unwrap();
     fs::create_dir_all(&batch_cancelled).unwrap();
+    fs::create_dir_all(&batch_background).unwrap();
+    fs::create_dir_all(&batch_background_conflict).unwrap();
+    fs::write(batch_background_conflict.join("verified.bin"), b"user data").unwrap();
     fs::write(batch_conflict.join("verified.bin"), b"user data").unwrap();
     fs::write(received.join("neighbor.bin"), b"untouched sibling").unwrap();
     fs::write(conflict.join("snapshot/.manifest"), b"local manifest").unwrap();
@@ -2645,6 +2650,20 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     );
     assert!(!batch_conflict.join("z-later.bin").exists());
     assert_eq!(fs::read_dir(batch_cancelled).unwrap().count(), 0);
+    for folder in [&batch_background, &batch_background_conflict] {
+        assert_eq!(
+            fs::read(folder.join("interrupted/nested/payload.bin")).unwrap(),
+            vec![42; 3 * w11term::sftp::CHUNK]
+        );
+    }
+    assert_eq!(
+        fs::read(batch_background.join("verified.bin")).unwrap(),
+        verified
+    );
+    assert_eq!(
+        fs::read(batch_background_conflict.join("verified.bin")).unwrap(),
+        b"user data"
+    );
 
     let downloaded = received.join("snapshot");
     assert_eq!(

@@ -16,6 +16,10 @@ pub enum NoticeTarget {
         pane: u64,
         sequence: u64,
     },
+    SftpTransfer {
+        pane: u64,
+        sequence: u64,
+    },
     GroupRun {
         tab: u64,
         submission: u64,
@@ -95,7 +99,15 @@ impl fmt::Debug for Inbox {
 }
 
 pub(crate) fn display_field(field: &str) -> String {
-    let prefix: String = field.chars().take(200).collect();
+    display_field_with_limit(field, 200)
+}
+
+pub(super) fn sftp_transfer_text(field: &str) -> String {
+    display_field_with_limit(field, 640)
+}
+
+fn display_field_with_limit(field: &str, limit: usize) -> String {
+    let prefix: String = field.chars().take(limit).collect();
     prefix
         .split(|c: char| {
             c.is_whitespace()
@@ -146,6 +158,12 @@ impl Inbox {
                         .collect()
                 }
             }
+            "sftp-transfer" => {
+                let Some(message) = event.data["message"].as_str() else {
+                    return;
+                };
+                format!("SFTP transfer · {}", sftp_transfer_text(message))
+            }
             "command-finished" => event.data["exit_code"].as_i64().map_or_else(
                 || "Command finished · exit status unavailable".into(),
                 |code| format!("Command finished · exit code {code}"),
@@ -155,11 +173,19 @@ impl Inbox {
                 .map_or_else(|| notification_text(&event.data), str::to_owned),
             _ => return,
         };
-        self.push(
+        let target = if event.kind == "sftp-transfer" {
+            NoticeTarget::SftpTransfer {
+                pane,
+                sequence: event.sequence,
+            }
+        } else {
             NoticeTarget::Pane {
                 pane,
                 sequence: event.sequence,
-            },
+            }
+        };
+        self.push(
+            target,
             source.clone(),
             message,
             event.command,
@@ -429,7 +455,9 @@ impl Inbox {
     pub(super) fn move_pane_to(&self, pane: u64, target: &Self) {
         let mut moved = Vec::new();
         self.state.lock().unwrap().rows.retain(|notice| {
-            if matches!(notice.target, NoticeTarget::Pane { pane: from, .. } if from == pane) {
+            if matches!(notice.target, NoticeTarget::Pane { pane: from, .. }
+                | NoticeTarget::SftpTransfer { pane: from, .. } if from == pane)
+            {
                 let mut notice = notice.clone();
                 if matches!(notice.effect, Effect::VisualBell(_)) {
                     notice.effect = Effect::None;
@@ -661,6 +689,42 @@ mod tests {
             rows,
             [(2, 2), (1, 2), (2, 1), (1, 1)]
                 .map(|(pane, sequence)| NoticeTarget::Pane { pane, sequence })
+        );
+    }
+
+    #[test]
+    fn transfer_results_are_quiet_and_follow_the_owning_pane() {
+        let events = Events::default();
+        let first = Inbox::new(|| {});
+        let second = Inbox::new(|| {});
+        events.connect_inbox(12, "SSH", &first);
+        events.sftp_transfer_finished("Downloaded\nreport \u{202e} 2 of 2 items completed.");
+        let target = NoticeTarget::SftpTransfer {
+            pane: 12,
+            sequence: 1,
+        };
+        let row = &first.rows()[0];
+        assert_eq!(row.target, target);
+        assert_eq!(
+            row.message,
+            "SFTP transfer · Downloaded report 2 of 2 items completed."
+        );
+        assert!(row.unread);
+        assert!(!first.mark_read(12, 1));
+        let wake = first.acknowledge_wake();
+        assert!(!wake.flash_taskbar && wake.bells.is_empty());
+
+        events.connect_inbox(12, "SSH", &second);
+        assert!(first.rows().is_empty());
+        assert_eq!(second.unread_count(), 1);
+        assert!(second.mark_target_read(target));
+        assert_eq!(second.unread_count(), 0);
+        let batch = events.since(0);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "sftp-transfer");
+        assert_eq!(
+            batch.events[0].data["message"],
+            "Downloaded report 2 of 2 items completed."
         );
     }
 

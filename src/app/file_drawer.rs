@@ -70,6 +70,7 @@ fn request_generation(operation: &Operation, generation: u64) -> Option<u64> {
 pub enum FileAction {
     Toggle,
     OpenHere,
+    ShowTransfer(u64),
     Bookmarks(u64, u64, bookmarks::Action),
     Search(u64, u64, find::Action),
     Follow(u64, u64, bool),
@@ -1247,10 +1248,17 @@ impl FileDrawer {
         self.awaiting_native_result() || self.pending.is_some()
     }
 
-    pub(super) fn observe_connection(&mut self, generation: u64) {
+    fn transferring(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|job| job.transfer.is_some())
+    }
+
+    pub(super) fn observe_connection(&mut self, generation: u64) -> bool {
         if self.generation == generation {
-            return;
+            return false;
         }
+        let had_transfer = self.transferring();
         let status = match self.pending.as_mut() {
             Some(Pending {
                 step: Step::Change { change, .. },
@@ -1283,6 +1291,13 @@ impl FileDrawer {
             status,
             ..Self::default()
         };
+        had_transfer
+    }
+
+    fn observe_transfer_connection(&mut self, session: &Session, generation: u64, active: bool) {
+        if self.observe_connection(generation) && (!active || !self.open) {
+            session.events.sftp_transfer_finished(&self.status);
+        }
     }
 
     /// Sample only when ready to browse. A burst during a transfer or listing is
@@ -2185,13 +2200,16 @@ impl FileDrawer {
                     self.queue.finish(&mut self.status);
                     if upload {
                         let path = self.directory.clone().context("Missing upload directory")?;
-                        self.job(
+                        if let Err(error) = self.job(
                             id,
                             session,
                             Operation::Ls { path: path.clone() },
                             Step::Listing(path, None),
                             context,
-                        )?;
+                        ) {
+                            self.status
+                                .push_str(&format!(" Directory refresh failed. {error:#}"));
+                        }
                     }
                 } else {
                     self.transfer_next(id, session, context)?;
@@ -2237,6 +2255,11 @@ impl FileDrawer {
 }
 
 impl LiveTab {
+    pub(super) fn observe_file_connection(&mut self, generation: u64, active: bool) {
+        self.files
+            .observe_transfer_connection(&self.session, generation, active);
+    }
+
     pub(super) fn follow_shell_directory(
         &mut self,
         frame: &w11term::terminal::Snapshot,
@@ -2248,7 +2271,8 @@ impl LiveTab {
         let Source::Ssh(ssh) = &self.source else {
             return;
         };
-        self.files.observe_connection(frame.connection_generation);
+        self.files
+            .observe_transfer_connection(&self.session, frame.connection_generation, true);
         if let Some(path) = self
             .files
             .follow_target(&frame.reported_directory, &ssh.host)
@@ -2279,6 +2303,7 @@ impl TerminalApp {
             self.folder_authority(pane).as_ref() == Some(authority),
             "The SSH connection has changed"
         );
+        let active = self.tabs.active_id() == Some(id);
         let Some(AppTab {
             page: super::Page::Terminal(tab),
             ..
@@ -2291,8 +2316,8 @@ impl TerminalApp {
             generation == authority.connection_generation(),
             "The SSH connection has changed"
         );
+        tab.observe_file_connection(generation, active);
         let files = &mut tab.files;
-        files.observe_connection(generation);
         ensure!(
             !files.busy(),
             "The SFTP drawer is busy. Try again when the current operation finishes."
@@ -2420,7 +2445,8 @@ impl TerminalApp {
                 Some(id) => id,
                 None => return,
             },
-            Close(id)
+            ShowTransfer(id)
+            | Close(id)
             | Bookmarks(id, ..)
             | Search(id, ..)
             | Follow(id, ..)
@@ -2497,7 +2523,7 @@ impl TerminalApp {
         let was_editing = files.filter_editing();
         let finish_filter =
             may_open_dialog && was_editing && matches!(action, EditFilter(_, _, _, false));
-        files.observe_connection(frame.connection_generation);
+        files.observe_transfer_connection(session, frame.connection_generation, visible);
         if !matches!(
             action,
             Tick(_) | Picked(..) | Listed(..) | Drop(..) | PreparedDrop(..)
@@ -2533,10 +2559,12 @@ impl TerminalApp {
             &action,
             TextEditor(_, _, editor::Action::Text(_) | editor::Action::Name(_))
         );
+        let background_transfer =
+            matches!(action, Tick(_)) && (!visible || !files.open) && files.transferring();
         let keep_directory = editor_typing
             || matches!(
                 &action,
-                Filter(..) | ClearFilter(..) | FocusFilter(..) | Sort(..)
+                Filter(..) | ClearFilter(..) | FocusFilter(..) | Sort(..) | ShowTransfer(..)
             );
         if !editor_typing && !matches!(action, Tick(_) | EditName(..) | FocusFilter(..)) {
             files.cached.borrow_mut().take();
@@ -2573,6 +2601,13 @@ impl TerminalApp {
                     if files.open && files.directory.is_none() && !files.busy() {
                         files.browse(pane, session, ".".into(), None, context)?;
                     }
+                }
+                ShowTransfer(_) => {
+                    files.open = true;
+                    files.bookmarks = None;
+                    files.close_search();
+                    self.initial_grid.set(None);
+                    crate::input::clear_grid();
                 }
                 OpenHere => {
                     files.bookmarks = None;
@@ -3045,6 +3080,10 @@ impl TerminalApp {
             };
             files.queue.finish(&mut files.status);
             files.cached.borrow_mut().take();
+        }
+        // A queued item installs the next transfer before the tick returns.
+        if background_transfer && !files.transferring() {
+            session.events.sftp_transfer_finished(&files.status);
         }
         if visible {
             let return_to_terminal = finish_filter && !tab.files.filter_editing();
