@@ -33,6 +33,8 @@ mod group_upload;
 pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_path};
 mod drop_source;
 mod editor;
+mod find;
+pub use find::{FilenameMatch, FilenameSearch, valid_filename_query};
 mod text_preview;
 mod upload_directory;
 pub(crate) use directory::valid_component;
@@ -136,6 +138,10 @@ pub enum Operation {
     },
     Ls {
         path: String,
+    },
+    Find {
+        path: String,
+        query: String,
     },
     /// Read the selected regular file for the native drawer on its current connection.
     #[serde(skip)]
@@ -619,6 +625,7 @@ pub(crate) async fn run(
                 },
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
+                Operation::Find { .. } => JobStage::Checking("Filename search did not finish"),
                 Operation::GetDir { .. } => JobStage::DirectoryDownload {
                     staging: None,
                     deadline,
@@ -950,6 +957,9 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            Find { path, query } => {
+                serde_json::to_value(self.find_filenames(&path, &query, cancel).await?)?
+            }
             EntryProperties { path } => {
                 let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
                 let mut result = json!({ "attrs": attrs });

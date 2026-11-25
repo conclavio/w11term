@@ -136,6 +136,18 @@ try {
     $null = Open-Filter
     if ((Filter-Value) -cne '') { throw 'Child directory retained a filter from its parent' }
     Click 'Done'
+    Click 'Back'
+    $null = Wait-Until 'parent directory restored' { Find-Element $parent }
+    Click ('Find files' + [char]0x2026)
+    $field = Wait-Until 'recursive filename search field' {
+        Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
+    }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('INSIDE.TXT')
+    Click 'Search'
+    Click "Reveal $parent/nested/inside.txt"
+    $null = Wait-Until 'search result shown and selected in its containing folder' {
+        (Find-Element "$parent/nested") -and (Button 'inside.txt') -and (Button $download).Current.IsEnabled
+    }
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
     foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }

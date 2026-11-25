@@ -552,6 +552,11 @@ impl russh_sftp::server::Handler for Files {
         Ok(handle)
     }
     async fn close(&mut self, id: u32, h: String) -> Result<Status, StatusCode> {
+        if self.root.join("trace-directory-close").exists()
+            && matches!(self.handles.get(&h), Some(Opened::Dir(_)))
+        {
+            self.trace_listing("CLOSE DIR")?;
+        }
         if matches!(self.handles.get(&h), Some(Opened::File(_))) {
             self.trace_transfer("CLOSE")?;
             self.hold_response("hold-transfer-close").await;
@@ -1049,6 +1054,8 @@ async fn guarded_job(
 mod cancellation;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
+#[path = "sftp/find.rs"]
+mod find;
 #[path = "sftp/in_band_resize.rs"]
 mod in_band_resize;
 #[cfg(feature = "ui-smoke")]

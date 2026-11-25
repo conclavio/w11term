@@ -12,6 +12,7 @@ pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECOND
   put LOCAL REMOTE [--overwrite] [--atomic]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
+  find ROOT QUERY\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -133,6 +134,15 @@ pub fn parse(
                 "path".into(),
                 json!(paths.next().unwrap_or_else(|| ".".into())),
             );
+        }
+        "find" => {
+            fields.insert("path".into(), json!(path()?));
+            let query = paths.next().context("missing filename fragment")?;
+            ensure!(
+                w11term::sftp::valid_filename_query(&query),
+                "Enter a filename fragment up to 256 bytes"
+            );
+            fields.insert("query".into(), json!(query));
         }
         "opendir" | "stat" | "lstat" | "setstat" | "mkdir" | "remove-file" | "remove-dir"
         | "realpath" | "readlink" | "statvfs" | "expand-path" | "open" => {
@@ -281,6 +291,24 @@ mod tests {
             assert!(p(args).is_err(), "{args:?}");
         }
     }
+    #[test]
+    fn find_preserves_the_remote_root_and_literal_fragment() {
+        let (
+            _,
+            Request::Sftp {
+                operation: Operation::Find { path, query },
+                ..
+            },
+        ) = p(&["find", "--pane", "2", "/logs old", "[Ångström]"]).unwrap()
+        else {
+            panic!("expected filename search")
+        };
+        assert_eq!(path, "/logs old");
+        assert_eq!(query, "[Ångström]");
+        assert!(p(&["find", "--pane", "2", "/logs", " "]).is_err());
+        assert!(p(&["find", "--pane", "2", "/logs"]).is_err());
+    }
+
     #[test]
     fn expected_sha256_is_only_accepted_for_single_file_downloads() {
         let digest = "AB".repeat(32);

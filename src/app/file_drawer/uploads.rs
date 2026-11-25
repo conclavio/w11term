@@ -39,6 +39,7 @@ impl DropTarget {
     fn current(&self, drawer: &FileDrawer) -> bool {
         drawer.open
             && drawer.bookmarks.is_none()
+            && drawer.search.is_none()
             && self.generation != 0
             && self.generation == drawer.generation
             && drawer.directory.as_ref() == Some(&self.parent)

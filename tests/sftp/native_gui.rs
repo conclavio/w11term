@@ -2881,13 +2881,17 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             listings.last_mut().expect("OPENDIR before READDIR").1 += 1;
         }
     }
-    // This fixture returns one entry per READDIR plus one final EOF. Only
-    // opening the drawer, refreshing, and entering the child may read a list.
+    // Each listing returns one entry per READDIR plus EOF. Filtering reads no
+    // directory pages. Recursive search reads the root and its child once each.
     assert_eq!(
         listings,
         [
             ("/shell directory", fillers + 4),
             ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5),
+            ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
         ]
     );

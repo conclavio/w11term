@@ -11,6 +11,7 @@ use w11term::sftp::{
 
 mod bookmarks;
 mod editor;
+mod find;
 mod history;
 mod preview;
 mod properties;
@@ -64,6 +65,7 @@ pub enum FileAction {
     Toggle,
     OpenHere,
     Bookmarks(u64, u64, bookmarks::Action),
+    Search(u64, u64, find::Action),
     Follow(u64, u64, bool),
     Reveal(u64, u64, String, Option<String>),
     Close(u64),
@@ -116,6 +118,7 @@ pub(super) struct FileDrawer {
     directory: Option<String>,
     history: FolderHistory,
     bookmarks: Option<bookmarks::List>,
+    search: Option<find::Panel>,
     /// Describes an explicit navigation request if either REALPATH or listing fails.
     opening_target: Option<String>,
     following: bool,
@@ -334,6 +337,7 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    Search(u64),
     SaveText(editor::Save),
     Transfer(TransferFile),
     Change { parent: String, change: EntryChange },
@@ -1158,6 +1162,7 @@ impl FileDrawer {
 
     fn close(&mut self) {
         self.open = false;
+        self.close_search();
         if self.preparing_drop.take().is_some() {
             self.status.clear();
         }
@@ -1213,6 +1218,7 @@ impl FileDrawer {
             },
         };
         let editor = self.detach_editor();
+        self.close_search();
         *self = Self {
             open: self.open,
             following: self.following,
@@ -1233,6 +1239,7 @@ impl FileDrawer {
             || self.busy()
             || self.filter_editing()
             || self.bookmarks.is_some()
+            || self.search.is_some()
             || self.last_report == *report
         {
             return None;
@@ -1267,6 +1274,9 @@ impl FileDrawer {
             });
             view
         };
+        if let Some(search) = &self.search {
+            return cache(search.view(self, pane, context));
+        }
         if let Some(list) = &self.bookmarks
             && Some(list.profile.as_str()) == profile
         {
@@ -1334,6 +1344,11 @@ impl FileDrawer {
                         GoToFolder(pane, generation, revision),
                     )),
                 )),
+            button(
+                "Find files…",
+                writable && generation != 0,
+                Search(pane, generation, find::Action::Show(revision)),
+            ),
             StackPanel::new()
                 .orientation(if layout.content_width() >= 300.0 {
                     Orientation::Horizontal
@@ -1820,6 +1835,8 @@ impl FileDrawer {
                 progress: tx_progress,
                 cancel: if matches!(step, Step::Preview(_)) {
                     self.preview.as_ref().map(|p| p.cancel.clone())
+                } else if matches!(step, Step::Search(_)) {
+                    self.search.as_ref().and_then(|p| p.cancel.clone())
                 } else {
                     transfer.as_ref().map(|active| active.cancel.clone())
                 },
@@ -1846,6 +1863,7 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.cancel_preview();
+        self.close_search();
         self.bookmarks = None;
         self.opening_target = None;
         self.end_filter_edit();
@@ -1936,6 +1954,7 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::Search(serial), reply) => self.finish_search(serial, reply),
             (Step::SaveText(save), result) => {
                 if let Some((parent, name)) = self.finish_save(save, result) {
                     self.reveal = Some(RevealTarget::Existing(name));
@@ -2278,6 +2297,7 @@ impl TerminalApp {
             },
             Close(id)
             | Bookmarks(id, ..)
+            | Search(id, ..)
             | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
@@ -2395,6 +2415,12 @@ impl TerminalApp {
         }
         let result = (|| -> Result<()> {
             match action {
+                Search(_, generation, action)
+                    if files.open && may_open_dialog && generation == files.generation =>
+                {
+                    files.filename_search(pane, session, action, context)?;
+                }
+                Search(..) => {}
                 Bookmarks(_, generation, action)
                     if files.open && generation == files.generation =>
                 {
