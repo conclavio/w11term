@@ -140,6 +140,14 @@ impl EntryPreview {
                             }))
                             .content("Copy SHA-256"),
                     ));
+                    fields.push(KeyedView::new(
+                        "verified-download",
+                        Button::new()
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::VerifyChecksum(pane, generation, serial))
+                            }))
+                            .content("Use for verified download"),
+                    ));
                 }
                 if let Some(status) = &self.copy_status {
                     fields.push(KeyedView::new(
@@ -285,16 +293,21 @@ impl FileDrawer {
         preview.view.take();
     }
 
-    pub(super) fn copy_checksum(&mut self, serial: u64) {
-        let Some(preview) = self.preview.as_ref().filter(|p| {
+    fn ready_checksum(&self, serial: u64) -> Option<(&ListedEntry, &str)> {
+        let preview = self.preview.as_ref().filter(|p| {
             p.serial == serial
                 && matches!(p.kind, PreviewKind::Checksum(_))
                 && self.open
                 && self.check_selected(&p.entry).is_ok()
-        }) else {
-            return;
-        };
+        })?;
         let Contents::Ready(sha256) = &preview.content else {
+            return None;
+        };
+        Some((&preview.entry, sha256))
+    }
+
+    pub(super) fn copy_checksum(&mut self, serial: u64) {
+        let Some((_, sha256)) = self.ready_checksum(serial) else {
             return;
         };
         let status = match w11term::clipboard::write(sha256) {
@@ -304,6 +317,15 @@ impl FileDrawer {
         let preview = self.preview.as_mut().unwrap();
         preview.copy_status = Some(status);
         preview.view.take();
+    }
+
+    pub(super) fn verify_checksum(&mut self, serial: u64) -> Result<()> {
+        let Some((entry, digest)) = self.ready_checksum(serial) else {
+            return Ok(());
+        };
+        let (entry, digest) = (entry.clone(), digest.to_owned());
+        self.cancel_preview();
+        self.begin_verified_download(entry, digest)
     }
 
     pub(super) fn close_preview(&mut self, serial: u64) {
@@ -329,6 +351,35 @@ impl FileDrawer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn verified_download_reuses_only_the_current_checksum_and_selection() {
+        let (mut files, entry) = selected(ListedKind::Known(EntryKind::File));
+        let (properties, _) = files
+            .begin_preview(entry.clone(), PreviewKind::Properties)
+            .unwrap();
+        files.finish_preview(properties, Ok(json!({"attrs": {"permissions": 0o100644}})));
+        let (checksum, _) = files
+            .begin_preview(entry, PreviewKind::Checksum(properties))
+            .unwrap();
+        let digest = "f".repeat(64);
+        files.finish_preview(checksum, Ok(json!({"sha256": digest})));
+
+        files.verify_checksum(properties).unwrap();
+        assert!(files.dialog.is_none());
+        let selection = files.selected.take();
+        files.verify_checksum(checksum).unwrap();
+        assert!(files.dialog.is_none());
+        files.selected = selection;
+
+        files.verify_checksum(checksum).unwrap();
+        assert!(files.preview.is_none());
+        let dialog = files.dialog.as_ref().unwrap();
+        assert!(!dialog.resume_download);
+        assert_eq!(dialog.destination().unwrap(), digest);
+        assert!(matches!(&dialog.action, EditAction::VerifyDownload(entry)
+            if entry.name == "résumé 100% [pilot].txt"));
+    }
 
     fn selected(kind: ListedKind) -> (FileDrawer, ListedEntry) {
         let name = "résumé 100% [pilot].txt";

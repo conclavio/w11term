@@ -98,6 +98,7 @@ pub enum FileAction {
     Preview(u64, u64, ListedEntry, PreviewKind),
     ClosePreview(u64, u64, u64),
     CopyChecksum(u64, u64, u64),
+    VerifyChecksum(u64, u64, u64),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
@@ -1091,6 +1092,17 @@ impl FileDrawer {
             self.end_filter_edit();
             self.show_entry_dialog(self.directory.clone(), EditAction::GoToFolder { revision });
         }
+    }
+
+    fn begin_verified_download(&mut self, entry: ListedEntry, digest: String) -> Result<()> {
+        ensure!(
+            entry.kind != ListedKind::Known(EntryKind::Directory),
+            "Choose a file to verify"
+        );
+        self.end_filter_edit();
+        self.begin_edit(entry.parent.clone(), EditAction::VerifyDownload(entry))?;
+        self.dialog.as_mut().unwrap().name = digest;
+        Ok(())
     }
 
     fn show_entry_dialog(&mut self, parent: Option<String>, action: EditAction) {
@@ -2680,6 +2692,7 @@ impl TerminalApp {
             | Preview(id, ..)
             | ClosePreview(id, ..)
             | CopyChecksum(id, ..)
+            | VerifyChecksum(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
@@ -2745,7 +2758,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2859,6 +2872,11 @@ impl TerminalApp {
                 CopyChecksum(_, _, serial) => {
                     if may_open_dialog {
                         files.copy_checksum(serial);
+                    }
+                }
+                VerifyChecksum(_, _, serial) => {
+                    if may_open_dialog {
+                        files.verify_checksum(serial)?;
                     }
                 }
                 StartTextEditor(_, generation, serial) => {
@@ -3193,12 +3211,7 @@ impl TerminalApp {
                     if !may_open_dialog {
                         return Ok(());
                     }
-                    ensure!(
-                        entry.kind != ListedKind::Known(EntryKind::Directory),
-                        "Choose a file to verify"
-                    );
-                    files.end_filter_edit();
-                    files.begin_edit(entry.parent.clone(), EditAction::VerifyDownload(entry))?;
+                    files.begin_verified_download(entry, String::new())?;
                 }
                 Delete(_, _, entry) if may_open_dialog => {
                     files.check_selected(&entry)?;

@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reads fresh metadata and hashes a file through native SFTP Properties and the CLI"]
+#[ignore = "reads fresh SFTP properties, hashes a file and carries its digest into a verified download"]
 async fn native_sftp_properties_uses_fresh_metadata_and_keeps_the_selected_entry() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, opens, server) =
@@ -39,6 +39,10 @@ async fn native_sftp_properties_uses_fresh_metadata_and_keeps_the_selected_entry
             "LSTAT /shell directory/pilot 雪.bin",
             "LSTAT /shell directory/pilot 雪.bin",
             "LSTAT /shell directory/pilot 雪.bin",
+            "LSTAT /shell directory/pilot 雪.bin",
+            "LSTAT /shell directory/pilot 雪.bin",
+            "LSTAT /shell directory/pilot 雪.bin",
+            "LSTAT /shell directory/pilot 雪.bin",
         ]
     );
     let transfers = fs::read_to_string(root.join("transfer-trace")).unwrap();
@@ -49,11 +53,8 @@ async fn native_sftp_properties_uses_fresh_metadata_and_keeps_the_selected_entry
             "READ 0",
             "READ 57",
             "CLOSE",
-            "OPEN /shell directory/pilot 雪.bin",
-            "READ 0",
-            "READ 57",
-            "CLOSE",
         ]
+        .repeat(5)
     );
     assert_eq!(
         fs::read(root.join("keyboard-input.bin")).unwrap(),
