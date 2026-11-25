@@ -463,6 +463,8 @@ After revealing a match, choose **Back to search results** to return to the same
 
 Choose **Properties…** beside a search result to inspect its current metadata without leaving the results. For regular files, you can also calculate or copy the SHA-256 digest and use it for a verified download.
 
+Choose **Shell in containing folder** to open a right split on the same authenticated SSH connection with that folder as its working directory. The search stays open in the source pane.
+
 Choose **Copy path** beside a search result for its absolute remote path, or **Copy all paths** for one path per line from every retained results page. Paths are plain text and keep their spaces, Unicode, and literal names. Copy paths containing line breaks individually.
 
 Under **Sort by**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.

@@ -91,6 +91,7 @@ impl Panel {
         &self,
         files: &FileDrawer,
         pane: u64,
+        shell_ready: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let generation = files.generation;
@@ -238,6 +239,24 @@ impl Panel {
                             .text(&path)
                             .text_wrapping(TextWrapping::Wrap),
                     );
+                let entry = if shell_ready
+                    && let Some(origin) =
+                        directory_split::Origin::search(pane, generation, serial, hit)
+                {
+                    let shell = Button::new()
+                        .automation_name(format!("Open shell in containing folder of {path}"))
+                        .is_enabled(ready)
+                        .on_click(ctx.callback(move |_| {
+                            directory_split::message(
+                                directory_split::Destination::Split(Axis::Columns),
+                                Some(&origin),
+                            )
+                        }))
+                        .content("Shell in containing folder");
+                    StackPanel::new().spacing(4.0).children((reveal, shell))
+                } else {
+                    reveal
+                };
                 let mut actions = Vec::new();
                 if let Some(label) = match hit.kind {
                     Some(EntryKind::File) => Some("Download…"),
@@ -305,7 +324,7 @@ impl Panel {
                         .columns([GridLength::Star(1.0), GridLength::Auto])
                         .column_spacing(6.0)
                         .children((
-                            reveal,
+                            entry,
                             StackPanel::new()
                                 .grid_column(1)
                                 .spacing(4.0)
@@ -649,7 +668,7 @@ mod tests {
                 query: "log".into(),
                 result: Some(FilenameSearch {
                     root: "/project".into(),
-                    matches: vec![hit],
+                    matches: vec![hit.clone()],
                     scanned_directories: 2,
                     scanned_entries: 3,
                     skipped_directories: 0,
@@ -662,6 +681,7 @@ mod tests {
             }),
             ..FileDrawer::default()
         };
+        assert!(drawer.search_shell_origin(14, 2, &hit).is_some());
         assert!(drawer.download_target(&target, false).is_err());
         let (serial, op) = drawer
             .begin_preview(target.clone(), PreviewKind::Properties)
@@ -708,6 +728,7 @@ mod tests {
         drawer.finish_preview(serial, Ok(metadata));
         assert!(!drawer.entry_dialog_open());
         assert!(drawer.download_target(&target, true).is_err());
+        assert!(drawer.search_shell_origin(14, 2, &hit).is_none());
     }
 
     #[test]
