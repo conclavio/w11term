@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 
 #[derive(Default)]
 pub(super) struct TransferQueue {
@@ -7,6 +8,8 @@ pub(super) struct TransferQueue {
     pub(super) batch_id: Option<TransferId>,
     pub(super) total: usize,
     pub(super) completed: usize,
+    pub(super) download_folder: Option<Arc<Path>>,
+    pub(super) saved_download: Option<SavedDownload>,
 }
 
 impl TransferQueue {
@@ -18,7 +21,16 @@ impl TransferQueue {
         self.completed + 1
     }
 
-    pub(super) fn finish(&mut self, status: &mut String) {
+    pub(super) fn record_download(&mut self, file: &TransferFile) {
+        if file.is_download() {
+            self.saved_download = match &self.download_folder {
+                Some(folder) => Some(SavedDownload::BatchFolder(folder.clone())),
+                None => file.downloaded_item(),
+            };
+        }
+    }
+
+    pub(super) fn finish(&mut self, status: &mut String) -> Option<SavedDownload> {
         if self.total > 1 {
             use std::fmt::Write;
             let _ = write!(
@@ -27,6 +39,6 @@ impl TransferQueue {
                 self.completed, self.total
             );
         }
-        *self = Self::default();
+        std::mem::take(self).saved_download
     }
 }

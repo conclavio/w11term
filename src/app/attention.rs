@@ -32,6 +32,7 @@ pub enum Action {
         pane: u64,
         sequence: u64,
     },
+    ShowSavedDownload(NoticeTarget),
     Notification {
         pane: u64,
         sequence: u64,
@@ -150,6 +151,12 @@ impl TerminalApp {
                 }
                 self.tabs.select(id);
                 self.file_action(FileAction::ShowTransfer(pane), ctx);
+            }
+            Action::ShowSavedDownload(target) => {
+                if let Some(saved) = self.inbox.read_saved_download(target) {
+                    explorer::show_download(saved, ctx);
+                }
+                return;
             }
             Action::Notification {
                 pane,
@@ -470,6 +477,23 @@ impl TerminalApp {
                             visit,
                             StackPanel::new().spacing(4.0).keyed_children(controls),
                         ))
+                    } else if let Some(saved) = &row.saved_download {
+                        let action = explorer::download_label(saved);
+                        let target = row.target;
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .column_spacing(8.0)
+                            .children((
+                                visit,
+                                Button::new()
+                                    .grid_column(1)
+                                    .style(ButtonStyle::Subtle)
+                                    .automation_name(format!("{action} for {source}, notice {sequence}"))
+                                    .on_click(ctx.callback(move |_| {
+                                        Message::Attention(Action::ShowSavedDownload(target))
+                                    }))
+                                    .content(action),
+                            ))
                     } else if let Some(command) = command {
                         Grid::new()
                             .columns([GridLength::STAR, GridLength::Auto])

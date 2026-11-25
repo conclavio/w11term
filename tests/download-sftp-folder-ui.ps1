@@ -7,6 +7,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_SFTP_PICKER_SMOKE_DIR = Join-Path $State 'picker'
+$env:W11TERM_TEST_EXPLORER_TRACE = Join-Path $State 'explorer-download.json'
 $profiles = Join-Path $State 'profiles.json'
 $peer = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $readGate = Join-Path $peer 'hold-transfer-read'
@@ -40,6 +41,34 @@ function Wait-Status([string]$Pattern) {
         foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text)) {
             if ($item.Current.Name -match $Pattern) { return $true }
         }
+    }
+}
+
+function Assert-Explorer([string]$ButtonName, [string]$Action, [string]$Expected) {
+    [IO.File]::Delete($env:W11TERM_TEST_EXPLORER_TRACE)
+    Click $ButtonName
+    $trace = Wait-Until "native Explorer call for '$ButtonName'" {
+        try {
+            $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+            $stream = [IO.File]::Open($env:W11TERM_TEST_EXPLORER_TRACE, [IO.FileMode]::Open,
+                [IO.FileAccess]::Read, $sharing)
+        } catch [IO.FileNotFoundException] {
+            return
+        } catch [IO.IOException] {
+            if (($_.Exception.HResult -band 0xffff) -in 32,33) { return }
+            throw
+        }
+        $reader = [IO.StreamReader]::new($stream)
+        try { $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    }
+    $samePath = if ([IO.Directory]::Exists($Expected)) {
+        [IO.Directory]::Exists($trace.path) -and
+            [IO.Path]::GetFullPath($Expected) -ieq [IO.Path]::GetFullPath($trace.path)
+    } else {
+        [FixtureDialog]::SameFile($Expected, $trace.path)
+    }
+    if ($trace.action -cne $Action -or !$samePath) {
+        throw "Explorer received the wrong action or item: $($trace | ConvertTo-Json -Compress)"
     }
 }
 
@@ -108,6 +137,10 @@ function Visit-TransferNotice([string]$Summary) {
 }
 
 $reader = $null
+try {
+    $explorer = New-Object -ComObject Shell.Application
+    $priorExplorerWindows = @($explorer.Windows() | ForEach-Object { $_.HWND })
+} catch { $explorer = $null }
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $reader = Open-PeerTraceReader (Join-Path $peer 'transfer-trace')
@@ -134,17 +167,20 @@ try {
 
     Download-To 'snapshot' 'receive here'
     Wait-Status '^Downloaded /shell directory/snapshot\b.*2 files, 23 bytes'
+    Assert-Explorer 'Show download in File Explorer' 'select' (Join-Path $State 'picker/receive here/snapshot')
     # Even when single-file replacement is enabled, an existing directory cannot be merged or replaced.
     (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
     $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
     Download-To 'snapshot' 'already exists'
     Wait-Status 'destination.*exists'
+    if (Find-Element 'Show download in File Explorer' $button) { throw 'An unsuccessful download offered an Explorer action' }
 
     $digest = [IO.File]::ReadAllText((Join-Path $State 'verified.sha256'))
     Download-Verified ('0' * 64) (Join-Path $State 'rejected.bin')
     Wait-Status 'SHA-256 mismatch'
     Download-Verified $digest (Join-Path $State 'accepted.bin') -ResumeDownload
     Wait-Status 'SHA-256 verified'
+    Assert-Explorer 'Show download in File Explorer' 'select' (Join-Path $State 'accepted.bin')
 
     Click ('Select downloads' + [char]0x2026)
     Mark-Download 'snapshot/'
@@ -174,6 +210,7 @@ try {
     }
     [IO.File]::Delete($readGate)
     Wait-Status '^Cancelled download of /shell directory/interrupted.*0 of 2 items completed'
+    if (Find-Element 'Open download folder' $button) { throw 'A cancelled batch without saved items offered an Explorer action' }
     if (@(Read-TransferEvents $since).Count -ne 0) { throw 'Visible transfers produced a background notice' }
 
     Start-BlockedBatch 'batch background'
@@ -201,10 +238,13 @@ try {
     [IO.File]::Delete($readGate)
     Visit-TransferNotice 'Could not download /shell directory/verified\.bin.*destination.*exists.*1 of 2 items completed'
     if (@(Read-TransferEvents $since).Count -ne 2) { throw 'Expected one additional notice for the failed batch' }
+    Assert-Explorer 'Open download folder' 'explore' (Join-Path $State 'picker/batch background conflict')
 
     Run-Palette 'SFTP files'
     foreach ($c in 'folder-download-live'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','folder-download-live')
+    Click 'Attention inbox, 0 unread'
+    Assert-Explorer "Open download folder for palette-ssh, notice $($events[0].sequence)" 'explore' (Join-Path $State 'picker/batch background')
 } catch {
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
     throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"
@@ -216,4 +256,15 @@ try {
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
     }
     $app.Dispose()
+    if ($explorer) {
+        $ownedRoot = [IO.Path]::GetFullPath($State).TrimEnd('\') + '\'
+        try { $views = @($explorer.Windows()) } catch { $views = @() }
+        foreach ($view in $views) {
+            try {
+                $folder = $view.Document.Folder.Self.Path
+                if ($view.HWND -notin $priorExplorerWindows -and $folder -and
+                    $folder.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { $view.Quit() }
+            } catch { }
+        }
+    }
 }

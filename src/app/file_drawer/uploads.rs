@@ -346,7 +346,8 @@ mod tests {
                     "directories":1, "skipped":0, "bytes_transferred":0})))
                     .unwrap();
             }
-            let status = file.reconnect_status(&mut response, 0, &mut queue);
+            let (status, saved) = file.reconnect_status(&mut response, 0, &mut queue);
+            assert!(saved.is_none());
             let completed = if reply_value == Some(false) { 2 } else { 1 };
             assert!(
                 status.ends_with(&format!("{completed} of 4 items completed.")),

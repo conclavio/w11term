@@ -41,7 +41,22 @@ pub struct Event {
     #[serde(skip)]
     pub(crate) command: Option<CommandLink>,
     #[serde(skip)]
+    saved_download: Option<SavedDownload>,
+    #[serde(skip)]
     eviction: Option<Arc<Notify>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavedDownload {
+    File(Arc<Path>),
+    Folder(Arc<Path>),
+    BatchFolder(Arc<Path>),
+}
+
+#[derive(Default)]
+struct EventLinks {
+    command: Option<CommandLink>,
+    saved_download: Option<SavedDownload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,7 +333,7 @@ impl Events {
         }
         let data = phase.as_json();
         state.ssh_connection_phase = Some(phase);
-        Self::append_locked(state, "ssh-connection", data, None);
+        Self::append_locked(state, "ssh-connection", data, EventLinks::default());
         true
     }
 
@@ -812,9 +827,20 @@ impl Events {
         self.append(self.state.lock().unwrap(), kind, data, None);
     }
 
-    pub fn sftp_transfer_finished(&self, message: &str) {
+    pub fn sftp_transfer_finished(&self, message: &str, saved_download: Option<SavedDownload>) {
         let message = inbox::sftp_transfer_text(message);
-        self.push("sftp-transfer", serde_json::json!({ "message": message }));
+        let mut state = self.state.lock().unwrap();
+        Self::append_locked(
+            &mut state,
+            "sftp-transfer",
+            serde_json::json!({ "message": message }),
+            EventLinks {
+                saved_download,
+                ..EventLinks::default()
+            },
+        );
+        drop(state);
+        self.changed.notify_waiters();
     }
 
     fn bounded_data(kind: &str, data: Value) -> Value {
@@ -845,12 +871,20 @@ impl Events {
         data: Value,
         command: Option<CommandLink>,
     ) {
-        Self::append_locked(&mut state, kind, data, command);
+        Self::append_locked(
+            &mut state,
+            kind,
+            data,
+            EventLinks {
+                command,
+                ..EventLinks::default()
+            },
+        );
         drop(state);
         self.changed.notify_waiters();
     }
 
-    fn append_locked(state: &mut State, kind: &str, data: Value, command: Option<CommandLink>) {
+    fn append_locked(state: &mut State, kind: &str, data: Value, links: EventLinks) {
         state.next += 1;
         let sequence = state.next;
         let timestamp_ms = SystemTime::now()
@@ -864,7 +898,8 @@ impl Events {
             timestamp_ms,
             kind: kind.into(),
             data,
-            command,
+            command: links.command,
+            saved_download: links.saved_download,
             eviction,
         };
         if let Some((pane, label, inbox)) = &state.inbox {

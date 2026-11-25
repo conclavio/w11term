@@ -74,6 +74,7 @@ impl FileDrawer {
             remaining,
             batch_id: Some(id),
             total,
+            download_folder: Some(Arc::from(parent)),
             ..TransferQueue::default()
         })
     }
@@ -98,14 +99,18 @@ pub(super) fn download_to(
         let resume = verification.as_ref().is_some_and(|options| options.resume);
         (
             Operation::Get {
-                local,
+                local: local.clone(),
                 remote: remote.clone(),
                 overwrite,
                 max_bytes: None,
                 expected_sha256: verification.map(|options| options.sha256),
                 resume,
             },
-            TransferFile::Download { remote, resume },
+            TransferFile::Download {
+                remote,
+                resume,
+                local,
+            },
         )
     }
 }
@@ -185,6 +190,39 @@ mod tests {
                 ..FileDrawer::default()
             };
             assert!(TransferPicker::DownloadMarked.purpose(&drawer).is_err());
+        }
+    }
+
+    #[test]
+    fn interrupted_batch_keeps_only_the_destination_of_confirmed_downloads() {
+        let destination = Arc::from(Path::new(r"C:\downloads"));
+        let (_, item) = download_to(
+            "/logs/second".into(),
+            PathBuf::from(r"C:\downloads\second"),
+            false,
+            false,
+            None,
+        );
+        for completed in [0, 1] {
+            let mut queue = TransferQueue {
+                download_folder: Some(Arc::clone(&destination)),
+                total: 2,
+                ..TransferQueue::default()
+            };
+            if completed > 0 {
+                queue.record_download(&item);
+                queue.completed_one();
+            }
+            let (sender, mut reply) = oneshot::channel();
+            sender
+                .send(Ok(serde_json::json!({"cancelled": true})))
+                .unwrap();
+            let (status, saved) = item.reconnect_status(&mut reply, 0, &mut queue);
+            assert!(status.ends_with(&format!("{completed} of 2 items completed.")));
+            assert_eq!(
+                saved,
+                (completed > 0).then(|| SavedDownload::BatchFolder(destination.clone()))
+            );
         }
     }
 }

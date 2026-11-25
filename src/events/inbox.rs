@@ -1,4 +1,6 @@
-use super::{CommandLink, Event, GroupTranscriptLine, PendingSshAttempt, SshAttemptOutcome};
+use super::{
+    CommandLink, Event, GroupTranscriptLine, PendingSshAttempt, SavedDownload, SshAttemptOutcome,
+};
 use std::{
     collections::VecDeque,
     fmt,
@@ -63,6 +65,14 @@ pub struct Notice {
     pub unread: bool,
     pub command: Option<CommandLink>,
     pub login_results: Option<Arc<[SshLoginResult]>>,
+    pub saved_download: Option<SavedDownload>,
+}
+
+#[derive(Default)]
+struct NoticeDetails {
+    command: Option<CommandLink>,
+    login_results: Option<Arc<[SshLoginResult]>>,
+    saved_download: Option<SavedDownload>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -188,8 +198,11 @@ impl Inbox {
             target,
             source.clone(),
             message,
-            event.command,
-            None,
+            NoticeDetails {
+                command: event.command,
+                saved_download: event.saved_download.clone(),
+                ..NoticeDetails::default()
+            },
             (
                 match (live, event.kind.as_str()) {
                     (true, "command-finished") => Effect::FlashTaskbar,
@@ -224,8 +237,7 @@ impl Inbox {
             NoticeTarget::GroupRun { tab, submission },
             display_field(source).into(),
             message,
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -247,8 +259,7 @@ impl Inbox {
             NoticeTarget::GroupCanary { tab, submission },
             display_field(source).into(),
             format!("{result} · {}", display_field(host)),
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -273,8 +284,10 @@ impl Inbox {
             NoticeTarget::GroupLogins { tab, sequence },
             display_field(source).into(),
             format!("SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"),
-            None,
-            Some(results.into()),
+            NoticeDetails {
+                login_results: Some(results.into()),
+                ..NoticeDetails::default()
+            },
             (Effect::FlashTaskbar, None),
         );
     }
@@ -302,8 +315,7 @@ impl Inbox {
             },
             display_field(source).into(),
             message,
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -368,8 +380,7 @@ impl Inbox {
             NoticeTarget::GroupOutputMissing { tab, submission },
             display_field(source).into(),
             message,
-            None,
-            None,
+            NoticeDetails::default(),
             (Effect::FlashTaskbar, None),
         );
     }
@@ -379,8 +390,7 @@ impl Inbox {
         target: NoticeTarget,
         source: Arc<str>,
         message: String,
-        command: Option<CommandLink>,
-        login_results: Option<Arc<[SshLoginResult]>>,
+        details: NoticeDetails,
         (effect, eviction): (Effect, Option<Arc<Notify>>),
     ) {
         let mut state = self.state.lock().unwrap();
@@ -400,8 +410,9 @@ impl Inbox {
             source,
             message,
             unread: true,
-            command,
-            login_results,
+            command: details.command,
+            login_results: details.login_results,
+            saved_download: details.saved_download,
         });
         self.wake_ui(state);
     }
@@ -573,6 +584,17 @@ impl Inbox {
         false
     }
 
+    pub fn read_saved_download(&self, target: NoticeTarget) -> Option<SavedDownload> {
+        let NoticeTarget::SftpTransfer { .. } = target else {
+            return None;
+        };
+        let mut state = self.state.lock().unwrap();
+        let row = state.rows.iter_mut().find(|row| row.target == target)?;
+        let location = row.saved_download.clone()?;
+        row.unread = false;
+        Some(location)
+    }
+
     pub fn mark_all_read(&self) {
         for row in &mut self.state.lock().unwrap().rows {
             row.unread = false;
@@ -698,7 +720,11 @@ mod tests {
         let first = Inbox::new(|| {});
         let second = Inbox::new(|| {});
         events.connect_inbox(12, "SSH", &first);
-        events.sftp_transfer_finished("Downloaded\nreport \u{202e} 2 of 2 items completed.");
+        let location = SavedDownload::BatchFolder(Arc::from(std::path::Path::new(r"C:\download")));
+        events.sftp_transfer_finished(
+            "Downloaded\nreport \u{202e} 2 of 2 items completed.",
+            Some(location.clone()),
+        );
         let target = NoticeTarget::SftpTransfer {
             pane: 12,
             sequence: 1,
@@ -717,7 +743,7 @@ mod tests {
         events.connect_inbox(12, "SSH", &second);
         assert!(first.rows().is_empty());
         assert_eq!(second.unread_count(), 1);
-        assert!(second.mark_target_read(target));
+        assert_eq!(second.read_saved_download(target), Some(location));
         assert_eq!(second.unread_count(), 0);
         let batch = events.since(0);
         assert_eq!(batch.events.len(), 1);
@@ -726,6 +752,9 @@ mod tests {
             batch.events[0].data["message"],
             "Downloaded report 2 of 2 items completed."
         );
+        let event = serde_json::to_value(&batch.events[0]).unwrap();
+        assert!(event.get("saved_download").is_none());
+        assert!(event["data"].get("local").is_none());
     }
 
     #[test]

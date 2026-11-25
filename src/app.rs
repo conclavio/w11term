@@ -6238,7 +6238,7 @@ impl Component for TerminalApp {
                 self.finish_directory_copy(request, result)
             }
             Message::ExplorerOpened(Err(error)) => {
-                self.window_error = Some(format!("Couldn’t open the current folder. {error}"));
+                self.window_error = Some(format!("Couldn’t open File Explorer. {error}"));
             }
             Message::ExplorerOpened(Ok(())) => {}
             Message::SyncSelection(epoch) => {
