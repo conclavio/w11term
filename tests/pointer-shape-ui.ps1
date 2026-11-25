@@ -16,7 +16,14 @@ public static class PointerProbe {
     [DllImport("user32.dll")] static extern bool GetPhysicalCursorPos(out Point point);
     [DllImport("user32.dll")] static extern IntPtr WindowFromPhysicalPoint(Point point);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window, uint flag);
-    [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
+    [StructLayout(LayoutKind.Sequential)]
+    struct MouseInput { public int X, Y; public uint Data, Flags, Time; public UIntPtr Extra; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Input { public uint Type; public MouseInput Mouse; }
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern uint SendInput(uint count, ref Input input, int size);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern bool SetPhysicalCursorPos(int x, int y);
     public static Point Position() {
         Point point;
@@ -31,14 +38,27 @@ public static class PointerProbe {
     public static string Describe(int resource) {
         var info = new CursorInfo { Size = Marshal.SizeOf(typeof(CursorInfo)) };
         bool ok = GetCursorInfo(ref info);
-        return String.Format("GetCursorInfo={0} cursor={1:x} expected={2:x} flags={3}", ok,
-            info.Cursor.ToInt64(), LoadCursorW(IntPtr.Zero, new IntPtr(resource)).ToInt64(), info.Flags);
+        Point actual = Position();
+        return String.Format("GetCursorInfo={0} cursor={1:x} expected={2:x} flags={3} at ({4},{5})", ok,
+            info.Cursor.ToInt64(), LoadCursorW(IntPtr.Zero, new IntPtr(resource)).ToInt64(),
+            info.Flags, actual.X, actual.Y);
     }
     public static bool MoveInWindow(IntPtr window, int x, int y) {
-        var point = new Point { X = x, Y = y };
-        if (GetAncestor(WindowFromPhysicalPoint(point), 2) != window || !SetPhysicalCursorPos(x, y)) return false;
-        mouse_event(1, 1, 0, 0, UIntPtr.Zero);
-        return true;
+        IntPtr prior = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            var point = new Point { X = x, Y = y };
+            if (GetAncestor(WindowFromPhysicalPoint(point), 2) != window) return false;
+            int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+            int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
+            if (x < left || y < top || x >= left + width || y >= top + height) return false;
+            // Aim at the center of the target pixel, in absolute virtual-desktop coordinates.
+            var input = new Input { Mouse = new MouseInput {
+                X = (int)((2L * (x - left) + 1) * 32768 / width),
+                Y = (int)((2L * (y - top) + 1) * 32768 / height),
+                Flags = 0xe001, // MOVE | MOVE_NOCOALESCE | VIRTUALDESK | ABSOLUTE
+            }};
+            return SendInput(1, ref input, Marshal.SizeOf(typeof(Input))) == 1;
+        } finally { SetThreadDpiAwarenessContext(prior); }
     }
 }
 '@
@@ -64,7 +84,11 @@ function Expect-Shape([int]$Id, [string]$Name) {
 }
 function Move-Pointer([int]$X, [int]$Y) {
     if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'Fixture lost foreground before pointer move' }
-    if (![PointerProbe]::MoveInWindow($window, $X, $Y)) { throw 'Could not position the pointer inside the fixture window' }
+    if (![PointerProbe]::MoveInWindow($window, $X, $Y)) { throw "Could not inject mouse input at ($X,$Y) inside the fixture window" }
+    $null = Wait-Until "pointer to reach ($X,$Y)" {
+        $actual = [PointerProbe]::Position()
+        [Math]::Abs($actual.X - $X) -le 1 -and [Math]::Abs($actual.Y - $Y) -le 1
+    }
 }
 
 $previous = [PointerProbe]::Position()
@@ -84,7 +108,14 @@ try {
     $leftCell = Pane-Cell $left 'LeftPointer'
     Press-Key 0x78
     Wait-Focus $right
-    Move-Pointer $leftCell.X $leftCell.Y
+    $menu = Wait-Until 'native tab menu' { Find-Element 'Tab menu' -Visible }
+    $header = $menu.Current.BoundingRectangle
+    Move-Pointer ($header.X + $header.Width / 2) ($header.Y + $header.Height / 2)
+    Send-Vt $left ($esc + ']22;pointer' + $bell + 'left-shape-ready')
+    $null = Control @('wait-for-text','--pane',"$left",'--timeout','15','left-shape-ready')
+    Move-Pointer ($leftCell.X + $leftCell.Width / 2) ($leftCell.Y + $leftCell.Height / 2)
+    Expect-Shape 32649 'hand after entering the left pane'
+    $stationary = [PointerProbe]::Position()
     Send-Vt $left ($esc + ']22;crosshair' + $bell)
     Expect-Shape 32515 'crosshair in the unfocused left pane'
     Send-Vt $right ($esc + ']22;wait' + $bell + 'right-shape-ready')
@@ -101,11 +132,11 @@ try {
     Expect-Shape 32651 'primary-screen help restored'
     Send-Vt $left ($esc + ']22;' + $bell)
     Expect-Shape 32512 'default after OSC 22 reset'
+    $actual = [PointerProbe]::Position()
+    if ($actual.X -ne $stationary.X -or $actual.Y -ne $stationary.Y) { throw 'Pointer moved during stationary checks' }
 
-    Move-Pointer $rightCell.X $rightCell.Y
+    Move-Pointer ($rightCell.X + $rightCell.Width / 2) ($rightCell.Y + $rightCell.Height / 2)
     Expect-Shape 32514 'right pane wait'
-    $menu = Wait-Until 'native tab menu' { Find-Element 'Tab menu' -Visible }
-    $header = $menu.Current.BoundingRectangle
     Move-Pointer ($header.X + $header.Width / 2) ($header.Y + $header.Height / 2)
     Expect-Shape 32512 'default on the tab menu'
     Wait-Focus $right
