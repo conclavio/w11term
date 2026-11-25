@@ -55,7 +55,7 @@ impl List {
         let save = Border::new().grid_column(1).content(button(
             "Save current search",
             Action::Save,
-            ready && !self.name.trim().is_empty() && panel.filter.valid_query(&panel.query),
+            ready && !self.name.trim().is_empty() && panel.can_search(),
         ));
         let mut rows = vec![
             KeyedView::new("hide", button("Hide saved searches", Action::Close, true)),
@@ -139,6 +139,44 @@ impl List {
                     .text(format!("{query}{scope} · {kind} · {sort}"))
                     .text_wrapping(TextWrapping::Wrap),
             ));
+            if !search.filter.exclude_dir_regex.is_empty() {
+                rows.push(KeyedView::new(
+                    "exclusions",
+                    TextBlock::new()
+                        .text(format!(
+                            "Exclude folders “{}”",
+                            search.filter.exclude_dir_regex
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+            let size = match (
+                search.filter.file_size.minimum,
+                search.filter.file_size.maximum,
+            ) {
+                (Some(min), Some(max)) => Some(format!("{min}–{max} bytes")),
+                (Some(min), None) => Some(format!("At least {min} bytes")),
+                (None, Some(max)) => Some(format!("At most {max} bytes")),
+                (None, None) => None,
+            };
+            if let Some(size) = size {
+                rows.push(KeyedView::new("size", TextBlock::new().text(size)));
+            }
+            let dates = &search.filter.modified_dates;
+            let date_summary = match (dates.from.trim(), dates.through.trim()) {
+                ("", "") => None,
+                ("", through) => Some(format!("Modified through {through} UTC")),
+                (from, "") => Some(format!("Modified from {from} UTC")),
+                (from, through) => Some(format!("Modified {from} through {through} UTC")),
+            };
+            if let Some(summary) = date_summary {
+                rows.push(KeyedView::new(
+                    "dates",
+                    TextBlock::new()
+                        .text(summary)
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
             rows.push(KeyedView::new(
                 "actions",
                 StackPanel::new()
@@ -216,7 +254,7 @@ impl FileDrawer {
                 let search = SavedSftpSearch {
                     root: panel.root.clone(),
                     query: panel.query.clone(),
-                    filter: panel.filter,
+                    filter: panel.size.apply(&panel.filter)?,
                     sort: panel.sort,
                 };
                 list.entries = store.save_sftp_search(profile, &peer, &name, search)?;
@@ -247,7 +285,8 @@ impl FileDrawer {
                     .context("The saved search changed. Reopen saved searches.")?;
                 panel.root.clone_from(&search.root);
                 panel.query.clone_from(&search.query);
-                panel.filter = search.filter;
+                panel.filter.clone_from(&search.filter);
+                panel.size = search.filter.file_size.into();
                 panel.sort = search.sort;
                 panel.saved = None;
                 panel.clear_results();
