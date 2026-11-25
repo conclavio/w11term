@@ -64,6 +64,8 @@ pub enum CommandId {
     SaveLiveProfile(Option<clipboard_paste::Origin>),
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
+    CopyPaneText(Option<u64>),
+    PaneImage(Option<u64>, text_export::ImageDestination),
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
     ScrollFailedCommand(Option<clipboard_paste::Origin>, bool),
@@ -295,12 +297,26 @@ impl TerminalApp {
         );
         let origin = self.paste_origin();
         let broadcast = self.broadcast_offer();
+        let live = self.tabs.active().and_then(|tab| match &tab.page {
+            Page::Terminal(live) => Some(live),
+            _ => None,
+        });
+        let pane = live.map(|tab| tab.session.pane_id);
         let rename_target = self
             .tabs
             .active()
             .and_then(AppTab::pane_id)
             .zip(self.tabs.active_group_id());
         for row in &mut rows {
+            if matches!(&row.id, CommandId::Menu(label) if label == text_export::COPY_VIEWPORT_LABEL)
+            {
+                row.id = CommandId::CopyPaneText(pane);
+            }
+            if let CommandId::Menu(label) = &row.id
+                && let Some(destination) = text_export::ImageDestination::from_label(label)
+            {
+                row.id = CommandId::PaneImage(pane, destination);
+            }
             if let CommandId::Menu(label) = &row.id
                 && let Some(enabled) = attention::long_command_toggle(label)
             {
@@ -392,12 +408,7 @@ impl TerminalApp {
                 }));
             }
         }
-        let live = self.tabs.active().and_then(|tab| match &tab.page {
-            Page::Terminal(live) => Some(live),
-            _ => None,
-        });
         let tab_count = self.tabs.headers().len();
-        let pane = live.map(|tab| tab.session.pane_id);
         if let Some(live) = live.filter(|tab| pane_colors::available(tab)) {
             rows.extend(
                 pane_colors::choices(live.color_scheme).map(|(scheme, label)| Row {
@@ -809,6 +820,12 @@ impl TerminalApp {
             CommandId::RestartExited(None) => return,
             CommandId::SaveScrollback(pane) => {
                 Message::Export(text_export::Action::StartScrollback(pane))
+            }
+            CommandId::CopyPaneText(pane) => {
+                Message::Export(text_export::Action::CopyPaneText(pane))
+            }
+            CommandId::PaneImage(pane, destination) => {
+                Message::Export(text_export::Action::StartPaneImage(pane, destination))
             }
             CommandId::ClearScrollback(pane) => {
                 pane.map_or(Message::ControlIdle, Message::ClearScrollback)

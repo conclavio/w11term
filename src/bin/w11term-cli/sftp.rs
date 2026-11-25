@@ -3,14 +3,16 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use w11term::{
     control::Request,
-    sftp::{Attributes, DEFAULT_TIMEOUT, Operation},
+    sftp::{Attributes, DEFAULT_TIMEOUT, Operation, normalize_sha256},
 };
 
 pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
-  get REMOTE LOCAL [--overwrite] [--max-bytes N] | put LOCAL REMOTE [--overwrite]\n\
+  get REMOTE LOCAL [--overwrite] [--max-bytes N] [--sha256 HEX]\n\
+  put LOCAL REMOTE [--overwrite] [--atomic]\n\
   get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
+  find ROOT QUERY\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -36,6 +38,7 @@ pub fn parse(
     let mut positional = Vec::new();
     let mut opts = BTreeMap::new();
     let mut overwrite = false;
+    let mut atomic = false;
     let mut spec_order = false;
     while let Some(arg) = args.next() {
         let value = |args: &mut std::iter::Peekable<_>| {
@@ -48,6 +51,10 @@ pub fn parse(
             "--overwrite" => {
                 ensure!(!overwrite, "duplicate --overwrite");
                 overwrite = true;
+            }
+            "--atomic" => {
+                ensure!(!atomic, "duplicate --atomic");
+                atomic = true;
             }
             "--spec-order" => {
                 ensure!(!spec_order, "duplicate --spec-order");
@@ -69,6 +76,7 @@ pub fn parse(
         }
     }
     let command = command.context(HELP)?;
+    ensure!(!atomic || command == "put", "--atomic requires put");
     let timeout = opts
         .remove("--timeout")
         .map(|s| s.parse::<u64>())
@@ -97,10 +105,18 @@ pub fn parse(
                 fields.insert("overwrite".into(), json!(overwrite));
                 overwrite = false;
             }
+            if command == "put" && atomic {
+                fields.insert("atomic".into(), json!(true));
+            }
             if command == "get"
                 && let Some(limit) = opts.remove("--max-bytes")
             {
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
+            }
+            if command == "get"
+                && let Some(sha256) = opts.remove("--sha256")
+            {
+                fields.insert("expected_sha256".into(), json!(normalize_sha256(&sha256)?));
             }
         }
         "rename" | "hardlink" => {
@@ -118,6 +134,15 @@ pub fn parse(
                 "path".into(),
                 json!(paths.next().unwrap_or_else(|| ".".into())),
             );
+        }
+        "find" => {
+            fields.insert("path".into(), json!(path()?));
+            let query = paths.next().context("missing filename fragment")?;
+            ensure!(
+                w11term::sftp::valid_filename_query(&query),
+                "Enter a filename fragment up to 256 bytes"
+            );
+            fields.insert("query".into(), json!(query));
         }
         "opendir" | "stat" | "lstat" | "setstat" | "mkdir" | "remove-file" | "remove-dir"
         | "realpath" | "readlink" | "statvfs" | "expand-path" | "open" => {
@@ -267,6 +292,53 @@ mod tests {
         }
     }
     #[test]
+    fn find_preserves_the_remote_root_and_literal_fragment() {
+        let (
+            _,
+            Request::Sftp {
+                operation: Operation::Find { path, query },
+                ..
+            },
+        ) = p(&["find", "--pane", "2", "/logs old", "[Ångström]"]).unwrap()
+        else {
+            panic!("expected filename search")
+        };
+        assert_eq!(path, "/logs old");
+        assert_eq!(query, "[Ångström]");
+        assert!(p(&["find", "--pane", "2", "/logs", " "]).is_err());
+        assert!(p(&["find", "--pane", "2", "/logs"]).is_err());
+    }
+
+    #[test]
+    fn expected_sha256_is_only_accepted_for_single_file_downloads() {
+        let digest = "AB".repeat(32);
+        let (
+            _,
+            Request::Sftp {
+                operation:
+                    Operation::Get {
+                        expected_sha256, ..
+                    },
+                ..
+            },
+        ) = p(&[
+            "get", "--pane", "2", "/remote", "local", "--sha256", &digest,
+        ])
+        .unwrap()
+        else {
+            panic!("expected a single file download")
+        };
+        assert_eq!(expected_sha256, Some(digest.to_ascii_lowercase()));
+        assert!(p(&["get", "--pane", "2", "/remote", "local", "--sha256", "abcd"]).is_err());
+        assert!(
+            p(&[
+                "get-dir", "--pane", "2", "/remote", "local", "--sha256", &digest
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn transfers_handles_attributes_and_validation() {
         let (
             _,
@@ -276,16 +348,28 @@ mod tests {
                         local,
                         remote,
                         overwrite,
+                        atomic,
                     },
                 ..
             },
-        ) = p(&["put", "--pane", "2", "a b", "/tmp/a b", "--overwrite"]).unwrap()
+        ) = p(&[
+            "put",
+            "--pane",
+            "2",
+            "a b",
+            "/tmp/a b",
+            "--overwrite",
+            "--atomic",
+        ])
+        .unwrap()
         else {
             panic!()
         };
         assert!(local.is_absolute());
         assert_eq!(remote, "/tmp/a b");
         assert!(overwrite);
+        assert!(atomic);
+        assert!(p(&["put-dir", "--pane", "2", "local", "/remote", "--atomic"]).is_err());
         let (
             _,
             Request::Sftp {

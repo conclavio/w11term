@@ -1451,6 +1451,28 @@ pub fn screenshot_with_font(
     path: &std::path::Path,
     appearance: &w11term::appearance::Appearance,
 ) -> anyhow::Result<(u32, u32)> {
+    let grid = render_grid(frame, size, appearance)?;
+    let dimensions = grid.dimensions();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("screenshot path has no parent"))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    write_grid_png(file.as_file_mut(), grid)?;
+    file.persist(path)?;
+    Ok(dimensions)
+}
+
+pub fn write_grid_png(file: &mut std::fs::File, grid: image::RgbaImage) -> std::io::Result<()> {
+    image::DynamicImage::ImageRgba8(grid)
+        .write_to(file, image::ImageFormat::Png)
+        .map_err(std::io::Error::other)
+}
+
+pub fn render_grid(
+    frame: &Snapshot,
+    size: wezterm_term::TerminalSize,
+    appearance: &w11term::appearance::Appearance,
+) -> anyhow::Result<image::RgbaImage> {
     use anyhow::ensure;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
     unsafe {
@@ -1502,14 +1524,7 @@ pub fn screenshot_with_font(
     }
     let image =
         image::RgbaImage::from_raw(width, height, pixels).expect("validated readback dimensions");
-    let grid = image::imageops::crop_imm(&image, pad, pad, grid_width, grid_height).to_image();
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("screenshot path has no parent"))?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    image::DynamicImage::ImageRgba8(grid).write_to(file.as_file_mut(), image::ImageFormat::Png)?;
-    file.persist(path)?;
-    Ok((grid_width, grid_height))
+    Ok(image::imageops::crop_imm(&image, pad, pad, grid_width, grid_height).to_image())
 }
 
 #[cfg(test)]

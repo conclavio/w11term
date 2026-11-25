@@ -132,11 +132,12 @@ impl DropSource {
     pub fn is_directory(&self) -> bool {
         self.directory
     }
-    pub fn into_operation(self, remote: String, overwrite: bool) -> Operation {
+    pub fn into_operation(self, remote: String, overwrite: bool, atomic: bool) -> Operation {
         Operation::PutDrop {
             source: self,
             remote,
             overwrite,
+            atomic,
         }
     }
 
@@ -200,8 +201,12 @@ mod tests {
         assert!(dir_token.is_directory());
         assert_eq!(file_token.path(), file);
         assert!(
-            serde_json::to_value(dir_token.clone().into_operation("/remote".into(), false))
-                .is_err()
+            serde_json::to_value(
+                dir_token
+                    .clone()
+                    .into_operation("/remote".into(), false, false)
+            )
+            .is_err()
         );
         assert!(
             serde_json::from_str::<Operation>(

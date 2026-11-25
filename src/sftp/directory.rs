@@ -133,24 +133,9 @@ impl Download<'_> {
         self.cancel.is_some_and(TransferCancel::is_cancelled)
     }
 
-    async fn canonical(&self, path: &str) -> Result<String> {
-        let entries = self.engine.raw.realpath(path).await?.files;
-        let [entry] = entries.as_slice() else {
-            bail!("invalid SFTP REALPATH reply")
-        };
-        let name = &entry.filename;
-        ensure!(
-            name.starts_with('/')
-                && !name.contains(['\0', '\\'])
-                && (name == "/" || !name[1..].split('/').any(|p| matches!(p, "" | "." | ".."))),
-            "SFTP did not return a canonical absolute path"
-        );
-        Ok(name.clone())
-    }
-
     async fn check_path(&self, path: &str) -> Result<()> {
         ensure!(
-            self.canonical(path).await? == path,
+            self.engine.canonical_remote_path(path).await? == path,
             "remote path changed or resolves through a symlink: {path}"
         );
         Ok(())
@@ -313,7 +298,7 @@ impl Download<'_> {
                     &mut file,
                     expected.map(|n| (n, "reported file size")),
                     self.cancel,
-                    |n| {
+                    |n, _| {
                         self.count.bytes = base.checked_add(n).context("folder size overflow")?;
                         report(self.progress, self.count.bytes, None);
                         Ok(())
@@ -345,6 +330,20 @@ impl Download<'_> {
 }
 
 impl Engine {
+    pub(super) async fn canonical_remote_path(&self, path: &str) -> Result<String> {
+        let entries = self.raw.realpath(path).await?.files;
+        let [entry] = entries.as_slice() else {
+            bail!("invalid SFTP REALPATH reply")
+        };
+        let name = &entry.filename;
+        ensure!(
+            name.starts_with('/')
+                && !name.contains(['\0', '\\'])
+                && (name == "/" || !name[1..].split('/').any(|p| matches!(p, "" | "." | ".."))),
+            "SFTP did not return a canonical absolute path"
+        );
+        Ok(name.clone())
+    }
     pub(super) async fn get_dir(
         &self,
         remote: String,
@@ -387,10 +386,10 @@ impl Engine {
         // Resolve the containing directory, not a possibly substituted final link.
         let (parent_remote, name) = source.rsplit_once('/').unwrap_or((".", source));
         let root = if matches!(name, "" | "." | "..") {
-            download.canonical(source).await?
+            self.canonical_remote_path(source).await?
         } else {
-            let parent = download
-                .canonical(if parent_remote.is_empty() {
+            let parent = self
+                .canonical_remote_path(if parent_remote.is_empty() {
                     "/"
                 } else {
                     parent_remote

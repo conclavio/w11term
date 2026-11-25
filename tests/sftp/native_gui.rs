@@ -2445,7 +2445,7 @@ async fn native_terminal_progress_updates_background_tab_and_resets_on_reconnect
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "exports a live SSH pane through the native Save dialog beside a PowerShell split"]
+#[ignore = "exports SSH scrollback and a pane image with the native Save dialog beside PowerShell"]
 async fn native_scrollback_export_saves_the_selected_pane_and_respects_cancel_and_replace() {
     let (Source::Ssh(ssh), _remote, opens, server) = fixture_connections(false, 1).await else {
         unreachable!()
@@ -2477,6 +2477,16 @@ async fn native_scrollback_export_saves_the_selected_pane_and_respects_cancel_an
     assert_eq!(fs::read(directory.join("cancel.txt")).unwrap(), sentinel);
     let replaced = fs::read_to_string(directory.join("replace.txt")).unwrap();
     assert_eq!(replaced, format!("{expected}arrived-after-picker"));
+    let before_picker = image::open(directory.join("reference.png"))
+        .unwrap()
+        .into_rgba8();
+    let saved_image = image::open(directory.join("captured.png"))
+        .unwrap()
+        .into_rgba8();
+    assert!(
+        before_picker == saved_image,
+        "the saved image must match the grid captured before the file picker opened"
+    );
     assert_eq!(opens.load(Ordering::Relaxed), 1, "one live SSH shell");
     server.abort();
 }
@@ -2576,6 +2586,19 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let data = [0, 255, 10, 13, 128, 42, 0];
     fs::write(source.join("data 雪/trace 例.bin"), data).unwrap();
     fs::write(source.join(".manifest"), b"remote manifest\n").unwrap();
+    let verified = b"verify the downloaded bytes\x00\xff";
+    fs::write(parent.join("verified.bin"), verified).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        fs::write(
+            state.path().join("verified.sha256"),
+            Sha256::digest(verified)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
     let interrupted = parent.join("interrupted/nested");
     fs::create_dir_all(&interrupted).unwrap();
     fs::write(
@@ -2593,6 +2616,11 @@ async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     .unwrap();
 
     drive_mixed_gui("download-sftp-folder-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        fs::read(state.path().join("accepted.bin")).unwrap(),
+        verified
+    );
+    assert!(!state.path().join("rejected.bin").exists());
 
     let downloaded = received.join("snapshot");
     assert_eq!(
@@ -2657,6 +2685,9 @@ async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
     let bytes: Vec<u8> = (0..(4 * chunk + 7)).map(|i| (i % 251) as u8).collect();
     fs::write(picker.join("01-first-upload"), &bytes).unwrap();
     fs::write(picker.join("02-queued-upload"), b"must stay local").unwrap();
+    fs::write(picker.join("atomic-note"), b"new atomic one").unwrap();
+    fs::write(parent.join("atomic-note"), b"old atomic one").unwrap();
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
     fs::write(picker.join("retained-download"), b"keep these bytes").unwrap();
     fs::write(parent.join("retained-download"), &bytes).unwrap();
     fs::write(parent.join("verified-download"), b"same SFTP channel").unwrap();
@@ -2690,12 +2721,12 @@ async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
     );
     assert_eq!(
         fs::read_dir(&picker).unwrap().count(),
-        4,
+        5,
         "partial download left a temporary file"
     );
     let trace = fs::read_to_string(remote.path().join("transfer-trace")).unwrap();
     assert_eq!(
-        trace.lines().collect::<Vec<_>>(),
+        trace.lines().take(12).collect::<Vec<_>>(),
         [
             "OPEN /shell directory/01-first-upload",
             "WRITE 0",
@@ -2710,6 +2741,24 @@ async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
             "READ 17",
             "CLOSE",
         ]
+    );
+    assert_eq!(
+        fs::read(parent.join("atomic-note")).unwrap(),
+        b"new atomic one"
+    );
+    let atomic_trace: Vec<_> = trace.lines().skip(12).collect();
+    assert!(
+        atomic_trace
+            .first()
+            .is_some_and(|line| line.starts_with("OPEN /shell directory/.w11term-upload-")),
+        "{atomic_trace:?}"
+    );
+    assert!(
+        atomic_trace
+            .iter()
+            .any(|line| line.starts_with("POSIX-RENAME ")
+                && line.ends_with("/shell directory/atomic-note")),
+        "{atomic_trace:?}"
     );
     assert_eq!(
         fs::read(remote.path().join("keyboard-input.bin")).unwrap(),
@@ -2832,13 +2881,17 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
             listings.last_mut().expect("OPENDIR before READDIR").1 += 1;
         }
     }
-    // This fixture returns one entry per READDIR plus one final EOF. Only
-    // opening the drawer, refreshing, and entering the child may read a list.
+    // Each listing returns one entry per READDIR plus EOF. Filtering reads no
+    // directory pages. Recursive search reads the root and its child once each.
     assert_eq!(
         listings,
         [
             ("/shell directory", fillers + 4),
             ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
+            ("/shell directory", fillers + 5),
+            ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
             ("/shell directory/nested", 2),
         ]
     );

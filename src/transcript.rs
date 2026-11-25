@@ -23,7 +23,7 @@ pub fn save_with(
         .unwrap_or(Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(directory)
         .with_context(|| format!("Creating a temporary file in {}", directory.display()))?;
-    write(file.as_file_mut()).context("Writing text export")?;
+    write(file.as_file_mut()).context("Writing export")?;
     file.as_file().sync_all()?;
     let result = if overwrite {
         file.persist(path)

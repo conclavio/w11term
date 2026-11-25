@@ -552,6 +552,11 @@ impl russh_sftp::server::Handler for Files {
         Ok(handle)
     }
     async fn close(&mut self, id: u32, h: String) -> Result<Status, StatusCode> {
+        if self.root.join("trace-directory-close").exists()
+            && matches!(self.handles.get(&h), Some(Opened::Dir(_)))
+        {
+            self.trace_listing("CLOSE DIR")?;
+        }
         if matches!(self.handles.get(&h), Some(Opened::File(_))) {
             self.trace_transfer("CLOSE")?;
             self.hold_response("hold-transfer-close").await;
@@ -1049,6 +1054,8 @@ async fn guarded_job(
 mod cancellation;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
+#[path = "sftp/find.rs"]
+mod find;
 #[path = "sftp/in_band_resize.rs"]
 mod in_band_resize;
 #[cfg(feature = "ui-smoke")]
@@ -1656,6 +1663,63 @@ async fn stopping_an_ssh_retry_keeps_the_pane_available_for_manual_reconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verified_download_checks_every_chunk_before_replacing_the_destination() {
+    use sha2::{Digest, Sha256};
+    use w11term::sftp::{CHUNK, Job, Operation};
+
+    let (session, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let destination = local.path().join("result.bin");
+    let data: Vec<_> = (0..CHUNK * 2 + 71).map(|i| (i % 251) as u8).collect();
+    fs::write(remote.path().join("source.bin"), &data).unwrap();
+    fs::write(&destination, b"previous version").unwrap();
+    let run = |expected_sha256: String| {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        session
+            .input
+            .send(Command::Sftp(Job {
+                operation: Operation::Get {
+                    remote: "/source.bin".into(),
+                    local: destination.clone(),
+                    overwrite: true,
+                    max_bytes: Some(data.len() as u64),
+                    expected_sha256: Some(expected_sha256),
+                },
+                expected_generation: None,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                reply,
+                progress: None,
+                cancel: None,
+            }))
+            .unwrap();
+        response
+    };
+    let hex_digest = |data: &[u8]| {
+        Sha256::digest(data)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let digest = hex_digest(&data);
+    let mut wrong = data.clone();
+    *wrong.last_mut().unwrap() ^= 1;
+    let bad_digest = hex_digest(&wrong);
+    assert!(
+        run(bad_digest)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("SHA-256 mismatch")
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"previous version");
+    assert_eq!(fs::read_dir(local.path()).unwrap().count(), 1);
+    let valid = run(digest.to_ascii_uppercase()).await.unwrap().unwrap();
+    assert_eq!(valid["sha256"], digest);
+    assert_eq!(fs::read(&destination).unwrap(), data);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
     use tokio::sync::{oneshot, watch};
     use w11term::sftp::{CHUNK, Job, Operation, TransferProgress};
@@ -1694,6 +1758,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         local: destination.clone(),
         overwrite: true,
         max_bytes: None,
+        expected_sha256: None,
     };
     let hold = remote.path().join("hold-next-chunk");
     fs::write(&hold, []).unwrap();
@@ -1742,6 +1807,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         local: destination.clone(),
         remote: "/upload".into(),
         overwrite: false,
+        atomic: false,
     };
     let fail = remote.path().join("fail-next-write");
     fs::write(&fail, []).unwrap();
@@ -1774,6 +1840,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
             local: destination.clone(),
             remote: "/upload".into(),
             overwrite: true,
+            atomic: false,
         },
     );
     assert_eq!(response.await.unwrap().unwrap()["bytes_transferred"], size);
@@ -1793,6 +1860,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
             local: destination,
             remote: "/dropped".into(),
             overwrite: false,
+            atomic: false,
         },
     );
     let error = response

@@ -1,11 +1,15 @@
-//! Plain Unicode clipboard access on a dedicated message-only window. No focus changes.
+//! Native clipboard access on a dedicated message-only window.
 use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use windows::{
     Win32::{
         Foundation::*,
-        System::{DataExchange::*, Memory::*},
+        System::{
+            DataExchange::*,
+            Memory::*,
+            Ole::{CF_DIBV5, CF_UNICODETEXT},
+        },
         UI::WindowsAndMessaging::*,
     },
     core::w,
@@ -15,7 +19,8 @@ use windows::{
 pub const MAX_TEXT: usize = 1024 * 1024;
 enum Request {
     Read(mpsc::SyncSender<Result<String>>),
-    Write(String, Option<u32>, mpsc::SyncSender<Result<()>>),
+    Write(String, Option<u32>, mpsc::SyncSender<Result<bool>>),
+    WriteImage(Vec<u8>, u32, mpsc::SyncSender<Result<bool>>),
     RemoteWrite(String, Permission),
 }
 fn service() -> Result<&'static mpsc::SyncSender<Request>> {
@@ -70,6 +75,14 @@ fn service() -> Result<&'static mpsc::SyncSender<Request>> {
                                     WriteGuard::Local(expected),
                                 ));
                             }
+                            Ok(Request::WriteImage(dib, expected, reply)) => {
+                                let _ = reply.send(publish_native(
+                                    hwnd,
+                                    &dib,
+                                    u32::from(CF_DIBV5.0),
+                                    WriteGuard::Local(Some(expected)),
+                                ));
+                            }
                             Ok(Request::RemoteWrite(text, permission)) => {
                                 if permission.current()
                                     && let Err(e) = write_remote(hwnd, &text, &permission)
@@ -101,7 +114,7 @@ pub fn read() -> Result<String> {
         .context("Clipboard read timed out")?
 }
 pub fn write(text: &str) -> Result<()> {
-    write_local(text, None)
+    write_local(text, None).map(|_| ())
 }
 
 pub fn sequence() -> u32 {
@@ -110,17 +123,67 @@ pub fn sequence() -> u32 {
 
 /// Complete a deferred local copy only if the clipboard is still current.
 pub fn write_if_sequence(text: &str, expected: u32) -> Result<()> {
+    try_write_if_sequence(text, expected).map(|_| ())
+}
+
+/// Returns false if another copy won while the text was being captured.
+pub fn try_write_if_sequence(text: &str, expected: u32) -> Result<bool> {
     write_local(text, Some(expected))
 }
 
-fn write_local(text: &str, expected: Option<u32>) -> Result<()> {
+/// Returns false if another copy won while the image was rendering.
+pub fn write_image_if_sequence(image: image::RgbaImage, expected: u32) -> Result<bool> {
+    let dib = image_dib(image)?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    service()?
+        .try_send(Request::WriteImage(dib, expected, tx))
+        .context("Clipboard service is busy")?;
+    rx.recv_timeout(Duration::from_secs(2))
+        .context("Clipboard write timed out")?
+}
+
+fn image_dib(image: image::RgbaImage) -> Result<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{BI_BITFIELDS, BITMAPV5HEADER, LCS_GM_IMAGES};
+    const HEADER: usize = std::mem::size_of::<BITMAPV5HEADER>();
+    let (width, height) = image.dimensions();
+    ensure!(
+        width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 16 * 1024 * 1024,
+        "Clipboard image must be between 1 and 16 megapixels in size"
+    );
+    let pixels = image.into_raw();
+    let mut dib = Vec::with_capacity(HEADER + pixels.len());
+    dib.resize(HEADER, 0);
+    let mut field = |offset: usize, value: u32| {
+        dib[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    field(0, HEADER as u32);
+    field(4, width);
+    field(8, (-(height as i32)) as u32); // Negative height stores rows top to bottom.
+    field(12, (32 << 16) | 1); // Bit count and plane count, two little-endian words.
+    field(16, BI_BITFIELDS.0);
+    field(20, pixels.len() as u32);
+    field(40, 0x00ff_0000); // Red mask
+    field(44, 0x0000_ff00); // Green mask
+    field(48, 0x0000_00ff); // Blue mask
+    field(52, 0xff00_0000); // Alpha mask
+    field(56, 0x7352_4742); // LCS_sRGB
+    field(108, LCS_GM_IMAGES as u32);
+    for &[r, g, b, a] in pixels.as_chunks::<4>().0 {
+        dib.extend_from_slice(&[b, g, r, a]);
+    }
+    Ok(dib)
+}
+
+fn write_local(text: &str, expected: Option<u32>) -> Result<bool> {
     ensure!(text.len() <= MAX_TEXT, "Clipboard text exceeds 1 MiB");
     #[cfg(feature = "ui-smoke")]
     if let Some(path) = std::env::var_os("W11TERM_TEST_COPY_FILE") {
         if expected.is_some_and(|expected| sequence() != expected) {
-            return Ok(());
+            return Ok(false);
         }
-        return std::fs::write(path, text).context("Writing the clipboard test fixture");
+        return std::fs::write(path, text)
+            .context("Writing the clipboard test fixture")
+            .map(|()| true);
     }
     let (tx, rx) = mpsc::sync_channel(1);
     service()?
@@ -315,7 +378,7 @@ fn write_remote(hwnd: HWND, text: &str, permission: &Permission) -> Result<()> {
         }
         return Ok(());
     }
-    write_native(hwnd, text, WriteGuard::Remote(permission))
+    write_native(hwnd, text, WriteGuard::Remote(permission)).map(|_| ())
 }
 
 enum WriteGuard<'a> {
@@ -323,7 +386,7 @@ enum WriteGuard<'a> {
     Remote(&'a Permission),
 }
 
-fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<()> {
+fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<bool> {
     let units: Vec<u16> = text
         .split('\0')
         .next()
@@ -331,15 +394,24 @@ fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<()> {
         .encode_utf16()
         .chain(Some(0))
         .collect();
+    publish_native(hwnd, &units, u32::from(CF_UNICODETEXT.0), guard)
+}
+
+fn publish_native<T: Copy>(
+    hwnd: HWND,
+    data: &[T],
+    format: u32,
+    guard: WriteGuard<'_>,
+) -> Result<bool> {
     // Allocate before EmptyClipboard so a failed allocation leaves the old contents intact.
     unsafe {
-        let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2)?;
-        let ptr = GlobalLock(memory).cast::<u16>();
+        let memory = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(data))?;
+        let ptr = GlobalLock(memory).cast::<u8>();
         if ptr.is_null() {
             let _ = GlobalFree(Some(memory));
             anyhow::bail!("Could not lock clipboard memory");
         }
-        std::ptr::copy_nonoverlapping(units.as_ptr(), ptr, units.len());
+        std::ptr::copy_nonoverlapping(data.as_ptr().cast(), ptr, std::mem::size_of_val(data));
         let _ = GlobalUnlock(memory);
         let result = (|| -> Result<bool> {
             let _open = open(hwnd)?;
@@ -352,19 +424,36 @@ fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<()> {
                 return Ok(false);
             }
             EmptyClipboard()?;
-            SetClipboardData(13, Some(HANDLE(memory.0)))?;
+            SetClipboardData(format, Some(HANDLE(memory.0)))?;
             Ok(true)
         })();
         if !matches!(result, Ok(true)) {
             let _ = GlobalFree(Some(memory));
         }
-        result.map(|_| ())
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_image_dib_preserves_row_order_and_channels() {
+        let image =
+            image::RgbaImage::from_raw(1, 2, vec![7, 23, 91, 255, 34, 56, 201, 255]).unwrap();
+        let dib = image_dib(image).unwrap();
+        let field = |offset| u32::from_le_bytes(dib[offset..offset + 4].try_into().unwrap());
+        assert_eq!(field(0), 124);
+        assert_eq!(field(4), 1);
+        assert_eq!(field(8) as i32, -2);
+        assert_eq!(field(12), 0x0020_0001);
+        assert_eq!(field(16), 3);
+        assert_eq!(field(20), 8);
+        assert_eq!(field(52), 0xff00_0000);
+        assert_eq!(&dib[124..], [91, 23, 7, 255, 201, 56, 34, 255]);
+    }
+
     #[test]
     fn remote_writes_are_rate_limited_without_touching_the_system_clipboard() {
         let now = std::time::Instant::now();

@@ -5,12 +5,13 @@ use std::{collections::VecDeque, path::PathBuf};
 use tokio::sync::{oneshot, watch};
 use w11term::folder_grants::Authority;
 use w11term::sftp::{
-    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, TransferProgress,
+    DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, TransferProgress, normalize_sha256,
     validate_download_name,
 };
 
 mod bookmarks;
 mod editor;
+mod find;
 mod history;
 mod preview;
 mod properties;
@@ -64,6 +65,7 @@ pub enum FileAction {
     Toggle,
     OpenHere,
     Bookmarks(u64, u64, bookmarks::Action),
+    Search(u64, u64, find::Action),
     Follow(u64, u64, bool),
     Reveal(u64, u64, String, Option<String>),
     Close(u64),
@@ -85,12 +87,14 @@ pub enum FileAction {
     ResumeTextEditor(u64, u64),
     TextEditor(u64, u64, editor::Action),
     Rename(u64, u64, ListedEntry),
+    VerifyDownload(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
     EditName(u64, u64, u64, String),
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
     Replace(u64, u64, bool),
+    AtomicUploads(u64, u64, bool),
     Pick(u64, u64, u64, TransferPicker),
     Picked(u64, u64, u64, TransferPicker, Result<Vec<PathBuf>, String>),
     Drop(DropTarget, Vec<PathBuf>),
@@ -114,6 +118,7 @@ pub(super) struct FileDrawer {
     directory: Option<String>,
     history: FolderHistory,
     bookmarks: Option<bookmarks::List>,
+    search: Option<find::Panel>,
     /// Describes an explicit navigation request if either REALPATH or listing fails.
     opening_target: Option<String>,
     following: bool,
@@ -133,6 +138,7 @@ pub(super) struct FileDrawer {
     editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
+    atomic_uploads: bool,
     picking: Option<u64>,
     parsing: bool,
     pending: Option<Pending>,
@@ -192,7 +198,7 @@ pub struct ListedEntry {
 pub enum TransferPicker {
     UploadFiles(String),
     UploadFolder(String),
-    Download(ListedEntry),
+    Download(ListedEntry, Option<String>),
 }
 
 impl TransferPicker {
@@ -210,7 +216,7 @@ impl TransferPicker {
                     Purpose::UploadFiles
                 })
             }
-            Self::Download(entry) => {
+            Self::Download(entry, _) => {
                 let remote = files.selected_path(entry)?;
                 if entry.kind == ListedKind::Known(EntryKind::Directory) {
                     validate_download_name(&entry.name)?;
@@ -247,6 +253,7 @@ enum EditAction {
     GoToFolder { revision: u64 },
     Create,
     Rename(ListedEntry),
+    VerifyDownload(ListedEntry),
     Delete(ListedEntry, EntryKind),
 }
 
@@ -254,7 +261,9 @@ impl EditAction {
     fn original(&self) -> Option<&ListedEntry> {
         match self {
             Self::GoToFolder { .. } | Self::Create => None,
-            Self::Rename(entry) | Self::Delete(entry, _) => Some(entry),
+            Self::Rename(entry) | Self::VerifyDownload(entry) | Self::Delete(entry, _) => {
+                Some(entry)
+            }
         }
     }
 }
@@ -282,6 +291,7 @@ impl EntryDialog {
                 bail!("Enter a different name")
             }
             EditAction::Delete(original, _) => delete_path(parent()?, &original.name),
+            EditAction::VerifyDownload(_) => normalize_sha256(&self.name),
             EditAction::Rename(_) | EditAction::Create => entry_path(parent()?, &self.name),
         }
     }
@@ -327,16 +337,26 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    Search(u64),
     SaveText(editor::Save),
     Transfer(TransferFile),
     Change { parent: String, change: EntryChange },
 }
 
 enum TransferFile {
-    Upload { name: String, remote: String },
-    UploadFolder { remote: String },
+    Upload {
+        name: String,
+        remote: String,
+        atomic: bool,
+    },
+    UploadFolder {
+        remote: String,
+    },
     Download(String),
-    DownloadFolder { remote: String, local: PathBuf },
+    DownloadFolder {
+        remote: String,
+        local: PathBuf,
+    },
 }
 
 fn counted(amount: u64, singular: &str) -> String {
@@ -348,9 +368,13 @@ impl TransferFile {
     fn outcome(&self, reply: &Value) -> String {
         let bytes = &reply["bytes_transferred"];
         match (self, reply["cancelled"].as_bool() == Some(true)) {
-            (Self::Upload { remote, .. }, true) => {
+            (Self::Upload { remote, atomic, .. }, true) => {
                 let path = reply["remote"].as_str().unwrap_or(remote);
-                if reply["remote_may_be_partial"] == true {
+                if *atomic {
+                    format!(
+                        "Cancelled atomic upload of {path} ({bytes} bytes acknowledged). The destination was left in place."
+                    )
+                } else if reply["remote_may_be_partial"] == true {
                     format!(
                         "Cancelled upload of {path} ({bytes} bytes acknowledged). The remote file may be incomplete."
                     )
@@ -390,6 +414,9 @@ impl TransferFile {
                 reply["skipped"],
             ),
             (Self::Upload { name, .. }, false) => format!("Uploaded {name} ({bytes} bytes)"),
+            (Self::Download(name), false) if reply["sha256"].is_string() => {
+                format!("Downloaded {name} ({bytes} bytes). SHA-256 verified.")
+            }
             (Self::Download(name), false) => format!("Downloaded {name} ({bytes} bytes)"),
             (Self::DownloadFolder { remote, local }, false) => format!(
                 "Downloaded {remote} to {} ({} files, {bytes} bytes, {} links or special files skipped).",
@@ -402,6 +429,13 @@ impl TransferFile {
 
     fn interrupted(&self, bytes: u64) -> String {
         match self {
+            Self::Upload {
+                remote,
+                atomic: true,
+                ..
+            } => format!(
+                "Atomic upload of {remote} was interrupted after at least {bytes} bytes. Check the destination and any temporary upload before trying again."
+            ),
             Self::Upload { remote, .. } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote file may be incomplete."
             ),
@@ -785,6 +819,7 @@ impl FileDrawer {
         &self,
         entry: &ListedEntry,
         destination: PathBuf,
+        expected_sha256: Option<String>,
     ) -> Result<(Operation, TransferFile)> {
         let remote = self.selected_path(entry)?;
         ensure!(
@@ -792,6 +827,7 @@ impl FileDrawer {
             "Choose an absolute download destination"
         );
         if entry.kind == ListedKind::Known(EntryKind::Directory) {
+            ensure!(expected_sha256.is_none(), "Choose a file to verify");
             validate_download_name(&entry.name)?;
             let local = destination.join(&entry.name);
             Ok((
@@ -808,6 +844,7 @@ impl FileDrawer {
                     remote: remote.clone(),
                     overwrite: self.replace,
                     max_bytes: None,
+                    expected_sha256,
                 },
                 TransferFile::Download(remote),
             ))
@@ -968,9 +1005,12 @@ impl FileDrawer {
         self.dialog = Some(EntryDialog {
             serial: self.dialog_serial,
             parent,
-            name: action
-                .original()
-                .map_or_else(String::new, |entry| entry.name.clone()),
+            name: match &action {
+                EditAction::VerifyDownload(_) => String::new(),
+                action => action
+                    .original()
+                    .map_or_else(String::new, |entry| entry.name.clone()),
+            },
             action,
         });
     }
@@ -1047,6 +1087,11 @@ impl FileDrawer {
         let (title, label, confirm) = match dialog.action {
             EditAction::GoToFolder { .. } => ("Go to folder", "Remote folder path", "Open"),
             EditAction::Rename(_) => ("Rename entry", "New name", "Rename"),
+            EditAction::VerifyDownload(_) => (
+                "Download and verify",
+                "Expected SHA-256",
+                "Choose destination",
+            ),
             EditAction::Create => ("New folder", "Folder name", "Create"),
             EditAction::Delete(..) => unreachable!(),
         };
@@ -1060,6 +1105,20 @@ impl FileDrawer {
                     Message::Files(FileAction::EditName(pane, generation, serial, name))
                 })),
         )];
+        if let EditAction::VerifyDownload(entry) = &dialog.action {
+            fields.insert(
+                0,
+                KeyedView::new(
+                    "download-source",
+                    TextBlock::new()
+                        .text(format!(
+                            "{}@{}:{} · {}",
+                            ssh.user, ssh.host, ssh.port, entry.name
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
+                ),
+            );
+        }
         if !dialog.name.is_empty()
             && let Err(error) = &valid
         {
@@ -1103,6 +1162,7 @@ impl FileDrawer {
 
     fn close(&mut self) {
         self.open = false;
+        self.close_search();
         if self.preparing_drop.take().is_some() {
             self.status.clear();
         }
@@ -1158,6 +1218,7 @@ impl FileDrawer {
             },
         };
         let editor = self.detach_editor();
+        self.close_search();
         *self = Self {
             open: self.open,
             following: self.following,
@@ -1178,6 +1239,7 @@ impl FileDrawer {
             || self.busy()
             || self.filter_editing()
             || self.bookmarks.is_some()
+            || self.search.is_some()
             || self.last_report == *report
         {
             return None;
@@ -1212,6 +1274,9 @@ impl FileDrawer {
             });
             view
         };
+        if let Some(search) = &self.search {
+            return cache(search.view(self, pane, context));
+        }
         if let Some(list) = &self.bookmarks
             && Some(list.profile.as_str()) == profile
         {
@@ -1279,6 +1344,11 @@ impl FileDrawer {
                         GoToFolder(pane, generation, revision),
                     )),
                 )),
+            button(
+                "Find files…",
+                writable && generation != 0,
+                Search(pane, generation, find::Action::Show(revision)),
+            ),
             StackPanel::new()
                 .orientation(if layout.content_width() >= 300.0 {
                     Orientation::Horizontal
@@ -1383,20 +1453,6 @@ impl FileDrawer {
                                 .is_some_and(|e| e.kind != ListedKind::Known(EntryKind::File)),
                         OpenEntry(pane, generation, listed(selected)),
                     ),
-                    button(
-                        if download_folder {
-                            "Download folder…"
-                        } else {
-                            "Download…"
-                        },
-                        ready && selected.is_some(),
-                        Pick(
-                            pane,
-                            generation,
-                            revision,
-                            TransferPicker::Download(listed(selected)),
-                        ),
-                    ),
                     Button::new()
                         .automation_name("Open shell here")
                         .is_enabled(shell.is_some())
@@ -1408,6 +1464,27 @@ impl FileDrawer {
                         }))
                         .content("Open shell here"),
                 )),
+            button_pair(
+                button(
+                    if download_folder {
+                        "Download folder…"
+                    } else {
+                        "Download…"
+                    },
+                    ready && selected.is_some(),
+                    Pick(
+                        pane,
+                        generation,
+                        revision,
+                        TransferPicker::Download(listed(selected), None),
+                    ),
+                ),
+                button(
+                    "Download and verify…",
+                    ready && selected.is_some() && !download_folder,
+                    VerifyDownload(pane, generation, listed(selected)),
+                ),
+            ),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
@@ -1449,6 +1526,13 @@ impl FileDrawer {
                     context.callback(move |v| Message::Files(Replace(pane, generation, v))),
                 )
                 .content(TextBlock::new().text("Replace existing files")),
+            CheckBox::new()
+                .is_enabled(ready)
+                .is_checked(self.atomic_uploads)
+                .on_is_checked_changed(
+                    context.callback(move |v| Message::Files(AtomicUploads(pane, generation, v))),
+                )
+                .content(TextBlock::new().text("Upload files atomically")),
         ];
         if let Some(editor) = &self.editor {
             controls.push(button(
@@ -1751,6 +1835,8 @@ impl FileDrawer {
                 progress: tx_progress,
                 cancel: if matches!(step, Step::Preview(_)) {
                     self.preview.as_ref().map(|p| p.cancel.clone())
+                } else if matches!(step, Step::Search(_)) {
+                    self.search.as_ref().and_then(|p| p.cancel.clone())
                 } else {
                     transfer.as_ref().map(|active| active.cancel.clone())
                 },
@@ -1777,6 +1863,7 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.cancel_preview();
+        self.close_search();
         self.bookmarks = None;
         self.opening_target = None;
         self.end_filter_edit();
@@ -1867,6 +1954,7 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::Search(serial), reply) => self.finish_search(serial, reply),
             (Step::SaveText(save), result) => {
                 if let Some((parent, name)) = self.finish_save(save, result) {
                     self.reveal = Some(RevealTarget::Existing(name));
@@ -2209,6 +2297,7 @@ impl TerminalApp {
             },
             Close(id)
             | Bookmarks(id, ..)
+            | Search(id, ..)
             | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
@@ -2228,12 +2317,14 @@ impl TerminalApp {
             | ResumeTextEditor(id, ..)
             | TextEditor(id, ..)
             | Rename(id, ..)
+            | VerifyDownload(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
             | EditName(id, ..)
             | FinishEdit(id, ..)
             | Page(id, ..)
             | Replace(id, ..)
+            | AtomicUploads(id, ..)
             | Pick(id, ..)
             | Picked(id, ..)
             | Listed(id, ..)
@@ -2286,7 +2377,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | AtomicUploads(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2324,6 +2415,12 @@ impl TerminalApp {
         }
         let result = (|| -> Result<()> {
             match action {
+                Search(_, generation, action)
+                    if files.open && may_open_dialog && generation == files.generation =>
+                {
+                    files.filename_search(pane, session, action, context)?;
+                }
+                Search(..) => {}
                 Bookmarks(_, generation, action)
                     if files.open && generation == files.generation =>
                 {
@@ -2443,7 +2540,12 @@ impl TerminalApp {
                                 files.directory.as_ref() == Some(&parent),
                                 "The upload destination changed. Choose the files again."
                             );
-                            files.uploads = UploadQueue::files(paths, &parent, files.replace)?;
+                            files.uploads = UploadQueue::files(
+                                paths,
+                                &parent,
+                                files.replace,
+                                files.atomic_uploads,
+                            )?;
                             files.upload_next(pane, session, context)?;
                         }
                         TransferPicker::UploadFolder(parent) => {
@@ -2460,11 +2562,12 @@ impl TerminalApp {
                                 context,
                             )?;
                         }
-                        TransferPicker::Download(entry) => {
+                        TransferPicker::Download(entry, expected_sha256) => {
                             let [local] = paths
                                 .try_into()
                                 .map_err(|_| anyhow!("Choose one download destination"))?;
-                            let (operation, transfer) = files.download_operation(&entry, local)?;
+                            let (operation, transfer) =
+                                files.download_operation(&entry, local, expected_sha256)?;
                             files.status = format!("Downloading {}…", entry.name);
                             files.job(
                                 pane,
@@ -2515,6 +2618,15 @@ impl TerminalApp {
                                     EntryChange::Delete(entry.name),
                                     Operation::RemoveEntry { path, kind },
                                 )
+                            }
+                            EditAction::VerifyDownload(entry) => {
+                                context.sender().send(Message::Files(Pick(
+                                    pane,
+                                    files.generation,
+                                    files.listing_revision,
+                                    TransferPicker::Download(entry, Some(path)),
+                                )));
+                                return Ok(());
                             }
                             EditAction::Rename(entry) => {
                                 files.status = format!("Renaming {} to {name}…", entry.name);
@@ -2636,6 +2748,17 @@ impl TerminalApp {
                     files.end_filter_edit();
                     files.begin_edit(entry.parent.clone(), EditAction::Rename(entry))?;
                 }
+                VerifyDownload(_, _, entry) => {
+                    if !may_open_dialog {
+                        return Ok(());
+                    }
+                    ensure!(
+                        entry.kind != ListedKind::Known(EntryKind::Directory),
+                        "Choose a file to verify"
+                    );
+                    files.end_filter_edit();
+                    files.begin_edit(entry.parent.clone(), EditAction::VerifyDownload(entry))?;
+                }
                 Delete(_, _, entry) if may_open_dialog => {
                     files.check_selected(&entry)?;
                     files.end_filter_edit();
@@ -2693,6 +2816,7 @@ impl TerminalApp {
                     files.set_page(page);
                 }
                 Replace(_, _, replace) => files.replace = replace,
+                AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,
                 Drop(target, paths) => {
                     if drop_allowed {
                         files.classify_drop(target, paths, context);
@@ -2880,7 +3004,7 @@ impl TerminalApp {
                         pane,
                         generation,
                         serial,
-                        TransferPicker::Download(entry),
+                        TransferPicker::Download(entry, None),
                         Ok(vec![local.join("download.bin")]),
                     ),
                     context,
@@ -3904,6 +4028,7 @@ mod tests {
             vec![r"C:\second.txt".into(), r"C:\third.txt".into()],
             "/",
             false,
+            false,
         )
         .unwrap();
         for stale in [
@@ -3929,6 +4054,7 @@ mod tests {
         let upload = TransferFile::Upload {
             name: "large.bin".into(),
             remote: "/srv/uploads/large.bin".into(),
+            atomic: false,
         };
         let download = TransferFile::Download("/large.bin".into());
         let complete = json!({"bytes_transferred": 128});
@@ -4123,7 +4249,7 @@ mod tests {
         };
         let entry = list(&mut drawer, "report files", directory);
         let (op, status) = drawer
-            .download_operation(&entry, destination.clone())
+            .download_operation(&entry, destination.clone(), None)
             .unwrap();
         assert!(matches!(op, Operation::GetDir {remote, local}
             if remote == "/srv/report files" && local == destination.join("report files")));
@@ -4149,11 +4275,11 @@ mod tests {
         );
         assert!(
             drawer
-                .download_operation(&entry, destination.clone())
+                .download_operation(&entry, destination.clone(), None)
                 .is_err()
         );
         let (op, _) = drawer
-            .download_operation(&file, destination.clone())
+            .download_operation(&file, destination.clone(), None)
             .unwrap();
         assert!(
             matches!(op, Operation::Get { overwrite: true, local, .. } if local == destination)
@@ -4162,7 +4288,7 @@ mod tests {
             let entry = list(&mut drawer, name, directory);
             assert!(
                 drawer
-                    .download_operation(&entry, destination.clone())
+                    .download_operation(&entry, destination.clone(), None)
                     .is_err()
             );
         }
@@ -4200,7 +4326,7 @@ mod tests {
             directory: Some("/old".into()),
             picking: Some(1),
             replace: true,
-            uploads: UploadQueue::files(vec![r"C:\queued".into()], "/old", true).unwrap(),
+            uploads: UploadQueue::files(vec![r"C:\queued".into()], "/old", true, false).unwrap(),
             ..Default::default()
         };
         drawer.observe_connection(2);

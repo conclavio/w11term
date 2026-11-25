@@ -772,6 +772,7 @@ SFTP is available through a pane's **existing authenticated SSH connection**, on
 & $ctl --pid 12345 sftp --pane $pane info
 & $ctl --pid 12345 sftp --pane $pane ls /var/log
 & $ctl --pid 12345 sftp --pane $pane get /tmp/output.bin .\output.bin
+& $ctl --pid 12345 sftp --pane $pane get /tmp/output.bin .\output.bin --sha256 $expectedDigest
 & $ctl --pid 12345 sftp --pane $pane get-dir /tmp/diagnostics .\incident-042
 & $ctl --pid 12345 sftp --pane $pane put .\input.bin /tmp/input.bin
 & $ctl --pid 12345 sftp --pane $pane put-dir .\cockpit /tmp/cockpit-v2
@@ -821,9 +822,12 @@ The command surface covers SFTP v3:
 | Commands | Arguments / result |
 | --- | --- |
 | `info` | Negotiated version, advertised extensions, open-handle count, read/write chunk limits |
+| `get REMOTE LOCAL --sha256 HEX` | Verify a single-file download against 64 hexadecimal digits before publishing the local file. A mismatch preserves any existing destination. Success adds `sha256` to `result.sftp`. Direct pipe clients set `expected_sha256` on the `get` operation. |
+| `put LOCAL REMOTE --atomic [--overwrite]` | Stage a single file next to its destination before publishing it. Replacing a regular file requires both `--overwrite` and `posix-rename@openssh.com`. Success returns `atomic: true`. Direct pipe clients set `atomic: true` on the `put` operation. |
 | `get-dir REMOTE NEW_LOCAL_DIRECTORY` | Recursively download a directory into the exact local path. Its parent must exist. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
 | `put-dir LOCAL NEW_REMOTE_DIRECTORY` | Recursively upload to the exact remote path. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
 | `ls [PATH]` | Collect directory entries (default `.`); maximum 8 MiB JSON, then use paged reads |
+| `find ROOT QUERY` | Search filenames recursively using a literal, case-insensitive fragment up to 256 bytes. Returns the canonical `root`, `matches` with `parent` and `name`, scan counts, and `truncated` and `cancelled` flags. A search examines up to 128 folders, 16,384 entries, 200 matches and 24 nested levels, with a 4096-byte path limit. Direct pipe clients send `{"op":"find","path":"ROOT","query":"QUERY"}`. |
 | `opendir PATH`, `readdir --handle ID`, `close --handle ID` | Persistent opaque handle, one server page at a time, explicit `eof` |
 | `open PATH [--flags FLAGS]` | Comma-separated `read,write,append,create,truncate,exclusive`; default `read`; returns handle |
 | `read --handle ID [--offset N] [--length N]` | Default offset 0, length 32768; returns `data_base64`, `bytes_read`, `eof`. Short reads are possible; EOF requires the server's EOF response |

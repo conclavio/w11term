@@ -399,6 +399,8 @@ Before replacing a file, w11term compares its contents to the version you opened
 
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
+Choose **Download and verify…** on a file and paste its expected SHA-256 digest from a source you trust. w11term checks the downloaded bytes before saving to the chosen destination. If the digest differs, the temporary download is discarded and any existing destination is kept, even with **Replace existing files** enabled.
+
 Choose **Download folder…** on a remote directory and select a Windows folder
 to receive it. For example, choosing `Downloads` for `/tmp/diagnostics`
 creates `Downloads\diagnostics`. The transfer preserves regular files, dotfiles
@@ -429,9 +431,13 @@ Choose **Go to folder…** to enter a remote directory directly. An absolute pat
 
 Use **Back** and **Forward** to revisit folders opened in the current SSH pane, including folders visited while following the shell. For example, after jumping from a project to `/var/log`, choose **Back** to return to the project. Opening a different folder from there starts a new history branch. Refreshing the listing or trying a path the server cannot open preserves your place. Reconnecting starts a fresh history.
 
-Choose **Cancel transfer** to stop the current upload or download and skip the rest of that batch. The drawer waits for the server to acknowledge an in-flight request. A cancelled download leaves an existing local file intact. If an upload has already opened the remote file, it can leave a partial file, including when replacing an existing file. The drawer reports the remote path and acknowledged byte count. The SSH shell and subsequent transfers remain available.
+Choose **Cancel transfer** to stop the current upload or download and skip the rest of that batch. The drawer waits for the server to acknowledge an in-flight request. A cancelled download leaves an existing local file intact. A cancelled direct upload can leave a partial file once it opens its final destination. The drawer reports the remote path and acknowledged byte count. The SSH shell and subsequent transfers remain available.
+
+Enable **Upload files atomically** before selecting or dropping regular files to stage them next to their remote destinations. Each file is published after all writes and the close are acknowledged. Replacing an existing regular file also requires **Replace existing files** and the server's OpenSSH atomic rename extension. New files start with private permissions. Replacements keep reported ownership and ordinary mode bits, and get a new inode. After a connection loss, the reported temporary path may still exist. If the rename was already sent, refresh to check the destination before retrying.
 
 Choose **Filter filenames…** and type part of a name to search the entire directory listing, including later pages. Matching ignores case and treats punctuation literally. Filtering uses the listing already in memory. **Done** returns keyboard input to the terminal and keeps the results visible. **Clear filter** brings back all entries. Refresh keeps your filter in the current directory, and opening another directory starts with its full listing.
+
+Choose **Find files…** to search the displayed directory and its subdirectories by filename. Matching is case-insensitive and literal. Select a result to open its containing folder with the entry selected. The search uses the pane’s SFTP channel, skips symbolic links when descending, and reports incomplete results if it reaches a limit. **Cancel search** keeps the matches already collected.
 
 Under **Sort by**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
 
@@ -678,6 +684,10 @@ The benchmark measures **only VT parsing and scrollback**. It excludes snapshot 
 ## Controls
 
 Press **Ctrl+Shift+A** or choose **Select all terminal text** in the command palette to select the focused pane’s retained text, including lines above the viewport. Press **Ctrl+Shift+C** to copy it as plain text, or **Esc** to cancel. Selecting leaves the clipboard untouched even when copy-on-select is on. In a full-screen application using the alternate screen, the selection covers that application’s text. For output larger than the 1 MiB clipboard limit, use **Panes → Save scrollback as text…**.
+
+Use **Copy pane as image** or **Save pane image…** under **Tab menu → Panes** or in the command palette. Both capture the current terminal grid, including graphics and any scrollback currently in view. Copy places a bitmap on the Windows clipboard and Save writes a PNG. The capture excludes selection highlights and surrounding window controls.
+
+Choose **Copy visible pane text** to copy the same viewport as plain text without selecting it first. It joins soft-wrapped rows, trims trailing space on hard lines, and omits unused rows at the bottom.
 
 **Ctrl+Shift+X** or **caret → Panes → Keyboard copy mode** lets you select text in the focused pane while its session continues running. Move with the arrow keys or **h/j/k/l**, page with **Page Up/Down**, use **Home/End** or **0/$** for the edges of a row, and **g/G** or **Ctrl+Home/End** for the ends of retained history. Press **v** for character selection or **Shift+V** for whole rows, then **y** or **Enter** to copy plain text. Soft-wrapped rows join in character and line selections. **Esc** cancels and restores your previous viewport. Inside an alternate screen the current grid is available. Remap the activation shortcut under **Settings → Keyboard**.
 
