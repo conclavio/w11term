@@ -131,6 +131,7 @@ pub enum FileAction {
     TextEditor(u64, u64, editor::Action),
     Rename(u64, u64, ListedEntry),
     MoveEntry(u64, u64, FileTarget),
+    CopyEntry(u64, u64, FileTarget),
     MoveMarked(u64, u64, u64),
     StopMoves(u64, u64, u64),
     MoveDestination(u64, u64, u64, destination::Action),
@@ -365,12 +366,17 @@ enum EditAction {
     Rename(ListedEntry),
     RenameSearch(u64, FilenameMatch),
     Move(FileTarget, Option<EntryKind>),
+    Copy(FileTarget),
     MoveBatch(MoveOrigin, Vec<FilenameMatch>),
     VerifyDownload(FileTarget),
     Delete(FileTarget, EntryKind),
 }
 
 impl EditAction {
+    fn uses_folder_picker(&self) -> bool {
+        matches!(self, Self::Move(..) | Self::MoveBatch(..) | Self::Copy(..))
+    }
+
     fn original(&self) -> Option<&ListedEntry> {
         match self {
             Self::GoToFolder { .. }
@@ -379,9 +385,11 @@ impl EditAction {
             | Self::RenameSearch(..)
             | Self::MoveBatch(..)
             | Self::Move(FileTarget::Search(..), _)
+            | Self::Copy(FileTarget::Search(..))
             | Self::Delete(FileTarget::Search(..), _) => None,
             Self::Rename(entry)
             | Self::Move(FileTarget::Listed(entry), _)
+            | Self::Copy(FileTarget::Listed(entry))
             | Self::Delete(FileTarget::Listed(entry), _) => Some(entry),
         }
     }
@@ -390,6 +398,7 @@ impl EditAction {
         match self {
             Self::RenameSearch(serial, hit)
             | Self::Move(FileTarget::Search(serial, hit), _)
+            | Self::Copy(FileTarget::Search(serial, hit))
             | Self::Delete(FileTarget::Search(serial, hit), _) => Some((*serial, hit)),
             _ => None,
         }
@@ -397,7 +406,7 @@ impl EditAction {
 }
 
 impl EntryDialog {
-    fn check_move_folder(&self, folder: &str) -> Result<()> {
+    fn check_destination_folder(&self, folder: &str) -> Result<()> {
         let check = |parent: &str, name: &str, kind| {
             ensure!(
                 folder.trim_end_matches('/') != parent.trim_end_matches('/'),
@@ -417,13 +426,16 @@ impl EntryDialog {
         };
         match &self.action {
             EditAction::Move(target, kind) => check(target.parent(), target.name(), *kind),
+            EditAction::Copy(target) => {
+                check(target.parent(), target.name(), Some(EntryKind::File))
+            }
             EditAction::MoveBatch(_, hits) => {
                 for hit in hits {
                     check(&hit.parent, &hit.name, hit.kind)?;
                 }
                 Ok(())
             }
-            _ => bail!("Open a move dialog before choosing its destination"),
+            _ => bail!("Open a file action before choosing its destination"),
         }
     }
 
@@ -451,7 +463,7 @@ impl EntryDialog {
             EditAction::RenameSearch(_, hit) if self.name == hit.name => {
                 bail!("Enter a different name")
             }
-            EditAction::Move(..) | EditAction::MoveBatch(..) => {
+            EditAction::Move(..) | EditAction::MoveBatch(..) | EditAction::Copy(..) => {
                 ensure!(
                     !self.name.trim().is_empty()
                         && !self.name.contains('\\')
@@ -466,7 +478,7 @@ impl EntryDialog {
                 };
                 let trimmed = folder.trim_end_matches('/');
                 let folder = if trimmed.is_empty() { "/" } else { trimmed };
-                self.check_move_folder(folder)?;
+                self.check_destination_folder(folder)?;
                 Ok(folder.to_owned())
             }
             EditAction::Delete(target, _) => delete_path(parent()?, target.name()),
@@ -480,14 +492,28 @@ impl EntryDialog {
 
 enum EntryChange {
     CreateFolder(String),
-    Rename { from: String, to: String },
-    Move { name: String, directory: String },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Move {
+        name: String,
+        directory: String,
+    },
+    Copy {
+        name: String,
+        directory: String,
+        size: Option<u64>,
+    },
     Delete(String),
 }
 impl EntryChange {
     fn name(&self) -> &str {
         match self {
-            Self::CreateFolder(name) | Self::Move { name, .. } | Self::Delete(name) => name,
+            Self::CreateFolder(name)
+            | Self::Move { name, .. }
+            | Self::Copy { name, .. }
+            | Self::Delete(name) => name,
             Self::Rename { to, .. } => to,
         }
     }
@@ -497,6 +523,9 @@ impl EntryChange {
             Self::Delete(name) => format!("deletion of {name}"),
             Self::Rename { from, to } => format!("rename of {from} to {to}"),
             Self::Move { name, directory } => format!("move of {name} to {directory}"),
+            Self::Copy {
+                name, directory, ..
+            } => format!("copy of {name} to {directory}"),
         }
     }
     fn completed(&self) -> String {
@@ -505,6 +534,9 @@ impl EntryChange {
             Self::Delete(name) => format!("Deleted {name}"),
             Self::Rename { from, to } => format!("Renamed {from} to {to}"),
             Self::Move { name, directory } => format!("Moved {name} to {directory}"),
+            Self::Copy {
+                name, directory, ..
+            } => format!("Copied {name} to {directory}"),
         }
     }
     fn error(&self, error: &str) -> String {
@@ -513,6 +545,9 @@ impl EntryChange {
             Self::Delete(name) => format!("Could not delete {name}: {error}"),
             Self::Rename { from, to } => format!("Rename {from} to {to}: {error}"),
             Self::Move { name, directory } => format!("Move {name} to {directory}: {error}"),
+            Self::Copy {
+                name, directory, ..
+            } => format!("Copy {name} to {directory}: {error}"),
         }
     }
 }
@@ -1369,6 +1404,24 @@ impl FileDrawer {
         Ok(())
     }
 
+    fn begin_copy_entry(&mut self, target: FileTarget) -> Result<()> {
+        ensure!(
+            self.open && self.generation != 0 && !self.busy(),
+            "Open the file drawer and select a file to copy"
+        );
+        ensure!(
+            target.is_regular_file()
+                || matches!(&target, FileTarget::Listed(entry) if entry.kind == ListedKind::Missing),
+            "Select a regular file to copy"
+        );
+        self.checked_target_path(&target)?;
+        let parent = target.parent().to_owned();
+        entry_path(&parent, target.name())?;
+        self.end_filter_edit();
+        self.show_entry_dialog(Some(parent), EditAction::Copy(target));
+        Ok(())
+    }
+
     fn begin_verified_download(&mut self, target: FileTarget, digest: String) -> Result<()> {
         ensure!(
             !matches!(&target, FileTarget::Listed(entry)
@@ -1394,6 +1447,7 @@ impl FileDrawer {
             name: match &action {
                 EditAction::VerifyDownload(_)
                 | EditAction::Move(..)
+                | EditAction::Copy(..)
                 | EditAction::MoveBatch(..) => String::new(),
                 EditAction::RenameSearch(_, hit) => hit.name.clone(),
                 action => action
@@ -1521,6 +1575,7 @@ impl FileDrawer {
                 ("Rename entry", "New name", "Rename")
             }
             EditAction::Move(..) => ("Move remote entry", "Destination folder", "Move"),
+            EditAction::Copy(..) => ("Copy remote file", "Destination folder", "Copy"),
             EditAction::MoveBatch(..) => ("Move marked entries", "Destination folder", "Move"),
             EditAction::VerifyDownload(_) => (
                 "Download and verify",
@@ -1559,13 +1614,18 @@ impl FileDrawer {
                 ),
             );
         }
-        if let EditAction::Move(target, _) = &dialog.action {
+        if let EditAction::Move(target, _) | EditAction::Copy(target) = &dialog.action {
+            let source_label = if matches!(dialog.action, EditAction::Copy(..)) {
+                "Remote copy source"
+            } else {
+                "Remote move source"
+            };
             fields.insert(
                 0,
                 KeyedView::new(
-                    "move-source",
+                    "folder-action-source",
                     TextBlock::new()
-                        .automation_name("Remote move source")
+                        .automation_name(source_label)
                         .text(format!(
                             "{}@{}:{} · {}/{}",
                             ssh.user,
@@ -1619,10 +1679,7 @@ impl FileDrawer {
                 ),
             );
         }
-        if matches!(
-            dialog.action,
-            EditAction::Move(..) | EditAction::MoveBatch(..)
-        ) {
+        if dialog.action.uses_folder_picker() {
             fields.push(KeyedView::new(
                 "browse-destination",
                 Button::new()
@@ -1637,7 +1694,7 @@ impl FileDrawer {
                     .content("Browse folders…"),
             ));
             fields.push(KeyedView::new(
-                "move-relative",
+                "destination-relative",
                 TextBlock::new()
                     .text(format!(
                         "Relative paths start in {}.",
@@ -2171,6 +2228,18 @@ impl FileDrawer {
                             }),
                         Delete(pane, generation, listed(selected)),
                     ),
+                ),
+                button(
+                    "Copy to folder…",
+                    writable
+                        && generation != 0
+                        && selected.is_some_and(|entry| {
+                            matches!(
+                                entry.kind,
+                                ListedKind::Known(EntryKind::File) | ListedKind::Missing
+                            ) && entry_path(folder, &entry.name).is_ok()
+                        }),
+                    CopyEntry(pane, generation, FileTarget::Listed(listed(selected))),
                 ),
             )),
             StackPanel::new()
@@ -2961,15 +3030,22 @@ impl FileDrawer {
                 },
                 Ok(reply),
             ) => {
-                if let EntryChange::Move { directory, .. } = &mut change
+                if let EntryChange::Move { directory, .. } | EntryChange::Copy { directory, .. } =
+                    &mut change
                     && let Some(resolved) = reply["directory"].as_str()
                 {
                     *directory = resolved.to_owned();
+                }
+                if let EntryChange::Copy { size, .. } = &mut change {
+                    *size = reply["bytes_copied"].as_u64();
                 }
                 if let Some((serial, hit)) = search_origin {
                     return self.search_change_completed(id, session, serial, hit, change, context);
                 }
                 self.status = change.completed();
+                if matches!(change, EntryChange::Copy { .. }) {
+                    return Ok(());
+                }
                 // The old name no longer identifies the entry the user selected.
                 // If the follow-up listing fails, do not leave stale rows actionable.
                 if matches!(
@@ -3263,6 +3339,7 @@ impl TerminalApp {
             | TextEditor(id, ..)
             | Rename(id, ..)
             | MoveEntry(id, ..)
+            | CopyEntry(id, ..)
             | MoveMarked(id, ..)
             | StopMoves(id, ..)
             | MoveDestination(id, ..)
@@ -3330,7 +3407,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | MoveMarked(_, g, ..) | StopMoves(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | MoveMarked(_, g, ..) | StopMoves(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3750,6 +3827,21 @@ impl TerminalApp {
                                     },
                                 )
                             }
+                            EditAction::Copy(target) => {
+                                let from = entry_path(target.parent(), target.name())?;
+                                files.status = format!("Copying {from} to {path}…");
+                                (
+                                    EntryChange::Copy {
+                                        name: target.name().to_owned(),
+                                        directory: path.clone(),
+                                        size: None,
+                                    },
+                                    Operation::CopyEntry {
+                                        from,
+                                        directory: path,
+                                    },
+                                )
+                            }
                             EditAction::MoveBatch(origin, hits) => {
                                 let batch = move_batch::Batch::new(review_id, origin, hits, path)?;
                                 return files.start_move_batch(pane, session, batch, context);
@@ -3860,6 +3952,7 @@ impl TerminalApp {
                     files.begin_edit(entry.parent.clone(), EditAction::Rename(entry))?;
                 }
                 MoveEntry(_, _, target) if may_open_dialog => files.begin_move_entry(target)?,
+                CopyEntry(_, _, target) if may_open_dialog => files.begin_copy_entry(target)?,
                 MoveMarked(_, _, revision) if may_open_dialog => {
                     files.begin_marked_move(MoveOrigin::Listing(revision))?;
                 }
@@ -3893,7 +3986,8 @@ impl TerminalApp {
                         }
                     }
                 }
-                NewFolder(..) | Rename(..) | MoveEntry(..) | MoveMarked(..) | Delete(..) => {}
+                NewFolder(..) | Rename(..) | MoveEntry(..) | CopyEntry(..) | MoveMarked(..)
+                | Delete(..) => {}
                 Browse(_, _, path) => {
                     if files.directory.as_ref() != Some(&path) {
                         files.following = false;

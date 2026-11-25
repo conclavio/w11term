@@ -518,6 +518,9 @@ impl russh_sftp::server::Handler for Files {
                 .extensions
                 .insert("limits@openssh.com".into(), "1".into());
         }
+        if self.root.join("fixture-copy-data").is_file() {
+            version.extensions.insert("copy-data".into(), "1".into());
+        }
         Ok(version)
     }
     async fn extended(
@@ -528,6 +531,32 @@ impl russh_sftp::server::Handler for Files {
     ) -> Result<Packet, StatusCode> {
         if request == "posix-rename@openssh.com" && self.posix.is_some() {
             return self.posix_rename(id, data);
+        }
+        if request == "copy-data" && self.root.join("fixture-copy-data").is_file() {
+            self.trace_transfer("COPY-DATA")?;
+            if self.root.join("reject-copy-data").is_file() {
+                return Err(StatusCode::OpUnsupported);
+            }
+            let mut payload = data.into();
+            let (from, offset, length, to, target): (String, u64, u64, String, u64) =
+                russh_sftp::de::from_bytes(&mut payload).map_err(|_| StatusCode::BadMessage)?;
+            if !payload.is_empty() || from == to || length == 0 || length > 4 * 1024 * 1024 {
+                return Err(StatusCode::BadMessage);
+            }
+            let mut bytes = Vec::new();
+            let source = self.file(&from)?;
+            source.seek(SeekFrom::Start(offset)).map_err(io)?;
+            source.take(length).read_to_end(&mut bytes).map_err(io)?;
+            if bytes.len() as u64 != length {
+                return Err(StatusCode::Failure);
+            }
+            if self.root.join("short-copy-data").is_file() {
+                bytes.pop();
+            }
+            let output = self.file(&to)?;
+            output.seek(SeekFrom::Start(target)).map_err(io)?;
+            output.write_all(&bytes).map_err(io)?;
+            return Ok(Packet::Status(status(id)));
         }
         if request != "limits@openssh.com" || !self.root.join("small-reads").exists() {
             return Err(StatusCode::OpUnsupported);
@@ -1116,6 +1145,8 @@ mod local_forward;
 mod native_gui;
 #[path = "sftp/properties.rs"]
 mod properties;
+#[path = "sftp/remote_copy.rs"]
+mod remote_copy;
 #[path = "sftp/remove.rs"]
 mod remove;
 #[path = "sftp/rename.rs"]

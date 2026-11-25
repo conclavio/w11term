@@ -42,6 +42,7 @@ pub use find::{
 mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
+mod remote_copy;
 mod text_preview;
 mod transfer_status;
 pub use transfer_status::{
@@ -359,6 +360,12 @@ pub enum Operation {
         kind: Option<EntryKind>,
         destination_is_canonical: bool,
     },
+    /// Copy an approved regular file into another folder on the same connection.
+    #[serde(skip)]
+    CopyEntry {
+        from: String,
+        directory: String,
+    },
     /// Delete the selected entry with the type and SSH connection the user approved.
     #[serde(skip)]
     RemoveEntry {
@@ -565,6 +572,10 @@ enum JobStage {
         temporary: String,
         publishing: bool,
     },
+    StagedCopy {
+        temporary: String,
+        publishing: bool,
+    },
     AwaitingStatus(&'static str),
 }
 
@@ -604,6 +615,14 @@ impl JobStage {
                     "destination was not replaced"
                 };
                 format!("Atomic upload interrupted; {state}. Temporary file may remain at {temporary}").into()
+            }
+            Self::StagedCopy { temporary, publishing } => {
+                let state = if *publishing {
+                    "publication outcome unknown; refresh the destination folder"
+                } else {
+                    "the final copy was not published"
+                };
+                format!("Copy interrupted; {state}. Temporary file may remain at {temporary}").into()
             }
             Self::Checking(message) | Self::AwaitingStatus(message) => (*message).into(),
         }
@@ -661,6 +680,9 @@ pub(crate) async fn run(
                 }
                 Operation::MoveEntry { .. } => {
                     Some("Missing SSH connection approval; move was not started")
+                }
+                Operation::CopyEntry { .. } => {
+                    Some("Missing SSH connection approval; copy was not started")
                 }
                 Operation::BrowseMoveFolders { .. } => {
                     Some("Missing SSH connection for the destination picker")
@@ -808,6 +830,7 @@ pub(crate) async fn run(
                 }
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
                 Operation::MoveEntry { .. } => JobStage::Checking("Move was not started"),
+                Operation::CopyEntry { .. } => JobStage::Checking("Copy was not started"),
                 Operation::BrowseMoveFolders { .. } => {
                     JobStage::Checking("Destination folders did not load")
                 }
@@ -860,6 +883,7 @@ pub(crate) async fn run(
                                 | JobStage::NativeUpload { .. }
                                 | JobStage::EditorSave { .. }
                                 | JobStage::AtomicUpload { .. }
+                                | JobStage::StagedCopy { .. }
                         ))
                 {
                     result.with_context(|| reply.stage.interrupted())
@@ -885,6 +909,7 @@ pub(crate) async fn run(
                         | JobStage::DirectoryUpload(_)
                         | JobStage::EditorSave { .. }
                         | JobStage::AtomicUpload { .. }
+                        | JobStage::StagedCopy { .. }
                         | JobStage::Checking(_)
                         | JobStage::AwaitingStatus(_)
                         | JobStage::NativeUpload { .. }
@@ -1150,33 +1175,9 @@ impl Engine {
         destination_is_canonical: bool,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        let (parent, name) = from.rsplit_once('/').context("Missing source folder")?;
-        let parent = if parent.is_empty() { "/" } else { parent };
-        ensure!(
-            from.starts_with('/')
-                && directory.starts_with('/')
-                && !matches!(name, "" | "." | "..")
-                && !from.contains('\\')
-                && !directory.contains('\\')
-                && !from.chars().chain(directory.chars()).any(char::is_control),
-            "Choose a remote entry and destination folder"
-        );
-        ensure!(
-            self.canonical_remote_path(parent).await? == parent,
-            "The source folder changed. Refresh the drawer."
-        );
-        let destination = self
-            .canonical_remote_path(&directory)
-            .await
-            .context("Could not resolve the destination folder")?;
-        ensure!(
-            !destination_is_canonical || destination == directory,
-            "The destination folder changed. Refresh the drawer."
-        );
-        ensure!(
-            parent != destination,
-            "Choose a different destination folder"
-        );
+        let (destination, to) = self
+            .cross_folder_paths(&from, &directory, destination_is_canonical)
+            .await?;
         let attributes = self
             .raw
             .lstat(&from)
@@ -1197,9 +1198,53 @@ impl Engine {
                         .is_some_and(|suffix| suffix.starts_with('/'))),
             "A folder cannot be moved into itself or one of its descendants"
         );
+        self.require_destination_directory(&destination).await?;
+        self.rename_without_replacement(from, to, MOVE_OUTCOME_UNKNOWN, stage)
+            .await?;
+        Ok(json!({"directory":destination}))
+    }
+
+    async fn cross_folder_paths(
+        &self,
+        from: &str,
+        directory: &str,
+        destination_is_canonical: bool,
+    ) -> Result<(String, String)> {
+        let (parent, name) = from.rsplit_once('/').context("Missing source folder")?;
+        let parent = if parent.is_empty() { "/" } else { parent };
+        ensure!(
+            from.starts_with('/')
+                && directory.starts_with('/')
+                && !matches!(name, "" | "." | "..")
+                && !from.contains('\\')
+                && !directory.contains('\\')
+                && !from.chars().chain(directory.chars()).any(char::is_control),
+            "Choose a remote entry and destination folder"
+        );
+        ensure!(
+            self.canonical_remote_path(parent).await? == parent,
+            "The source folder changed. Refresh the drawer."
+        );
+        let destination = self
+            .canonical_remote_path(directory)
+            .await
+            .context("Could not resolve the destination folder")?;
+        ensure!(
+            !destination_is_canonical || destination == directory,
+            "The destination folder changed. Refresh the drawer."
+        );
+        ensure!(
+            parent != destination,
+            "Choose a different destination folder"
+        );
+        let to = format!("{}/{name}", destination.trim_end_matches('/'));
+        Ok((destination, to))
+    }
+
+    async fn require_destination_directory(&self, destination: &str) -> Result<()> {
         let attrs = self
             .raw
-            .stat(&destination)
+            .stat(destination)
             .await
             .context("Could not check the destination folder")?
             .attrs;
@@ -1209,10 +1254,7 @@ impl Engine {
             }),
             "The destination is not a folder"
         );
-        let to = format!("{}/{name}", destination.trim_end_matches('/'));
-        self.rename_without_replacement(from, to, MOVE_OUTCOME_UNKNOWN, stage)
-            .await?;
-        Ok(json!({"directory":destination}))
+        Ok(())
     }
 
     async fn execute(
@@ -1609,6 +1651,7 @@ impl Engine {
                 self.move_entry(from, directory, kind, destination_is_canonical, stage)
                     .await?
             }
+            CopyEntry { from, directory } => self.copy_entry(&from, &directory, stage).await?,
             RemoveEntry {
                 path,
                 kind,

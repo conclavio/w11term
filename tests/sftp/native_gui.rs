@@ -2973,6 +2973,31 @@ async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "copies regular files from the native listing and recursive search over one live SSH connection"]
+async fn native_sftp_copy_from_listing_and_search_keeps_both_originals() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path().join("shell directory");
+    fs::create_dir_all(root.join("archive")).unwrap();
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join("copy-first.bin"), b"original\0file").unwrap();
+    fs::write(root.join("sub/copy-nested.bin"), b"nested\0file").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("sftp-copy-ui.ps1", &ssh, state.path());
+    for (path, expected) in [
+        ("copy-first.bin", b"original\0file".as_slice()),
+        ("archive/copy-first.bin", b"original\0file".as_slice()),
+        ("sub/copy-nested.bin", b"nested\0file".as_slice()),
+        ("copy-nested.bin", b"nested\0file".as_slice()),
+    ] {
+        assert_eq!(fs::read(root.join(path)).unwrap(), expected);
+    }
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "filters a paginated SFTP listing while checking shell input and directory reads"]
 async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
