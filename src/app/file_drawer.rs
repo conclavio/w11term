@@ -136,7 +136,7 @@ pub enum FileAction {
     MovePreviewMatch(u64, u64, u64, bool),
     CopyChecksum(u64, u64, u64),
     VerifyChecksum(u64, u64, u64),
-    LocalComparisonReady(
+    ComparisonReady(
         u64,
         u64,
         u64,
@@ -144,6 +144,7 @@ pub enum FileAction {
         Result<preview::ComparisonOutput, String>,
     ),
     DismissComparison(u64, u64, u64),
+    TextReference(u64, u64, preview::ReferenceAction),
     Permissions(u64, u64, u64, preview::PermissionsAction),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
@@ -217,6 +218,7 @@ pub(super) struct FileDrawer {
     reveal: Option<RevealTarget>,
     dialog: Option<EntryDialog>,
     preview: Option<preview::EntryPreview>,
+    text_reference: Option<preview::TextReference>,
     folder_report: Option<folder_report::Panel>,
     editor: Option<editor::Editor>,
     dialog_serial: u64,
@@ -600,6 +602,7 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    CompareReference(u64, u64),
     OpenLinkTarget(u64),
     FolderReport(u64),
     Permissions(u64, u32),
@@ -1614,14 +1617,7 @@ impl FileDrawer {
             return Some(editor.dialog(pane, self.generation, context));
         }
         if let Some(preview) = &self.preview {
-            return Some(preview.dialog(
-                pane,
-                self.generation,
-                self.listing_revision,
-                self.editor.is_none(),
-                self.picking.is_some(),
-                context,
-            ));
+            return Some(preview.dialog(pane, self, context));
         }
         if let Some(space) = &self.folder_report {
             let progress = self
@@ -2261,6 +2257,8 @@ impl FileDrawer {
                         GoToFolder(pane, generation, revision),
                     )),
                 )),
+            self.reference_controls(pane, context)
+                .unwrap_or_else(View::empty),
             search_actions,
             StackPanel::new()
                 .orientation(if layout.content_width() >= 300.0 {
@@ -2478,7 +2476,7 @@ impl FileDrawer {
                         preview(PreviewKind::Properties),
                     ),
                 );
-                if regular {
+                let actions = if regular {
                     let tail = button("Tail text file…", writable, preview(PreviewKind::Tail));
                     let supplemental = if selected.is_some_and(|e| image_preview_name(&e.name)) {
                         button_pair(
@@ -2491,6 +2489,25 @@ impl FileDrawer {
                     StackPanel::new()
                         .spacing(6.0)
                         .children((actions, supplemental))
+                } else {
+                    actions
+                };
+                if let Some(id) = self.reference_id()
+                    && regular
+                {
+                    let target = FileTarget::Listed(listed(selected));
+                    StackPanel::new().spacing(6.0).children((
+                        actions,
+                        button(
+                            "Compare selected with reference…",
+                            writable,
+                            TextReference(
+                                pane,
+                                generation,
+                                preview::ReferenceAction::Open(target, id),
+                            ),
+                        ),
+                    ))
                 } else {
                     actions
                 }
@@ -2916,7 +2933,10 @@ impl FileDrawer {
                 expected_generation: request_generation(&operation, self.generation),
                 operation,
                 progress: tx_progress,
-                cancel: if matches!(step, Step::Preview(_) | Step::OpenLinkTarget(_)) {
+                cancel: if matches!(
+                    step,
+                    Step::Preview(_) | Step::CompareReference(..) | Step::OpenLinkTarget(_)
+                ) {
                     self.preview.as_ref().map(|p| p.cancel.clone())
                 } else if let Step::RenamePreflight(batch) = &step {
                     batch.preflight_cancel()
@@ -3071,6 +3091,12 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::CompareReference(serial, reference), reply) => {
+                self.finish_preview(serial, reply);
+                if may_open_dialog {
+                    self.compare_reference(id, serial, reference, context);
+                }
+            }
             (Step::FolderReport(serial), reply) => self.finish_folder_report(serial, reply),
             (Step::OpenLinkTarget(serial), reply) => {
                 self.finish_link_target(id, serial, reply, context)
@@ -3560,8 +3586,9 @@ impl TerminalApp {
             | MovePreviewMatch(id, ..)
             | CopyChecksum(id, ..)
             | VerifyChecksum(id, ..)
-            | LocalComparisonReady(id, ..)
+            | ComparisonReady(id, ..)
             | DismissComparison(id, ..)
+            | TextReference(id, ..)
             | Permissions(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
@@ -3636,7 +3663,7 @@ impl TerminalApp {
             action,
             Tick(_)
                 | Picked(..)
-                | LocalComparisonReady(..)
+                | ComparisonReady(..)
                 | Listed(..)
                 | LinkTargetListed(..)
                 | Drop(..)
@@ -3646,7 +3673,7 @@ impl TerminalApp {
         {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | OpenLinkTarget(_, g, ..) | LinkTargetListed(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | LocalComparisonReady(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | RenameMarkedText(_, g, ..) | ConfirmRenameMarked(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | ShowFolderReport(_, g, ..) | FolderReport(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | OpenLinkTarget(_, g, ..) | LinkTargetListed(_, g, ..) | ShowFullPreview(_, g, ..) | MovePreviewMatch(_, g, ..) | CopyChecksum(_, g, ..) | VerifyChecksum(_, g, ..) | ComparisonReady(_, g, ..) | Permissions(_, g, ..) | NewFolder(_, g, ..) | NewTextFile(_, g, ..) | Choose(_, g, ..) | SelectDownloads(_, g, ..) | MarkDownload(_, g, ..) | BulkListingMarks(_, g, ..) | Rename(_, g, ..) | RenameMarkedText(_, g, ..) | ConfirmRenameMarked(_, g, ..) | MoveEntry(_, g, ..) | CopyEntry(_, g, ..) | StartFolderBatch(_, g, ..) | StopFolderBatch(_, g, ..) | MoveDestination(_, g, ..) | VerifyDownload(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | ResumeDownload(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | ShowFolderReport(_, g, ..) | FolderReport(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | PreserveMtime(_, g, ..) | AtomicUploads(_, g, ..) | PreserveUploadTimes(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -3773,6 +3800,11 @@ impl TerminalApp {
                     outcome = TransferOutcome::Cancelled;
                 }
                 ClosePreview(_, _, serial) => files.close_preview(serial),
+                TextReference(_, generation, action) => {
+                    if may_open_dialog && generation == files.generation {
+                        files.reference_action(pane, action, session, context)?;
+                    }
+                }
                 ShowFullPreview(_, _, serial, full) => files.show_full_preview(serial, full),
                 MovePreviewMatch(_, _, serial, forward) => {
                     files.move_preview_match(serial, forward)
@@ -3892,8 +3924,8 @@ impl TerminalApp {
                     outcome = TransferOutcome::Cancelled;
                 }
                 LinkTargetListed(_, _, serial, result) => files.accept_link_target(serial, result),
-                LocalComparisonReady(_, _, serial, id, result) => {
-                    files.finish_local_comparison(serial, id, result);
+                ComparisonReady(_, _, serial, id, result) => {
+                    files.finish_comparison(serial, id, result);
                 }
                 DismissComparison(_, generation, serial) => {
                     if may_open_dialog && generation == files.generation {
