@@ -611,15 +611,23 @@ Success returns `pane`, `matched`, `generation`, `cols`, `rows`, and matching sc
 `text`. It observes screen state, not every transient byte that may have appeared
 between snapshots.
 
+Pass `--after-frame N` to consider only committed frames with a generation
+greater than `N`. Use the `generation` from `get-text` or a previous match
+for the same process and pane. A cursor ahead of the pane's current frame is an
+error. A later frame can satisfy the pattern with text that was also visible in
+the baseline. Synchronized output becomes eligible when its frame commits.
+
 Pass `--connection-generation N` to match frames from a particular live SSH
 session or local process. Use the generation from `list` or
 `wait-ssh-connected` with the same process and pane ID. A scoped wait fails as
 soon as that connection ends or changes. On success, the reply includes
 `connection_generation` as well as the frame's `generation`. Use the regular
 unscoped wait to observe a pane across reconnects or to read its final screen.
+`get-text` returns both generations from the same screen snapshot.
 
 ```powershell
-& $ctl --pid 12345 wait-for-text --pane $pane --connection-generation 2 --regex 'fps=\d+'
+$screen = (& $ctl --pid 12345 get-text --pane $pane | ConvertFrom-Json).result
+& $ctl --pid 12345 wait-for-text --pane $pane --connection-generation $screen.connection_generation --after-frame $screen.generation --regex 'fps=\d+'
 ```
 
 `resize` accepts the launch grid ranges. In a visible split it adjusts available dividers to reach the requested cell grid. Unzoom the focused pane before resizing it. A dimension fixed by the tab bounds, or a grid that leaves too little space for a sibling, produces a geometry error. The command keeps keyboard focus on its current pane.
@@ -764,7 +772,7 @@ if ($exitReply.ok -and $null -ne $exitReply.result.restart_token) {
 
 ```json
 {"verb":"wait-for-text","pane":1,"pattern":"fps=\\d+","regex":true,"timeout_seconds":15}
-{"verb":"wait-for-text","pane":1,"connection_generation":2,"pattern":"ready","timeout_seconds":15}
+{"verb":"wait-for-text","pane":1,"connection_generation":2,"after_frame":35,"pattern":"ready","timeout_seconds":15}
 {"verb":"resize","pane":1,"cols":170,"rows":48}
 {"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
 {"verb":"events","pane":1,"since":42,"timeout_seconds":30}

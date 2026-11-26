@@ -154,15 +154,17 @@ try {
     if ($LASTEXITCODE -ne 1 -or $staleWrite.ok -or $staleWrite.error -notmatch 'connection changed') {
         throw 'The previous PowerShell generation could still send input'
     }
-    $current = ((Control @('list')).sessions | Where-Object id -eq $local).connection_generation
+    $baseline = Control @('get-text','--pane',"$local")
+    $current = $baseline.connection_generation
     $wire = [Text.Encoding]::UTF8.GetBytes(('"new-shell-" + ($null -eq $restartValue)' + "`r"))
     $written = Control @('send-text','--pane',"$local",'--no-paste','--connection-generation',"$current",'--base64',[Convert]::ToBase64String($wire))
     if ($written.pane -ne $local -or $written.connection_generation -ne $current -or $written.bytes_written -ne $wire.Length) {
         throw 'Scoped PowerShell write did not acknowledge the replacement process'
     }
-    $match = Control @('wait-for-text','--pane',"$local",'--connection-generation',"$current",'--timeout','15','new-shell-True')
-    if ($match.pane -ne $local -or $match.connection_generation -ne $current -or !$match.matched) {
-        throw 'The screen match did not report the replacement PowerShell generation'
+    $match = Control @('wait-for-text','--pane',"$local",'--connection-generation',"$current",'--after-frame',"$($baseline.generation)",'--timeout','15','new-shell-True')
+    if ($match.pane -ne $local -or $match.connection_generation -ne $current -or !$match.matched -or
+        $match.generation -le $baseline.generation) {
+        throw 'The screen match did not report a newer frame from the replacement PowerShell generation'
     }
     $staleWait = & $Cli --pid $app.Id wait-for-text --pane $local --connection-generation $originalPs.connection_generation --timeout 3 'new-shell-True' | ConvertFrom-Json
     if ($LASTEXITCODE -ne 1 -or $staleWait.ok -or $staleWait.error -notmatch 'connection changed|no longer active') {

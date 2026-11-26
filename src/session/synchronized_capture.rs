@@ -165,6 +165,7 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
             .unwrap();
         assert!(screen["text"].as_str().unwrap().contains("old HUD"));
         assert_eq!(screen["generation"], old.generation);
+        assert_eq!(screen["connection_generation"], 0);
         // The callback inspects the snapshot without writing a PNG. No
         // temporary directory or filesystem access is needed for this capture.
         let image = registry
@@ -178,25 +179,35 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
             .await
             .unwrap();
         assert_eq!(image["generation"], old.generation);
-        let waiting = registry.execute(
-            Request::WaitForText {
-                pane: 1,
-                pattern: "new picture".into(),
-                regex: false,
-                connection_generation: None,
-                timeout_seconds: 1,
-            },
-            screenshot,
-        );
-        tokio::pin!(waiting);
+        // Keep the concurrent request dispatcher futures off the Windows test stack.
+        let wait = |pattern: &str, after_frame| {
+            Box::pin(registry.execute(
+                Request::WaitForText {
+                    pane: 1,
+                    pattern: pattern.into(),
+                    regex: false,
+                    connection_generation: None,
+                    after_frame: Some(after_frame),
+                    timeout_seconds: 1,
+                },
+                screenshot.clone(),
+            ))
+        };
+        let future_cursor = wait("HUD", old.generation + 1).await.unwrap_err();
+        assert!(future_cursor.to_string().contains("ahead of this pane"));
+        let mut waiting = wait("new picture", old.generation);
+        let mut recurring = wait("HUD", old.generation);
         assert_pending(waiting.as_mut()).await; // queues Command::Frames
+        assert_pending(recurring.as_mut()).await;
         capture(&input).await; // FIFO barrier: the worker has replied to Frames
         assert_pending(waiting.as_mut()).await; // matcher has checked the held frame
+        assert_pending(recurring.as_mut()).await; // HUD already appears in the held frame
         let done = feed(&input, "\x1b[?2026l").await;
         let found = waiting.await.unwrap();
         assert!(text(&done).contains("new HUD\nnew picture"));
         assert_eq!(done.generation, old.generation + 1);
         assert_eq!(found["generation"], done.generation);
+        assert_eq!(recurring.await.unwrap()["generation"], done.generation);
     })
     .await;
 }

@@ -20,6 +20,7 @@ async fn seen(pane: u64, marker: &str) -> Result<()> {
     split_control(Request::WaitForText {
         pane,
         connection_generation: None,
+        after_frame: None,
         pattern: marker.into(),
         regex: false,
         timeout_seconds: 15,

@@ -2484,6 +2484,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
                 pattern: "fps=144".into(),
                 regex: false,
                 connection_generation: None,
+                after_frame: None,
                 timeout_seconds: 3,
             },
             capture.clone(),

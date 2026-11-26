@@ -90,6 +90,8 @@ pub enum Request {
         regex: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection_generation: Option<std::num::NonZeroU64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_frame: Option<u64>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
@@ -727,6 +729,7 @@ impl Registry {
                 regex,
                 timeout_seconds,
                 connection_generation,
+                after_frame,
             } => {
                 ensure!(
                     (1..=3600).contains(&timeout_seconds),
@@ -757,12 +760,17 @@ impl Registry {
                     .send(Command::Frames(reply))
                     .context("pane is closed")?;
                 let frames = tokio::time::timeout(TIMEOUT, response).await??;
+                ensure!(
+                    after_frame.is_none_or(|baseline| baseline <= frames.load().generation),
+                    "frame generation is ahead of this pane; check the instance and pane ID"
+                );
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
                 let wait = async {
                     loop {
                         let frame = frames.load();
-                        if expected
-                            .is_none_or(|generation| frame.connection_generation == generation)
+                        if after_frame.is_none_or(|baseline| frame.generation > baseline)
+                            && expected
+                                .is_none_or(|generation| frame.connection_generation == generation)
                         {
                             let text = frame
                                 .rows
@@ -1208,9 +1216,18 @@ impl Registry {
                     .iter()
                     .map(|line| line.as_str().trim_end_matches(' ').to_owned())
                     .collect();
-                Ok(
-                    json!({"pane":pane,"generation":frame.generation,"cols":size.cols,"rows":size.rows,"lines":lines,"text":lines.join("\n"),"title":frame.title,"status":frame.status,"alternate_screen":frame.alternate}),
-                )
+                Ok(json!({
+                    "pane": pane,
+                    "generation": frame.generation,
+                    "connection_generation": frame.connection_generation,
+                    "cols": size.cols,
+                    "rows": size.rows,
+                    "lines": lines,
+                    "text": lines.join("\n"),
+                    "title": frame.title,
+                    "status": frame.status,
+                    "alternate_screen": frame.alternate,
+                }))
             }
             Request::SaveText {
                 pane,

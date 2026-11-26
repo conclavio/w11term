@@ -1082,6 +1082,30 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_text_parses_a_frame_cursor_alongside_connection_scope() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (_, request) =
+            parse_line("wait-for-text --pane 7 --after-frame 15 --connection-generation 4 ready")
+                .unwrap();
+        assert!(matches!(
+            request,
+            Request::WaitForText {
+                pane: 7,
+                after_frame: Some(15),
+                connection_generation: Some(generation),
+                ..
+            } if generation.get() == 4
+        ));
+        for line in [
+            "wait-for-text --pane 7 --after-frame -1 ready",
+            "wait-for-text --pane 7 --after-frame 1 --after-frame 2 ready",
+            "events --pane 7 --after-frame 15",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
     fn raw_bytes_and_required_options() {
         let p = |a: &[&str]| parse(a.iter().map(|s| s.to_string()));
         let (
