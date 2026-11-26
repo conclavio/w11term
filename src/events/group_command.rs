@@ -283,6 +283,7 @@ mod tests {
                 id: 7,
                 finished_at: finished,
                 command: Some("report".into()),
+                reported_directory: None,
                 exit_code: Some(17),
                 output: Ok(String::new()),
             }),
@@ -306,6 +307,7 @@ mod tests {
             id: 7,
             finished_at: std::time::Instant::now(),
             command: None,
+            reported_directory: None,
             exit_code: None,
             output: Ok("夜".repeat(PREVIEW_BYTES)),
         };

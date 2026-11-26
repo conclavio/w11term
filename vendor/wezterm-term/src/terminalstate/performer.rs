@@ -985,6 +985,7 @@ impl Performer<'_> {
                 self.command_history = Default::default();
                 self.capturing_shell_input = false;
                 self.command_label = None;
+                self.command_directory = None;
                 self.vscode_command = VscodeCommand::Idle;
                 self.current_dir = None;
                 self.forget_iterm_reported_host();
@@ -1181,6 +1182,7 @@ impl Performer<'_> {
                 if matches!(self.vscode_command, VscodeCommand::Running) {
                     if command.trim().is_empty() {
                         self.command_label = None;
+                        self.command_directory = None;
                         self.screen.command_start = None;
                         self.vscode_command = VscodeCommand::Idle;
                     } else {

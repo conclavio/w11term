@@ -150,7 +150,7 @@ When xterm modified-key reporting or its alternate format is enabled, `keyboard.
 
 `list-commands --pane ID` reads the pane’s OSC 133 command history. It returns
 `pane`, `connection_generation`, and a `commands` array, newest first. Each entry
-contains `id`, `command`, `exit_code`, and `output_available`. The array is empty
+contains `id`, `command`, `reported_directory`, `exit_code`, and `output_available`. The array is empty
 until the shell marks a completed command. A missing command line or exit status
 is JSON `null`. Listing transfers only this metadata and preserves keyboard focus
 and the scroll position.
@@ -158,6 +158,10 @@ and the scroll position.
 The command comes from the shell’s OSC 133 C `cmdline_url` field when
 available, including whitespace and line breaks. Otherwise it comes from
 visible text between the B and C markers.
+
+Both `list-commands` and `get-command` include `reported_directory`. This is the
+shell’s file URI from the start of that command, or JSON `null` if unavailable.
+The value is the original shell report, including its authority and escapes.
 
 Use `--status failed` for nonzero exit codes, `--status succeeded` for zero, or
 `--status unknown` when the shell omitted the exit code. The default is `all`.

@@ -389,6 +389,7 @@ mod tests {
                     id: link.id,
                     finished_at: std::time::Instant::now(),
                     command: Some("show".into()),
+                    reported_directory: None,
                     exit_code: Some(17),
                     output: Ok("full output\r\nsecond line".into()),
                 })

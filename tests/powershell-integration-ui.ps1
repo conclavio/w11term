@@ -9,15 +9,22 @@ $appearance = Get-Content -LiteralPath $env:W11TERM_SETTINGS_PATH -Raw | Convert
 $appearance.shortcuts | Add-Member NoteProperty 'find_command_history' 'F6'
 [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($appearance | ConvertTo-Json -Depth 8))
 $profiles = Join-Path $State 'profiles.json'
+$startFolder = Join-Path $State ('history start % ' + [char]0x96ea)
+$env:W11TERM_HISTORY_LATER = Join-Path $State 'history later'
+$env:W11TERM_TEST_EXPLORER_TRACE = Join-Path $State 'history-explorer.json'
+$null = [IO.Directory]::CreateDirectory($startFolder)
+$null = [IO.Directory]::CreateDirectory($env:W11TERM_HISTORY_LATER)
+[IO.File]::WriteAllText((Join-Path $startFolder 'history-folder-proof'), 'original Windows directory')
+$catalog = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+$catalog.profiles.'Palette PowerShell' | Add-Member NoteProperty cwd $startFolder
 $labels = @('Palette PowerShell')
 if ($pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1) {
-    $catalog = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
     $catalog.profiles | Add-Member NoteProperty 'Fixture PowerShell 7' @{
-        backend='local'; executable=$pwsh.Source; args=@('-NoLogo','-NoProfile')
+        backend='local'; executable=$pwsh.Source; args=@('-NoLogo','-NoProfile'); cwd=$startFolder
     }
-    [IO.File]::WriteAllText($profiles, ($catalog | ConvertTo-Json -Depth 12))
     $labels += 'Fixture PowerShell 7'
 }
+[IO.File]::WriteAllText($profiles, ($catalog | ConvertTo-Json -Depth 12))
 
 function Click([string]$Name) {
     try {
@@ -65,7 +72,7 @@ try {
         $null = Control @('record','--pane',"$pane",$capture)
 
         # Type an ordinary line. The shell supplies every semantic marker.
-        $line = "Write-Output ('shell-output-' + (40 + 2)); cmd.exe /d /c exit 17"
+        $line = 'Write-Output (''shell-output-'' + (40 + 2)); cd -LiteralPath $env:W11TERM_HISTORY_LATER; cmd.exe /d /c exit 17'
         $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($line + [char]13))
         $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64',$encoded)
         $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','shell-output-42')
@@ -97,6 +104,19 @@ try {
                 [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
             $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
                 Where-Object { $_.Current.Name.Trim() -ceq 'shell-output-42' } | Select-Object -First 1
+        }
+        $saved = ((Control @('list-commands','--pane',"$pane")).commands)[0]
+        $cwd = ([Uri]$saved.reported_directory).LocalPath
+        if (!$cwd -or ![IO.File]::Exists((Join-Path $cwd 'history-folder-proof'))) {
+            throw "History lost the original command folder for $label"
+        }
+        $dot = ' ' + [char]0xb7 + ' '
+        $null = Wait-Until "$label recorded working directory is shown" { Find-Element "Working directory${dot}$cwd" }
+        [IO.File]::Delete($env:W11TERM_TEST_EXPLORER_TRACE)
+        Click 'Open command directory'
+        $null = Wait-Until "$label opens its recorded working directory in Explorer" {
+            try { $trace = [IO.File]::ReadAllText($env:W11TERM_TEST_EXPLORER_TRACE) | ConvertFrom-Json } catch { return }
+            $trace.action -ceq 'explore' -and [IO.File]::Exists((Join-Path $trace.path 'history-folder-proof'))
         }
         Click 'Return to pane'
         Wait-Focus $pane
@@ -130,11 +150,17 @@ try {
     $null = Wait-Until 'the source profile matches its SSH command' { Find-Element $caption }
     $value.SetValue('WINDOW-REMOTE-NEEDLE')
     $null = Wait-Until 'the full SSH command matches past the shortened caption' { Find-Element $caption }
+    $value.SetValue('REMOTE HISTORY START')
+    $null = Wait-Until 'the captured command directory matches' { Find-Element $caption }
     Press-Key 0x0d
     $selectedRemote = "Selected, $($remoteCommand.Substring(0, 120))${dot}exit 8"
     $null = Wait-Until 'the exact SSH history capture opens' { Find-Element $selectedRemote }
-    Click 'Return to pane'
+    $null = Wait-Until 'SSH history shows the directory at the command start' { Find-Element "Working directory${dot}/remote history start" }
+    Click 'Open command directory'
     Wait-Focus $remote
+    $null = Wait-Until 'the original command directory opens in SFTP' {
+        (Find-Element '/remote history start') -and (Find-Element 'history-proof' ([System.Windows.Automation.ControlType]::Button))
+    }
 
     $null = Control @('send-text','--pane',"$remote",'--no-paste','neighbor-ok')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','neighbor-ok')

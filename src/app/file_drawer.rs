@@ -2046,7 +2046,7 @@ impl FileDrawer {
         self.awaiting_native_result() || self.pending.is_some()
     }
 
-    pub(super) fn ready_for_transfer_reveal(&self) -> bool {
+    pub(super) fn can_reveal_path(&self) -> bool {
         !self.busy() && !self.parsing && !self.entry_dialog_open()
     }
 

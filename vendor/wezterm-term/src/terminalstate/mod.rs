@@ -329,13 +329,16 @@ pub struct CompletedCommand {
     pub id: u64,
     pub finished_at: std::time::Instant,
     pub command: Option<String>,
+    pub reported_directory: Option<Arc<str>>,
     pub exit_code: Option<i32>,
     pub output: Result<String, &'static str>,
 }
 
 impl CompletedCommand {
     fn text_bytes(&self) -> usize {
-        self.command.as_ref().map_or(0, String::len) + self.output.as_ref().map_or(0, String::len)
+        self.command.as_ref().map_or(0, String::len)
+            + self.output.as_ref().map_or(0, String::len)
+            + self.reported_directory.as_deref().map_or(0, str::len)
     }
 }
 
@@ -494,6 +497,7 @@ pub struct TerminalState {
     track_primary_prints: bool,
     last_primary_print: Option<PrimaryPrint>,
     command_label: Option<String>,
+    command_directory: Option<Arc<str>>,
     vscode_command: VscodeCommand,
 
     term_program: String,
@@ -781,6 +785,7 @@ impl TerminalState {
             track_primary_prints: false,
             last_primary_print: None,
             command_label: None,
+            command_directory: None,
             vscode_command: VscodeCommand::Idle,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
@@ -1057,6 +1062,7 @@ impl TerminalState {
     fn begin_command_input(&mut self) {
         if !self.is_alt_screen_active() {
             self.command_label = None;
+            self.command_directory = None;
             self.capturing_shell_input = true;
             self.mark_shell_position();
         }
@@ -1064,6 +1070,11 @@ impl TerminalState {
 
     fn begin_command_output(&mut self, reported_command: Option<String>) {
         if !self.is_alt_screen_active() {
+            self.command_directory = self
+                .current_dir
+                .as_ref()
+                .filter(|(url, raw)| url.scheme() == "file" && raw.len() <= 16 * 1024)
+                .map(|(_, raw)| raw.clone());
             self.command_label = reported_command.or_else(|| {
                 if !self.capturing_shell_input {
                     return None;
@@ -1090,6 +1101,7 @@ impl TerminalState {
             self.capturing_shell_input = false;
             self.screen.command_start = None;
             self.command_label = None;
+            self.command_directory = None;
         }
     }
 
@@ -1110,6 +1122,7 @@ impl TerminalState {
                 id: self.next_command_id,
                 finished_at: std::time::Instant::now(),
                 command: self.command_label.take(),
+                reported_directory: self.command_directory.take(),
                 exit_code,
                 output,
             });

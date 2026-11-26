@@ -999,6 +999,7 @@ mod tests {
                 id: link.id,
                 finished_at: std::time::Instant::now(),
                 command: None,
+                reported_directory: None,
                 exit_code: Some(0),
                 output: Ok(output.into()),
             }))

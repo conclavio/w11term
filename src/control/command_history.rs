@@ -37,6 +37,7 @@ impl Registry {
                 json!({
                     "id": entry.id,
                     "command": entry.command,
+                    "reported_directory": entry.reported_directory.as_deref(),
                     "exit_code": entry.exit_code,
                     "output_available": entry.output.is_ok(),
                 })
@@ -72,6 +73,7 @@ impl Registry {
             "connection_generation": connection_generation,
             "id": entry.id,
             "command": entry.command,
+            "reported_directory": entry.reported_directory.as_deref(),
             "exit_code": entry.exit_code,
             "output": entry.output.as_ref().ok(),
             "output_error": entry.output.as_ref().err(),
@@ -164,8 +166,10 @@ mod tests {
     #[tokio::test]
     async fn metadata_only_listing_and_exact_output_from_read_only_background_pane() {
         let (registry, _session) = pane(concat!(
-            "\x1b]133;B\x07echo 雪\n\x1b]133;C\x07  雪 \"x\"\n\n  end\x1b]133;D;7\x07",
-            "\x1b]133;C\x07\x1b]133;D\x07", // available empty output and unknown exit code
+            "\x1b]7;file://loopback/old%20folder\x07",
+            "\x1b]133;B\x07echo 雪\n\x1b]133;C\x07  雪 \"x\"\n\n  end",
+            "\x1b]7;file://loopback/new\x07\x1b]133;D;7\x07",
+            "\x1b]633;C\x07\x1b]633;D\x07", // available empty output and unknown exit code
             "\x1b]133;D;1\x07",             // no C marker for this output
         ));
         let target = registry.pane(23).unwrap();
@@ -179,22 +183,30 @@ mod tests {
             json!({
                 "pane":23,"connection_generation":generation,
                 "commands":[
-                    {"id":3,"command":null,"exit_code":1,"output_available":false},
-                    {"id":2,"command":null,"exit_code":null,"output_available":true},
-                    {"id":1,"command":"echo 雪","exit_code":7,"output_available":true}
+                    {"id":3,"command":null,"reported_directory":null,"exit_code":1,"output_available":false},
+                    {"id":2,"command":null,"reported_directory":"file://loopback/new","exit_code":null,"output_available":true},
+                    {"id":1,"command":"echo 雪","reported_directory":"file://loopback/old%20folder","exit_code":7,"output_available":true}
                 ]
             })
         );
-        for (id, command, code, output, error) in [
+        for (id, command, directory, code, output, error) in [
             (
                 1,
                 Some("echo 雪"),
+                Some("file://loopback/old%20folder"),
                 Some(7),
                 Some("  雪 \"x\"\r\n\r\n  end"),
                 None,
             ),
-            (2, None, None, Some(""), None),
-            (3, None, Some(1), None, Some("No command output marker")),
+            (2, None, Some("file://loopback/new"), None, Some(""), None),
+            (
+                3,
+                None,
+                None,
+                Some(1),
+                None,
+                Some("No command output marker"),
+            ),
         ] {
             let result = execute(
                 &registry,
@@ -205,7 +217,7 @@ mod tests {
             assert_eq!(
                 result,
                 json!({"pane":23,"id":id,"connection_generation":generation,
-                "command":command,"exit_code":code,"output":output,"output_error":error})
+                "command":command,"reported_directory":directory,"exit_code":code,"output":output,"output_error":error})
             );
         }
         let after = Registry::capture(&target).await.unwrap().0;

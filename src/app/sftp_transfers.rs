@@ -607,7 +607,7 @@ fn remote_location(path: &str) -> Option<(&str, Option<&str>)> {
 fn remote_reveal_blocker(tab: &LiveTab, id: TransferId) -> Option<&'static str> {
     if tab.session.ssh_connection_generation() != Some(id.generation) {
         Some("The original SSH connection is unavailable.")
-    } else if !tab.files.ready_for_transfer_reveal() {
+    } else if !tab.files.can_reveal_path() {
         Some("Finish the active operation in the SFTP drawer first.")
     } else {
         None

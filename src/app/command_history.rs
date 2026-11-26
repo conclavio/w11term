@@ -44,12 +44,18 @@ pub enum HistoryAction {
     Copy(u64, u64, CopyPart),
     ExportOutput((u64, u64)),
     ShowOutput((u64, u64)),
+    OpenDirectory((u64, u64)),
     Insert((u64, u64)),
     BeginSave((u64, u64)),
     SaveName((u64, u64), String),
     Save((u64, u64)),
     CancelSave((u64, u64)),
     Return,
+}
+
+enum DirectoryNavigation {
+    Sftp(TabId, String),
+    Explorer(explorer::Location),
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +158,13 @@ fn command_status(entry: &CompletedCommand) -> String {
     entry
         .exit_code
         .map_or_else(|| "status unknown".into(), |code| format!("exit {code}"))
+}
+
+fn command_directory(
+    source: &Source,
+    entry: &CompletedCommand,
+) -> Option<directory_split::Directory> {
+    directory_split::Directory::reported(source, entry.reported_directory.as_deref()?)
 }
 
 fn output_preview(text: &str, hit: Option<Range<usize>>) -> String {
@@ -273,11 +286,12 @@ impl TerminalApp {
                     .profile_name()
                     .is_some_and(|name| name.to_lowercase().contains(&needle));
             let frame = live.session.frames.load();
-            for command in frame
-                .command_history
-                .iter()
-                .filter(|command| source_matches || command_text_matches(command, &needle))
-            {
+            for command in frame.command_history.iter().filter(|command| {
+                source_matches
+                    || command_text_matches(command, &needle)
+                    || command_directory(&live.source, command)
+                        .is_some_and(|path| path.display().to_lowercase().contains(&needle))
+            }) {
                 let link = CommandLink {
                     generation: frame.connection_generation,
                     id: command.id,
@@ -299,6 +313,29 @@ impl TerminalApp {
         }
         rows.sort_unstable_by_key(|(order, _)| *order);
         rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    fn history_directory(
+        &self,
+        pane: u64,
+        generation: u64,
+        entry: &CompletedCommand,
+    ) -> Option<(directory_split::Directory, Option<DirectoryNavigation>)> {
+        let tab_id = self.tab_for_pane(pane)?;
+        let Page::Terminal(live) = &self.tabs.get(tab_id)?.page else {
+            return None;
+        };
+        let directory = command_directory(&live.source, entry)?;
+        let navigation = match &directory {
+            directory_split::Directory::Ssh(path) => (live.session.ssh_connection_generation()
+                == Some(generation)
+                && live.files.can_reveal_path())
+            .then(|| DirectoryNavigation::Sftp(tab_id, path.clone())),
+            _ => directory
+                .explorer_location(&live.source)
+                .map(DirectoryNavigation::Explorer),
+        };
+        Some((directory, navigation))
     }
 
     fn history_insert_target(
@@ -592,6 +629,26 @@ impl TerminalApp {
                     });
                 }
             }
+            HistoryAction::OpenDirectory(target) => {
+                if page.selected != Some(target) {
+                    return;
+                }
+                let navigation = selected_command(&frame, Some(target))
+                    .and_then(|entry| self.history_directory(pane, target.0, entry))
+                    .and_then(|(_, navigation)| navigation);
+                match navigation {
+                    Some(DirectoryNavigation::Explorer(location)) => {
+                        explorer::open_location(location, ctx);
+                    }
+                    Some(DirectoryNavigation::Sftp(tab, path)) if self.tabs.select(tab) => {
+                        self.file_action(FileAction::Reveal(pane, target.0, path, None), ctx);
+                        self.sync_selection(ctx);
+                        self.activate(ctx);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             HistoryAction::SaveName(target, name) => {
                 if let Some(draft) = &mut page.save
                     && draft.target == target
@@ -744,6 +801,25 @@ impl TerminalApp {
         let show_target = page
             .selected
             .filter(|_| selected.is_some() && !frame.alternate && page.showing.is_none());
+        let directory = selected
+            .and_then(|entry| {
+                self.history_directory(pane, generation, entry)
+                    .map(|(path, navigation)| (entry.id, path, navigation.is_some()))
+            })
+            .map_or_else(View::empty, |(id, path, can_open)| {
+                StackPanel::new().spacing(4.0).children((
+                    TextBlock::new()
+                        .text(format!("Working directory · {}", path.display()))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true),
+                    Button::new()
+                        .is_enabled(can_open)
+                        .on_click(ctx.callback(move |_| {
+                            action(HistoryAction::OpenDirectory((generation, id)))
+                        }))
+                        .content("Open command directory"),
+                ))
+            });
         let save = match (&page.save, save_target) {
             (Some(draft), Some(target)) if draft.target == target => saved_commands::name_form(
                 &draft.name,
@@ -841,6 +917,7 @@ impl TerminalApp {
                                     .font_size(18.0)
                                     .text(heading)
                                     .text_wrapping(TextWrapping::Wrap),
+                                directory,
                                 Button::new()
                                     .is_enabled(insert_target.is_some())
                                     .on_click(ctx.callback(move |_| {
@@ -892,6 +969,7 @@ mod tests {
                 id,
                 finished_at: std::time::Instant::now(),
                 command: Some(format!("run {id}")),
+                reported_directory: None,
                 output,
                 exit_code,
             })
@@ -932,6 +1010,7 @@ mod tests {
             id: 9,
             finished_at: std::time::Instant::now(),
             command: Some(command.clone()),
+            reported_directory: None,
             output: Ok("archived result\r\n".into()),
             exit_code: Some(17),
         };
