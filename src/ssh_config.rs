@@ -1,6 +1,6 @@
 //! Import a selected OpenSSH client configuration into editable native profiles.
 use crate::options::{
-    AgentFingerprint, Authentication, JumpHost, MAX_JUMPS, SshKeepalive, SshOptions,
+    AgentFingerprint, AgentPipe, Authentication, JumpHost, MAX_JUMPS, SshKeepalive, SshOptions,
     validate_host_key_alias,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -411,6 +411,7 @@ impl Config<'_> {
                     | "user"
                     | "port"
                     | "identitiesonly"
+                    | "identityagent"
                     | "serveraliveinterval"
                     | "connecttimeout"
                     | "serveralivecountmax" => {
@@ -551,6 +552,21 @@ impl Config<'_> {
             (None, Some(certificate)) => Authentication::agent_certificate(certificate, None),
             (None, None) => Authentication::Agent,
         };
+        let agent_pipe = match scalars.get("identityagent") {
+            Some(directive) if authentication.uses_agent() => {
+                let path = argument(directive)?;
+                ensure!(
+                    !path.eq_ignore_ascii_case("none"),
+                    "{}: IdentityAgent none disables the agent. Import this host with an explicit private IdentityFile",
+                    directive.line
+                );
+                Some(
+                    path.parse::<AgentPipe>()
+                        .with_context(|| format!("{}: IdentityAgent", directive.line))?,
+                )
+            }
+            _ => None,
+        };
         Ok((
             JumpHost {
                 host,
@@ -559,6 +575,7 @@ impl Config<'_> {
                 connect_timeout_seconds,
                 keepalive,
                 authentication,
+                agent_pipe,
                 host_key: None,
                 host_key_alias,
             },
@@ -733,6 +750,59 @@ mod tests {
             .find(|alias| alias.name == name)
             .unwrap()
     }
+    #[test]
+    fn identity_agent_imports_local_pipes_with_first_value_precedence_and_preserves_disabling() {
+        let report = parse_config(
+            r#"
+            Host destination
+                ProxyJump gateway
+                IdentityAgent "\\\\.\\pipe\\agent-destination"
+                IdentityAgent none
+            Host gateway
+                IdentityAgent $SSH_AUTH_SOCK
+            Host disabled
+                IdentityAgent none
+            Host private
+                IdentityAgent none
+                IdentityFile ~/key
+            Host remote
+                IdentityAgent "\\\\server\\pipe\\agent"
+            "#,
+        );
+        let destination = alias(&report, "destination").options.as_ref().unwrap();
+        assert_eq!(
+            destination.agent_pipe.as_ref().map(AgentPipe::as_str),
+            Some(r"\\.\pipe\agent-destination")
+        );
+        assert_eq!(
+            destination.proxy_jump[0]
+                .agent_pipe
+                .as_ref()
+                .map(AgentPipe::as_str),
+            Some("SSH_AUTH_SOCK")
+        );
+        for (name, diagnostic) in [
+            ("disabled", "IdentityAgent none disables the agent"),
+            ("remote", "Enter a local Windows SSH agent pipe"),
+        ] {
+            let alias = alias(&report, name);
+            assert!(alias.options.is_none());
+            assert!(
+                alias.warnings[0].contains(diagnostic),
+                "{:?}",
+                alias.warnings
+            );
+        }
+        let private = alias(&report, "private").options.as_ref().unwrap();
+        assert!(matches!(
+            private.authentication,
+            Authentication::Identity { .. }
+        ));
+        assert!(private.agent_pipe.is_none());
+        let conditional = parse_config("Host pending\nMatch exec ignored\n IdentityAgent none");
+        assert!(alias(&conditional, "pending").options.is_none());
+    }
+
     #[test]
     fn certificate_import_allows_an_agent_certificate_but_rejects_multiple_files() {
         let report = parse_config(

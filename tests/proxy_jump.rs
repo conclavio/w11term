@@ -260,6 +260,7 @@ impl Fixture {
                 keepalive: Default::default(),
                 user: USERS[index].into(),
                 authentication: Authentication::identity(path, certificate_path),
+                agent_pipe: None,
                 host_key: Some(host.public_key().fingerprint(HashAlg::Sha256).to_string()),
                 host_key_alias: alias.map(str::to_owned),
             });

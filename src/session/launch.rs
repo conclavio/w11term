@@ -40,7 +40,7 @@ impl Launcher {
 
     pub(super) fn set_authentication(&mut self, auth: Authentication) {
         if let Source::Ssh(options) = &mut self.source {
-            options.authentication = auth;
+            options.set_authentication(auth);
         }
     }
 

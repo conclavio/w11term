@@ -18,6 +18,7 @@ pub enum Field {
     Identity,
     Certificate,
     AgentFingerprint,
+    AgentPipe,
     Fingerprint,
     Alias,
     Timeout,
@@ -64,6 +65,7 @@ struct Draft {
     identity: String,
     certificate: String,
     agent_fingerprint: String,
+    agent_pipe: String,
     fingerprint: String,
     alias: String,
     timeout: String,
@@ -88,6 +90,11 @@ impl Draft {
             identity,
             certificate,
             agent_fingerprint,
+            agent_pipe: existing
+                .and_then(|hop| hop.agent_pipe.as_ref())
+                .map(AgentPipe::as_str)
+                .unwrap_or_default()
+                .into(),
             fingerprint: existing
                 .and_then(|hop| hop.host_key.clone())
                 .unwrap_or_default(),
@@ -111,16 +118,18 @@ impl Draft {
             validate_host_key_alias(alias)?;
         }
         let fingerprint = self.fingerprint.trim();
+        let authentication = ssh_authentication(
+            self.authentication,
+            &self.identity,
+            &self.certificate,
+            &self.agent_fingerprint,
+        )?;
         Ok(JumpHost {
             host,
             user,
             port,
-            authentication: ssh_authentication(
-                self.authentication,
-                &self.identity,
-                &self.certificate,
-                &self.agent_fingerprint,
-            )?,
+            agent_pipe: ssh_agent_pipe(&authentication, &self.agent_pipe)?,
+            authentication,
             host_key: (!fingerprint.is_empty()).then(|| fingerprint.to_owned()),
             host_key_alias: (!alias.is_empty()).then(|| alias.to_ascii_lowercase()),
             connect_timeout_seconds: parse_ssh_connect_timeout(&self.timeout)?,
@@ -136,6 +145,7 @@ impl Draft {
             Field::Identity => &mut self.identity,
             Field::Certificate => &mut self.certificate,
             Field::AgentFingerprint => &mut self.agent_fingerprint,
+            Field::AgentPipe => &mut self.agent_pipe,
             Field::Fingerprint => &mut self.fingerprint,
             Field::Alias => &mut self.alias,
             Field::Timeout => &mut self.timeout,
@@ -201,6 +211,15 @@ impl Draft {
             )),
         ];
         use identity_picker::{Kind, Target};
+        if uses_agent_auth(self.authentication) {
+            fields.push(agent_key_picker::pipe_field(
+                "Jump host SSH agent pipe (optional)",
+                &self.agent_pipe,
+                context.callback(move |value| {
+                    Message::ProfileJump(id, Edit::Text(Field::AgentPipe, value))
+                }),
+            ));
+        }
         if self.authentication == PRIVATE_KEY_AUTH {
             fields.push(identity_picker::field(
                 Target::Jump {
@@ -235,6 +254,7 @@ impl Draft {
             fields.push(agent_key_picker::field(
                 "Jump host agent key fingerprint",
                 &self.agent_fingerprint,
+                &self.agent_pipe,
                 context.callback(move |value| {
                     Message::ProfileJump(id, Edit::Text(Field::AgentFingerprint, value))
                 }),
@@ -406,6 +426,7 @@ impl Editor {
                     &hop.user,
                     &hop.authentication,
                     hop.host_key_alias.as_deref(),
+                    hop.agent_pipe.as_ref(),
                 );
                 let name = format!("Jump host {}", index + 1);
                 KeyedView::new(
@@ -547,6 +568,7 @@ mod tests {
             user: "admin".into(),
             port: 2222,
             authentication: Authentication::identity("keys/bastion", None),
+            agent_pipe: None,
             host_key: Some("SHA256:fixture".into()),
             host_key_alias: Some("bastion.internal".into()),
             connect_timeout_seconds: std::num::NonZeroU32::new(15),

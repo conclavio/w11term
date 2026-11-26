@@ -160,6 +160,62 @@ pub enum Authentication {
 #[serde(try_from = "String")]
 pub struct AgentFingerprint(Box<str>);
 
+/// A local Windows SSH agent pipe or an explicit request for SSH_AUTH_SOCK.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+pub struct AgentPipe(Box<str>);
+
+impl AgentPipe {
+    pub const ENVIRONMENT: &str = "SSH_AUTH_SOCK";
+    const LOCAL_PREFIX: &str = r"\\.\pipe\";
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn optional(value: &str) -> Result<Option<Self>> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.parse()).transpose()
+    }
+}
+
+impl std::str::FromStr for AgentPipe {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if matches!(value, "SSH_AUTH_SOCK" | "$SSH_AUTH_SOCK") {
+            return Ok(Self(Self::ENVIRONMENT.into()));
+        }
+        let prefix = Self::LOCAL_PREFIX;
+        let Some(name) = value.get(prefix.len()..).filter(|_| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        }) else {
+            bail!(r"Enter a local Windows SSH agent pipe (\\.\pipe\name) or SSH_AUTH_SOCK");
+        };
+        ensure!(
+            !name.is_empty()
+                && !name.ends_with('.')
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || "\\/:*?\"<>|".contains(c))
+                && value.encode_utf16().count() <= 256,
+            "Invalid Windows SSH agent pipe name"
+        );
+        Ok(Self(format!("{prefix}{name}").into_boxed_str()))
+    }
+}
+
+impl TryFrom<String> for AgentPipe {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
 impl AgentFingerprint {
     pub(crate) fn for_key(key: &PublicKey) -> Self {
         Self(
@@ -194,6 +250,13 @@ impl TryFrom<String> for AgentFingerprint {
 }
 
 impl Authentication {
+    pub fn uses_agent(&self) -> bool {
+        matches!(
+            self,
+            Self::Agent | Self::AgentKey { .. } | Self::AgentCertificate { .. }
+        )
+    }
+
     pub fn identity(identity: impl Into<PathBuf>, certificate: Option<PathBuf>) -> Self {
         Self::Identity {
             identity: Box::new(identity.into()),
@@ -253,7 +316,7 @@ pub struct PlayerOptions {
     pub bell: String,
     pub sync_assets: Option<bool>,
     pub remote_sounds: Option<bool>,
-    pub device_key: Option<PathBuf>,
+    pub device_key: Option<Box<PathBuf>>,
 }
 impl Default for PlayerOptions {
     fn default() -> Self {
@@ -390,6 +453,8 @@ pub struct SshOptions {
     pub tab_color: TabColor,
     #[serde(flatten)]
     pub authentication: Authentication,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pipe: Option<AgentPipe>,
     pub host_key: Option<String>,
     #[serde(
         default,
@@ -423,6 +488,8 @@ pub struct JumpHost {
     pub keepalive: SshKeepalive,
     #[serde(flatten)]
     pub authentication: Authentication,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pipe: Option<AgentPipe>,
     pub host_key: Option<String>,
     #[serde(
         default,
@@ -446,6 +513,7 @@ impl From<JumpHost> for SshOptions {
             font_size: None,
             tab_color: Default::default(),
             authentication: hop.authentication,
+            agent_pipe: hop.agent_pipe,
             host_key: hop.host_key,
             host_key_alias: hop.host_key_alias,
             proxy_jump: Vec::new(),
@@ -499,6 +567,13 @@ pub(crate) fn deserialize_host_key_alias<'de, D: serde::Deserializer<'de>>(
 }
 
 impl SshOptions {
+    pub fn set_authentication(&mut self, authentication: Authentication) {
+        if !authentication.uses_agent() {
+            self.agent_pipe = None;
+        }
+        self.authentication = authentication;
+    }
+
     /// Validate a profile and resolve its key paths against the catalog location.
     pub fn prepare_profile_connection(&mut self, catalog: &Path) -> Result<()> {
         ensure!(
@@ -511,7 +586,7 @@ impl SshOptions {
         );
         self.validate_route()?;
         let base = catalog.parent().unwrap_or(Path::new("."));
-        if let Some(key) = &mut self.player.device_key
+        if let Some(key) = self.player.device_key.as_deref_mut()
             && key.is_relative()
         {
             *key = base.join(&*key);
@@ -529,9 +604,15 @@ impl SshOptions {
 
     pub(crate) fn validate_route(&self) -> Result<()> {
         validate_ssh_host(&self.host)?;
-        for auth in std::iter::once(&self.authentication)
-            .chain(self.proxy_jump.iter().map(|hop| &hop.authentication))
-        {
+        for (auth, agent_pipe) in std::iter::once((&self.authentication, &self.agent_pipe)).chain(
+            self.proxy_jump
+                .iter()
+                .map(|hop| (&hop.authentication, &hop.agent_pipe)),
+        ) {
+            ensure!(
+                agent_pipe.is_none() || auth.uses_agent(),
+                "An SSH agent pipe requires SSH agent authentication"
+            );
             ensure!(
                 auth.identity_path()
                     .is_none_or(|path| !path.as_os_str().is_empty()),
@@ -976,6 +1057,7 @@ impl Options {
         let mut port = None;
         let mut authentication = None;
         let mut certificate = None;
+        let mut agent_pipe = None;
         let mut host_key = None;
         let mut host_key_alias = None;
         let mut benchmark = false;
@@ -991,7 +1073,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -1046,6 +1128,10 @@ impl Options {
                 "--certificate" => {
                     ensure!(certificate.is_none(), "specify --certificate only once");
                     certificate = Some(PathBuf::from(value(&mut args, &arg)?));
+                }
+                "--agent-pipe" => {
+                    ensure!(agent_pipe.is_none(), "specify --agent-pipe only once");
+                    agent_pipe = Some(value(&mut args, &arg)?.parse::<AgentPipe>()?);
                 }
                 "--auth" => {
                     ensure!(
@@ -1118,6 +1204,7 @@ impl Options {
         let ssh_override = port.is_some()
             || authentication.is_some()
             || certificate.is_some()
+            || agent_pipe.is_some()
             || host_key.is_some()
             || host_key_alias.is_some();
         let mut initial_profile = profile.clone().filter(|_| !ssh_override);
@@ -1148,7 +1235,7 @@ impl Options {
                 ssh.port = port;
             }
             if let Some(authentication) = authentication {
-                ssh.authentication = authentication;
+                ssh.set_authentication(authentication);
             }
             if let Some(path) = certificate {
                 match &mut ssh.authentication {
@@ -1170,6 +1257,9 @@ impl Options {
             }
             if let Some(host_key) = host_key {
                 ssh.host_key = Some(host_key);
+            }
+            if let Some(agent_pipe) = agent_pipe {
+                ssh.agent_pipe = Some(agent_pipe);
             }
             if let Some(alias) = host_key_alias {
                 ssh.host_key_alias = Some(alias);
@@ -1312,6 +1402,88 @@ mod tests {
         dest["proxy_jump"] = serde_json::json!([]);
         dest["host_key_alias"] = "!host".into();
         assert!(parse(dest).is_err());
+    }
+
+    #[test]
+    fn ssh_agent_pipes_are_local_and_travel_with_each_endpoint() {
+        const GATEWAY: &str = r"\\.\pipe\agent-jump";
+        const DESTINATION: &str = r"\\.\pipe\agent-destination";
+        for invalid in [
+            r"\\server\pipe\relay",
+            r"\\?\pipe\alternate",
+            r"\\.\pipe\nested\socket",
+            r"\\.\pipe\..",
+            r"\\.\pipe\",
+            "/tmp/agent",
+            "$OTHER_AGENT",
+        ] {
+            assert!(invalid.parse::<AgentPipe>().is_err(), "{invalid}");
+        }
+        assert_eq!(
+            "$SSH_AUTH_SOCK".parse::<AgentPipe>().unwrap().as_str(),
+            "SSH_AUTH_SOCK"
+        );
+        let mut profile = serde_json::json!({
+            "host": "destination", "user": "pilot", "auth": "agent", "agent_pipe": DESTINATION,
+            "proxy_jump": [{ "host": "jump", "user": "pilot", "auth": "agent", "agent_pipe": GATEWAY }]
+        });
+        let options: SshOptions = serde_json::from_value(profile.clone()).unwrap();
+        assert!(options.validate_route().is_ok());
+        assert_eq!(options.agent_pipe.unwrap().as_str(), DESTINATION);
+        let hop = SshOptions::from(options.proxy_jump[0].clone());
+        assert_eq!(hop.agent_pipe.unwrap().as_str(), GATEWAY);
+        profile["proxy_jump"][0]["auth"] = "password".into();
+        assert!(
+            serde_json::from_value::<SshOptions>(profile)
+                .unwrap()
+                .validate_route()
+                .is_err()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"profiles":{"pilot":{
+                "host":"destination","user":"pilot","auth":"agent","agent_pipe":DESTINATION
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                args.iter()
+                    .map(|arg| arg.to_string())
+                    .chain(["--profiles".into(), path.to_string_lossy().into_owned()]),
+            )
+        };
+        let Source::Ssh(ssh) = parse(&["--profile", "pilot", "--agent-pipe", GATEWAY])
+            .unwrap()
+            .unwrap()
+            .source
+        else {
+            panic!("expected SSH");
+        };
+        assert_eq!(ssh.agent_pipe.unwrap().as_str(), GATEWAY);
+        let Source::Ssh(ssh) = parse(&["--profile", "pilot", "--auth", "none"])
+            .unwrap()
+            .unwrap()
+            .source
+        else {
+            panic!("expected SSH");
+        };
+        assert!(ssh.agent_pipe.is_none());
+        assert!(
+            parse(&[
+                "ssh",
+                "pilot@localhost",
+                "--auth",
+                "password",
+                "--agent-pipe",
+                GATEWAY
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1881,6 +2053,7 @@ mod tests {
             user: "alice".into(),
             port: 22,
             authentication: Authentication::Agent,
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
             terminal_type: TerminalType::default(),
@@ -1906,6 +2079,7 @@ mod tests {
             connect_timeout_seconds: None,
             keepalive: Default::default(),
             authentication: Authentication::Agent,
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
         });

@@ -141,6 +141,12 @@ async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::
         FixtureIdentity::plain(decoy, "Decoy agent key")?,
         FixtureIdentity::plain(selected, "Selected agent key")?,
     ])?;
+    let inherited_key = fixture_key();
+    let inherited_fingerprint = fingerprint(&inherited_key);
+    let inherited = AgentFixture::start(vec![FixtureIdentity::plain(
+        inherited_key,
+        "Inherited agent key",
+    )?])?;
 
     ssh.authentication = Authentication::Agent;
     ssh.player.reconnect = false;
@@ -149,6 +155,7 @@ async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::
         profile.authentication = Authentication::AgentKey {
             agent_fingerprint: fingerprint.parse().unwrap(),
         };
+        profile.agent_pipe = Some(agent.pipe.parse().unwrap());
         profile
     };
     fs::write(
@@ -161,7 +168,10 @@ async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::
     )?;
     fs::write(
         state.path().join("agent-fixture.json"),
-        serde_json::to_vec(&json!({"pipe":agent.pipe, "wanted":wanted}))?,
+        serde_json::to_vec(&json!({
+            "pipe": inherited.pipe, "selected_pipe": agent.pipe,
+            "wanted": wanted, "inherited_fingerprint": inherited_fingerprint,
+        }))?,
     )?;
     drive_gui("ssh-agent-key-ui.ps1", state.path());
     assert_eq!(
@@ -169,6 +179,7 @@ async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::
         [&wanted, &rejected],
     );
     assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert!(inherited.signed.lock().unwrap().is_empty());
     server.abort();
     Ok(())
 }
@@ -233,8 +244,11 @@ async fn native_agent_user_certificates_use_the_correct_signer_at_each_endpoint(
     ] {
         fs::write(state.path().join(name), cert.to_openssh()?)?;
     }
-    let agent = AgentFixture::start(vec![
-        FixtureIdentity::plain(gateway_key, "Gateway signing key")?,
+    let gateway_agent = AgentFixture::start(vec![FixtureIdentity::plain(
+        gateway_key,
+        "Gateway signing key",
+    )?])?;
+    let destination_agent = AgentFixture::start(vec![
         FixtureIdentity::plain(destination_key.clone(), "Destination plain key")?,
         FixtureIdentity {
             key: destination_key,
@@ -244,6 +258,7 @@ async fn native_agent_user_certificates_use_the_correct_signer_at_each_endpoint(
     ])?;
 
     destination.player.reconnect = false;
+    destination.agent_pipe = Some(destination_agent.pipe.parse()?);
     let with_certificate = |path: &str, pin| {
         let mut profile = destination.clone();
         profile.authentication = Authentication::agent_certificate(path, pin);
@@ -259,30 +274,41 @@ async fn native_agent_user_certificates_use_the_correct_signer_at_each_endpoint(
         connect_timeout_seconds: gateway.connect_timeout_seconds,
         keepalive: gateway.keepalive,
         authentication: Authentication::agent_certificate(gateway_path, pinned.clone()),
+        agent_pipe: Some(gateway_agent.pipe.parse()?),
         host_key: gateway.host_key,
         host_key_alias: gateway.host_key_alias,
     });
+    let mut rejected = with_certificate(gateway_path, None);
+    rejected.agent_pipe = Some(gateway_agent.pipe.parse()?);
     fs::write(
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({"profiles": {
             "Agent certificate route": route,
             "Mismatched certificate pin": with_certificate(destination_path, pinned),
             "Missing certificate key": with_certificate(missing_path, None),
-            "Rejected certificate": with_certificate(gateway_path, None),
+            "Rejected certificate": rejected,
         }}))?,
     )?;
     fs::write(
         state.path().join("agent-fixture.json"),
-        serde_json::to_vec(
-            &json!({"pipe": agent.pipe, "certificate": destination_path, "gateway_pin": gateway_pin}),
-        )?,
+        serde_json::to_vec(&json!({
+            "pipe": format!(r"\\.\pipe\w11term-no-agent-{}", rand::random::<u64>()),
+            "certificate": destination_path,
+            "gateway_pin": gateway_pin,
+            "gateway_pipe": gateway_agent.pipe,
+            "destination_pipe": destination_agent.pipe,
+        }))?,
     )?;
     drive_gui("ssh-agent-certificate-ui.ps1", state.path());
     assert_eq!(gateway_opens.load(Ordering::Relaxed), 0);
     assert_eq!(destination_opens.load(Ordering::Relaxed), 1);
     assert_eq!(
-        *agent.signed.lock().unwrap(),
-        [gateway_blob.clone(), destination_blob, gateway_blob]
+        *gateway_agent.signed.lock().unwrap(),
+        [gateway_blob.clone(), gateway_blob]
+    );
+    assert_eq!(
+        *destination_agent.signed.lock().unwrap(),
+        [destination_blob]
     );
     assert_eq!(
         fs::read_to_string(gateway_root.path().join("offered-key-trace"))?

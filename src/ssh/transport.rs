@@ -5,7 +5,7 @@ use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use super::{ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT, agent};
 use crate::{
     events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
-    options::{AgentFingerprint, Authentication, SshOptions},
+    options::{AgentFingerprint, AgentPipe, Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
 };
@@ -660,8 +660,8 @@ fn load_user_certificate(path: &Path) -> Result<Certificate> {
     Ok(cert)
 }
 
-async fn open_authentication_agent() -> Result<agent::WindowsAgent> {
-    agent::connect().await.map_err(|error| {
+async fn open_authentication_agent(agent_pipe: Option<&AgentPipe>) -> Result<agent::WindowsAgent> {
+    agent::connect(agent_pipe).await.map_err(|error| {
         stop(format!(
             "{error:#}. Choose a device key or password if the agent is unavailable."
         ))
@@ -732,7 +732,7 @@ pub(super) async fn authenticate(
                 Permanent("the SSH user certificate does not match the selected agent key".into())
             );
             let hash = session.best_supported_rsa_hash().await?.flatten();
-            let mut agent = open_authentication_agent().await?;
+            let mut agent = open_authentication_agent(options.agent_pipe.as_ref()).await?;
             let identities = agent.request_identities().await?;
             let mut signer = agent::CertificateSigner::matching(
                 &mut agent,
@@ -767,7 +767,7 @@ pub(super) async fn authenticate(
             use russh::keys::agent::AgentIdentity;
 
             let hash = session.best_supported_rsa_hash().await?.flatten();
-            let mut agent = open_authentication_agent().await?;
+            let mut agent = open_authentication_agent(options.agent_pipe.as_ref()).await?;
             let identities = agent.request_identities().await?;
             if let Authentication::AgentKey { agent_fingerprint } = &options.authentication {
                 let Some(key) = identities.into_iter().find_map(|identity| match identity {
@@ -1034,7 +1034,7 @@ pub(super) async fn key_exchange(
 fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOptions) {
     match input {
         TransportInput::Resize(new) => *size = new,
-        TransportInput::Authenticate(auth) => options.authentication = auth,
+        TransportInput::Authenticate(auth) => options.set_authentication(auth),
         TransportInput::Data(_) | TransportInput::Automatic(_) => {}
         message @ TransportInput::DisconnectShell { .. } => {
             message.reject_input("The SSH shell changed before disconnect.");
@@ -1692,7 +1692,7 @@ async fn run_channel(
                             return Ok(());
                         }
                     }
-                    Some(TransportInput::Authenticate(auth)) => options.authentication = auth,
+                    Some(TransportInput::Authenticate(auth)) => options.set_authentication(auth),
                     Some(TransportInput::Sftp(job)) => {
                         forward_sftp(&sftp_tx,&cleanup_tx,job);
                     }

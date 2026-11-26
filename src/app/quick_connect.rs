@@ -9,6 +9,7 @@ pub(super) struct Draft {
     pub(super) identity: String,
     pub(super) certificate: String,
     agent_fingerprint: String,
+    agent_pipe: String,
     pub(super) error: Option<String>,
     input: ElementRef<TextBox>,
 }
@@ -20,6 +21,7 @@ pub enum Action {
     Identity(TabId, String),
     Certificate(TabId, String),
     AgentFingerprint(TabId, String),
+    AgentPipe(TabId, String),
     Connect(TabId),
 }
 
@@ -82,6 +84,7 @@ impl TerminalApp {
             | Action::Identity(id, _)
             | Action::Certificate(id, _)
             | Action::AgentFingerprint(id, _)
+            | Action::AgentPipe(id, _)
             | Action::Connect(id) => *id,
         };
         let active = self.tabs.active_id() == Some(id);
@@ -112,6 +115,10 @@ impl TerminalApp {
                 draft.agent_fingerprint = value;
                 draft.error = None;
             }
+            Action::AgentPipe(_, value) if draft.agent_pipe != value => {
+                draft.agent_pipe = value;
+                draft.error = None;
+            }
             Action::Connect(_) if active => {
                 let result =
                     SshOptions::from_destination(&draft.destination).and_then(|mut options| {
@@ -121,6 +128,8 @@ impl TerminalApp {
                             &draft.certificate,
                             &draft.agent_fingerprint,
                         )?;
+                        options.agent_pipe =
+                            ssh_agent_pipe(&options.authentication, &draft.agent_pipe)?;
                         options.prepare_profile_connection(self.store.path())?;
                         Ok(options)
                     });
@@ -182,6 +191,16 @@ pub(super) fn view(
             ),
         ];
     use identity_picker::{Kind, Target};
+    if uses_agent_auth(draft.authentication) {
+        fields.push(KeyedView::new(
+            "agent-pipe",
+            agent_key_picker::pipe_field(
+                "SSH agent pipe (optional)",
+                &draft.agent_pipe,
+                context.callback(move |value| Message::QuickConnect(Action::AgentPipe(id, value))),
+            ),
+        ));
+    }
     if draft.authentication == PRIVATE_KEY_AUTH {
         fields.push(KeyedView::new(
             "identity",
@@ -213,6 +232,7 @@ pub(super) fn view(
             agent_key_picker::field(
                 "SSH agent key fingerprint",
                 &draft.agent_fingerprint,
+                &draft.agent_pipe,
                 context.callback(move |value| {
                     Message::QuickConnect(Action::AgentFingerprint(id, value))
                 }),

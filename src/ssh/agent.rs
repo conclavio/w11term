@@ -9,16 +9,28 @@ use russh::{
 use std::time::Duration;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
-use crate::options::AgentFingerprint;
+use crate::options::{AgentFingerprint, AgentPipe};
 
 pub(super) type WindowsAgent = AgentClient<NamedPipeClient>;
 
-pub(super) async fn connect() -> Result<WindowsAgent> {
-    let pipe =
-        std::env::var_os("SSH_AUTH_SOCK").unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into());
-    AgentClient::connect_named_pipe(pipe)
+pub(super) async fn connect(source: Option<&AgentPipe>) -> Result<WindowsAgent> {
+    let inherited = || std::env::var_os(AgentPipe::ENVIRONMENT).filter(|value| !value.is_empty());
+    let pipe = match source.map(AgentPipe::as_str) {
+        None => inherited().unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into()),
+        Some(AgentPipe::ENVIRONMENT) => {
+            inherited().context("SSH_AUTH_SOCK is not set for this endpoint")?
+        }
+        Some(path) => path.into(),
+    };
+    AgentClient::connect_named_pipe(&pipe)
         .await
-        .context("cannot connect to Windows SSH agent")
+        .with_context(|| match source.map(AgentPipe::as_str) {
+            None => "cannot connect to the default Windows SSH agent".into(),
+            Some(AgentPipe::ENVIRONMENT) => {
+                "cannot connect to the Windows SSH agent from SSH_AUTH_SOCK".into()
+            }
+            Some(path) => format!("cannot connect to the Windows SSH agent at {path}"),
+        })
 }
 
 pub(super) struct CertificateSigner<'a> {
@@ -70,9 +82,9 @@ pub struct Key {
 }
 
 /// Read the agent's public key inventory for a user who requested it.
-pub async fn list_keys() -> Result<Vec<Key>> {
+pub async fn list_keys(source: Option<&AgentPipe>) -> Result<Vec<Key>> {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut agent = connect().await?;
+        let mut agent = connect(source).await?;
         let mut keys = agent
             .request_identities()
             .await

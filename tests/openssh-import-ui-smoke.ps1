@@ -60,6 +60,8 @@ try {
     Write-Config $prior "Host previous`n    User pilot`n    HostName previous.test`n"
     $destinationIdentity = (Join-Path $state 'build identity.pub').Replace('\','/')
     $gatewayIdentity = (Join-Path $state 'gateway identity').Replace('\','/')
+    $gatewayAgent = '\\.\pipe\w11term-import-fixture-agent'
+    $escapedGatewayAgent = $gatewayAgent.Replace('\','\\')
     $destinationFingerprint = Write-PublicIdentity $destinationIdentity 'AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF'
     $gatewayFingerprint = Write-PublicIdentity $gatewayIdentity 'AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti'
     Write-Config (Join-Path $fragments '10-destination.conf') @"
@@ -73,6 +75,7 @@ Host via
     HostKeyAlias Build.Key.Test
     IdentityFile "$destinationIdentity"
     IdentitiesOnly yes
+    IdentityAgent SSH_AUTH_SOCK
 "@
     Write-Config (Join-Path $fragments '20-gateway.conf') @"
 Host gateway
@@ -84,6 +87,7 @@ Host gateway
     ServerAliveInterval 0
     IdentityFile "$gatewayIdentity"
     IdentitiesOnly yes
+    IdentityAgent "$escapedGatewayAgent"
 "@
     Write-Config (Join-Path $fragments '30-blocked.conf') @'
 # This alias cannot be represented by a native SSH profile.
@@ -143,8 +147,9 @@ Host web
     $hop = $via.proxy_jump[0]
     if ($hop.host -cne 'gateway.test' -or $hop.user -cne 'jump' -or $hop.port -ne 2201) { throw "Unexpected saved included gateway. See $profiles" }
     if ($via.auth -cne 'agent-key' -or $via.agent_fingerprint -cne $destinationFingerprint -or
-        $hop.auth -cne 'agent-key' -or $hop.agent_fingerprint -cne $gatewayFingerprint) {
-        throw "The imported destination and jump did not retain their public key fingerprints. See $profiles"
+        $hop.auth -cne 'agent-key' -or $hop.agent_fingerprint -cne $gatewayFingerprint -or
+        $via.agent_pipe -cne 'SSH_AUTH_SOCK' -or $hop.agent_pipe -cne $gatewayAgent) {
+        throw "The imported destination and jump did not retain their agent settings. See $profiles"
     }
     if ($via.host_key_alias -cne 'build.key.test' -or $hop.host_key_alias -cne 'bastion.key.test') { throw "Host key aliases were lost during import or edit. See $profiles" }
     if ($via.keepalive.interval_seconds -ne 15 -or $via.keepalive.max_unanswered -ne 3 -or
@@ -195,7 +200,7 @@ Host web
     }
     $gatewayEntry.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $null = Wait-Until 'gateway destination preview' {
-        Find-Element "Destination`njump@gateway.test:2201 (SSH agent key $gatewayFingerprint, host key alias bastion.key.test)"
+        Find-Element "Destination`njump@gateway.test:2201 (SSH agent key $gatewayFingerprint via $gatewayAgent, host key alias bastion.key.test)"
     }
     Click 'Save profile'
     $null = Wait-Until 'gateway saved for reuse' { Find-Element 'Saved profile gateway' }
@@ -261,8 +266,11 @@ Host web
         $catalog.profiles.'via with jump'.host -cne 'target.test' -or
         $catalog.profiles.'via with jump'.host_key_alias -cne 'build.key.test' -or
         $catalog.profiles.gateway.agent_fingerprint -cne $gatewayFingerprint -or
+        $catalog.profiles.gateway.agent_pipe -cne $gatewayAgent -or
         $catalog.profiles.'via with jump'.agent_fingerprint -cne $destinationFingerprint -or
+        $catalog.profiles.'via with jump'.agent_pipe -cne 'SSH_AUTH_SOCK' -or
         $catalog.profiles.'via with jump'.proxy_jump[0].agent_fingerprint -cne $gatewayFingerprint -or
+        $catalog.profiles.'via with jump'.proxy_jump[0].agent_pipe -cne $gatewayAgent -or
         $catalog.profiles.'via with jump'.proxy_jump[0].host_key_alias -cne 'bastion.key.test') {
         throw "Unexpected saved group membership or profile options. See $profiles"
     }
@@ -275,6 +283,9 @@ Host web
     $connectTimeout = Field 'SSH connection timeout (seconds)'
     if ((Field 'SSH agent key fingerprint').Current.Value -cne $destinationFingerprint) {
         throw 'The profile editor did not restore the imported agent fingerprint'
+    }
+    if ((Field 'SSH agent pipe (optional)').Current.Value -cne 'SSH_AUTH_SOCK') {
+        throw 'The profile editor did not restore the imported agent pipe policy'
     }
     if ($interval.Current.Value -cne '15' -or $unanswered.Current.Value -cne '3') {
         throw 'The profile editor did not show the imported keepalive values'

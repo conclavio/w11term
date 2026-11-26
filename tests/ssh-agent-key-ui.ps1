@@ -41,6 +41,14 @@ function Wait-AuthFailure([string]$Profile, [string]$Reason) {
     }
 }
 
+function Set-AgentPipe([string]$Pipe) {
+    $field = Wait-Until 'SSH agent pipe field' { Find-Element 'SSH agent pipe (optional)' $edit }
+    $field.GetCurrentPattern($value).SetValue($Pipe)
+    $null = Wait-Until 'agent pipe updated' {
+        (Find-Element 'SSH agent pipe (optional)' $edit).GetCurrentPattern($value).Current.Value -ceq $Pipe
+    }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--demo', '--profiles', ('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -48,6 +56,12 @@ try {
     Run-Palette 'Settings'
     Click 'Edit profile Agent profile'
     Choose-Item 'Authentication' 'Specific SSH agent key'
+    Click 'Load agent keys'
+    Choose-Item 'Keys in the SSH agent' ("Inherited agent key " + [char]0xb7 + " $($fixture.inherited_fingerprint)")
+    Set-AgentPipe $fixture.selected_pipe
+    $null = Wait-Until 'previous inventory is hidden when the pipe changes' {
+        !(Find-Element 'Keys in the SSH agent' $combo)
+    }
     Click 'Load agent keys'
     Choose-Item 'Keys in the SSH agent' ("Selected agent key " + [char]0xb7 + " $($fixture.wanted)")
     $null = Wait-Until 'the selected agent fingerprint is in the draft' {
@@ -57,7 +71,8 @@ try {
     Click 'Save and connect'
     $null = Wait-Until 'the profile persists the selected key' {
         $entry = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'Agent profile'
-        $entry.auth -eq 'agent-key' -and $entry.agent_fingerprint -ceq $fixture.wanted
+        $entry.auth -eq 'agent-key' -and $entry.agent_fingerprint -ceq $fixture.wanted -and
+            $entry.agent_pipe -ceq $fixture.selected_pipe
     }
     $pane = Wait-Until 'the saved SSH pane' {
         ((Control @('list')).sessions | Where-Object label -eq 'Agent profile').id
@@ -65,6 +80,15 @@ try {
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
     Wait-AuthFailure 'Missing agent key' 'does not hold the selected key'
     Wait-AuthFailure 'Rejected agent key' 'rejected the selected SSH agent key'
+    Run-Palette 'Settings'
+    Click 'Edit profile Agent profile'
+    Set-AgentPipe ''
+    Click 'Save profile changes'
+    $null = Wait-Until 'clearing the field removes the saved pipe override' {
+        $entry = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'Agent profile'
+        !$entry.agent_pipe -and $entry.agent_fingerprint -ceq $fixture.wanted
+    }
+    Wait-AuthFailure 'Agent profile' 'does not hold the selected key'
 } finally {
     Close-FixtureApp $app
 }

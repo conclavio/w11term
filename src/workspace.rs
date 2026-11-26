@@ -142,7 +142,7 @@ impl SavedSource {
                     ensure!(!path.as_os_str().is_empty(), "Empty SSH credential path");
                     *path = std::path::absolute(&*path)?;
                 }
-                if let Some(path) = &mut options.player.device_key {
+                if let Some(path) = options.player.device_key.as_deref_mut() {
                     ensure!(!path.as_os_str().is_empty(), "Empty device key path");
                     *path = std::path::absolute(&*path)?;
                 }
@@ -643,6 +643,7 @@ mod tests {
             terminal_type: Default::default(),
             port: 22,
             authentication: Authentication::Agent,
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
             proxy_jump: Vec::new(),

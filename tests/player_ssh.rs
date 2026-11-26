@@ -288,6 +288,7 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
         .into(),
         port,
         authentication,
+        agent_pipe: None,
         host_key: pin,
         host_key_alias: None,
         proxy_jump: Vec::new(),

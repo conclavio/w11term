@@ -133,8 +133,9 @@ pub(super) fn endpoint(
     user: &str,
     auth: &Authentication,
     host_key_alias: Option<&str>,
+    agent_pipe: Option<&AgentPipe>,
 ) -> String {
-    let auth = match auth {
+    let mut auth = match auth {
         Authentication::None => "none".to_owned(),
         Authentication::Agent => "SSH agent".to_owned(),
         Authentication::AgentKey { agent_fingerprint } => {
@@ -165,6 +166,10 @@ pub(super) fn endpoint(
         Authentication::Password => "password".to_owned(),
         Authentication::KeyboardInteractive => "keyboard-interactive".to_owned(),
     };
+    if let Some(pipe) = agent_pipe {
+        use std::fmt::Write;
+        let _ = write!(auth, " via {}", pipe.as_str());
+    }
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
@@ -186,6 +191,7 @@ fn jump_summary(hops: &[JumpHost]) -> String {
             &hop.user,
             &hop.authentication,
             hop.host_key_alias.as_deref(),
+            hop.agent_pipe.as_ref(),
         ));
         if hop.keepalive != SshKeepalive::default() {
             text.push_str("\n  ");
@@ -461,7 +467,8 @@ impl TerminalApp {
                             options.port,
                             &options.user,
                             &options.authentication,
-                            options.host_key_alias.as_deref()
+                            options.host_key_alias.as_deref(),
+                            options.agent_pipe.as_ref(),
                         )
                     ),
                 ));

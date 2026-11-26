@@ -110,6 +110,7 @@ impl ConnectionShare {
             && connected.user == options.user
             && connected.keepalive == options.keepalive
             && connected.authentication == options.authentication
+            && connected.agent_pipe == options.agent_pipe
             && connected.host_key == options.host_key
             && connected.host_key_alias == options.host_key_alias
             && connected.proxy_jump == options.proxy_jump

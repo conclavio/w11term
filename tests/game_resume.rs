@@ -237,6 +237,7 @@ impl Fixture {
                 user: "play".into(),
                 port,
                 authentication: Authentication::None,
+                agent_pipe: None,
                 host_key: Some(pin),
                 host_key_alias: None,
                 proxy_jump: vec![],

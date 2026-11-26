@@ -958,6 +958,9 @@ impl ProfileStore {
                 object.remove("certificate");
             }
             object.remove("agent_fingerprint");
+            if options.agent_pipe.is_none() {
+                object.remove("agent_pipe");
+            }
             let keep_route =
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
             let keep_forwards =
@@ -1359,6 +1362,7 @@ mod tests {
             user: "root".into(),
             port: 22,
             authentication: Authentication::identity("local-key", None),
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
             proxy_jump: Vec::new(),

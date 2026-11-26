@@ -271,6 +271,7 @@ async fn roundtrip(
                 } else {
                     Authentication::identity(key_file.path(), None)
                 },
+                agent_pipe: None,
                 host_key: Some(pin),
                 host_key_alias: None,
                 proxy_jump: Vec::new(),

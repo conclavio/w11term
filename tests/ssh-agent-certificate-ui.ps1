@@ -55,7 +55,8 @@ try {
     $null = Wait-Until 'destination certificate and jump fingerprint saved' {
         $entry = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'Agent certificate route'
         $entry.auth -ceq 'agent-certificate' -and $entry.certificate -ceq $fixture.certificate -and
-            !$entry.agent_fingerprint -and $entry.proxy_jump[0].agent_fingerprint -ceq $fixture.gateway_pin
+            !$entry.agent_fingerprint -and $entry.proxy_jump[0].agent_fingerprint -ceq $fixture.gateway_pin -and
+            $entry.agent_pipe -ceq $fixture.destination_pipe -and $entry.proxy_jump[0].agent_pipe -ceq $fixture.gateway_pipe
     }
     $pane = Wait-Until 'authenticated route pane' {
         ((Control @('list')).sessions | Where-Object label -eq 'Agent certificate route').id

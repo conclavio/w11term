@@ -19,8 +19,8 @@ use w11term::{
         word_range,
     },
     options::{
-        Authentication, ColorScheme, LocalOptions, ProfileTextSize, Profiles, ScrollbackLines,
-        Source, SshKeepalive, SshOptions, TabColor, TerminalType,
+        AgentPipe, Authentication, ColorScheme, LocalOptions, ProfileTextSize, Profiles,
+        ScrollbackLines, Source, SshKeepalive, SshOptions, TabColor, TerminalType,
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
@@ -544,6 +544,7 @@ struct ProfileDraft {
     identity: String,
     certificate: String,
     agent_fingerprint: String,
+    agent_pipe: String,
     fingerprint: String,
     host_key_alias: String,
     group_prompt: String,
@@ -585,6 +586,7 @@ impl Default for ProfileDraft {
             identity: String::new(),
             certificate: String::new(),
             agent_fingerprint: String::new(),
+            agent_pipe: String::new(),
             fingerprint: String::new(),
             host_key_alias: String::new(),
             group_prompt: String::new(),
@@ -629,6 +631,7 @@ impl ProfileDraft {
             port,
             connect_timeout_seconds: parse_ssh_connect_timeout(&self.connect_timeout)?,
             keepalive: parse_ssh_keepalive(&self.keepalive_interval, &self.keepalive_max)?,
+            agent_pipe: ssh_agent_pipe(&authentication, &self.agent_pipe)?,
             authentication,
             host_key: (!self.fingerprint.trim().is_empty()).then(|| self.fingerprint.trim().into()),
             host_key_alias: self.host_key_alias(),
@@ -690,6 +693,12 @@ impl ProfileDraft {
             identity,
             certificate,
             agent_fingerprint,
+            agent_pipe: options
+                .agent_pipe
+                .as_ref()
+                .map(AgentPipe::as_str)
+                .unwrap_or_default()
+                .into(),
             fingerprint: options.host_key.clone().unwrap_or_default(),
             host_key_alias: options.host_key_alias.clone().unwrap_or_default(),
             group_prompt: options
@@ -716,6 +725,21 @@ const SSH_AUTH_LABELS: [&str; 7] = [
     "Specific SSH agent key",
     "SSH agent with user certificate",
 ];
+
+fn uses_agent_auth(index: usize) -> bool {
+    matches!(index, 0 | SPECIFIC_AGENT_KEY_AUTH | AGENT_CERTIFICATE_AUTH)
+}
+
+fn ssh_agent_pipe(
+    authentication: &Authentication,
+    value: &str,
+) -> anyhow::Result<Option<AgentPipe>> {
+    if authentication.uses_agent() {
+        AgentPipe::optional(value)
+    } else {
+        Ok(None)
+    }
+}
 
 fn parse_ssh_address(host: &str, user: &str, port: &str) -> anyhow::Result<(String, String, u16)> {
     let host = host.trim().trim_matches(['[', ']']);
@@ -1125,6 +1149,7 @@ pub enum Field {
     Identity,
     Certificate,
     AgentFingerprint,
+    AgentPipe,
     Fingerprint,
     HostKeyAlias,
     GroupPrompt,
@@ -4973,6 +4998,13 @@ impl TerminalApp {
         );
         use identity_picker::{Kind, Target};
         let can_browse = self.identity_picker.is_none() && !draft.generating;
+        if uses_agent_auth(draft.authentication) {
+            fields.push(agent_key_picker::pipe_field(
+                "SSH agent pipe (optional)",
+                &draft.agent_pipe,
+                context.callback(move |value| Message::Edit(id, Field::AgentPipe, value)),
+            ));
+        }
         if draft.authentication == PRIVATE_KEY_AUTH {
             fields.push(identity_picker::field(
                 Target::Endpoint(id, Kind::PrivateKey),
@@ -4995,6 +5027,7 @@ impl TerminalApp {
             fields.push(agent_key_picker::field(
                 "SSH agent key fingerprint",
                 &draft.agent_fingerprint,
+                &draft.agent_pipe,
                 context.callback(move |value| Message::Edit(id, Field::AgentFingerprint, value)),
             ));
         } else if draft.authentication == AGENT_CERTIFICATE_AUTH {
@@ -5969,7 +6002,8 @@ impl Component for TerminalApp {
                         let path = profile
                             .player
                             .device_key
-                            .clone()
+                            .as_deref()
+                            .cloned()
                             .context("Generate a device key in the connect wizard first")?;
                         anyhow::ensure!(
                             tab.session.frames.load().connection_generation > 0
@@ -6038,13 +6072,13 @@ impl Component for TerminalApp {
                                         cached
                                             .player
                                             .device_key
-                                            .clone()
+                                            .as_deref()
                                             .context("device key path missing")?,
                                         None,
                                     )
                                 };
                                 let mut updated = cached.clone();
-                                updated.authentication = auth.clone();
+                                updated.set_authentication(auth.clone());
                                 self.store.edit(label, label, &updated, cached)?;
                                 *cached = updated;
                                 auth_update = Some((label.clone(), auth));
@@ -6473,7 +6507,7 @@ impl Component for TerminalApp {
                         Ok(key) => {
                             draft.identity = key.path.to_string_lossy().into_owned();
                             draft.certificate.clear();
-                            draft.player.device_key = Some(key.path.clone());
+                            draft.player.device_key = Some(Box::new(key.path.clone()));
                             draft.saved = false;
                             draft.authentication = if draft.player.rustmush { 3 } else { 1 };
                             if let Err(e) = w11term::clipboard::write(&key.public_line) {
@@ -7517,6 +7551,7 @@ impl Component for TerminalApp {
                         Field::Identity => &mut draft.identity,
                         Field::Certificate => &mut draft.certificate,
                         Field::AgentFingerprint => &mut draft.agent_fingerprint,
+                        Field::AgentPipe => &mut draft.agent_pipe,
                         Field::Fingerprint => &mut draft.fingerprint,
                         Field::HostKeyAlias => &mut draft.host_key_alias,
                         Field::GroupPrompt => &mut draft.group_prompt,
@@ -9044,6 +9079,9 @@ mod profile_ui_tests {
                 scrollback_lines: "0".parse().unwrap(),
                 user: "pilot+character".into(),
                 port: 6792,
+                agent_pipe: authentication
+                    .uses_agent()
+                    .then(|| r"\\.\pipe\work-agent".parse().unwrap()),
                 authentication,
                 host_key: Some("SHA256:test".into()),
                 host_key_alias: Some("cockpit.example".into()),
@@ -9059,6 +9097,7 @@ mod profile_ui_tests {
             };
             let mut draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
+            assert_eq!(draft.ssh_options().unwrap().agent_pipe, options.agent_pipe);
             assert_eq!(
                 draft.ssh_options().unwrap().authentication,
                 options.authentication

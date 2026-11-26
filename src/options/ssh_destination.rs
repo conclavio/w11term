@@ -45,6 +45,7 @@ impl SshOptions {
             font_size: None,
             tab_color: Default::default(),
             authentication: Authentication::Agent,
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
             proxy_jump: Vec::new(),

@@ -367,6 +367,7 @@ fn details(options: &SshOptions) -> String {
         &options.user,
         &options.authentication,
         options.host_key_alias.as_deref(),
+        options.agent_pipe.as_ref(),
     );
     if !options.proxy_jump.is_empty() {
         text.push('\n');
