@@ -74,7 +74,7 @@ function Assert-Explorer([string]$ButtonName, [string]$Action, [string]$Expected
 
 function Download-Verified([string]$Digest, [string]$Destination, [switch]$ResumeDownload) {
     Click 'verified.bin'
-    Click ('Download and verify' + [char]0x2026)
+    Invoke-SftpEntryAction ('Download and verify' + [char]0x2026)
     $field = Wait-Until 'expected SHA-256 field' { Find-Element 'Expected SHA-256' }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Digest)
     if ($ResumeDownload) {
@@ -165,14 +165,12 @@ try {
     [IO.File]::Delete($readGate)
     Wait-Status '^Cancelled download of /shell directory/interrupted\b'
 
-    (Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Preserve modification times' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Preserve modification times'
     Download-To 'snapshot' 'receive here'
     Wait-Status '^Downloaded /shell directory/snapshot\b.*2 files, 23 bytes'
     Assert-Explorer 'Show download in File Explorer' 'select' (Join-Path $State 'picker/receive here/snapshot')
     # Even when single-file replacement is enabled, an existing directory cannot be merged or replaced.
-    (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Replace existing files'
     Download-To 'snapshot' 'already exists'
     Wait-Status 'destination.*exists'
     if (Find-Element 'Show download in File Explorer' $button) { throw 'An unsuccessful download offered an Explorer action' }
@@ -256,9 +254,29 @@ try {
     Assert-Explorer "Open download folder for palette-ssh, notice $($events[0].sequence)" 'explore' (Join-Path $State 'picker/batch background')
     Run-Palette 'SFTP transfers'
     Assert-Explorer "Open download folder for transfer $($results[1].data.transfer_id)" 'explore' (Join-Path $State 'picker/batch background conflict')
+    Set-NativeExpansion "Transfer item details for $($results[1].data.transfer_id)" $true
+    $dot = ' ' + [char]0xb7 + ' '
+    $completed = Join-Path $State 'picker\batch background conflict\interrupted'
+    $failedDestination = Join-Path $State 'picker\batch background conflict\verified.bin'
+    $null = Wait-Until 'partially completed batch lists both attempted item paths' {
+        (Find-Element "Remote${dot}/shell directory/interrupted") -and
+            (Test-TransferDestination $completed) -and
+            (Find-Element "Failed${dot}File download") -and
+            (Find-Element "Remote${dot}/shell directory/verified.bin") -and
+            (Test-TransferDestination $failedDestination)
+    }
+    $batchId = $results[1].data.transfer_id
+    Assert-Explorer "Show in File Explorer for item 1 of transfer $batchId" 'select' $completed
+    if (Find-Element "Show in File Explorer for item 2 of transfer $batchId" $button) {
+        throw 'A failed download offered to reveal the existing file'
+    }
 } catch {
+    $failure = $_
+    $details = if ($window) {
+        try { (Get-TransferDetailLabels | Where-Object { $_ -match '^(Remote|Windows|Failed) ' }) -join ' | ' } catch { }
+    }
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
-    throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"
+    throw "$failure at $($failure.ScriptStackTrace). Transfer details: [$details]. Server packets: $wire"
 } finally {
     [IO.File]::Delete($readGate)
     if ($reader) { $reader.Dispose() }

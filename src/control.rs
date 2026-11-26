@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    future::Future,
     num::NonZeroUsize,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
@@ -16,7 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer},
     sync::{mpsc, oneshot},
 };
@@ -31,7 +32,7 @@ mod registry;
 pub(crate) mod security;
 mod sftp_transfers;
 mod ssh_groups;
-pub use command_history::CommandStatus;
+pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
 pub use sftp_transfers::{SftpCancelState, SftpTransferStatus};
@@ -57,11 +58,43 @@ pub enum Request {
         pane: u64,
         exit_token: u64,
     },
+    StopSshAttempt {
+        pane: u64,
+        attempt_token: crate::events::PendingSshAttempt,
+    },
+    RetrySshNow {
+        pane: u64,
+        retry_token: crate::events::PendingSshRetry,
+    },
+    DisconnectSshShell {
+        pane: u64,
+        connection_generation: std::num::NonZeroU64,
+    },
+    WaitSshConnected {
+        pane: u64,
+        #[serde(default)]
+        after_generation: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
+    WaitPaneExit {
+        pane: u64,
+        #[serde(default)]
+        after_exit_token: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     WaitForText {
         pane: u64,
         pattern: String,
         #[serde(default)]
         regex: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_generation: Option<std::num::NonZeroU64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_frame: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screenshot_path: Option<PathBuf>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
@@ -69,6 +102,8 @@ pub enum Request {
         pane: u64,
         #[serde(default)]
         since: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
         #[serde(default)]
         timeout_seconds: u64,
     },
@@ -83,6 +118,9 @@ pub enum Request {
         rows: Option<usize>,
         #[serde(default)]
         activate: bool,
+    },
+    ClosePane {
+        pane: u64,
     },
     Sftp {
         pane: u64,
@@ -240,12 +278,29 @@ pub enum Request {
         pane: u64,
         data_base64: String,
         no_paste: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_generation: Option<std::num::NonZeroU64>,
     },
     GetText {
         pane: u64,
     },
     Inspect {
         pane: u64,
+    },
+    GetRunningOutput {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
+    },
+    WaitRunningOutput {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
+        pattern: String,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default)]
+        match_case: bool,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
     },
     Playback {
         pane: u64,
@@ -261,6 +316,31 @@ pub enum Request {
         pane: u64,
         id: u64,
         connection_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<CommandOutputFile>,
+    },
+    WaitCommand {
+        pane: u64,
+        after_id: u64,
+        connection_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<CommandOutputFile>,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
+    WaitCommandCapture {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<CommandOutputFile>,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
+    InterruptCommand {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
     },
     FindText {
         pattern: String,
@@ -370,6 +450,10 @@ pub enum UiRequest {
         activate: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    ClosePane {
+        pane: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Resize {
         pane: u64,
         cols: usize,
@@ -381,6 +465,7 @@ impl UiRequest {
     pub fn fail(self, message: &str) {
         let reply = match self {
             Self::Open { reply, .. }
+            | Self::ClosePane { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
@@ -414,14 +499,19 @@ impl UiRequest {
 
     fn routed_pane(&self) -> Option<u64> {
         match self {
-            Self::Resize { pane, .. } => Some(*pane),
+            Self::Resize { pane, .. } | Self::ClosePane { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
         }
     }
 
     fn pane_reply_closed(&self) -> bool {
-        matches!(self, Self::Resize { reply, .. } | Self::CancelSftpTransfer { reply, .. } if reply.is_closed())
+        matches!(self,
+            Self::Resize { reply, .. }
+            | Self::ClosePane { reply, .. }
+            | Self::CancelSftpTransfer { reply, .. }
+            if reply.is_closed()
+        )
     }
 }
 
@@ -475,6 +565,7 @@ pub struct Pane {
     pub active: bool,
     pub visible: bool,
     pub input: mpsc::UnboundedSender<Command>,
+    pub capture: Option<CapturePng>,
 }
 impl Registry {
     async fn pane_events(pane: &Pane) -> Result<crate::events::Events> {
@@ -485,6 +576,17 @@ impl Registry {
         tokio::time::timeout(TIMEOUT, response)
             .await
             .context("pane did not respond")?
+            .context("pane is closed")
+    }
+
+    async fn live_frames(pane: &Pane) -> Result<crate::terminal::FrameStore> {
+        let (reply, response) = oneshot::channel();
+        pane.input
+            .send(Command::Frames(reply))
+            .context("pane is closed")?;
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("pane frame request timed out")?
             .context("pane is closed")
     }
 
@@ -551,6 +653,15 @@ impl Registry {
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }
+            Request::ClosePane { pane } => {
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(pane, UiRequest::ClosePane { pane, reply });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("close-pane timed out. Use list to check whether the pane closed")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::Resize { pane, cols, rows } => {
                 validate_grid(cols, rows)?;
                 let (reply, response) = oneshot::channel();
@@ -575,28 +686,128 @@ impl Registry {
                 events.restart_exited(&target.input, exit_token)?;
                 Ok(json!({"pane":pane,"exit_token":exit_token,"accepted":true}))
             }
+            Request::StopSshAttempt {
+                pane,
+                attempt_token,
+            } => {
+                let events = Self::pane_events(&self.pane(pane)?).await?;
+                ensure!(
+                    events.cancel_ssh_attempt(attempt_token),
+                    "SSH attempt is no longer pending in this pane"
+                );
+                Ok(json!({"pane":pane,"attempt_token":attempt_token,"accepted":true}))
+            }
+            Request::RetrySshNow { pane, retry_token } => {
+                let events = Self::pane_events(&self.pane(pane)?).await?;
+                ensure!(
+                    events.retry_ssh_now(retry_token),
+                    "SSH retry is no longer waiting in this pane"
+                );
+                Ok(json!({"pane":pane,"retry_token":retry_token,"accepted":true}))
+            }
+            Request::DisconnectSshShell {
+                pane,
+                connection_generation,
+            } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::DisconnectSshShell {
+                        connection: connection_generation.get(),
+                        reply,
+                    })
+                    .context("pane is closed")?;
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("disconnect acknowledgement timed out")?
+                    .context("pane is closed")?
+                    .map_err(anyhow::Error::msg)?;
+                Ok(
+                    json!({"pane":pane,"connection_generation":connection_generation,"accepted":true}),
+                )
+            }
+            Request::WaitSshConnected {
+                pane,
+                after_generation,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "wait timeout must be 1..=3600 seconds"
+                );
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+                let generation = tokio::select! {
+                    result = events.wait_ssh_connected(after_generation, deadline) => result?,
+                    _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                };
+                Ok(json!({"pane":pane,"connection_generation":generation}))
+            }
+            Request::WaitPaneExit {
+                pane,
+                after_exit_token,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "wait timeout must be 1..=3600 seconds"
+                );
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+                let exit = tokio::select! {
+                    result = events.wait_pane_exit(after_exit_token, deadline) => result?,
+                    _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                };
+                let mut result = json!({
+                    "pane": pane,
+                    "exit_token": exit.exit_token,
+                    "restart_token": exit.restart_token,
+                });
+                if let Some(phase) = exit.ssh_connection {
+                    result["ssh_connection"] = phase.as_json();
+                }
+                Ok(result)
+            }
             Request::Events {
                 pane,
                 since,
+                kind,
                 timeout_seconds,
             } => {
+                ensure!(
+                    kind.as_ref().is_none_or(|kind| !kind.is_empty()),
+                    "event kind is empty"
+                );
                 ensure!(
                     timeout_seconds <= 3600,
                     "events timeout must be 0..=3600 seconds"
                 );
-                let events = Self::pane_events(&self.pane(pane)?).await?;
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
                 ensure!(
-                    since <= events.since(0).next,
+                    since <= events.cursor(),
                     "event cursor is ahead of this pane; check the instance/pane identity"
                 );
-                let journal = events
-                    .wait(since, Duration::from_secs(timeout_seconds))
-                    .await;
-                let (restart_token, ssh_phase) = events.exit_snapshot();
+                let wait =
+                    events.wait_kind(since, Duration::from_secs(timeout_seconds), kind.as_deref());
+                let journal = tokio::select! {
+                    biased;
+                    journal = wait => journal,
+                    _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                };
+                let connection = events.connection_snapshot();
                 let mut result =
-                    json!({"pane":pane,"journal":journal,"restart_token":restart_token});
-                if let Some(phase) = ssh_phase {
+                    json!({"pane":pane,"journal":journal,"restart_token":connection.restart_token});
+                if let Some(phase) = connection.phase {
                     result["ssh_connection"] = phase.as_json();
+                }
+                if let Some(attempt) = connection.attempt {
+                    result["ssh_attempt_token"] = json!(attempt);
+                }
+                if let Some(retry) = connection.retry {
+                    result["ssh_retry_token"] = json!(retry);
                 }
                 Ok(result)
             }
@@ -605,7 +816,16 @@ impl Registry {
                 pattern,
                 regex,
                 timeout_seconds,
+                connection_generation,
+                after_frame,
+                screenshot_path,
             } => {
+                ensure!(
+                    screenshot_path
+                        .as_ref()
+                        .is_none_or(|path| path.is_absolute()),
+                    "screenshot path must be absolute"
+                );
                 ensure!(
                     (1..=3600).contains(&timeout_seconds),
                     "wait timeout must be 1..=3600 seconds"
@@ -623,35 +843,83 @@ impl Registry {
                     None
                 };
                 let target = self.pane(pane)?;
-                let (reply, response) = oneshot::channel();
-                target
-                    .input
-                    .send(Command::Frames(reply))
-                    .context("pane is closed")?;
-                let frames = tokio::time::timeout(TIMEOUT, response).await??;
+                let expected = connection_generation.map(std::num::NonZeroU64::get);
+                let scope = if let Some(generation) = expected {
+                    Some((generation, Self::pane_events(&target).await?))
+                } else {
+                    None
+                };
+                let frames = Self::live_frames(&target).await?;
+                ensure!(
+                    after_frame.is_none_or(|baseline| baseline <= frames.load().generation),
+                    "frame generation is ahead of this pane; check the instance and pane ID"
+                );
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
-                loop {
-                    let frame = frames.load();
-                    let generation = frame.generation;
-                    let text = frame
-                        .rows
-                        .iter()
-                        .map(|line| line.as_str().trim_end_matches(' ').to_owned())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if matcher
-                        .as_ref()
-                        .map_or_else(|| text.contains(&pattern), |r| r.is_match(&text))
-                    {
-                        return Ok(
-                            json!({"pane":pane,"matched":true,"generation":frame.generation,"cols":frame.cols,"rows":frame.rows.len(),"text":text}),
+                let wait = async {
+                    loop {
+                        let frame = frames.load();
+                        if after_frame.is_none_or(|baseline| frame.generation > baseline)
+                            && expected
+                                .is_none_or(|generation| frame.connection_generation == generation)
+                        {
+                            let text = frame
+                                .rows
+                                .iter()
+                                .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if matcher
+                                .as_ref()
+                                .map_or_else(|| text.contains(&pattern), |r| r.is_match(&text))
+                            {
+                                return Ok((frame, text));
+                            }
+                        }
+                        ensure!(
+                            frames.changed(frame.generation, deadline).await,
+                            "wait-for-text timed out without a match"
                         );
                     }
-                    ensure!(
-                        frames.changed(generation, deadline).await,
-                        "wait-for-text timed out without a match"
-                    );
+                };
+                const STALE: &str =
+                    "The pane connection changed or is no longer active; no match was accepted";
+                let (frame, text) = if let Some((generation, events)) = scope {
+                    let result = tokio::select! {
+                        biased;
+                        _ = events.terminal_connection_changed(generation) => anyhow::bail!(STALE),
+                        _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                        result = wait => result?,
+                    };
+                    ensure!(events.terminal_connection_is(generation), STALE);
+                    result
+                } else {
+                    tokio::select! {
+                        biased;
+                        result = wait => result?,
+                        _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                    }
+                };
+                let mut result = json!({
+                    "pane": pane,
+                    "matched": true,
+                    "generation": frame.generation,
+                    "cols": frame.cols,
+                    "rows": frame.rows.len(),
+                    "text": text,
+                });
+                if let Some(generation) = expected {
+                    result["connection_generation"] = generation.into();
                 }
+                if let Some(path) = screenshot_path {
+                    let (_, capture_png) = self
+                        .capture_for(pane, capture_png)
+                        .context("matched text but the pane is no longer available for capture")?;
+                    let size = frame.size;
+                    result["screenshot"] = save_screenshot(capture_png, frame, size, path)
+                        .await
+                        .context("matched text but failed to save its screenshot")?;
+                }
+                Ok(result)
             }
             Request::Sftp {
                 pane,
@@ -896,8 +1164,8 @@ impl Registry {
                     let mut session = match Self::describe_pane(&pane).await {
                         Ok(PaneDescription {
                             frame,
-                            restart_token,
-                            ssh_phase,
+                            connection,
+                            ssh_transport_id,
                         }) => {
                             let mut session = json!({
                                 "title": frame.title,
@@ -907,9 +1175,18 @@ impl Registry {
                                 "prompt": frame.prompt,
                                 "connection_generation": frame.connection_generation,
                             });
-                            if let Some(phase) = ssh_phase {
+                            if let Some(phase) = connection.phase {
                                 session["ssh_connection"] = phase.as_json();
-                                session["restart_token"] = json!(restart_token);
+                                session["restart_token"] = json!(connection.restart_token);
+                            }
+                            if let Some(attempt) = connection.attempt {
+                                session["ssh_attempt_token"] = json!(attempt);
+                            }
+                            if let Some(retry) = connection.retry {
+                                session["ssh_retry_token"] = json!(retry);
+                            }
+                            if let Some(id) = ssh_transport_id {
+                                session["ssh_transport_id"] = id.into();
                             }
                             session
                         }
@@ -938,6 +1215,7 @@ impl Registry {
                 pane,
                 data_base64,
                 no_paste,
+                connection_generation,
             } => {
                 ensure!(
                     no_paste,
@@ -953,16 +1231,28 @@ impl Registry {
                 ensure!(bytes.len() <= MAX_BYTES, "input exceeds 1 MiB");
                 let count = bytes.len();
                 let (tx, rx) = oneshot::channel();
+                let command = match connection_generation {
+                    Some(generation) => Command::ScopedRaw {
+                        connection: generation.get(),
+                        bytes,
+                        reply: tx,
+                    },
+                    None => Command::Raw(bytes, tx),
+                };
                 self.pane(pane)?
                     .input
-                    .send(Command::Raw(bytes, tx))
+                    .send(command)
                     .context("pane is closed")?;
                 tokio::time::timeout(TIMEOUT, rx)
                     .await
                     .context("SSH write timed out; delivery is unknown, do not blindly retry")?
                     .context("SSH connection closed before acknowledging the write")?
                     .map_err(anyhow::Error::msg)?;
-                Ok(json!({"pane":pane,"bytes_written":count}))
+                let mut result = json!({"pane":pane,"bytes_written":count});
+                if let Some(generation) = connection_generation {
+                    result["connection_generation"] = json!(generation);
+                }
+                Ok(result)
             }
             Request::FindText {
                 pattern,
@@ -975,11 +1265,111 @@ impl Registry {
                     .await
             }
             Request::ListCommands { pane, status } => self.list_commands(pane, status).await,
+            Request::GetRunningOutput { pane, start_token } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::ReadRunningOutput(start_token.get(), reply))
+                    .context("pane is closed")?;
+                let sample = tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("reading running command output timed out")?
+                    .context("pane closed before reading running command output")?
+                    .map_err(anyhow::Error::msg)?;
+                let mut result = serde_json::to_value(sample)?;
+                result["pane"] = pane.into();
+                Ok(result)
+            }
+            Request::WaitRunningOutput {
+                pane,
+                start_token,
+                pattern,
+                regex,
+                match_case,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "wait timeout must be 1..=3600 seconds"
+                );
+                let pattern = ssh_groups::output_pattern(&pattern, regex, match_case)?;
+                let (reply, response) = oneshot::channel();
+                let mut pending = PendingCommandWait {
+                    input: self.pane(pane)?.input,
+                    response,
+                };
+                pending
+                    .input
+                    .send(Command::WaitRunningOutput {
+                        start_token: start_token.get(),
+                        pattern,
+                        reply,
+                    })
+                    .context("pane is closed")?;
+                let matched = tokio::time::timeout(
+                    Duration::from_secs(timeout_seconds),
+                    &mut pending.response,
+                )
+                .await
+                .context("wait-running-output timed out without a matching line")?
+                .context("pane closed before the output matched")?
+                .map_err(anyhow::Error::msg)?;
+                let mut result = serde_json::to_value(matched)?;
+                result["pane"] = pane.into();
+                Ok(result)
+            }
             Request::GetCommand {
                 pane,
                 id,
                 connection_generation,
-            } => self.get_command(pane, id, connection_generation).await,
+                output_file,
+            } => {
+                self.get_command(pane, id, connection_generation, output_file)
+                    .await
+            }
+            Request::WaitCommand {
+                pane,
+                after_id,
+                connection_generation,
+                command,
+                output_file,
+                timeout_seconds,
+            } => {
+                self.wait_command(
+                    pane,
+                    after_id,
+                    connection_generation,
+                    timeout_seconds,
+                    command.as_deref(),
+                    output_file,
+                )
+                .await
+            }
+            Request::WaitCommandCapture {
+                pane,
+                start_token,
+                output_file,
+                timeout_seconds,
+            } => {
+                self.wait_command_capture(pane, start_token.get(), timeout_seconds, output_file)
+                    .await
+            }
+            Request::InterruptCommand { pane, start_token } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::InterruptCommand {
+                        start_token: start_token.get(),
+                        reply,
+                    })
+                    .context("pane is closed")?;
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("Ctrl+C write was not confirmed before the timeout")?
+                    .context("pane closed before confirming the Ctrl+C write")?
+                    .map_err(anyhow::Error::msg)?;
+                Ok(json!({"pane":pane,"start_token":start_token,"sent":true}))
+            }
             Request::Playback { pane, action } => {
                 let (reply, response) = oneshot::channel();
                 self.pane(pane)?
@@ -1001,13 +1391,35 @@ impl Registry {
                     .input
                     .send(Command::ReadModes(reply))
                     .context("pane is closed")?;
-                let (connection_generation, modes) = tokio::time::timeout(TIMEOUT, response)
+                let inspection = tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("pane inspection timed out")?
                     .context("pane closed before inspection")?;
-                let mut report = modes.as_json();
+                let mut report = inspection.modes.as_json();
                 report["pane"] = pane.into();
-                report["connection_generation"] = connection_generation.into();
+                report["connection_generation"] = inspection.connection_generation.into();
+                if let Some(command) = inspection.running_command {
+                    report["running_command"] = json!({
+                        "id": command.id,
+                        "start_token": command.start_token,
+                        "command": command.command.as_deref(),
+                        "reported_directory": command.reported_directory.as_deref(),
+                        "started_unix_ms": command.started_unix_ms,
+                        "elapsed_ms": command.elapsed_ms(),
+                    });
+                }
+                if let Some(ssh) = inspection.ssh {
+                    report["ssh"] = serde_json::to_value(ssh.as_ref())?;
+                }
+                if let Some(transport) = inspection.ssh_transport {
+                    report["ssh_transport"] = serde_json::to_value(transport.as_ref())?;
+                }
+                if let Some(connection) = inspection.ssh_connection {
+                    report["ssh_connection"] = connection.as_json();
+                }
+                if let Some(progress) = inspection.ssh_progress {
+                    report["ssh_progress"] = serde_json::to_value(progress.as_ref())?;
+                }
                 Ok(report)
             }
             Request::GetText { pane } => {
@@ -1017,9 +1429,18 @@ impl Registry {
                     .iter()
                     .map(|line| line.as_str().trim_end_matches(' ').to_owned())
                     .collect();
-                Ok(
-                    json!({"pane":pane,"generation":frame.generation,"cols":size.cols,"rows":size.rows,"lines":lines,"text":lines.join("\n"),"title":frame.title,"status":frame.status,"alternate_screen":frame.alternate}),
-                )
+                Ok(json!({
+                    "pane": pane,
+                    "generation": frame.generation,
+                    "connection_generation": frame.connection_generation,
+                    "cols": size.cols,
+                    "rows": size.rows,
+                    "lines": lines,
+                    "text": lines.join("\n"),
+                    "title": frame.title,
+                    "status": frame.status,
+                    "alternate_screen": frame.alternate,
+                }))
             }
             Request::SaveText {
                 pane,
@@ -1050,16 +1471,27 @@ impl Registry {
                 let (target, capture_png) = self.capture_for(pane, capture_png)?;
                 let (frame, size) = Self::capture(&target).await?;
                 let generation = frame.generation;
-                let saved_path = path.clone();
-                let (width, height) =
-                    tokio::task::spawn_blocking(move || capture_png(&frame, size, &path)).await??;
-                Ok(
-                    json!({"pane":pane,"generation":generation,"path":saved_path,"width":width,"height":height}),
-                )
+                let mut result = save_screenshot(capture_png, frame, size, path).await?;
+                result["pane"] = pane.into();
+                result["generation"] = generation.into();
+                Ok(result)
             }
         }
     }
 }
+async fn save_screenshot(
+    capture_png: CapturePng,
+    frame: impl std::borrow::Borrow<Snapshot> + Send + 'static,
+    size: TerminalSize,
+    path: PathBuf,
+) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        let (width, height) = capture_png(frame.borrow(), size, &path)?;
+        Ok(json!({"path": path, "width": width, "height": height}))
+    })
+    .await?
+}
+
 fn validate_grid(cols: usize, rows: usize) -> Result<()> {
     ensure!(
         (1..=1000).contains(&cols) && (1..=500).contains(&rows),
@@ -1230,9 +1662,14 @@ async fn serve(
     } else {
         match serde_json::from_slice::<Request>(&line) {
             Ok(r) => {
-                let pool = if matches!(
+                let is_wait = matches!(
                     r,
                     Request::WaitForText { .. }
+                        | Request::WaitCommand { .. }
+                        | Request::WaitCommandCapture { .. }
+                        | Request::WaitRunningOutput { .. }
+                        | Request::WaitSshConnected { .. }
+                        | Request::WaitPaneExit { .. }
                         | Request::WaitSftpTransfer { .. }
                         | Request::WaitSshGroupRun { .. }
                         | Request::WaitSshGroupApproval { .. }
@@ -1243,11 +1680,8 @@ async fn serve(
                             timeout_seconds: 1..,
                             ..
                         }
-                ) {
-                    waits
-                } else {
-                    commands
-                };
+                );
+                let pool = if is_wait { waits } else { commands };
                 match pool.try_acquire_owned() {
                     Ok(_permit) => match r {
                         Request::FollowSshGroupOutput {
@@ -1258,19 +1692,29 @@ async fn serve(
                             after_line,
                             timeout_seconds,
                         } => {
-                            return registry
-                                .follow_ssh_group_output(
-                                    &mut pipe,
-                                    ssh_groups::GroupOutputFollow {
-                                        window: window_id,
-                                        tab: tab_id,
-                                        run: run_id,
-                                        pane,
-                                        after_line,
-                                        timeout_seconds,
-                                    },
-                                )
-                                .await;
+                            let (mut reader, mut writer) = tokio::io::split(&mut pipe);
+                            let follow = registry.follow_ssh_group_output(
+                                &mut writer,
+                                ssh_groups::GroupOutputFollow {
+                                    window: window_id,
+                                    tab: tab_id,
+                                    run: run_id,
+                                    pane,
+                                    after_line,
+                                    timeout_seconds,
+                                },
+                            );
+                            return while_client_waits(&mut reader, follow)
+                                .await
+                                .unwrap_or(Ok(()));
+                        }
+                        request if is_wait => {
+                            let execution = registry.execute(request, capture_png);
+                            let Some(result) = while_client_waits(&mut pipe, execution).await
+                            else {
+                                return Ok(());
+                            };
+                            result
                         }
                         request => registry.execute(request, capture_png).await,
                     },
@@ -1284,7 +1728,33 @@ async fn serve(
     };
     write_reply(&mut pipe, result).await
 }
-async fn write_reply(pipe: &mut NamedPipeServer, result: Result<Value>) -> Result<()> {
+async fn while_client_waits<T>(
+    reader: &mut (impl AsyncRead + Unpin),
+    wait: impl Future<Output = T>,
+) -> Option<T> {
+    // A valid client sends one request and then reads replies. Any further
+    // input, including a broken pipe or EOF, ends its pending wait.
+    let mut probe = [0];
+    tokio::select! {
+        biased;
+        _ = reader.read(&mut probe) => None,
+        result = wait => Some(result),
+    }
+}
+
+struct PendingCommandWait<T> {
+    input: mpsc::UnboundedSender<Command>,
+    response: oneshot::Receiver<Result<T, &'static str>>,
+}
+
+impl<T> Drop for PendingCommandWait<T> {
+    fn drop(&mut self) {
+        self.response.close();
+        let _ = self.input.send(Command::PruneCommandWaits);
+    }
+}
+
+async fn write_reply(pipe: &mut (impl AsyncWrite + Unpin), result: Result<Value>) -> Result<()> {
     let mut bytes = serde_json::to_vec(&Reply::from_result(result))?;
     bytes.push(b'\n');
     tokio::time::timeout(TIMEOUT, pipe.write_all(&bytes)).await??;
@@ -1579,6 +2049,21 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,
             Request::WaitForText {
+                timeout_seconds, ..
+            }
+            | Request::WaitCommand {
+                timeout_seconds, ..
+            }
+            | Request::WaitCommandCapture {
+                timeout_seconds, ..
+            }
+            | Request::WaitRunningOutput {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshConnected {
+                timeout_seconds, ..
+            }
+            | Request::WaitPaneExit {
                 timeout_seconds, ..
             }
             | Request::WaitSftpTransfer {

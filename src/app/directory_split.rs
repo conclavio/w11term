@@ -1,5 +1,6 @@
 use super::*;
 use std::{
+    borrow::Cow,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -10,10 +11,51 @@ use w11term::{
 pub(super) const OPEN_EXPLORER: &str = "Open current folder in File Explorer";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Directory {
+pub(super) enum Directory {
     Ssh(String),
     Local(PathBuf),
     Wsl(String),
+}
+
+impl Directory {
+    pub(super) fn reported(source: &Source, report: &str) -> Option<Self> {
+        match source {
+            Source::Ssh(ssh) => {
+                file_drawer::shell_directory(Some(report), &ssh.host).map(Self::Ssh)
+            }
+            Source::Local(shell) => {
+                let computer = std::env::var("COMPUTERNAME").ok();
+                match shell.wsl_distribution() {
+                    Some(distribution) => {
+                        wsl_directory(report, distribution, computer.as_deref()).map(Self::Wsl)
+                    }
+                    None => local_directory(report, computer.as_deref()).map(Self::Local),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn display(&self) -> Cow<'_, str> {
+        match self {
+            Self::Ssh(path) | Self::Wsl(path) => Cow::Borrowed(path),
+            Self::Local(path) => path.to_string_lossy(),
+        }
+    }
+
+    pub(super) fn explorer_location(&self, source: &Source) -> Option<explorer::Location> {
+        let Source::Local(shell) = source else {
+            return None;
+        };
+        match self {
+            Self::Local(path) => Some(explorer::Location::Drive(path.clone())),
+            Self::Wsl(path) if path.starts_with('/') => {
+                explorer::Location::wsl(shell.wsl_distribution()?, path)
+            }
+            Self::Wsl(path) => Some(explorer::Location::Drive(PathBuf::from(path))),
+            Self::Ssh(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,7 +247,7 @@ impl LiveTab {
     }
 
     fn local_directory_split(&self) -> Option<Origin> {
-        let Source::Local(shell) = &self.source else {
+        let Source::Local(_) = &self.source else {
             return None;
         };
         let frame = self.session.frames.load();
@@ -213,13 +255,7 @@ impl LiveTab {
             return None;
         }
         let report = frame.reported_directory.as_deref()?;
-        let computer = std::env::var("COMPUTERNAME").ok();
-        let directory = match shell.wsl_distribution() {
-            Some(distribution) => {
-                Directory::Wsl(wsl_directory(report, distribution, computer.as_deref())?)
-            }
-            None => Directory::Local(local_directory(report, computer.as_deref())?),
-        };
+        let directory = Directory::reported(&self.source, report)?;
         Some(Origin {
             pane: self.session.pane_id,
             generation: frame.connection_generation,
@@ -255,20 +291,10 @@ impl TerminalApp {
         let Page::Terminal(tab) = &self.tabs.active()?.page else {
             return None;
         };
-        let Source::Local(shell) = &tab.source else {
-            return None;
-        };
         if tab.local_directory_split().as_ref()? != origin {
             return None;
         }
-        match &origin.directory {
-            Directory::Local(path) => Some(explorer::Location::Drive(path.clone())),
-            Directory::Wsl(path) if path.starts_with('/') => {
-                explorer::Location::wsl(shell.wsl_distribution()?, path)
-            }
-            Directory::Wsl(path) => Some(explorer::Location::Drive(PathBuf::from(path))),
-            Directory::Ssh(_) => None,
-        }
+        origin.directory.explorer_location(&tab.source)
     }
 
     pub(super) fn can_open_explorer(&self, origin: Option<&Origin>) -> bool {
@@ -281,10 +307,7 @@ impl TerminalApp {
         let Some(folder) = self.explorer_folder(&origin) else {
             return;
         };
-        ctx.spawn_background_with_rejection(
-            move |_| Message::ExplorerOpened(folder.open().map_err(|error| format!("{error:#}"))),
-            Message::ExplorerOpened(Err("The Explorer request could not start.".into())),
-        );
+        explorer::open_location(folder, ctx);
     }
 
     pub(super) fn cancel_directory_copy(&mut self) {

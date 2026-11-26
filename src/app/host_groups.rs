@@ -16,12 +16,14 @@ mod alerted_send;
 mod close_ended;
 mod command_order;
 mod command_queue;
+mod command_toolbar;
 mod compare;
 mod completion;
 mod connection_notice;
 mod control_api;
 mod disconnect;
 mod dispatch_policy;
+mod dispatch_settings;
 mod environment;
 mod filter;
 mod host_list_export;
@@ -38,15 +40,18 @@ mod recipient_sets;
 mod reconnect;
 mod recorded_send;
 mod report;
+mod result_toolbar;
 mod retry;
 mod reuse;
 mod roster_commands;
 mod roster_report;
+mod roster_toolbar;
 mod run_search;
 mod save_command;
 mod saved;
 mod transfer;
 
+pub(super) use address::display as ssh_address;
 pub(super) use live_output::displayed_line;
 pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffer};
 pub(super) use reconnect::FailedLogin;
@@ -74,6 +79,7 @@ pub(super) struct HostGroup {
     ready_waiters: Vec<control_api::ReadinessWait>,
     filter: filter::Filter,
     roster_preferences: SshRosterDefaults,
+    dispatch_settings_open: bool,
     login_queue: Option<(usize, Arc<Semaphore>)>,
     roster_copy_feedback: String,
     draft: String,
@@ -165,7 +171,7 @@ impl Drop for Submission {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
@@ -218,7 +224,7 @@ impl HostGroup {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Target {
     pane: u64,
     name: String,
@@ -243,7 +249,7 @@ impl Target {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum TargetState {
     Offline,
     Failed(Option<ExitedPane>),
@@ -790,6 +796,7 @@ pub enum Action {
     ShowLastOutput(TabId, bool),
     ShowTerminalLine(TabId, bool),
     RequireAllReady(TabId, bool),
+    ShowDispatchSettings(TabId, bool),
     CopyRoster(TabId, BTreeSet<u64>),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
@@ -812,7 +819,7 @@ pub enum Action {
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
-    StopPending(TabId, Vec<reconnect::Attempt>),
+    StopPending(TabId, Vec<PendingPaneAttempt>),
     ConnectionNotice(TabId, connection_notice::Action),
     CloseEnded(TabId, close_ended::Action),
     Disconnect(TabId, disconnect::Action),
@@ -1047,7 +1054,7 @@ impl TerminalApp {
                 let state = if let Some(prompt) = live.session.prompts.current() {
                     match prompt.question {
                         Question::HostKey { .. } => TargetState::HostKey(prompt.id),
-                        Question::Authentication { .. } => {
+                        Question::Authentication { .. } | Question::IdentityPassphrase { .. } => {
                             TargetState::Authentication(Some(prompt.id))
                         }
                     }
@@ -1491,6 +1498,11 @@ impl TerminalApp {
             Action::ShowTerminalLine(id, show) => {
                 if let Some(page) = self.host_group_mut(id) {
                     page.roster_preferences.show_terminal_line = show;
+                }
+            }
+            Action::ShowDispatchSettings(id, open) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.dispatch_settings_open = open;
                 }
             }
             Action::RequireAllReady(id, require) => {
@@ -2178,18 +2190,6 @@ impl TerminalApp {
                     && !selected_shown.contains(&target.pane)
             })
             .count();
-        let shown_ids: BTreeSet<_> = shown.iter().map(|target| target.pane).collect();
-        let bulk = |label, selection: ShownSelection| {
-            let panes = shown_ids.clone();
-            Button::new()
-                .is_enabled(shown.iter().any(|target| {
-                    page.selected.contains(&target.pane) != selection.includes(target.state)
-                }))
-                .on_click(ctx.callback(move |_| {
-                    Message::HostGroup(Action::SelectShown(id, panes.clone(), selection))
-                }))
-                .content(label)
-        };
         let filter_input = Grid::new()
             .column_spacing(8.0)
             .columns([
@@ -2255,7 +2255,7 @@ impl TerminalApp {
                             })
                     })),
             ));
-        let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
+        let filter = StackPanel::new().grid_row(3).spacing(6.0).children((
             filter_input,
             roster_state_summary(&matching, shown.len()).map_or_else(View::empty, |summary| {
                 TextBlock::new()
@@ -2263,54 +2263,13 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             }),
-            page.roster.as_ref().map_or_else(View::empty, |roster| {
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        CheckBox::new()
-                            .automation_name("Show all window SSH panes")
-                            .is_checked(roster.show_window)
-                            .on_is_checked_changed(ctx.callback(move |show| {
-                                Message::HostGroup(Action::ShowWindowRoster(id, show))
-                            }))
-                            .content("Show all window SSH panes"),
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::Membership(id, membership::Action::Open))
-                            }))
-                            .content(membership::LABEL),
-                        if page.saved.can_update_roster() {
-                            saved::update_button(id, ctx)
-                        } else {
-                            View::empty()
-                        },
-                        saved::roster_defaults_button(id, page, ctx),
-                    ))
-            }),
             filter_error.map_or_else(View::empty, |error| {
                 TextBlock::new()
                     .text(error)
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             }),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    bulk("Select shown", ShownSelection::All),
-                    bulk("Deselect shown", ShownSelection::None),
-                    bulk("Select only ready shown", ShownSelection::Ready),
-                    Button::new()
-                        .is_enabled(!selected_shown.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            Message::HostGroup(Action::Saved(
-                                id,
-                                saved::Action::NewFromSelection(selected_shown.clone()),
-                            ))
-                        }))
-                        .content("Save selection as group…"),
-                )),
+            roster_toolbar::view(id, page, &selected, &shown, ctx),
             reconnect::selection_controls(
                 id,
                 page,
@@ -2323,50 +2282,6 @@ impl TerminalApp {
             page.disconnect
                 .controls(id, self.disconnect_recipients(selected.iter()), ctx),
             next_prompt,
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    transfer::button(id, &selected, transfer::Direction::Upload, ctx),
-                    transfer::button(id, &selected, transfer::Direction::Download, ctx),
-                    if page.saved.origin().is_some() {
-                        recipient_sets::button(id, ctx)
-                    } else {
-                        View::empty()
-                    },
-                    host_list_export::button(id, &selected, ctx),
-                )),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    environment::button(id, page, &selected, ctx),
-                    Button::new()
-                        .is_enabled(!shown_ids.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            Message::HostGroup(Action::CopyRoster(id, shown_ids.clone()))
-                        }))
-                        .content("Copy shown roster"),
-                )),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    CheckBox::new()
-                        .automation_name("Show last command output")
-                        .is_checked(page.roster_preferences.show_last_output)
-                        .on_is_checked_changed(ctx.callback(move |show| {
-                            Message::HostGroup(Action::ShowLastOutput(id, show))
-                        }))
-                        .content("Show last command output"),
-                    CheckBox::new()
-                        .automation_name("Show current terminal line")
-                        .is_checked(page.roster_preferences.show_terminal_line)
-                        .on_is_checked_changed(ctx.callback(move |show| {
-                            Message::HostGroup(Action::ShowTerminalLine(id, show))
-                        }))
-                        .content("Show current terminal line"),
-                )),
             if page.roster_copy_feedback.is_empty() {
                 View::empty()
             } else {
@@ -2391,12 +2306,6 @@ impl TerminalApp {
                 format!("{ready} of {count} selected {hosts} ready")
             }
         };
-        let entry = TextBox::new()
-            .element_ref(&page.command_editor)
-            .automation_name("Group command")
-            .placeholder_text("Enter one shell command")
-            .text(&page.draft)
-            .on_text_changed(ctx.callback(move |text| Message::HostGroup(Action::Edit(id, text))));
         let offer = page.command_offer(
             text,
             command_order::recipients(page, shown.iter().copied())
@@ -2416,42 +2325,7 @@ impl TerminalApp {
                 StackPanel::new().spacing(10.0).keyed_children(details),
             )
         };
-        let preview = command_order::button(
-            id,
-            page.preview_command_order,
-            !offer.targets.is_empty(),
-            ctx,
-        );
-        let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
-        let send_alerted = alerted_send::button(id, offer.clone(), enabled, ctx);
-        let send = Button::new()
-            .style(ButtonStyle::Accent)
-            .is_enabled(enabled)
-            .on_click(ctx.callback(move |_| Message::HostGroup(Action::Send(id, offer.clone()))))
-            .content(send_label);
-        let saved_commands = Button::new()
-            .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenSavedCommands(id))))
-            .content("Saved commands…");
-        let recall = ctx.sender();
-        let recent_commands = Button::new()
-            .automation_name("Recent commands…")
-            .key_accelerators(KeyAccelerators::new([KeyAccelerator::new(
-                AcceleratorKey::R,
-                AcceleratorModifiers::Control,
-                move || {
-                    recall.send(Message::HostGroup(Action::OpenRecentCommands(id)));
-                },
-            )]))
-            .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenRecentCommands(id))))
-            .content("Recent commands…  Ctrl+R");
-        let save_command = page.command_save.button(id, &page.draft, ctx);
-        let restore = if page.previous_draft.is_some() {
-            Button::new()
-                .on_click(ctx.callback(move |_| Message::HostGroup(Action::RestoreDraft(id))))
-                .content("Restore draft")
-        } else {
-            View::empty()
-        };
+        let dispatch = self.dispatch_settings(id, page, &offer, &selected, ctx);
         let hidden_selection = if hidden_count == 0 {
             View::empty()
         } else {
@@ -2479,74 +2353,19 @@ impl TerminalApp {
             .children((
                 TextBlock::new().font_size(24.0).text(LABEL),
                 self.saved_host_group_toolbar(id, page, ctx),
-                filter,
-                StackPanel::new().grid_row(3).spacing(7.0).children((
-                    entry,
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(12.0)
-                        .children((
-                            parallel_limit::picker(
-                                "Parallel SSH commands",
-                                page.roster_preferences.command_limit,
-                                !page.recorded_send.pending(),
-                                move |limit| Message::HostGroup(Action::CommandLimit(id, limit)),
-                                ctx,
-                            ),
-                            CheckBox::new()
-                                .automation_name("Stop queue on failure")
-                                .is_checked(page.roster_preferences.stop_command_queue_on_failure)
-                                .is_enabled(!page.recorded_send.pending() && page.orders_commands())
-                                .on_is_checked_changed(ctx.callback(move |stop| {
-                                    Message::HostGroup(Action::StopCommandQueueOnFailure(id, stop))
-                                }))
-                                .content("Stop queue on failure"),
-                            preview,
-                        )),
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(12.0)
-                        .children((
-                            command_queue::interval_picker(id, page, ctx),
-                            command_queue::expiry_picker(id, page, ctx),
-                        )),
-                    command_queue::canary_picker(id, page, &selected, ctx),
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(8.0)
-                        .children((
-                            send,
-                            send_recorded,
-                            send_alerted,
-                            recent_commands,
-                            saved_commands,
-                            save_command,
-                            restore,
-                        )),
+                StackPanel::new().grid_row(2).spacing(7.0).children((
+                    command_toolbar::composer(id, page, offer, send_label, enabled, ctx),
+                    TextBlock::new()
+                        .text(instructions)
+                        .text_wrapping(TextWrapping::Wrap),
+                    hidden_selection,
+                    dispatch,
                     page.command_save.view(id, ctx),
                     page.recorded_send.feedback(),
                     page.alerted_send.feedback(),
                     retry::feedback(page),
-                    hidden_selection,
-                    Grid::new()
-                        .column_spacing(12.0)
-                        .columns([GridLength::Auto, GridLength::STAR])
-                        .children((
-                            CheckBox::new()
-                                .automation_name(REQUIRE_READY)
-                                .is_checked(page.roster_preferences.require_all_ready)
-                                .is_enabled(!page.recorded_send.pending())
-                                .on_is_checked_changed(ctx.callback(move |require| {
-                                    Message::HostGroup(Action::RequireAllReady(id, require))
-                                }))
-                                .content(REQUIRE_READY),
-                            TextBlock::new()
-                                .grid_column(1)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text(instructions)
-                                .text_wrapping(TextWrapping::Wrap),
-                        )),
                 )),
+                filter,
                 Grid::new()
                     .grid_row(4)
                     .keyed_children([KeyedView::new(body_key, ScrollViewer::new().content(body))]),
@@ -2594,16 +2413,16 @@ impl TerminalApp {
                 ))
             }))
             .content(interrupt_label);
-        let navigate = |label, destination: Option<&Submission>| {
+        let navigate = |label, glyph, destination: Option<&Submission>| {
             let destination = destination.map(|item| item.id);
-            Button::new()
+            title_tools::button(label)
                 .is_enabled(destination.is_some())
                 .on_click(ctx.callback(move |_| {
                     destination.map_or(Message::ControlIdle, |next| {
                         Message::HostGroup(Action::ViewSubmission(id, next))
                     })
                 }))
-                .content(label)
+                .content(result_toolbar::icon(label, glyph))
         };
         let result_filter = ComboBox::new()
             .automation_name("Filter submission results")
@@ -2670,47 +2489,62 @@ impl TerminalApp {
         } else {
             View::empty()
         };
-        let copy = |label, offered: Option<Arc<[u64]>>| {
-            Button::new()
-                .on_click(ctx.callback(move |_| {
-                    Message::HostGroup(Action::CopyResults(id, submission_id, offered.clone()))
-                }))
-                .content(label)
-        };
-        let save = |label, format, offered: Option<Arc<[u64]>>| {
-            Button::new()
-                .is_enabled(self.export.pending.is_none())
-                .on_click(ctx.callback(move |_| {
-                    Message::HostGroup(Action::SaveResults(
-                        id,
-                        submission_id,
-                        format,
-                        offered.clone(),
-                    ))
-                }))
-                .content(label)
-        };
-        let shown_exports = if !shown.is_empty() && shown.len() < summary.total() {
-            let offered: Arc<[u64]> = shown.iter().map(|(row, _)| row.target.pane).collect();
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    copy("Copy shown results", Some(offered.clone())),
-                    save(
-                        text_export::GROUP_SHOWN_REPORT_LABEL,
-                        text_export::GroupReportFormat::Text,
-                        Some(offered.clone()),
-                    ),
-                    save(
-                        text_export::GROUP_SHOWN_JSON_LABEL,
-                        text_export::GroupReportFormat::Json,
-                        Some(offered),
-                    ),
-                ))
-        } else {
-            View::empty()
-        };
+        let shown_exports = (!shown.is_empty() && shown.len() < summary.total())
+            .then(|| shown.iter().map(|(row, _)| row.target.pane).collect());
+        let notice = submission.transcript.completion_state();
+        let run_actions = result_toolbar::menu(
+            id,
+            submission,
+            index > 0,
+            shown_exports,
+            self.export.pending.is_some(),
+            notice,
+            ctx,
+        );
+        let history = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(4.0)
+            .children((
+                navigate(
+                    "Previous submission",
+                    "\u{e72b}",
+                    index.checked_sub(1).and_then(|i| page.submissions.get(i)),
+                ),
+                navigate(
+                    "Next submission",
+                    "\u{e72a}",
+                    page.submissions.get(index + 1),
+                ),
+                title_tools::button("Find run…")
+                    .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenRunPicker(id))))
+                    .content(result_toolbar::icon("Find run…", "\u{e721}")),
+                TextBlock::new()
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text(format!("{} of {}", index + 1, page.submissions.len())),
+            ));
+        let run_tools = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(8.0)
+            .children((
+                history,
+                StackPanel::new()
+                    .grid_column(1)
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .children((
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::LiveOutput(
+                                    id,
+                                    submission_id,
+                                    live_output::Action::Open,
+                                ))
+                            }))
+                            .content("Live output…"),
+                        interrupt,
+                        run_actions,
+                    )),
+            ));
         details.push(KeyedView::new(
             "results",
             StackPanel::new().spacing(4.0).children((
@@ -2732,6 +2566,7 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap),
                 StackPanel::new().spacing(4.0).children((
                     output_recording::status_view(id, submission, ctx),
+                    completion::status(notice),
                     submission
                         .transcript
                         .output_alert_rule()
@@ -2744,95 +2579,13 @@ impl TerminalApp {
                     .automation_name("SSH group submission progress")
                     .maximum(summary.total().max(1) as f64)
                     .value(summary.settled() as f64),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        navigate(
-                            "Previous submission",
-                            index.checked_sub(1).and_then(|i| page.submissions.get(i)),
-                        ),
-                        navigate("Next submission", page.submissions.get(index + 1)),
-                        Button::new()
-                            .on_click(
-                                ctx.callback(move |_| {
-                                    Message::HostGroup(Action::OpenRunPicker(id))
-                                }),
-                            )
-                            .content("Find run…"),
-                        TextBlock::new().text(format!(
-                            "{} of {}",
-                            index + 1,
-                            page.submissions.len()
-                        )),
-                    )),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        if submission.content.command().is_some() {
-                            Button::new()
-                                .on_click(ctx.callback(move |_| {
-                                    Message::HostGroup(Action::LoadCommand(id, submission_id))
-                                }))
-                                .content("Load command")
-                        } else {
-                            View::empty()
-                        },
-                        copy("Copy results", None),
-                        save(
-                            text_export::GROUP_REPORT_LABEL,
-                            text_export::GroupReportFormat::Text,
-                            None,
-                        ),
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::LiveOutput(
-                                    id,
-                                    submission_id,
-                                    live_output::Action::Open,
-                                ))
-                            }))
-                            .content("Live output…"),
-                        interrupt,
-                    )),
+                run_tools,
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
                     .children((result_filter, result_order)),
                 recipient_search,
                 result_count,
-                shown_exports,
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::Compare(
-                                    id,
-                                    submission_id,
-                                    compare::Action::Open,
-                                ))
-                            }))
-                            .content("Compare results…"),
-                        Button::new()
-                            .is_enabled(index > 0)
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::Compare(
-                                    id,
-                                    submission_id,
-                                    compare::Action::RunOverview(compare::RunOverviewAction::Open),
-                                ))
-                            }))
-                            .content("Compare runs…"),
-                        save(
-                            text_export::GROUP_JSON_LABEL,
-                            text_export::GroupReportFormat::Json,
-                            None,
-                        ),
-                        completion::button(id, submission, ctx),
-                    )),
                 command_queue::controls(id, submission, ctx),
                 queue_activity::view(id, submission, ctx),
                 retry::button(

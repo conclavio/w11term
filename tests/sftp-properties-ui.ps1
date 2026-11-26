@@ -26,7 +26,7 @@ function Click([string]$Name) {
     })
 }
 function Open-Properties([string[]]$Expected) {
-    Click $properties
+    Invoke-SftpEntryAction $properties
     $field = Wait-Until 'read-only file properties displayed' {
         $b = Find-Element 'File properties'
         if ($b -and $b.Current.AutomationId -eq 'sftp-properties-text') { $b }
@@ -123,8 +123,8 @@ try {
     Press-Key 13
     Wait-Focus $remote
     Run-Palette 'Open files here'
-    $null = Wait-Until 'directory listed, Properties disabled before selection' {
-        $b = Find-Element $properties $button
+    $null = Wait-Until 'directory listed, entry actions disabled before selection' {
+        $b = Find-Element 'Selected entry actions' $button
         (Find-Element $filename $button) -and $b -and !$b.Current.IsEnabled
     }
 
@@ -150,7 +150,7 @@ try {
     }
     $expectedDigest = Get-Digest $disk
     Click $filename
-    Click $properties
+    Invoke-SftpEntryAction $properties
     Click 'Calculate SHA-256'
     $digestField = Wait-Until 'selectable SHA-256 digest in the dialog' {
         $b = Find-Element 'SHA-256 digest'
@@ -188,7 +188,7 @@ try {
     if ($sha.sftp.sha256 -cne $expectedDigest -or $sha.sftp.bytes -ne 57) {
         throw 'The CLI returned an unexpected checksum or byte count'
     }
-    Click $properties
+    Invoke-SftpEntryAction $properties
     Click 'Calculate SHA-256'
     $null = Wait-Until 'digest available before the server file changes' { Find-Element 'SHA-256 digest' }
     [IO.File]::WriteAllBytes($disk,[byte[]](1..57))
@@ -196,14 +196,8 @@ try {
     Download-WithChecksum $rejected $expectedDigest
     Wait-TransferOutcome 'failed' 'SHA-256 mismatch'
     if ([IO.File]::Exists($rejected)) { throw 'A changed remote file was installed locally' }
-    $actions = Find-Element 'SFTP actions'
-    $close = [System.Windows.Automation.AndCondition]::new(
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Close'),
-        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,$button))
-    # The dialog returns focus to the file drawer. Use its Close button, scoped
-    # to the drawer so it cannot invoke the window caption's Close button.
-    Invoke-Button (Wait-Until 'drawer Close button' { $actions.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$close) })
-    $null = Wait-Until 'drawer closed' { !(Find-Element $properties $button) }
+    Click 'Close files'
+    $null = Wait-Until 'drawer closed' { !(Find-Element 'Selected entry actions' $button) }
     Wait-Focus $remote
     foreach ($ch in 'ssh-properties-still-live'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ssh-properties-still-live')

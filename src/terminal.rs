@@ -155,9 +155,11 @@ impl TransportInput {
 #[derive(Clone, Debug)]
 pub enum ScopedInput {
     Clipboard,
+    Raw,
     Notification,
     GroupCommand(crate::events::GroupWriteReceipt),
     GroupInterrupt(crate::events::GroupInterruptTarget),
+    CommandInterrupt(crate::events::CommandInterruptPermit),
 }
 
 impl ScopedInput {
@@ -177,14 +179,18 @@ impl ScopedInput {
             Self::Clipboard => {
                 "The pane connection changed. Paste again to use the new connection."
             }
+            Self::Raw => "The pane connection changed before the write; input was not sent.",
             Self::Notification => "The terminal connection changed before the notification reply.",
             Self::GroupCommand(_) => "The host reconnected before the command was sent.",
             Self::GroupInterrupt(_) => "The host reconnected before Ctrl+C was sent.",
+            Self::CommandInterrupt(_) => "The pane connection changed before Ctrl+C was sent.",
         }
     }
 }
 
 pub(crate) const GROUP_COMMAND_ENDED: &str = "The selected group command is no longer running.";
+pub(crate) const COMMAND_INTERRUPT_EXPIRED: &str =
+    "The selected command is no longer interruptible; Ctrl+C was not sent.";
 
 struct ReplyWriter {
     sender: mpsc::UnboundedSender<TransportInput>,
@@ -640,7 +646,7 @@ fn encode_kitty_key_event(
 pub(crate) fn group_command_bytes(terminal: &Terminal, text: &str) -> anyhow::Result<Vec<u8>> {
     use wezterm_term::{KeyCode, KeyModifiers};
     let mut encoded = terminal.encode_paste(text);
-    encoded.push_str(&group_key_press(
+    encoded.push_str(&encode_key_press(
         terminal,
         KeyCode::Enter,
         KeyModifiers::NONE,
@@ -648,12 +654,12 @@ pub(crate) fn group_command_bytes(terminal: &Terminal, text: &str) -> anyhow::Re
     Ok(encoded.into_bytes())
 }
 
-pub(crate) fn group_interrupt_bytes(terminal: &Terminal) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn interrupt_bytes(terminal: &Terminal) -> anyhow::Result<Vec<u8>> {
     use wezterm_term::{KeyCode, KeyModifiers};
-    Ok(group_key_press(terminal, KeyCode::Char('c'), KeyModifiers::CTRL)?.into_bytes())
+    Ok(encode_key_press(terminal, KeyCode::Char('c'), KeyModifiers::CTRL)?.into_bytes())
 }
 
-fn group_key_press(
+fn encode_key_press(
     terminal: &Terminal,
     key: wezterm_term::KeyCode,
     modifiers: wezterm_term::KeyModifiers,
@@ -691,6 +697,7 @@ pub struct Snapshot {
     pub title: String,
     application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
+    pub latest_command_id: u64,
     pub failed_command_rows: Arc<[isize]>,
     pub scrollback_bookmarks: Arc<[isize]>,
     pub command_context: Option<CommandContext>,
@@ -957,6 +964,7 @@ impl Snapshot {
                     })
             }),
             command_history: terminal.command_history().clone(),
+            latest_command_id: terminal.latest_command_id(),
             failed_command_rows: scrollback_view::failed_command_rows(terminal, previous),
             scrollback_bookmarks: scrollback_view::bookmark_rows(screen, previous),
             command_context: scrollback_view::command_context(
@@ -1061,6 +1069,7 @@ impl Snapshot {
             && self.visual_bell_color == old.visual_bell_color
             && self.title == old.title
             && self.application_title() == old.application_title()
+            && self.latest_command_id == old.latest_command_id
             && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.failed_command_rows == old.failed_command_rows
             && self.scrollback_bookmarks == old.scrollback_bookmarks
@@ -1113,7 +1122,8 @@ pub struct FrameStore(Arc<(Mutex<ViewState>, Condvar, tokio::sync::Notify)>);
 #[derive(Debug)]
 struct ViewState {
     frame: Arc<Snapshot>,
-    inspection: Option<TerminalModes>,
+    inspection: Option<crate::session::PaneInspection>,
+    running_command: Option<(u64, wezterm_term::RunningCommand)>,
     inbox: Option<WindowInbox>,
 }
 
@@ -1130,6 +1140,7 @@ impl FrameStore {
             Mutex::new(ViewState {
                 frame: Arc::new(frame),
                 inspection: None,
+                running_command: None,
                 inbox: None,
             }),
             Condvar::new(),
@@ -1182,13 +1193,19 @@ impl FrameStore {
         }
         tokio::time::timeout_at(deadline, changed).await.is_ok()
     }
-    pub fn inspection(&self) -> Option<TerminalModes> {
-        self.0.0.lock().unwrap().inspection
+    pub fn inspection(&self) -> Option<crate::session::PaneInspection> {
+        self.0.0.lock().unwrap().inspection.clone()
     }
-    pub(crate) fn set_inspection(&self, modes: Option<TerminalModes>) {
+    pub(crate) fn running_command(&self) -> Option<(u64, wezterm_term::RunningCommand)> {
+        self.0.0.lock().unwrap().running_command.clone()
+    }
+    pub(crate) fn set_running_command(&self, command: Option<(u64, wezterm_term::RunningCommand)>) {
+        self.0.0.lock().unwrap().running_command = command;
+    }
+    pub(crate) fn set_inspection(&self, inspection: Option<crate::session::PaneInspection>) {
         let mut state = self.0.0.lock().unwrap();
-        if state.inspection != modes {
-            state.inspection = modes;
+        if state.inspection != inspection {
+            state.inspection = inspection;
             // Wake the native watcher only. Control consumers await committed frames.
             self.0.1.notify_all();
         }
@@ -1201,12 +1218,14 @@ impl FrameStore {
     pub fn wait_for_view(
         &self,
         generation: u64,
-        inspected: Option<Option<TerminalModes>>,
+        inspected: Option<Option<crate::session::PaneInspection>>,
         cancelled: impl Fn() -> bool,
     ) {
         let mut state = self.0.0.lock().unwrap();
         while state.frame.generation == generation
-            && inspected.is_none_or(|previous| previous == state.inspection)
+            && inspected
+                .as_ref()
+                .is_none_or(|previous| previous == &state.inspection)
             && !cancelled()
         {
             state = self
@@ -1583,7 +1602,7 @@ mod tests {
     #[test]
     fn group_interrupt_uses_the_panes_ctrl_c_encoding() {
         let (mut term, mut outgoing) = engine();
-        assert_eq!(group_interrupt_bytes(&term).unwrap(), b"\x03");
+        assert_eq!(interrupt_bytes(&term).unwrap(), b"\x03");
         term.advance_bytes(b"\x1b[>11u");
         let mut expected = Vec::new();
         for down in [true, false] {
@@ -1601,7 +1620,7 @@ mod tests {
                 item => panic!("expected Kitty Ctrl+C: {item:?}"),
             }
         }
-        assert_eq!(group_interrupt_bytes(&term).unwrap(), expected);
+        assert_eq!(interrupt_bytes(&term).unwrap(), expected);
     }
 
     #[test]
@@ -1871,6 +1890,238 @@ mod tests {
         );
         let long = "雪".repeat(2048);
         assert_eq!(command_output_tail(&long), "雪".repeat(200));
+    }
+
+    #[test]
+    fn command_start_events_ignore_replay_and_alternate_screen_markers() {
+        let (mut term, events) = watched_terminal();
+        term.advance_bytes(b"\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert!(events.since(0).events.is_empty());
+        events.command_stream(Some(2));
+        term.advance_bytes(b"\x1b[?1049h\x1b]133;C\x07\x1b[?1049l");
+        assert!(events.since(0).events.is_empty());
+
+        term.advance_bytes(b"\x1b]633;E;original\x07\x1b]633;C\x07");
+        let first = term.running_command().unwrap();
+        term.advance_bytes(b"\x1b]633;E;amended\x07\x1b]133;C\x07\x1b]133;D;7\x07");
+        let history = term.last_command().unwrap();
+        let batch = events.since(0);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "command-started");
+        assert_eq!(history.id, first.id);
+        assert_eq!(
+            batch.events[0].data,
+            serde_json::json!({
+                "id": history.id, "connection_generation": 2, "start_token": first.start_token,
+                "started_unix_ms": first.started_unix_ms,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_command_start_observes_a_finish_in_the_same_byte_batch() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(7));
+        let cursor = events.cursor();
+        let wait = events.wait_kind(cursor, Duration::from_secs(1), Some("command-started"));
+        let run = async {
+            term.advance_bytes(b"\x1b]133;C;cmdline_url=fast%20check\x07\x1b]133;D;0\x07");
+        };
+        let (batch, ()) = tokio::join!(wait, run);
+        assert_eq!(batch.events.len(), 1);
+        assert!(term.running_command().is_none());
+        let record = term.last_command().unwrap();
+        assert_eq!(batch.events[0].data["id"], record.id);
+        assert_eq!(
+            batch.events[0].data["started_unix_ms"],
+            record.timing.started_unix_ms.unwrap()
+        );
+    }
+
+    #[test]
+    fn transport_cannot_claim_interrupt_after_observed_prompt_or_capture_replacement() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(5));
+        term.advance_bytes(b"\x1b]133;C\x07first");
+        let target = |term: &Terminal| {
+            crate::events::RunningCommandTarget::new(5, &term.running_command().unwrap())
+        };
+        let arm = |term: &Terminal| events.arm_command_interrupt(target(term)).unwrap();
+        let replacement = arm(&term);
+        term.advance_bytes(b"\x1b]133;C\x07second");
+        assert!(
+            !replacement.claim(),
+            "the new marker must invalidate the queued write immediately"
+        );
+
+        let superseded = arm(&term);
+        let current = arm(&term);
+        assert!(!superseded.claim());
+        assert!(current.claim());
+        assert!(
+            !current.claim(),
+            "the transport may claim a permit only once"
+        );
+
+        let read_only = arm(&term);
+        events.cancel_command_interrupt();
+        assert!(!read_only.claim());
+        let completed = arm(&term);
+        term.advance_bytes(b"\x1b]133;D;0\x07");
+        assert!(!completed.claim());
+        term.advance_bytes(b"\x1b]133;C\x07third");
+        let disconnected = arm(&term);
+        events.command_stream(None);
+        assert!(!disconnected.claim());
+    }
+
+    #[test]
+    fn exact_completion_wait_follows_only_its_start_marker() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(8));
+        term.advance_bytes(b"\x1b]133;C\x07original");
+        let original = term.running_command().unwrap();
+        let watch = |running: &wezterm_term::RunningCommand| {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            events.watch_command_completion(
+                crate::events::RunningCommandTarget::new(8, running),
+                reply,
+            );
+            response
+        };
+        let mut stale = watch(&original);
+        term.advance_bytes(b"\x1b]133;C\x07replacement");
+        let running = term.running_command().unwrap();
+        assert_eq!(running.id, original.id);
+        assert_ne!(running.start_token, original.start_token);
+        let mut active = watch(&running);
+        term.advance_bytes(b"\x1b]133;D;7\x07\r\n\x1b]133;C\x07later\x1b]133;D;0\x07");
+        let captured = active.try_recv().unwrap().unwrap();
+        assert_eq!(captured.connection_generation, 8);
+        assert_eq!(captured.command.id, running.id);
+        assert_eq!(captured.command.start_token, Some(running.start_token));
+        assert_eq!(captured.command.exit_code, Some(7));
+        assert_eq!(captured.command.output.as_deref().unwrap(), "replacement");
+        events.retain_running_capture(None);
+        assert!(stale.try_recv().unwrap().is_err());
+
+        term.advance_bytes(b"\x1b]133;C\x07pending");
+        let mut disconnected = watch(&term.running_command().unwrap());
+        events.command_stream(None);
+        assert_eq!(
+            disconnected.try_recv().unwrap().unwrap_err(),
+            "shell connection changed before command completion"
+        );
+    }
+
+    #[test]
+    fn running_output_waits_match_retained_live_and_final_lines() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(6));
+        term.advance_bytes(b"$ build\r\n\x1b]133;C\x07cached ready\r\n");
+        let running = term.running_command().unwrap();
+        let wait = |pattern: &str| {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            events.watch_running_output(
+                crate::events::RunningCommandTarget::new(6, &running),
+                regex::Regex::new(pattern).unwrap(),
+                reply,
+            );
+            response
+        };
+        let mut cached = wait("^cached ready$");
+        let mut live = wait("^next line$");
+        let mut finished = wait("^last line$");
+        let mut missing = wait("^missing$");
+        term.notify_running_shell_output();
+        assert_eq!(cached.try_recv().unwrap().unwrap().text, "cached ready");
+
+        term.advance_bytes(b"next line");
+        term.notify_running_shell_output();
+        assert!(matches!(
+            live.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        term.advance_bytes(b"\r\n");
+        term.notify_running_shell_output();
+        let hit = live.try_recv().unwrap().unwrap();
+        assert_eq!(hit.text, "next line");
+        assert_eq!(
+            (hit.connection_generation, hit.id, hit.start_token),
+            (6, running.id, running.start_token)
+        );
+
+        term.advance_bytes(b"last line\x1b]133;D;17\x07");
+        assert_eq!(finished.try_recv().unwrap().unwrap().text, "last line");
+        assert_eq!(
+            missing.try_recv().unwrap().unwrap_err(),
+            "command finished without a matching output line"
+        );
+        assert!(!events.prune_command_waits());
+    }
+
+    #[test]
+    fn running_output_waits_reject_gaps_and_retire_when_the_capture_changes() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(1));
+        term.advance_bytes(b"\x1b]133;C\x07");
+        let original =
+            crate::events::RunningCommandTarget::new(1, &term.running_command().unwrap());
+        let watch = |target| {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            events.watch_running_output(target, regex::Regex::new("^ready$").unwrap(), reply);
+            response
+        };
+        let mut gap = watch(original);
+        term.advance_bytes(format!("{}ready\r\n", "noise\r\n".repeat(130)).as_bytes());
+        term.notify_running_shell_output();
+        assert!(gap.try_recv().unwrap().unwrap_err().contains("incomplete"));
+
+        let mut stale = watch(original);
+        term.advance_bytes(b"\x1b]133;C\x07ready\r\n");
+        term.notify_running_shell_output();
+        let current = crate::events::RunningCommandTarget::new(1, &term.running_command().unwrap());
+        events.retain_running_capture(Some(current));
+        assert_eq!(
+            stale.try_recv().unwrap().unwrap_err(),
+            "command capture ended before an output match"
+        );
+
+        let mut disconnected = watch(current);
+        events.command_stream(None);
+        assert_eq!(
+            disconnected.try_recv().unwrap().unwrap_err(),
+            "shell connection changed before an output match"
+        );
+    }
+
+    #[test]
+    fn running_command_handles_late_shell_metadata_prompt_and_terminal_reset() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]633;A\x07\x1b]633;B\x07");
+        assert!(term.running_command().is_none());
+        term.advance_bytes(b"\x1b]633;C\x07");
+        let started = term.running_command().unwrap();
+        assert!(started.command.is_none());
+
+        term.advance_bytes(b"\x1b]633;E;build all\x07");
+        let named = term.running_command().unwrap();
+        assert_eq!(named.command.as_deref(), Some("build all"));
+        assert_eq!(named.id, started.id);
+        assert_eq!(named.start_token, started.start_token);
+        assert_eq!(named.started_unix_ms, started.started_unix_ms);
+
+        term.advance_bytes(b"\x1b]633;A\x07");
+        assert!(term.running_command().is_none());
+        let finished = term.last_command().unwrap();
+        assert_eq!(finished.id, named.id);
+        assert_eq!(finished.timing.started_unix_ms, Some(named.started_unix_ms));
+        assert_eq!(finished.exit_code, None);
+
+        term.advance_bytes(b"\x1b]133;C\x07");
+        assert!(term.running_command().is_some());
+        term.advance_bytes(b"\x1bc");
+        assert!(term.running_command().is_none());
     }
 
     #[test]

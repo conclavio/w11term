@@ -1,4 +1,26 @@
 use super::*;
+use wezterm_term::CompletedCommand;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandOutputFile {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overwrite: bool,
+}
+
+impl CommandOutputFile {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.path.is_absolute(),
+            "command output path must be absolute"
+        );
+        ensure!(
+            self.path.file_name().is_some(),
+            "Choose a command output file name"
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +59,10 @@ impl Registry {
                 json!({
                     "id": entry.id,
                     "command": entry.command,
+                    "reported_directory": entry.reported_directory.as_deref(),
+                    "started_unix_ms": entry.timing.started_unix_ms,
+                    "finished_unix_ms": entry.timing.finished_unix_ms,
+                    "duration_ms": entry.timing.duration_ms,
                     "exit_code": entry.exit_code,
                     "output_available": entry.output.is_ok(),
                 })
@@ -45,6 +71,7 @@ impl Registry {
         Ok(json!({
             "pane": pane,
             "connection_generation": frame.connection_generation,
+            "latest_id": frame.latest_command_id,
             "commands": commands,
         }))
     }
@@ -54,29 +81,202 @@ impl Registry {
         pane: u64,
         id: u64,
         connection_generation: u64,
+        output_file: Option<CommandOutputFile>,
     ) -> Result<Value> {
+        if let Some(destination) = &output_file {
+            destination.validate()?;
+        }
         // Resolve the connection and record against the same committed frame.
         let (frame, _) = Self::capture(&self.pane(pane)?).await?;
-        ensure!(
-            frame.connection_generation == connection_generation,
-            "pane {pane} connection generation changed (requested {connection_generation}, current {})",
-            frame.connection_generation
-        );
+        check_generation(&frame, pane, connection_generation)?;
         let entry = frame
-            .command_history
-            .iter()
-            .find(|entry| entry.id == id)
-            .with_context(|| format!("command {id} is not retained in pane {pane}"))?;
-        Ok(json!({
-            "pane": pane,
-            "connection_generation": connection_generation,
-            "id": entry.id,
-            "command": entry.command,
-            "exit_code": entry.exit_code,
-            "output": entry.output.as_ref().ok(),
-            "output_error": entry.output.as_ref().err(),
-        }))
+            .command_for_link(crate::events::CommandLink {
+                generation: connection_generation,
+                id,
+            })
+            .with_context(|| format!("command {id} is not retained in pane {pane}"))?
+            .clone();
+        drop(frame);
+        reply_command(pane, connection_generation, entry, output_file).await
     }
+
+    pub(super) async fn wait_command(
+        &self,
+        pane: u64,
+        after_id: u64,
+        connection_generation: u64,
+        timeout_seconds: u64,
+        command: Option<&str>,
+        output_file: Option<CommandOutputFile>,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=3600).contains(&timeout_seconds),
+            "wait timeout must be 1..=3600 seconds"
+        );
+        if let Some(destination) = &output_file {
+            destination.validate()?;
+        }
+        let target = self.pane(pane)?;
+        let events = if connection_generation == 0 {
+            None
+        } else {
+            Some(Self::pane_events(&target).await?)
+        };
+        let frames = Self::live_frames(&target).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+        let wait = async {
+            let mut cursor = after_id;
+            loop {
+                let frame = frames.load();
+                check_generation(&frame, pane, connection_generation)?;
+                if let Some(entry) = matching_command(&frame, &mut cursor, command)? {
+                    return Ok::<_, anyhow::Error>(Arc::clone(entry));
+                }
+                ensure!(
+                    tokio::time::Instant::now() < deadline
+                        && frames.changed(frame.generation, deadline).await,
+                    "wait-command timed out without a matching completed command"
+                );
+            }
+        };
+        const STALE: &str =
+            "The pane connection changed or is no longer active; no command was accepted";
+        let entry = tokio::select! {
+            biased;
+            _ = async {
+                match &events {
+                    Some(events) => events.terminal_connection_changed(connection_generation).await,
+                    None => std::future::pending().await,
+                }
+            } => anyhow::bail!(STALE),
+            _ = target.input.closed() => anyhow::bail!("pane is closed"),
+            result = wait => result?,
+        };
+        ensure!(
+            events.is_none_or(|events| events.terminal_connection_is(connection_generation)),
+            STALE
+        );
+        reply_command(pane, connection_generation, entry, output_file).await
+    }
+
+    pub(super) async fn wait_command_capture(
+        &self,
+        pane: u64,
+        start_token: u64,
+        timeout_seconds: u64,
+        output_file: Option<CommandOutputFile>,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=3600).contains(&timeout_seconds),
+            "wait timeout must be 1..=3600 seconds"
+        );
+        if let Some(destination) = &output_file {
+            destination.validate()?;
+        }
+        let (reply, response) = oneshot::channel();
+        let mut pending = PendingCommandWait {
+            input: self.pane(pane)?.input,
+            response,
+        };
+        pending
+            .input
+            .send(Command::WaitCommandCapture { start_token, reply })
+            .context("pane is closed")?;
+        let capture =
+            tokio::time::timeout(Duration::from_secs(timeout_seconds), &mut pending.response)
+                .await
+                .context("wait-command timed out before the selected capture completed")?
+                .context("pane closed before command completion")?
+                .map_err(anyhow::Error::msg)?;
+        drop(pending);
+        let mut result = reply_command(
+            pane,
+            capture.connection_generation,
+            capture.command,
+            output_file,
+        )
+        .await?;
+        result["start_token"] = start_token.into();
+        Ok(result)
+    }
+}
+
+fn check_generation(frame: &Snapshot, pane: u64, expected: u64) -> Result<()> {
+    ensure!(
+        frame.connection_generation == expected,
+        "pane {pane} connection generation changed (requested {expected}, current {})",
+        frame.connection_generation
+    );
+    Ok(())
+}
+
+fn matching_command<'a>(
+    frame: &'a Snapshot,
+    cursor: &mut u64,
+    command: Option<&str>,
+) -> Result<Option<&'a Arc<CompletedCommand>>> {
+    let after_id = *cursor;
+    ensure!(
+        after_id <= frame.latest_command_id,
+        "command ID is ahead of this pane; check the instance and pane ID"
+    );
+    if after_id == frame.latest_command_id {
+        return Ok(None);
+    }
+    let mut newer = frame
+        .command_history
+        .iter()
+        .skip_while(|entry| entry.id <= after_id)
+        .peekable();
+    ensure!(
+        newer.peek().is_some_and(|entry| entry.id == after_id + 1),
+        "command history is no longer retained immediately after ID {after_id}; get a new cursor with list-commands"
+    );
+    let matched =
+        newer.find(|entry| command.is_none_or(|text| entry.command.as_deref() == Some(text)));
+    if matched.is_none() {
+        // These entries were seen and rejected. Their later eviction is safe.
+        *cursor = frame.latest_command_id;
+    }
+    Ok(matched)
+}
+
+async fn reply_command(
+    pane: u64,
+    connection_generation: u64,
+    entry: Arc<CompletedCommand>,
+    output_file: Option<CommandOutputFile>,
+) -> Result<Value> {
+    let output = if output_file.is_none() {
+        entry.output.as_ref().ok()
+    } else {
+        None
+    };
+    let mut result = json!({
+        "pane": pane,
+        "connection_generation": connection_generation,
+        "id": entry.id,
+        "command": entry.command,
+        "reported_directory": entry.reported_directory.as_deref(),
+        "started_unix_ms": entry.timing.started_unix_ms,
+        "finished_unix_ms": entry.timing.finished_unix_ms,
+        "duration_ms": entry.timing.duration_ms,
+        "exit_code": entry.exit_code,
+        "output": output,
+        "output_error": entry.output.as_ref().err(),
+    });
+    if let Some(CommandOutputFile { path, overwrite }) = output_file {
+        let published = tokio::task::spawn_blocking(move || {
+            let text = entry.output.as_deref().map_err(|error| {
+                anyhow::anyhow!("command {} output is unavailable: {error}", entry.id)
+            })?;
+            crate::transcript::save(&path, text, overwrite)?;
+            Ok::<_, anyhow::Error>(json!({"path": path, "bytes": text.len()}))
+        })
+        .await??;
+        result["output_file"] = published;
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -103,6 +303,7 @@ mod tests {
             pane_name: None,
             label: "background pane".into(),
             read_only: true,
+            capture: None,
             active: false,
             visible: false,
             input: session.input.clone(),
@@ -145,6 +346,7 @@ mod tests {
             .unwrap();
             assert_eq!(list["pane"], all["pane"]);
             assert_eq!(list["connection_generation"], all["connection_generation"]);
+            assert_eq!(list["latest_id"], 4);
             let entries = all["commands"].as_array().unwrap();
             let expected: Vec<_> = ids.into_iter().map(|id: usize| &entries[4 - id]).collect();
             assert_eq!(list["commands"], json!(expected));
@@ -163,8 +365,10 @@ mod tests {
     #[tokio::test]
     async fn metadata_only_listing_and_exact_output_from_read_only_background_pane() {
         let (registry, _session) = pane(concat!(
-            "\x1b]133;B\x07echo 雪\n\x1b]133;C\x07  雪 \"x\"\n\n  end\x1b]133;D;7\x07",
-            "\x1b]133;C\x07\x1b]133;D\x07", // available empty output and unknown exit code
+            "\x1b]7;file://loopback/old%20folder\x07",
+            "\x1b]133;B\x07echo 雪\n\x1b]133;C\x07  雪 \"x\"\n\n  end",
+            "\x1b]7;file://loopback/new\x07\x1b]133;D;7\x07",
+            "\x1b]633;C\x07\x1b]633;D\x07", // available empty output and unknown exit code
             "\x1b]133;D;1\x07",             // no C marker for this output
         ));
         let target = registry.pane(23).unwrap();
@@ -173,28 +377,51 @@ mod tests {
             .await
             .unwrap();
         let generation = before.connection_generation;
+        let first = before.command_history[0].timing;
+        let second = before.command_history[1].timing;
+        let third = before.command_history[2].timing;
+        for timing in [first, second] {
+            assert!(timing.started_unix_ms.is_some());
+            assert!(timing.duration_ms.is_some());
+            assert!(timing.finished_unix_ms > 0);
+        }
+        assert!(third.started_unix_ms.is_none());
+        assert!(third.duration_ms.is_none());
+        assert!(third.finished_unix_ms > 0);
         assert_eq!(
             list,
             json!({
-                "pane":23,"connection_generation":generation,
+                "pane":23,"connection_generation":generation,"latest_id":3,
                 "commands":[
-                    {"id":3,"command":null,"exit_code":1,"output_available":false},
-                    {"id":2,"command":null,"exit_code":null,"output_available":true},
-                    {"id":1,"command":"echo 雪","exit_code":7,"output_available":true}
+                    {"id":3,"command":null,"reported_directory":null,"exit_code":1,"output_available":false,
+                     "started_unix_ms":null,"finished_unix_ms":third.finished_unix_ms,"duration_ms":null},
+                    {"id":2,"command":null,"reported_directory":"file://loopback/new","exit_code":null,"output_available":true,
+                     "started_unix_ms":second.started_unix_ms,"finished_unix_ms":second.finished_unix_ms,"duration_ms":second.duration_ms},
+                    {"id":1,"command":"echo 雪","reported_directory":"file://loopback/old%20folder","exit_code":7,"output_available":true,
+                     "started_unix_ms":first.started_unix_ms,"finished_unix_ms":first.finished_unix_ms,"duration_ms":first.duration_ms}
                 ]
             })
         );
-        for (id, command, code, output, error) in [
+        for (id, command, directory, code, output, error) in [
             (
                 1,
                 Some("echo 雪"),
+                Some("file://loopback/old%20folder"),
                 Some(7),
                 Some("  雪 \"x\"\r\n\r\n  end"),
                 None,
             ),
-            (2, None, None, Some(""), None),
-            (3, None, Some(1), None, Some("No command output marker")),
+            (2, None, Some("file://loopback/new"), None, Some(""), None),
+            (
+                3,
+                None,
+                None,
+                Some(1),
+                None,
+                Some("No command output marker"),
+            ),
         ] {
+            let timing = [first, second, third][id - 1];
             let result = execute(
                 &registry,
                 json!({"verb":"get-command","pane":23,"id":id,"connection_generation":generation}),
@@ -204,7 +431,8 @@ mod tests {
             assert_eq!(
                 result,
                 json!({"pane":23,"id":id,"connection_generation":generation,
-                "command":command,"exit_code":code,"output":output,"output_error":error})
+                "command":command,"reported_directory":directory,"exit_code":code,"output":output,"output_error":error,
+                "started_unix_ms":timing.started_unix_ms,"finished_unix_ms":timing.finished_unix_ms,"duration_ms":timing.duration_ms})
             );
         }
         let after = Registry::capture(&target).await.unwrap().0;
@@ -212,6 +440,153 @@ mod tests {
         assert!(before.same_presentation(&after));
         let pane = registry.pane(23).unwrap();
         assert!(pane.read_only && !pane.active && !pane.visible);
+    }
+
+    #[tokio::test]
+    async fn output_export_preserves_bytes_keeps_existing_files_and_reports_unavailable_output() {
+        let (registry, _session) = pane(concat!(
+            "\x1b]133;C\x07雪\r\n\r\nend\x1b]133;D;7\x07",
+            "\x1b]133;C\x07\x1b]133;D;0\x07",
+            "\x1b]133;D;1\x07",
+        ));
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("captured output.txt");
+        let get = |id, overwrite| {
+            json!({
+                "verb":"get-command","pane":23,"id":id,"connection_generation":0,
+                "output_file":{"path":path,"overwrite":overwrite}
+            })
+        };
+        let bytes = "雪\r\n\r\nend".as_bytes();
+        let saved = execute(&registry, get(1, false)).await.unwrap();
+        assert_eq!(saved["id"], 1);
+        assert_eq!(saved["exit_code"], 7);
+        assert!(saved["output"].is_null());
+        assert_eq!(
+            saved["output_file"],
+            json!({"path":path,"bytes":bytes.len()})
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        assert!(execute(&registry, get(2, false)).await.is_err());
+        assert!(
+            execute(&registry, get(3, true))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("output is unavailable")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let empty = execute(&registry, get(2, true)).await.unwrap();
+        assert_eq!(empty["output_file"]["bytes"], 0);
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);
+
+        let relative = json!({
+            "verb":"wait-command","pane":23,"after_id":3,"connection_generation":0,
+            "output_file":{"path":"relative.txt"}
+        });
+        assert!(
+            execute(&registry, relative)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("path must be absolute")
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_returns_the_first_new_record_and_detects_an_evicted_cursor_gap() {
+        let (registry, _session) = pane(&"\x1b]133;C\x07\x1b]133;D;9\x07".repeat(65));
+        let request = |after_id| {
+            json!({
+                "verb":"wait-command","pane":23,"connection_generation":0,
+                "after_id":after_id,"timeout_seconds":1
+            })
+        };
+        let first = execute(&registry, request(1)).await.unwrap();
+        assert_eq!(first["id"], 2);
+        assert_eq!(first["exit_code"], 9);
+        assert_eq!(
+            execute(&registry, request(0))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "command history is no longer retained immediately after ID 0; get a new cursor with list-commands"
+        );
+        assert!(
+            execute(&registry, request(66))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ahead of this pane")
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_advances_past_seen_nonmatches_but_rejects_an_unseen_gap() {
+        let (registry, session) = pane(concat!(
+            "\x1b]133;B\x07build  Ω\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+            "\x1b]133;B\x07Build Ω\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+            "\x1b]133;C\x07\x1b]133;D;0\x07",
+        ));
+        let target = registry.pane(23).unwrap();
+        let (frame, _) = Registry::capture(&target).await.unwrap();
+        let mut cursor = 0;
+        let text = Some("Build  Ω");
+        assert!(
+            matching_command(&frame, &mut cursor, text)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cursor, 3);
+        session.input.send(Command::SetReadOnly(false)).unwrap();
+        let mut more = "\x1b]133;C\x07\x1b]133;D;0\x07".repeat(63);
+        more.push_str("\x1b]133;B\x07Build  Ω\r\n\x1b]133;C\x07\x1b]133;D;7\x07");
+        session.input.send(Command::Paste(more)).unwrap();
+        let (frame, _) = Registry::capture(&target).await.unwrap();
+        assert_eq!(frame.command_history.front().unwrap().id, cursor + 1);
+        let matched = matching_command(&frame, &mut cursor, text)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.id, 67);
+        assert_eq!(matched.exit_code, Some(7));
+
+        let mut stale_cursor = 2;
+        let error = matching_command(&frame, &mut stale_cursor, text).unwrap_err();
+        assert!(error.to_string().contains("no longer retained"));
+    }
+
+    #[tokio::test]
+    async fn reset_keeps_the_latest_id_for_new_waiters() {
+        let (registry, session) = pane("\x1b]133;D;0\x07\x1bc");
+        let list = execute(&registry, json!({"verb":"list-commands","pane":23}))
+            .await
+            .unwrap();
+        assert_eq!(list["commands"], json!([]));
+        assert_eq!(list["latest_id"], 1);
+        let request = |after_id| {
+            json!({
+                "verb":"wait-command","pane":23,"connection_generation":0,
+                "after_id":after_id,"timeout_seconds":1
+            })
+        };
+        assert!(
+            execute(&registry, request(0))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no longer retained")
+        );
+        session.input.send(Command::SetReadOnly(false)).unwrap();
+        session
+            .input
+            .send(Command::Paste("\x1b]633;C\x07\x1b]633;D;7\x07".into()))
+            .unwrap();
+        let entry = execute(&registry, request(1)).await.unwrap();
+        assert_eq!(entry["id"], 2);
+        assert_eq!(entry["exit_code"], 7);
     }
 
     #[tokio::test]

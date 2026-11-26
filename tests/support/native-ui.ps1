@@ -24,6 +24,7 @@ public static class FixtureMessages {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(
         IntPtr hwnd, uint msg, UIntPtr key, IntPtr detail);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern uint MapVirtualKeyW(uint key, uint mapping);
     public static bool PostKey(IntPtr hwnd, uint msg, uint key) {
         uint detail = 0;
@@ -51,6 +52,23 @@ function Open-PeerTraceReader([string]$Path) {
 function Read-PeerTrace([IO.BinaryReader]$Reader) {
     $Reader.BaseStream.Position = 0
     return ,$Reader.ReadBytes([int]$Reader.BaseStream.Length)
+}
+
+function Close-FixtureApp([Diagnostics.Process]$Process) {
+    try {
+        if ($Process.HasExited) { return }
+        $null = $Process.CloseMainWindow()
+        if ($Process.WaitForExit(5000)) { return }
+        try {
+            $Process.Kill()
+        } catch {
+            # Windows can reject termination after the child has already exited.
+            if (!$Process.WaitForExit(1000)) { throw }
+        }
+        if (!$Process.WaitForExit(5000)) {
+            throw "Fixture process $($Process.Id) did not exit after termination"
+        }
+    } finally { $Process.Dispose() }
 }
 
 # Give the app permission to finish its write while the fixture polls.
@@ -126,6 +144,12 @@ function Control([string[]]$Command) {
     if ($LASTEXITCODE -ne 0 -or -not $reply.ok) { throw "Control request failed: $Command $($reply.error)" }
     return $reply.result
 }
+function Get-PaneCellHeight([int]$Pane) {
+    $geometry = Control @('inspect','--pane',"$Pane")
+    if ($geometry.dpi -gt 0 -and $geometry.rows -gt 0 -and $geometry.pixel_height -gt 0) {
+        $geometry.pixel_height / $geometry.rows
+    }
+}
 function Copy-ModeOpen {
     $dot = ' ' + [char]0xb7 + ' '
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -166,6 +190,94 @@ function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Typ
 function Invoke-Button($Element) {
     $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }
+function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Submenu, [switch]$AllowDisabled, [scriptblock]$Reveal, [switch]$VisibleItem) {
+    $button = [System.Windows.Automation.ControlType]::Button
+    $menu = [System.Windows.Automation.ControlType]::MenuItem
+    try {
+        Invoke-Button (Wait-Until "'$TriggerName' button" {
+            $trigger = Find-Element $TriggerName $button -Visible
+            if ($trigger -and $trigger.Current.IsEnabled) { return $trigger }
+            if ($Reveal) { & $Reveal }
+        })
+    } catch {
+        $trigger = Find-Element $TriggerName $button
+        throw "$_ Trigger=$($trigger.Current.Name) Enabled=$($trigger.Current.IsEnabled) Offscreen=$($trigger.Current.IsOffscreen) Bounds=$($trigger.Current.BoundingRectangle)"
+    }
+    if ($Submenu) {
+        $category = Wait-Until "'$Submenu' submenu" { Find-Element $Submenu $menu -Visible:$VisibleItem }
+        $category.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    }
+    try { Wait-Until "'$Name' in '$TriggerName'" {
+        $item = Find-Element $Name $menu -Visible:$VisibleItem
+        if ($item -and ($AllowDisabled -or $item.Current.IsEnabled)) { $item }
+    } } catch {
+        $item = Find-Element $Name $menu
+        $category = if ($Submenu) { Find-Element $Submenu $menu }
+        $trigger = Find-Element $TriggerName $button
+        throw "$_ Item=$($item.Current.Name) Enabled=$($item.Current.IsEnabled) Offscreen=$($item.Current.IsOffscreen) Bounds=$($item.Current.BoundingRectangle) Submenu=$($category.Current.Name) Menu trigger enabled=$($trigger.Current.IsEnabled)"
+    }
+}
+function Get-SftpFolderAction([string]$Name, [switch]$Comparison, [switch]$AllowDisabled) {
+    $submenu = if ($Comparison) { 'Compare folders' }
+    Get-NativeMenuAction 'More folder actions' $Name -Submenu $submenu -AllowDisabled:$AllowDisabled
+}
+function Invoke-SftpFolderAction([string]$Name, [switch]$Comparison) {
+    Invoke-Button (Get-SftpFolderAction $Name -Comparison:$Comparison)
+}
+function Get-SftpEntryAction([string]$Name, [switch]$AllowDisabled) {
+    Get-NativeMenuAction 'Selected entry actions' $Name -AllowDisabled:$AllowDisabled
+}
+function Invoke-SftpEntryAction([string]$Name) {
+    Invoke-Button (Get-SftpEntryAction $Name)
+}
+function Invoke-NativeMenuAction([string]$Trigger, [string]$Name) {
+    Invoke-Button (Get-NativeMenuAction $Trigger $Name)
+}
+function Get-ScrollableMenuAction([string]$TriggerName, [string]$Name, [switch]$VisibleItem) {
+    $button = [System.Windows.Automation.ControlType]::Button
+    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    $search = @{ scroll = $null }
+    Get-NativeMenuAction $TriggerName $Name -VisibleItem:$VisibleItem -Reveal {
+        $trigger = Find-Element $TriggerName $button
+        if (!$trigger -or !$trigger.Current.IsEnabled -or !$trigger.Current.IsOffscreen) { return }
+        if ($search.scroll) {
+            if ($search.scroll.Current.VerticalScrollPercent -lt 100) {
+                $search.scroll.Scroll([System.Windows.Automation.ScrollAmount]::NoAmount,
+                    [System.Windows.Automation.ScrollAmount]::SmallIncrement)
+            }
+            return
+        }
+        $parent = $walker.GetParent($trigger)
+        while ($parent -and $parent.Current.ProcessId -eq $app.Id) {
+            $pattern = $null
+            if ($parent.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$pattern) -and
+                $pattern.Current.VerticallyScrollable) {
+                $search.scroll = $pattern
+                $pattern.SetScrollPercent(-1, 0)
+                return
+            }
+            $parent = $walker.GetParent($parent)
+        }
+        throw "'$TriggerName' is offscreen without a scrollable ancestor"
+    }
+}
+function Get-RunAction([string]$Name) {
+    Get-ScrollableMenuAction 'Run actions' $Name
+}
+function Invoke-RunAction([string]$Name) {
+    Invoke-Button (Get-RunAction $Name)
+    $menu = [System.Windows.Automation.ControlType]::MenuItem
+    $alwaysPresent = 'Compare results' + [char]0x2026
+    $null = Wait-Until "the run actions flyout closes after '$Name'" {
+        !(Find-Element $alwaysPresent $menu -Visible)
+    }
+}
+function Close-NativeMenu([string]$ItemName) {
+    $null = Press-FocusedKey 27
+    $null = Wait-Until 'menu closes after Escape' {
+        !(Find-Element $ItemName ([System.Windows.Automation.ControlType]::MenuItem) -Visible)
+    }
+}
 function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$State) {
     Wait-Until "enabled checkbox '$Name' in state $State" {
         $element = Find-Element $Name ([System.Windows.Automation.ControlType]::CheckBox)
@@ -174,6 +286,57 @@ function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$St
             if ($pattern.Current.ToggleState -eq $State) { $pattern }
         }
     }
+}
+function Get-NativeExpander([string]$Name) {
+    $label = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+    $expandable = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty, $true)
+    $query = [System.Windows.Automation.AndCondition]::new($label, $expandable)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $query)
+    if ($element -and $element.Current.IsEnabled) {
+        $element.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    }
+}
+function Set-NativeExpansion([string]$Name, [bool]$Expanded) {
+    $expected = if ($Expanded) { 'Expanded' } else { 'Collapsed' }
+    $null = Wait-Until "'$Name' is $expected" {
+        $options = Get-NativeExpander $Name
+        if (!$options) { return }
+        $state = $options.Current.ExpandCollapseState
+        if ($state -eq $expected) { return $true }
+        if ($Expanded) { $options.Expand() } else { $options.Collapse() }
+    }
+}
+function Get-TransferDetailLabels {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $kind = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $kind)) {
+        $item.Current.Name
+    }
+}
+function Test-TransferDestination([string]$Path) {
+    $prefix = 'Windows ' + [char]0xb7 + ' '
+    foreach ($name in Get-TransferDetailLabels) {
+        if ($name.StartsWith($prefix, [StringComparison]::Ordinal) -and
+            [FixtureDialog]::SameDestination($Path, $name.Substring($prefix.Length))) {
+            return $true
+        }
+    }
+}
+function Get-SftpOptionsExpander {
+    Get-NativeExpander 'File options'
+}
+function Set-SftpOptionsExpansion([bool]$Expanded) {
+    Set-NativeExpansion 'File options' $Expanded
+}
+function Enable-SftpFileOption([string]$Name) {
+    Set-SftpOptionsExpansion $true
+    (Wait-CheckBox $Name ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox $Name ([System.Windows.Automation.ToggleState]::On)
+    Set-SftpOptionsExpansion $false
 }
 function Post-Key([uint32]$Message, [uint32]$Key) {
     # Address this process's window. This never types into the foreground application.
@@ -184,6 +347,27 @@ function Post-Key([uint32]$Message, [uint32]$Key) {
 function Press-Key([uint32]$Key) {
     Post-Key 0x100 $Key
     Post-Key 0x101 $Key
+}
+function Wait-SftpSearchFocus([string]$Description = 'focused recursive filename field') {
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    try {
+        Wait-Until $Description {
+            $field = Find-Element 'Filename contains' $edit
+            if ($field -and $field.Current.HasKeyboardFocus) { $field }
+        }
+    } catch {
+        $failure = $_
+        $field = Find-Element 'Filename contains' $edit
+        $state = if ($field) {
+            "enabled=$($field.Current.IsEnabled), offscreen=$($field.Current.IsOffscreen), bounds=$($field.Current.BoundingRectangle)"
+        } else { 'field not found' }
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        $focus = if ($focused -and $focused.Current.ProcessId -eq $app.Id) {
+            "$($focused.Current.ClassName) '$($focused.Current.Name)'"
+        } else { 'outside the fixture window' }
+        $search = $null -ne (Find-Element 'SFTP search actions')
+        throw "$($failure.Exception.Message). Search visible to UIA=$search. Field: $state. Focus: $focus"
+    }
 }
 function Press-FocusedKey([uint32]$Key) {
     # WinUI routes ordinary typing through the focused child HWND. Inspect the

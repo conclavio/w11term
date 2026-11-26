@@ -16,7 +16,7 @@ $upload = 'Upload folder' + [char]0x2026
 $release = 'release ' + [char]0x96ea
 
 function Pick-Folder([string]$Folder) {
-    Click $upload
+    Invoke-SftpFolderAction $upload
     $dialog = Wait-Until 'owned upload folder picker' { Find-OwnedDialog 'Choose a folder to upload' }
     Select-DialogItem $dialog $Folder
     $null = Wait-Until 'accept exact selected source folder' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -37,7 +37,10 @@ try {
             [int]$entry.Groups[1].Value
         }
     }
-    Click 'Cancel transfer'
+    Invoke-Button (Wait-Until 'visible cancel action in the drawer footer' {
+        $cancel = Find-Element 'Cancel transfer' $button -Visible
+        if ($cancel -and $cancel.Current.IsEnabled) { $cancel }
+    })
     $null = Wait-Until 'cancel accepted before the write reply' {
         $cancel = Find-Element 'Cancel transfer' $button
         $cancel -and !$cancel.Current.IsEnabled
@@ -45,13 +48,11 @@ try {
     [IO.File]::Delete($writeGate)
     Wait-Status "^Cancelled upload of /shell directory/interrupted \(0 files completed, $($offset * 2) bytes acknowledged\)\. The remote folder may be incomplete\.$"
 
-    (Wait-CheckBox 'Preserve upload timestamps' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Preserve upload timestamps' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Preserve upload timestamps'
     Pick-Folder $release
     Wait-Status "^Uploaded folder /shell directory/$release \(2 files, 3 folders, 6 bytes, 1 skipped\)\.$"
     $null = Wait-Until 'refreshed directory lists uploaded root' { Find-Element "$release/" $button }
-    (Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
-    $null = Wait-CheckBox 'Replace existing files' ([System.Windows.Automation.ToggleState]::On)
+    Enable-SftpFileOption 'Replace existing files'
     Pick-Folder $release
     Wait-Status "^Could not upload folder /shell directory/$release.*already exists"
 

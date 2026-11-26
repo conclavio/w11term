@@ -61,7 +61,22 @@ function Wait-CommandDraft([string]$Text) {
         ) -and $provider.Current.Value -ceq $Text
     }
 }
+function Set-GroupReadiness([bool]$Required) {
+    $label = 'Require all recipients ready'
+    $before, $after = if ($Required) { 'Off','On' } else { 'On','Off' }
+    Set-NativeExpansion 'Dispatch settings' $true
+    (Wait-CheckBox $label $before).Toggle()
+    $null = Wait-CheckBox $label $after
+    Set-NativeExpansion 'Dispatch settings' $false
+}
 function Submit([string]$Text, [string]$ButtonName) {
+    # Observe the invalid draft first so an enabled control belongs to the new
+    # command after the queued UI Automation text edit reaches the app.
+    (Command-Editor).SetValue('')
+    $null = Wait-Until "disabled $ButtonName for an empty draft" {
+        $entry = Find-Element $ButtonName $button
+        $entry -and !$entry.Current.IsEnabled
+    }
     (Command-Editor).SetValue($Text)
     Invoke-Button (Wait-Until "enabled $ButtonName" {
         $entry = Find-Element $ButtonName $button
@@ -211,6 +226,21 @@ try {
     $groupTab = ($owner.groups | Where-Object label -ceq 'SSH host group').tab_id
     if (!$groupWindow -or !$groupTab) { throw 'The CLI did not list the active SSH group' }
     $readyArgs = @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab")
+    $null = Wait-Until 'send and its menus share the command row above the host filter' {
+        $command = Find-Element 'Group command' $edit -Visible
+        $filter = Find-Element 'Host filter' $edit -Visible
+        $libraryMenu = Find-Element 'Command library' $button -Visible
+        $send = Find-Element 'Send to 0 hosts' $button -Visible
+        $sendOptions = Find-Element 'Send options' $button -Visible
+        if (!$command -or !$filter -or !$libraryMenu -or !$send -or !$sendOptions) { return }
+        $entryBounds = $command.Current.BoundingRectangle
+        $libraryBounds = $libraryMenu.Current.BoundingRectangle
+        $sendBounds = $send.Current.BoundingRectangle
+        $optionsBounds = $sendOptions.Current.BoundingRectangle
+        $entryBounds.Right -le $libraryBounds.Left -and $libraryBounds.Right -le $sendBounds.Left -and
+            $sendBounds.Right -le $optionsBounds.Left -and $entryBounds.Top -lt $optionsBounds.Bottom -and
+            $optionsBounds.Top -lt $entryBounds.Bottom -and $optionsBounds.Bottom -lt $filter.Current.BoundingRectangle.Top
+    }
     $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Connecting'
     $null = Wait-Until 'the connecting filter isolates West during its shell request' {
@@ -268,7 +298,7 @@ try {
     (Command-Editor).SetValue('one')
     $alertedSend = 'Send with alert' + [char]0x2026
     $alertSearch = 'Search for the output alert'
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     $null = Wait-Until 'an empty alert rule cannot send the command' {
         $confirm = Find-Element 'Send with alert' $button
         $confirm -and !$confirm.Current.IsEnabled
@@ -284,7 +314,7 @@ try {
     $null = Wait-Until 'cancelling the alert review preserves the unsent draft' {
         (Find-Element 'Send to 1 host' $button) -and !(Find-Element "Submitted${dot}one")
     }
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     $savedAlertRules = 'Saved alert rules' + [char]0x2026
     $ruleName = 'Fast success'
     $ruleQuery = '^east-accepted one$'
@@ -310,9 +340,9 @@ try {
     $null = Wait-Until 'cancel the recorded alert' { [FixtureDialog]::ClickButton($dialog, 2) }
     $null = Wait-Until 'cancelling the file picker keeps the command unsent' {
         !(Find-OwnedDialog 'Record SSH group output') -and
-            (Find-Element $alertedSend $button) -and !(Find-Element "Submitted${dot}one")
+            (Find-Element 'Send options' $button) -and !(Find-Element "Submitted${dot}one")
     }
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     Click $savedAlertRules
     Click "Use alert rule $ruleName"
     $null = Wait-Until 'loading the saved rule restores the exact review query' {
@@ -346,11 +376,10 @@ try {
     }
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
-    $showLastOutput = 'Show last command output'
     $openEastOutput = "Open last command for pane $east"
     $openWestOutput = "Open last command for pane $west"
     if (Find-Element $openEastOutput $button) { throw 'The roster output preview was on by default' }
-    (Wait-CheckBox $showLastOutput Off).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Show last command output'
     $null = Wait-Until 'the checked preview shows the last completed output on East' {
         Find-Element "Pane $east${dot}Last command${dot}Exit 0${dot}east-accepted one"
     }
@@ -359,7 +388,7 @@ try {
         Find-Element "Selected, one${dot}exit 0" $button
     }
     Run-Palette 'SSH host group'
-    (Wait-CheckBox $showLastOutput On).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Hide last command output'
     $null = Wait-Until 'turning off the preview hides the history shortcut' {
         !(Find-Element $openEastOutput $button)
     }
@@ -376,11 +405,12 @@ try {
     Outcome $westName 'Sent to SSH channel'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Running'
-    Click 'Notify when run finishes'
-    Click 'Cancel run notification'
-    Click 'Notify when run finishes'
+    Invoke-RunAction 'Notify when run finishes'
+    Invoke-RunAction 'Cancel run notification'
+    $null = Wait-Until 'canceling disarms the notification' { !(Find-Element 'Run notification armed') }
+    Invoke-RunAction 'Notify when run finishes'
     $null = Wait-Until 'the current run is armed for completion' {
-        Find-Element 'Cancel run notification' $button
+        Find-Element 'Run notification armed'
     }
     $runningPrefix = [regex]::Escape("$westName${dot}Running for ")
     $null = Wait-Until 'the held West result reports live elapsed time' {
@@ -671,7 +701,7 @@ try {
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
     $readyButton = 'Select only ready shown'
     $null = Wait-Until 'only one selected host is ready' { Find-Element '1 of 2 selected hosts ready' }
-    Click $readyButton
+    Invoke-NativeMenuAction 'Roster actions' $readyButton
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName Off
     $null = Wait-Until 'the ready selection matches the send scope' {
@@ -684,7 +714,7 @@ try {
         (Find-Element '1 selected host is hidden by the filter.') -and
             (Find-Element '0 of 1 selected host ready')
     }
-    Click $readyButton
+    Invoke-NativeMenuAction 'Roster actions' $readyButton
     $null = Wait-CheckBox $westName Off
     Set-HostFilter ''
     $null = Wait-CheckBox $eastName On
@@ -701,7 +731,7 @@ try {
     $hostList = "test@127.0.0.1:$($profileData.East.port)`n"
     $hostListDestination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-hosts.txt'
     $saveHostList = 'Save host list' + [char]0x2026
-    Click ('Export host list' + [char]0x2026)
+    Invoke-NativeMenuAction 'Roster actions' ('Export host list' + [char]0x2026)
     $null = Wait-Until 'the checked host list preview' { Find-Element 'SSH host list preview' }
     Click 'Copy host list'
     $null = Wait-Until 'only the shown checked East address is copied' {
@@ -726,7 +756,7 @@ try {
     $null = Wait-Until 'the full East output is retained' { Find-Element "View output for pane $east" $button }
     Set-RecipientSearch 'east'
     Expect-ResultOrder @($east)
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'the current report contains full output and both host outcomes' {
         $report = Read-ClipboardFixture
         $report -and $report.StartsWith("Submitted${dot}while-slow") -and
@@ -739,12 +769,12 @@ try {
     Click 'Clear recipient search'
     $saveResults = 'Save results' + [char]0x2026
     $destination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3.txt'
-    Click $saveResults
+    Invoke-RunAction $saveResults
     $dialog = Wait-Until 'owned group results save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
     $null = Wait-Until 'cancel the group results export' { [FixtureDialog]::ClickButton($dialog, 2) }
     $null = Wait-Until 'group results dialog closes after cancel' { !(Find-OwnedDialog 'Save SSH group results as text') }
     if ([IO.File]::Exists($destination)) { throw 'Cancelling the save published a report' }
-    Click $saveResults
+    Invoke-RunAction $saveResults
     $dialog = Wait-Until 'owned group results save dialog reopens' { Find-OwnedDialog 'Save SSH group results as text' }
     $null = Wait-Until 'save the group results report' { [FixtureDialog]::ClickButton($dialog, 1) }
     $savedStatus = Wait-Until 'report was saved with its submission name' {
@@ -776,7 +806,7 @@ try {
             (Find-Element "Added line 1${dot}east-accepted while-slow")
     }
     Click 'Back to results'
-    Click ('Compare runs' + [char]0x2026)
+    Invoke-RunAction ('Compare runs' + [char]0x2026)
     $null = Wait-Until 'group run comparison opens' { Find-Element 'SSH group run comparison' }
     Select-ComboValue 'Earlier group run' "Run 1${dot}one"
     Click 'Compare runs'
@@ -874,7 +904,7 @@ try {
         (Find-Element "Focus result pane $east" $button) -and !(Find-Element "Focus result pane $west" $button)
     }
     $jsonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'group results.json'
-    Click ('Save results as JSON' + [char]0x2026)
+    Invoke-RunAction ('Save results as JSON' + [char]0x2026)
     $dialog = Wait-Until 'owned group JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
     $null = Wait-Until 'enter the JSON destination' {
         [FixtureDialog]::SetFilename($dialog, $jsonPath, 'ssh-group-submission-3.json')
@@ -910,18 +940,24 @@ try {
         throw 'The full report was marked as a subset'
     }
     Set-RecipientSearch 'west'
-    $null = Wait-Until 'an empty result filter has no shown export' {
-        (Find-Element 'Showing 0 of 2 recipients') -and !(Find-Element 'Copy shown results' $button)
+    $null = Wait-Until 'the result filter leaves no recipients' {
+        Find-Element 'Showing 0 of 2 recipients'
     }
+    $null = Get-RunAction 'Copy results'
+    if (Find-Element 'Copy shown results' ([System.Windows.Automation.ControlType]::MenuItem) -Visible) {
+        throw 'An empty result filter offered to copy shown results'
+    }
+    Close-NativeMenu 'Copy results'
     Click 'Clear recipient search'
-    Click 'Copy shown results'
+    Invoke-RunAction 'Copy shown results'
     $shownText = Wait-Until 'clipboard holds only the successful result' {
         $report = Read-ClipboardFixture
         if ($report -and $report.Contains("Shown results${dot}1 of 2 recipients") -and
             $report.Contains("$eastName${dot}Sent to SSH channel") -and
             $report.Contains('east-report-tail') -and !$report.Contains($westName)) { $report }
     }
-    Click ('Save shown results' + [char]0x2026)
+    $null = Wait-Until 'shown results copy is published' { Find-Element 'Copied shown results' }
+    Invoke-RunAction ('Save shown results' + [char]0x2026)
     $dialog = Wait-Until 'shown group text Save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
     $null = Wait-Until 'save the shown group text report' { [FixtureDialog]::ClickButton($dialog, 1) }
     $shownTextPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.txt'
@@ -929,7 +965,7 @@ try {
         [IO.File]::Exists($shownTextPath) -and
             [IO.File]::ReadAllText($shownTextPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $shownText
     }
-    Click ('Save shown results as JSON' + [char]0x2026)
+    Invoke-RunAction ('Save shown results as JSON' + [char]0x2026)
     $dialog = Wait-Until 'shown group JSON Save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
     $null = Wait-Until 'save the shown group JSON report' { [FixtureDialog]::ClickButton($dialog, 1) }
     $shownJsonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.json'
@@ -983,7 +1019,7 @@ try {
     $null = Wait-CheckBox $westName On
     Outcome $westName 'Running'
     $compareButton = 'Compare results' + [char]0x2026
-    Click $compareButton
+    Invoke-RunAction $compareButton
     $null = Wait-Until 'the comparison separates the still-running host' {
         (Find-Element 'SSH group result comparison') -and
         (Find-Element "1 distinct result${dot}1 host compared${dot}1 pending or unavailable") -and
@@ -1122,7 +1158,7 @@ try {
     $null = Wait-Until 'show only the failed result' {
         (Find-Element "Focus result pane $west" $button) -and !(Find-Element "Focus result pane $east" $button)
     }
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'the earlier report contains its own outputs and exit statuses' {
         $report = Read-ClipboardFixture
         $report -and $report.StartsWith("Submitted${dot}both") -and
@@ -1184,7 +1220,7 @@ try {
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Alternate screen"
     Expect-ResultOrder @($east, $west)
-    (Wait-CheckBox $showLastOutput Off).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Show last command output'
     $null = Wait-Until 'the alternate-screen host has no roster preview' {
         (Find-Element $openEastOutput $button) -and !(Find-Element $openWestOutput $button)
     }
@@ -1195,7 +1231,7 @@ try {
     $null = Wait-Until 'the roster summarizes both ready and alternate-screen hosts' {
         Find-Element "2 matching hosts${dot}Ready (1)${dot}Alternate screen (1)"
     }
-    Click $copyRoster
+    Invoke-NativeMenuAction 'Roster actions' $copyRoster
     $null = Wait-Until 'the copied roster includes both the ready and unchecked alternate-screen host' {
         $report = Read-ClipboardFixture
         (Find-Element 'Copied roster with 2 hosts') -and $report -and
@@ -1238,10 +1274,12 @@ try {
     }
     Set-HostFilter 'east'
     $null = Wait-Until 'the text filter still applies inside the selected host state' {
-        $copy = Find-Element $copyRoster $button
-        (Find-Element 'No SSH panes match this filter.') -and $copy -and !$copy.Current.IsEnabled -and
+        (Find-Element 'No SSH panes match this filter.') -and
             (Find-Element "Showing 0 of 1 matching host${dot}Ready (1)")
     }
+    $copyItem = Get-NativeMenuAction 'Roster actions' $copyRoster -AllowDisabled
+    if ($copyItem.Current.IsEnabled) { throw 'Copy shown roster is available with no shown hosts' }
+    Close-NativeMenu $copyRoster
     Set-HostFilter ''
     $null = Wait-CheckBox $westName On
     $null = Wait-Until 'West is shown with its original check but cannot receive a command' {
@@ -1297,7 +1335,7 @@ try {
         (Find-Element "Pane $west${dot}Reconnecting${dot}attempt 1") -and
             !(Find-Element "Focus pane $east" $button) -and !(Find-Element "Reconnect SSH pane $west" $button)
     }
-    Click $copyRoster
+    Invoke-NativeMenuAction 'Roster actions' $copyRoster
     $null = Wait-Until 'the roster report carries the automatic retry' {
         $report = Read-ClipboardFixture
         $report -and $report.Contains("$westName${dot}Reconnecting${dot}attempt 1") -and !$report.Contains($eastName)
@@ -1312,16 +1350,16 @@ try {
     Submit 'while-reconnecting' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Prompt unverified"
-    $requireReady = 'Require all recipients ready'
     $sendRecordedOption = 'Send and record' + [char]0x2026
-    (Wait-CheckBox $requireReady Off).Toggle()
+    Set-GroupReadiness $true
     (Command-Editor).SetValue('after-reconnect')
-    $null = Wait-Until 'both send actions wait for the unverified checked host' {
+    $null = Wait-Until 'send waits for the unverified checked host' {
         $send = Find-Element 'Send to 2 hosts' $button
-        $record = Find-Element $sendRecordedOption $button
-        $send -and !$send.Current.IsEnabled -and $record -and !$record.Current.IsEnabled -and
-            (Find-Element "1 of 2 selected hosts ready${dot}waiting for all")
+        $send -and !$send.Current.IsEnabled -and (Find-Element "1 of 2 selected hosts ready$($dot)waiting for all")
     }
+    $record = Get-NativeMenuAction 'Send options' $sendRecordedOption -AllowDisabled
+    if ($record.Current.IsEnabled) { throw 'Recording bypassed the readiness requirement' }
+    Close-NativeMenu $sendRecordedOption
     Set-HostFilter 'east'
     $null = Wait-Until 'strict readiness respects the visible recipient scope' {
         $send = Find-Element 'Send to 1 host' $button
@@ -1334,11 +1372,12 @@ try {
     }
     Send-Raw $west 'prompt'
     Pane-Status $west "Connected${dot}Ready"
-    $null = Wait-Until 'both send actions become available when both prompts are fresh' {
+    $null = Wait-Until 'send becomes available when both prompts are fresh' {
         $send = Find-Element 'Send to 2 hosts' $button
-        $record = Find-Element $sendRecordedOption $button
-        $send -and $send.Current.IsEnabled -and $record -and $record.Current.IsEnabled
+        $send -and $send.Current.IsEnabled
     }
+    $null = Get-NativeMenuAction 'Send options' $sendRecordedOption
+    Close-NativeMenu $sendRecordedOption
     if (Find-Element "Submitted${dot}after-reconnect") { throw 'The ready check sent the draft automatically' }
     Submit 'after-reconnect' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
@@ -1346,8 +1385,8 @@ try {
     $null = Wait-Until 'the roster preview uses the replacement SSH connection output' {
         Find-Element "Pane $west${dot}Last command${dot}Exit 17${dot}west-accepted after-reconnect"
     }
-    (Wait-CheckBox $showLastOutput On).Toggle()
-    (Wait-CheckBox $requireReady On).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Hide last command output'
+    Set-GroupReadiness $false
     $null = Wait-Until 'finished results cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
@@ -1430,19 +1469,23 @@ try {
         Find-Element '1 selected host is hidden by the filter.'
     }
     (Command-Editor).SetValue('unsent notes')
-    Click 'Load command'
+    Invoke-RunAction 'Load command'
     Wait-CommandDraft 'after-reconnect'
     Click 'Restore draft'
     Wait-CommandDraft 'unsent notes'
-    Click 'Load command'
+    Invoke-RunAction 'Load command'
     Wait-CommandDraft 'after-reconnect'
     Submit 'after-reconnect-review' 'Send to 1 host'
     Outcome $westName 'Exit 17'
     $null = Wait-Until 'submission clears the restore action' { !(Find-Element 'Restore draft' $button) }
     (Command-Editor).SetValue('draft before library')
+    $null = Wait-Until 'the edited draft has reached the command toolbar' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and $send.Current.IsEnabled
+    }
     $libraryButton = 'Saved commands' + [char]0x2026
     $saved = "Load group command${dot}Fleet health"
-    Click $libraryButton
+    Invoke-NativeMenuAction 'Command library' $libraryButton
     $librarySearch = Wait-Until 'the group library opens with its saved command results' {
         $entry = Find-Element 'Search saved commands' $edit
         $provider = $null
@@ -1460,7 +1503,7 @@ try {
     Click $saved
     Click ("This saved command changed. Open the palette again.  " + [char]0xb7 + '  Dismiss')
     if ((Command-Editor).Current.Value -cne 'draft before library') { throw 'A stale saved command replaced the draft' }
-    Click $libraryButton
+    Invoke-NativeMenuAction 'Command library' $libraryButton
     Click $saved
     Wait-CommandDraft 'show  fleet-health'
     Click 'Restore draft'
@@ -1472,7 +1515,7 @@ try {
     Outcome $westName 'Exit 17'
     $saveButton = 'Save as command' + [char]0x2026
     (Command-Editor).SetValue('snapshot  status')
-    Click $saveButton
+    Invoke-NativeMenuAction 'Command library' $saveButton
     (Command-Editor 'Saved command name').SetValue('Discarded name')
     Click 'Cancel saving command'
     $null = Wait-Until 'canceled naming form is gone' { !(Find-Element 'Saved command name' $edit) }
@@ -1481,7 +1524,7 @@ try {
         (Command-Editor).Current.Value -cne 'snapshot  status') {
         throw 'Canceling save changed the draft or command library'
     }
-    Click $saveButton
+    Invoke-NativeMenuAction 'Command library' $saveButton
     $null = Wait-Until 'save form shows the exact captured draft' { Find-Element 'snapshot  status' }
     (Command-Editor).SetValue('new unsent notes')
     (Command-Editor 'Saved command name').SetValue('Fleet health')
@@ -1497,7 +1540,7 @@ try {
         (Command-Editor).Current.Value -cne 'new unsent notes') {
         throw 'Saving did not preserve the captured command, existing entry, and current draft'
     }
-    Click $libraryButton
+    Invoke-NativeMenuAction 'Command library' $libraryButton
     Click "Load group command${dot}Fleet snapshot"
     Wait-CommandDraft 'snapshot  status'
     Click 'Send to 1 host'
@@ -1546,7 +1589,7 @@ try {
         (Find-Element $failureReason) -and (Find-Element "Reconnect SSH pane $west" $button) -and
             !(Find-Element "Focus pane $east" $button)
     }
-    Click $copyRoster
+    Invoke-NativeMenuAction 'Roster actions' $copyRoster
     $null = Wait-Until 'the copied roster includes the failed connection state' {
         $report = Read-ClipboardFixture
         $report -and $report.Contains("$westName${dot}Connection failed${dot}reconnect available")
@@ -1592,7 +1635,7 @@ try {
     Submit 'shared-status' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Exit 0'
-    Click $compareButton
+    Invoke-RunAction $compareButton
     $null = Wait-Until 'identical complete results from both hosts share one group' {
         (Find-Element "1 distinct result${dot}2 hosts compared${dot}0 pending or unavailable") -and
         (Find-Element 'fleet-status-ok') -and (Find-Element "Focus compared pane $east" $button) -and
@@ -1600,7 +1643,7 @@ try {
     }
     Click 'Back to results'
     Set-HostFilter 'west'
-    Click $compareButton
+    Invoke-RunAction $compareButton
     $firstComparedPane = [Math]::Min($east, $west)
     Click "Prepare follow-up for result group starting at pane $firstComparedPane${dot}Prepare follow-up (1 of 2 hosts in roster)"
     Wait-CommandDraft 'shared-status'
@@ -1616,7 +1659,7 @@ try {
     $recent = 'Search recent group commands'
     (Command-Editor).SetValue('unsent recent witness')
     Set-HostFilter 'west'
-    Click ('Recent commands' + [char]0x2026)
+    Invoke-NativeMenuAction 'Command library' ('Recent commands' + [char]0x2026)
     (Command-Editor $recent).SetValue('never-submitted-witness')
     $null = Wait-Until 'recent search reports no matches' { Find-Element 'No matching recent commands' }
     Press-Key 27
@@ -1650,13 +1693,13 @@ try {
     Set-HostFilter ''
     $sendRecorded = 'Send and record' + [char]0x2026
     (Command-Editor).SetValue('record-fast')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'record-before-send file picker' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'cancel recording before dispatch' { [FixtureDialog]::ClickButton($dialog, 2) }
     $null = Wait-Until 'file picker closes without a recorded submission' { !(Find-OwnedDialog 'Record SSH group output') }
     if (Find-Element "Submitted$($dot)record-fast") { throw 'Cancelling the picker sent the command' }
     $previousLogs = @(Get-ChildItem -LiteralPath $env:W11TERM_EXPORT_SMOKE_DIR -Filter 'ssh-group-output-*.txt')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'second record-before-send file picker' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'accept recording before dispatch' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'submission is attached to its recording' { Find-Element "Submitted$($dot)record-fast" }
@@ -1880,7 +1923,7 @@ try {
 
     $beforeCollision = [IO.File]::ReadAllText($burstPath)
     (Command-Editor).SetValue('never-send-on-collision')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'recording file picker for collision' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'choose the existing capture' { [FixtureDialog]::SetFilename($dialog, $burstPath, $nextName) }
     $null = Wait-Until 'confirm the existing name in the picker' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -1892,12 +1935,12 @@ try {
         }
     }
     if ([IO.File]::ReadAllText($burstPath) -cne $beforeCollision) { throw 'The existing recording was modified' }
-    (Wait-CheckBox $requireReady Off).Toggle()
+    Set-GroupReadiness $true
     Select-ComboValue $hostStateFilter 'Ready'
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     (Command-Editor).SetValue('never-send-with-stale-prompt')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'file picker before a host changes prompt state' { Find-OwnedDialog 'Record SSH group output' }
     Send-Raw $west 'alt'
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','alternate-proof')
@@ -1909,10 +1952,10 @@ try {
         throw 'A stale review was presented as a recorded submission'
     }
     Select-ComboValue $hostStateFilter 'All host states'
-    (Wait-CheckBox $requireReady On).Toggle()
+    Set-GroupReadiness $false
     Pane-Status $west "Connected$($dot)Alternate screen"
     (Command-Editor).SetValue('record-one')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'file picker for a group with an unavailable host' { Find-OwnedDialog 'Record SSH group output' }
     $withheldPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'withheld.txt'
     $null = Wait-Until 'enter the filename for the partially delivered submission' {
@@ -1933,7 +1976,7 @@ try {
         Find-Element 'Send to 1 host' $button
     }
     (Command-Editor).SetValue('check-expected')
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     (Command-Editor $alertSearch).SetValue('ready marker')
     (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()
     $null = Wait-CheckBox 'Alert if expected output is missing' On
@@ -1954,7 +1997,7 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     (Command-Editor).SetValue('check-each-host')
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     $expectedLine = 'east-accepted check-each-host'
     (Command-Editor $alertSearch).SetValue($expectedLine)
     (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()
@@ -1987,14 +2030,15 @@ try {
             !(Find-Element "Expected output missing${dot}$eastName") -and
             (Find-Element 'Attention inbox, 0 unread' $button)
     }
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'the text report includes the expected output check and both outcomes' {
         $text = Read-ClipboardFixture
         $text -and $text.Contains("Expected output${dot}$expectedLine") -and
             $text.Contains("  Expected output matched`r`n") -and $text.Contains("  Expected output missing`r`n")
     }
+    $null = Wait-Until 'the full results copy is published' { Find-Element 'Copied results' }
     $expectedJson = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'output check.json'
-    Click ('Save results as JSON' + [char]0x2026)
+    Invoke-RunAction ('Save results as JSON' + [char]0x2026)
     $dialog = Wait-Until 'owned expected output JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
     $null = Wait-Until 'enter the expected output JSON destination' {
         [FixtureDialog]::SetFilename($dialog, $expectedJson, "ssh-group-submission-$everyHostRun.json")

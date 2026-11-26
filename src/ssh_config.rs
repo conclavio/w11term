@@ -1,7 +1,11 @@
 //! Import a selected OpenSSH client configuration into editable native profiles.
-use crate::options::{Authentication, JumpHost, MAX_JUMPS, SshOptions, validate_host_key_alias};
+use crate::options::{
+    AgentFingerprint, AgentPipe, Authentication, JumpHost, MAX_JUMPS, SshKeepalive, SshOptions,
+    validate_host_key_alias,
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
@@ -22,6 +26,7 @@ pub struct ImportedAlias {
 }
 
 mod forwards;
+mod identity;
 mod includes;
 
 pub fn import_file(path: &Path) -> Result<ImportReport> {
@@ -96,6 +101,7 @@ impl Parsed {
             sections: self.sections,
             home,
             user,
+            identity_fingerprints: RefCell::default(),
         };
         let aliases = self
             .aliases
@@ -292,7 +298,14 @@ struct Config<'a> {
     sections: Vec<Section>,
     home: &'a Path,
     user: &'a str,
+    identity_fingerprints: RefCell<BTreeMap<PathBuf, Result<Option<AgentFingerprint>, String>>>,
 }
+
+struct CredentialFile {
+    path: PathBuf,
+    source: Location,
+}
+
 impl Config<'_> {
     fn resolve(&self, alias: &str, warnings: &mut BTreeSet<String>) -> Result<SshOptions> {
         let mut route = Vec::new();
@@ -358,6 +371,7 @@ impl Config<'_> {
     ) -> Result<(JumpHost, Option<(String, Location)>)> {
         let mut scalars = BTreeMap::new();
         let mut identities = Vec::new();
+        let mut certificates = Vec::new();
         let mut proxy = None;
         for section in &self.sections {
             match &section.scope {
@@ -392,10 +406,19 @@ impl Config<'_> {
             for d in &section.directives {
                 let key = d.key.as_str();
                 match key {
-                    "hostname" | "hostkeyalias" | "user" | "port" | "identitiesonly" => {
+                    "hostname"
+                    | "hostkeyalias"
+                    | "user"
+                    | "port"
+                    | "identitiesonly"
+                    | "identityagent"
+                    | "serveraliveinterval"
+                    | "connecttimeout"
+                    | "serveralivecountmax" => {
                         scalars.entry(key).or_insert(d);
                     }
                     "identityfile" => identities.push(d),
+                    "certificatefile" => certificates.push(d),
                     "addressfamily" => warn(warnings, || {
                         format!(
                             "Host {}, {}: the SSH connection does not import AddressFamily. Local forward presets are checked separately.",
@@ -452,6 +475,29 @@ impl Config<'_> {
             Some(p) => p,
             None => configured(scalars.get("port").copied(), "22", parse_port)?,
         };
+        let interval = scalars.get("serveraliveinterval").copied();
+        let max_unanswered = scalars.get("serveralivecountmax").copied();
+        let keepalive = if interval.is_none() && max_unanswered.is_none() {
+            SshKeepalive::default()
+        } else {
+            // When an alias supplies a keepalive directive, use OpenSSH's
+            // complementary default for any directive it leaves unspecified.
+            SshKeepalive {
+                interval_seconds: configured(interval, "0", parse_time_seconds)?,
+                max_unanswered: configured(max_unanswered, "3", |value| {
+                    value
+                        .parse()
+                        .context("ServerAliveCountMax must be a positive whole number")
+                })?,
+            }
+        };
+        let connect_timeout_seconds =
+            configured(scalars.get("connecttimeout").copied(), "none", |value| {
+                if value.eq_ignore_ascii_case("none") {
+                    return Ok(None);
+                }
+                Ok(std::num::NonZeroU32::new(parse_time_seconds(value)?))
+            })?;
         let port_text = port.to_string();
         let tokens = [
             ('h', host.as_str()),
@@ -477,71 +523,163 @@ impl Config<'_> {
         } else {
             None
         };
-        let mut identity = None;
-        for d in identities {
-            let value = argument(d)?;
-            if value.eq_ignore_ascii_case("none") {
-                continue;
-            }
-            let mut tokens = tokens.to_vec();
-            let home = self.home.to_str().context("non-Unicode home path")?;
-            tokens.extend([
-                ('d', home),
-                ('u', self.user),
-                ('k', host_key_alias.as_deref().unwrap_or(alias)),
-            ]);
-            let path =
-                expand(value, &tokens).with_context(|| format!("{}: IdentityFile", d.line))?;
-            let path =
-                if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-                    self.home.join(rest)
-                } else {
-                    ensure!(
-                        !path.starts_with('~'),
-                        "{}: unsupported named-user home in IdentityFile",
-                        d.line
-                    );
-                    PathBuf::from(path)
-                };
-            ensure!(
-                path.is_absolute(),
-                "{}: relative IdentityFile is ambiguous; use ~/ or an absolute path",
-                d.line
-            );
-            ensure!(
-                identity.as_ref().is_none_or(|first| first == &path),
-                "{}: multiple IdentityFile entries are additive in OpenSSH; select one identity for this profile",
-                d.line
-            );
-            identity = Some(path);
-        }
+        let identity = self.credential_file(
+            identities,
+            &tokens,
+            host_key_alias.as_deref().unwrap_or(alias),
+            "IdentityFile",
+        )?;
+        let certificate = self.credential_file(
+            certificates,
+            &tokens,
+            host_key_alias.as_deref().unwrap_or(alias),
+            "CertificateFile",
+        )?;
         configured(scalars.get("identitiesonly").copied(), "no", |value| {
             ensure!(
                 value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("no"),
                 "IdentitiesOnly requires yes or no"
             );
             ensure!(
-                identity.is_some() || !value.eq_ignore_ascii_case("yes"),
-                "IdentitiesOnly yes requires an explicit identity file"
+                identity.is_some() || certificate.is_some() || !value.eq_ignore_ascii_case("yes"),
+                "IdentitiesOnly yes requires an explicit IdentityFile or CertificateFile"
             );
             Ok(())
         })?;
-        let authentication = match identity {
-            Some(identity) => Authentication::Identity { identity },
-            None => Authentication::Agent,
+        let certificate = certificate.map(|file| file.path);
+        let authentication = match (identity, certificate) {
+            (Some(identity), certificate) => self.identity_authentication(identity, certificate)?,
+            (None, Some(certificate)) => Authentication::agent_certificate(certificate, None),
+            (None, None) => Authentication::Agent,
+        };
+        let agent_pipe = match scalars.get("identityagent") {
+            Some(directive) if authentication.uses_agent() => {
+                let path = argument(directive)?;
+                ensure!(
+                    !path.eq_ignore_ascii_case("none"),
+                    "{}: IdentityAgent none disables the agent. Import this host with an explicit private IdentityFile",
+                    directive.line
+                );
+                Some(
+                    path.parse::<AgentPipe>()
+                        .with_context(|| format!("{}: IdentityAgent", directive.line))?,
+                )
+            }
+            _ => None,
         };
         Ok((
             JumpHost {
                 host,
                 user: user.into(),
                 port,
+                connect_timeout_seconds,
+                keepalive,
                 authentication,
+                agent_pipe,
                 host_key: None,
                 host_key_alias,
             },
             via,
         ))
     }
+
+    fn identity_authentication(
+        &self,
+        identity: CredentialFile,
+        certificate: Option<PathBuf>,
+    ) -> Result<Authentication> {
+        let mut cache = self.identity_fingerprints.borrow_mut();
+        let fingerprint = cache.entry(identity.path.clone()).or_insert_with(|| {
+            identity::public_fingerprint(&identity.path).map_err(|error| format!("{error:#}"))
+        });
+        let agent_fingerprint = match fingerprint {
+            Ok(fingerprint) => fingerprint.clone(),
+            Err(error) => bail!(
+                "{}: IdentityFile {}: {error}",
+                identity.source,
+                identity.path.display()
+            ),
+        };
+        if let Some(agent_fingerprint) = agent_fingerprint {
+            return Ok(match certificate {
+                Some(certificate) => {
+                    Authentication::agent_certificate(certificate, Some(agent_fingerprint))
+                }
+                None => Authentication::AgentKey { agent_fingerprint },
+            });
+        }
+        Ok(Authentication::identity(identity.path, certificate))
+    }
+
+    fn credential_file(
+        &self,
+        directives: Vec<&Directive>,
+        endpoint_tokens: &[(char, &str)],
+        host_key_name: &str,
+        label: &str,
+    ) -> Result<Option<CredentialFile>> {
+        let mut selected: Option<CredentialFile> = None;
+        for d in directives {
+            let value = argument(d)?;
+            if value.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let mut tokens = endpoint_tokens.to_vec();
+            let home = self.home.to_str().context("non-Unicode home path")?;
+            tokens.extend([('d', home), ('u', self.user), ('k', host_key_name)]);
+            let path = expand(value, &tokens).with_context(|| format!("{}: {label}", d.line))?;
+            let path =
+                if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+                    self.home.join(rest)
+                } else {
+                    ensure!(
+                        !path.starts_with('~'),
+                        "{}: unsupported named-user home in {label}",
+                        d.line
+                    );
+                    PathBuf::from(path)
+                };
+            ensure!(
+                path.is_absolute(),
+                "{}: relative {label} is ambiguous; use ~/ or an absolute path",
+                d.line
+            );
+            ensure!(
+                selected.as_ref().is_none_or(|first| first.path == path),
+                "{}: multiple {label} entries are additive in OpenSSH; select one file for this profile",
+                d.line
+            );
+            selected = Some(CredentialFile {
+                path,
+                source: d.line.clone(),
+            });
+        }
+        Ok(selected)
+    }
+}
+
+fn parse_time_seconds(mut value: &str) -> Result<u32> {
+    ensure!(!value.is_empty(), "Missing time value");
+    let mut seconds = 0_u32;
+    while !value.is_empty() {
+        let digits = value.len() - value.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let (number, suffix) = value.split_at(digits);
+        let number: u32 = number.parse().context("Invalid time value")?;
+        let factor = match suffix.as_bytes().first().map(u8::to_ascii_lowercase) {
+            None | Some(b's') => 1,
+            Some(b'm') => 60,
+            Some(b'h') => 3_600,
+            Some(b'd') => 86_400,
+            Some(b'w') => 604_800,
+            _ => bail!("Invalid time unit"),
+        };
+        seconds = number
+            .checked_mul(factor)
+            .and_then(|part| seconds.checked_add(part))
+            .context("Time value is too large")?;
+        value = suffix.get(1..).unwrap_or_default();
+    }
+    Ok(seconds)
 }
 
 fn warn(warnings: &mut BTreeSet<String>, message: impl FnOnce() -> String) {
@@ -613,6 +751,90 @@ mod tests {
             .unwrap()
     }
     #[test]
+    fn identity_agent_imports_local_pipes_with_first_value_precedence_and_preserves_disabling() {
+        let report = parse_config(
+            r#"
+            Host destination
+                ProxyJump gateway
+                IdentityAgent "\\\\.\\pipe\\agent-destination"
+                IdentityAgent none
+            Host gateway
+                IdentityAgent $SSH_AUTH_SOCK
+            Host disabled
+                IdentityAgent none
+            Host private
+                IdentityAgent none
+                IdentityFile ~/key
+            Host remote
+                IdentityAgent "\\\\server\\pipe\\agent"
+            "#,
+        );
+        let destination = alias(&report, "destination").options.as_ref().unwrap();
+        assert_eq!(
+            destination.agent_pipe.as_ref().map(AgentPipe::as_str),
+            Some(r"\\.\pipe\agent-destination")
+        );
+        assert_eq!(
+            destination.proxy_jump[0]
+                .agent_pipe
+                .as_ref()
+                .map(AgentPipe::as_str),
+            Some("SSH_AUTH_SOCK")
+        );
+        for (name, diagnostic) in [
+            ("disabled", "IdentityAgent none disables the agent"),
+            ("remote", "Enter a local Windows SSH agent pipe"),
+        ] {
+            let alias = alias(&report, name);
+            assert!(alias.options.is_none());
+            assert!(
+                alias.warnings[0].contains(diagnostic),
+                "{:?}",
+                alias.warnings
+            );
+        }
+        let private = alias(&report, "private").options.as_ref().unwrap();
+        assert!(matches!(
+            private.authentication,
+            Authentication::Identity { .. }
+        ));
+        assert!(private.agent_pipe.is_none());
+        let conditional = parse_config("Host pending\nMatch exec ignored\n IdentityAgent none");
+        assert!(alias(&conditional, "pending").options.is_none());
+    }
+
+    #[test]
+    fn certificate_import_allows_an_agent_certificate_but_rejects_multiple_files() {
+        let report = parse_config(
+            r#"
+            Host multiple
+                IdentityFile ~/id
+                CertificateFile ~/first-cert.pub
+                CertificateFile ~/second-cert.pub
+            Host agent-only
+                CertificateFile ~/id-cert.pub
+                IdentitiesOnly yes
+        "#,
+        );
+        let entry = alias(&report, "multiple");
+        assert!(entry.options.is_none());
+        assert!(
+            entry
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("multiple CertificateFile"))
+        );
+        let imported = alias(&report, "agent-only").options.as_ref().unwrap();
+        assert_eq!(
+            imported.authentication,
+            Authentication::agent_certificate(
+                Path::new(r"C:\Users\pilot").join("id-cert.pub"),
+                None
+            )
+        );
+    }
+
+    #[test]
     fn host_key_alias_is_literal_per_hop_and_available_as_identity_file_token() {
         let report = parse_config(
             r#"
@@ -638,8 +860,8 @@ mod tests {
         let dest = alias(&report, "dest").options.as_ref().unwrap();
         assert_eq!(dest.host_key_alias.as_deref(), Some("dev-%h"));
         assert_eq!((dest.host.as_str(), dest.port), ("127.0.0.1", 2200));
-        let identity = |key: &str| Authentication::Identity {
-            identity: Path::new(r"C:\Users\pilot").join("keys").join(key),
+        let identity = |key: &str| {
+            Authentication::identity(Path::new(r"C:\Users\pilot").join("keys").join(key), None)
         };
         assert_eq!(dest.authentication, identity("dev-%h"));
         assert_eq!(
@@ -696,21 +918,59 @@ mod tests {
         );
         assert_eq!(
             options.authentication,
-            Authentication::Identity {
-                identity: Path::new(r"C:\Users\pilot").join(".ssh/with space #1")
-            }
+            Authentication::identity(
+                Path::new(r"C:\Users\pilot").join(".ssh/with space #1"),
+                None
+            )
         );
         assert!(options.proxy_jump.is_empty());
-        assert!(
-            admin
-                .warnings
-                .iter()
-                .any(|s| s.contains("serveraliveinterval"))
-        );
+        assert_eq!(options.keepalive.interval_seconds, 15);
+        assert_eq!(options.keepalive.max_unanswered.get(), 3);
+        assert!(admin.warnings.is_empty());
         let dev = alias(&report, "admin-dev").options.as_ref().unwrap();
         assert_eq!(dev.proxy_jump[0].host, "gateway.example");
         assert_eq!(dev.proxy_jump[0].port, 22);
         assert_eq!(dev.proxy_jump[0].authentication, Authentication::Agent);
+        assert_eq!(dev.proxy_jump[0].keepalive, options.keepalive);
+    }
+
+    #[test]
+    fn keepalives_respect_each_hop_and_first_value_with_openssh_time_units() {
+        let report = parse_config(
+            "Host target\n ProxyJump gateway\n ServerAliveInterval 1m15s\n ServerAliveCountMax 6\n Host gateway\n ServerAliveInterval 0\n Host *\n ServerAliveInterval 25",
+        );
+        let target = alias(&report, "target").options.as_ref().unwrap();
+        assert_eq!(target.keepalive.interval_seconds, 75);
+        assert_eq!(target.keepalive.max_unanswered.get(), 6);
+        assert_eq!(target.proxy_jump[0].keepalive.interval(), None);
+        assert_eq!(target.proxy_jump[0].keepalive.max_unanswered.get(), 3);
+        for directive in [
+            "ServerAliveInterval -1",
+            "ServerAliveInterval 5x",
+            "ServerAliveInterval 999999w",
+            "ServerAliveInterval 5\n ServerAliveCountMax 0",
+        ] {
+            let report = parse_config(&format!("Host bad\n {directive}"));
+            assert!(alias(&report, "bad").options.is_none(), "{directive}");
+        }
+    }
+
+    #[test]
+    fn connect_timeout_imports_independent_destination_and_jump_values() {
+        let report = parse_config(
+            "Host target\n ProxyJump gateway\n ConnectTimeout 1m5s\n ConnectTimeout 4\n Host gateway\n ConnectTimeout 2s\n Host default\n ConnectTimeout none\n Host zero\n ConnectTimeout 0",
+        );
+        let timeout = |host| alias(&report, host).options.as_ref().unwrap();
+        let target = timeout("target");
+        assert_eq!(target.connect_timeout_seconds.unwrap().get(), 65);
+        assert_eq!(
+            target.proxy_jump[0].connect_timeout_seconds.unwrap().get(),
+            2
+        );
+        assert!(timeout("default").connect_timeout_seconds.is_none());
+        assert!(timeout("zero").connect_timeout_seconds.is_none());
+        let bad = parse_config("Host bad\n ConnectTimeout 2x");
+        assert!(alias(&bad, "bad").options.is_none());
     }
     #[test]
     fn resolves_nested_and_explicit_jump_routes_with_independent_flags() {
@@ -745,9 +1005,7 @@ mod tests {
         );
         assert_eq!(
             dest.proxy_jump[1].authentication,
-            Authentication::Identity {
-                identity: Path::new(r"C:\Users\pilot").join("keys/alice-2201")
-            }
+            Authentication::identity(Path::new(r"C:\Users\pilot").join("keys/alice-2201"), None)
         );
     }
     #[test]

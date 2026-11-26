@@ -46,6 +46,10 @@ impl TerminalApp {
         state: &Path,
         context: &ComponentContext<Self>,
     ) {
+        context.spawn_background(move |_| {
+            std::thread::sleep(Duration::from_millis(80));
+            Message::Smoke(0)
+        });
         let capture = state.join("rail-capture");
         if capture.is_file() {
             let pane = std::fs::read_to_string(&capture).unwrap().parse().unwrap();
@@ -78,20 +82,29 @@ impl TerminalApp {
                 let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
                     panic!("scrollbar probe must target a fixture pane")
                 };
-                let (width, height, scale) = tab.surface.area.get().unwrap();
-                let top = PADDING + 1.0;
-                let bottom = height - STATUS_HEIGHT - PADDING - 1.0;
-                let track = width - PADDING / 2.0;
-                let (x, press, drag) = match gesture {
-                    "drag-up" => (track, bottom, Some(top)),
-                    "drag-down" => (track, top, Some(bottom)),
-                    "page-up" => (track, top, None),
-                    value if let Some(pixel) = value.strip_prefix("failure:") => (
+                let (x, press, drag) = if let Some(pixel) = gesture.strip_prefix("failure:") {
+                    let (width, _, scale) = tab.surface.area.get().unwrap();
+                    (
                         width - PADDING + 1.5,
                         ((PADDING * scale).round() + pixel.parse::<f32>().unwrap()) / scale,
                         None,
-                    ),
-                    _ => panic!("unknown scrollbar probe"),
+                    )
+                } else {
+                    // UI Automation can observe scroll changes before the swap chain
+                    // paints the thumb. Wait for the rail that will receive the press.
+                    let Some((track, top, bottom)) = tab
+                        .surface
+                        .scrollbar
+                        .painted_track(&tab.session.frames.load())
+                    else {
+                        return;
+                    };
+                    match gesture {
+                        "drag-up" => (track, bottom, Some(top)),
+                        "drag-down" => (track, top, Some(bottom)),
+                        "page-up" => (track, top, None),
+                        _ => panic!("unknown scrollbar probe"),
+                    }
                 };
                 let event = |y: f32, held| PointerEventInfo {
                     x: f64::from(x),
@@ -122,10 +135,6 @@ impl TerminalApp {
             }
             std::fs::remove_file(request).unwrap();
         }
-        context.spawn_background(move |_| {
-            std::thread::sleep(Duration::from_millis(80));
-            Message::Smoke(0)
-        });
     }
 
     pub(super) fn word_selection_smoke(&mut self, state: &Path, context: &ComponentContext<Self>) {

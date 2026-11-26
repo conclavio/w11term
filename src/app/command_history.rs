@@ -1,20 +1,34 @@
 use super::*;
 use regex::{Regex, RegexBuilder};
-use std::{collections::HashMap, ops::Range, sync::Weak};
+use std::{cmp::Reverse, collections::HashMap, ops::Range, sync::Weak};
 use w11term::control::CommandStatus;
+use w11term::events::CommandLink;
 use w11term::saved_commands::{Entry, valid_command_text};
 use w11term::session::history_text_allowed;
 use w11term::terminal::Snapshot;
 use wezterm_term::CompletedCommand;
 
+mod compare;
+pub use compare::Request as CompareRequest;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputCapture {
+    pane: u64,
+    link: CommandLink,
+}
+
 pub(super) struct HistoryPage {
     pane: u64,
     selected: Option<(u64, u64)>, // Connection generation and command id.
     search: HistorySearch,
+    output_hit: Option<(CommandLink, Range<usize>)>,
+    window_search: Option<Box<pane_picker::WindowHistoryReturn>>,
     status: CommandStatus,
+    order: HistoryOrder,
     feedback: String,
     save: Option<SaveDraft>,
     showing: Option<Arc<()>>,
+    comparison: Option<compare::Panel>,
 }
 
 struct SaveDraft {
@@ -32,23 +46,44 @@ pub enum Action {
         request: Arc<()>,
         result: Result<(), &'static str>,
     },
+    ComparisonReady {
+        page: TabId,
+        request: Arc<()>,
+        result: Result<text_diff::Difference, &'static str>,
+    },
 }
 
 pub enum HistoryAction {
     Search(String),
     IncludeOutput(bool),
     Status(CommandStatus),
+    Order(HistoryOrder),
     Refresh,
     Select(u64, u64),
     Copy(u64, u64, CopyPart),
     ExportOutput((u64, u64)),
     ShowOutput((u64, u64)),
+    OpenDirectory((u64, u64)),
+    Compare(CompareRequest),
     Insert((u64, u64)),
     BeginSave((u64, u64)),
     SaveName((u64, u64), String),
     Save((u64, u64)),
     CancelSave((u64, u64)),
     Return,
+    ReturnToWindowSearch,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HistoryOrder {
+    #[default]
+    Newest,
+    Slowest,
+}
+
+enum DirectoryNavigation {
+    Sftp(TabId, String),
+    Explorer(explorer::Location),
 }
 
 #[derive(Clone, Copy)]
@@ -66,11 +101,16 @@ impl CopyPart {
     }
 }
 
-const STATUS_OPTIONS: [(CommandStatus, &str); 4] = [
+pub(super) const STATUS_OPTIONS: [(CommandStatus, &str); 4] = [
     (CommandStatus::All, "All commands"),
     (CommandStatus::Failed, "Failed"),
     (CommandStatus::Succeeded, "Succeeded"),
     (CommandStatus::Unknown, "Status unknown"),
+];
+
+pub(super) const ORDER_OPTIONS: [(HistoryOrder, &str); 2] = [
+    (HistoryOrder::Newest, "Newest first"),
+    (HistoryOrder::Slowest, "Slowest first"),
 ];
 
 #[derive(Default)]
@@ -92,10 +132,7 @@ struct OutputMatches {
 impl HistorySearch {
     fn update_matcher(&mut self) {
         self.matcher = if self.include_output && !self.query.is_empty() {
-            RegexBuilder::new(&regex::escape(&self.query))
-                .case_insensitive(true)
-                .build()
-                .ok()
+            output_matcher(&self.query)
         } else {
             None
         };
@@ -127,12 +164,167 @@ impl HistorySearch {
     }
 }
 
+fn output_matcher(query: &str) -> Option<Regex> {
+    RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+pub(super) struct WindowCapture {
+    pane: u64,
+    generation: u64,
+    source: Arc<str>,
+    command: Arc<CompletedCommand>,
+    fields_match: bool,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(super) struct WindowHistoryOptions {
+    pub(super) status: CommandStatus,
+    pub(super) order: HistoryOrder,
+    pub(super) include_output: bool,
+}
+
+pub(super) fn window_history_rows(
+    captures: Vec<WindowCapture>,
+    output_query: Option<&str>,
+    order: HistoryOrder,
+    cancelled: impl Fn() -> bool,
+) -> Vec<command_palette::Row> {
+    let matcher = output_query.and_then(output_matcher);
+    let mut rows = Vec::new();
+    for capture in captures {
+        if cancelled() {
+            return Vec::new();
+        }
+        let command = &capture.command;
+        let output_match = matcher.as_ref().and_then(|matcher| {
+            let output = command.output.as_deref().ok()?;
+            Some((output, matcher.find(output)?.range()))
+        });
+        if !capture.fields_match && output_match.is_none() {
+            continue;
+        }
+        let pane = capture.pane;
+        let link = CommandLink {
+            generation: capture.generation,
+            id: command.id,
+        };
+        let mut label = format!(
+            "{} · {} · {}",
+            capture.source,
+            command_status(command),
+            command_name(command),
+        );
+        if let Some((output, hit)) = &output_match {
+            label = format!("{} · {label}", output_excerpt(output, hit));
+        }
+        let (duration, elapsed) = match order {
+            HistoryOrder::Newest => (None, String::new()),
+            HistoryOrder::Slowest => (
+                command.timing.duration_ms,
+                command
+                    .timing
+                    .duration_ms
+                    .map_or_else(|| "Duration unavailable".into(), elapsed_label),
+            ),
+        };
+        rows.push((
+            Reverse((duration, command.finished_at, pane, command.id)),
+            command_palette::Row {
+                id: command_palette::CommandId::OpenWindowCommand(
+                    pane,
+                    link,
+                    output_match.map(|(_, hit)| hit),
+                ),
+                label,
+                chord: elapsed,
+                enabled: true,
+            },
+        ));
+    }
+    rows.sort_unstable_by_key(|(order, _)| *order);
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+fn output_excerpt(output: &str, hit: &Range<usize>) -> String {
+    let start = output.ceil_char_boundary(hit.start.saturating_sub(24));
+    let end = output.floor_char_boundary(output.len().min(hit.start + 64));
+    let excerpt = output[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{}{excerpt}{}",
+        if start > 0 { "…" } else { "" },
+        if end < output.len() { "…" } else { "" }
+    )
+}
+
 fn command_text_matches(entry: &CompletedCommand, needle: &str) -> bool {
     needle.is_empty()
         || entry
             .command
             .as_ref()
             .is_some_and(|text| text.to_lowercase().contains(needle))
+}
+
+fn command_name(entry: &CompletedCommand) -> String {
+    entry.command.as_ref().map_or_else(
+        || format!("Command {}", entry.id),
+        |text| {
+            text.chars()
+                .take(120)
+                .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+                .collect()
+        },
+    )
+}
+
+fn command_status(entry: &CompletedCommand) -> String {
+    entry
+        .exit_code
+        .map_or_else(|| "status unknown".into(), |code| format!("exit {code}"))
+}
+
+fn elapsed_label(ms: u64) -> String {
+    match ms {
+        0 => "<1 ms".into(),
+        1..=999 => format!("{ms} ms"),
+        1000..=59_999 => format!("{}.{:03} s", ms / 1000, ms % 1000),
+        _ => {
+            let seconds = ms / 1000;
+            format!("{}m {:02}s", seconds / 60, seconds % 60)
+        }
+    }
+}
+
+pub(super) fn timestamp_label(ms: u64) -> Option<String> {
+    let time = chrono::DateTime::from_timestamp_millis(i64::try_from(ms).ok()?)?;
+    Some(time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+}
+
+fn timing_label(entry: &CompletedCommand) -> String {
+    let timing = entry.timing;
+    let mut fields = Vec::new();
+    if let Some(start) = timing.started_unix_ms.and_then(timestamp_label) {
+        fields.push(format!("Started {start}"));
+    }
+    if let Some(finish) = timestamp_label(timing.finished_unix_ms) {
+        fields.push(format!("Finished {finish}"));
+    }
+    if let Some(elapsed) = timing.duration_ms {
+        fields.push(format!("Elapsed {}", elapsed_label(elapsed)));
+    }
+    fields.join(" · ")
+}
+
+fn command_directory(
+    source: &Source,
+    entry: &CompletedCommand,
+) -> Option<directory_split::Directory> {
+    directory_split::Directory::reported(source, entry.reported_directory.as_deref()?)
 }
 
 fn output_preview(text: &str, hit: Option<Range<usize>>) -> String {
@@ -167,13 +359,34 @@ fn saveable_command(frame: &Snapshot, target: (u64, u64)) -> Option<&str> {
         .filter(|text| valid_command_text(text))
 }
 
-fn newest(frame: &Snapshot, search: &HistorySearch, status: CommandStatus) -> Option<(u64, u64)> {
-    frame
+fn history_matches<'a>(
+    frame: &'a Snapshot,
+    search: &HistorySearch,
+    status: CommandStatus,
+    order: HistoryOrder,
+) -> Vec<&'a CompletedCommand> {
+    let mut matches: Vec<_> = frame
         .command_history
         .iter()
         .rev()
-        .find(|entry| search.includes(frame, entry, status))
-        .map(|c| (frame.connection_generation, c.id))
+        .map(AsRef::as_ref)
+        .filter(|entry| search.includes(frame, entry, status))
+        .collect();
+    if order == HistoryOrder::Slowest {
+        matches.sort_unstable_by_key(|entry| Reverse((entry.timing.duration_ms, entry.id)));
+    }
+    matches
+}
+
+fn first_matching(
+    frame: &Snapshot,
+    search: &HistorySearch,
+    status: CommandStatus,
+    order: HistoryOrder,
+) -> Option<(u64, u64)> {
+    history_matches(frame, search, status, order)
+        .first()
+        .map(|entry| (frame.connection_generation, entry.id))
 }
 
 impl HistoryPage {
@@ -181,7 +394,7 @@ impl HistoryPage {
         if !selected_command(frame, self.selected)
             .is_some_and(|entry| self.search.includes(frame, entry, self.status))
         {
-            self.selected = newest(frame, &self.search, self.status);
+            self.selected = first_matching(frame, &self.search, self.status, self.order);
         }
     }
 }
@@ -228,6 +441,94 @@ impl TerminalApp {
             Page::Terminal(live) => Some(live.session.frames.load()),
             _ => None,
         }
+    }
+
+    pub(super) fn window_command_history_rows(
+        &self,
+        query: &str,
+        options: WindowHistoryOptions,
+    ) -> Vec<command_palette::Row> {
+        window_history_rows(
+            self.window_command_captures(query, options),
+            None,
+            options.order,
+            || false,
+        )
+    }
+
+    pub(super) fn window_command_captures(
+        &self,
+        query: &str,
+        options: WindowHistoryOptions,
+    ) -> Vec<WindowCapture> {
+        let needle = query.trim().to_lowercase();
+        let mut captures = Vec::new();
+        for tab in self.tabs.entries().iter().map(|entry| &entry.value) {
+            let Page::Terminal(live) = &tab.page else {
+                continue;
+            };
+            let pane = live.session.pane_id;
+            let label = tab
+                .pane_name()
+                .map_or(tab.label.as_str(), |name| name.as_str());
+            let source = match &live.source {
+                Source::Ssh(ssh) => format!(
+                    "{label} · {}@{}:{} · Pane {pane}",
+                    ssh.user, ssh.host, ssh.port
+                ),
+                Source::Local(_) => format!("{label} · Pane {pane}"),
+                _ => continue,
+            };
+            let source_matches = source.to_lowercase().contains(&needle)
+                || tab
+                    .profile_name()
+                    .is_some_and(|name| name.to_lowercase().contains(&needle));
+            let source: Arc<str> = source.into();
+            let frame = live.session.frames.load();
+            for command in frame
+                .command_history
+                .iter()
+                .filter(|entry| options.status.matches(entry.exit_code))
+            {
+                let fields_match = source_matches
+                    || command_text_matches(command, &needle)
+                    || command_directory(&live.source, command)
+                        .is_some_and(|path| path.display().to_lowercase().contains(&needle));
+                if fields_match || (options.include_output && command.output.is_ok()) {
+                    captures.push(WindowCapture {
+                        pane,
+                        generation: frame.connection_generation,
+                        source: Arc::clone(&source),
+                        command: Arc::clone(command),
+                        fields_match,
+                    });
+                }
+            }
+        }
+        captures
+    }
+
+    fn history_directory(
+        &self,
+        pane: u64,
+        generation: u64,
+        entry: &CompletedCommand,
+    ) -> Option<(directory_split::Directory, Option<DirectoryNavigation>)> {
+        let tab_id = self.tab_for_pane(pane)?;
+        let Page::Terminal(live) = &self.tabs.get(tab_id)?.page else {
+            return None;
+        };
+        let directory = command_directory(&live.source, entry)?;
+        let navigation = match &directory {
+            directory_split::Directory::Ssh(path) => (live.session.ssh_connection_generation()
+                == Some(generation)
+                && live.files.can_reveal_path())
+            .then(|| DirectoryNavigation::Sftp(tab_id, path.clone())),
+            _ => directory
+                .explorer_location(&live.source)
+                .map(DirectoryNavigation::Explorer),
+        };
+        Some((directory, navigation))
     }
 
     fn history_insert_target(
@@ -316,6 +617,17 @@ impl TerminalApp {
         target: Option<w11term::events::CommandLink>,
         ctx: &ComponentContext<Self>,
     ) -> bool {
+        self.open_command_history_preview(pane, target, None, None, ctx)
+    }
+
+    pub(super) fn open_command_history_preview(
+        &mut self,
+        pane: u64,
+        target: Option<CommandLink>,
+        output_hit: Option<Range<usize>>,
+        window_search: Option<pane_picker::WindowHistoryReturn>,
+        ctx: &ComponentContext<Self>,
+    ) -> bool {
         let Some(source) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) else {
             return false;
         };
@@ -327,7 +639,7 @@ impl TerminalApp {
         let selected = match target {
             Some(link) if frame.has_command(link) => Some((link.generation, link.id)),
             Some(_) => return false,
-            None => newest(&frame, &search, CommandStatus::All),
+            None => first_matching(&frame, &search, CommandStatus::All, HistoryOrder::Newest),
         };
         let existing = self
             .tabs
@@ -339,10 +651,14 @@ impl TerminalApp {
             pane,
             selected,
             search,
+            output_hit: target.zip(output_hit),
+            window_search: window_search.map(Box::new),
             status: CommandStatus::All,
+            order: HistoryOrder::Newest,
             feedback: String::new(),
             save: None,
             showing: None,
+            comparison: None,
         });
         if let Some(id) = existing {
             self.tabs.get_mut(id).unwrap().page = page;
@@ -356,6 +672,15 @@ impl TerminalApp {
     }
 
     pub(super) fn handle_history(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if let Action::ComparisonReady {
+            page,
+            request,
+            result,
+        } = action
+        {
+            self.finish_history_comparison(page, &request, result);
+            return;
+        }
         if let Action::OutputShown {
             page,
             pane,
@@ -423,6 +748,16 @@ impl TerminalApp {
         if source != pane {
             return;
         }
+        if let HistoryAction::Compare(request) = action {
+            self.history_compare(id, pane, request, ctx);
+            return;
+        }
+        if matches!(action, HistoryAction::ReturnToWindowSearch) {
+            if let Some(saved) = history.window_search.as_deref().cloned() {
+                self.restore_window_history(saved, ctx);
+            }
+            return;
+        }
         let Some(frame) = self.history_frame(pane) else {
             return;
         };
@@ -430,13 +765,24 @@ impl TerminalApp {
             return;
         };
         if matches!(&action, HistoryAction::Status(status) if *status == page.status)
+            || matches!(&action, HistoryAction::Order(order) if *order == page.order)
             || matches!(&action, HistoryAction::IncludeOutput(include) if *include == page.search.include_output)
             || matches!(&action, HistoryAction::Search(query) if *query == page.search.query)
         {
             return;
         }
         page.feedback.clear();
+        if matches!(
+            action,
+            HistoryAction::Search(_)
+                | HistoryAction::IncludeOutput(_)
+                | HistoryAction::Refresh
+                | HistoryAction::Select(..)
+        ) {
+            page.output_hit = None;
+        }
         match action {
+            HistoryAction::Compare(_) | HistoryAction::ReturnToWindowSearch => unreachable!(),
             HistoryAction::Search(query) => {
                 page.search.needle = query.to_lowercase();
                 page.search.query = query;
@@ -452,7 +798,13 @@ impl TerminalApp {
                 page.status = status;
                 page.keep_matching_selection(&frame);
             }
-            HistoryAction::Refresh => page.selected = newest(&frame, &page.search, page.status),
+            HistoryAction::Order(order) => {
+                page.order = order;
+                page.keep_matching_selection(&frame);
+            }
+            HistoryAction::Refresh => {
+                page.selected = first_matching(&frame, &page.search, page.status, page.order);
+            }
             HistoryAction::Select(generation, command) => {
                 let key = Some((generation, command));
                 if selected_command(&frame, key)
@@ -521,6 +873,26 @@ impl TerminalApp {
                     });
                 }
             }
+            HistoryAction::OpenDirectory(target) => {
+                if page.selected != Some(target) {
+                    return;
+                }
+                let navigation = selected_command(&frame, Some(target))
+                    .and_then(|entry| self.history_directory(pane, target.0, entry))
+                    .and_then(|(_, navigation)| navigation);
+                match navigation {
+                    Some(DirectoryNavigation::Explorer(location)) => {
+                        explorer::open_location(location, ctx);
+                    }
+                    Some(DirectoryNavigation::Sftp(tab, path)) if self.tabs.select(tab) => {
+                        self.file_action(FileAction::Reveal(pane, target.0, path, None), ctx);
+                        self.sync_selection(ctx);
+                        self.activate(ctx);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             HistoryAction::SaveName(target, name) => {
                 if let Some(draft) = &mut page.save
                     && draft.target == target
@@ -575,38 +947,46 @@ impl TerminalApp {
     }
 
     pub(super) fn history_view(&self, page: &HistoryPage, ctx: &ViewContext<Self>) -> View {
-        let Some(frame) = self.history_frame(page.pane) else {
-            return TextBlock::new()
-                .margin(16.0)
-                .text("The source pane has closed")
-                .into();
-        };
-        let generation = frame.connection_generation;
+        if let Some(comparison) = &page.comparison {
+            return self.history_comparison_view(page.pane, comparison, ctx);
+        }
         let pane = page.pane;
         let action = move |request| Message::History(Action::InPane(pane, request));
+        let page_heading = Grid::new()
+            .grid_column_span(2)
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(8.0)
+            .children((
+                TextBlock::new()
+                    .font_size(24.0)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .text(format!("Command history · Pane {pane}")),
+                if page.window_search.is_some() {
+                    Button::new()
+                        .grid_column(1)
+                        .on_click(
+                            ctx.callback(move |_| action(HistoryAction::ReturnToWindowSearch)),
+                        )
+                        .content("Back to search results")
+                } else {
+                    View::empty()
+                },
+            ));
+        let Some(frame) = self.history_frame(page.pane) else {
+            return StackPanel::new().margin(16.0).spacing(8.0).children((
+                page_heading,
+                TextBlock::new().text("The source pane has closed"),
+            ));
+        };
+        let generation = frame.connection_generation;
         let selected = selected_command(&frame, page.selected)
             .filter(|entry| page.search.includes(&frame, entry, page.status));
-        let mut matches = frame
-            .command_history
-            .iter()
-            .rev()
-            .filter(|c| page.search.includes(&frame, c, page.status))
-            .peekable();
-        let has_matches = matches.peek().is_some();
-        let rows = matches.map(|entry| {
+        let matches = history_matches(&frame, &page.search, page.status, page.order);
+        let has_matches = !matches.is_empty();
+        let rows = matches.into_iter().map(|entry| {
             let id = entry.id;
-            let name = entry.command.as_ref().map_or_else(
-                || format!("Command {id}"),
-                |s| {
-                    s.chars()
-                        .take(120)
-                        .map(|c| if c.is_whitespace() { ' ' } else { c })
-                        .collect()
-                },
-            );
-            let status = entry
-                .exit_code
-                .map_or_else(|| "status unknown".into(), |code| format!("exit {code}"));
+            let name = command_name(entry);
+            let status = command_status(entry);
             let label = format!("{name} · {status}");
             let active = page.selected == Some((generation, id));
             KeyedView::new(
@@ -618,16 +998,38 @@ impl TerminalApp {
                         ButtonStyle::Subtle
                     })
                     .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .horizontal_content_alignment(HorizontalAlignment::Stretch)
                     .automation_name(if active {
                         format!("Selected, {label}")
                     } else {
                         label.clone()
                     })
                     .on_click(ctx.callback(move |_| action(HistoryAction::Select(generation, id))))
-                    .content(label),
+                    .content(
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .column_spacing(8.0)
+                            .children((
+                                TextBlock::new()
+                                    .text(label)
+                                    .text_trimming(TextTrimming::CharacterEllipsis),
+                                TextBlock::new().grid_column(1).text(
+                                    entry
+                                        .timing
+                                        .duration_ms
+                                        .map_or_else(String::new, elapsed_label),
+                                ),
+                            )),
+                    ),
             )
         });
-        let preview_hit = selected.and_then(|entry| page.search.output_match(&frame, entry.id));
+        let preview_hit = selected.and_then(|entry| {
+            page.search.output_match(&frame, entry.id).or_else(|| {
+                page.output_hit.as_ref().and_then(|(link, range)| {
+                    (link.generation == generation && link.id == entry.id).then(|| range.clone())
+                })
+            })
+        });
         // Mount a fresh native scroll surface when the matching context moves.
         let preview_key = selected.zip(preview_hit.as_ref()).map_or_else(
             || "output".to_owned(),
@@ -683,6 +1085,33 @@ impl TerminalApp {
         let show_target = page
             .selected
             .filter(|_| selected.is_some() && !frame.alternate && page.showing.is_none());
+        let directory = selected
+            .and_then(|entry| {
+                self.history_directory(pane, generation, entry)
+                    .map(|(path, navigation)| (entry.id, path, navigation.is_some()))
+            })
+            .map_or_else(View::empty, |(id, path, can_open)| {
+                StackPanel::new().spacing(4.0).children((
+                    TextBlock::new()
+                        .text(format!("Working directory · {}", path.display()))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true),
+                    Button::new()
+                        .is_enabled(can_open)
+                        .on_click(ctx.callback(move |_| {
+                            action(HistoryAction::OpenDirectory((generation, id)))
+                        }))
+                        .content("Open command directory"),
+                ))
+            });
+        let timing = selected.map_or_else(View::empty, |entry| {
+            TextBlock::new()
+                .automation_id("command-timing")
+                .text(timing_label(entry))
+                .text_wrapping(TextWrapping::Wrap)
+                .into()
+        });
+        let comparison = self.history_reference_view(pane, generation, selected, ctx);
         let save = match (&page.save, save_target) {
             (Some(draft), Some(target)) if draft.target == target => saved_commands::name_form(
                 &draft.name,
@@ -711,10 +1140,7 @@ impl TerminalApp {
             ])
             .columns([GridLength::Star(1.0), GridLength::Star(2.0)])
             .children((
-                TextBlock::new()
-                    .grid_column_span(2)
-                    .font_size(24.0)
-                    .text(format!("Command history · Pane {}", page.pane)),
+                page_heading,
                 StackPanel::new()
                     .grid_row(1)
                     .grid_column_span(2)
@@ -764,6 +1190,22 @@ impl TerminalApp {
                                     action(HistoryAction::Status(status))
                                 })
                         })),
+                    ComboBox::new()
+                        .automation_name("Command order")
+                        .items_source(ORDER_OPTIONS.map(|(_, label)| label))
+                        .selected_index(
+                            ORDER_OPTIONS
+                                .iter()
+                                .position(|(order, _)| *order == page.order),
+                        )
+                        .horizontal_alignment(HorizontalAlignment::Stretch)
+                        .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                            index
+                                .and_then(|index| ORDER_OPTIONS.get(index))
+                                .map_or(Message::ControlIdle, |&(order, _)| {
+                                    action(HistoryAction::Order(order))
+                                })
+                        })),
                 )),
                 ScrollViewer::new()
                     .grid_row(3)
@@ -780,6 +1222,9 @@ impl TerminalApp {
                                     .font_size(18.0)
                                     .text(heading)
                                     .text_wrapping(TextWrapping::Wrap),
+                                timing,
+                                directory,
+                                comparison,
                                 Button::new()
                                     .is_enabled(insert_target.is_some())
                                     .on_click(ctx.callback(move |_| {
@@ -820,6 +1265,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slowest_order_keeps_the_status_filter_and_places_unknown_durations_last() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let terminal = w11term::terminal::create(TerminalSize::default(), tx);
+        let mut frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        frame.command_history = Arc::new(VecDeque::from(
+            [
+                (1, Some(45), Some(1)),
+                (2, Some(0), Some(1)),
+                (3, Some(45), Some(1)),
+                (4, Some(900), Some(0)),
+                (5, None, Some(1)),
+            ]
+            .map(|(id, duration_ms, exit_code)| {
+                Arc::new(CompletedCommand {
+                    id,
+                    start_token: None,
+                    finished_at: std::time::Instant::now(),
+                    timing: wezterm_term::CommandTiming {
+                        duration_ms,
+                        ..Default::default()
+                    },
+                    command: Some("timed command".into()),
+                    reported_directory: None,
+                    exit_code,
+                    output: Ok(String::new()),
+                })
+            }),
+        ));
+        let search = HistorySearch::default();
+        let ordered = |order| {
+            history_matches(&frame, &search, CommandStatus::Failed, order)
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordered(HistoryOrder::Newest), [5, 3, 2, 1]);
+        assert_eq!(ordered(HistoryOrder::Slowest), [3, 1, 2, 5]);
+    }
+
+    #[test]
     fn output_search_uses_literal_unicode_text_and_keeps_the_status_filter() {
         let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let terminal = w11term::terminal::create(TerminalSize::default(), tx);
@@ -829,7 +1314,11 @@ mod tests {
         let entry = |id, output, exit_code| {
             Arc::new(CompletedCommand {
                 id,
+                start_token: None,
+                finished_at: std::time::Instant::now(),
+                timing: Default::default(),
                 command: Some(format!("run {id}")),
+                reported_directory: None,
                 output,
                 exit_code,
             })
@@ -844,12 +1333,26 @@ mod tests {
             needle: "[ångström.*]".into(),
             ..Default::default()
         };
-        assert_eq!(newest(&frame, &search, CommandStatus::All), None);
+        assert_eq!(
+            first_matching(&frame, &search, CommandStatus::All, HistoryOrder::Newest),
+            None
+        );
 
         search.include_output = true;
         search.update_matcher();
-        assert_eq!(newest(&frame, &search, CommandStatus::Failed), Some((0, 1)));
-        assert_eq!(newest(&frame, &search, CommandStatus::Succeeded), None);
+        assert_eq!(
+            first_matching(&frame, &search, CommandStatus::Failed, HistoryOrder::Newest),
+            Some((0, 1))
+        );
+        assert_eq!(
+            first_matching(
+                &frame,
+                &search,
+                CommandStatus::Succeeded,
+                HistoryOrder::Newest
+            ),
+            None
+        );
         assert!(search.output_match(&frame, 3).is_none());
         let hit = search.output_match(&frame, 1).unwrap();
         assert_eq!(&long[hit.clone()], "[Ångström.*]");
@@ -868,7 +1371,11 @@ mod tests {
         let command = format!("{} [Ångström]\r\n  --final", "x".repeat(130));
         let mut entry = CompletedCommand {
             id: 9,
+            start_token: None,
+            finished_at: std::time::Instant::now(),
+            timing: Default::default(),
             command: Some(command.clone()),
+            reported_directory: None,
             output: Ok("archived result\r\n".into()),
             exit_code: Some(17),
         };

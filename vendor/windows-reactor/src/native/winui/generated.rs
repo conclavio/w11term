@@ -890,6 +890,27 @@ pub fn set_property(
                 .map_err(native_error)?;
             control.SetForeground(&brush).map_err(native_error)
         }
+        (
+            handle @ Handle::Button(_),
+            PropertyId::ButtonPadding,
+            PropertyValue::Thickness(value),
+        )
+        | (
+            handle @ Handle::ToggleButton(_),
+            PropertyId::ToggleButtonPadding,
+            PropertyValue::Thickness(value),
+        ) => {
+            let control = match handle {
+                Handle::Button(button) => button.cast::<IControl>(),
+                Handle::ToggleButton(toggle) => toggle.cast::<IControl>(),
+                _ => unreachable!("the padding arm only handles buttons"),
+            }
+            .map_err(native_error)?;
+            let [left, top, right, bottom] = value.values();
+            control
+                .SetPadding(bindings::Thickness { left, top, right, bottom })
+                .map_err(native_error)
+        }
         (Handle::Button(control), PropertyId::ButtonIsEnabled, PropertyValue::Bool(value)) => {
             control
                 .cast::<IControl>()
@@ -2988,6 +3009,10 @@ pub fn clear_property(handle: &Handle, property: PropertyId) -> Result<(), Runti
             .map_err(native_error),
         (Handle::TextBlock(_), PropertyId::TextBlockForeground) => dependency_object
             .ClearValue(&bindings::TextBlock::ForegroundProperty().map_err(native_error)?)
+            .map_err(native_error),
+        (Handle::Button(_), PropertyId::ButtonPadding)
+        | (Handle::ToggleButton(_), PropertyId::ToggleButtonPadding) => dependency_object
+            .ClearValue(&Control::PaddingProperty().map_err(native_error)?)
             .map_err(native_error),
         (Handle::Button(_), PropertyId::ButtonIsEnabled) => dependency_object
             .ClearValue(&bindings::Control::IsEnabledProperty().map_err(native_error)?)

@@ -99,7 +99,10 @@ try {
     Wait-Text $remote 'before SSH exit'
     if ((Control @('get-text','--pane',"$remote")).text.Contains('archived SSH')) { throw 'Expected retained SSH history above the viewport' }
     $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64','BA==')
-    $exitToken = Wait-Until 'orderly remote session exit' { (Control @('events','--pane',"$remote")).restart_token }
+    $sshExit = Control @('wait-pane-exit','--pane',"$remote",'--timeout','15')
+    if ($sshExit.pane -ne $remote -or !$sshExit.restart_token -or $sshExit.exit_token -ne $sshExit.restart_token -or
+        $sshExit.ssh_connection.phase -cne 'disconnected') { throw 'Incorrect result for the SSH exit' }
+    $exitToken = $sshExit.restart_token
     Wait-Focus $local
     Choose-Pane 'palette-ssh' $remote
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
@@ -130,17 +133,46 @@ try {
     Type-Line '"neighbor-value-" + $restartValue'
     Wait-Text $local 'neighbor-value-4021'
     Assert-LiveRestartDisabled $local
+    $waitLog = Join-Path $State 'local-exit-wait.json'
+    $waiter = Start-Process -FilePath $Cli -ArgumentList @('--pid',"$($app.Id)",'wait-pane-exit','--pane',"$local",'--timeout','20') -WindowStyle Hidden -PassThru -RedirectStandardOutput $waitLog
+    $null = $waiter.Handle
     Type-Line 'exit 37'
-    $null = Wait-Until 'PowerShell process exit' {
-        (Control @('get-text','--pane',"$local")).status -eq 'Local process exited with code 37' -and
-            (Control @('events','--pane',"$local")).restart_token
+    if (!$waiter.WaitForExit(15000)) { throw 'The PowerShell exit wait did not finish' }
+    $localExit = Get-Content -LiteralPath $waitLog -Raw | ConvertFrom-Json
+    if ($waiter.ExitCode -ne 0 -or !$localExit.ok -or $localExit.result.pane -ne $local -or
+        !$localExit.result.restart_token -or $localExit.result.exit_token -ne $localExit.result.restart_token -or
+        $localExit.result.ssh_connection -or
+        (Control @('get-text','--pane',"$local")).status -cne 'Local process exited with code 37') {
+        throw "Incorrect result for the PowerShell exit: $($localExit | ConvertTo-Json -Compress)"
     }
     Run-Palette $restart
     Wait-NextGeneration $originalPs
     Wait-Focus $local
     if ((Shell-Pid 'replacement') -eq $oldPid) { throw 'PowerShell restart did not launch a fresh process' }
-    Type-Line '"new-shell-" + ($null -eq $restartValue)'
-    Wait-Text $local 'new-shell-True'
+    $stalePayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(('Write-Output ("stale-" + "scope")' + "`r")))
+    $staleWrite = & $Cli --pid $app.Id send-text --pane $local --no-paste --connection-generation $originalPs.connection_generation --base64 $stalePayload | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $staleWrite.ok -or $staleWrite.error -notmatch 'connection changed') {
+        throw 'The previous PowerShell generation could still send input'
+    }
+    $screenBaseline = Control @('get-text','--pane',"$local")
+    $current = $screenBaseline.connection_generation
+    $wire = [Text.Encoding]::UTF8.GetBytes(('"new-shell-" + ($null -eq $restartValue)' + "`r"))
+    $written = Control @('send-text','--pane',"$local",'--no-paste','--connection-generation',"$current",'--base64',[Convert]::ToBase64String($wire))
+    if ($written.pane -ne $local -or $written.connection_generation -ne $current -or $written.bytes_written -ne $wire.Length) {
+        throw 'Scoped PowerShell write did not acknowledge the replacement process'
+    }
+    $match = Control @('wait-for-text','--pane',"$local",'--connection-generation',"$current",'--after-frame',"$($screenBaseline.generation)",'--timeout','15','new-shell-True')
+    if ($match.pane -ne $local -or $match.connection_generation -ne $current -or !$match.matched -or
+        $match.generation -le $screenBaseline.generation) {
+        throw 'The screen match did not report a newer frame from the replacement PowerShell generation'
+    }
+    $staleWait = & $Cli --pid $app.Id wait-for-text --pane $local --connection-generation $originalPs.connection_generation --timeout 3 'new-shell-True' | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $staleWait.ok -or $staleWait.error -notmatch 'connection changed|no longer active') {
+        throw 'The previous PowerShell generation could match the replacement screen'
+    }
+    if ((Control @('get-text','--pane',"$local")).text.Contains('stale-scope')) {
+        throw 'A stale write reached the replacement PowerShell process'
+    }
     Assert-Transcript $local @('local-history-4021',"neighbor-value-4021",'new-shell-True') 'restarted-ssh'
     Assert-Layout
     Assert-LiveRestartDisabled $local
@@ -150,6 +182,10 @@ try {
     Type-Text '-neighbor-alive'
     Wait-Text $remote '-neighbor-alive'
 } finally {
+    if ($waiter) {
+        if (!$waiter.HasExited) { $waiter.Kill(); $null = $waiter.WaitForExit(5000) }
+        $waiter.Dispose()
+    }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

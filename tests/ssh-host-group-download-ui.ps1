@@ -89,7 +89,7 @@ try {
     $null = Wait-Until 'Witness is hidden by the roster filter' {
         Find-Element '1 selected host is hidden by the filter.'
     }
-    Click "Download files$ellipsis"
+    Invoke-NativeMenuAction 'Roster actions' "Download files$ellipsis"
     $null = Wait-Until 'download review includes the four shown hosts' {
         (Find-Element 'Download from selected SSH hosts') -and
         (Find-Element $targets['Fetch East']) -and (Find-Element $targets['Fetch West']) -and
@@ -130,7 +130,7 @@ try {
     (Wait-CheckBox $targets['Fetch Stale'] On).Toggle()
     $null = Wait-CheckBox $targets['Fetch Missing'] Off
     $null = Wait-CheckBox $targets['Fetch Stale'] Off
-    Click "Download files$ellipsis"
+    Invoke-NativeMenuAction 'Roster actions' "Download files$ellipsis"
     Choose-Parent
     Set-Field 'Remote file paths' ('/archive/snapshot.bin' + [Environment]::NewLine +
         [Environment]::NewLine + '/reports/snapshot.bin' + [Environment]::NewLine + '/archive/snapshot.bin')
@@ -157,7 +157,7 @@ try {
     Click 'Back to host group'
     Set-Field 'Host filter' 'Fetch East'
     $null = Wait-CheckBox $targets['Fetch East'] On
-    Click "Download files$ellipsis"
+    Invoke-NativeMenuAction 'Roster actions' "Download files$ellipsis"
     Choose-Parent
     [IO.File]::WriteAllText($gate, '')
     $start = (Read-PeerTrace $reader).Length

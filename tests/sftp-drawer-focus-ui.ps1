@@ -24,7 +24,9 @@ function Select-Row([string]$Name, [bool]$Directory, [string]$ExpectedWire) {
     Focus-Row $Name
     $null = Press-FocusedKey 0x20
     $null = Wait-Until "Space selected '$Name'" {
-        if ([IO.File]::ReadAllText($trace) -cne $ExpectedWire) { throw "A native drawer keystroke reached the SSH channel while '$Name' had focus" }
+        if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $traceReader)) -cne $ExpectedWire) {
+            throw "A native drawer keystroke reached the SSH channel while '$Name' had focus"
+        }
         (Find-Element 'Open folder' $button).Current.IsEnabled -eq $Directory -and (Find-Element $download $button).Current.IsEnabled -ne $Directory
     }
 }
@@ -37,7 +39,9 @@ function Focus-TerminalCanvas {
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+$scenarioFailure = $null
 try {
+    $traceReader = Open-PeerTraceReader $trace
     $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -60,21 +64,31 @@ try {
     Select-Row 'note.txt' $false 'canvas-typed'
 
     Invoke-Button (Wait-Until 'Find files button' { Find-Element ('Find files' + [char]0x2026) $button })
-    $null = Wait-Until 'focused file search query' {
+    $null = Wait-SftpSearchFocus 'focused file search query'
+    $null = Press-FocusedKey 0x51
+    $null = Wait-Until 'the first key goes to the new search field' {
         $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
-        $query -and $query.Current.HasKeyboardFocus
+        if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $traceReader)) -cne 'canvas-typed') {
+            throw 'The search keystroke reached SSH'
+        }
+        $query -and $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq 'q'
     }
     Focus-TerminalCanvas
     foreach ($ch in 'search-canvas-typed'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','search-canvas-typed')
     $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
-    if (!$query -or $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne '') {
+    if (!$query -or $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'q') {
         throw 'Returning to the terminal changed or closed the search'
     }
+} catch {
+    $scenarioFailure = $_
+    throw
 } finally {
-    if (!$app.HasExited) {
-        $null = $app.CloseMainWindow()
-        if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
+    if ($traceReader) { $traceReader.Dispose() }
+    try { Close-FixtureApp $app } catch {
+        if ($scenarioFailure) {
+            throw "$scenarioFailure at $($scenarioFailure.ScriptStackTrace)`nGUI cleanup also failed: $_"
+        }
+        throw
     }
-    $app.Dispose()
 }

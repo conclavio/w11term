@@ -2,6 +2,8 @@ use super::*;
 #[path = "../support/drive_gui.rs"]
 mod drive;
 use drive::{drive_gui, drive_mixed_gui};
+#[path = "agent_key_ui.rs"]
+mod agent_key_ui;
 #[path = "mixed_drop_ui.rs"]
 mod mixed_drop_ui;
 #[path = "recording_ui.rs"]
@@ -19,6 +21,87 @@ mod upload_folder_ui;
 use shared::run_gui;
 #[path = "properties_ui.rs"]
 mod properties_ui;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits a profile's jump route and authenticates with a browsed key and certificate"]
+async fn native_profile_jump_editor_saves_and_connects_the_ordered_route() {
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
+
+    let (Source::Ssh(destination), _destination_root, shells, destination_server) =
+        fixture_connections(false, 2).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(mut outer), outer_root, outer_shells, outer_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(mut inner), inner_root, inner_shells, inner_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    outer.user = "outer".into();
+    inner.user = "inner".into();
+    for (root, port) in [
+        (outer_root.path(), inner.port),
+        (inner_root.path(), destination.port),
+    ] {
+        fs::write(root.join("forward-port"), port.to_string()).unwrap();
+        fs::write(root.join("forward-trace"), []).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    let key_directory = state.path().join("jump keys");
+    fs::create_dir(&key_directory).unwrap();
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let pem = key.to_openssh(LineEnding::LF).unwrap();
+    let key_path = key_directory.join("selected key");
+    fs::write(&key_path, pem.as_bytes()).unwrap();
+    let ca = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let mut certificate = russh::keys::ssh_key::certificate::Builder::new_with_random_nonce(
+        &mut rand::rng(),
+        key.public_key().key_data().clone(),
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    certificate
+        .cert_type(russh::keys::ssh_key::certificate::CertType::User)
+        .unwrap();
+    certificate.valid_principal(outer.user.as_str()).unwrap();
+    let certificate = certificate.sign(&ca).unwrap().to_openssh().unwrap();
+    fs::write(key_directory.join("selected key-cert.pub"), &certificate).unwrap();
+    fs::write(
+        outer_root.path().join("authorized-certificate"),
+        &certificate,
+    )
+    .unwrap();
+    fs::write(
+        state.path().join("fixture-jumps.json"),
+        serde_json::to_vec(&[&outer, &inner]).unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("profile-jumps-ui.ps1", &destination, state.path());
+    assert!(
+        fs::read(&key_path).unwrap() == pem.as_bytes(),
+        "the file picker modified the fixture key"
+    );
+    for (root, port) in [
+        (outer_root.path(), inner.port),
+        (inner_root.path(), destination.port),
+    ] {
+        let trace = fs::read_to_string(root.join("forward-trace")).unwrap();
+        assert_eq!(trace.lines().count(), 1, "{trace}");
+        assert!(trace.starts_with(&format!("127.0.0.1:{port} ")), "{trace}");
+    }
+    assert_eq!(outer_shells.load(Ordering::Relaxed), 0);
+    assert_eq!(inner_shells.load(Ordering::Relaxed), 0);
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
+    outer_server.abort();
+    inner_server.abort();
+    destination_server.abort();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks persisted Follow Windows colors and reports against native UISettings"]
@@ -190,7 +273,29 @@ async fn serve_forward_http(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "imports loopback SSH forward presets through WinUI and starts one only on explicit request"]
+#[ignore = "manages two real loopback forwarding listeners across background SSH panes"]
+async fn native_active_port_forwards_manages_background_listeners() {
+    let (Source::Ssh(mut ssh), root, shells, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    ssh.player.reconnect = false;
+    let state = tempfile::tempdir().unwrap();
+    let (_, service) = serve_forward_http(state.path(), root.path(), 2).await;
+    fs::write(root.path().join("disconnect-on-eot"), []).unwrap();
+    drive_mixed_gui("active-port-forwards-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), service)
+            .await
+            .unwrap()
+            .unwrap(),
+        [1, 2]
+    );
+    assert_eq!(shells.load(Ordering::Relaxed), 2, "one shell per pane");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "imports and edits loopback SSH forward presets and starts one only on explicit request"]
 async fn native_imported_forward_preset_remains_inactive_across_save_open_and_reconnect() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), root, sessions, server) =
@@ -201,23 +306,25 @@ async fn native_imported_forward_preset_remains_inactive_across_save_open_and_re
     let state = tempfile::tempdir().unwrap();
     let (remote, service) = serve_forward_http(state.path(), root.path(), 1).await;
     let reservation = || std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let (supported, rejected) = (reservation(), reservation());
-    let (local, wildcard) = (
+    let (supported, rejected, manual) = (reservation(), reservation(), reservation());
+    let (local, wildcard, manual_port) = (
         supported.local_addr().unwrap().port(),
         rejected.local_addr().unwrap().port(),
+        manual.local_addr().unwrap().port(),
     );
     fs::write(state.path().join("config"), format!(
         "Host imported-loopback\n  HostName 127.0.0.1\n  User test\n  Port {}\n  LocalForward 127.0.0.1:{local} localhost:{remote}\n  LocalForward *:{wildcard} localhost:{remote}\n", ssh.port
     )).unwrap();
     fs::write(state.path().join("local-port"), local.to_string()).unwrap();
     fs::write(state.path().join("wildcard-port"), wildcard.to_string()).unwrap();
+    fs::write(state.path().join("manual-port"), manual_port.to_string()).unwrap();
     let gate = root.path().join("keep-first-connection");
     fs::write(&gate, []).unwrap();
     fs::write(state.path().join("disconnect-gate"), gate.to_str().unwrap()).unwrap();
     for log in ["authenticated-users", "keyboard-input.bin", "forward-trace"] {
         fs::write(root.path().join(log), []).unwrap();
     }
-    drop((supported, rejected));
+    drop((supported, rejected, manual));
     drive_mixed_gui("import-forward-preset-ui.ps1", &ssh, state.path());
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), service)
@@ -496,7 +603,7 @@ async fn native_word_delimiters_update_reader_and_pointer_selection_in_running_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reads OSC 133 captures from a read-only, inactive SSH pane across a live reconnect"]
+#[ignore = "reads and waits for OSC 133 captures in a read-only, inactive SSH pane across a live reconnect"]
 async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(mut ssh), remote, channels, server) =
@@ -518,6 +625,18 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
     stream.push_str(&"older row\r\n".repeat(150));
     stream.push_str("\x1b[3J\x1b]133;D;3\x07\r\nhistory-one-ready\r\n");
     fs::write(remote.path().join("copy-history.vt"), stream).unwrap();
+    fs::write(
+        remote.path().join("deferred-output.vt"),
+        format!(
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07background check\r\n\x1b]133;C\x07\x1b]133;D;0\x07\r\n",
+                "\x1b]133;A\x07$ \x1b]133;B\x07{}\r\n\x1b]133;C\x07{}\x1b]133;D;6\x07\r\n"
+            ),
+            command, output,
+        ),
+    )
+    .unwrap();
+    fs::write(remote.path().join("hold-shell-output"), []).unwrap();
     fs::write(remote.path().join("keyboard-input.bin"), []).unwrap();
     fs::write(remote.path().join("keep-first-connection"), []).unwrap();
     fs::write(
@@ -585,6 +704,73 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
         Some(&stream),
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "sorts actual shell captures by duration and checks their native timing details"]
+async fn native_ssh_history_displays_timing_and_sorts_slowest_first() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    fs::write(remote.path().join("hold-shell-output"), []).unwrap();
+    fs::write(
+        remote.path().join("copy-history.vt"),
+        b"\x1b]133;D;9\x07\x1b]133;A\x07$ \x1b]133;B\x07timing slow\r\n\x1b]133;C\x07timing-started\r\n",
+    )
+    .unwrap();
+    fs::write(
+        remote.path().join("deferred-output.vt"),
+        b"\x1b]133;D;2\x07\x1b]133;A\x07$ \x1b]133;B\x07timing quick\r\n\x1b]133;C\x07done\r\n\x1b]133;D;0\x07timing-ready\r\n",
+    )
+    .unwrap();
+    drive_mixed_gui("command-history-timing-ui.ps1", &ssh, state.path());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "compares retained outputs across native SSH panes and exports the full changes"]
+async fn native_history_compares_and_exports_two_shell_captures() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for (label, output, exit) in [
+        ("History before", "old result", 5),
+        ("History after", "new result", 0),
+    ] {
+        let (Source::Ssh(ssh), root, _, task) = fixture_server(false).await else {
+            unreachable!()
+        };
+        fs::write(
+            root.path().join("copy-history.vt"),
+            format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07check result\r\n\x1b]133;C\x07unchanged\r\n{output}\r\n\x1b]133;D;{exit}\x07capture-ready\r\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.path().join("keyboard-input.bin"), []).unwrap();
+        profiles.insert(label.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((root, task));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":profiles})).unwrap(),
+    )
+    .unwrap();
+    drive_gui("command-history-compare-ui.ps1", state.path());
+    for (root, task) in peers {
+        assert!(
+            fs::read(root.path().join("keyboard-input.bin"))
+                .unwrap()
+                .is_empty()
+        );
+        task.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -678,6 +864,7 @@ async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
     let mut packets = serde_json::Map::new();
     let mut expected = Vec::new();
     for (witness, prefix, completion) in [
+        ("preview-update", "", ""),
         ("first-complete", "", "\x1b]133;D;17\x07"),
         ("not-rearmed", start, "\x1b]133;D;0\x07"),
         ("cancel-complete", start, "\x1b]133;D;9\x07"),
@@ -711,9 +898,30 @@ async fn native_powershell_shell_integration_records_history_and_completion() {
     let state = tempfile::tempdir().unwrap();
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
+    let command = format!("inspect-history {} window-remote-needle", "s".repeat(132));
+    fs::create_dir(remote.path().join("remote history start")).unwrap();
+    fs::write(
+        remote.path().join("remote history start/history-proof"),
+        b"original folder",
+    )
+    .unwrap();
+    let encoded =
+        percent_encoding::utf8_percent_encode(&command, percent_encoding::NON_ALPHANUMERIC);
+    let padding = "background log line\r\n".repeat(480);
+    fs::write(
+        remote.path().join("copy-history.vt"),
+        format!(
+            "\x1b]7;file://127.0.0.1/remote%20history%20start\x07\x1b]133;A\x07$ \x1b]133;B\x07short display\r\n\x1b]133;C;cmdline_url={encoded}\x07{padding}remote result [42]\r\n\x1b]7;file://127.0.0.1/changed\x07\x1b]133;D;8\x07history ready\r\n"
+        ),
+    )
+    .unwrap();
     drive_mixed_gui("powershell-integration-ui.ps1", &ssh, state.path());
     assert_eq!(fs::read(trace).unwrap(), b"neighbor-ok");
-    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and its SFTP subsystem"
+    );
     server.abort();
 }
 
@@ -740,9 +948,103 @@ async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "zooms text in one split, preserves the adjacent shell and captures the adjusted font"]
+async fn native_pane_text_size_preserves_the_neighbor_and_screenshot_grid() {
+    run_palette_fixture("pane-text-size-ui.ps1", b"", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits both profile types and checks native grid, pane reset and PNG over SSH and PowerShell"]
+async fn native_profile_text_size_is_used_by_new_panes() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 3).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("profile-text-size-ui.ps1", &ssh, state.path());
+    assert!(fs::read(trace).unwrap().is_empty());
+    assert_eq!(opens.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens Files, Find, Commands, pane layout and Settings from native title-bar controls"]
+async fn native_title_tools_follow_the_active_ssh_and_powershell_panes() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    fs::write(remote.path().join("title-tools.txt"), []).unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("title-tools-ui.ps1", &ssh, state.path());
+    assert!(fs::read(trace).unwrap().is_empty());
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and SFTP"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "selects tabs at opposite ends of an overflowing native title strip"]
+async fn native_tab_search_reveals_the_selected_header_in_an_overflowing_strip() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("tab-overflow-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(trace).unwrap(), b"still-focused");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
 async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
     run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches native profiles for tabs and splits and revalidates the offered SSH endpoint"]
+async fn native_profile_finder_matches_address_and_opens_ssh_and_powershell() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), _remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    for number in 1..=18 {
+        let label = format!("Fleet {number:02}");
+        profiles.insert(
+            label,
+            json!({"host":format!("fleet-{number:02}.invalid"),"user":"ops","auth":"none"}),
+        );
+    }
+    profiles.insert("Fleet North".into(), serde_json::to_value(ssh).unwrap());
+    profiles.insert(
+        "Palette PowerShell".into(),
+        json!({"backend":"local","executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}),
+    );
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":profiles})).unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("profile-finder-ui.ps1", state.path());
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "only the two selected SSH shells"
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 2, "each SSH login");
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1107,6 +1409,45 @@ fn recording_burst(host: &str) -> String {
         .map(|index| format!("{host} record row {index:02}"))
         .collect::<Vec<_>>()
         .join("\r\n")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "unlocks a native OpenSSH key and verifies scoped opt-in reconnect reuse"]
+async fn native_encrypted_ssh_identity_can_retry_cancel_and_unlock() {
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
+
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 6).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    fs::write(
+        remote.path().join("authorized-key"),
+        key.public_key().to_openssh().unwrap(),
+    )
+    .unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    let identity = state.path().join("fixture-key.ed25519");
+    for (path, passphrase) in [
+        (identity.clone(), "ui-fixture-passphrase"),
+        (
+            state.path().join("rotated-key.ed25519"),
+            "ui-rotated-passphrase",
+        ),
+    ] {
+        let encrypted = key.encrypt(&mut rand::rng(), passphrase).unwrap();
+        fs::write(
+            path,
+            encrypted.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap();
+    }
+    ssh.authentication = Authentication::identity(identity, None);
+    ssh.player.reconnect = true;
+
+    drive_mixed_gui("ssh-identity-passphrase-ui.ps1", &ssh, state.path());
+    assert_eq!(opens.load(Ordering::Relaxed), 3);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2113,7 +2454,7 @@ async fn native_pane_names_identify_one_ssh_split_and_survive_workspace_restore(
 
     assert_eq!(
         fs::read(trace).unwrap(),
-        b"named-input/\x1b]2;changed-by-shell\x07restored-input/"
+        b"named-input/\x1b]2;changed-by-shell\x07rename-cancel-return/restored-input/"
     );
     assert_eq!(
         shells.load(Ordering::Relaxed),
@@ -2203,18 +2544,51 @@ async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "inspects live SSH modes and geometry from the CLI while PowerShell keeps input focus"]
 async fn native_inspect_reads_background_ssh_without_disturbing_powershell() {
-    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_server(false).await else {
         unreachable!()
     };
     let wire = remote.path().join("keyboard-input.bin");
+    let hold = remote.path().join("hold-shell-request");
     fs::write(&wire, []).unwrap();
+    fs::write(&hold, []).unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    ssh.player.reconnect = false;
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join("ssh-wire"), wire.to_str().unwrap()).unwrap();
+    fs::write(
+        state.path().join("hold-shell-request"),
+        hold.to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("inspect-pane-ui.ps1", &ssh, state.path());
     assert_eq!(
         opens.load(Ordering::Relaxed),
         1,
         "inspect opened an SSH channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reports shared and independent SSH transports and updates inspector membership live"]
+async fn native_inspector_tracks_other_panes_on_the_same_ssh_transport() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), _remote, channels, server) =
+        fixture_counting_accepts(false, 4, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("ssh-transport-membership-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        3,
+        "one shared login and two independent logins"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        4,
+        "one shell per pane or restart"
     );
     server.abort();
 }
@@ -2246,7 +2620,7 @@ async fn native_reopen_closed_tab_layout_restores_position_focus_and_input_lock(
 async fn native_reopen_closed_pane_keeps_the_neighboring_ssh_session() {
     check_mixed_tab_layout(
         "reopen-pane-ui.ps1",
-        b"before-local-close/after-local-reopen/",
+        b"before-local-close/after-local-reopen/after-control-close/",
         1,
     )
     .await;
@@ -2534,6 +2908,84 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "disconnects a reviewed SSH shell in a mixed split and checks scoped CLI disconnects"]
+async fn native_disconnect_ssh_shell_leaves_its_pane_and_powershell_neighbor() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 4, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("disconnect-ssh-shell-ui.ps1", &ssh, state.path());
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    assert_eq!(fs::read(trace).unwrap(), b"saved-history/after-cancel/");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "skips SSH reconnect waits from the native pane and CLI without replacing the pane"]
+async fn native_retry_ssh_now_skips_the_current_wait_and_keeps_pane_history() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 7, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let state = tempfile::tempdir().unwrap();
+    fs::write(remote.path().join("keep-first-connection"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("retry-ssh-now-ui.ps1", &ssh, state.path());
+    let matched = image::open(state.path().join("matched.png"))
+        .expect("wait-for-text should save a decodable terminal PNG");
+    assert!(matched.width() > 0 && matched.height() > 0);
+    assert_eq!(accepted.load(Ordering::Relaxed), 6);
+    assert_eq!(channels.load(Ordering::Relaxed), 6);
+    assert_eq!(
+        fs::read(trace).unwrap(),
+        b"before-retry/scoped-after-retry/"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "stops initial and retrying SSH attempts from pane actions and the CLI"]
+async fn native_stop_ssh_attempt_preserves_the_pane_and_rejects_stale_tokens() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 5, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(remote.path().join("withhold-shell-reply"), []).unwrap();
+    fs::write(remote.path().join("keep-first-connection"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("stop-ssh-attempt-ui.ps1", &ssh, state.path());
+    assert_eq!(accepted.load(Ordering::Relaxed), 5);
+    assert_eq!(channels.load(Ordering::Relaxed), 5);
+    assert_eq!(fs::read(trace).unwrap(), b"before-retry/");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "previews read-only remote text through the native drawer in a live SSH and PowerShell split"]
 async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
@@ -2737,6 +3189,29 @@ async fn native_sftp_compares_two_remote_text_files_across_folders_and_search() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "sets the per-profile SFTP starting folder and verifies both native download dialogs"]
+async fn native_sftp_download_dialogs_start_in_the_saved_profile_folder() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let preferred = picker.join("preferred downloads");
+    fs::create_dir_all(picker.join("usual marker")).unwrap();
+    fs::create_dir_all(preferred.join("preferred marker")).unwrap();
+    let parent = remote.path().join("shell directory");
+    fs::create_dir_all(parent.join("snapshot")).unwrap();
+    let bytes = b"downloaded to the saved folder\x00\xff";
+    fs::write(parent.join("payload.bin"), bytes).unwrap();
+
+    drive_mixed_gui("sftp-default-download-folder-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(preferred.join("payload.bin")).unwrap(), bytes);
+    assert!(!preferred.join("snapshot").exists());
+    assert!(!picker.join("payload.bin").exists());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
 async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
@@ -2920,10 +3395,12 @@ async fn native_sftp_transfers_tab_routes_cancellation_and_drawer_focus() {
     else {
         unreachable!()
     };
-    let (Source::Ssh(beta_ssh), beta, beta_channels, beta_server) = fixture_server(false).await
+    let (Source::Ssh(mut beta_ssh), beta, beta_channels, beta_server) = fixture_server(false).await
     else {
         unreachable!()
     };
+    beta_ssh.player.reconnect = false;
+    fs::write(beta.path().join("disconnect-on-eot"), []).unwrap();
     let state = tempfile::tempdir().unwrap();
     let picker = state.path().join("picker");
     let alpha_target = picker.join("alpha");
@@ -3140,6 +3617,50 @@ async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old
         ]
     );
     assert!(target.join("bookmark-witness.txt").is_file());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews, confirms and stops native SFTP deletes in the listing and search"]
+async fn native_sftp_deletes_only_reviewed_marks_and_stops_on_failure_or_request() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    for directory in ["a-empty", "b-occupied", "nested"] {
+        fs::create_dir_all(folder.join(directory)).unwrap();
+    }
+    for (name, bytes) in [
+        ("b-occupied/keep.txt", "inhabitant"),
+        ("c-queued.txt", "should survive failure"),
+        ("search-batch.txt", "root copy"),
+        ("nested/search-batch.txt", "should survive stop"),
+    ] {
+        fs::write(folder.join(name), bytes).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    fs::write(root.join("delete-trace.jsonl"), []).unwrap();
+
+    drive_mixed_gui("sftp-delete-marked-ui.ps1", &ssh, state.path());
+    assert!(!folder.join("a-empty").exists());
+    assert!(!folder.join("search-batch.txt").exists());
+    for (name, bytes) in [
+        ("b-occupied/keep.txt", "inhabitant"),
+        ("c-queued.txt", "should survive failure"),
+        ("nested/search-batch.txt", "should survive stop"),
+    ] {
+        assert_eq!(fs::read(folder.join(name)).unwrap(), bytes.as_bytes());
+    }
+    assert_eq!(
+        mutation_trace(root, "delete-trace.jsonl"),
+        [
+            ["RMDIR", "/shell directory/a-empty"],
+            ["RMDIR", "/shell directory/b-occupied"],
+            ["REMOVE", "/shell directory/search-batch.txt"],
+        ]
+    );
     server.abort();
 }
 

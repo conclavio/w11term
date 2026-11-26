@@ -35,6 +35,13 @@ pub(super) fn load(path: &Path, home: &Path, user: &str) -> Result<ImportReport>
     Ok(reader.parsed.report(home, user))
 }
 
+/// Open only a regular local file when a directive points outside the selected config.
+pub(super) fn open_local_identity(path: &Path) -> Result<Option<std::fs::File>> {
+    let full = path.to_str().context("non-Unicode IdentityFile path")?;
+    let normalized = absolute_pattern(full, Path::new(""), false)?;
+    local::open(&normalized, false)
+}
+
 #[cfg(test)]
 pub(super) fn parse_test(text: &str, home: &Path, user: &str) -> Result<ImportReport> {
     let mut reader = Reader::new(home);
@@ -262,17 +269,17 @@ fn pattern(raw: &str, home: &Path) -> Result<PathBuf> {
             !relative.starts_with(['\\', '/']) && !relative.contains(':'),
             "invalid home-relative Include"
         );
-        absolute_pattern(relative, home)
+        absolute_pattern(relative, home, true)
     } else {
         ensure!(
             !raw.starts_with('~'),
             "named-user home expansion is unsupported"
         );
-        absolute_pattern(raw, &home.join(".ssh"))
+        absolute_pattern(raw, &home.join(".ssh"), true)
     }
 }
 
-fn absolute_pattern(raw: &str, base: &Path) -> Result<PathBuf> {
+fn absolute_pattern(raw: &str, base: &Path, allow_glob: bool) -> Result<PathBuf> {
     ensure!(
         !raw.is_empty() && !raw.ends_with(['\\', '/']),
         "expected a config filename"
@@ -305,7 +312,7 @@ fn absolute_pattern(raw: &str, base: &Path) -> Result<PathBuf> {
                 result.pop();
             }
             _ => {
-                component(part, parts.peek().is_none())?;
+                component(part, allow_glob && parts.peek().is_none())?;
                 result.push(part);
             }
         }

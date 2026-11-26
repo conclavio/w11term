@@ -1,7 +1,7 @@
 //! Named workspace recipes. Slot IDs are scoped to a single saved layout.
 
 use crate::durable::DurableReference;
-use crate::options::{Authentication, Source, SshOptions, TabColor};
+use crate::options::{Authentication, ProfileTextSize, Source, SshOptions, TabColor};
 use crate::pane_layout::{Axis, Layout};
 use crate::tabs::TabTitle;
 use anyhow::{Context, Result, ensure};
@@ -135,14 +135,14 @@ impl SavedSource {
             (Source::Ssh(_), Some(name)) => Self::SavedProfile(name.into()),
             (Source::Ssh(options), None) => {
                 let mut options = options.clone();
-                for auth in options.authentications_mut() {
-                    let Authentication::Identity { identity } = auth else {
-                        continue;
-                    };
-                    ensure!(!identity.as_os_str().is_empty(), "Empty identity path");
-                    *identity = std::path::absolute(&*identity)?;
+                for path in options
+                    .authentications_mut()
+                    .flat_map(Authentication::credential_paths_mut)
+                {
+                    ensure!(!path.as_os_str().is_empty(), "Empty SSH credential path");
+                    *path = std::path::absolute(&*path)?;
                 }
-                if let Some(path) = &mut options.player.device_key {
+                if let Some(path) = options.player.device_key.as_deref_mut() {
                     ensure!(!path.as_os_str().is_empty(), "Empty device key path");
                     *path = std::path::absolute(&*path)?;
                 }
@@ -213,10 +213,14 @@ impl SavedSource {
                 for auth in std::iter::once(&options.authentication)
                     .chain(options.proxy_jump.iter().map(|hop| &hop.authentication))
                 {
-                    let Authentication::Identity { identity } = auth else {
-                        continue;
-                    };
-                    ensure!(identity.is_absolute(), "Expected an absolute identity path");
+                    ensure!(
+                        auth.identity_path().is_none_or(Path::is_absolute),
+                        "Expected an absolute identity path"
+                    );
+                    ensure!(
+                        auth.certificate_path().is_none_or(Path::is_absolute),
+                        "Expected an absolute SSH user certificate path"
+                    );
                 }
                 if let Some(path) = &options.player.device_key {
                     ensure!(path.is_absolute(), "Expected an absolute device key path");
@@ -302,14 +306,20 @@ enum SavedAxis {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedPane {
+    pub slot: u64,
+    pub source: SavedSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_name: Option<TabTitle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SavedLayout {
-    Leaf {
-        slot: u64,
-        source: SavedSource,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pane_name: Option<TabTitle>,
-    },
+    Leaf(SavedPane),
     Split {
         #[serde(with = "SavedAxis")]
         axis: Axis,
@@ -324,7 +334,7 @@ impl SavedLayout {
         layout: &Layout,
         depth: usize,
         slots: &mut BTreeMap<u64, u64>,
-        source: &mut impl FnMut(u64) -> Result<(SavedSource, Option<TabTitle>)>,
+        pane: &mut impl FnMut(u64) -> Result<(SavedSource, Option<TabTitle>, Option<f32>)>,
     ) -> Result<Self> {
         ensure!(depth <= MAX_DEPTH, "Workspace split tree is too deep");
         Ok(match layout {
@@ -334,12 +344,13 @@ impl SavedLayout {
                     slots.insert(*id, slot).is_none(),
                     "Pane occurs more than once"
                 );
-                let (source, pane_name) = source(*id)?;
-                Self::Leaf {
+                let (source, pane_name, font_size) = pane(*id)?;
+                Self::Leaf(SavedPane {
                     slot,
                     source,
                     pane_name,
-                }
+                    font_size,
+                })
             }
             Layout::Split {
                 axis,
@@ -349,20 +360,16 @@ impl SavedLayout {
             } => Self::Split {
                 axis: *axis,
                 ratio: *ratio,
-                first: Box::new(Self::capture(first, depth + 1, slots, source)?),
-                second: Box::new(Self::capture(second, depth + 1, slots, source)?),
+                first: Box::new(Self::capture(first, depth + 1, slots, pane)?),
+                second: Box::new(Self::capture(second, depth + 1, slots, pane)?),
             },
         })
     }
 
-    fn visit(
-        &self,
-        depth: usize,
-        leaf: &mut impl FnMut(u64, &SavedSource) -> Result<()>,
-    ) -> Result<()> {
+    fn visit(&self, depth: usize, leaf: &mut impl FnMut(&SavedPane) -> Result<()>) -> Result<()> {
         ensure!(depth <= MAX_DEPTH, "Workspace split tree is too deep");
         match self {
-            Self::Leaf { slot, source, .. } => leaf(*slot, source),
+            Self::Leaf(pane) => leaf(pane),
             Self::Split {
                 ratio,
                 first,
@@ -416,9 +423,9 @@ impl WorkspaceLaunch {
             .with_context(|| format!("Unknown workspace {name}"))?;
         let mut needs_profiles = false;
         for tab in &layout.tabs {
-            tab.layout.visit(0, &mut |_, source| {
-                needs_profiles |=
-                    !matches!(source, SavedSource::Local { .. }) && source.profile_name().is_some();
+            tab.layout.visit(0, &mut |pane| {
+                needs_profiles |= !matches!(pane.source, SavedSource::Local { .. })
+                    && pane.source.profile_name().is_some();
                 Ok(())
             })?;
         }
@@ -438,13 +445,13 @@ impl Workspace {
         active_tab: usize,
         mut source: impl FnMut(u64) -> Result<SavedSource>,
     ) -> Result<Self> {
-        Self::capture_with_pane_names(tabs, active_tab, |id| Ok((source(id)?, None)))
+        Self::capture_panes(tabs, active_tab, |id| Ok((source(id)?, None, None)))
     }
 
-    pub fn capture_with_pane_names<'a>(
+    pub fn capture_panes<'a>(
         tabs: impl IntoIterator<Item = (&'a Layout, u64)>,
         active_tab: usize,
-        mut source: impl FnMut(u64) -> Result<(SavedSource, Option<TabTitle>)>,
+        mut pane: impl FnMut(u64) -> Result<(SavedSource, Option<TabTitle>, Option<f32>)>,
     ) -> Result<Self> {
         let mut slots = BTreeMap::new();
         let mut saved = Self {
@@ -452,7 +459,7 @@ impl Workspace {
             tabs: vec![],
         };
         for (tree, focused) in tabs {
-            let layout = SavedLayout::capture(tree, 0, &mut slots, &mut source)?;
+            let layout = SavedLayout::capture(tree, 0, &mut slots, &mut pane)?;
             let focused = *slots
                 .get(&focused)
                 .context("Focused pane missing from workspace")?;
@@ -480,13 +487,21 @@ impl Workspace {
         let mut seen = BTreeSet::new();
         for tab in &self.tabs {
             let mut has_focus = false;
-            tab.layout.visit(0, &mut |slot, source| {
+            tab.layout.visit(0, &mut |pane| {
+                let slot = pane.slot;
                 ensure!(
                     slot > 0 && seen.insert(slot),
                     "Invalid or duplicate workspace slot {slot}"
                 );
                 has_focus |= slot == tab.focused;
-                source.validate()
+                ensure!(
+                    pane.font_size
+                        .is_none_or(|size| (f32::from(ProfileTextSize::MIN)
+                            ..=f32::from(ProfileTextSize::MAX))
+                            .contains(&size)),
+                    "Invalid workspace text size for pane {slot}"
+                );
+                pane.source.validate()
             })?;
             ensure!(has_focus, "Focused pane missing from its workspace tab");
         }
@@ -501,8 +516,8 @@ impl Workspace {
         self.validate()?;
         let mut sources = BTreeMap::new();
         for tab in &self.tabs {
-            tab.layout.visit(0, &mut |slot, source| {
-                sources.insert(slot, source.resolve(profiles)?);
+            tab.layout.visit(0, &mut |pane| {
+                sources.insert(pane.slot, pane.source.resolve(profiles)?);
                 Ok(())
             })?;
         }
@@ -620,11 +635,15 @@ mod tests {
             host: host.into(),
             user: "tester".into(),
             scrollback_lines: Default::default(),
+            connect_timeout_seconds: None,
+            keepalive: Default::default(),
             color_scheme: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             terminal_type: Default::default(),
             port: 22,
             authentication: Authentication::Agent,
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
             proxy_jump: Vec::new(),
@@ -800,33 +819,40 @@ mod tests {
     }
 
     #[test]
-    fn pane_names_round_trip_per_leaf_and_clear_without_changing_the_workspace_format() {
+    fn pane_appearance_round_trips_and_clears_without_changing_the_workspace_format() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("workspaces.json");
         let store = WorkspaceStore::new(path.clone());
         let mut split = Layout::Leaf(41);
         split.split(41, 87, Axis::Columns);
-        let capture = |name: Option<TabTitle>| {
-            let mut workspace = Workspace::capture_with_pane_names([(&split, 87)], 0, |id| {
+        let capture = |name: Option<TabTitle>, size| {
+            let mut workspace = Workspace::capture_panes([(&split, 87)], 0, |id| {
                 let pane_name = if id == 41 { name.clone() } else { None };
-                Ok((SavedSource::SavedProfile("ops".into()), pane_name))
+                let font_size = if id == 41 { size } else { None };
+                Ok((
+                    SavedSource::SavedProfile("ops".into()),
+                    pane_name,
+                    font_size,
+                ))
             })
             .unwrap();
             workspace.tabs[0].title = Some("Servers".to_owned().try_into().unwrap());
             workspace
         };
-        let named = capture(Some("Build 雪".to_owned().try_into().unwrap()));
+        let named = capture(Some("Build 雪".to_owned().try_into().unwrap()), Some(18.5));
         store.save("work", &named).unwrap();
         assert_eq!(store.load().unwrap()["work"], named);
         let mut json = serde_json::to_value(&named).unwrap();
         let layout = &mut json["tabs"][0]["layout"];
         assert_eq!(layout["first"]["pane_name"], "Build 雪");
+        assert_eq!(layout["first"]["font_size"], 18.5);
         assert!(layout["second"].get("pane_name").is_none());
+        assert!(layout["second"].get("font_size").is_none());
         assert_eq!(layout["first"]["source"], layout["second"]["source"]);
         layout["first"]["pane_name"] = serde_json::Value::String(" name ".into());
         assert!(serde_json::from_value::<Workspace>(json).is_err());
 
-        let cleared = capture(None);
+        let cleared = capture(None, None);
         store.save("work", &cleared).unwrap();
         let file: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -836,8 +862,26 @@ mod tests {
         assert_eq!(tab["focused"], 2);
         for child in ["first", "second"] {
             assert!(tab["layout"][child].get("pane_name").is_none());
+            assert!(tab["layout"][child].get("font_size").is_none());
         }
         assert_eq!(store.load().unwrap()["work"], cleared);
+    }
+
+    #[test]
+    fn workspace_rejects_invalid_pane_text_sizes_before_resolving_sources() {
+        let leaf = Layout::Leaf(9);
+        for size in [0.0, 73.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                Workspace::capture_panes([(&leaf, 9)], 0, |_| {
+                    Ok((SavedSource::Demo, None, Some(size)))
+                })
+                .is_err()
+            );
+        }
+        let mut json = serde_json::to_value(demo()).unwrap();
+        json["tabs"][0]["layout"]["font_size"] = serde_json::json!(1.0);
+        let workspace: Workspace = serde_json::from_value(json).unwrap();
+        assert!(workspace.resolve_sources(&BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -944,6 +988,7 @@ mod tests {
             cwd: Some(dir.path().to_owned()),
             scrollback_lines: "420".parse().unwrap(),
             color_scheme: crate::options::ColorScheme::OneHalfLight,
+            font_size: None,
             tab_color: crate::options::TabColor::Purple,
             powershell_integration: true,
         };
@@ -977,6 +1022,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 scrollback_lines: Default::default(),
                 color_scheme: Default::default(),
+                font_size: None,
                 tab_color: Default::default(),
                 powershell_integration: false,
                 args: Vec::new(),
@@ -1030,16 +1076,18 @@ mod tests {
             workspace.tabs[0].layout = SavedLayout::Split {
                 axis: Axis::Columns,
                 ratio,
-                first: Box::new(SavedLayout::Leaf {
+                first: Box::new(SavedLayout::Leaf(SavedPane {
                     slot: 1,
                     source: SavedSource::Demo,
                     pane_name: None,
-                }),
-                second: Box::new(SavedLayout::Leaf {
+                    font_size: None,
+                })),
+                second: Box::new(SavedLayout::Leaf(SavedPane {
                     slot: 2,
                     source: SavedSource::Demo,
                     pane_name: None,
-                }),
+                    font_size: None,
+                })),
             };
             assert!(workspace.validate().is_err());
         }
@@ -1103,17 +1151,28 @@ mod tests {
     #[test]
     fn ad_hoc_sources_keep_only_options_with_absolute_paths() {
         let mut options = ssh("dev.example");
-        options.authentication = Authentication::Identity {
-            identity: "keys/dev".into(),
-        };
+        options.authentication = Authentication::identity("keys/dev", None);
         let saved = SavedSource::capture(&Source::Ssh(options), None).unwrap();
         let Source::Ssh(options) = saved.resolve(&BTreeMap::new()).unwrap() else {
             panic!()
         };
-        let Authentication::Identity { identity } = options.authentication else {
+        let Authentication::Identity { identity, .. } = options.authentication else {
             panic!()
         };
-        assert_eq!(identity, std::path::absolute("keys/dev").unwrap());
+        assert_eq!(*identity, std::path::absolute("keys/dev").unwrap());
+        let mut options = ssh("dev.example");
+        let pin = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .unwrap();
+        options.authentication = Authentication::agent_certificate("keys/dev-cert.pub", Some(pin));
+        let saved = SavedSource::capture(&Source::Ssh(options), None).unwrap();
+        let Source::Ssh(options) = saved.resolve(&BTreeMap::new()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            options.authentication.certificate_path(),
+            Some(std::path::absolute("keys/dev-cert.pub").unwrap().as_path())
+        );
         assert!(SavedSource::capture(&Source::Replay("some-capture.vt".into()), None).is_ok());
     }
 }

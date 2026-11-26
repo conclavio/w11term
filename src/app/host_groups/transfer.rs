@@ -21,6 +21,12 @@ impl Direction {
         }
     }
 
+    pub(super) fn available(self, selected: &[Target]) -> bool {
+        selected
+            .iter()
+            .any(|target| target.connected && self.allows(target.state))
+    }
+
     fn allows(self, state: TargetState) -> bool {
         !state.is_authenticating()
             && (self == Self::Download || !matches!(state, TargetState::ReadOnly))
@@ -425,27 +431,6 @@ impl Report {
                     .content(StackPanel::new().spacing(8.0).keyed_children(details)),
             ))
     }
-}
-
-pub(super) fn button(
-    id: TabId,
-    selected: &[Target],
-    direction: Direction,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    Button::new()
-        .is_enabled(
-            selected
-                .iter()
-                .any(|target| target.connected && direction.allows(target.state)),
-        )
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(super::Action::Transfer(id, Action::Open(direction)))
-        }))
-        .content(match direction {
-            Direction::Upload => "Upload files…",
-            Direction::Download => "Download files…",
-        })
 }
 
 impl TerminalApp {

@@ -7,6 +7,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_SFTP_PICKER_SMOKE_DIR = Join-Path $State 'picker'
+$env:W11TERM_EXPORT_SMOKE_DIR = $State
 $profiles = Join-Path $State 'profiles.json'
 $alphaRoot = [IO.File]::ReadAllText((Join-Path $State 'alpha-root'))
 $betaRoot = [IO.File]::ReadAllText((Join-Path $State 'beta-root'))
@@ -156,6 +157,19 @@ try {
     if (Find-Element "Open download folder for transfer $firstId" $button) {
         throw 'A cancelled batch without saved items offered an Explorer action in history'
     }
+    Set-NativeExpansion "Transfer item details for $firstId" $true
+    $alphaLocal = Join-Path $State 'picker\alpha\bulk-alpha'
+    $null = Wait-Until 'cancelled item paths and the skipped queue count' {
+        (Find-Element "Remote${dot}/shell directory/bulk-alpha" $text) -and
+            (Test-TransferDestination $alphaLocal) -and
+            (Find-Element '1 item did not start' $text)
+    }
+    if (Find-Element "Remote${dot}/shell directory/queued-alpha" $text) {
+        throw 'A queued item was shown as attempted'
+    }
+    if (Find-Element "Show remote entry for item 1 of transfer $firstId" $button) {
+        throw 'A cancelled transfer offered a completed-item shortcut'
+    }
     if (!$waiting.WaitForExit(15000)) { throw 'The named-pipe waiter did not return' }
     $waitReply = [IO.File]::ReadAllText($waitPath) | ConvertFrom-Json
     if ($waiting.ExitCode -ne 0 -or !$waitReply.ok -or
@@ -189,10 +203,82 @@ try {
     if (@((Control @('sftp','list-transfers')).transfers).Count -ne 0) {
         throw 'The control pipe still lists an ended transfer'
     }
+    Set-NativeExpansion "Transfer item details for $secondId" $true
+    $betaLocal = Join-Path $State 'picker\beta\beta folder'
+    $null = Wait-Until 'completed folder details replace the expanded cancelled batch' {
+        (Find-Element "Remote${dot}/shell directory/beta folder" $text) -and
+            (Test-TransferDestination $betaLocal) -and
+            !(Find-Element '1 item did not start' $text)
+    }
+    $remoteAction = "Show remote entry for item 1 of transfer $secondId"
+    Click $remoteAction
+    Wait-Focus $beta
+    $null = Wait-Until 'transferred folder selected in its original SSH drawer' {
+        $open = Find-Element 'Open folder' $button
+        (Find-Element '/shell directory' $text) -and $open -and $open.Current.IsEnabled
+    }
+    Click 'Open folder'
+    $null = Wait-Until 'the selected entry was the transferred folder' {
+        (Find-Element '/shell directory/beta folder' $text) -and (Find-Element 'payload' $button)
+    }
+
+    $null = Control @('send-text','--pane',"$beta",'--no-paste','--base64','BA==')
+    Run-Palette 'SFTP transfers'
+    $null = Wait-Until 'completed history cannot browse a disconnected transport' {
+        $remote = Find-Element $remoteAction $button
+        $remote -and !$remote.Current.IsEnabled -and
+            (Find-Element "Show download in File Explorer for transfer $secondId" $button).Current.IsEnabled
+    }
+    $export = "Save recent transfers as JSON$ellipsis"
+    $reportPath = Join-Path $State 'sftp-transfers.json'
+    Click $export
+    $dialog = Wait-Until 'owned transfer history save dialog' {
+        Find-OwnedDialog 'Save recent SFTP transfers as JSON'
+    }
+    $null = Wait-Until 'cancel the export' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'export available after cancel' {
+        $item = Find-Element $export $button
+        $item -and $item.Current.IsEnabled
+    }
+    if ([IO.File]::Exists($reportPath)) { throw 'Cancelled export created a history file' }
+    Click $export
+    $dialog = Wait-Until 'owned transfer history save dialog reopens' {
+        Find-OwnedDialog 'Save recent SFTP transfers as JSON'
+    }
+    $null = Control @('close-pane','--pane',"$beta")
+    $null = Wait-Until 'confirm the export' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the history report has been published' { [IO.File]::Exists($reportPath) }
+
+    $report = [IO.File]::ReadAllText($reportPath) | ConvertFrom-Json
+    if ($report.schema_version -ne 1 -or $report.transfers.Count -ne 2) {
+        throw 'Export did not capture both visible results exactly once'
+    }
+    $saved = $report.transfers[0]
+    if ($saved.transfer_id -cne $secondId -or $saved.pane.id -ne $beta -or
+        $saved.pane.label -cne 'second-ssh' -or $saved.ssh.host -cne $profile.host -or
+        $saved.ssh.user -cne $profile.user -or $saved.ssh.port -ne $profile.port -or
+        $saved.finished_unix_ms -ne $finished.timestamp_ms -or $saved.outcome -cne 'completed' -or
+        $saved.saved_download.kind -cne 'folder' -or ![FixtureDialog]::SameDestination($betaLocal, $saved.saved_download.path) -or
+        $saved.details.completed.Count -ne 1 -or
+        $saved.details.completed[0].remote -cne '/shell directory/beta folder' -or
+        $saved.details.completed[0].bytes_transferred -le 0) {
+        throw "Unexpected completed transfer report: $($saved | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    $stopped = $report.transfers[1]
+    if ($stopped.transfer_id -cne $firstId -or $stopped.outcome -cne 'cancelled' -or !$stopped.background -or
+        $stopped.finished_unix_ms -ne $cancelled[0].timestamp_ms -or $stopped.saved_download -or
+        ![FixtureDialog]::SameDestination($alphaLocal, $stopped.details.stopped.local) -or
+        $stopped.details.stopped.outcome -cne 'cancelled' -or $stopped.details.not_started -ne 1) {
+        throw "Unexpected stopped transfer report: $($stopped | ConvertTo-Json -Depth 8 -Compress)"
+    }
 } catch {
+    $failure = $_
+    $details = if ($window) {
+        try { (Get-TransferDetailLabels | Where-Object { $_ -match '^(Remote|Windows|Cancelled) | did not start$' }) -join ' | ' } catch { }
+    }
     $alphaWire = if ($alphaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $alphaTrace)) }
     $betaWire = if ($betaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $betaTrace)) }
-    throw "$_ at $($_.ScriptStackTrace). First peer: $alphaWire Second peer: $betaWire"
+    throw "$failure at $($failure.ScriptStackTrace). Transfer details: [$details]. First peer: $alphaWire Second peer: $betaWire"
 } finally {
     if ($waiting) {
         if (!$waiting.HasExited) { $waiting.Kill(); $waiting.WaitForExit() }

@@ -94,7 +94,7 @@ try {
     Expect-Disabled
     Press-Key 0x75
     Wait-Geometry $false
-    Run-Palette $rotate
+    Invoke-NativeMenuAction 'Pane layout' $rotate
     Wait-Geometry $true
     Type-Ssh 'rotated/'
     Run-Palette ('Workspaces' + [char]0x2026)

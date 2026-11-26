@@ -87,6 +87,12 @@ jobs:
         env:
           W11TERM_VERIFY_HOSTED_PASTE: '1'
         run: cargo test --locked --features ui-smoke --test accessibility --test durable_ssh --test sftp -- --ignored --test-threads=1
+      - name: Verify server-required SSH factors with an independent loopback peer
+        run: |
+          $env:PYTHONPATH = "$env:RUNNER_TEMP/ssh-factor-fixture"
+          python -m pip install --only-binary=:all: --target $env:PYTHONPATH paramiko==4.0.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --features ui-smoke --test player_ssh key_second_factor:: -- --ignored --test-threads=1
       - name: Copy Unicode text through the real OSC 52 clipboard path
         run: |
           Set-Clipboard -Value 'w11term clipboard fixture'

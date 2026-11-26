@@ -1,7 +1,7 @@
 use crate::{
     clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     demo,
-    events::{ShellPrompt, SshConnectionPhase},
+    events::{RunningCommandTarget, ShellPrompt},
     options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
@@ -75,8 +75,23 @@ pub enum Command {
     Frames(tokio::sync::oneshot::Sender<FrameStore>),
     DescribePane(tokio::sync::oneshot::Sender<PaneDescription>),
     Inspect(bool),
+    WatchRunningCommand(RunningCommandTarget, bool),
+    ReadRunningOutput(
+        u64,
+        tokio::sync::oneshot::Sender<Result<RunningCommandSample, &'static str>>,
+    ),
+    WaitRunningOutput {
+        start_token: u64,
+        pattern: regex::Regex,
+        reply: tokio::sync::oneshot::Sender<crate::events::RunningOutputResult>,
+    },
+    WaitCommandCapture {
+        start_token: u64,
+        reply: tokio::sync::oneshot::Sender<crate::events::CommandCompletionResult>,
+    },
+    PruneCommandWaits,
     /// One read of the live model and its connection generation, even between paints.
-    ReadModes(tokio::sync::oneshot::Sender<(u64, terminal::TerminalModes)>),
+    ReadModes(tokio::sync::oneshot::Sender<PaneInspection>),
     Replay {
         action: ReplayAction,
         reply: tokio::sync::oneshot::Sender<Result<ReplayStatus, String>>,
@@ -99,6 +114,11 @@ pub enum Command {
     ClipboardPaste(ClipboardPaste, ClipboardReply),
     Text(String),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
+    ScopedRaw {
+        connection: u64,
+        bytes: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     SendGroupCommand {
         prompt: crate::events::PromptToken,
         text: Arc<str>,
@@ -114,6 +134,10 @@ pub enum Command {
     },
     InterruptGroupCommand {
         target: crate::events::GroupInterruptTarget,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    InterruptCommand {
+        start_token: u64,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     DisconnectSshShell {
@@ -264,8 +288,57 @@ impl Command {
 #[derive(Debug)]
 pub struct PaneDescription {
     pub(crate) frame: Arc<Snapshot>,
-    pub(crate) restart_token: Option<u64>,
-    pub(crate) ssh_phase: Option<SshConnectionPhase>,
+    pub(crate) connection: crate::events::SshConnectionSnapshot,
+    pub(crate) ssh_transport_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneInspection {
+    pub connection_generation: u64,
+    pub modes: terminal::TerminalModes,
+    pub running_command: Option<wezterm_term::RunningCommand>,
+    pub ssh: Option<Arc<ssh::VerifiedSshRoute>>,
+    pub ssh_transport: Option<Arc<ssh::SshTransport>>,
+    pub ssh_connection: Option<crate::events::SshConnectionPhase>,
+    pub ssh_progress: Option<Arc<ssh::ConnectionProgress>>,
+}
+
+impl PaneInspection {
+    fn read(
+        terminal: &wezterm_term::Terminal,
+        connection_generation: u64,
+        ssh: &ssh::ShareSlot,
+        events: &crate::events::Events,
+        progress: Option<&Arc<ssh::ConnectionProgress>>,
+    ) -> (Self, Option<ssh::TransportWatch>) {
+        use crate::events::SshConnectionPhase::*;
+        let (route, ssh_transport, transport_watch) = ssh
+            .inspect_transport(connection_generation)
+            .map_or((None, None, None), |(route, transport, watch)| {
+                (Some(route), Some(transport), Some(watch))
+            });
+        let ssh_connection = events.ssh_connection_phase();
+        let ssh_progress = match ssh_connection {
+            Some(Connecting | Reconnecting { .. } | Failed(_)) => progress.cloned(),
+            _ => None,
+        };
+        (
+            Self {
+                connection_generation,
+                modes: terminal::TerminalModes::read(terminal),
+                running_command: if events.shell_generation() == Some(connection_generation) {
+                    terminal.running_command()
+                } else {
+                    None
+                },
+                ssh: route,
+                ssh_transport,
+                ssh_connection,
+                ssh_progress,
+            },
+            transport_watch,
+        )
+    }
 }
 
 pub struct Session {
@@ -324,10 +397,40 @@ fn has_cell_pixels(size: TerminalSize) -> bool {
         && size.pixel_height >= size.rows
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct RunningCommandSample {
+    pub id: u64,
+    pub start_token: u64,
+    pub connection_generation: u64,
+    #[serde(flatten)]
+    pub output: RunningCommandOutput,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum RunningCommandOutput {
+    Unavailable,
+    Updating,
+    AlternateScreen,
+    #[serde(rename = "ready")]
+    Text {
+        text: String,
+        earlier_omitted: bool,
+    },
+}
+
 impl Session {
     /// Read the newest committed screen even while the pane shows scrollback.
     pub fn live_snapshot(&self) -> Arc<Snapshot> {
         self.live_frames.load()
+    }
+
+    pub fn running_command_snapshot(&self) -> Option<(u64, wezterm_term::RunningCommand)> {
+        let (generation, command) = self.live_frames.running_command()?;
+        if self.events.shell_generation() != Some(generation) {
+            return None;
+        }
+        Some((generation, command))
     }
 
     pub fn restart_exited(&self, token: u64) -> anyhow::Result<()> {
@@ -371,9 +474,7 @@ impl Session {
     }
     /// Require the same authenticated transport generation as a pane snapshot.
     pub fn ssh_connection_at(&self, generation: u64) -> Option<ssh::ConnectionShare> {
-        self.ssh_connection
-            .generation()
-            .and_then(|(current, link)| (current == generation).then_some(link))
+        self.ssh_connection.connection_at(generation)
     }
     pub fn ssh_connection_generation(&self) -> Option<u64> {
         self.ssh_connection
@@ -593,6 +694,7 @@ impl Session {
         launch_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let pane_id = NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (commands, input) = mpsc::unbounded_channel();
         let prompts = crate::prompts::Prompts::default();
         let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
@@ -601,6 +703,9 @@ impl Session {
             _ => None,
         };
         let events = crate::events::Events::with_group_prompt_pattern(group_prompt_pattern);
+        if matches!(source, Source::Ssh(_) | Source::Local(_)) {
+            events.track_pane_process();
+        }
         if matches!(source, Source::Ssh(_)) {
             let phase = if launch_gate.is_some() {
                 crate::events::SshConnectionPhase::Queued
@@ -669,7 +774,7 @@ impl Session {
         let worker_live_frames = live_frames.clone();
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
-        let ssh_connection = ssh::ShareSlot::default();
+        let ssh_connection = ssh::ShareSlot::for_pane(pane_id);
         let (durable, lifecycle) = saved
             .filter(|_| matches!(source, Source::Ssh(_)))
             .map(ssh::DurableControl::new)
@@ -719,7 +824,7 @@ impl Session {
             })
             .expect("starting terminal worker");
         Self {
-            pane_id: NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            pane_id,
             prompts,
             events,
             player,
@@ -791,11 +896,13 @@ async fn run(
         .map(group_prompt::Matcher::new);
     terminal.set_track_primary_prints(prompt_matcher.is_some());
     let restartable = can_restart(live_commands, sharing.startup.as_ref());
+    let published_ssh = sharing.published.clone();
     let mut launch =
         launch::Launcher::new(source.clone(), sharing, prompts.clone(), events.clone());
     let mut launch_id = 1u64;
     let mut phase = Phase::Running;
     let mut ssh_exit = None;
+    let mut ssh_progress = None;
     let mut queued_before_connection = 0usize;
     let mut show_progress = interactive;
     let endpoint = match &source {
@@ -865,6 +972,8 @@ async fn run(
     let mut connection_generation = 0;
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let mut inspecting = false;
+    let mut published_running = None;
+    let mut waiting_for_output = false;
     let mut replay_label = None;
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
@@ -961,15 +1070,35 @@ async fn run(
                     .take()
                     .unwrap_or(crate::events::SshConnectionPhase::Disconnected)
             });
-            if restartable {
-                events.pane_exited(launch_id, ssh_phase);
-            } else if let Some(phase) = ssh_phase {
-                events.set_ssh_connection_phase(phase);
+            events.pane_exited(launch_id, ssh_phase, restartable);
+        }
+        if live_commands {
+            let running = terminal
+                .running_command()
+                .map(|command| (connection_generation, command));
+            if running != published_running {
+                events.retain_running_capture(
+                    running.as_ref().map(|(generation, command)| {
+                        RunningCommandTarget::new(*generation, command)
+                    }),
+                );
+                live_frames.set_running_command(running.clone());
+                published_running = running;
             }
         }
-        if inspecting {
-            frames.set_inspection(Some(terminal::TerminalModes::read(&terminal)));
-        }
+        let mut inspected_transport = if inspecting {
+            let (inspection, transport) = PaneInspection::read(
+                &terminal,
+                connection_generation,
+                &published_ssh,
+                &events,
+                ssh_progress.as_ref(),
+            );
+            frames.set_inspection(Some(inspection));
+            transport
+        } else {
+            None
+        };
         let notification_expiry = events.next_notification_expiry();
         let animation_deadline = presentation.animation_deadline(&terminal);
         let replay_deadline = animation_deadline
@@ -977,6 +1106,11 @@ async fn run(
             .chain(presentation.deadline)
             .min();
         tokio::select! {
+            _ = async {
+                if let Some(transport) = &mut inspected_transport {
+                    let _ = transport.changed().await;
+                }
+            }, if inspected_transport.is_some() => {},
             step = async { playback.as_mut().unwrap().next(replay_deadline).await }, if playback.is_some() => {
                 use crate::recorder::ReplayEvent;
                 use timed_replay::Update;
@@ -1070,7 +1204,8 @@ async fn run(
                             continue;
                         }
                         Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
-                        Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
+                        Some(Command::InterruptCommand { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; Ctrl+C was not sent.".into())); continue; }
+                        Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::NotificationReply(_)) => continue,
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
@@ -1092,8 +1227,8 @@ async fn run(
                             let _ = reply.send(Err(reason.into()));
                             continue;
                         }
-                        Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
-                        Some(Command::Raw(_, reply)) => {
+                        Some(Command::InterruptGroupCommand { reply, .. } | Command::InterruptCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
+                        Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
                         }
@@ -1103,6 +1238,20 @@ async fn run(
                         other => other,
                     }
                 } else { command };
+                let command = match command {
+                    Some(Command::ScopedRaw { connection, reply, .. })
+                        if !interactive || connection != connection_generation =>
+                    {
+                        let reason = if interactive {
+                            terminal::ScopedInput::Raw.stale_error()
+                        } else {
+                            "raw input requires an SSH or local shell"
+                        };
+                        let _ = reply.send(Err(reason.into()));
+                        continue;
+                    }
+                    other => other,
+                };
                 if group_shell && (prompt_matcher.is_some() || matches!(events.shell_prompt(), Some(
                     ShellPrompt::Ready(_) | ShellPrompt::Matched(_) | ShellPrompt::Opening
                 ))) && match &command {
@@ -1113,7 +1262,7 @@ async fn run(
                         terminal::encode_key_input(&terminal, *key, *modifiers, *down, *repeat, details)
                             .is_ok_and(|wire| !wire.is_empty()),
                     Some(Command::Paste(text) | Command::Text(text) | Command::Composed(text)) => !text.is_empty(),
-                    Some(Command::Raw(bytes, _)) => !bytes.is_empty(),
+                    Some(Command::Raw(bytes, _) | Command::ScopedRaw { bytes, .. }) => !bytes.is_empty(),
                     Some(Command::Mouse(_) | Command::MouseLeave { .. } | Command::Wheel(..)) => terminal.is_mouse_grabbed(),
                     Some(Command::Focus(_)) => terminal.focus_tracking_enabled(),
                     _ => false,
@@ -1164,7 +1313,7 @@ async fn run(
                         }
                         match terminal::group_command_bytes(&terminal, &text) {
                             Ok(bytes) => {
-                                if write_group_input(&writer, prompt.connection, bytes, reply, kind) {
+                                if write_scoped_input(&writer, prompt.connection, bytes, reply, kind) {
                                     events.observe_group_command(prompt.connection, text, execution, transcript);
                                 }
                             }
@@ -1183,11 +1332,30 @@ async fn run(
                         } else if !events.group_command_running(target) {
                             Err(terminal::GROUP_COMMAND_ENDED.into())
                         } else {
-                            terminal::group_interrupt_bytes(&terminal).map_err(|error| error.to_string())
+                            terminal::interrupt_bytes(&terminal).map_err(|error| error.to_string())
                         };
                         match bytes {
-                            Ok(bytes) => { write_group_input(&writer, target.generation, bytes, reply, kind); }
+                            Ok(bytes) => { write_scoped_input(&writer, target.generation, bytes, reply, kind); }
                             Err(error) => { let _ = reply.send(Err(error)); }
+                        }
+                        Ok(())
+                    }
+                    Some(Command::InterruptCommand { start_token, reply }) => {
+                        if !reply.is_closed() {
+                            let dispatch = if prompts.current().is_some() {
+                                Err("The host requires authentication.".into())
+                            } else {
+                                prepare_command_interrupt(&terminal, &events, connection_generation, start_token)
+                            };
+                            match dispatch {
+                                Ok((bytes, permit)) => {
+                                    write_scoped_input(
+                                        &writer, connection_generation, bytes, reply,
+                                        terminal::ScopedInput::CommandInterrupt(permit),
+                                    );
+                                }
+                                Err(reason) => { let _ = reply.send(Err(reason)); }
+                            }
                         }
                         Ok(())
                     }
@@ -1250,6 +1418,7 @@ async fn run(
                     Some(Command::RestartExited(ClaimedRestart { token, login_permits })) => {
                         if phase == Phase::Exited && restartable && token == launch_id {
                             launch_id += 1;
+                            ssh_progress = None;
                             phase = Phase::Restarting { reset: true };
                             search_origin = Arc::new(());
                             terminal.reset_connection();
@@ -1282,6 +1451,9 @@ async fn run(
                     }
                     Some(Command::SetReadOnly(enabled)) => {
                         read_only = enabled;
+                        if enabled {
+                            events.cancel_command_interrupt();
+                        }
                         if enabled && matches!(last_mouse.button, wezterm_term::MouseButton::Left | wezterm_term::MouseButton::Middle | wezterm_term::MouseButton::Right)
                             && last_mouse.kind != wezterm_term::MouseEventKind::Release {
                             let release = MouseEvent { kind: wezterm_term::MouseEventKind::Release, ..last_mouse };
@@ -1314,11 +1486,13 @@ async fn run(
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
                     Some(Command::DescribePane(reply)) => {
-                        let (restart_token, ssh_phase) = events.exit_snapshot();
+                        let frame = live_frames.load();
+                        let ssh_transport_id = published_ssh.connection_at(frame.connection_generation)
+                            .map(|link| link.transport_id());
                         let _ = reply.send(PaneDescription {
-                            frame: live_frames.load(),
-                            restart_token,
-                            ssh_phase,
+                            frame,
+                            connection: events.connection_snapshot(),
+                            ssh_transport_id,
                         });
                         Ok(())
                     }
@@ -1327,9 +1501,52 @@ async fn run(
                         if !enabled { frames.set_inspection(None); }
                         Ok(())
                     },
+                    Some(Command::WatchRunningCommand(target, armed)) => {
+                        if terminal.running_command().is_some_and(|command| {
+                            target == RunningCommandTarget::new(connection_generation, &command)
+                        }) {
+                            events.set_running_command_watch(target, armed);
+                        }
+                        Ok(())
+                    }
+                    Some(Command::ReadRunningOutput(start_token, reply)) => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(read_running_output(
+                                &terminal, &events, connection_generation, start_token,
+                            ));
+                        }
+                        Ok(())
+                    }
+                    Some(Command::WaitRunningOutput { start_token, pattern, reply }) => {
+                        if !reply.is_closed() {
+                            match find_running_command(&terminal, &events, connection_generation, start_token) {
+                                Ok(command) => {
+                                    events.watch_running_output(
+                                        RunningCommandTarget::new(connection_generation, &command),
+                                        pattern, reply,
+                                    );
+                                    terminal.notify_running_shell_output();
+                                    waiting_for_output = events.prune_command_waits();
+                                }
+                                Err(reason) => { let _ = reply.send(Err(reason)); }
+                            }
+                        }
+                        Ok(())
+                    }
+                    Some(Command::WaitCommandCapture { start_token, reply }) => {
+                        wait_for_capture(&terminal, &events, connection_generation, live_commands, start_token, reply);
+                        Ok(())
+                    }
+                    Some(Command::PruneCommandWaits) => {
+                        waiting_for_output = events.prune_command_waits();
+                        Ok(())
+                    }
                     Some(Command::ReadModes(reply)) => {
                         if !reply.is_closed() {
-                            let _ = reply.send((connection_generation, terminal::TerminalModes::read(&terminal)));
+                            let (inspection, _) = PaneInspection::read(
+                                &terminal, connection_generation, &published_ssh, &events, ssh_progress.as_ref(),
+                            );
+                            let _ = reply.send(inspection);
                         }
                         Ok(())
                     }
@@ -1353,6 +1570,18 @@ async fn run(
                             if let Err(error) = writer.send(TransportInput::Raw(bytes, reply))
                                 && let TransportInput::Raw(_, reply) = error.0 { let _ = reply.send(Err("Terminal connection is closed".into())); }
                         } else { let _ = reply.send(Err("raw input requires an SSH or local shell".into())); }
+                        Ok(())
+                    }
+                    Some(Command::ScopedRaw { connection, bytes, reply }) => {
+                        let input = TransportInput::Scoped {
+                            connection,
+                            bytes,
+                            reply,
+                            kind: terminal::ScopedInput::Raw,
+                        };
+                        if let Err(error) = writer.send(input) {
+                            error.0.reject_input("Terminal connection is closed");
+                        }
                         Ok(())
                     }
                     Some(Command::Capture(reply)) => {
@@ -1664,6 +1893,7 @@ async fn run(
                             show_progress = interactive;
                         }
                         ssh::Event::Reconnecting(attempt) => {
+                            ssh_progress = None;
                             events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Reconnecting {
                                 attempt: Some(attempt),
                             });
@@ -1676,8 +1906,15 @@ async fn run(
                             log::info!("{status}");
                         }
                         ssh::Event::ConnectionStopped => {
+                            ssh_progress = None;
                             ssh_exit = Some(crate::events::SshConnectionPhase::Stopped);
                             status = "SSH connection attempt stopped".into();
+                        }
+                        ssh::Event::ConnectionProgress(progress) => {
+                            if ssh_progress.as_ref() != Some(&progress) {
+                                events.push("ssh-step", serde_json::json!(progress.as_ref()));
+                                ssh_progress = Some(progress);
+                            }
                         }
                         ssh::Event::Data(bytes) => {
                             if observed.receiver_count() > 0 {
@@ -1689,8 +1926,11 @@ async fn run(
                             let program_before = terminal.program_status().cloned();
                             let seq_before = terminal.current_seqno();
                             scroll_offset = presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
-                            if group_shell {
+                            if group_shell || waiting_for_output {
                                 terminal.notify_running_shell_output();
+                                if waiting_for_output {
+                                    waiting_for_output = events.prune_command_waits();
+                                }
                             }
                             if let Some(matcher) = &mut prompt_matcher
                                 && connection_generation != 0
@@ -1718,6 +1958,7 @@ async fn run(
                             presentation.refresh_view = true;
                         }
                         ssh::Event::Connected(generation) => {
+                            ssh_progress = None;
                             if let Some(matcher) = &mut prompt_matcher { matcher.reset(); }
                             search_origin = Arc::new(());
                             if matches!(phase, Phase::Restarting { .. }) {
@@ -1735,9 +1976,7 @@ async fn run(
                             phase = Phase::Running;
                             events.command_stream(live_commands.then_some(generation));
                             events.notification_stream(interactive.then_some(generation));
-                            if is_ssh {
-                                events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connected);
-                            }
+                            events.terminal_connected(generation, is_ssh);
                         }
                     }
                 }
@@ -1758,6 +1997,108 @@ async fn run(
     }
 }
 
+fn wait_for_capture(
+    terminal: &wezterm_term::TerminalState,
+    events: &crate::events::Events,
+    generation: u64,
+    live_commands: bool,
+    start_token: u64,
+    reply: tokio::sync::oneshot::Sender<crate::events::CommandCompletionResult>,
+) {
+    if reply.is_closed() {
+        return;
+    }
+    if !live_commands {
+        let _ = reply.send(Err("command start tokens require a live shell"));
+        return;
+    }
+    if let Some(command) = terminal
+        .command_history()
+        .iter()
+        .find(|command| command.start_token == Some(start_token))
+    {
+        let _ = reply.send(Ok(crate::events::CommandCompletionCapture {
+            connection_generation: generation,
+            command: command.clone(),
+        }));
+    } else if let Ok(command) = find_running_command(terminal, events, generation, start_token) {
+        events.watch_command_completion(RunningCommandTarget::new(generation, &command), reply);
+    } else {
+        let _ = reply.send(Err(
+            "that command capture is no longer running or retained in this pane",
+        ));
+    }
+}
+
+fn prepare_command_interrupt(
+    terminal: &wezterm_term::Terminal,
+    events: &crate::events::Events,
+    generation: u64,
+    start_token: u64,
+) -> Result<(Vec<u8>, crate::events::CommandInterruptPermit), String> {
+    let running = find_running_command(terminal, events, generation, start_token)?;
+    let bytes = terminal::interrupt_bytes(terminal).map_err(|error| error.to_string())?;
+    let permit = events
+        .arm_command_interrupt(RunningCommandTarget::new(generation, &running))
+        .ok_or(terminal::COMMAND_INTERRUPT_EXPIRED)?;
+    Ok((bytes, permit))
+}
+
+fn read_running_output(
+    terminal: &wezterm_term::TerminalState,
+    events: &crate::events::Events,
+    generation: u64,
+    start_token: u64,
+) -> Result<RunningCommandSample, &'static str> {
+    let running = find_running_command(terminal, events, generation, start_token)?;
+    Ok(RunningCommandSample {
+        id: running.id,
+        start_token,
+        connection_generation: generation,
+        output: sample_running_output(terminal),
+    })
+}
+
+fn find_running_command(
+    terminal: &wezterm_term::TerminalState,
+    events: &crate::events::Events,
+    generation: u64,
+    start_token: u64,
+) -> Result<wezterm_term::RunningCommand, &'static str> {
+    terminal
+        .running_command()
+        .filter(|command| command.start_token == start_token)
+        .filter(|_| events.shell_generation() == Some(generation))
+        .ok_or("that command capture is no longer running in this pane")
+}
+
+fn sample_running_output(terminal: &wezterm_term::TerminalState) -> RunningCommandOutput {
+    use RunningCommandOutput::*;
+    if terminal.synchronized_output() {
+        return Updating;
+    }
+    if terminal.is_alt_screen_active() {
+        return AlternateScreen;
+    }
+    let Some(batch) = terminal.recent_running_command_output() else {
+        return Unavailable;
+    };
+    let mut text = String::new();
+    for (index, line) in batch.lines.iter().enumerate() {
+        if index != 0 {
+            text.push('\n');
+        }
+        text.push_str(&line.text);
+        if line.shortened {
+            text.push('…');
+        }
+    }
+    Text {
+        text,
+        earlier_omitted: batch.gap,
+    }
+}
+
 fn send_notification_reply(
     writer: &mpsc::UnboundedSender<TransportInput>,
     generation: u64,
@@ -1774,7 +2115,7 @@ fn send_notification_reply(
     }
 }
 
-fn write_group_input(
+fn write_scoped_input(
     writer: &mpsc::UnboundedSender<TransportInput>,
     connection: u64,
     bytes: Vec<u8>,
@@ -1980,6 +2321,82 @@ mod failure_tests {
     }
 
     #[test]
+    fn exact_completion_can_read_retained_results_after_the_shell_exits() {
+        let (writer, _) = mpsc::unbounded_channel();
+        let mut terminal = terminal::create(TerminalSize::default(), writer);
+        let events = crate::events::Events::default();
+        terminal.advance_bytes(b"\x1b]133;C\x07saved");
+        let original = terminal.running_command().unwrap();
+        terminal.advance_bytes(b"\x1b]133;D;6\x07");
+        let fetch = |live, token| {
+            let (reply, mut response) = tokio::sync::oneshot::channel();
+            wait_for_capture(&terminal, &events, 4, live, token, reply);
+            response.try_recv().unwrap()
+        };
+        let found = fetch(true, original.start_token).unwrap();
+        assert_eq!(found.connection_generation, 4);
+        assert_eq!(found.command.exit_code, Some(6));
+        assert_eq!(found.command.output.as_deref().unwrap(), "saved");
+        assert!(fetch(true, original.start_token + 1).is_err());
+        assert!(fetch(false, original.start_token).is_err());
+    }
+
+    #[test]
+    fn running_output_reads_only_the_selected_capture_and_bounds_the_tail() {
+        use RunningCommandOutput::{AlternateScreen, Text, Updating};
+        let (writer, _) = mpsc::unbounded_channel();
+        let mut terminal = terminal::create(
+            TerminalSize {
+                cols: 12,
+                rows: 4,
+                ..Default::default()
+            },
+            writer,
+        );
+        let events = crate::events::Events::default();
+        events.command_stream(Some(8));
+        terminal.advance_bytes(b"$ build\r\n\x1b]133;C\x07abcdefghijklmno\r\npartial");
+        let start_token = terminal.running_command().unwrap().start_token;
+        let read = |terminal: &wezterm_term::Terminal| {
+            read_running_output(terminal, &events, 8, start_token).map(|sample| sample.output)
+        };
+        assert!(matches!(
+            read(&terminal),
+            Ok(Text { text, earlier_omitted: false }) if text == "abcdefghijklmno\npartial"
+        ));
+
+        terminal.advance_bytes(b"\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\nlast");
+        assert!(matches!(
+            read(&terminal),
+            Ok(Text { text, earlier_omitted: true }) if text == "3\n4\n5\n6\n7\nlast"
+        ));
+        terminal.advance_bytes(b"\x1b[?2026h-new");
+        assert!(matches!(read(&terminal), Ok(Updating)));
+        terminal.advance_bytes(b"\x1b[?2026l");
+        assert!(matches!(read(&terminal), Ok(Text { text, .. }) if text.ends_with("last-new")));
+
+        terminal.advance_bytes(b"\x1b[?1049hTUI");
+        assert!(matches!(read(&terminal), Ok(AlternateScreen)));
+        terminal.advance_bytes(b"\x1b[?1049l");
+        assert!(matches!(read(&terminal), Ok(Text { text, .. }) if text.ends_with("last-new")));
+        events.command_stream(Some(9));
+        assert!(read(&terminal).is_err());
+        events.command_stream(Some(8));
+        let old_id = terminal.running_command().unwrap().id;
+        terminal.advance_bytes(b"\x1b]133;C\x07replacement");
+        let replacement = terminal.running_command().unwrap();
+        assert_eq!(replacement.id, old_id);
+        assert_ne!(replacement.start_token, start_token);
+        assert!(read(&terminal).is_err());
+        assert!(matches!(
+            read_running_output(&terminal, &events, 8, replacement.start_token).unwrap().output,
+            Text { text, .. } if text == "replacement"
+        ));
+        terminal.advance_bytes(b"\x1b]133;D;0\x07\x1b]133;C\x07other");
+        assert!(read(&terminal).is_err());
+    }
+
+    #[test]
     fn command_watch_accepts_live_shells_and_excludes_reconstructed_streams() {
         let mut ssh: crate::options::SshOptions = serde_json::from_value(
             serde_json::json!({"user":"user","host":"localhost","auth":"none"}),
@@ -2002,6 +2419,7 @@ mod failure_tests {
                 powershell_integration: false,
                 scrollback_lines: Default::default(),
                 color_scheme: Default::default(),
+                font_size: None,
                 tab_color: Default::default(),
             }
         )));

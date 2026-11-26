@@ -24,7 +24,6 @@ const RESULT_SORTS: [(ResultSort, &str); 4] = [
 pub enum Action {
     Show(u64),
     Restore(u64),
-    FocusQuery(u64, u8),
     Query(u64, String),
     SetOption(u64, MatchOption),
     ShowAdvanced(u64, bool),
@@ -698,6 +697,14 @@ impl Panel {
                         ready && !marked.is_empty(),
                     ),
                 ));
+                actions.push(KeyedView::new(
+                    "delete-marked",
+                    button(
+                        "Delete marked entries…",
+                        Action::StartFolderBatch(serial, FolderBatchKind::Delete),
+                        ready && !marked.is_empty(),
+                    ),
+                ));
             }
             rows.push(KeyedView::new(
                 "marking",
@@ -1193,6 +1200,7 @@ impl FileDrawer {
     }
 
     pub(super) fn close_search(&mut self) {
+        self.search_focus = None;
         if let Some(panel) = self.search.take() {
             if let Some(cancel) = panel.cancel {
                 cancel.cancel();
@@ -1209,6 +1217,8 @@ impl FileDrawer {
         self.end_filter_edit();
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         panel.serial = self.dialog_serial;
+        panel.input = ElementRef::new();
+        self.search_focus = Some(panel.serial);
         self.status = panel
             .result
             .as_ref()
@@ -1481,6 +1491,53 @@ impl FileDrawer {
         }
     }
 
+    pub(super) fn publish_search_focus(&self, pane: u64, ctx: &mut ViewContext<TerminalApp>) {
+        let Some(serial) = self.search_focus else {
+            return;
+        };
+        if self.search_serial() != Some(serial) || self.busy() {
+            return;
+        }
+        let generation = self.generation;
+        let sender = ctx.sender();
+        // The toolbar or results button disappears when the form opens.
+        // Focus its replacement after Reactor has published the new tree.
+        ctx.use_effect("focus SFTP search", (pane, generation, serial), move || {
+            sender.send(Message::Files(FileAction::FocusSearch(
+                pane, generation, serial, 0,
+            )));
+            None
+        });
+    }
+
+    pub(super) fn focus_search_query(
+        &mut self,
+        pane: u64,
+        serial: u64,
+        attempt: u8,
+        allowed: bool,
+        ctx: &ComponentContext<TerminalApp>,
+    ) {
+        if attempt == 0
+            && self
+                .search_focus
+                .take_if(|pending| *pending == serial)
+                .is_none()
+        {
+            return;
+        }
+        if !allowed || !self.open || self.busy() {
+            return;
+        }
+        let Some(panel) = self.search.as_ref().filter(|panel| panel.serial == serial) else {
+            return;
+        };
+        // Layout the new scrollable form before requesting native focus.
+        let _ = panel.input.request_bring_into_view();
+        let next = FileAction::FocusSearch(pane, self.generation, serial, attempt + 1);
+        focus_file_input(&panel.input, attempt, next, ctx);
+    }
+
     pub(super) fn filename_search(
         &mut self,
         pane: u64,
@@ -1516,21 +1573,11 @@ impl FileDrawer {
                 copy_status: None,
                 marked_downloads: None,
             });
-            ctx.sender().send(Message::Files(FileAction::Search(
-                pane,
-                self.generation,
-                Action::FocusQuery(self.dialog_serial, 0),
-            )));
+            self.search_focus = Some(self.dialog_serial);
             return Ok(());
         }
         if let Action::Restore(serial) = action {
-            if let Some(serial) = self.restore_search(serial) {
-                ctx.sender().send(Message::Files(FileAction::Search(
-                    pane,
-                    self.generation,
-                    Action::FocusQuery(serial, 0),
-                )));
-            }
+            let _ = self.restore_search(serial);
             return Ok(());
         }
         if let Action::Saved(serial, action) = action {
@@ -1541,14 +1588,6 @@ impl FileDrawer {
             return Ok(());
         };
         match action {
-            Action::FocusQuery(serial, attempt) if serial == panel.serial && !busy => {
-                let next = FileAction::Search(
-                    pane,
-                    self.generation,
-                    Action::FocusQuery(serial, attempt + 1),
-                );
-                focus_file_input(&panel.input, attempt, next, ctx);
-            }
             Action::Query(serial, query) if serial == panel.serial && !busy => {
                 if panel.query != query {
                     panel.query = query;
@@ -1988,7 +2027,10 @@ mod tests {
         };
         assert_eq!(drawer.restore_search(6), None);
         assert!(drawer.search.is_none());
+        let former_input = drawer.saved_search.as_ref().unwrap().input.clone();
         assert_eq!(drawer.restore_search(7), Some(8));
+        assert_eq!(drawer.search_focus, Some(8));
+        assert!(drawer.search.as_ref().unwrap().input != former_input);
         let mut panel = drawer.search.take().unwrap();
         assert_eq!(panel.page, 1);
         assert_eq!(panel.query, "log");

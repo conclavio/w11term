@@ -50,12 +50,22 @@ function Select-Fish {
     if ($selector -and $selector.TryGetCurrentPattern($expand, [ref]$popup) -and
         $popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
+function Open-EnvironmentReview {
+    $null = Wait-Until 'both shown recipients are back at fresh prompts' {
+        Find-Element '2 of 2 selected hosts ready'
+    }
+    Invoke-NativeMenuAction 'Roster actions' $entry
+}
 function Wait-SendResult {
     $null = Wait-Until 'export submission' { Find-Element "Submitted$dot$review" }
     foreach ($name in @('Fleet East', 'Fleet West')) {
         $null = Wait-Until "successful export to $name" { Find-Element "$($targets[$name])$($dot)Exit 0" }
     }
-    if (Find-Element 'Load command' $button) { throw 'Per-host assignments cannot load as a shared draft' }
+    $null = Get-RunAction 'Copy results'
+    if (Find-Element 'Load command' ([System.Windows.Automation.ControlType]::MenuItem) -Visible) {
+        throw 'Per-host assignments cannot load as a shared draft'
+    }
+    Close-NativeMenu 'Copy results'
     if (Find-Element $targets['Witness']) { throw 'The hidden host appeared in the export' }
 }
 
@@ -80,12 +90,34 @@ try {
     (Field 'Host filter').SetValue('Fleet')
     (Field 'Group command').SetValue('working draft')
     $null = Wait-Until 'the checked witness is hidden' { Find-Element '1 selected host is hidden by the filter.' }
-    Click $entry
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $original = $root.Current.BoundingRectangle
+    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
+    $resize.Resize([Math]::Round(620 * $scale), $original.Height)
+    $null = Wait-Until 'selection, display, and roster actions fit on one row in a narrow window' {
+        $select = Find-Element 'Select shown' $button -Visible
+        $deselect = Find-Element 'Deselect shown' $button -Visible
+        $display = Find-Element 'Roster display' $button -Visible
+        $more = Find-Element 'Roster actions' $button -Visible
+        if (!$select -or !$deselect -or !$display -or !$more) { return }
+        $bounds = $root.Current.BoundingRectangle
+        $first = $select.Current.BoundingRectangle
+        $second = $deselect.Current.BoundingRectangle
+        $preview = $display.Current.BoundingRectangle
+        $menu = $more.Current.BoundingRectangle
+        $first.Bottom -gt $menu.Top -and $first.Top -lt $menu.Bottom -and
+            $first.Left -ge $bounds.Left -and $first.Right -le $second.Left -and
+            $second.Right -le $preview.Left -and $preview.Right -le $menu.Left -and
+            $menu.Right -le $bounds.Right
+    }
+    Open-EnvironmentReview
     $eastPosix = "export POLYSH_NR_SHELLS=2 POLYSH_RANK=0 POLYSH_NAME='127.0.0.1' POLYSH_DISPLAY_NAME='Fleet East'"
     $westPosix = "export POLYSH_NR_SHELLS=2 POLYSH_RANK=1 POLYSH_NAME='127.0.0.1' POLYSH_DISPLAY_NAME='Fleet West'"
     $null = Wait-Until 'ordered assignments for the two shown hosts' {
         (Find-Element $eastPosix) -and (Find-Element $westPosix) -and !(Find-Element $targets['Witness'])
     }
+    $resize.Resize($original.Width, $original.Height)
     $null = Control @('send-text','--pane',"$west",'--no-paste','alt')
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','alternate-proof')
     $null = Wait-Until 'stale review disables the entire export' {
@@ -95,16 +127,37 @@ try {
     }
     Click 'Back to host group'
     $null = Control @('send-text','--pane',"$west",'--no-paste','prompt')
-    Click $entry
+    Open-EnvironmentReview
     Click 'Export to 2 hosts'
     Wait-SendResult
+    $resize.Resize([Math]::Round(620 * $scale), $original.Height)
+    $null = Wait-Until 'run navigation, live output, and actions fit on a single row' {
+        $previous = Find-Element 'Previous submission' $button -Visible
+        $find = Find-Element ('Find run' + [char]0x2026) $button -Visible
+        $live = Find-Element ('Live output' + [char]0x2026) $button -Visible
+        $interrupt = Find-Element 'Interrupt selected' $button -Visible
+        $actions = Find-Element 'Run actions' $button -Visible
+        if (!$previous -or !$find -or !$live -or !$interrupt -or !$actions) { return }
+        $left = $previous.Current.BoundingRectangle
+        $search = $find.Current.BoundingRectangle
+        $output = $live.Current.BoundingRectangle
+        $stop = $interrupt.Current.BoundingRectangle
+        $menu = $actions.Current.BoundingRectangle
+        $bounds = $root.Current.BoundingRectangle
+        $bounds.Width -lt $original.Width -and $left.Top -lt $menu.Bottom -and
+            $menu.Top -lt $left.Bottom -and $left.Left -ge $bounds.Left -and
+            $left.Right -le $search.Left -and $search.Right -le $output.Left -and
+            $output.Right -le $stop.Left -and $stop.Right -le $menu.Left -and
+            $menu.Right -le $bounds.Right
+    }
+    $resize.Resize($original.Width, $original.Height)
     if ((Field 'Group command').Current.Value -cne 'working draft') { throw 'The group draft changed' }
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'export report includes each reviewed assignment' {
         $report = Read-ClipboardFixture
         $report -and $report.Contains($eastPosix) -and $report.Contains($westPosix)
     }
-    Click $entry
+    Open-EnvironmentReview
     Select-Fish
     $westFish = "set -gx POLYSH_NR_SHELLS 2 && set -gx POLYSH_RANK 1 && set -gx POLYSH_NAME '127.0.0.1' && set -gx POLYSH_DISPLAY_NAME 'Fleet West'"
     $null = Wait-Until 'review shows the selected Fish syntax' { Find-Element $westFish }

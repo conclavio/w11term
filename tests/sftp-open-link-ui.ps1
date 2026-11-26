@@ -35,7 +35,7 @@ try {
     Run-Palette 'Open files here'
 
     Click 'broken-link'
-    Click $properties
+    Invoke-SftpEntryAction $properties
     Wait-Properties 'Link target  missing'
     Click 'Open link target'
     $null = Wait-Until 'broken target reports an error in Properties' {
@@ -49,14 +49,14 @@ try {
     Click 'Close properties'
 
     Click 'file-link'
-    Click $properties
+    Invoke-SftpEntryAction $properties
     Wait-Properties 'Link target  objects/payload [file].txt'
     Click 'Open link target'
     $null = Wait-Until 'file target appears and Properties is closed' {
         (Find-Element 'payload [file].txt' $button) -and !(Find-Element 'Close properties' $button)
     }
     # The target should be selected already.
-    Click $properties
+    Invoke-SftpEntryAction $properties
     Wait-Properties "Path  $parent/objects/payload [file].txt"
     Click 'Close properties'
     Click 'Back'

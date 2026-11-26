@@ -37,7 +37,16 @@ enum LocalMode {
 pub enum PickerStage {
     Search,
     Commands,
+    CommandHistory,
+    RunningCommands,
     Placement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryPickerOption {
+    Status,
+    Order,
+    Output,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -234,10 +243,17 @@ pub enum Shortcut {
     CommandPalette,
     PanePicker,
     FindTab,
+    FindCommandHistory,
     FindAllPanes,
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
+    PickerHistoryOption(HistoryPickerOption),
+    PickerSaveHistory,
+    PickerWatchRunningCommand,
+    PickerRunningOutput,
+    PickerReviewRunningInterrupt,
+    PickerConfirmRunningInterrupt,
     PickerPlace(Direction),
     KeyboardHints,
     HintKey(u32),
@@ -1634,16 +1650,61 @@ impl State {
                 let repeat = message.lParam.0 & (1 << 30) != 0;
                 let action = match (stage, vk) {
                     (_, 0x1b) => Shortcut::PickerCancel,
-                    (PickerStage::Commands, 0x09) => {
-                        Shortcut::PickerMove(if modifiers().contains(KeyModifiers::SHIFT) {
-                            -1
-                        } else {
-                            1
-                        })
+                    (PickerStage::RunningCommands, 0x0d) if modifiers() == KeyModifiers::CTRL => {
+                        Shortcut::PickerConfirmRunningInterrupt
                     }
-                    (PickerStage::Search | PickerStage::Commands, 0x0d) => Shortcut::PickerAccept,
-                    (PickerStage::Search | PickerStage::Commands, 0x26) => Shortcut::PickerMove(-1),
-                    (PickerStage::Search | PickerStage::Commands, 0x28) => Shortcut::PickerMove(1),
+                    (
+                        PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
+                        0x09,
+                    ) => Shortcut::PickerMove(if modifiers().contains(KeyModifiers::SHIFT) {
+                        -1
+                    } else {
+                        1
+                    }),
+                    (
+                        PickerStage::Search
+                        | PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
+                        0x0d,
+                    ) => Shortcut::PickerAccept,
+                    (
+                        PickerStage::Search
+                        | PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
+                        0x26,
+                    ) => Shortcut::PickerMove(-1),
+                    (
+                        PickerStage::Search
+                        | PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
+                        0x28,
+                    ) => Shortcut::PickerMove(1),
+                    (PickerStage::CommandHistory, 0x76) if modifiers().is_empty() => {
+                        Shortcut::PickerHistoryOption(HistoryPickerOption::Status)
+                    }
+                    (PickerStage::CommandHistory, 0x77) if modifiers().is_empty() => {
+                        Shortcut::PickerHistoryOption(HistoryPickerOption::Order)
+                    }
+                    (PickerStage::CommandHistory, 0x78) if modifiers().is_empty() => {
+                        Shortcut::PickerHistoryOption(HistoryPickerOption::Output)
+                    }
+                    (PickerStage::CommandHistory, 0x53) if modifiers() == KeyModifiers::CTRL => {
+                        Shortcut::PickerSaveHistory
+                    }
+                    (PickerStage::RunningCommands, 0x77) if modifiers().is_empty() => {
+                        Shortcut::PickerWatchRunningCommand
+                    }
+                    (PickerStage::RunningCommands, 0x78) if modifiers().is_empty() => {
+                        Shortcut::PickerRunningOutput
+                    }
+                    (PickerStage::RunningCommands, 0x79) if modifiers().is_empty() => {
+                        Shortcut::PickerReviewRunningInterrupt
+                    }
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),
                     (PickerStage::Placement, 0x27) => Shortcut::PickerPlace(Direction::Right),
@@ -1818,16 +1879,15 @@ impl State {
                         Shortcut::CommandPalette
                             | Shortcut::PanePicker
                             | Shortcut::FindTab
+                            | Shortcut::FindCommandHistory
                             | Shortcut::FindAllPanes
                             | Shortcut::MovePaneToExistingTab
                     ) {
-                        self.picker = Some(
-                            if matches!(shortcut, Shortcut::CommandPalette | Shortcut::FindTab) {
-                                PickerStage::Commands
-                            } else {
-                                PickerStage::Search
-                            },
-                        );
+                        self.picker = Some(match shortcut {
+                            Shortcut::FindCommandHistory => PickerStage::CommandHistory,
+                            Shortcut::CommandPalette | Shortcut::FindTab => PickerStage::Commands,
+                            _ => PickerStage::Search,
+                        });
                         self.local_held.insert(slot, false);
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
@@ -2164,6 +2224,7 @@ impl From<Action> for Shortcut {
             Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
             Action::FindTab => Self::FindTab,
+            Action::FindCommandHistory => Self::FindCommandHistory,
             Action::Find => Self::Find,
             Action::FindNext => Self::FindNext,
             Action::FindPrevious => Self::FindPrevious,

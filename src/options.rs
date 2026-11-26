@@ -1,16 +1,20 @@
 use anyhow::{Context, Result, bail, ensure};
+use russh::keys::{HashAlg, PublicKey, ssh_key::Fingerprint};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
 };
 mod group_prompt;
 mod local;
+mod profile_text_size;
 mod ssh_destination;
 mod tab_color;
 pub use group_prompt::GroupPromptPattern;
 pub use local::LocalOptions;
+pub use profile_text_size::ProfileTextSize;
 pub use tab_color::TabColor;
 
 /// Base colors for a new terminal pane. Applications can override them with OSC.
@@ -133,16 +137,177 @@ impl std::str::FromStr for ScrollbackLines {
 #[serde(tag = "auth", rename_all = "kebab-case")]
 pub enum Authentication {
     Agent,
+    AgentKey {
+        agent_fingerprint: AgentFingerprint,
+    },
+    AgentCertificate {
+        certificate: Box<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_fingerprint: Option<AgentFingerprint>,
+    },
     None,
-    Identity { identity: PathBuf },
+    Identity {
+        identity: Box<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        certificate: Option<Box<PathBuf>>,
+    },
     Password,
     KeyboardInteractive,
+}
+
+/// An explicitly selected plain SSH agent key, identified by its OpenSSH SHA256 fingerprint.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+pub struct AgentFingerprint(Box<str>);
+
+/// A local Windows SSH agent pipe or an explicit request for SSH_AUTH_SOCK.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+pub struct AgentPipe(Box<str>);
+
+impl AgentPipe {
+    pub const ENVIRONMENT: &str = "SSH_AUTH_SOCK";
+    const LOCAL_PREFIX: &str = r"\\.\pipe\";
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn optional(value: &str) -> Result<Option<Self>> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.parse()).transpose()
+    }
+}
+
+impl std::str::FromStr for AgentPipe {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if matches!(value, "SSH_AUTH_SOCK" | "$SSH_AUTH_SOCK") {
+            return Ok(Self(Self::ENVIRONMENT.into()));
+        }
+        let prefix = Self::LOCAL_PREFIX;
+        let Some(name) = value.get(prefix.len()..).filter(|_| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        }) else {
+            bail!(r"Enter a local Windows SSH agent pipe (\\.\pipe\name) or SSH_AUTH_SOCK");
+        };
+        ensure!(
+            !name.is_empty()
+                && !name.ends_with('.')
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || "\\/:*?\"<>|".contains(c))
+                && value.encode_utf16().count() <= 256,
+            "Invalid Windows SSH agent pipe name"
+        );
+        Ok(Self(format!("{prefix}{name}").into_boxed_str()))
+    }
+}
+
+impl TryFrom<String> for AgentPipe {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl AgentFingerprint {
+    pub(crate) fn for_key(key: &PublicKey) -> Self {
+        Self(
+            key.fingerprint(HashAlg::Sha256)
+                .to_string()
+                .into_boxed_str(),
+        )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for AgentFingerprint {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let Ok(fingerprint @ Fingerprint::Sha256(_)) = value.trim().parse() else {
+            bail!("Enter an OpenSSH SHA256 fingerprint for the SSH agent key");
+        };
+        Ok(Self(fingerprint.to_string().into_boxed_str()))
+    }
+}
+
+impl TryFrom<String> for AgentFingerprint {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl Authentication {
+    pub fn uses_agent(&self) -> bool {
+        matches!(
+            self,
+            Self::Agent | Self::AgentKey { .. } | Self::AgentCertificate { .. }
+        )
+    }
+
+    pub fn identity(identity: impl Into<PathBuf>, certificate: Option<PathBuf>) -> Self {
+        Self::Identity {
+            identity: Box::new(identity.into()),
+            certificate: certificate.map(Box::new),
+        }
+    }
+
+    pub fn agent_certificate(
+        certificate: impl Into<PathBuf>,
+        agent_fingerprint: Option<AgentFingerprint>,
+    ) -> Self {
+        Self::AgentCertificate {
+            certificate: Box::new(certificate.into()),
+            agent_fingerprint,
+        }
+    }
+
+    pub(crate) fn identity_path(&self) -> Option<&Path> {
+        match self {
+            Self::Identity { identity, .. } => Some(identity.as_path()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn certificate_path(&self) -> Option<&Path> {
+        match self {
+            Self::Identity { certificate, .. } => certificate.as_deref().map(PathBuf::as_path),
+            Self::AgentCertificate { certificate, .. } => Some(certificate.as_path()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn credential_paths_mut(&mut self) -> impl Iterator<Item = &mut PathBuf> {
+        let (identity, certificate) = match self {
+            Self::Identity {
+                identity,
+                certificate,
+            } => (Some(identity.as_mut()), certificate.as_deref_mut()),
+            Self::AgentCertificate { certificate, .. } => (None, Some(certificate.as_mut())),
+            _ => (None, None),
+        };
+        identity.into_iter().chain(certificate)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlayerOptions {
     pub reconnect: bool,
+    #[serde(skip_serializing_if = "default_reconnect_window")]
+    pub reconnect_window_seconds: NonZeroU32,
     pub game_mode: bool,
     /// None follows game mode: compatible cursor-key scrolling outside games.
     pub alternate_scroll: Option<bool>,
@@ -151,12 +316,13 @@ pub struct PlayerOptions {
     pub bell: String,
     pub sync_assets: Option<bool>,
     pub remote_sounds: Option<bool>,
-    pub device_key: Option<PathBuf>,
+    pub device_key: Option<Box<PathBuf>>,
 }
 impl Default for PlayerOptions {
     fn default() -> Self {
         Self {
             reconnect: true,
+            reconnect_window_seconds: DEFAULT_RECONNECT_WINDOW,
             game_mode: false,
             alternate_scroll: None,
             rustmush: false,
@@ -167,6 +333,12 @@ impl Default for PlayerOptions {
             device_key: None,
         }
     }
+}
+
+const DEFAULT_RECONNECT_WINDOW: NonZeroU32 = NonZeroU32::new(300).unwrap();
+
+fn default_reconnect_window(seconds: &NonZeroU32) -> bool {
+    *seconds == DEFAULT_RECONNECT_WINDOW
 }
 
 impl PlayerOptions {
@@ -232,22 +404,57 @@ pub struct LocalForwardPreset {
     pub remote_port: std::num::NonZeroU16,
 }
 
+/// Transport keepalives for one authenticated SSH endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshKeepalive {
+    pub interval_seconds: u32,
+    pub max_unanswered: NonZeroU32,
+}
+
+impl Default for SshKeepalive {
+    fn default() -> Self {
+        Self {
+            interval_seconds: 5,
+            max_unanswered: NonZeroU32::new(2).unwrap(),
+        }
+    }
+}
+
+impl SshKeepalive {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn interval(self) -> Option<Duration> {
+        (self.interval_seconds != 0).then(|| Duration::from_secs(self.interval_seconds.into()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SshOptions {
     pub host: String,
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_seconds: Option<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "SshKeepalive::is_default")]
+    pub keepalive: SshKeepalive,
     #[serde(default, skip_serializing_if = "TerminalType::is_default")]
     pub terminal_type: TerminalType,
     #[serde(default, skip_serializing_if = "ScrollbackLines::is_default")]
     pub scrollback_lines: ScrollbackLines,
     #[serde(default, skip_serializing_if = "ColorScheme::is_default")]
     pub color_scheme: ColorScheme,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<ProfileTextSize>,
     #[serde(default, skip_serializing_if = "TabColor::is_default")]
     pub tab_color: TabColor,
     #[serde(flatten)]
     pub authentication: Authentication,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pipe: Option<AgentPipe>,
     pub host_key: Option<String>,
     #[serde(
         default,
@@ -275,8 +482,14 @@ pub struct JumpHost {
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_seconds: Option<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "SshKeepalive::is_default")]
+    pub keepalive: SshKeepalive,
     #[serde(flatten)]
     pub authentication: Authentication,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pipe: Option<AgentPipe>,
     pub host_key: Option<String>,
     #[serde(
         default,
@@ -292,11 +505,15 @@ impl From<JumpHost> for SshOptions {
             host: hop.host,
             user: hop.user,
             port: hop.port,
+            connect_timeout_seconds: hop.connect_timeout_seconds,
+            keepalive: hop.keepalive,
             terminal_type: TerminalType::default(),
             scrollback_lines: ScrollbackLines::default(),
             color_scheme: ColorScheme::default(),
+            font_size: None,
             tab_color: Default::default(),
             authentication: hop.authentication,
+            agent_pipe: hop.agent_pipe,
             host_key: hop.host_key,
             host_key_alias: hop.host_key_alias,
             proxy_jump: Vec::new(),
@@ -350,6 +567,13 @@ pub(crate) fn deserialize_host_key_alias<'de, D: serde::Deserializer<'de>>(
 }
 
 impl SshOptions {
+    pub fn set_authentication(&mut self, authentication: Authentication) {
+        if !authentication.uses_agent() {
+            self.agent_pipe = None;
+        }
+        self.authentication = authentication;
+    }
+
     /// Validate a profile and resolve its key paths against the catalog location.
     pub fn prepare_profile_connection(&mut self, catalog: &Path) -> Result<()> {
         ensure!(
@@ -362,17 +586,17 @@ impl SshOptions {
         );
         self.validate_route()?;
         let base = catalog.parent().unwrap_or(Path::new("."));
-        if let Some(key) = &mut self.player.device_key
+        if let Some(key) = self.player.device_key.as_deref_mut()
             && key.is_relative()
         {
             *key = base.join(&*key);
         }
-        for auth in self.authentications_mut() {
-            if let Authentication::Identity { identity } = auth {
-                ensure!(!identity.as_os_str().is_empty(), "identity path is empty");
-                if identity.is_relative() {
-                    *identity = base.join(&*identity);
-                }
+        for path in self
+            .authentications_mut()
+            .flat_map(Authentication::credential_paths_mut)
+        {
+            if path.is_relative() {
+                *path = base.join(&*path);
             }
         }
         Ok(())
@@ -380,6 +604,26 @@ impl SshOptions {
 
     pub(crate) fn validate_route(&self) -> Result<()> {
         validate_ssh_host(&self.host)?;
+        for (auth, agent_pipe) in std::iter::once((&self.authentication, &self.agent_pipe)).chain(
+            self.proxy_jump
+                .iter()
+                .map(|hop| (&hop.authentication, &hop.agent_pipe)),
+        ) {
+            ensure!(
+                agent_pipe.is_none() || auth.uses_agent(),
+                "An SSH agent pipe requires SSH agent authentication"
+            );
+            ensure!(
+                auth.identity_path()
+                    .is_none_or(|path| !path.as_os_str().is_empty()),
+                "identity path is empty"
+            );
+            ensure!(
+                auth.certificate_path()
+                    .is_none_or(|path| !path.as_os_str().is_empty()),
+                "SSH user certificate path is empty"
+            );
+        }
         ensure!(
             self.proxy_jump.len() <= MAX_JUMPS,
             "at most {MAX_JUMPS} SSH jump hosts are supported"
@@ -539,6 +783,7 @@ pub struct Profiles {
     pub local: BTreeMap<String, LocalOptions>,
     /// Each available name once, including discovered local shells.
     pub profile_order: Vec<String>,
+    pub pinned_profiles: BTreeSet<String>,
     pub startup_profile: Option<String>,
     pub ssh_host_groups: BTreeMap<String, Vec<String>>,
     pub ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
@@ -553,6 +798,7 @@ impl Default for Profiles {
             profile_order: local.keys().cloned().collect(),
             profiles: BTreeMap::new(),
             local,
+            pinned_profiles: BTreeSet::new(),
             startup_profile: None,
             ssh_host_groups: BTreeMap::new(),
             ssh_recipient_sets: BTreeMap::new(),
@@ -647,6 +893,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         #[serde(default)]
         profile_order: Option<serde_json::Value>,
         #[serde(default)]
+        pinned_profiles: BTreeSet<String>,
+        #[serde(default)]
         startup_profile: Option<String>,
         #[serde(default)]
         ssh_host_groups: BTreeMap<String, Vec<String>>,
@@ -664,6 +912,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         .context("profile_order must be an array of profile names")?;
     let mut profiles = Profiles {
         has_explicit_order: explicit_order.is_some(),
+        pinned_profiles: document.pinned_profiles,
         startup_profile: document.startup_profile,
         ssh_host_groups: document.ssh_host_groups,
         ssh_recipient_sets: document.ssh_recipient_sets,
@@ -755,6 +1004,14 @@ impl Source {
         }
     }
 
+    pub fn profile_font_size(&self) -> Option<ProfileTextSize> {
+        match self {
+            Self::Local(shell) => shell.font_size,
+            Self::Ssh(ssh) => ssh.font_size,
+            _ => None,
+        }
+    }
+
     pub fn scrollback_lines(&self) -> ScrollbackLines {
         match self {
             Self::Local(shell) => shell.scrollback_lines,
@@ -799,6 +1056,8 @@ impl Options {
         let mut paused = false;
         let mut port = None;
         let mut authentication = None;
+        let mut certificate = None;
+        let mut agent_pipe = None;
         let mut host_key = None;
         let mut host_key_alias = None;
         let mut benchmark = false;
@@ -814,7 +1073,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -853,16 +1112,31 @@ impl Options {
                 "--identity" => {
                     ensure!(
                         authentication.is_none(),
-                        "choose only one of --identity and --auth"
+                        "choose only one of --identity, --agent-key, and --auth"
                     );
-                    authentication = Some(Authentication::Identity {
-                        identity: value(&mut args, &arg)?.into(),
+                    authentication = Some(Authentication::identity(value(&mut args, &arg)?, None));
+                }
+                "--agent-key" => {
+                    ensure!(
+                        authentication.is_none(),
+                        "choose only one of --identity, --agent-key, and --auth"
+                    );
+                    authentication = Some(Authentication::AgentKey {
+                        agent_fingerprint: value(&mut args, &arg)?.parse()?,
                     });
+                }
+                "--certificate" => {
+                    ensure!(certificate.is_none(), "specify --certificate only once");
+                    certificate = Some(PathBuf::from(value(&mut args, &arg)?));
+                }
+                "--agent-pipe" => {
+                    ensure!(agent_pipe.is_none(), "specify --agent-pipe only once");
+                    agent_pipe = Some(value(&mut args, &arg)?.parse::<AgentPipe>()?);
                 }
                 "--auth" => {
                     ensure!(
                         authentication.is_none(),
-                        "choose only one of --identity and --auth"
+                        "choose only one of --identity, --agent-key, and --auth"
                     );
                     authentication = Some(match value(&mut args, &arg)?.as_str() {
                         "none" => Authentication::None,
@@ -916,6 +1190,8 @@ impl Options {
                         match ssh.authentication {
                             Authentication::None => "none",
                             Authentication::Agent => "agent",
+                            Authentication::AgentKey { .. } => "agent-key",
+                            Authentication::AgentCertificate { .. } => "agent-certificate",
                             Authentication::Identity { .. } => "identity",
                             Authentication::Password => "password",
                             Authentication::KeyboardInteractive => "keyboard-interactive",
@@ -927,6 +1203,8 @@ impl Options {
         }
         let ssh_override = port.is_some()
             || authentication.is_some()
+            || certificate.is_some()
+            || agent_pipe.is_some()
             || host_key.is_some()
             || host_key_alias.is_some();
         let mut initial_profile = profile.clone().filter(|_| !ssh_override);
@@ -957,10 +1235,31 @@ impl Options {
                 ssh.port = port;
             }
             if let Some(authentication) = authentication {
-                ssh.authentication = authentication;
+                ssh.set_authentication(authentication);
+            }
+            if let Some(path) = certificate {
+                match &mut ssh.authentication {
+                    Authentication::Identity { certificate, .. } => {
+                        *certificate = Some(Box::new(path))
+                    }
+                    Authentication::AgentCertificate { certificate, .. } => **certificate = path,
+                    Authentication::Agent => {
+                        ssh.authentication = Authentication::agent_certificate(path, None);
+                    }
+                    Authentication::AgentKey { agent_fingerprint } => {
+                        ssh.authentication = Authentication::agent_certificate(
+                            path,
+                            Some(agent_fingerprint.clone()),
+                        );
+                    }
+                    _ => bail!("--certificate requires private-key or SSH agent authentication"),
+                }
             }
             if let Some(host_key) = host_key {
                 ssh.host_key = Some(host_key);
+            }
+            if let Some(agent_pipe) = agent_pipe {
+                ssh.agent_pipe = Some(agent_pipe);
             }
             if let Some(alias) = host_key_alias {
                 ssh.host_key_alias = Some(alias);
@@ -1103,6 +1402,259 @@ mod tests {
         dest["proxy_jump"] = serde_json::json!([]);
         dest["host_key_alias"] = "!host".into();
         assert!(parse(dest).is_err());
+    }
+
+    #[test]
+    fn ssh_agent_pipes_are_local_and_travel_with_each_endpoint() {
+        const GATEWAY: &str = r"\\.\pipe\agent-jump";
+        const DESTINATION: &str = r"\\.\pipe\agent-destination";
+        for invalid in [
+            r"\\server\pipe\relay",
+            r"\\?\pipe\alternate",
+            r"\\.\pipe\nested\socket",
+            r"\\.\pipe\..",
+            r"\\.\pipe\",
+            "/tmp/agent",
+            "$OTHER_AGENT",
+        ] {
+            assert!(invalid.parse::<AgentPipe>().is_err(), "{invalid}");
+        }
+        assert_eq!(
+            "$SSH_AUTH_SOCK".parse::<AgentPipe>().unwrap().as_str(),
+            "SSH_AUTH_SOCK"
+        );
+        let mut profile = serde_json::json!({
+            "host": "destination", "user": "pilot", "auth": "agent", "agent_pipe": DESTINATION,
+            "proxy_jump": [{ "host": "jump", "user": "pilot", "auth": "agent", "agent_pipe": GATEWAY }]
+        });
+        let options: SshOptions = serde_json::from_value(profile.clone()).unwrap();
+        assert!(options.validate_route().is_ok());
+        assert_eq!(options.agent_pipe.unwrap().as_str(), DESTINATION);
+        let hop = SshOptions::from(options.proxy_jump[0].clone());
+        assert_eq!(hop.agent_pipe.unwrap().as_str(), GATEWAY);
+        profile["proxy_jump"][0]["auth"] = "password".into();
+        assert!(
+            serde_json::from_value::<SshOptions>(profile)
+                .unwrap()
+                .validate_route()
+                .is_err()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"profiles":{"pilot":{
+                "host":"destination","user":"pilot","auth":"agent","agent_pipe":DESTINATION
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                args.iter()
+                    .map(|arg| arg.to_string())
+                    .chain(["--profiles".into(), path.to_string_lossy().into_owned()]),
+            )
+        };
+        let Source::Ssh(ssh) = parse(&["--profile", "pilot", "--agent-pipe", GATEWAY])
+            .unwrap()
+            .unwrap()
+            .source
+        else {
+            panic!("expected SSH");
+        };
+        assert_eq!(ssh.agent_pipe.unwrap().as_str(), GATEWAY);
+        let Source::Ssh(ssh) = parse(&["--profile", "pilot", "--auth", "none"])
+            .unwrap()
+            .unwrap()
+            .source
+        else {
+            panic!("expected SSH");
+        };
+        assert!(ssh.agent_pipe.is_none());
+        assert!(
+            parse(&[
+                "ssh",
+                "pilot@localhost",
+                "--auth",
+                "password",
+                "--agent-pipe",
+                GATEWAY
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_agent_key_requires_and_round_trips_an_openssh_fingerprint() {
+        const KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let expected = Authentication::AgentKey {
+            agent_fingerprint: KEY.parse().unwrap(),
+        };
+        let mut profile = serde_json::json!({
+            "host": "destination", "user": "pilot", "auth": "agent-key", "agent_fingerprint": KEY,
+            "proxy_jump":[{"host": "jump", "user": "pilot", "auth": "agent-key", "agent_fingerprint": KEY}]
+        });
+        let decoded: SshOptions = serde_json::from_value(profile.clone()).unwrap();
+        assert_eq!(decoded.authentication, expected);
+        assert_eq!(decoded.proxy_jump[0].authentication, expected);
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["agent_fingerprint"], KEY);
+        assert_eq!(encoded["proxy_jump"][0]["agent_fingerprint"], KEY);
+
+        profile.as_object_mut().unwrap().remove("agent_fingerprint");
+        assert!(serde_json::from_value::<SshOptions>(profile.clone()).is_err());
+        profile["agent_fingerprint"] = KEY.into();
+        profile["proxy_jump"][0]["agent_fingerprint"] = "SHA256:short".into();
+        assert!(serde_json::from_value::<SshOptions>(profile).is_err());
+        assert!(
+            serde_json::from_value::<Authentication>(serde_json::json!({"auth":"agent"})).is_ok()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"profiles":{"pilot": {
+                "host":"localhost","user":"pilot","auth":"password"
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                args.iter()
+                    .map(|arg| arg.to_string())
+                    .chain(["--profiles".into(), path.to_string_lossy().into_owned()]),
+            )
+        };
+        for base in [["ssh", "pilot@localhost"], ["--profile", "pilot"]] {
+            let Source::Ssh(ssh) = parse(&[base[0], base[1], "--agent-key", KEY])
+                .unwrap()
+                .unwrap()
+                .source
+            else {
+                panic!("expected SSH");
+            };
+            assert_eq!(ssh.authentication, expected);
+        }
+        for extra in [["--auth", "agent"], ["--identity", "id"]] {
+            assert!(
+                parse(&[
+                    "ssh",
+                    "pilot@localhost",
+                    "--agent-key",
+                    KEY,
+                    extra[0],
+                    extra[1]
+                ])
+                .is_err()
+            );
+        }
+        let Source::Ssh(ssh) = parse(&[
+            "ssh",
+            "pilot@localhost",
+            "--agent-key",
+            KEY,
+            "--certificate",
+            "id-cert.pub",
+        ])
+        .unwrap()
+        .unwrap()
+        .source
+        else {
+            panic!("expected SSH");
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::agent_certificate("id-cert.pub", Some(KEY.parse().unwrap()))
+        );
+        assert!(parse(&["--demo", "--agent-key", KEY]).is_err());
+    }
+
+    #[test]
+    fn explicitly_configured_user_certificates_follow_identity_path_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(&path, br#"{"profiles":{"pilot":{"host":"localhost","user":"pilot",
+            "auth":"identity","identity":"id","certificate":"id-cert.pub",
+            "proxy_jump":[{"host":"gate","user":"pilot","auth":"identity","identity":"hop","certificate":"hop-cert.pub"}]}}}"#).unwrap();
+        let profile = load_profiles(&path)
+            .unwrap()
+            .profiles
+            .remove("pilot")
+            .unwrap();
+        assert_eq!(
+            profile.authentication,
+            Authentication::identity(
+                directory.path().join("id"),
+                Some(directory.path().join("id-cert.pub"))
+            )
+        );
+        assert_eq!(
+            profile.proxy_jump[0].authentication,
+            Authentication::identity(
+                directory.path().join("hop"),
+                Some(directory.path().join("hop-cert.pub"))
+            )
+        );
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                args.iter()
+                    .map(|arg| arg.to_string())
+                    .chain(["--profiles".into(), path.to_string_lossy().into_owned()]),
+            )
+        };
+        let options = parse(&[
+            "ssh",
+            "pilot@localhost",
+            "--identity",
+            "id",
+            "--certificate",
+            "cert.pub",
+        ])
+        .unwrap()
+        .unwrap();
+        let Source::Ssh(ssh) = options.source else {
+            panic!("expected SSH")
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::identity("id", Some("cert.pub".into()))
+        );
+        let replaced = parse(&["--profile", "pilot", "--identity", "unrelated"])
+            .unwrap()
+            .unwrap();
+        let Source::Ssh(ssh) = replaced.source else {
+            panic!("expected SSH")
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::identity("unrelated", None)
+        );
+        let Source::Ssh(ssh) = parse(&["ssh", "pilot@localhost", "--certificate", "cert.pub"])
+            .unwrap()
+            .unwrap()
+            .source
+        else {
+            panic!("expected SSH");
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::agent_certificate("cert.pub", None)
+        );
+        assert!(
+            parse(&[
+                "ssh",
+                "pilot@localhost",
+                "--auth",
+                "password",
+                "--certificate",
+                "cert.pub"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1305,9 +1857,7 @@ mod tests {
         let profiles = load_profiles(&config).unwrap().profiles;
         assert_eq!(
             profiles["root"].authentication,
-            Authentication::Identity {
-                identity: directory.path().join("hostinger")
-            }
+            Authentication::identity(directory.path().join("hostinger"), None)
         );
         for (name, port) in [("play-6789", 6789), ("play-6792", 6792)] {
             assert_eq!(profiles[name].authentication, Authentication::None);
@@ -1503,10 +2053,14 @@ mod tests {
             user: "alice".into(),
             port: 22,
             authentication: Authentication::Agent,
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
             terminal_type: TerminalType::default(),
             color_scheme: Default::default(),
+            connect_timeout_seconds: None,
+            keepalive: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             scrollback_lines: ScrollbackLines::default(),
             player: PlayerOptions::default(),
@@ -1522,7 +2076,10 @@ mod tests {
             host: "*".into(),
             user: "jump".into(),
             port: 22,
+            connect_timeout_seconds: None,
+            keepalive: Default::default(),
             authentication: Authentication::Agent,
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
         });

@@ -1,7 +1,11 @@
 //! Profile persistence preserves unrelated JSON fields and replaces the file atomically.
 use crate::options::{Profiles, SshOptions, SshRecipientSets, SshRosterDefaults, load_profiles};
 use anyhow::{Context, Result, ensure};
-use std::{collections::BTreeMap, io::Write, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 mod bookmarks;
 pub use bookmarks::{BookmarkPeer, bookmark_directory};
@@ -37,7 +41,9 @@ pub enum ImportedGroupMember<'a> {
 
 const SHARE_TOKEN: &str = "folder_share_id";
 const SHARE_EPOCH: &str = "folder_share_epoch";
+const PINNED_PROFILES: &str = "pinned_profiles";
 const STARTUP_PROFILE: &str = "startup_profile";
+const SFTP_DOWNLOAD_FOLDER: &str = "sftp_download_folder";
 const SSH_HOST_GROUPS: &str = "ssh_host_groups";
 const SSH_RECIPIENT_SETS: &str = "ssh_recipient_sets";
 const SSH_HOST_GROUP_DEFAULTS: &str = "ssh_host_group_defaults";
@@ -74,6 +80,7 @@ impl SavedSshGroup {
 #[derive(Default)]
 struct CatalogEdit {
     order: Option<Vec<String>>,
+    pinned_profiles: Option<BTreeSet<String>>,
     startup: Option<Option<String>>, // None leaves the setting untouched.
     ssh_host_groups: Option<BTreeMap<String, Vec<String>>>,
     ssh_recipient_sets: Option<BTreeMap<String, SshRecipientSets>>,
@@ -137,8 +144,17 @@ fn order_after_edit(
 }
 
 fn profile_identity_edit(catalog: &Profiles, old: Option<&str>, new: Option<&str>) -> CatalogEdit {
+    let pinned_profiles = old
+        .filter(|name| Some(*name) != new && catalog.pinned_profiles.contains(*name))
+        .map(|old| {
+            let mut pins = catalog.pinned_profiles.clone();
+            pins.remove(old);
+            pins.extend(new.map(str::to_owned));
+            pins
+        });
     CatalogEdit {
         order: order_after_edit(catalog, old, new),
+        pinned_profiles,
         startup: (old.is_some() && old != new && catalog.startup_profile.as_deref() == old)
             .then(|| new.map(str::to_owned)),
         ..Default::default()
@@ -196,6 +212,23 @@ fn replace_profile_member(members: &mut Vec<String>, old: &str, new: Option<&str
         }
         seen.insert(name.clone())
     });
+}
+
+fn preserve_forward_preset_fields(previous: &serde_json::Value, next: &mut serde_json::Value) {
+    let (Some(previous), Some(next)) = (previous.as_array(), next.as_array_mut()) else {
+        return;
+    };
+    let ports =
+        |entry: &serde_json::Value| (entry["local_port"].as_u64(), entry["remote_port"].as_u64());
+    let mut raw = BTreeMap::<_, VecDeque<_>>::new();
+    for entry in previous {
+        raw.entry(ports(entry)).or_default().push_back(entry);
+    }
+    for entry in next {
+        if let Some(saved) = raw.get_mut(&ports(entry)).and_then(VecDeque::pop_front) {
+            *entry = saved.clone();
+        }
+    }
 }
 
 fn validate_group_name(name: &str) -> Result<()> {
@@ -552,6 +585,25 @@ impl ProfileStore {
         })
     }
 
+    pub fn set_profile_pin(&self, name: &str, pinned: bool) -> Result<Profiles> {
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.profiles.contains_key(name) || catalog.local.contains_key(name),
+                "Profile {name} is no longer available"
+            );
+            let mut pins = catalog.pinned_profiles.clone();
+            if pinned {
+                pins.insert(name.into());
+            } else {
+                pins.remove(name);
+            }
+            Ok(CatalogEdit {
+                pinned_profiles: Some(pins),
+                ..Default::default()
+            })
+        })
+    }
+
     pub fn set_startup_profile(
         &self,
         name: Option<&str>,
@@ -712,6 +764,11 @@ impl ProfileStore {
                 );
             }
             fields.insert("args".into(), serde_json::to_value(&shell.args)?);
+            if let Some(size) = shell.font_size {
+                fields.insert("font_size".into(), serde_json::to_value(size)?);
+            } else {
+                fields.remove("font_size");
+            }
             if shell.color_scheme.is_default() {
                 fields.remove("color_scheme");
             } else {
@@ -760,6 +817,45 @@ impl ProfileStore {
     pub fn inspect(&self, name: &str) -> Result<(BTreeMap<String, SshOptions>, ProfileSnapshot)> {
         let (catalog, snapshot) = self.inspect_catalog(name)?;
         Ok((catalog.profiles, snapshot))
+    }
+
+    pub fn sftp_download_folder(&self, name: &str, peer: &BookmarkPeer) -> Result<Option<PathBuf>> {
+        let (_, snapshot) = self.inspect(name)?;
+        peer.check_profile(&snapshot.options)?;
+        Ok(snapshot
+            .raw
+            .get(SFTP_DOWNLOAD_FOLDER)
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from))
+    }
+
+    pub fn set_sftp_download_folder(
+        &self,
+        name: &str,
+        peer: &BookmarkPeer,
+        folder: Option<&Path>,
+    ) -> Result<()> {
+        if let Some(folder) = folder {
+            ensure!(folder.is_absolute(), "Choose an absolute Windows folder");
+        }
+        self.modify(|profiles, catalog| {
+            let options = catalog
+                .profiles
+                .get(name)
+                .context("The saved SSH profile is no longer available")?;
+            peer.check_profile(options)?;
+            let fields = profiles
+                .get_mut(name)
+                .and_then(serde_json::Value::as_object_mut)
+                .context("The SSH profile must be an object")?;
+            if let Some(folder) = folder {
+                fields.insert(SFTP_DOWNLOAD_FOLDER.into(), serde_json::to_value(folder)?);
+            } else {
+                fields.remove(SFTP_DOWNLOAD_FOLDER);
+            }
+            Ok(CatalogEdit::default())
+        })?;
+        Ok(())
     }
 
     pub fn inspect_catalog(
@@ -886,14 +982,24 @@ impl ProfileStore {
             {
                 replace_share_epoch(object);
             }
-            let keep_identity = expected
-                .is_some_and(|previous| previous.authentication == options.authentication)
-                && matches!(
-                    options.authentication,
-                    crate::options::Authentication::Identity { .. }
-                );
+            let old_authentication = expected.map(|previous| &previous.authentication);
+            let identity = options.authentication.identity_path();
+            let certificate = options.authentication.certificate_path();
+            let keep_identity = identity.is_some()
+                && old_authentication.and_then(crate::options::Authentication::identity_path)
+                    == identity;
+            let keep_certificate = certificate.is_some()
+                && old_authentication.and_then(crate::options::Authentication::certificate_path)
+                    == certificate;
             if !keep_identity {
                 object.remove("identity");
+            }
+            if !keep_certificate {
+                object.remove("certificate");
+            }
+            object.remove("agent_fingerprint");
+            if options.agent_pipe.is_none() {
+                object.remove("agent_pipe");
             }
             let keep_route =
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
@@ -902,8 +1008,17 @@ impl ProfileStore {
             if options.terminal_type.is_default() {
                 object.remove("terminal_type");
             }
+            if options.keepalive.is_default() {
+                object.remove("keepalive");
+            }
+            if options.connect_timeout_seconds.is_none() {
+                object.remove("connect_timeout_seconds");
+            }
             if options.color_scheme.is_default() {
                 object.remove("color_scheme");
+            }
+            if options.font_size.is_none() {
+                object.remove("font_size");
             }
             if options.tab_color.is_default() {
                 object.remove("tab_color");
@@ -925,12 +1040,18 @@ impl ProfileStore {
             }
             for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
                 if (key == "identity" && keep_identity)
+                    || (key == "certificate" && keep_certificate)
                     || (key == "proxy_jump" && keep_route)
                     || (key == "local_forwards" && keep_forwards)
                 {
                     continue;
                 }
                 let mut value = value.clone();
+                if key == "local_forwards"
+                    && let Some(previous) = object.get(key)
+                {
+                    preserve_forward_preset_fields(previous, &mut value);
+                }
                 if key == "player"
                     && expected.is_some_and(|previous| {
                         previous.player.device_key == options.player.device_key
@@ -1017,6 +1138,13 @@ impl ProfileStore {
         let edit = change(profiles, &catalog)?;
         if let Some(order) = edit.order {
             fields.insert("profile_order".into(), serde_json::to_value(order)?);
+        }
+        if let Some(pins) = edit.pinned_profiles {
+            if pins.is_empty() {
+                fields.remove(PINNED_PROFILES);
+            } else {
+                fields.insert(PINNED_PROFILES.into(), serde_json::to_value(pins)?);
+            }
         }
         match edit.startup {
             Some(Some(name)) => {
@@ -1266,13 +1394,15 @@ mod tests {
             host: "new.test".into(),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            connect_timeout_seconds: None,
+            keepalive: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             terminal_type: Default::default(),
             user: "root".into(),
             port: 22,
-            authentication: Authentication::Identity {
-                identity: "local-key".into(),
-            },
+            authentication: Authentication::identity("local-key", None),
+            agent_pipe: None,
             host_key: None,
             host_key_alias: None,
             proxy_jump: Vec::new(),
@@ -1288,9 +1418,7 @@ mod tests {
         assert_eq!(doc["profiles"]["existing"]["custom"], 42);
         assert_eq!(
             store.load().unwrap()["new"].authentication,
-            Authentication::Identity {
-                identity: dir.path().join("local-key")
-            }
+            Authentication::identity(dir.path().join("local-key"), None)
         );
         assert!(store.add("new", &options).is_err());
         assert_eq!(std::fs::read(path).unwrap(), saved);
@@ -1660,6 +1788,41 @@ mod order_tests {
     }
 
     #[test]
+    fn profile_pins_follow_renames_and_clear_when_removed() {
+        let (_dir, store) = fixture();
+        let original = store.catalog().unwrap();
+        assert!(original.pinned_profiles.is_empty());
+        store.set_profile_pin("Lima", true).unwrap();
+        store.set_profile_pin("Alpha", true).unwrap();
+        let pinned = disk(&store);
+        assert_eq!(pinned[PINNED_PROFILES], json!(["Alpha", "Lima"]));
+        assert_eq!(pinned["theme"]["tone"], "dark");
+        assert!(store.set_profile_pin("missing", true).is_err());
+        store.set_profile_pin("Alpha", true).unwrap();
+        assert_eq!(disk(&store), pinned);
+
+        let ssh = store.inspect("Alpha").unwrap().1;
+        store.duplicate(&ssh, "Alpha copy", &ssh.options).unwrap();
+        store
+            .edit("Alpha", "Renamed SSH", &ssh.options, &ssh.options)
+            .unwrap();
+        let local = store.inspect_local("Lima").unwrap();
+        store
+            .save_local(Some(&local), "Renamed local", &local.options)
+            .unwrap();
+        assert_eq!(
+            disk(&store)[PINNED_PROFILES],
+            json!(["Renamed SSH", "Renamed local"])
+        );
+        store
+            .delete(&store.inspect("Renamed SSH").unwrap().1)
+            .unwrap();
+        let catalog = store.set_profile_pin("Renamed local", false).unwrap();
+        assert!(catalog.pinned_profiles.is_empty());
+        assert!(disk(&store).get(PINNED_PROFILES).is_none());
+    }
+
+    #[test]
     fn startup_profile_follows_renames_and_clears_when_deleted() {
         let (_dir, store) = fixture();
         store.set_startup_profile(Some("Alpha"), None).unwrap();
@@ -1786,7 +1949,7 @@ mod order_tests {
     }
 
     #[test]
-    fn schemes_and_tab_colors_survive_profile_copies_and_allow_resets() {
+    fn appearance_survives_profile_copies_and_allows_resets() {
         use crate::options::ColorScheme::{Default, OneHalfDark, OneHalfLight};
         use crate::options::TabColor;
         let (_dir, store) = fixture();
@@ -1795,10 +1958,13 @@ mod order_tests {
         assert_eq!(catalog.source("Lima").unwrap().color_scheme(), Default);
         assert_eq!(catalog.source("Alpha").unwrap().tab_color(), TabColor::None);
         assert_eq!(catalog.source("Lima").unwrap().tab_color(), TabColor::None);
+        assert_eq!(catalog.source("Alpha").unwrap().profile_font_size(), None);
+        assert_eq!(catalog.source("Lima").unwrap().profile_font_size(), None);
 
         let mut ssh = catalog.profiles["Alpha"].clone();
         ssh.color_scheme = OneHalfLight;
         ssh.tab_color = TabColor::Red;
+        ssh.font_size = Some(6.try_into().unwrap());
         store
             .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
             .unwrap();
@@ -1807,6 +1973,7 @@ mod order_tests {
         let mut shell = catalog.local["Lima"].clone();
         shell.color_scheme = OneHalfDark;
         shell.tab_color = TabColor::Blue;
+        shell.font_size = Some(72.try_into().unwrap());
         store
             .save_local(Some(&store.inspect_local("Lima").unwrap()), "Lima", &shell)
             .unwrap();
@@ -1832,25 +1999,115 @@ mod order_tests {
             catalog.source("Local copy").unwrap().tab_color(),
             TabColor::Blue
         );
+        assert_eq!(
+            catalog.source("SSH copy").unwrap().profile_font_size(),
+            ssh.font_size
+        );
+        assert_eq!(
+            catalog.source("Local copy").unwrap().profile_font_size(),
+            shell.font_size
+        );
         ssh.color_scheme = Default;
         ssh.tab_color = TabColor::None;
+        ssh.font_size = None;
         store
             .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
             .unwrap();
         shell.color_scheme = Default;
         shell.tab_color = TabColor::None;
+        shell.font_size = None;
         store.save_local(Some(&base), "Lima", &shell).unwrap();
         let entries = &disk(&store)["profiles"];
         assert!(entries["Alpha"].get("color_scheme").is_none());
         assert!(entries["Lima"].get("color_scheme").is_none());
         assert!(entries["Alpha"].get("tab_color").is_none());
         assert!(entries["Lima"].get("tab_color").is_none());
+        assert!(entries["Alpha"].get("font_size").is_none());
+        assert!(entries["Lima"].get("font_size").is_none());
         assert_eq!(entries["SSH copy"]["tab_color"], "red");
         assert_eq!(entries["Local copy"]["tab_color"], "blue");
         assert_eq!(entries["SSH copy"]["color_scheme"], "one-half-light");
         assert_eq!(entries["Local copy"]["color_scheme"], "one-half-dark");
+        assert_eq!(entries["SSH copy"]["font_size"], 6);
+        assert_eq!(entries["Local copy"]["font_size"], 72);
         assert_eq!(entries["SSH copy"]["extra"], 7);
         assert_eq!(entries["Local copy"]["extra"], "local");
+    }
+
+    #[test]
+    fn editing_keepalive_can_save_a_custom_policy_and_restore_the_default() {
+        let (_dir, store) = fixture();
+        let initial = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(initial.keepalive, Default::default());
+        let mut custom = initial.clone();
+        custom.keepalive.interval_seconds = 0;
+        custom.keepalive.max_unanswered = 7.try_into().unwrap();
+        store.edit("Alpha", "Alpha", &custom, &initial).unwrap();
+        let saved = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(saved.keepalive, custom.keepalive);
+        assert_eq!(
+            disk(&store)["profiles"]["Alpha"]["keepalive"],
+            json!({
+                "interval_seconds": 0, "max_unanswered": 7
+            })
+        );
+        store.edit("Alpha", "Alpha", &initial, &saved).unwrap();
+        assert!(disk(&store)["profiles"]["Alpha"].get("keepalive").is_none());
+    }
+
+    #[test]
+    fn editing_a_connect_timeout_can_restore_the_legacy_default() {
+        let (_dir, store) = fixture();
+        let initial = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(initial.connect_timeout_seconds, None);
+        let mut custom = initial.clone();
+        custom.connect_timeout_seconds = Some(18.try_into().unwrap());
+        store.edit("Alpha", "Alpha", &custom, &initial).unwrap();
+        let saved = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(
+            saved.connect_timeout_seconds,
+            custom.connect_timeout_seconds
+        );
+        assert_eq!(
+            disk(&store)["profiles"]["Alpha"]["connect_timeout_seconds"],
+            18
+        );
+        store.edit("Alpha", "Alpha", &initial, &saved).unwrap();
+        assert!(
+            disk(&store)["profiles"]["Alpha"]
+                .get("connect_timeout_seconds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconnect_windows_round_trip_with_the_legacy_default_and_opt_out() {
+        let (_dir, store) = fixture();
+        let initial = store.inspect("Alpha").unwrap().1.options;
+        assert!(initial.player.reconnect);
+        assert_eq!(initial.player.reconnect_window_seconds.get(), 300);
+        let mut custom = initial.clone();
+        custom.player.reconnect = false;
+        custom.player.reconnect_window_seconds = 45.try_into().unwrap();
+        store.edit("Alpha", "Alpha", &custom, &initial).unwrap();
+        let saved = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(saved.player, custom.player);
+        assert_eq!(
+            disk(&store)["profiles"]["Alpha"]["player"]["reconnect_window_seconds"],
+            45
+        );
+        store.edit("Alpha", "Alpha", &initial, &saved).unwrap();
+        assert!(
+            disk(&store)["profiles"]["Alpha"]["player"]
+                .get("reconnect_window_seconds")
+                .is_none()
+        );
+        assert!(
+            serde_json::from_value::<crate::options::PlayerOptions>(
+                json!({"reconnect_window_seconds": 0})
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2082,6 +2339,72 @@ mod edit_tests {
         assert_eq!(std::fs::read(&key).unwrap(), b"fixture");
     }
     #[test]
+    fn edit_preserves_each_relative_ssh_credential_independently_and_clears_removed_certificates() {
+        use crate::options::Authentication::{Identity, Password};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{"pilot":{"host":"localhost","user":"pilot",
+            "auth":"identity","identity":"keys/id","certificate":"keys/old-cert.pub"}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let read_document =
+            || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+
+        let initial = store.load().unwrap().remove("pilot").unwrap();
+        let mut updated = initial.clone();
+        let Identity { certificate, .. } = &mut updated.authentication else {
+            panic!("expected key authentication")
+        };
+        *certificate = Some(dir.path().join("keys/new-cert.pub").into());
+        store.edit("pilot", "pilot", &updated, &initial).unwrap();
+        assert_eq!(read_document()["profiles"]["pilot"]["identity"], "keys/id");
+
+        updated.authentication = Password;
+        let current = store.load().unwrap().remove("pilot").unwrap();
+        store.edit("pilot", "pilot", &updated, &current).unwrap();
+        let saved = read_document();
+        let profile = &saved["profiles"]["pilot"];
+        assert!(profile.get("identity").is_none());
+        assert!(profile.get("certificate").is_none());
+    }
+
+    #[test]
+    fn saving_an_agent_certificate_preserves_a_relative_path_and_clears_its_removed_pin() {
+        const KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"profiles":{"pilot":{
+                "host":"localhost","user":"pilot","auth":"agent-certificate",
+                "certificate":"keys/login-cert.pub","agent_fingerprint":KEY
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let original = store.load().unwrap().remove("pilot").unwrap();
+        let absolute = dir.path().join("keys/login-cert.pub");
+        assert_eq!(
+            original.authentication,
+            Authentication::agent_certificate(&absolute, Some(KEY.parse().unwrap()))
+        );
+        let mut changed = original.clone();
+        changed.authentication = Authentication::agent_certificate(absolute, None);
+        store.edit("pilot", "pilot", &changed, &original).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let profile = &saved["profiles"]["pilot"];
+        assert_eq!(profile["auth"], "agent-certificate");
+        assert_eq!(profile["certificate"], "keys/login-cert.pub");
+        assert!(profile.get("agent_fingerprint").is_none());
+    }
+
+    #[test]
     fn edit_renames_preserves_relative_keys_and_metadata_and_refuses_collisions_or_stale_edits() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
@@ -2153,9 +2476,7 @@ mod jump_tests {
         let old = store.load().unwrap()["destination"].clone();
         assert_eq!(
             old.proxy_jump[0].authentication,
-            Authentication::Identity {
-                identity: dir.path().join("keys/jump")
-            }
+            Authentication::identity(dir.path().join("keys/jump"), None)
         );
         let mut edited = old.clone();
         edited.port = 2200;
@@ -2205,6 +2526,14 @@ mod jump_tests {
         store.duplicate(&renamed, "copy", &edited).unwrap();
         let (_, copy) = store.inspect("copy").unwrap();
         assert_eq!(copy.raw["local_forwards"], forwards);
+        edited.local_forwards.push(
+            serde_json::from_value(serde_json::json!({"local_port":9090, "remote_port":9000}))
+                .unwrap(),
+        );
+        store.edit("copy", "copy", &edited, &copy.options).unwrap();
+        let (_, copy) = store.inspect("copy").unwrap();
+        assert_eq!(copy.raw["local_forwards"][0], forwards[0]);
+        assert_eq!(copy.raw["local_forwards"][1]["remote_port"], 9000);
         edited.local_forwards.clear();
         store.edit("copy", "copy", &edited, &copy.options).unwrap();
         let (_, copy) = store.inspect("copy").unwrap();

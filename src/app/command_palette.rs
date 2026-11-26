@@ -4,12 +4,26 @@ use w11term::shortcuts::BINDINGS;
 use w11term::terminal::BookmarkScreen;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
+pub(super) const FIND_COMMAND_HISTORY_LABEL: &str = "Find command history…";
+pub(super) const FIND_RUNNING_COMMANDS_LABEL: &str = "Find running commands…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
+pub(super) const FIND_PROFILE_LABEL: &str = "Find profile…";
+pub(super) const SPLIT_RIGHT_PROFILE_LABEL: &str = "Find profile to split right…";
+pub(super) const SPLIT_BELOW_PROFILE_LABEL: &str = "Find profile to split below…";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileDestination {
+    Tab,
+    Split { axis: Axis, origin: TabId },
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Search {
     Window,
     Tabs,
+    CommandHistory,
+    RunningCommands,
+    Profiles(ProfileDestination),
     GroupLibrary(TabId),
     GroupRecent(TabId),
     GroupRuns(TabId),
@@ -18,10 +32,24 @@ pub(super) enum Search {
 }
 
 impl Search {
+    pub(super) fn is_profiles(self) -> bool {
+        matches!(self, Self::Profiles(_))
+    }
+
     fn placeholder(self) -> &'static str {
         match self {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
+            Self::CommandHistory => "Search commands across panes",
+            Self::RunningCommands => "Search running commands",
+            Self::Profiles(ProfileDestination::Tab) => "Search profiles",
+            Self::Profiles(ProfileDestination::Split {
+                axis: Axis::Columns,
+                ..
+            }) => "Search profiles to split right",
+            Self::Profiles(ProfileDestination::Split {
+                axis: Axis::Rows, ..
+            }) => "Search profiles to split below",
             Self::Bookmarks(..) => "Search scrollback bookmarks",
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
@@ -48,6 +76,15 @@ impl Search {
             }
             Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
+            Self::CommandHistory if query.trim().is_empty() => {
+                "No retained commands in this window"
+            }
+            Self::CommandHistory => "No matching commands in this window",
+            Self::RunningCommands if query.trim().is_empty() => {
+                "No running shell commands in this window"
+            }
+            Self::RunningCommands => "No matching running commands",
+            Self::Profiles(_) => "No matching profiles",
             Self::Bookmarks(..) if query.is_empty() => "No retained scrollback bookmarks",
             Self::Bookmarks(..) => "No matching scrollback bookmarks",
             _ => "No matching commands",
@@ -80,6 +117,9 @@ pub enum CommandId {
     SharedFolders(Option<u64>),
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
+    StopSshAttempt(PendingPaneAttempt),
+    RetrySshNow(PendingPaneRetry),
+    DisconnectSsh(disconnect_ssh::Target),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     LongCommands(Option<clipboard_paste::Origin>, bool),
     SavedCommand(
@@ -94,6 +134,12 @@ pub enum CommandId {
     SearchWindowGroupRuns(WindowRunScope),
     WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(TabId),
+    FocusRunningCommand(u64, w11term::events::RunningCommandTarget),
+    OpenWindowCommand(
+        u64,
+        w11term::events::CommandLink,
+        Option<std::ops::Range<usize>>,
+    ),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
     ManageRecipientSets(TabId, String),
@@ -115,6 +161,7 @@ pub enum CommandId {
     OpenExplorer(Option<directory_split::Origin>),
     CopyCurrentDirectory(Option<directory_split::Origin>),
     Profile(String),
+    LaunchProfile(ProfileDestination, String, Option<String>),
     Shortcut(Shortcut),
 }
 
@@ -160,6 +207,9 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                         && (key == "save-scrollback".into()
                             || key == "copy-selection".into()
                             || key == "restart-exited".into()
+                            || key == "stop-ssh-attempt".into()
+                            || key == "retry-ssh-now".into()
+                            || key == "disconnect-ssh-shell".into()
                             || key == "shared-folders".into()
                             || key == "local-forward".into()))
                 {
@@ -178,6 +228,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                     CommandId::Profile(_)
                         if key != "new-profile".into()
                             && key != "quick-connect".into()
+                            && key != "find-profile".into()
                             && key != "lab".into() =>
                     {
                         (format!("New tab with {label}"), String::new())
@@ -231,6 +282,32 @@ fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
         )
     });
     rows
+}
+
+pub(super) fn profile_search_rows(
+    catalog: &Profiles,
+    destination: ProfileDestination,
+    query: &str,
+) -> Vec<Row> {
+    let query = profile_query::Query::new(query);
+    let mut matches = Vec::new();
+    for name in &catalog.profile_order {
+        let endpoint = catalog.profiles.get(name).map(profile_query::address);
+        let details = endpoint.as_deref().unwrap_or("Local");
+        if let Some(rank) = query.rank(name, details) {
+            matches.push((
+                rank,
+                Row {
+                    label: format!("{name} · {details}"),
+                    id: CommandId::LaunchProfile(destination, name.clone(), endpoint),
+                    chord: String::new(),
+                    enabled: true,
+                },
+            ));
+        }
+    }
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, row)| row).collect()
 }
 
 impl TerminalApp {
@@ -438,6 +515,30 @@ impl TerminalApp {
             chord: String::new(),
             enabled: exited.is_some(),
         });
+        if let Some(attempt) = self.tabs.active().and_then(AppTab::pending_pane_attempt) {
+            rows.push(Row {
+                id: CommandId::StopSshAttempt(attempt),
+                label: STOP_SSH_ATTEMPT.into(),
+                chord: String::new(),
+                enabled: true,
+            });
+        }
+        if let Some(retry) = self.tabs.active().and_then(AppTab::pending_pane_retry) {
+            rows.push(Row {
+                id: CommandId::RetrySshNow(retry),
+                label: RETRY_SSH_NOW.into(),
+                chord: String::new(),
+                enabled: true,
+            });
+        }
+        if let Some(target) = self.disconnect_target() {
+            rows.push(Row {
+                id: CommandId::DisconnectSsh(target),
+                label: disconnect_ssh::LABEL.into(),
+                chord: String::new(),
+                enabled: true,
+            });
+        }
         rows.push(Row {
             id: CommandId::SaveScrollback(pane),
             label: text_export::SCROLLBACK_LABEL.into(),
@@ -736,6 +837,13 @@ impl TerminalApp {
     }
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
+        let history_search = match &id {
+            CommandId::OpenWindowCommand(pane, link, _) => {
+                self.window_history_return((*pane, *link))
+            }
+            _ => None,
+        };
+        self.close_picker(ctx);
         let message = match id {
             CommandId::RenamePane(target) => tab_title::show_pane(target),
             CommandId::SaveLiveProfile(origin) => live_profile::open(origin),
@@ -782,6 +890,17 @@ impl TerminalApp {
                 return;
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
+            CommandId::FocusRunningCommand(pane, target) => {
+                self.focus_running_command(pane, target, ctx);
+                return;
+            }
+            CommandId::OpenWindowCommand(pane, link, hit) => {
+                if !self.open_command_history_preview(pane, Some(link), hit, history_search, ctx) {
+                    self.window_error =
+                        Some("That command is no longer retained in its source pane.".into());
+                }
+                return;
+            }
             CommandId::OpenSavedHostGroup(name, members) => {
                 Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
             }
@@ -818,6 +937,11 @@ impl TerminalApp {
             CommandId::SharedFolders(None) => return,
             CommandId::RestartExited(Some(exit)) => Message::RestartExited(exit),
             CommandId::RestartExited(None) => return,
+            CommandId::StopSshAttempt(attempt) => Message::StopSshAttempt(attempt),
+            CommandId::RetrySshNow(retry) => Message::RetrySshNow(retry),
+            CommandId::DisconnectSsh(target) => {
+                Message::DisconnectSsh(disconnect_ssh::Action::Review(target))
+            }
             CommandId::SaveScrollback(pane) => {
                 Message::Export(text_export::Action::StartScrollback(pane))
             }
@@ -850,6 +974,22 @@ impl TerminalApp {
                 attention::set_long_commands(origin, enabled)
             }
             CommandId::Profile(label) => Message::ProfileMenu(label),
+            CommandId::LaunchProfile(destination, name, _) => {
+                match destination {
+                    ProfileDestination::Tab => {
+                        if let Some(source) = self.catalog.source(&name) {
+                            self.open(name.clone(), source, Some(name), ctx);
+                        }
+                    }
+                    ProfileDestination::Split { axis, origin }
+                        if self.move_source() == Some(origin) =>
+                    {
+                        self.split_pane(axis, Some(name), ctx);
+                    }
+                    ProfileDestination::Split { .. } => {}
+                }
+                return;
+            }
             CommandId::Menu(label) => tab_menu_message(label),
             CommandId::MoveTabToExistingWindow(group, window) => {
                 Message::MoveTabToExistingWindow(group, window)
@@ -879,12 +1019,27 @@ pub(super) fn view(
     app: &TerminalApp,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
-    let page = ((app.window_height - 156.0) / 40.0).clamp(1.0, 10.0) as usize;
+    let narrow_history = app.width < 520.0;
+    let running = app
+        .picker
+        .as_ref()
+        .filter(|_| mode == Search::RunningCommands);
+    let search_height = if mode == Search::CommandHistory {
+        if narrow_history { 264.0 } else { 232.0 }
+    } else if mode == Search::RunningCommands {
+        running.map_or(296.0, pane_picker::Picker::running_controls_height)
+    } else {
+        156.0
+    };
+    let page = ((app.window_height - search_height) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
     let search_label = mode.placeholder();
     let trimming = if matches!(
         mode,
         Search::Tabs
+            | Search::CommandHistory
+            | Search::RunningCommands
+            | Search::Profiles(_)
             | Search::GroupRecent(_)
             | Search::GroupRuns(_)
             | Search::WindowGroupRuns(_)
@@ -900,7 +1055,11 @@ pub(super) fn view(
             TextBox::new()
                 .element_ref(input)
                 .text(query)
-                .placeholder_text(search_label)
+                .placeholder_text(if mode.is_profiles() {
+                    "Search by profile name or SSH address"
+                } else {
+                    search_label
+                })
                 .automation_name(search_label)
                 .on_text_changed(ctx.callback(Message::PickerQuery)),
             Button::new()
@@ -908,6 +1067,15 @@ pub(super) fn view(
                 .style(ButtonStyle::Subtle)
                 .automation_name(match mode {
                     Search::Tabs => "Close tab search",
+                    Search::CommandHistory => "Close command history search",
+                    Search::RunningCommands
+                        if running
+                            .is_some_and(pane_picker::Picker::reviewing_running_interrupt) =>
+                    {
+                        "Cancel command interrupt"
+                    }
+                    Search::RunningCommands => "Close running command search",
+                    Search::Profiles(_) => "Close profile search",
                     Search::Bookmarks(..) => "Close bookmark search",
                     _ => "Close command palette",
                 })
@@ -952,8 +1120,18 @@ pub(super) fn view(
             TextBlock::new().text(
                 app.picker
                     .as_ref()
-                    .and_then(|picker| picker.bookmark_status(app))
-                    .unwrap_or_else(|| mode.empty(query)),
+                    .and_then(|picker| {
+                        picker
+                            .window_history_status()
+                            .or_else(|| picker.bookmark_status(app))
+                    })
+                    .unwrap_or_else(|| {
+                        if mode.is_profiles() && app.profile_error.is_some() {
+                            "Could not load profiles"
+                        } else {
+                            mode.empty(query)
+                        }
+                    }),
             ),
         ));
     } else if rows.len() > page {
@@ -965,10 +1143,10 @@ pub(super) fn view(
                 .spacing(8.0)
                 .children((
                     Button::new()
-                        .automation_name(if mode == Search::Tabs {
-                            "Previous tabs"
-                        } else {
-                            "Previous commands"
+                        .automation_name(match mode {
+                            Search::Tabs => "Previous tabs",
+                            Search::Profiles(_) => "Previous profiles",
+                            _ => "Previous commands",
                         })
                         .is_enabled(first > 0)
                         .on_click(ctx.callback(move |_| {
@@ -979,10 +1157,10 @@ pub(super) fn view(
                         .vertical_alignment(VerticalAlignment::Center)
                         .text(format!("{}–{last} of {}", first + 1, rows.len())),
                     Button::new()
-                        .automation_name(if mode == Search::Tabs {
-                            "Next tabs"
-                        } else {
-                            "Next commands"
+                        .automation_name(match mode {
+                            Search::Tabs => "Next tabs",
+                            Search::Profiles(_) => "Next profiles",
+                            _ => "Next commands",
                         })
                         .is_enabled(last < rows.len())
                         .on_click(ctx.callback(move |_| {
@@ -992,10 +1170,25 @@ pub(super) fn view(
                 )),
         ));
     }
+    let history = app
+        .picker
+        .as_ref()
+        .filter(|_| mode == Search::CommandHistory);
+    let history_controls = history.map_or_else(View::empty, |picker| {
+        picker.window_history_controls(narrow_history, ctx)
+    });
+    let history_export =
+        history.map_or_else(View::empty, |picker| picker.history_export_button(app, ctx));
+    let running_controls = running.map_or_else(View::empty, |picker| {
+        picker.running_command_controls(app, ctx)
+    });
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
+            history_controls,
             StackPanel::new().spacing(4.0).keyed_children(results),
+            history_export,
+            running_controls,
         )),
         (app.width - 32.0).clamp(1.0, 660.0),
     )
@@ -1004,6 +1197,56 @@ pub(super) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_search_keeps_catalog_order_and_matches_names_and_addresses() {
+        let mut catalog = Profiles::default();
+        catalog.local.insert(
+            "Terminal lab".into(),
+            serde_json::from_value(serde_json::json!({"executable": "powershell.exe"})).unwrap(),
+        );
+        let ssh = serde_json::from_value::<SshOptions>(serde_json::json!({
+            "host": "2001:db8::1", "port": 6789, "user": "ops", "auth": "none"
+        }))
+        .unwrap();
+        catalog.profiles.insert("West lab".into(), ssh.clone());
+        catalog
+            .profiles
+            .insert("West    lab".into(), SshOptions { port: 6792, ..ssh });
+        catalog.profile_order = ["Terminal lab", "West    lab", "West lab"]
+            .map(String::from)
+            .into();
+
+        let labels = |query| {
+            profile_search_rows(&catalog, ProfileDestination::Tab, query)
+                .into_iter()
+                .map(|row| row.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(""),
+            [
+                "Terminal lab · Local",
+                "West    lab · ops@[2001:db8::1]:6792",
+                "West lab · ops@[2001:db8::1]:6789",
+            ]
+        );
+        assert_eq!(labels("LOCAL LAB"), ["Terminal lab · Local"]);
+        assert_eq!(
+            labels("6789 WEST OPS"),
+            ["West lab · ops@[2001:db8::1]:6789"]
+        );
+        assert_eq!(labels("west lab")[0], "West lab · ops@[2001:db8::1]:6789");
+        assert!(labels("west east").is_empty());
+        assert_eq!(
+            profile_search_rows(&catalog, ProfileDestination::Tab, "6792")[0].id,
+            CommandId::LaunchProfile(
+                ProfileDestination::Tab,
+                "West    lab".into(),
+                Some("ops@[2001:db8::1]:6792".into())
+            )
+        );
+    }
 
     #[test]
     fn select_all_menu_and_palette_share_the_configured_chord() {

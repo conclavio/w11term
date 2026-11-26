@@ -87,7 +87,7 @@ pub enum Alert {
 }
 
 pub struct ShellCommandCompletion<'a> {
-    pub command: &'a crate::CompletedCommand,
+    pub command: &'a Arc<crate::CompletedCommand>,
     pub had_output_start: bool,
 }
 
@@ -107,12 +107,15 @@ pub trait AlertHandler: Send + Sync {
         _completed: Option<ShellCommandCompletion<'_>>,
     ) {
     }
+    /// The first output start marker for the current primary-screen command.
+    fn shell_command_started(&mut self, _id: u64, _start_token: u64, _started_unix_ms: u64) {}
     /// A shell may report the command line after marking the start of its output.
     fn shell_command_line(&mut self, _id: u64, _label: Option<&str>) {}
     fn live_shell_output(
         &mut self,
         _id: u64,
         _label: Option<&str>,
+        _start_token: Option<u64>,
         _output: crate::LiveCommandOutput<'_>,
     ) {
     }

@@ -234,10 +234,14 @@ async fn check_split_control(
                 pane,
                 data_base64: STANDARD.encode(format!("\r\n{marker}\r\n")),
                 no_paste: true,
+                connection_generation: None,
             })
             .await?;
             split_control(Request::WaitForText {
                 pane,
+                connection_generation: None,
+                after_frame: None,
+                screenshot_path: None,
                 pattern: marker.into(),
                 regex: false,
                 timeout_seconds: 5,

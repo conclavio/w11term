@@ -1,4 +1,7 @@
 //! Real isolated SSH peers exercise trust, private prompts, env, and reconnection.
+#[path = "player_ssh/key_second_factor.rs"]
+mod key_second_factor;
+
 use anyhow::Result;
 use russh::{
     Channel, ChannelId,
@@ -271,6 +274,9 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
     SshOptions {
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        connect_timeout_seconds: None,
+        keepalive: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         terminal_type: Default::default(),
         host: "127.0.0.1".into(),
@@ -282,6 +288,7 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
         .into(),
         port,
         authentication,
+        agent_pipe: None,
         host_key: pin,
         host_key_alias: None,
         proxy_jump: Vec::new(),
@@ -1053,6 +1060,23 @@ async fn first_trust_is_saved_known_host_skips_prompt_and_changed_key_fails() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_connect_timeout_pauses_while_the_user_verifies_a_host_key() {
+    let (port, _seen, server) = fixture(vec![key()]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let prompts = Prompts::with_known_hosts(directory.path().join("known_hosts"));
+    let mut options = options(port, Authentication::None, None);
+    options.connect_timeout_seconds = Some(2.try_into().unwrap());
+    let mut client = start(options, prompts.clone());
+    let trust = prompt(&prompts).await;
+    assert!(matches!(trust.question, Question::HostKey { .. }));
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    prompts.answer(trust.id, Answer::Trust(true)).unwrap();
+    connected(&mut client, 1).await;
+    client.task.abort();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_trust_saves_the_literal_alias_and_reuses_it_on_a_different_port() {
     let host_key = key();
     let public = host_key.public_key().key_data().clone();
@@ -1139,9 +1163,7 @@ async fn stock_openssh_host_certificate() -> Result<()> {
         let (mut client, prompts) = connect(
             host,
             alias,
-            Authentication::Identity {
-                identity: identity.clone().into(),
-            },
+            Authentication::identity(identity.clone(), None),
         );
         let mut transcript = Vec::new();
         tokio::time::timeout(Duration::from_secs(40), async {

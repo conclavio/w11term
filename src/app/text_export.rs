@@ -31,6 +31,13 @@ pub enum Subject {
         pane: u64,
         command: u64,
     },
+    CommandOutputDiff {
+        reference_pane: u64,
+        reference: u64,
+        selected_pane: u64,
+        selected: u64,
+    },
+    WindowCommandHistory,
     HostGroupResults {
         submission: u64,
         format: GroupReportFormat,
@@ -52,6 +59,7 @@ pub enum Subject {
         run: u64,
     },
     FolderComparison(FolderComparisonTarget),
+    SftpTransferHistory,
     SshHostList,
     SshGroupDefinition,
     SshLoginReport(u64),
@@ -64,6 +72,8 @@ impl Subject {
             Self::PaneImage(pane) => format!("image of pane {pane}"),
             Self::PaneText(pane) => format!("visible text from pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
+            Self::CommandOutputDiff { .. } => "command output differences".into(),
+            Self::WindowCommandHistory => "command history results".into(),
             Self::HostGroupResults { format, shown, .. } => {
                 let scope = if shown { "shown " } else { "" };
                 let format = if format == GroupReportFormat::Json {
@@ -78,6 +88,7 @@ impl Subject {
             Self::HostGroupRunDiff { .. } => "SSH group run differences".into(),
             Self::HostGroupRunComparison { .. } => "SSH group run comparison".into(),
             Self::FolderComparison(_) => "folder comparison".into(),
+            Self::SftpTransferHistory => "SFTP transfer history".into(),
             Self::SshHostList => "SSH host list".into(),
             Self::SshGroupDefinition => "SSH group definition".into(),
             Self::SshLoginReport(_) => "SSH login report".into(),
@@ -92,6 +103,15 @@ impl Subject {
             Self::CommandOutput { pane, command } => {
                 file_picker::Purpose::CommandOutput(format!("pane-{pane}-command-{command}.txt"))
             }
+            Self::CommandOutputDiff {
+                reference_pane,
+                reference,
+                selected_pane,
+                selected,
+            } => file_picker::Purpose::CommandOutputDiff(format!(
+                "command-diff-{reference_pane}-{reference}-to-{selected_pane}-{selected}.txt"
+            )),
+            Self::WindowCommandHistory => file_picker::Purpose::WindowCommandHistory,
             Self::HostGroupResults {
                 submission,
                 format,
@@ -131,6 +151,7 @@ impl Subject {
                 ))
             }
             Self::FolderComparison(_) => file_picker::Purpose::FolderComparison,
+            Self::SftpTransferHistory => file_picker::Purpose::SftpTransferHistory,
             Self::SshHostList => file_picker::Purpose::SshHostList,
             Self::SshGroupDefinition => file_picker::Purpose::SshGroupDefinition,
             Self::SshLoginReport(sequence) => {
@@ -281,7 +302,16 @@ impl TerminalApp {
             return;
         };
         // Freeze the displayed viewport and appearance before showing the Save dialog.
-        let appearance = self.appearance.read().unwrap().clone();
+        let font_size = self
+            .tab_for_pane(pane)
+            .and_then(|id| match &self.tabs.get(id)?.page {
+                Page::Terminal(tab) => tab.font_size_override(),
+                _ => None,
+            });
+        let mut appearance = self.appearance.read().unwrap().clone();
+        if let Some(font_size) = font_size {
+            appearance.font_size = font_size;
+        }
         let render = move || crate::renderer::render_grid(&frame, frame.size, &appearance);
         match destination {
             ImageDestination::File => self.begin_text_export(

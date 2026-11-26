@@ -3,12 +3,13 @@ use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::sync::{oneshot, watch};
 use w11term::control::SftpCancelState;
-use w11term::events::SavedDownload;
+use w11term::events::{SavedDownload, SftpTransferDetails};
 use w11term::folder_grants::Authority;
+use w11term::profiles::BookmarkPeer;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
     CopyDestination, DEFAULT_TIMEOUT, EntryKind, FilenameMatch, FolderInventory, Job, JobProgress,
@@ -21,16 +22,19 @@ mod bookmarks;
 mod destination;
 mod downloads;
 mod editor;
+mod entry_menu;
 pub(super) mod find;
 mod folder_batch;
 mod folder_report;
 mod history;
 mod link_target;
+mod options;
 mod preview;
 mod properties;
 mod rename_batch;
 mod sort;
 mod text_draft;
+mod toolbar;
 mod transfer_queue;
 mod uploads;
 
@@ -105,7 +109,9 @@ pub enum FileAction {
     ShowTransfer(u64),
     ShowSavedDownload(u64, SavedDownload),
     Bookmarks(u64, u64, bookmarks::Action),
+    ResetDownloadFolder(u64, u64),
     Search(u64, u64, find::Action),
+    FocusSearch(u64, u64, u64, u8),
     Follow(u64, u64, bool),
     Reveal(u64, u64, String, Option<String>),
     Close(u64),
@@ -175,6 +181,7 @@ pub enum FileAction {
     ResumeDownload(u64, u64, u64, bool),
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
+    OptionsExpanded(u64, u64, bool),
     Replace(u64, u64, bool),
     PreserveMtime(u64, u64, bool),
     AtomicUploads(u64, u64, bool),
@@ -209,6 +216,7 @@ pub(super) struct FileDrawer {
     history: FolderHistory,
     bookmarks: Option<bookmarks::List>,
     search: Option<find::Panel>,
+    search_focus: Option<u64>,
     saved_search: Option<find::Panel>,
     /// Describes an explicit navigation request if either REALPATH or listing fails.
     opening_target: Option<String>,
@@ -233,6 +241,7 @@ pub(super) struct FileDrawer {
     folder_reference: Option<Arc<FolderInventory>>,
     editor: Option<editor::Editor>,
     dialog_serial: u64,
+    options_expanded: bool,
     replace: bool,
     preserve_mtime: bool,
     atomic_uploads: bool,
@@ -242,6 +251,7 @@ pub(super) struct FileDrawer {
     pending: Option<Pending>,
     queue: TransferQueue,
     last_download: Option<SavedDownload>,
+    finished_transfer_details: Option<Arc<SftpTransferDetails>>,
     preparing_drop: Option<DropPreparation>,
     transfer_serial: u64,
     status: String,
@@ -336,6 +346,7 @@ pub enum TransferPicker {
     Download(FileTarget, Option<DownloadVerification>),
     DownloadMarked,
     DownloadSearch(u64),
+    DefaultDownloadFolder,
     ComparePreview(u64),
     LocalFolderReference(u64),
 }
@@ -347,6 +358,16 @@ pub struct DownloadVerification {
 }
 
 impl TransferPicker {
+    fn uses_default_download_folder(&self) -> bool {
+        matches!(
+            self,
+            Self::Download(..)
+                | Self::DownloadMarked
+                | Self::DownloadSearch(_)
+                | Self::DefaultDownloadFolder
+        )
+    }
+
     fn purpose(&self, files: &FileDrawer) -> Result<file_picker::Purpose> {
         use file_picker::Purpose;
         match self {
@@ -372,6 +393,7 @@ impl TransferPicker {
                 files.search_download_selection(*serial)?;
                 Ok(Purpose::SaveSearchResults)
             }
+            Self::DefaultDownloadFolder => Ok(Purpose::DefaultDownloadFolder),
             Self::ComparePreview(_) => Ok(Purpose::CompareLocalFile),
             Self::LocalFolderReference(revision) => {
                 ensure!(
@@ -429,7 +451,9 @@ impl EditAction {
     fn uses_folder_picker(&self) -> bool {
         matches!(
             self,
-            Self::Move(..) | Self::FolderBatch(..) | Self::Copy(_, CopyFileMode::ToFolder)
+            Self::Move(..)
+                | Self::FolderBatch(FolderBatchKind::Move | FolderBatchKind::Copy, ..)
+                | Self::Copy(_, CopyFileMode::ToFolder)
         )
     }
 
@@ -524,6 +548,7 @@ impl EntryDialog {
                 ensure!(self.name != target.name(), "Enter a different name");
                 entry_path(parent()?, &self.name)
             }
+            EditAction::FolderBatch(FolderBatchKind::Delete, ..) => Ok(String::new()),
             EditAction::Move(..)
             | EditAction::FolderBatch(..)
             | EditAction::Copy(_, CopyFileMode::ToFolder) => {
@@ -644,10 +669,12 @@ enum TransferFile {
     Upload {
         name: String,
         remote: String,
+        local: PathBuf,
         atomic: bool,
     },
     UploadFolder {
         remote: String,
+        local: PathBuf,
     },
     Download {
         remote: String,
@@ -675,6 +702,21 @@ fn download_folder_subject(remote: &str, selected: bool) -> String {
 }
 
 impl TransferFile {
+    fn paths(&self) -> (TransferOperation, &str, &Path) {
+        match self {
+            Self::Upload { remote, local, .. } => (TransferOperation::UploadFile, remote, local),
+            Self::UploadFolder { remote, local } => {
+                (TransferOperation::UploadFolder, remote, local)
+            }
+            Self::Download { remote, local, .. } => {
+                (TransferOperation::DownloadFile, remote, local)
+            }
+            Self::DownloadFolder { remote, local, .. } => {
+                (TransferOperation::DownloadFolder, remote, local)
+            }
+        }
+    }
+
     fn downloaded_item(&self) -> Option<SavedDownload> {
         match self {
             Self::Download { local, .. } => Some(SavedDownload::File(Arc::from(local.as_path()))),
@@ -727,7 +769,7 @@ impl TransferFile {
                 "Cancelled download of {} ({bytes} bytes written to the temporary folder).",
                 download_folder_subject(remote, *selected),
             ),
-            (Self::UploadFolder { remote }, true) => {
+            (Self::UploadFolder { remote, .. }, true) => {
                 let destination = reply["resolved_remote"].as_str().unwrap_or(remote);
                 let outcome = if reply["remote_may_be_partial"] == true {
                     "The remote folder may be incomplete."
@@ -740,7 +782,7 @@ impl TransferFile {
                     counted(bytes.as_u64().unwrap_or_default(), "byte"),
                 )
             }
-            (Self::UploadFolder { remote }, false) => format!(
+            (Self::UploadFolder { remote, .. }, false) => format!(
                 "Uploaded folder {} ({}, {}, {}, {} skipped).",
                 reply["resolved_remote"].as_str().unwrap_or(remote),
                 counted(reply["files"].as_u64().unwrap_or_default(), "file"),
@@ -792,7 +834,7 @@ impl TransferFile {
             Self::Upload { remote, .. } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote file may be incomplete."
             ),
-            Self::UploadFolder { remote } => format!(
+            Self::UploadFolder { remote, .. } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote folder may be incomplete."
             ),
             Self::Download {
@@ -826,22 +868,24 @@ impl TransferFile {
         reply: &mut oneshot::Receiver<Result<Value, String>>,
         bytes: u64,
         queue: &mut TransferQueue,
-    ) -> (String, Option<SavedDownload>, TransferOutcome) {
+    ) -> (String, transfer_queue::FinishedTransfer, TransferOutcome) {
         use TransferOutcome::*;
         let (mut status, outcome) = match reply.try_recv() {
             Ok(Ok(result)) => {
-                let outcome = if result["cancelled"] == true {
+                let item_outcome = if result["cancelled"] == true {
                     Cancelled
                 } else {
-                    queue.completed_one();
-                    queue.record_download(self);
-                    if queue.completed >= queue.total {
-                        Completed
-                    } else if queue.remaining.is_empty() {
-                        Cancelled
-                    } else {
-                        Interrupted
-                    }
+                    Completed
+                };
+                queue.settle_item(self, item_outcome, Some(&result));
+                let outcome = if item_outcome == Cancelled {
+                    Cancelled
+                } else if queue.completed >= queue.total {
+                    Completed
+                } else if queue.remaining.is_empty() {
+                    Cancelled
+                } else {
+                    Interrupted
                 };
                 (
                     format!(
@@ -851,17 +895,26 @@ impl TransferFile {
                     outcome,
                 )
             }
-            Ok(Err(error)) if let Self::UploadFolder { remote } = self => {
-                (format!("Could not upload folder {remote}: {error}"), Failed)
+            Ok(Err(error)) => {
+                queue.settle_item(self, Failed, None);
+                let message = match self {
+                    Self::UploadFolder { remote, .. } => {
+                        format!("Could not upload folder {remote}: {error}")
+                    }
+                    _ => error,
+                };
+                (message, Failed)
             }
-            Ok(Err(error)) => (error, Failed),
-            Err(_) => (
-                format!(
-                    "SSH reconnected. {} Refresh to browse.",
-                    self.interrupted(bytes)
-                ),
-                Interrupted,
-            ),
+            Err(_) => {
+                queue.settle_item(self, Interrupted, None);
+                (
+                    format!(
+                        "SSH reconnected. {} Refresh to browse.",
+                        self.interrupted(bytes)
+                    ),
+                    Interrupted,
+                )
+            }
         };
         let saved = queue.finish(&mut status);
         (status, saved, outcome)
@@ -1320,11 +1373,11 @@ impl FileDrawer {
         self.status = format!("Uploading folder {remote}…");
         Ok((
             Operation::PutDir {
-                local,
+                local: local.clone(),
                 remote: remote.clone(),
                 preserve_times: self.preserve_upload_times,
             },
-            TransferFile::UploadFolder { remote },
+            TransferFile::UploadFolder { remote, local },
         ))
     }
 
@@ -1658,6 +1711,56 @@ impl FileDrawer {
         if let EditAction::RenameMarked(review) = &dialog.action {
             return Some(review.dialog(dialog, pane, generation, ssh, context));
         }
+        if let EditAction::FolderBatch(FolderBatchKind::Delete, _, hits) = &dialog.action {
+            let paths = hits
+                .iter()
+                .map(|hit| {
+                    let kind = if hit.kind == Some(EntryKind::Directory) {
+                        "Folder"
+                    } else {
+                        "File"
+                    };
+                    format!("{kind} · {}/{}", hit.parent.trim_end_matches('/'), hit.name)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(
+                ContentDialog::new()
+                    .title("Delete marked remote entries?")
+                    .primary_button_text("Delete entries")
+                    .close_button_text("Cancel")
+                    .is_open(true)
+                    .on_closed(context.callback(move |result| {
+                        Message::Files(FileAction::FinishEdit(pane, generation, serial, result))
+                    }))
+                    .content(
+                        StackPanel::new().spacing(8.0).min_width(300.0).children((
+                            TextBlock::new()
+                                .text(format!(
+                                    "{} {} on {}@{}:{}",
+                                    hits.len(),
+                                    FolderBatchKind::Delete.subject(hits.len()),
+                                    ssh.user,
+                                    ssh.host,
+                                    ssh.port
+                                ))
+                                .text_wrapping(TextWrapping::Wrap),
+                            TextBlock::new()
+                                .text("Deletion is permanent. Only empty folders can be deleted.")
+                                .text_wrapping(TextWrapping::Wrap),
+                            ScrollViewer::new()
+                                .max_height(190.0)
+                                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                                .content(
+                                    TextBlock::new()
+                                        .automation_id("sftp-delete-review-paths")
+                                        .text(paths)
+                                        .text_wrapping(TextWrapping::Wrap),
+                                ),
+                        )),
+                    ),
+            );
+        }
         let valid = dialog.destination();
         if let EditAction::Delete(_, kind) = &dialog.action {
             let title = match kind {
@@ -1705,7 +1808,8 @@ impl FileDrawer {
             EditAction::FolderBatch(FolderBatchKind::Copy, ..) => {
                 ("Copy marked files", "Destination folder", "Copy")
             }
-            EditAction::RenameMarked(_) | EditAction::FolderBatch(FolderBatchKind::Rename, ..) => {
+            EditAction::RenameMarked(_)
+            | EditAction::FolderBatch(FolderBatchKind::Rename | FolderBatchKind::Delete, ..) => {
                 unreachable!()
             }
             EditAction::VerifyDownload(_) => (
@@ -1908,6 +2012,7 @@ impl FileDrawer {
 
     fn close(&mut self) {
         self.open = false;
+        self.options_expanded = false;
         self.marked_downloads = None;
         self.close_search();
         self.saved_search = None;
@@ -1939,6 +2044,10 @@ impl FileDrawer {
 
     pub(super) fn busy(&self) -> bool {
         self.awaiting_native_result() || self.pending.is_some()
+    }
+
+    pub(super) fn can_reveal_path(&self) -> bool {
+        !self.busy() && !self.parsing && !self.entry_dialog_open()
     }
 
     fn transfer_file(&self) -> Option<&TransferFile> {
@@ -1975,14 +2084,7 @@ impl FileDrawer {
         }
         let file = self.transfer_file()?;
         let transfer = self.pending.as_ref()?.transfer.as_ref()?;
-        let (operation, remote) = match file {
-            TransferFile::Upload { remote, .. } => (TransferOperation::UploadFile, remote),
-            TransferFile::UploadFolder { remote } => (TransferOperation::UploadFolder, remote),
-            TransferFile::Download { remote, .. } => (TransferOperation::DownloadFile, remote),
-            TransferFile::DownloadFolder { remote, .. } => {
-                (TransferOperation::DownloadFolder, remote)
-            }
-        };
+        let (operation, remote, _) = file.paths();
         Some(TransferView {
             id: transfer.id,
             operation,
@@ -2034,27 +2136,37 @@ impl FileDrawer {
     }
 
     fn finish_transfer_queue(&mut self) {
-        if let Some(saved) = self.queue.finish(&mut self.status) {
+        let finished = self.queue.finish(&mut self.status);
+        if let Some(saved) = finished.saved {
             self.last_download = Some(saved);
+        }
+        if finished.details.is_some() {
+            self.finished_transfer_details = finished.details;
         }
     }
 
     fn publish_ended_transfer(
-        &self,
+        &mut self,
         session: &Session,
         previous: Option<(TransferId, bool)>,
         background: bool,
         outcome: TransferOutcome,
     ) {
+        let details = self.finished_transfer_details.take();
         if let Some((id, download)) = previous
             && self
                 .transfer_stamp()
                 .is_none_or(|(current, _)| current != id)
         {
             let saved = self.last_download.as_ref().filter(|_| download).cloned();
-            session
-                .events
-                .sftp_transfer_finished(id, outcome, &self.status, saved, background);
+            session.events.sftp_transfer_finished(
+                id,
+                outcome,
+                &self.status,
+                saved,
+                details,
+                background,
+            );
         }
     }
 
@@ -2064,6 +2176,7 @@ impl FileDrawer {
             return outcome;
         }
         let mut last_download = self.last_download.take();
+        let mut finished_transfer_details = None;
         let status = match self.pending.as_mut() {
             Some(Pending {
                 step: Step::Change { change, .. },
@@ -2094,12 +2207,13 @@ impl FileDrawer {
                 transfer: Some(transfer),
                 ..
             }) => {
-                let (status, saved, terminal) =
+                let (status, finished, terminal) =
                     file.reconnect_status(reply, transfer.progress.borrow().bytes, &mut self.queue);
                 outcome = terminal;
-                if saved.is_some() {
-                    last_download = saved;
+                if finished.saved.is_some() {
+                    last_download = finished.saved;
                 }
+                finished_transfer_details = finished.details;
                 status
             }
             _ if self.move_listing_refresh.is_some() => format!(
@@ -2128,6 +2242,7 @@ impl FileDrawer {
             dialog_serial: self.dialog_serial,
             editor,
             last_download,
+            finished_transfer_details,
             generation,
             status,
             ..Self::default()
@@ -2212,16 +2327,6 @@ impl FileDrawer {
         let selected = self
             .page_entries()
             .find(|e| Some(&e.name) == self.selected.as_ref());
-        let download_folder =
-            selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::Directory));
-        let can_copy = writable
-            && generation != 0
-            && selected.is_some_and(|entry| {
-                matches!(
-                    entry.kind,
-                    ListedKind::Known(EntryKind::File) | ListedKind::Missing
-                ) && entry_path(folder, &entry.name).is_ok()
-            });
         let revision = self.listing_revision;
         let drop_target = DropTarget::new(pane, self, folder);
         let shell = if shell_ready {
@@ -2235,427 +2340,58 @@ impl FileDrawer {
             name: entry.map_or_else(String::new, |e| e.name.clone()),
             kind: entry.map_or(ListedKind::Missing, |e| e.kind),
         };
-        let find_files = button(
-            "Find files…",
-            writable && generation != 0,
-            Search(pane, generation, find::Action::Show(revision)),
+        let toolbar = self.listing_toolbar(
+            pane,
+            ssh,
+            profile,
+            selected.map(|entry| listed(Some(entry))),
+            layout,
+            context,
         );
-        let search_actions = if let Some(saved) = &self.saved_search {
-            StackPanel::new().spacing(6.0).children((
-                button(
-                    "Back to search results",
-                    writable && generation != 0,
-                    Search(pane, generation, find::Action::Restore(saved.serial)),
-                ),
-                find_files,
-            ))
-        } else {
-            find_files
-        };
-        let mut controls: Vec<View> = vec![
-            Grid::new()
-                .width(layout.content_width())
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .columns([GridLength::Star(1.0), GridLength::Auto])
-                .children((
-                    TextBlock::new()
-                        .text(format!("{}@{}:{}", ssh.user, ssh.host, ssh.port))
-                        .text_wrapping(TextWrapping::Wrap),
-                    Border::new()
-                        .grid_column(1)
-                        .content(button("Close", true, Close(pane))),
-                )),
-            Grid::new()
-                .width(layout.content_width())
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .columns([GridLength::Star(1.0), GridLength::Auto])
-                .children((
-                    TextBlock::new()
-                        .text(folder)
-                        .text_wrapping(TextWrapping::Wrap),
-                    Border::new().grid_column(1).content(button(
-                        "Go to folder…",
-                        ready && generation != 0,
-                        GoToFolder(pane, generation, revision),
-                    )),
-                )),
-            self.reference_controls(pane, context)
-                .unwrap_or_else(View::empty),
-            search_actions,
-            StackPanel::new()
-                .orientation(if layout.content_width() >= 300.0 {
-                    Orientation::Horizontal
-                } else {
-                    Orientation::Vertical
-                })
-                .spacing(6.0)
-                .children((
-                    button_pair(
-                        button(
-                            "Back",
-                            writable && self.history.target(HistoryDirection::Back).is_some(),
-                            History(pane, generation, revision, HistoryDirection::Back),
-                        ),
-                        button(
-                            "Forward",
-                            writable && self.history.target(HistoryDirection::Forward).is_some(),
-                            History(pane, generation, revision, HistoryDirection::Forward),
-                        ),
-                    ),
-                    button_pair(
-                        button(
-                            "Up",
-                            writable && folder != "/",
-                            Browse(
-                                pane,
-                                generation,
-                                format!("{}/..", folder.trim_end_matches('/')),
-                            ),
-                        ),
-                        button("Refresh", ready, Browse(pane, generation, folder.into())),
-                    ),
-                )),
-            button(
-                "Filesystem space…",
-                writable && generation != 0,
-                ShowFolderReport(pane, generation, revision, folder_report::Kind::Space),
-            ),
-            button(
-                "Folder contents…",
-                writable && generation != 0,
-                ShowFolderReport(pane, generation, revision, folder_report::Kind::Contents),
-            ),
-            StackPanel::new().spacing(6.0).children((
-                button(
-                    "Set folder as comparison reference…",
-                    writable && generation != 0,
-                    ShowFolderReport(pane, generation, revision, folder_report::Kind::Reference),
-                ),
-                button(
-                    "Set Windows folder as reference…",
-                    writable && generation != 0,
-                    Pick(
-                        pane,
-                        generation,
-                        revision,
-                        TransferPicker::LocalFolderReference(revision),
-                    ),
-                ),
-                self.folder_reference
-                    .as_ref()
-                    .map(|reference| {
-                        StackPanel::new().spacing(6.0).children((
-                            TextBlock::new()
-                                .automation_id("sftp-folder-reference")
-                                .text(format!(
-                                    "{}  {}",
-                                    folder_report::reference_label(reference.origin, false),
-                                    reference.root
-                                ))
-                                .text_wrapping(TextWrapping::Wrap),
-                            button(
-                                "Compare folder with reference…",
-                                writable,
-                                ShowFolderReport(
-                                    pane,
-                                    generation,
-                                    revision,
-                                    folder_report::Kind::Comparison,
-                                ),
-                            ),
-                            button(
-                                "Clear folder reference",
-                                ready,
-                                ClearFolderReference(pane, generation, revision),
-                            ),
-                        ))
-                    })
-                    .unwrap_or_else(View::empty),
-            )),
-            StackPanel::new()
-                .orientation(if layout.content_width() >= 320.0 {
-                    Orientation::Horizontal
-                } else {
-                    Orientation::Vertical
-                })
-                .spacing(6.0)
-                .children((
-                    button(
-                        "Bookmarks…",
-                        ready && profile.is_some(),
-                        Bookmarks(pane, generation, bookmarks::Action::Show),
-                    ),
-                    button_pair(
-                        button(
-                            "Upload…",
-                            writable,
-                            Pick(
-                                pane,
-                                generation,
-                                revision,
-                                TransferPicker::UploadFiles(folder.into()),
-                            ),
-                        ),
-                        button(
-                            "Upload folder…",
-                            writable,
-                            Pick(
-                                pane,
-                                generation,
-                                revision,
-                                TransferPicker::UploadFolder(folder.into()),
-                            ),
-                        ),
-                    ),
-                )),
-            StackPanel::new().spacing(6.0).children((
-                button_pair(
-                    button(
-                        "New folder",
-                        writable,
-                        NewFolder(pane, generation, folder.into()),
-                    ),
-                    button(
-                        "New text file…",
-                        self.can_start_new_editor(revision),
-                        NewTextFile(pane, generation, revision),
-                    ),
-                ),
-                button(
-                    "Move to folder…",
-                    writable
-                        && generation != 0
-                        && selected.is_some_and(|entry| {
-                            entry.kind != ListedKind::Unsupported
-                                && entry_path(folder, &entry.name).is_ok()
-                        }),
-                    MoveEntry(pane, generation, FileTarget::Listed(listed(selected))),
-                ),
-                button_pair(
-                    button(
-                        "Rename…",
-                        writable && selected.is_some_and(|e| entry_path(folder, &e.name).is_ok()),
-                        Rename(pane, generation, listed(selected)),
-                    ),
-                    button(
-                        "Delete…",
-                        writable
-                            && selected.is_some_and(|e| {
-                                e.kind != ListedKind::Unsupported
-                                    && delete_path(folder, &e.name).is_ok()
-                            }),
-                        Delete(pane, generation, listed(selected)),
-                    ),
-                ),
-                button_pair(
-                    button(
-                        "Copy to folder…",
-                        can_copy,
-                        CopyEntry(
-                            pane,
-                            generation,
-                            FileTarget::Listed(listed(selected)),
-                            CopyFileMode::ToFolder,
-                        ),
-                    ),
-                    button(
-                        "Duplicate as…",
-                        can_copy,
-                        CopyEntry(
-                            pane,
-                            generation,
-                            FileTarget::Listed(listed(selected)),
-                            CopyFileMode::Duplicate,
-                        ),
-                    ),
-                ),
-            )),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(6.0)
-                .children((
-                    button(
-                        "Open folder",
-                        ready
-                            && selected
-                                .is_some_and(|e| e.kind != ListedKind::Known(EntryKind::File)),
-                        OpenEntry(pane, generation, listed(selected)),
-                    ),
-                    Button::new()
-                        .automation_name("Open shell here")
-                        .is_enabled(shell.is_some())
-                        .on_click(context.callback(move |_| {
-                            directory_split::message(
-                                directory_split::Destination::Split(Axis::Columns),
-                                shell.as_ref(),
-                            )
-                        }))
-                        .content("Open shell here"),
-                )),
-            button_pair(
-                button(
-                    if download_folder {
-                        "Download folder…"
-                    } else {
-                        "Download…"
-                    },
-                    ready && selected.is_some(),
-                    Pick(
-                        pane,
-                        generation,
-                        revision,
-                        TransferPicker::Download(FileTarget::Listed(listed(selected)), None),
-                    ),
-                ),
-                button(
-                    "Download and verify…",
-                    ready && selected.is_some() && !download_folder,
-                    VerifyDownload(pane, generation, listed(selected)),
-                ),
-            ),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(6.0)
-                .children((
-                    button(
-                        "Copy directory path",
-                        writable,
-                        CopyPath(pane, generation, revision, None),
-                    ),
-                    button(
-                        "Copy selected path",
-                        writable && selected.is_some(),
-                        CopyPath(pane, generation, revision, Some(listed(selected))),
-                    ),
-                )),
-            {
-                let regular =
-                    selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File));
-                let preview =
-                    |kind| Preview(pane, generation, FileTarget::Listed(listed(selected)), kind);
-                let actions = button_pair(
-                    button(
-                        "Preview text…",
-                        writable && regular,
-                        preview(PreviewKind::Text),
-                    ),
-                    button(
-                        "Properties…",
-                        writable && selected.is_some(),
-                        preview(PreviewKind::Properties),
-                    ),
-                );
-                let actions = if regular {
-                    let tail = button("Tail text file…", writable, preview(PreviewKind::Tail));
-                    let supplemental = if selected.is_some_and(|e| image_preview_name(&e.name)) {
-                        button_pair(
-                            button("Preview image…", writable, preview(PreviewKind::Image)),
-                            tail,
-                        )
-                    } else {
-                        tail
-                    };
-                    StackPanel::new()
-                        .spacing(6.0)
-                        .children((actions, supplemental))
-                } else {
-                    actions
-                };
-                if let Some(id) = self.reference_id()
-                    && regular
-                {
-                    let target = FileTarget::Listed(listed(selected));
-                    StackPanel::new().spacing(6.0).children((
-                        actions,
-                        button(
-                            "Compare selected with reference…",
-                            writable,
-                            TextReference(
-                                pane,
-                                generation,
-                                preview::ReferenceAction::Open(target, id),
-                            ),
-                        ),
+        let mut controls = Vec::new();
+        controls.extend(self.reference_controls(pane, context));
+        if let Some(reference) = &self.folder_reference {
+            controls.push(
+                TextBlock::new()
+                    .automation_id("sftp-folder-reference")
+                    .text(format!(
+                        "{}  {}",
+                        folder_report::reference_label(reference.origin, false),
+                        reference.root
                     ))
-                } else {
-                    actions
-                }
-            },
-            CheckBox::new()
-                .is_checked(self.following)
-                .on_is_checked_changed(
-                    context.callback(move |v| Message::Files(Follow(pane, generation, v))),
-                )
-                .content(TextBlock::new().text("Follow shell directory")),
-            CheckBox::new()
-                .is_enabled(ready)
-                .is_checked(self.replace)
-                .on_is_checked_changed(
-                    context.callback(move |v| Message::Files(Replace(pane, generation, v))),
-                )
-                .content(TextBlock::new().text("Replace existing files")),
-            CheckBox::new()
-                .automation_name("Preserve modification times")
-                .is_enabled(ready)
-                .is_checked(self.preserve_mtime)
-                .on_is_checked_changed(context.callback(move |enabled| {
-                    Message::Files(PreserveMtime(pane, generation, enabled))
-                }))
-                .content(TextBlock::new().text("Preserve modification times")),
-            CheckBox::new()
-                .is_enabled(ready)
-                .is_checked(self.atomic_uploads)
-                .on_is_checked_changed(
-                    context.callback(move |v| Message::Files(AtomicUploads(pane, generation, v))),
-                )
-                .content(TextBlock::new().text("Upload files atomically")),
-            CheckBox::new()
-                .automation_name("Preserve upload timestamps")
-                .is_enabled(ready)
-                .is_checked(self.preserve_upload_times)
-                .on_is_checked_changed(context.callback(move |enabled| {
-                    Message::Files(PreserveUploadTimes(pane, generation, enabled))
-                }))
-                .content(TextBlock::new().text("Preserve upload timestamps")),
-        ];
-        controls.extend(self.resume_draft_button(pane, context));
-        let sort_button = |order, label: &str, name: &str| {
-            RadioButton::new()
-                .group_name(format!("sftp-sort-{pane}"))
-                .automation_name(name)
-                .min_width(0.0)
-                .is_enabled(writable)
-                .is_checked(self.sort_order == order)
-                .on_checked(context.callback(move |checked| {
-                    if checked {
-                        Message::Files(Sort(pane, generation, revision, order))
-                    } else {
-                        Message::ControlIdle
-                    }
-                }))
-                .content(label)
-        };
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            );
+        }
+        if let Some(saved) = &self.saved_search {
+            controls.push(button(
+                "Back to search results",
+                writable && generation != 0,
+                Search(pane, generation, find::Action::Restore(saved.serial)),
+            ));
+        }
         controls.push(
-            StackPanel::new()
-                .orientation(if layout.content_width() >= 320.0 {
-                    Orientation::Horizontal
-                } else {
-                    Orientation::Vertical
-                })
-                .spacing(6.0)
+            Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Auto])
+                .column_spacing(6.0)
                 .children((
-                    TextBlock::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .text("Sort by"),
-                    sort_button(SortOrder::Name, "Name", "Sort by name"),
-                    sort_button(SortOrder::NewestFirst, "Newest first", "Sort newest first"),
-                    sort_button(
-                        SortOrder::LargestFirst,
-                        "Largest first",
-                        "Sort largest first",
+                    self.sorting_control(pane, context),
+                    Border::new().grid_column(1).content(
+                        title_tools::button("Open shell here")
+                            .is_enabled(shell.is_some())
+                            .on_click(context.callback(move |_| {
+                                directory_split::message(
+                                    directory_split::Destination::Split(Axis::Columns),
+                                    shell.as_ref(),
+                                )
+                            }))
+                            .content(FontIcon::new().glyph("\u{e756}"))
+                            .tooltip_with(title_tools::below("Open shell in this folder")),
                     ),
                 )),
         );
+        controls.push(self.listing_options(pane, context));
+        controls.extend(self.resume_draft_button(pane, context));
         let filter: View = if let Some(input) = &self.filter_input {
             Grid::new()
                 .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -2762,6 +2498,11 @@ impl FileDrawer {
                         StartFolderBatch(pane, generation, revision, FolderBatchKind::Rename),
                     ),
                     button(
+                        "Delete marked entries…",
+                        writable && generation != 0 && !marked.is_empty(),
+                        StartFolderBatch(pane, generation, revision, FolderBatchKind::Delete),
+                    ),
+                    button(
                         "Exit selection",
                         writable,
                         SelectDownloads(pane, generation, revision, false),
@@ -2775,45 +2516,12 @@ impl FileDrawer {
                 SelectDownloads(pane, generation, revision, true),
             ));
         }
-        if let Some(transfer) = self.transfer_controls(context) {
-            controls.extend(transfer);
-        }
-        if let Some(stop) =
-            self.stop_folder_batch_button(pane, FolderBatchOrigin::Listing(revision), context)
-        {
-            controls.push(stop);
-        }
-        if let Some(preparation) = &self.preparing_drop {
-            controls.push(button(
-                "Cancel transfer",
-                true,
-                CancelTransfer(preparation.id),
-            ));
-        }
         #[cfg(feature = "ui-smoke")]
         if let Some(file) = std::env::var_os("W11TERM_SFTP_DROP_SMOKE_ITEMS") {
             controls.push(button(
                 "Drop fixture items",
                 writable,
                 SmokeDrop(drop_target.clone(), file.into()),
-            ));
-        }
-        if !self.status.is_empty() {
-            controls.push(
-                TextBlock::new()
-                    .automation_id("sftp-listing-status")
-                    .text(&self.status)
-                    .max_width(layout.content_width())
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .into(),
-            );
-        }
-        if let Some(download) = &self.last_download {
-            controls.push(button(
-                explorer::download_label(download),
-                ready,
-                ShowSavedDownload(pane, download.clone()),
             ));
         }
         let count = self.matching_entries().len();
@@ -2920,7 +2628,7 @@ impl FileDrawer {
             .collect();
         let actions = ScrollViewer::new()
             .automation_name("SFTP actions")
-            .max_height(layout.actions_max_height)
+            .max_height((layout.actions_max_height * 0.40).min(190.0))
             .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
@@ -2931,6 +2639,60 @@ impl FileDrawer {
                         .map(|(index, view)| KeyedView::new(index.to_string(), view)),
                 ),
             );
+        let mut activity = Vec::new();
+        if let Some(transfer) = self.transfer_controls(context) {
+            activity.extend(transfer);
+        }
+        activity.extend(self.stop_folder_batch_button(
+            pane,
+            FolderBatchOrigin::Listing(revision),
+            context,
+        ));
+        if let Some(preparation) = &self.preparing_drop {
+            activity.push(button(
+                "Cancel transfer",
+                true,
+                CancelTransfer(preparation.id),
+            ));
+        }
+        if !self.status.is_empty() {
+            activity.push(
+                TextBlock::new()
+                    .automation_id("sftp-listing-status")
+                    .text(&self.status)
+                    .max_width(layout.content_width())
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            );
+        }
+        if let Some(download) = &self.last_download {
+            activity.push(button(
+                explorer::download_label(download),
+                ready,
+                ShowSavedDownload(pane, download.clone()),
+            ));
+        }
+        let feedback = (!activity.is_empty()).then(|| {
+            KeyedView::new(
+                "activity",
+                ScrollViewer::new()
+                    .automation_name("SFTP activity")
+                    .max_height((layout.actions_max_height * 0.45).min(116.0))
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(
+                        StackPanel::new().spacing(4.0).keyed_children(
+                            activity
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, view)| KeyedView::new(index.to_string(), view)),
+                        ),
+                    ),
+            )
+        });
+        let footer = StackPanel::new()
+            .spacing(6.0)
+            .keyed_children(std::iter::once(KeyedView::new("actions", actions)).chain(feedback));
         let panel = Border::new()
             .padding(PANEL_PADDING)
             .background(Color::rgb(31, 32, 35))
@@ -2943,14 +2705,16 @@ impl FileDrawer {
             .on_drop(context.callback(move |data| Message::Files(drop_target.data(data))))
             .content(
                 Grid::new()
-                    .rows([GridLength::Auto, GridLength::Star(1.0)])
+                    .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+                    .row_spacing(6.0)
                     .children((
-                        actions,
+                        toolbar,
                         ScrollViewer::new()
                             .grid_row(1)
                             .automation_name("SFTP entries")
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                             .content(StackPanel::new().keyed_children(list)),
+                        Border::new().grid_row(2).content(footer),
                     )),
             );
         cache(panel)
@@ -3102,7 +2866,7 @@ impl FileDrawer {
             .context("No transfer selected")?;
         self.status = match &transfer {
             TransferFile::Upload { name, .. } => format!("Uploading {name}…"),
-            TransferFile::UploadFolder { remote } => format!("Uploading folder {remote}…"),
+            TransferFile::UploadFolder { remote, .. } => format!("Uploading folder {remote}…"),
             TransferFile::Download { remote, .. } | TransferFile::DownloadFolder { remote, .. } => {
                 format!(
                     "Downloading item {} of {}: {remote}…",
@@ -3152,6 +2916,8 @@ impl FileDrawer {
                 {
                     let error = file.interrupted(transfer.progress.borrow().bytes);
                     *outcome = TransferOutcome::Interrupted;
+                    self.queue
+                        .settle_item(file, TransferOutcome::Interrupted, None);
                     self.pending.take();
                     self.cached.borrow_mut().take();
                     bail!("{error}");
@@ -3219,6 +2985,9 @@ impl FileDrawer {
                 }
             }
             (step, Err(error)) => {
+                if let Step::Transfer(file) = &step {
+                    self.queue.settle_item(file, TransferOutcome::Failed, None);
+                }
                 if let Step::IdentifyDelete(entry) = &step {
                     bail!("Could not delete {}: {error}", entry.name);
                 }
@@ -3250,7 +3019,7 @@ impl FileDrawer {
                 {
                     bail!("Could not download {remote}: {error}");
                 }
-                if let Step::Transfer(TransferFile::UploadFolder { remote }) = &step {
+                if let Step::Transfer(TransferFile::UploadFolder { remote, .. }) = &step {
                     bail!("Could not upload folder {remote}: {error}");
                 }
                 bail!("{error}");
@@ -3307,17 +3076,19 @@ impl FileDrawer {
                 self.status = file.outcome(&reply);
                 if reply["cancelled"] == true {
                     *outcome = TransferOutcome::Cancelled;
+                    self.queue
+                        .settle_item(&file, TransferOutcome::Cancelled, Some(&reply));
                     self.finish_transfer_queue();
                     return Ok(());
                 }
                 let upload = !file.is_download();
-                self.queue.record_download(&file);
+                self.queue
+                    .settle_item(&file, TransferOutcome::Completed, Some(&reply));
                 if !upload && self.queue.batch_id.is_none() {
                     *outcome = TransferOutcome::Completed;
                     self.finish_transfer_queue();
                     return Ok(());
                 }
-                self.queue.completed_one();
                 if self.queue.remaining.is_empty() {
                     *outcome = if self.queue.completed < self.queue.total {
                         TransferOutcome::Cancelled
@@ -3576,7 +3347,7 @@ impl TerminalApp {
                 .is_some_and(|transfer| self.tabs.active_group_id() == Some(transfer.group))
     }
 
-    pub(super) fn with_file_drawer(&self, content: View, context: &ViewContext<Self>) -> View {
+    pub(super) fn with_file_drawer(&self, content: View, context: &mut ViewContext<Self>) -> View {
         let Some(AppTab {
             page: Page::Terminal(tab),
             ..
@@ -3601,6 +3372,7 @@ impl TerminalApp {
         let shell_ready =
             connection.is_some() && self.drawer_shell_eligible(tab, tab.files.generation);
         let layout = DrawerLayout::for_window(self.width, self.window_height);
+        tab.files.publish_search_focus(tab.session.pane_id, context);
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(layout.width)])
             .keyed_children([
@@ -3637,7 +3409,9 @@ impl TerminalApp {
             | ShowSavedDownload(id, _)
             | Close(id)
             | Bookmarks(id, ..)
+            | ResetDownloadFolder(id, ..)
             | Search(id, ..)
+            | FocusSearch(id, ..)
             | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
@@ -3693,6 +3467,7 @@ impl TerminalApp {
             | ResumeDownload(id, ..)
             | FinishEdit(id, ..)
             | Page(id, ..)
+            | OptionsExpanded(id, ..)
             | Replace(id, ..)
             | PreserveMtime(id, ..)
             | AtomicUploads(id, ..)
@@ -3722,6 +3497,11 @@ impl TerminalApp {
         };
         let session = &tab.session;
         let files = &mut tab.files;
+        let download_profile = |generation| {
+            let name = tab.profile_name.as_deref()?;
+            let connection = session.ssh_connection_at(generation)?;
+            Some((name, BookmarkPeer::from_connection(&connection)))
+        };
         let frame = session.frames.load();
         let may_open_dialog = visible
             && !transferring
@@ -3782,6 +3562,13 @@ impl TerminalApp {
         {
             return;
         }
+        if let OptionsExpanded(_, generation, expanded) = &action
+            && (!files.open
+                || *generation != files.generation
+                || *expanded == files.options_expanded)
+        {
+            return;
+        }
         let editor_typing = matches!(
             &action,
             TextEditor(_, _, editor::Action::Text(_) | editor::Action::Name(_))
@@ -3797,16 +3584,18 @@ impl TerminalApp {
         let keep_directory = editor_typing
             || matches!(
                 &action,
-                Filter(..) | ClearFilter(..) | FocusFilter(..) | Sort(..) | ShowTransfer(..)
+                Filter(..)
+                    | ClearFilter(..)
+                    | FocusFilter(..)
+                    | FocusSearch(..)
+                    | Sort(..)
+                    | OptionsExpanded(..)
+                    | ShowTransfer(..)
             );
         if !editor_typing
             && !matches!(
                 action,
-                Tick(_)
-                    | PollTail(..)
-                    | EditName(..)
-                    | FocusFilter(..)
-                    | Search(_, _, find::Action::FocusQuery(..))
+                Tick(_) | PollTail(..) | EditName(..) | FocusFilter(..) | FocusSearch(..)
             )
         {
             files.cached.borrow_mut().take();
@@ -3826,6 +3615,10 @@ impl TerminalApp {
                     )?;
                 }
                 Search(..) => {}
+                FocusSearch(_, generation, serial, attempt) if generation == files.generation => {
+                    files.focus_search_query(pane, serial, attempt, may_open_dialog, context);
+                }
+                FocusSearch(..) => {}
                 Bookmarks(_, generation, action)
                     if files.open && generation == files.generation =>
                 {
@@ -3839,6 +3632,19 @@ impl TerminalApp {
                     )?;
                 }
                 Bookmarks(..) => {}
+                ResetDownloadFolder(_, generation)
+                    if files.open
+                        && may_open_dialog
+                        && !files.busy()
+                        && generation == files.generation =>
+                {
+                    let (name, peer) = download_profile(generation)
+                        .context("Choose a connected, saved SSH profile")?;
+                    self.store.set_sftp_download_folder(name, &peer, None)?;
+                    files.status =
+                        "Downloads will use the Windows dialog's usual starting folder.".into();
+                }
+                ResetDownloadFolder(..) => {}
                 Toggle => {
                     if files.open {
                         files.close();
@@ -4177,6 +3983,17 @@ impl TerminalApp {
                                 context,
                             )?;
                         }
+                        TransferPicker::DefaultDownloadFolder => {
+                            let [folder] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one default download folder"))?;
+                            let (name, peer) = download_profile(files.generation)
+                                .context("Choose a connected, saved SSH profile")?;
+                            self.store
+                                .set_sftp_download_folder(name, &peer, Some(&folder))?;
+                            files.status =
+                                format!("Default download folder for {name}: {}", folder.display());
+                        }
                         TransferPicker::ComparePreview(preview) => {
                             let [local] = paths
                                 .try_into()
@@ -4195,7 +4012,11 @@ impl TerminalApp {
                     if let Some(dialog) = files.dialog.as_mut().filter(|e| {
                         e.serial == serial
                             && e.destination_picker.is_none()
-                            && !matches!(e.action, EditAction::Delete(..))
+                            && !matches!(
+                                e.action,
+                                EditAction::Delete(..)
+                                    | EditAction::FolderBatch(FolderBatchKind::Delete, ..)
+                            )
                     }) {
                         dialog.name = name;
                     }
@@ -4585,6 +4406,7 @@ impl TerminalApp {
                     files.end_filter_edit();
                     files.set_page(page);
                 }
+                OptionsExpanded(_, _, expanded) => files.options_expanded = expanded,
                 Replace(_, _, replace) => files.replace = replace,
                 PreserveMtime(_, _, enabled) => files.preserve_mtime = enabled,
                 AtomicUploads(_, _, atomic) => files.atomic_uploads = atomic,
@@ -4615,6 +4437,7 @@ impl TerminalApp {
                             picker,
                             TransferPicker::DownloadMarked
                                 | TransferPicker::DownloadSearch(_)
+                                | TransferPicker::DefaultDownloadFolder
                                 | TransferPicker::Download(FileTarget::Search(..), _)
                         ) && files.busy())
                         || revision != files.listing_revision
@@ -4623,6 +4446,18 @@ impl TerminalApp {
                         return Ok(());
                     }
                     let purpose = picker.purpose(files)?;
+                    let mut initial_folder = None;
+                    if picker.uses_default_download_folder() {
+                        let profile = download_profile(files.generation);
+                        if matches!(picker, TransferPicker::DefaultDownloadFolder) {
+                            let (name, peer) =
+                                profile.context("Choose a connected, saved SSH profile")?;
+                            initial_folder = self.store.sftp_download_folder(name, &peer)?;
+                        } else if let Some((name, peer)) = profile {
+                            initial_folder =
+                                self.store.sftp_download_folder(name, &peer).ok().flatten();
+                        }
+                    }
                     let owner = crate::input::window().context("Window is not ready")?.0 as usize;
                     files.end_filter_edit();
                     let serial = files.start_picker();
@@ -4639,8 +4474,9 @@ impl TerminalApp {
                     ));
                     context.spawn_background_with_rejection(
                         move |_| {
-                            let result = file_picker::pick_paths(owner, purpose)
-                                .map_err(|error| format!("{error:#}"));
+                            let result =
+                                file_picker::pick_paths_from_folder(owner, purpose, initial_folder)
+                                    .map_err(|error| format!("{error:#}"));
                             Message::Files(Picked(pane, generation, serial, picker, result))
                         },
                         reject,
@@ -4666,12 +4502,17 @@ impl TerminalApp {
                     None => format!("{error:#}"),
                 },
             };
-            files.finish_transfer_queue();
+            if files.transfer_file().is_none() {
+                files.finish_transfer_queue();
+            }
             files.cached.borrow_mut().take();
         }
         files.publish_ended_transfer(session, previous_transfer, !visible || !files.open, outcome);
         if visible {
             let return_to_terminal = finish_filter && !tab.files.filter_editing();
+            if drawer_was_open != tab.files.open {
+                self.header.borrow_mut().take();
+            }
             if !keep_directory {
                 tab.follow_shell_directory(&frame, context);
             }
@@ -5950,6 +5791,7 @@ mod tests {
         let upload = TransferFile::Upload {
             name: "large.bin".into(),
             remote: "/srv/uploads/large.bin".into(),
+            local: r"C:\upload\large.bin".into(),
             atomic: false,
         };
         let download = TransferFile::Download {
@@ -5982,7 +5824,11 @@ mod tests {
         let (worker, mut reply) = oneshot::channel();
         let (interrupted, saved, outcome) =
             upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default());
-        assert!(saved.is_none());
+        assert!(saved.saved.is_none());
+        assert_eq!(
+            saved.details.unwrap().stopped.as_ref().unwrap().outcome,
+            TransferOutcome::Interrupted
+        );
         assert_eq!(outcome, TransferOutcome::Interrupted);
         assert!(interrupted.contains("/srv/uploads/large.bin"));
         assert!(interrupted.contains("at least 32 bytes acknowledged"));
@@ -5998,20 +5844,17 @@ mod tests {
         worker
             .send(Err("WRITE timed out; outcome is unknown".into()))
             .unwrap();
-        assert_eq!(
-            upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default()),
-            (
-                "WRITE timed out; outcome is unknown".into(),
-                None,
-                TransferOutcome::Failed
-            )
-        );
+        let (status, finished, outcome) =
+            upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default());
+        assert_eq!(status, "WRITE timed out; outcome is unknown");
+        assert!(finished.saved.is_none());
+        assert_eq!(outcome, TransferOutcome::Failed);
         let (worker, mut reply) = oneshot::channel();
         worker.send(Ok(complete)).unwrap();
         let (status, saved, outcome) =
             download.reconnect_status(&mut reply, 64, &mut TransferQueue::default());
         assert!(status.starts_with("Downloaded /large.bin (128 bytes)"));
-        assert_eq!(saved, download.downloaded_item());
+        assert_eq!(saved.saved, download.downloaded_item());
         assert_eq!(outcome, TransferOutcome::Completed);
     }
 
@@ -6095,6 +5938,7 @@ mod tests {
     fn folder_upload_reports_its_destination_and_distinguishes_partial_remote_trees() {
         let folder = TransferFile::UploadFolder {
             remote: "/reports/run".into(),
+            local: r"C:\reports\run".into(),
         };
         let partial = json!({
             "cancelled": true,
@@ -6122,14 +5966,14 @@ mod tests {
         assert!(interrupted.contains("at least 42 bytes acknowledged"));
         assert!(interrupted.contains("remote folder may be incomplete"));
         worker.send(Err("Permission denied".into())).unwrap();
+        let (status, finished, outcome) =
+            folder.reconnect_status(&mut reply, 0, &mut TransferQueue::default());
         assert_eq!(
-            folder.reconnect_status(&mut reply, 0, &mut TransferQueue::default()),
-            (
-                "Could not upload folder /reports/run: Permission denied".into(),
-                None,
-                TransferOutcome::Failed,
-            )
+            status,
+            "Could not upload folder /reports/run: Permission denied"
         );
+        assert!(finished.saved.is_none());
+        assert_eq!(outcome, TransferOutcome::Failed);
     }
 
     #[test]

@@ -41,6 +41,8 @@ function Queue-Action([uint64]$Run, [string]$Action) {
     Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$Run",$Action)
 }
 function Select-GroupOption([string]$Name, [string]$Label) {
+    $dispatch = $Name -in 'Parallel SSH commands','Time between sends','Expire unsent commands','Canary host'
+    if ($dispatch) { Set-NativeExpansion 'Dispatch settings' $true }
     $combo = [System.Windows.Automation.ControlType]::ComboBox
     $listItem = [System.Windows.Automation.ControlType]::ListItem
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
@@ -70,6 +72,7 @@ function Select-GroupOption([string]$Name, [string]$Label) {
     $popup = $null
     if ($field -and $field.TryGetCurrentPattern($expand, [ref]$popup) -and
         $popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    if ($dispatch) { Set-NativeExpansion 'Dispatch settings' $false }
 }
 
 $launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '--rows', '36')
@@ -95,7 +98,15 @@ try {
         $null = Control @('wait-for-text','--pane',"$($panes[$name])",'--timeout','10','fixture$')
         $labels[$name] = "$name${dot}test@127.0.0.1:$($config.$name.port)${dot}Pane $($panes[$name])"
     }
+    $options = Wait-Until 'dispatch settings expander available' { Get-NativeExpander 'Dispatch settings' }
+    if ($options.Current.ExpandCollapseState -ne 'Collapsed' -or
+        (Find-Element 'Parallel SSH commands' ([System.Windows.Automation.ControlType]::ComboBox) -Visible)) {
+        throw 'Dispatch controls should start collapsed'
+    }
     Select-GroupOption 'Parallel SSH commands' '1 at a time'
+    $null = Wait-Until 'the collapsed header shows the effective parallel limit' {
+        Find-Element '1 at a time' ([System.Windows.Automation.ControlType]::Text) -Visible
+    }
     Set-Command 'roll'
     Click 'Preview send order'
     $null = Wait-Until 'tab order starts the preview with West' {
@@ -227,7 +238,7 @@ try {
     (Wait-CheckBox $labels.North On).Toggle()
     $null = Wait-CheckBox $labels.North Off
     Set-Command 'keep-first'
-    Click ('Send and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Send and record' + [char]0x2026)
     $dialog = Wait-Until 'output recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the bounded recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started keep-first')
@@ -251,8 +262,10 @@ try {
             $recorded.Contains("Dispatch${dot}parallel limit 1${dot}no delay") -and
             $recorded.Contains('[Queue activity]') -and $recorded.Contains('Cancelled queued commands')
     }
+    Set-NativeExpansion 'Dispatch settings' $true
     (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
     $null = Wait-CheckBox 'Stop queue on failure' On
+    Set-NativeExpansion 'Dispatch settings' $false
     Set-Command 'halt-on-failure'
     Click 'Send to 2 hosts'
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started halt-on-failure')
@@ -322,14 +335,16 @@ try {
             (Find-Element 'The canary must be checked, visible, and at a fresh shell marker.')
     }
     (Wait-CheckBox $labels.East Off).Toggle()
+    Set-NativeExpansion 'Dispatch settings' $true
     (Wait-CheckBox 'Notify when canary finishes' Off).Toggle()
     $null = Wait-CheckBox 'Notify when canary finishes' On
+    Set-NativeExpansion 'Dispatch settings' $false
     Click 'Preview send order'
     $null = Wait-Until 'the preview puts the chosen canary ahead of the other ready host' {
         (Find-Element "Canary first${dot}$($labels.East)") -and (Find-Element "Ready${dot}$($labels.West)") -and
             (Find-Element 'After approval, send to all remaining ready hosts.')
     }
-    Click ('Run canary and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Run canary and record' + [char]0x2026)
     $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-ok')
@@ -352,9 +367,9 @@ try {
             (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
             !(Find-Element 'Approve remaining hosts' $button)
     }
-    Click 'Notify when run finishes'
+    Invoke-RunAction 'Notify when run finishes'
     $null = Wait-Until 'both notifications are armed' {
-        (Find-Element 'Cancel run notification' $button) -and (Find-Element 'Cancel canary notification' $button)
+        (Find-Element 'Run notification armed') -and (Find-Element 'Cancel canary notification' $button)
     }
     Click 'Preview send order'
     $null = Wait-Until 'the preview is open before leaving the group' { Find-Element 'Back to roster and results' $button }
@@ -461,8 +476,10 @@ try {
             (Find-Element 'Attention inbox, 0 unread' $button)
     }
 
+    Set-NativeExpansion 'Dispatch settings' $true
     (Wait-CheckBox 'Notify when canary finishes' On).Toggle()
     $null = Wait-CheckBox 'Notify when canary finishes' Off
+    Set-NativeExpansion 'Dispatch settings' $false
     Set-Command 'canary-stale'
     Click 'Run canary first'
     $null = Wait-Until 'the canary succeeds before West changes its prompt' {
@@ -503,9 +520,11 @@ try {
     $null = Wait-CheckBox $labels.North On
     Select-GroupOption 'Time between sends' 'No delay'
     Select-GroupOption 'Parallel SSH commands' '1 at a time'
+    Set-NativeExpansion 'Dispatch settings' $true
     $null = Wait-CheckBox 'Stop queue on failure' On
+    Set-NativeExpansion 'Dispatch settings' $false
     Set-Command 'skip-middle'
-    Click ('Send and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Send and record' + [char]0x2026)
     $dialog = Wait-Until 'skip run recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the skip run' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started skip-middle')
@@ -538,8 +557,8 @@ try {
             (Find-Element "$($labels.North)${dot}Queued") -and
             !(Find-Element "Skip queued pane $($panes.East)" $button)
     }
-    Click 'Notify when run finishes'
-    $null = Wait-Until 'the skip completion notice is armed' { Find-Element 'Cancel run notification' $button }
+    Invoke-RunAction 'Notify when run finishes'
+    $null = Wait-Until 'the skip completion notice is armed' { Find-Element 'Run notification armed' }
     New-Item -ItemType File -Path (Join-Path $State 'release-skip-middle') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.North)",'--timeout','10','North finished skip-middle')
 
@@ -565,15 +584,15 @@ try {
     Set-Command 'deadline'
     Click 'Preview send order'
     $null = Wait-Until 'the queue deadline is visible in preview' { Find-Element 'Unsent commands expire after 5s' }
-    Click ('Send and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Send and record' + [char]0x2026)
     $dialog = Wait-Until 'deadline recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the deadline run' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started deadline')
     $elapsed = [Diagnostics.Stopwatch]::StartNew()
     Click 'Pause queue'
-    Click 'Notify when run finishes'
+    Invoke-RunAction 'Notify when run finishes'
     $null = Wait-Until 'the queue is paused and waiting for the run notice' {
-        (Find-Element 'Command queue paused') -and (Find-Element 'Cancel run notification' $button)
+        (Find-Element 'Command queue paused') -and (Find-Element 'Run notification armed')
     }
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the deadline passes with the paused group in the background' { $elapsed.ElapsedMilliseconds -ge 5200 }

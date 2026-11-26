@@ -1,11 +1,11 @@
-use super::Invocation;
+use super::{Invocation, SuccessCheck};
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{
-    CommandStatus, Request, SshGroupExpectedOutput, SshGroupQueueAction, SshGroupReportFormat,
-    validate_group_panes, validate_group_submission,
+    CommandOutputFile, CommandStatus, Request, SshGroupExpectedOutput, SshGroupQueueAction,
+    SshGroupReportFormat, validate_group_panes, validate_group_submission,
 };
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] get-running-output --pane ID --start-token TOKEN\nw11term-cli [--pid PID] interrupt-command --pane ID --start-token TOKEN\nw11term-cli [--pid PID] wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] [--connection-generation N] [--after-frame N] [--screenshot PATH] [--] TEXT\nw11term-cli [--pid PID] wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]\nw11term-cli [--pid PID] wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--kind KIND] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] close-pane --pane ID\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --after-id ID --connection-generation N [--timeout SECONDS] [--command TEXT] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --start-token TOKEN [--timeout SECONDS] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN\nw11term-cli [--pid PID] stop-ssh-attempt --pane ID --attempt-token TOKEN\nw11term-cli [--pid PID] retry-ssh-now --pane ID --retry-token TOKEN\nw11term-cli [--pid PID] disconnect-ssh-shell --pane ID --connection-generation N";
 pub(super) fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -13,6 +13,12 @@ pub(super) fn parse(
     mut pane: Option<u64>,
 ) -> Result<Invocation> {
     let mut args = args.peekable();
+    let pane_wait = matches!(
+        verb,
+        "wait-ssh-connected" | "wait-pane-exit" | "wait-command"
+    );
+    let command_detail = matches!(verb, "get-command" | "wait-command");
+    let running_output = matches!(verb, "get-running-output" | "wait-running-output");
     let mut cols = None;
     let mut rows = None;
     let mut profile = None;
@@ -21,17 +27,26 @@ pub(super) fn parse(
     let mut regex = false;
     let mut match_case = false;
     let mut timeout = None;
-    let mut require_success = false;
+    let mut wait_after = None;
+    let mut success_check = None;
     let mut since = None;
+    let mut event_kind = None;
     let mut after_line = None;
+    let mut after_frame = None;
+    let mut screenshot_path = None;
     let mut limit = None;
     let mut text = None;
     let mut stop = false;
     let mut timed = false;
     let mut playback = None;
     let mut overwrite = false;
+    let mut output_path = None;
     let mut exit_token = None;
+    let mut attempt_token = None;
+    let mut retry_token = None;
     let mut command_id = None;
+    let mut start_token = None;
+    let mut command_match = None;
     let mut status = None;
     let mut connection_generation = None;
     let mut window_id = None;
@@ -63,7 +78,17 @@ pub(super) fn parse(
             {
                 pane_ids.push(value(&mut args)?.parse()?);
             }
-            "--pane" if matches!(verb, "ssh-group-queue" | "interrupt-ssh-group-command") => {
+            "--pane"
+                if pane_wait
+                    || running_output
+                    || matches!(
+                        verb,
+                        "close-pane"
+                            | "ssh-group-queue"
+                            | "interrupt-ssh-group-command"
+                            | "interrupt-command"
+                    ) =>
+            {
                 ensure!(pane.is_none(), "specify --pane only once");
                 pane = Some(value(&mut args)?.parse()?);
             }
@@ -142,6 +167,7 @@ pub(super) fn parse(
                     verb,
                     "find-text"
                         | "wait-for-text"
+                        | "wait-running-output"
                         | "wait-ssh-group-output"
                         | "submit-ssh-group-command"
                 ) =>
@@ -151,27 +177,77 @@ pub(super) fn parse(
             "--match-case"
                 if matches!(
                     verb,
-                    "find-text" | "wait-ssh-group-output" | "submit-ssh-group-command"
+                    "find-text"
+                        | "wait-running-output"
+                        | "wait-ssh-group-output"
+                        | "submit-ssh-group-command"
                 ) =>
             {
                 match_case = true
             }
-            "--require-success" if verb == "wait-ssh-group-run" => require_success = true,
+            "--require-success" if verb == "wait-ssh-group-run" => {
+                success_check = Some(SuccessCheck::SshGroup)
+            }
+            "--require-success" if verb == "wait-command" => {
+                success_check = Some(SuccessCheck::Command)
+            }
+            "--command" if verb == "wait-command" => {
+                ensure!(command_match.is_none(), "specify --command only once");
+                command_match = Some(value(&mut args)?);
+            }
             "--timeout"
-                if matches!(
-                    verb,
-                    "wait-for-text"
-                        | "events"
-                        | "wait-ssh-group-run"
-                        | "wait-ssh-group-approval"
-                        | "wait-ssh-group-ready"
-                        | "wait-ssh-group-output"
-                        | "follow-ssh-group-output"
-                ) =>
+                if pane_wait
+                    || matches!(
+                        verb,
+                        "wait-for-text"
+                            | "wait-running-output"
+                            | "events"
+                            | "wait-ssh-group-run"
+                            | "wait-ssh-group-approval"
+                            | "wait-ssh-group-ready"
+                            | "wait-ssh-group-output"
+                            | "follow-ssh-group-output"
+                    ) =>
             {
+                if pane_wait || verb == "wait-running-output" {
+                    ensure!(timeout.is_none(), "specify --timeout only once");
+                }
                 timeout = Some(value(&mut args)?.parse()?)
             }
+            "--after-generation" | "--after-exit-token" | "--after-id"
+                if matches!(
+                    (verb, arg.as_str()),
+                    ("wait-ssh-connected", "--after-generation")
+                        | ("wait-pane-exit", "--after-exit-token")
+                        | ("wait-command", "--after-id")
+                ) =>
+            {
+                ensure!(wait_after.is_none(), "specify {arg} only once");
+                wait_after = Some(
+                    value(&mut args)?
+                        .parse()
+                        .with_context(|| format!("{arg} requires a nonnegative integer"))?,
+                );
+            }
             "--since" if verb == "events" => since = Some(value(&mut args)?.parse()?),
+            "--kind" if verb == "events" => {
+                ensure!(event_kind.is_none(), "specify --kind only once");
+                let kind = value(&mut args)?;
+                ensure!(!kind.is_empty(), "--kind requires a nonempty event kind");
+                event_kind = Some(kind);
+            }
+            "--after-frame" if verb == "wait-for-text" => {
+                ensure!(after_frame.is_none(), "specify --after-frame only once");
+                after_frame = Some(
+                    value(&mut args)?
+                        .parse()
+                        .context("--after-frame requires a frame generation")?,
+                );
+            }
+            "--screenshot" if verb == "wait-for-text" => {
+                ensure!(screenshot_path.is_none(), "specify --screenshot only once");
+                screenshot_path = Some(std::path::absolute(value(&mut args)?)?);
+            }
             "--after-line"
                 if matches!(
                     verb,
@@ -202,8 +278,19 @@ pub(super) fn parse(
                     _ => ReplayAction::Step,
                 });
             }
-            "--overwrite" if matches!(verb, "save-text" | "save-ssh-group-report") => {
+            "--overwrite"
+                if command_detail || matches!(verb, "save-text" | "save-ssh-group-report") =>
+            {
                 overwrite = true
+            }
+            "--output-file" if command_detail => {
+                ensure!(output_path.is_none(), "specify --output-file only once");
+                let path = value(&mut args)?;
+                ensure!(
+                    !path.is_empty() && !path.starts_with("--"),
+                    "--output-file requires a destination path"
+                );
+                output_path = Some(std::path::absolute(path)?);
             }
             "--format" if verb == "save-ssh-group-report" => {
                 ensure!(report_format.is_none(), "specify --format only once");
@@ -214,7 +301,25 @@ pub(super) fn parse(
                 });
             }
             "--exit-token" if verb == "restart" => exit_token = Some(value(&mut args)?.parse()?),
+            "--attempt-token" if verb == "stop-ssh-attempt" => {
+                ensure!(attempt_token.is_none(), "specify --attempt-token only once");
+                attempt_token = Some(value(&mut args)?.parse::<std::num::NonZeroU64>()?.into());
+            }
+            "--retry-token" if verb == "retry-ssh-now" => {
+                ensure!(retry_token.is_none(), "specify --retry-token only once");
+                retry_token = Some(value(&mut args)?.parse::<std::num::NonZeroU64>()?.into());
+            }
             "--id" if verb == "get-command" => command_id = Some(value(&mut args)?.parse()?),
+            "--start-token"
+                if running_output || matches!(verb, "wait-command" | "interrupt-command") =>
+            {
+                ensure!(start_token.is_none(), "specify --start-token only once");
+                start_token = Some(
+                    value(&mut args)?
+                        .parse::<std::num::NonZeroU64>()
+                        .context("--start-token requires a positive integer")?,
+                );
+            }
             "--status" if verb == "list-commands" => {
                 ensure!(status.is_none(), "specify --status only once");
                 status = Some(
@@ -224,6 +329,18 @@ pub(super) fn parse(
             }
             "--connection-generation" if verb == "get-command" => {
                 connection_generation = Some(value(&mut args)?.parse()?)
+            }
+            "--connection-generation"
+                if matches!(
+                    verb,
+                    "disconnect-ssh-shell" | "wait-for-text" | "wait-command"
+                ) =>
+            {
+                ensure!(
+                    connection_generation.is_none(),
+                    "specify --connection-generation only once"
+                );
+                connection_generation = Some(value(&mut args)?.parse()?);
             }
             "--window" | "--tab" | "--run"
                 if (matches!(verb, "open-ssh-group" | "list-saved-ssh-groups")
@@ -281,7 +398,7 @@ pub(super) fn parse(
             }
             "--" if matches!(
                 verb,
-                "find-text" | "wait-for-text" | "wait-ssh-group-output"
+                "find-text" | "wait-for-text" | "wait-running-output" | "wait-ssh-group-output"
             ) =>
             {
                 ensure!(text.is_none(), "only one pattern is accepted");
@@ -293,6 +410,7 @@ pub(super) fn parse(
                     verb,
                     "find-text"
                         | "wait-for-text"
+                        | "wait-running-output"
                         | "wait-ssh-group-output"
                         | "record"
                         | "save-text"
@@ -307,6 +425,11 @@ pub(super) fn parse(
             _ => bail!("unsupported {verb} option {arg}"),
         }
     }
+    ensure!(
+        !command_detail || !overwrite || output_path.is_some(),
+        "--overwrite requires --output-file"
+    );
+    let output_file = output_path.map(|path| CommandOutputFile { path, overwrite });
     let request = match verb {
         "open" => {
             ensure!(pane.is_none(), "open does not accept --pane");
@@ -317,6 +440,11 @@ pub(super) fn parse(
                 activate,
             }
         }
+        "close-pane" => Request::ClosePane {
+            pane: pane
+                .filter(|id| *id > 0)
+                .context("provide a positive --pane ID")?,
+        },
         "resize" => Request::Resize {
             pane: pane.context("--pane is required")?,
             cols: cols.context("--cols is required")?,
@@ -325,6 +453,7 @@ pub(super) fn parse(
         "events" => Request::Events {
             pane: pane.context("--pane is required")?,
             since: since.unwrap_or(0),
+            kind: event_kind,
             timeout_seconds: timeout.unwrap_or(0),
         },
         "find-text" => {
@@ -351,11 +480,78 @@ pub(super) fn parse(
             pane: pane.context("--pane is required")?,
             pattern: text.context("a literal pattern or regular expression is required")?,
             regex,
+            connection_generation: connection_generation
+                .map(std::num::NonZeroU64::try_from)
+                .transpose()
+                .context("--connection-generation requires a positive integer")?,
+            after_frame,
+            screenshot_path,
             timeout_seconds: timeout.unwrap_or(30),
         },
+        "wait-ssh-connected" | "wait-pane-exit" => {
+            let pane = pane
+                .filter(|id| *id > 0)
+                .context("provide a positive --pane ID")?;
+            let timeout_seconds = timeout.unwrap_or(30);
+            ensure!(
+                (1..=3600).contains(&timeout_seconds),
+                "wait timeout must be 1..=3600 seconds"
+            );
+            if verb == "wait-ssh-connected" {
+                Request::WaitSshConnected {
+                    pane,
+                    after_generation: wait_after.unwrap_or(0),
+                    timeout_seconds,
+                }
+            } else {
+                Request::WaitPaneExit {
+                    pane,
+                    after_exit_token: wait_after.unwrap_or(0),
+                    timeout_seconds,
+                }
+            }
+        }
         "inspect" => Request::Inspect {
             pane: pane.context("--pane is required")?,
         },
+        "interrupt-command" => Request::InterruptCommand {
+            pane: pane
+                .filter(|id| *id > 0)
+                .context("provide a positive --pane ID")?,
+            start_token: start_token
+                .context("--start-token is required (from inspect or command-started)")?,
+        },
+        "get-running-output" | "wait-running-output" => {
+            let pane = pane
+                .filter(|id| *id > 0)
+                .context("provide a positive --pane ID")?;
+            let start_token = start_token
+                .context("--start-token is required (from inspect or command-started)")?;
+            if verb == "get-running-output" {
+                Request::GetRunningOutput { pane, start_token }
+            } else {
+                let pattern = text.context("search text or regular expression is required")?;
+                ensure!(!pattern.is_empty(), "search text is empty");
+                ensure!(
+                    pattern.len() <= w11term::search::MAX_QUERY_BYTES,
+                    "search text exceeds {} UTF-8 bytes",
+                    w11term::search::MAX_QUERY_BYTES
+                );
+                let timeout_seconds = timeout.unwrap_or(30);
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "--timeout must be 1..=3600 seconds"
+                );
+                Request::WaitRunningOutput {
+                    pane,
+                    start_token,
+                    pattern,
+                    regex,
+                    match_case,
+                    timeout_seconds,
+                }
+            }
+        }
         "playback" => Request::Playback {
             pane: pane.context("--pane is required")?,
             action: playback.unwrap_or_default(),
@@ -369,7 +565,42 @@ pub(super) fn parse(
             id: command_id.context("--id is required (from list-commands)")?,
             connection_generation: connection_generation
                 .context("--connection-generation is required (from list-commands)")?,
+            output_file,
         },
+        "wait-command" => {
+            let timeout_seconds = timeout.unwrap_or(30);
+            ensure!(
+                (1..=3600).contains(&timeout_seconds),
+                "--timeout must be 1..=3600 seconds"
+            );
+            let pane = pane.context("--pane is required")?;
+            if let Some(start_token) = start_token {
+                ensure!(pane > 0, "provide a positive --pane ID");
+                ensure!(
+                    wait_after.is_none()
+                        && connection_generation.is_none()
+                        && command_match.is_none(),
+                    "--start-token cannot be combined with --after-id, --connection-generation, or --command"
+                );
+                Request::WaitCommandCapture {
+                    pane,
+                    start_token,
+                    timeout_seconds,
+                    output_file,
+                }
+            } else {
+                Request::WaitCommand {
+                    pane,
+                    after_id: wait_after
+                        .context("--after-id is required (use latest_id from list-commands)")?,
+                    connection_generation: connection_generation
+                        .context("--connection-generation is required (from list-commands)")?,
+                    timeout_seconds,
+                    output_file,
+                    command: command_match,
+                }
+            }
+        }
         "list-ssh-groups" => {
             ensure!(pane.is_none(), "list-ssh-groups does not accept --pane");
             Request::ListSshGroups
@@ -609,6 +840,21 @@ pub(super) fn parse(
             pane: pane.context("--pane is required")?,
             exit_token: exit_token.context("--exit-token is required (from events)")?,
         },
+        "stop-ssh-attempt" => Request::StopSshAttempt {
+            pane: pane.context("--pane is required")?,
+            attempt_token: attempt_token
+                .context("--attempt-token is required (from list or events)")?,
+        },
+        "retry-ssh-now" => Request::RetrySshNow {
+            pane: pane.context("--pane is required")?,
+            retry_token: retry_token.context("--retry-token is required (from list or events)")?,
+        },
+        "disconnect-ssh-shell" => Request::DisconnectSshShell {
+            pane: pane.context("--pane is required")?,
+            connection_generation: connection_generation
+                .and_then(std::num::NonZeroU64::new)
+                .context("--connection-generation must be positive (from list)")?,
+        },
         "save-text" => Request::SaveText {
             pane: pane.context("--pane is required")?,
             path: std::path::absolute(text.context("save-text requires a destination path")?)?,
@@ -628,12 +874,54 @@ pub(super) fn parse(
     Ok(Invocation {
         pid,
         request,
-        require_success,
+        success_check,
     })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_requires_a_pane_and_a_positive_retry_token() {
+        let retry = |args: &[&str]| {
+            parse(
+                "retry-ssh-now",
+                args.iter().map(|s| s.to_string()),
+                None,
+                None,
+            )
+            .map(|invocation| invocation.request)
+        };
+        let request = retry(&["--pane", "2", "--retry-token", "7"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"retry-ssh-now","pane":2,"retry_token":7})
+        );
+        assert!(retry(&["--pane", "2"]).is_err());
+        assert!(retry(&["--retry-token", "7"]).is_err());
+        assert!(retry(&["--pane", "2", "--retry-token", "0"]).is_err());
+    }
+
+    #[test]
+    fn disconnect_requires_a_pane_and_a_positive_connection_generation() {
+        let disconnect = |args: &[&str]| {
+            parse(
+                "disconnect-ssh-shell",
+                args.iter().map(|s| s.to_string()),
+                None,
+                None,
+            )
+            .map(|invocation| invocation.request)
+        };
+        let request = disconnect(&["--pane", "2", "--connection-generation", "7"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"disconnect-ssh-shell","pane":2,"connection_generation":7})
+        );
+        assert!(disconnect(&["--pane", "2"]).is_err());
+        assert!(disconnect(&["--connection-generation", "7"]).is_err());
+        assert!(disconnect(&["--pane", "2", "--connection-generation", "0"]).is_err());
+    }
     #[test]
     fn timed_recording_is_opt_in_and_old_record_requests_round_trip() {
         let record =
@@ -697,5 +985,32 @@ mod tests {
         assert!(p("restart", &["--pane", "2"]).is_err());
         assert!(p("restart", &["--exit-token", "2"]).is_err());
         assert!(p("events", &["--pane", "2", "--exit-token", "1"]).is_err());
+        let stop = p(
+            "stop-ssh-attempt",
+            &["--pane", "2", "--attempt-token", "13"],
+        )
+        .unwrap()
+        .1;
+        assert_eq!(
+            serde_json::to_value(stop).unwrap(),
+            serde_json::json!({"verb":"stop-ssh-attempt","pane":2,"attempt_token":13})
+        );
+        assert!(p("stop-ssh-attempt", &["--pane", "2"]).is_err());
+        assert!(p("stop-ssh-attempt", &["--attempt-token", "13"]).is_err());
+        assert!(p("stop-ssh-attempt", &["--pane", "2", "--attempt-token", "0"]).is_err());
+        assert!(
+            p(
+                "stop-ssh-attempt",
+                &[
+                    "--pane",
+                    "2",
+                    "--attempt-token",
+                    "1",
+                    "--attempt-token",
+                    "2"
+                ]
+            )
+            .is_err()
+        );
     }
 }

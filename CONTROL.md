@@ -48,7 +48,13 @@ $found.result.panes | Where-Object { !$_.error -and $_.count -gt 0 }
 & $ctl --pid 12345 save-text --pane $pane .\shell-transcript.txt
 ```
 
-`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8; the limit is 1 MiB per command. A successful reply acknowledges the write to the SSH channel or local ConPTY input pipe. The receiving program may still be processing it. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown; retrying could duplicate input. Demo/replay panes reject raw input. Reconnecting panes reject raw writes and SFTP work rather than queuing them for a later connection.
+`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel or local ConPTY input pipe, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8. The limit is 1 MiB per command. A successful reply acknowledges the write. The receiving program may still be processing it. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown and retrying could duplicate input. Demo and replay panes reject raw input. Writes and SFTP requests during reconnect return errors.
+
+Pass `--connection-generation N` to bind the write to the live session you
+inspected. Use the generation from `list`, or from `wait-ssh-connected` for SSH,
+with the same process and pane ID. A stale generation returns an error before
+any bytes reach the replacement session. A successful scoped reply includes
+`connection_generation` alongside `pane` and `bytes_written`.
 
 `get-text` returns the current live screen, including alternate-screen TUI content. It excludes scrollback, trims trailing ASCII spaces on each row, and preserves the row count as `lines`. `text` joins those lines with LF. Graphics are not OCRed. Both text and screenshots include a snapshot generation to help correlate results. Reading does not change the user's scrollback position.
 
@@ -73,18 +79,29 @@ Each GUI owns `\\.\pipe\w11term-<pid>` and publishes `%LOCALAPPDATA%\w11term\ins
 
 The pipe accepts only the process's Windows user and SYSTEM, and rejects remote clients. Treat access as permission to type into that user's SSH and local sessions and save screenshots with that user's filesystem permissions. Discovery records are removed on normal exit; stale records from a crash are ignored when the pipe cannot be opened.
 
-Open a new pipe connection for each command. Write one UTF-8 JSON object followed by LF. Replies are UTF-8 JSON objects followed by LF. `follow-ssh-group-output` sends a sequence of replies on the same connection. Maximum request size is 2 MiB. The server allows eight ordinary requests and sixteen waits or followers concurrently. The initial read and each reply write time out after ten seconds. Input and snapshot requests have a ten-second execution timeout, and the CLI allows thirty seconds for a reply to accommodate rendering.
+Open a new pipe connection for each command. Write one UTF-8 JSON object followed
+by LF. Replies are UTF-8 JSON objects followed by LF. `follow-ssh-group-output`
+sends a sequence of replies on the same connection. Maximum request size is
+2 MiB. The server allows eight ordinary requests and sixteen waits or followers
+concurrently. The initial read and each reply write time out after ten seconds.
+Input and snapshot requests have a ten-second execution timeout, and the CLI
+allows thirty seconds for a reply to accommodate rendering.
+
+Keep the connection open while waiting for replies. Disconnecting cancels a
+pending wait or output follower and releases its slot. A screenshot write that
+already started after a text match can still finish.
 
 ```json
 {"verb":"list"}
 {"verb":"send-text","pane":1,"no_paste":true,"data_base64":"Qk9BUkQN"}
+{"verb":"send-text","pane":1,"no_paste":true,"connection_generation":2,"data_base64":"Qk9BUkQN"}
 {"verb":"get-text","pane":1}
 {"verb":"inspect","pane":1}
 {"verb":"save-text","pane":1,"path":"C:\\tests\\shell-transcript.txt","overwrite":false}
 {"verb":"screenshot","pane":1,"path":"C:\\tests\\frame.png"}
 ```
 
-Direct protocol screenshot paths must be absolute. The CLI resolves relative paths in the caller's working directory.
+Direct protocol screenshot paths, including `wait-for-text.screenshot_path`, must be absolute. The CLI resolves relative paths in the caller's working directory.
 
 ```json
 {"version":1,"ok":true,"result":{"pane":1,"bytes_written":6}}
@@ -115,15 +132,104 @@ if ($modes.in_band_resize) { 'This pane has subscribed to resize reports.' }
 
 The reply includes `pane`, `connection_generation`, `cols`, `rows`, `pixel_width`, `pixel_height` and `dpi`. Pixel dimensions describe the drawable text area. An unavailable measurement is zero. The booleans `alternate_screen`, `bracketed_paste`, `synchronized_output` and `in_band_resize` reflect the modes at the time of the read.
 
+For a live shell that emits supported integration markers, `running_command`
+appears after the command start marker. It contains `id`, `start_token`, `command`,
+`reported_directory`, `started_unix_ms`, and `elapsed_ms`. The command line
+and initial directory can be `null`. Elapsed time uses the local monotonic
+clock. The command remains visible through alternate-screen programs and the
+field clears when completion, a new prompt, reset, or disconnect ends the
+observation. When the shell finishes normally, the capture uses the same ID
+in `list-commands` for this pane and connection generation.
+
+SSH panes also include `ssh_connection`, with the same phase and optional reason or retry attempt as `list`. While a shell is opening, `ssh_progress` reports the current `step`, `host`, `port` and `user`. A one-based `jump` identifies a ProxyJump hop. Its absence identifies the destination. A connection that ends in failure during an endpoint operation retains that step. Steps are `opening-tcp`, `opening-jump-channel`, `key-exchange`, `authenticating`, `opening-session-channel`, `requesting-terminal` and `preparing-remote-program`. Each observed step also appears in the pane's event journal as `ssh-step`. Local and replay panes omit these SSH fields.
+
+A connected SSH pane also reports `ssh.destination` and `ssh.jump_hosts`, ordered from the first jump toward the destination. Each peer contains `host`, `user`, `port`, the verified SHA256 `key_fingerprint`, and `host_key_alias` when configured. The `ssh` object is available only while that pane has an authenticated connection.
+
+Each peer's `initial_algorithms` reports `key_exchange`, `host_key`, `cipher`, and the boolean `strict_key_exchange` from the first key exchange on that transport. `host_key` includes the SSH certificate algorithm suffix when a certificate was presented. Panes that share a transport report the same initial algorithms. Reopening the transport uses the next connection's negotiation.
+
+Each peer's `authentication` reports the completed user authentication. The `method` is `none`, `password`, `keyboard-interactive`, or `public-key`. With `public-key`, `source` is `file` or `agent`, and `key_fingerprint` identifies the accepted user key. An OpenSSH user certificate adds `certificate_authority_fingerprint`. The optional `additional_methods` array lists successful password or keyboard-interactive steps in order. These fields describe the authenticated transport and are shared by all panes that use it.
+
+While the pane has an active SSH transport, `inspect` reports `ssh_transport` with its numeric `id` and a sorted `pane_ids` list, including the inspected pane. Match it to `ssh_transport_id` in `list` to find other panes on the same authenticated connection across the process's windows. Independent logins have different IDs, even for the same profile. A fresh transport gets a new ID. These fields are omitted when the pane has no active SSH transport.
+
 `mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
 When xterm modified-key reporting or its alternate format is enabled, `keyboard.modify_other_keys` is the active level from 0 through 3 and `keyboard.format_other_keys` is `xterm-27` or `csi-u`.
 
+## Running command output
+
+`get-running-output --pane ID --start-token TOKEN` reads a bounded sample from
+one active command. Take the token from `inspect.result.running_command.start_token`
+or from the same pane's `command-started` event. The token is valid only for that
+capture in the running w11term process. A capture can reuse its history ID after
+an abandoned or repeated start marker. A new start has a new token. Use
+`inspect` to find the current token after a replacement.
+
+```powershell
+$inspection = & $ctl --pid 12345 inspect --pane $pane | ConvertFrom-Json
+$token = $inspection.result.running_command.start_token
+if ($inspection.ok -and $token) {
+    & $ctl --pid 12345 get-running-output --pane $pane --start-token $token
+}
+```
+
+The reply includes `pane`, `id`, `connection_generation`, `start_token`, and
+`state`. With `state: "ready"`, `text` contains up to six primary-screen rows
+joined with LF, including the current unfinished line. An empty string means
+there is no text in the sample. `earlier_omitted` marks rows outside the sample,
+and a trailing ellipsis marks a shortened line. `"updating"` indicates an
+uncommitted synchronized update. `"alternate-screen"` indicates that an
+application is using the alternate screen. `"unavailable"` indicates that
+the active capture's output range could not be located. Those three states
+omit `text`. A finished, replaced, wrong-pane, or disconnected token returns
+an error. Use `get-command` for a completed capture's retained output.
+
+The read preserves focus and scroll position, including on background and
+read-only panes. The equivalent pipe request is
+`{"verb":"get-running-output","pane":2,"start_token":27}`.
+
+`wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case]
+[--timeout SECONDS] [--] TEXT` waits for a completed logical line in that
+same active command. It checks retained output first, then watches lines as
+the parser receives them. Soft wraps are joined, and the shell's completion
+marker makes the final line eligible even without a newline. Matching is a
+case-insensitive literal search by default. It runs on parsed primary-screen
+output independently of when a synchronized update is painted.
+
+The timeout defaults to 30 seconds and accepts 1–3600. A match returns
+`pane`, `id`, `connection_generation`, `start_token`, and the matched line
+as `text` without its newline. If the capture ends without a match, is
+replaced, or disconnects, the wait fails immediately. An already stale token
+is rejected. Each scan can read at most 128 physical rows and 1,024 UTF-8 bytes
+per logical line. Dropped or reflowed rows and overlong lines return an
+incomplete-output error. Alternate-screen contents are excluded.
+
+The pipe request uses `verb: "wait-running-output"` with `pane`,
+`start_token`, and `pattern`. Optional fields are `regex`, `match_case`,
+and `timeout_seconds`. It uses the same wait capacity as `wait-for-text` and
+leaves focus, scroll position, and shell input in place.
+
+`interrupt-command --pane ID --start-token TOKEN` sends Ctrl+C to that
+observed running command on native SSH or local ConPTY. Take the token from
+`inspect` or `command-started`. It works on a background pane and uses the
+pane's negotiated keyboard encoding. The worker checks that the pane accepts
+input, then the transport rechecks the queued interrupt against the client's
+latest observed capture before writing. A newer interrupt request for the same
+pane supersedes an older request still waiting to write.
+
+The result contains `pane`, `start_token`, and `sent: true`. This confirms
+the transport write. Use `wait-command --start-token` to check whether the
+shell reports completion and which exit status it returns. Read-only panes,
+authentication prompts, stale tokens, and disconnections produce errors.
+The equivalent pipe request is
+`{"verb":"interrupt-command","pane":2,"start_token":27}`.
+
 ## Completed shell commands
 
-`list-commands --pane ID` reads the pane’s OSC 133 command history. It returns
-`pane`, `connection_generation`, and a `commands` array, newest first. Each entry
-contains `id`, `command`, `exit_code`, and `output_available`. The array is empty
+`list-commands --pane ID` reads the pane’s OSC 133 or OSC 633 command history. It
+returns `pane`, `connection_generation`, `latest_id`, and a `commands` array,
+newest first. Use `latest_id` as the wait cursor even if a filter or terminal
+reset leaves the listing empty. It starts at zero. Each entry
+contains `id`, `command`, `reported_directory`, `exit_code`, and `output_available`. The array is empty
 until the shell marks a completed command. A missing command line or exit status
 is JSON `null`. Listing transfers only this metadata and preserves keyboard focus
 and the scroll position.
@@ -132,9 +238,19 @@ The command comes from the shell’s OSC 133 C `cmdline_url` field when
 available, including whitespace and line breaks. Otherwise it comes from
 visible text between the B and C markers.
 
+Both `list-commands` and `get-command` include `reported_directory`. This is the
+shell’s file URI from the start of that command, or JSON `null` if unavailable.
+The value is the original shell report, including its authority and escapes.
+
+Both commands also include `started_unix_ms`, `finished_unix_ms`, and
+`duration_ms`. The timestamps use the Windows client's clock. Duration uses
+monotonic time between the observed shell markers, through the next prompt
+when it closes a capture without an explicit finish marker. Start time and
+duration are JSON `null` when there is no command start marker.
+
 Use `--status failed` for nonzero exit codes, `--status succeeded` for zero, or
 `--status unknown` when the shell omitted the exit code. The default is `all`.
-Filtered listings keep the original IDs, generation, and newest-first order.
+Filtered listings keep the original IDs, generation, latest ID, and newest-first order.
 
 To get the latest command’s output, pass its ID and the generation from the same
 listing. A generation of zero is valid.
@@ -152,13 +268,79 @@ if ($history.commands.Count -gt 0) {
 }
 ```
 
+To wait for a new completion, read the cursor before triggering the command.
+`wait-command` returns the first completed capture after that cursor in the
+same generation, with the same fields as `get-command`. A command that has
+already finished since the cursor was read is returned immediately. The shell
+exit code is in `result.exit_code`, and a successfully retrieved capture
+returns CLI exit code zero even when the shell command failed.
+
+```powershell
+$cursor = & $ctl --pid 12345 list-commands --pane $pane | ConvertFrom-Json
+if (!$cursor.ok) { throw $cursor.error }
+# Trigger the shell command here.
+$completion = & $ctl --pid 12345 wait-command --pane $pane --after-id $cursor.result.latest_id --connection-generation $cursor.result.connection_generation --timeout 60 | ConvertFrom-Json
+if (!$completion.ok) { throw $completion.error }
+$completion.result.exit_code
+```
+
+Add `--command TEXT` to wait for the first capture with that exact recorded
+command line. Matching is case-sensitive and preserves spacing and line
+breaks. Captures whose shell integration supplied no command line are skipped.
+The cursor still advances past inspected captures, and a gap in uninspected
+history remains an error.
+
+To wait for a specific command, use the `start_token` from `inspect` or the
+pane's `command-started` event.
+
+```powershell
+& $ctl --pid 12345 wait-command --pane $pane --start-token $token --timeout 60
+```
+
+This form returns the exact capture when the parser receives its completion
+marker. If it already completed, the reply comes from retained history and
+is available even after the shell exits. The result includes `start_token`
+along with the usual command fields. Replacement, reset, disconnection before
+completion, and expired history produce errors. Use `--start-token` on its own
+as the command selector. It is exclusive with `--after-id`,
+`--connection-generation`, and `--command`.
+
+Use `--require-success` to make the CLI exit 0 for shell exit code zero,
+2 for a nonzero or unknown shell exit status, and 1 if the wait or file save
+fails. The JSON reply and any requested output file are available for exit 2.
+This flag affects the CLI process and is independent of the pipe request.
+
+Both forms default to 30 seconds and accept 1 to 3600 seconds. The cursor-based
+wait fails if the pane closes, its SSH connection ends, or the next capture has already fallen
+out of the retained history. After a gap or reconnect, take a new cursor with
+`list-commands`. Use a pane dedicated to the script if it needs to attribute
+the next completion to a particular input.
+
+Add `--output-file PATH` to either `get-command` or `wait-command` to save
+the captured text as UTF-8 without a BOM. The file preserves the capture's
+line endings and trailing whitespace. The CLI resolves relative paths from
+its current directory. The destination directory must already exist.
+
+The reply still includes the command metadata and exit code. It sets
+`output` to `null` and returns `output_file` with the absolute `path` and
+`bytes` saved. An empty capture produces a zero-byte file. A failed or
+unavailable capture leaves the destination untouched. Pass `--overwrite`
+to replace an existing file with the complete new capture.
+
 Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-commands","pane":2}
 {"verb":"list-commands","pane":2,"status":"failed"}
 {"verb":"get-command","pane":2,"id":5,"connection_generation":1}
+{"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"timeout_seconds":60}
+{"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"command":"make test"}
+{"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"output_file":{"path":"C:\\Logs\\capture.txt"}}
+{"verb":"wait-command-capture","pane":2,"start_token":27,"timeout_seconds":60}
 ```
+
+For either command, direct pipe clients send an absolute `output_file.path`
+and may set `output_file.overwrite` to `true`.
 
 `get-command` returns `pane`, `connection_generation`, `id`, `command`,
 `exit_code`, `output`, and `output_error`. Output preserves Unicode text,
@@ -594,7 +776,33 @@ size, and can match across LF-separated rows. It does not search scrollback or O
 images. Timeout defaults to 30 seconds, range 1–3600; no match is a JSON error.
 Success returns `pane`, `matched`, `generation`, `cols`, `rows`, and matching screen
 `text`. It observes screen state, not every transient byte that may have appeared
-between snapshots.
+between snapshots. Closing the target pane ends a pending text wait with
+an error.
+
+Pass `--screenshot PATH` to save the exact matched frame as a PNG, even if the
+pane has already repainted. The reply includes `screenshot` with the absolute
+`path`, `width`, and `height` in pixels. The same file replacement and rendering
+rules as `screenshot` apply. A text match timeout leaves the destination
+untouched. If the text matches but saving fails, the request returns a JSON error.
+
+Pass `--after-frame N` to consider only committed frames with a generation
+greater than `N`. Use the `generation` from `get-text` or a previous match
+for the same process and pane. A cursor ahead of the pane's current frame is an
+error. A later frame can satisfy the pattern with text that was also visible in
+the baseline. Synchronized output becomes eligible when its frame commits.
+
+Pass `--connection-generation N` to match frames from a particular live SSH
+session or local process. Use the generation from `list` or
+`wait-ssh-connected` with the same process and pane ID. A scoped wait fails as
+soon as that connection ends or changes. On success, the reply includes
+`connection_generation` as well as the frame's `generation`. Use the regular
+unscoped wait to observe a pane across reconnects or to read its final screen.
+`get-text` returns both generations from the same screen snapshot.
+
+```powershell
+$screen = (& $ctl --pid 12345 get-text --pane $pane | ConvertFrom-Json).result
+& $ctl --pid 12345 wait-for-text --pane $pane --connection-generation $screen.connection_generation --after-frame $screen.generation --screenshot .\cockpit.png --regex 'fps=\d+'
+```
 
 `resize` accepts the launch grid ranges. In a visible split it adjusts available dividers to reach the requested cell grid. Unzoom the focused pane before resizing it. A dimension fixed by the tab bounds, or a grid that leaves too little space for a sibling, produces a geometry error. The command keeps keyboard focus on its current pane.
 
@@ -603,7 +811,9 @@ background pane's PTY without selecting the pane or activating the window. Chang
 to the active grid require leaving fullscreen first. A grid that cannot fit the
 current display/window constraints fails clearly; geometry may
 already have changed. The next user tab activation uses the shared window's grid.
-Success acknowledges the client model/resize request, not a remote TUI redraw.
+For a visible pane, success means the measured viewport and terminal grid both
+match the request. For a background pane, success means its terminal model
+accepted the new grid. A remote TUI can redraw afterward.
 
 `open` creates an independent tab in the existing process from a saved profile.
 Without `--activate`, the current tab stays selected. `--activate` selects the new
@@ -611,6 +821,32 @@ tab inside the app; it does not request OS keyboard focus. Omitted dimensions us
 the current window grid. Replies return `pane`, `cols`, `rows`, and `active`. New
 tabs may still be connecting or awaiting a native trust/authentication prompt;
 scripts can inspect `list`. No command starts a new GUI process.
+
+`close-pane --pane ID` closes one terminal pane and acknowledges after it has
+been removed from `list`. It can close a background tab without selecting it, or
+remove a split while keeping a surviving active pane selected. The reply contains
+`pane` and `tab_closed`, which is true when the pane was alone in its tab. A
+single-pane tab must be unpinned and have another tab in the same window. Closing
+discards the pane's scrollback and shuts down its local process or SSH shell
+channel. As with closing through the UI, an eligible closed layout can be reopened
+with a fresh session. Use the pane ID returned by `open` to clean up a script's tab.
+
+`wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]`
+waits until an existing SSH pane reports a successful connection. The reply
+contains `pane` and `connection_generation`. An already connected pane returns
+immediately unless its generation is at or below `--after-generation`.
+For an automatic reconnect or a manual `restart`, use the previous generation
+from the same pane. A settled disconnect, a failed or stopped login, or a closed
+pane returns an error. A pending login or scheduled retry can continue until the
+timeout, which defaults to 30 seconds and accepts 1–3600 seconds. Use
+`wait-for-text` separately when a script needs a specific remote shell prompt.
+
+```powershell
+& $ctl --pid 12345 wait-ssh-connected --pane 2 --after-generation 1 --timeout 60
+```
+
+The same pipe request is
+`{"verb":"wait-ssh-connected","pane":2,"after_generation":1,"timeout_seconds":60}`.
 
 `events` returns `{"pane":1,"journal":{"events":[...],"next":42,"oldest":1,"lost":false},"restart_token":null}`.
 Each event has `sequence`, Unix `timestamp_ms`, `kind`, and JSON `data`. Use the
@@ -622,6 +858,18 @@ bytes. `lost=true` reports eviction. Events include `bell`, `title`, `notificati
 audible playback; inspect the `sound` outcome. See [the game protocol](docs/game-client-protocol.md).
 The CLI allows the requested wait timeout plus 15 seconds for these replies.
 
+Use `--kind KIND` to wait for an exact, case-sensitive kind. For example, after
+saving the pane's current `journal.next` and triggering a bell, run
+`events --pane 1 --since 42 --kind bell --timeout 15`. Unrelated events do not
+complete the wait. Use `--kind sound` and check `data.outcome` for `played`
+when playback is what the test needs to verify. With no match at the deadline,
+the reply has an empty `journal.events` array. An unread history gap returns
+`lost=true` immediately, with any matching retained events.
+
+The cursor always follows the full pane journal and advances past skipped
+events. Keep separate cursors if you also need to read those skipped kinds.
+Closing the target pane ends a pending event wait with an error.
+
 For SSH panes the reply also includes `ssh_connection`, an object with a
 `phase` of `queued`, `connecting`, `connected`, `reconnecting`, `disconnected`,
 `stopped`, or `failed`. Reconnecting includes an `attempt` number for an
@@ -630,6 +878,61 @@ a slot in a group launch. Failed includes a short
 `reason`. The journal adds an `ssh-connection` event on each phase change
 with the same data shape. The connection snapshot and restart token describe
 the pane at reply time, including when recorded transitions have aged out.
+
+The `reconnecting` journal event records the scheduled wait's `attempt`,
+`delay_seconds`, `retry_remaining_seconds`, and `will_retry`. The two time
+values round up to whole seconds. When `will_retry` is false, the wait ends
+at the retry deadline and the client starts no further automatic attempt.
+
+While a direct SSH login or retry is pending, `list` and `events` also include
+`ssh_attempt_token` for its pane. The `ssh-attempt` journal event carries
+`attempt_token` and a `pending` flag whenever the token is offered or retired.
+Use the token with the same process ID and pane ID.
+
+```powershell
+& $ctl --pid 12345 stop-ssh-attempt --pane 2 --attempt-token 4
+```
+
+An accepted stop returns `pane`, `attempt_token`, and `accepted: true`. Wait
+for the pane's `stopped` phase or a `restart_token` before restarting it. A
+retired token returns an error. The pane, its history, and desktop focus stay in place.
+
+During an automatic retry wait for a direct SSH pane, `list` and `events`
+include `ssh_retry_token`. Use it to start that specific retry early.
+
+```powershell
+& $ctl --pid 12345 retry-ssh-now --pane 2 --retry-token 3
+```
+
+A successful reply includes `pane`, `retry_token`, and `accepted: true`.
+The `ssh-retry-wait` journal event records when each token becomes available
+or retires. A successful early request retires the token with `requested: true`.
+Each wait has its own token. The retry window and input behavior are the same
+as for a scheduled retry.
+
+To end a connected direct SSH shell, use the `connection_generation` from
+`list` for the same process and pane.
+
+```powershell
+& $ctl --pid 12345 disconnect-ssh-shell --pane 2 --connection-generation 4
+```
+
+The reply includes `pane`, `connection_generation`, and `accepted: true`.
+The pane journals `ssh-disconnect-requested` with that generation. Wait for
+its `restart_token` with `wait-pane-exit` before starting a fresh shell. A
+stale generation is rejected. Deliberate disconnect leaves the pane, scrollback, and focus in
+place and skips automatic reconnect. Other shells on the same authenticated
+transport can continue.
+
+A live shell's integration start marker adds a `command-started` event to the pane's
+journal. Its data contains `id`, `connection_generation`, `start_token`, and
+`started_unix_ms` from the first observed start. Wait for it with
+`events --pane ID --since CURSOR --kind command-started --timeout SECONDS`.
+The journal records starts even when a command starts and finishes in one
+read. Duplicate markers during the same capture produce one event. The ID
+identifies the completed capture in that generation if the shell finishes it.
+If the capture is abandoned before completion, the next command can reuse
+that ID. Event data contains metadata only.
 
 A command completion watch armed in the GUI adds one `command-finished` event to
 the originating pane. Its data is `{"exit_code":17}` for a reported status or
@@ -650,21 +953,36 @@ When a direct SSH shell or local program finishes, a restartable pane emits
 events result identifies its current exit, even if the event has aged out.
 Use that token with the same process and pane ID to restart the program in
 place. Each exit can be claimed once. Live and reconnecting panes have a
-null token. The restart reply acknowledges the request. Use `list` to observe
-the new connection generation or `wait-for-text` for an application prompt.
+null token. The restart reply acknowledges the request. Use
+`wait-ssh-connected` for the new SSH generation or `wait-for-text` for an
+application prompt.
+
+`wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]` waits for
+an SSH session or local program to end and publish its final screen.
+The reply contains `pane`, `exit_token`, and `restart_token`, plus the final
+`ssh_connection` phase for SSH panes. A `null` restart token means the
+program cannot restart in that pane. An already ended pane returns immediately
+unless its exit token is at or below `--after-exit-token`. That option lets
+scripts wait for a later exit after a restart. Automatic SSH retries keep the
+wait pending. Replay and demo panes, closed panes, and a request for a newer
+exit from a pane that cannot restart return errors. The timeout defaults to
+30 seconds and accepts 1–3600 seconds.
 
 ```powershell
-$state = (& $ctl --pid 12345 events --pane $pane | ConvertFrom-Json).result
-if ($null -ne $state.restart_token) {
-    & $ctl --pid 12345 restart --pane $pane --exit-token $state.restart_token
+$exitReply = & $ctl --pid 12345 wait-pane-exit --pane $pane --timeout 60 | ConvertFrom-Json
+if ($exitReply.ok -and $null -ne $exitReply.result.restart_token) {
+    & $ctl --pid 12345 restart --pane $pane --exit-token $exitReply.result.restart_token
 }
 ```
 
 ```json
 {"verb":"wait-for-text","pane":1,"pattern":"fps=\\d+","regex":true,"timeout_seconds":15}
+{"verb":"wait-for-text","pane":1,"connection_generation":2,"after_frame":35,"screenshot_path":"C:\\tests\\ready.png","pattern":"ready","timeout_seconds":15}
 {"verb":"resize","pane":1,"cols":170,"rows":48}
 {"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
-{"verb":"events","pane":1,"since":42,"timeout_seconds":30}
+{"verb":"close-pane","pane":3}
+{"verb":"events","pane":1,"since":42,"kind":"bell","timeout_seconds":30}
+{"verb":"wait-pane-exit","pane":1,"after_exit_token":1,"timeout_seconds":30}
 {"verb":"restart","pane":1,"exit_token":1}
 ```
 

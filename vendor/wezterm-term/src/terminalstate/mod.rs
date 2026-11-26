@@ -327,14 +327,95 @@ impl ScreenOrAlt {
 #[derive(Debug)]
 pub struct CompletedCommand {
     pub id: u64,
+    pub start_token: Option<u64>,
+    pub finished_at: std::time::Instant,
+    pub timing: CommandTiming,
     pub command: Option<String>,
+    pub reported_directory: Option<Arc<str>>,
     pub exit_code: Option<i32>,
     pub output: Result<String, &'static str>,
 }
 
+/// Shell integration metadata observed at the start of the current command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningCommand {
+    pub id: u64,
+    pub start_token: u64,
+    pub command: Option<Arc<str>>,
+    pub reported_directory: Option<Arc<str>>,
+    pub started_unix_ms: u64,
+    started_at: std::time::Instant,
+}
+
+impl RunningCommand {
+    pub fn started_at(&self) -> std::time::Instant {
+        self.started_at
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommandTiming {
+    pub started_unix_ms: Option<u64>,
+    pub finished_unix_ms: u64,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct CommandClock {
+    monotonic: std::time::Instant,
+    unix_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CommandStart {
+    clock: CommandClock,
+    token: u64,
+}
+
+impl CommandStart {
+    fn now() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        Self {
+            clock: CommandClock::now(),
+            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl CommandClock {
+    fn now() -> Self {
+        Self {
+            monotonic: std::time::Instant::now(),
+            unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+
+    fn timing(self, start: Option<Self>) -> CommandTiming {
+        CommandTiming {
+            started_unix_ms: start.map(|started| started.unix_ms),
+            finished_unix_ms: self.unix_ms,
+            duration_ms: start.map(|started| {
+                self.monotonic
+                    .saturating_duration_since(started.monotonic)
+                    .as_millis() as u64
+            }),
+        }
+    }
+}
+
 impl CompletedCommand {
     fn text_bytes(&self) -> usize {
-        self.command.as_ref().map_or(0, String::len) + self.output.as_ref().map_or(0, String::len)
+        self.command.as_ref().map_or(0, String::len)
+            + self.output.as_ref().map_or(0, String::len)
+            + self.reported_directory.as_deref().map_or(0, str::len)
     }
 }
 
@@ -492,7 +573,9 @@ pub struct TerminalState {
     capturing_shell_input: bool,
     track_primary_prints: bool,
     last_primary_print: Option<PrimaryPrint>,
-    command_label: Option<String>,
+    command_label: Option<Arc<str>>,
+    command_started: Option<CommandStart>,
+    command_directory: Option<Arc<str>>,
     vscode_command: VscodeCommand,
 
     term_program: String,
@@ -780,6 +863,8 @@ impl TerminalState {
             track_primary_prints: false,
             last_primary_print: None,
             command_label: None,
+            command_started: None,
+            command_directory: None,
             vscode_command: VscodeCommand::Idle,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
@@ -1025,6 +1110,36 @@ impl TerminalState {
         &self.command_history
     }
 
+    /// The newest assigned capture ID, even when no capture remains in history.
+    pub fn latest_command_id(&self) -> u64 {
+        self.next_command_id - 1
+    }
+
+    pub fn running_command(&self) -> Option<RunningCommand> {
+        let start = self.command_started?;
+        Some(RunningCommand {
+            id: self.next_command_id,
+            start_token: start.token,
+            command: self.command_label.clone(),
+            reported_directory: self.command_directory.clone(),
+            started_unix_ms: start.clock.unix_ms,
+            started_at: start.clock.monotonic,
+        })
+    }
+
+    /// Read a bounded sample of primary-screen output without consuming the capture.
+    pub fn recent_running_command_output(&self) -> Option<crate::LiveOutputBatch> {
+        self.command_started?;
+        if self.is_alt_screen_active() || self.capturing_shell_input {
+            return None;
+        }
+        Some(
+            self.screen
+                .live_command_output(self.cursor.y, self.shell_column(), false)?
+                .recent(),
+        )
+    }
+
     fn shell_column(&self) -> usize {
         if self.wrap_next {
             self.screen().physical_cols
@@ -1056,6 +1171,8 @@ impl TerminalState {
     fn begin_command_input(&mut self) {
         if !self.is_alt_screen_active() {
             self.command_label = None;
+            self.command_started = None;
+            self.command_directory = None;
             self.capturing_shell_input = true;
             self.mark_shell_position();
         }
@@ -1063,19 +1180,27 @@ impl TerminalState {
 
     fn begin_command_output(&mut self, reported_command: Option<String>) {
         if !self.is_alt_screen_active() {
-            self.command_label = reported_command.or_else(|| {
-                if !self.capturing_shell_input {
-                    return None;
-                }
-                let col = self.shell_column();
-                self.screen
-                    .take_command_text(self.cursor.y, col, 4096)
-                    .ok()
-                    .and_then(|mut text| {
-                        text.truncate(text.trim_end_matches(['\r', '\n']).len());
-                        (!text.is_empty()).then_some(text)
-                    })
-            });
+            self.command_started = Some(CommandStart::now());
+            self.command_directory = self
+                .current_dir
+                .as_ref()
+                .filter(|(url, raw)| url.scheme() == "file" && raw.len() <= 16 * 1024)
+                .map(|(_, raw)| raw.clone());
+            self.command_label = reported_command
+                .or_else(|| {
+                    if !self.capturing_shell_input {
+                        return None;
+                    }
+                    let col = self.shell_column();
+                    self.screen
+                        .take_command_text(self.cursor.y, col, 4096)
+                        .ok()
+                        .and_then(|mut text| {
+                            text.truncate(text.trim_end_matches(['\r', '\n']).len());
+                            (!text.is_empty()).then_some(text)
+                        })
+                })
+                .map(Arc::from);
             self.capturing_shell_input = false;
             self.mark_shell_position();
         }
@@ -1089,16 +1214,22 @@ impl TerminalState {
             self.capturing_shell_input = false;
             self.screen.command_start = None;
             self.command_label = None;
+            self.command_started = None;
+            self.command_directory = None;
         }
     }
 
     fn finish_command_output(&mut self, exit_code: Option<i32>) {
         if !self.is_alt_screen_active() {
+            let finished = CommandClock::now();
+            let start = self.command_started;
+            let timing = finished.timing(start.map(|start| start.clock));
             if self.capturing_shell_input {
                 self.screen.command_start = None;
                 self.capturing_shell_input = false;
             }
             self.notify_live_shell_output(true);
+            self.command_started = None;
             let col = self.shell_column();
             self.screen
                 .remember_command_output(self.next_command_id, (self.cursor.y, col));
@@ -1107,7 +1238,11 @@ impl TerminalState {
                 .take_command_text(self.cursor.y, col, 1024 * 1024);
             let command = Arc::new(CompletedCommand {
                 id: self.next_command_id,
-                command: self.command_label.take(),
+                start_token: start.map(|start| start.token),
+                finished_at: finished.monotonic,
+                timing,
+                command: self.command_label.take().map(|label| label.to_string()),
+                reported_directory: self.command_directory.take(),
                 exit_code,
                 output,
             });
@@ -1139,7 +1274,12 @@ impl TerminalState {
         ) else {
             return;
         };
-        handler.live_shell_output(self.next_command_id, self.command_label.as_deref(), output);
+        handler.live_shell_output(
+            self.next_command_id,
+            self.command_label.as_deref(),
+            self.command_started.map(|start| start.token),
+            output,
+        );
     }
 
     pub fn command_output_row(&self, id: u64) -> Option<StableRowIndex> {

@@ -10,6 +10,7 @@ async fn raw(pane: u64, bytes: &[u8]) -> Result<()> {
         pane,
         data_base64: STANDARD.encode(bytes),
         no_paste: true,
+        connection_generation: None,
     })
     .await?;
     Ok(())
@@ -18,6 +19,9 @@ async fn raw(pane: u64, bytes: &[u8]) -> Result<()> {
 async fn seen(pane: u64, marker: &str) -> Result<()> {
     split_control(Request::WaitForText {
         pane,
+        connection_generation: None,
+        after_frame: None,
+        screenshot_path: None,
         pattern: marker.into(),
         regex: false,
         timeout_seconds: 15,

@@ -6,7 +6,7 @@ pub enum RosterCommand {
     Copy(BTreeSet<u64>),
     OpenPrompt { pane: u64, prompt: u64 },
     Reconnect(Vec<ExitedPane>),
-    StopPending(Vec<reconnect::Attempt>),
+    StopPending(Vec<PendingPaneAttempt>),
     ReviewCloseEnded(Vec<close_ended::Recipient>),
     ReviewDisconnect(Vec<disconnect::Recipient>),
 }

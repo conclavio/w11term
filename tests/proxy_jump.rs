@@ -2,29 +2,32 @@
 //! The two private host names can only be resolved by their preceding test jump.
 use anyhow::Result;
 use russh::{
-    Channel, ChannelId, ChannelOpenFailure, Pty,
+    Channel, ChannelId, ChannelOpenFailure, Preferred, Pty, cipher, kex,
     keys::{
-        Algorithm, EcdsaCurve, HashAlg, PrivateKey, PublicKey,
+        Algorithm, Certificate, EcdsaCurve, HashAlg, PrivateKey, PublicKey,
         ssh_key::{LineEnding, certificate},
     },
     server,
 };
 use std::{
+    borrow::Cow,
     fmt::Write,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     task::JoinHandle,
 };
 use w11term::{
     events::Events,
-    options::{Authentication, JumpHost, SshOptions},
+    options::{Authentication, JumpHost, Source, SshOptions},
     profiles::ProfileStore,
     prompts::Prompts,
+    session::{Command, Session},
     ssh::{self, Event},
     terminal::TransportInput,
 };
@@ -36,6 +39,16 @@ const HOSTS: [&str; 3] = [
 ];
 const USERS: [&str; 3] = ["outer-user", "inner-user", "shell-user"];
 const PROBE: &[u8] = b"through-both-jumps";
+const INSPECTION_KEX: [kex::Name; 3] = [
+    kex::CURVE25519,
+    kex::CURVE25519_PRE_RFC_8731,
+    kex::MLKEM768X25519_SHA256,
+];
+const INSPECTION_CIPHERS: [cipher::Name; 3] = [
+    cipher::AES_128_CTR,
+    cipher::AES_256_GCM,
+    cipher::CHACHA20_POLY1305,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Seen {
@@ -47,6 +60,7 @@ enum Seen {
 struct Peer {
     index: usize,
     identity: PublicKey,
+    user_certificate: Option<Certificate>,
     next: Option<SocketAddr>,
     seen: Arc<Mutex<Vec<Seen>>>,
 }
@@ -54,7 +68,19 @@ impl server::Handler for Peer {
     type Error = anyhow::Error;
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<server::Auth> {
-        if user == USERS[self.index] && key == &self.identity {
+        if self.user_certificate.is_none() && user == USERS[self.index] && key == &self.identity {
+            self.seen.lock().unwrap().push(Seen::Auth(self.index));
+            Ok(server::Auth::Accept)
+        } else {
+            Ok(server::Auth::reject())
+        }
+    }
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        cert: &Certificate,
+    ) -> Result<server::Auth> {
+        if user == USERS[self.index] && self.user_certificate.as_ref() == Some(cert) {
             self.seen.lock().unwrap().push(Seen::Auth(self.index));
             Ok(server::Auth::Accept)
         } else {
@@ -150,6 +176,15 @@ impl Fixture {
         Self::start_with_aliases(None).await
     }
     async fn start_with_aliases(aliases: Option<[&str; 3]>) -> Result<Self> {
+        Self::start_route(aliases, None, false, false).await
+    }
+
+    async fn start_route(
+        aliases: Option<[&str; 3]>,
+        stall: Option<usize>,
+        inspect_algorithms: bool,
+        user_certificates: bool,
+    ) -> Result<Self> {
         let keys = tempfile::tempdir()?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut endpoints = Vec::new();
@@ -202,29 +237,64 @@ impl Fixture {
             let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
             let path = keys.path().join(format!("id-{index}"));
             std::fs::write(&path, identity.to_openssh(LineEnding::LF)?.as_bytes())?;
+            let (certificate_path, user_certificate) = if user_certificates {
+                let mut user_cert = certificate::Builder::new_with_random_nonce(
+                    &mut rand::rng(),
+                    identity.public_key().key_data().clone(),
+                    0,
+                    u64::MAX,
+                )?;
+                user_cert.cert_type(certificate::CertType::User)?;
+                user_cert.valid_principal(USERS[index])?;
+                let user_cert = user_cert.sign(&ca)?;
+                let path = keys.path().join(format!("id-{index}-cert.pub"));
+                std::fs::write(&path, user_cert.to_openssh()?)?;
+                (Some(path), Some(user_cert))
+            } else {
+                (None, None)
+            };
             endpoints.push(JumpHost {
                 host: HOSTS[index].into(),
                 port: address.port(),
+                connect_timeout_seconds: None,
+                keepalive: Default::default(),
                 user: USERS[index].into(),
-                authentication: Authentication::Identity { identity: path },
+                authentication: Authentication::identity(path, certificate_path),
+                agent_pipe: None,
                 host_key: Some(host.public_key().fingerprint(HashAlg::Sha256).to_string()),
                 host_key_alias: alias.map(str::to_owned),
             });
+            let mut preferred = Preferred::default();
+            if inspect_algorithms {
+                let mut kex = vec![INSPECTION_KEX[index]];
+                if index != 0 {
+                    kex.push(kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER);
+                }
+                preferred.kex = Cow::Owned(kex);
+                preferred.cipher = Cow::Owned(vec![INSPECTION_CIPHERS[index]]);
+            }
             let config = Arc::new(server::Config {
                 certificates: vec![cert.sign(&ca)?],
                 keys: vec![host],
                 auth_rejection_time: Duration::ZERO,
+                preferred,
                 ..Default::default()
             });
             let peer = Peer {
                 index,
                 identity: identity.public_key().clone(),
+                user_certificate,
                 next,
                 seen: seen.clone(),
             };
             servers.push(tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                if let Ok(running) = server::run_stream(config, stream, peer).await {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if stall == Some(index) {
+                    stream.write_all(b"SSH-2.0-w11term-test\r\n").await.unwrap();
+                    let mut received = Vec::new();
+                    stream.read_to_end(&mut received).await.unwrap();
+                    assert!(received.starts_with(b"SSH-2.0-"));
+                } else if let Ok(running) = server::run_stream(config, stream, peer).await {
                     let _ = running.await;
                 }
             }));
@@ -262,6 +332,18 @@ impl Fixture {
                 ports[i],
                 identity.display()
             );
+            let authentication = self
+                .options
+                .proxy_jump
+                .get(i)
+                .map_or(&self.options.authentication, |hop| &hop.authentication);
+            if let Authentication::Identity {
+                certificate: Some(path),
+                ..
+            } = authentication
+            {
+                writeln!(section, " CertificateFile \"{}\"", path.display())?;
+            }
             let trust_alias = self
                 .options
                 .proxy_jump
@@ -340,17 +422,182 @@ impl Drop for Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_config_fragments_connect_through_both_trusted_jumps_and_close_with_the_terminal()
 {
-    assert_imported_route(None).await;
+    assert_imported_route(None, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_hop_trust_aliases_validate_certificates_without_changing_forwarding_addresses() {
-    assert_imported_route(Some(["public-jump.keys", "inner-jump.keys", "shell.keys"])).await;
+    assert_imported_route(
+        Some(["public-jump.keys", "inner-jump.keys", "shell.keys"]),
+        false,
+    )
+    .await;
 }
 
-async fn assert_imported_route(aliases: Option<[&str; 3]>) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_user_certificates_authenticate_each_jump_and_the_destination() {
+    assert_imported_route(None, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_or_mismatched_user_certificates_do_not_fall_back_to_the_raw_key() -> Result<()> {
+    for matching in [true, false] {
+        // This fixture accepts the raw private key. A certificate failure must
+        // stop login instead of authenticating with that raw key.
+        let mut fixture = Fixture::start().await?;
+        let identity = fixture.keys.path().join("id-0");
+        let public = russh::keys::load_secret_key(
+            fixture
+                .keys
+                .path()
+                .join(if matching { "id-0" } else { "id-1" }),
+            None,
+        )?;
+        let ca = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let mut cert = certificate::Builder::new_with_random_nonce(
+            &mut rand::rng(),
+            public.public_key().key_data().clone(),
+            0,
+            u64::MAX,
+        )?;
+        cert.cert_type(certificate::CertType::User)?;
+        cert.valid_principal(USERS[0])?;
+        let path = fixture.keys.path().join("test-cert.pub");
+        std::fs::write(&path, cert.sign(&ca)?.to_openssh()?)?;
+        fixture.options.proxy_jump[0].authentication =
+            Authentication::identity(identity, Some(path));
+
+        let (_input, _output, task) = fixture.connect();
+        let result = tokio::time::timeout(Duration::from_secs(8), task).await??;
+        let error = format!("{:#}", result.unwrap_err());
+        let expected = if matching {
+            "certificate authentication rejected"
+        } else {
+            "certificate does not match the private key"
+        };
+        assert!(error.contains(expected), "{error}");
+        assert!(fixture.seen.lock().unwrap().is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspection_reports_each_verified_peer_in_connection_order() {
+    let fixture = Fixture::start_route(
+        Some([
+            "outer-inspect.invalid",
+            "inner-inspect.invalid",
+            "destination-inspect.invalid",
+        ]),
+        None,
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let session = Session::start(Source::Ssh(fixture.options.clone()));
+    let route = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            session.input.send(Command::ReadModes(reply)).unwrap();
+            let inspection = receive.await.unwrap();
+            if let Some(ssh) = inspection.ssh {
+                assert_eq!(inspection.connection_generation, 1);
+                assert_eq!(
+                    inspection.ssh_connection,
+                    Some(w11term::events::SshConnectionPhase::Connected)
+                );
+                assert!(inspection.ssh_progress.is_none());
+                break ssh;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("verified SSH route was never published");
+    let stages: Vec<_> = session
+        .events
+        .since(0)
+        .events
+        .into_iter()
+        .filter(|event| event.kind == "ssh-step")
+        .map(|event| event.data)
+        .collect();
+    let mut expected_stages = Vec::new();
+    for (index, (host, user)) in HOSTS.into_iter().zip(USERS).enumerate() {
+        let opening = if index == 0 {
+            "opening-tcp"
+        } else {
+            "opening-jump-channel"
+        };
+        let (port, jump) = if let Some(hop) = fixture.options.proxy_jump.get(index) {
+            (hop.port, Some(index + 1))
+        } else {
+            (fixture.options.port, None)
+        };
+        for step in [opening, "key-exchange", "authenticating"] {
+            let mut stage = serde_json::json!({
+                "step": step, "host": host, "user": user, "port": port
+            });
+            if let Some(jump) = jump {
+                stage["jump"] = jump.into();
+            }
+            expected_stages.push(stage);
+        }
+    }
+    for step in ["opening-session-channel", "requesting-terminal"] {
+        expected_stages.push(serde_json::json!({
+            "step": step, "host": HOSTS[2], "user": USERS[2], "port": fixture.options.port
+        }));
+    }
+    assert_eq!(stages, expected_stages);
+
+    let expected = fixture
+        .options
+        .proxy_jump
+        .iter()
+        .cloned()
+        .map(SshOptions::from)
+        .chain(std::iter::once(fixture.options.clone()));
+    assert_eq!(route.jump_hosts.len(), 2);
+    let expected_host_keys = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp521"];
+    for (index, (peer, expected)) in route
+        .jump_hosts
+        .iter()
+        .chain([&route.destination])
+        .zip(expected)
+        .enumerate()
+    {
+        assert_eq!(
+            (&peer.host, &peer.user, peer.port),
+            (&expected.host, &expected.user, expected.port)
+        );
+        assert_eq!(Some(&peer.key_fingerprint), expected.host_key.as_ref());
+        assert_eq!(peer.host_key_alias, expected.host_key_alias);
+        let Authentication::Identity { identity, .. } = expected.authentication else {
+            panic!("expected fixture identity file");
+        };
+        let key = russh::keys::load_secret_key(identity.as_path(), None).unwrap();
+        assert_eq!(
+            peer.authentication,
+            w11term::ssh::VerifiedSshAuthentication::PublicKey {
+                source: w11term::ssh::SshKeySource::File,
+                key_fingerprint: key.public_key().fingerprint(HashAlg::Sha256).to_string(),
+                certificate_authority_fingerprint: None,
+                additional_methods: Vec::new(),
+            }
+        );
+        let algorithms = peer.initial_algorithms.as_ref().unwrap();
+        assert_eq!(algorithms.key_exchange, INSPECTION_KEX[index].as_ref());
+        assert_eq!(algorithms.host_key, expected_host_keys[index]);
+        assert_eq!(algorithms.cipher, INSPECTION_CIPHERS[index].as_ref());
+        assert_eq!(algorithms.strict_key_exchange, index != 0);
+    }
+}
+
+async fn assert_imported_route(aliases: Option<[&str; 3]>, user_certificates: bool) {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let mut fixture = Fixture::start_with_aliases(aliases).await?;
+        let mut fixture = Fixture::start_route(aliases, None, false, user_certificates).await?;
         fixture.import_saved_route()?;
         let (input, mut output, task) = fixture.connect();
         let mut echo = Vec::new();
@@ -436,4 +683,39 @@ async fn refused_forward_stops_before_the_next_ssh_handshake() {
         "{diagnostic}"
     );
     assert_eq!(*fixture.seen.lock().unwrap(), [Seen::Auth(0)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_key_exchange_expires_and_closes_a_direct_or_forwarded_stream() {
+    for stalled in [0, 1, 2] {
+        let mut fixture = Fixture::start_route(None, Some(stalled), false, false)
+            .await
+            .unwrap();
+        let seconds = Some(1.try_into().unwrap());
+        if let Some(hop) = fixture.options.proxy_jump.get_mut(stalled) {
+            hop.connect_timeout_seconds = seconds;
+        } else {
+            fixture.options.connect_timeout_seconds = seconds;
+        }
+        let (_input, _output, task) = fixture.connect();
+        let error = tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("the endpoint's timeout did not end the handshake")
+            .unwrap()
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("SSH handshake timed out"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains(HOSTS[stalled]), "{diagnostic}");
+        let seen: Vec<_> = (0..stalled)
+            .flat_map(|index| [Seen::Auth(index), Seen::Forward(index)])
+            .collect();
+        assert_eq!(*fixture.seen.lock().unwrap(), seen);
+        tokio::time::timeout(Duration::from_secs(5), &mut fixture.servers[2 - stalled])
+            .await
+            .expect("the timed-out handshake left its stream open")
+            .unwrap();
+    }
 }

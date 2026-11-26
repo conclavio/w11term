@@ -731,6 +731,7 @@ mod tests {
             crate::sftp::TransferOutcome::Completed,
             "Downloaded\nreport \u{202e} 2 of 2 items completed.",
             Some(location.clone()),
+            None,
             true,
         );
         let target = NoticeTarget::SftpTransfer {
@@ -768,6 +769,7 @@ mod tests {
             crate::sftp::TransferId { serial: 2, ..id },
             crate::sftp::TransferOutcome::Completed,
             "Foreground result",
+            None,
             None,
             false,
         );

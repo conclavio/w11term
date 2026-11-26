@@ -12,13 +12,19 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-text --pane ID --no-paste [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
     pid: Option<u32>,
     request: Request,
-    require_success: bool,
+    success_check: Option<SuccessCheck>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SuccessCheck {
+    Command,
+    SshGroup,
 }
 
 impl Invocation {
@@ -26,7 +32,7 @@ impl Invocation {
         Self {
             pid,
             request,
-            require_success: false,
+            success_check: None,
         }
     }
 }
@@ -37,6 +43,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
     let mut verb = None;
     let mut pane = None;
     let mut no_paste = false;
+    let mut connection_generation = None;
     let mut payload = None;
     let mut path = None;
     while let Some(arg) = args.next() {
@@ -53,8 +60,18 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "record"
             | "save-text"
             | "restart"
+            | "stop-ssh-attempt"
+            | "retry-ssh-now"
+            | "disconnect-ssh-shell"
+            | "wait-ssh-connected"
+            | "wait-pane-exit"
+            | "close-pane"
             | "list-commands"
             | "get-command"
+            | "get-running-output"
+            | "wait-running-output"
+            | "interrupt-command"
+            | "wait-command"
             | "inspect"
             | "playback"
             | "list-ssh-groups"
@@ -91,8 +108,22 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                     .map(|(pid, request)| Invocation::new(pid, request));
             }
             "--pid" => pid = Some(value(&mut args)?.parse()?),
-            "--pane" => pane = Some(value(&mut args)?.parse()?),
+            "--pane" => {
+                ensure!(pane.is_none(), "specify --pane only once");
+                pane = Some(value(&mut args)?.parse()?);
+            }
             "--no-paste" => no_paste = true,
+            "--connection-generation" if verb.as_deref() == Some("send-text") => {
+                ensure!(
+                    connection_generation.is_none(),
+                    "specify --connection-generation only once"
+                );
+                connection_generation = Some(
+                    value(&mut args)?
+                        .parse()
+                        .context("--connection-generation requires a positive integer")?,
+                );
+            }
             "--base64" | "--file" | "--stdin" => {
                 ensure!(payload.is_none(), "choose one input source");
                 let bytes = match arg.as_str() {
@@ -157,6 +188,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                 pane: pane.context("--pane is required")?,
                 data_base64: STANDARD.encode(bytes),
                 no_paste,
+                connection_generation,
             }
         }
         "screenshot" => {
@@ -188,7 +220,7 @@ async fn main() -> ExitCode {
         println!("{HELP}\n\n{}\n\n{}", sftp_args::HELP, automation::HELP);
         return ExitCode::SUCCESS;
     }
-    let mut require_success = false;
+    let mut success_check = None;
     let result = if args == ["instances"] {
         control::discover().await.map(|instances| {
             Reply::from_result(serde_json::to_value(instances).map_err(Into::into))
@@ -223,7 +255,7 @@ async fn main() -> ExitCode {
                 }
             }
             Ok(invocation) => {
-                require_success = invocation.require_success;
+                success_check = invocation.success_check;
                 control::call(invocation.pid, &invocation.request).await
             }
             Err(e) => Err(e),
@@ -231,17 +263,27 @@ async fn main() -> ExitCode {
     };
     let reply = result.unwrap_or_else(|e| Reply::from_result(Err(e)));
     println!("{}", serde_json::to_string(&reply).unwrap());
-    cli_exit_code(&reply, require_success)
+    cli_exit_code(&reply, success_check)
 }
 
-fn cli_exit_code(reply: &Reply, require_success: bool) -> ExitCode {
+fn cli_exit_code(reply: &Reply, success_check: Option<SuccessCheck>) -> ExitCode {
     if !reply.ok {
         return ExitCode::FAILURE;
     }
-    if !require_success {
+    let Some(success_check) = success_check else {
         return ExitCode::SUCCESS;
+    };
+    let Some(result) = reply.result.as_ref() else {
+        return ExitCode::FAILURE;
+    };
+    if success_check == SuccessCheck::Command {
+        return if result["exit_code"].as_i64() == Some(0) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        };
     }
-    let Some(run) = reply.result.as_ref().and_then(|result| result.get("run")) else {
+    let Some(run) = result.get("run") else {
         return ExitCode::FAILURE;
     };
     let Some(recipients) = run.get("recipients").and_then(serde_json::Value::as_array) else {
@@ -279,7 +321,7 @@ mod tests {
                 .map(str::to_owned),
         )
         .unwrap();
-        assert!(invocation.require_success);
+        assert_eq!(invocation.success_check, Some(SuccessCheck::SshGroup));
         assert_eq!(
             serde_json::to_value(invocation.request).unwrap(),
             serde_json::json!({
@@ -311,7 +353,7 @@ mod tests {
             })))
         };
         assert_eq!(
-            cli_exit_code(&outcome(success.clone()), true),
+            cli_exit_code(&outcome(success.clone()), Some(SuccessCheck::SshGroup)),
             ExitCode::SUCCESS
         );
         for (field, bad) in [
@@ -325,11 +367,17 @@ mod tests {
             recipient[field] = bad;
             let reply = outcome(recipient);
             assert!(reply.ok);
-            assert_eq!(cli_exit_code(&reply, true), ExitCode::from(2));
-            assert_eq!(cli_exit_code(&reply, false), ExitCode::SUCCESS);
+            assert_eq!(
+                cli_exit_code(&reply, Some(SuccessCheck::SshGroup)),
+                ExitCode::from(2)
+            );
+            assert_eq!(cli_exit_code(&reply, None), ExitCode::SUCCESS);
         }
         assert_eq!(
-            cli_exit_code(&Reply::from_result(Err(anyhow::anyhow!("timeout"))), true),
+            cli_exit_code(
+                &Reply::from_result(Err(anyhow::anyhow!("timeout"))),
+                Some(SuccessCheck::SshGroup)
+            ),
             ExitCode::FAILURE
         );
     }
@@ -868,6 +916,181 @@ mod tests {
     }
 
     #[test]
+    fn running_output_requires_an_exact_positive_start_token_and_pane() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (pid, request) =
+            parse_line("--pid 42 get-running-output --pane 8 --start-token 27").unwrap();
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(pid, Some(42));
+        assert_eq!(
+            json,
+            serde_json::json!({"verb":"get-running-output","pane":8,"start_token":27})
+        );
+        assert!(matches!(
+            serde_json::from_value(json).unwrap(),
+            Request::GetRunningOutput { pane: 8, start_token } if start_token.get() == 27
+        ));
+        for line in [
+            "get-running-output --pane 8",
+            "get-running-output --start-token 27",
+            "get-running-output --pane 0 --start-token 27",
+            "get-running-output --pane 8 --start-token 0",
+            "get-running-output --pane 8 --start-token -1",
+            "get-running-output --pane 8 --start-token 27 --start-token 28",
+            "get-running-output --pane 8 --pane 9 --start-token 27",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn running_output_wait_accepts_match_options_and_valid_timeout() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (_, request) = parse_line("wait-running-output --pane 8 --start-token 27 --regex --match-case --timeout 7 -- ^ready$").unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"wait-running-output","pane":8,"start_token":27,"pattern":"^ready$","regex":true,"match_case":true,"timeout_seconds":7})
+        );
+        for line in [
+            "wait-running-output --pane 8 --start-token 0 ready",
+            "wait-running-output --pane 8 --start-token 27",
+            "wait-running-output --pane 8 --start-token 27 --timeout 0 ready",
+            "wait-running-output --pane 8 --start-token 27 --timeout 3601 ready",
+            "wait-running-output --pane 8 --start-token 27 --timeout 1 --timeout 2 ready",
+            "get-running-output --pane 8 --start-token 27 --regex ready",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn interrupt_command_requires_a_positive_pane_and_start_token() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (pid, request) =
+            parse_line("--pid 42 interrupt-command --pane 8 --start-token 27").unwrap();
+        assert_eq!(pid, Some(42));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"interrupt-command","pane":8,"start_token":27})
+        );
+        for line in [
+            "interrupt-command --pane 8",
+            "interrupt-command --start-token 27",
+            "interrupt-command --pane 0 --start-token 27",
+            "interrupt-command --pane 8 --start-token 0",
+            "interrupt-command --pane 8 --start-token 27 --start-token 28",
+            "interrupt-command --pane 8 --pane 9 --start-token 27",
+            "interrupt-command --pane 8 --start-token 27 --connection-generation 1",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn wait_command_start_token_is_exclusive_and_preserves_success_checks() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let invocation = parse_invocation(
+            "--pid 9 wait-command --pane 8 --start-token 27 --timeout 7 --require-success"
+                .split_ascii_whitespace()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(invocation.pid, Some(9));
+        assert_eq!(invocation.success_check, Some(SuccessCheck::Command));
+        assert_eq!(
+            serde_json::to_value(invocation.request).unwrap(),
+            serde_json::json!({"verb":"wait-command-capture","pane":8,"start_token":27,"timeout_seconds":7})
+        );
+        for line in [
+            "wait-command --pane 8 --start-token 0",
+            "wait-command --pane 0 --start-token 27",
+            "wait-command --pane 8 --start-token 27 --after-id 4",
+            "wait-command --pane 8 --start-token 27 --connection-generation 1",
+            "wait-command --pane 8 --start-token 27 --command build",
+            "wait-command --pane 8 --start-token 27 --start-token 28",
+            "wait-command --pane 8 --start-token 27 --timeout 0",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn single_pane_ssh_wait_accepts_a_generation_floor_and_valid_timeout() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 9 wait-ssh-connected --pane 7").unwrap(),
+            (
+                Some(9),
+                Request::WaitSshConnected {
+                    pane: 7,
+                    after_generation: 0,
+                    timeout_seconds: 30
+                }
+            )
+        ));
+        assert!(matches!(
+            parse_line("wait-ssh-connected --pane 7 --after-generation 4 --timeout 15").unwrap(),
+            (
+                None,
+                Request::WaitSshConnected {
+                    pane: 7,
+                    after_generation: 4,
+                    timeout_seconds: 15
+                }
+            )
+        ));
+        for line in [
+            "wait-ssh-connected",
+            "wait-ssh-connected --pane 0",
+            "wait-ssh-connected --pane 7 --pane 8",
+            "wait-ssh-connected --pane 7 --after-generation -1",
+            "wait-ssh-connected --pane 7 --after-generation 1 --after-generation 2",
+            "wait-ssh-connected --pane 7 --timeout 0",
+            "wait-ssh-connected --pane 7 --timeout 3601",
+            "wait-ssh-connected --pane 7 --timeout 4 --timeout 5",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn pane_exit_wait_accepts_only_its_scoped_options() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 9 wait-pane-exit --pane 7").unwrap(),
+            (
+                Some(9),
+                Request::WaitPaneExit {
+                    pane: 7,
+                    after_exit_token: 0,
+                    timeout_seconds: 30
+                }
+            )
+        ));
+        assert!(matches!(
+            parse_line("wait-pane-exit --pane 7 --after-exit-token 4 --timeout 60").unwrap(),
+            (
+                None,
+                Request::WaitPaneExit {
+                    pane: 7,
+                    after_exit_token: 4,
+                    timeout_seconds: 60
+                }
+            )
+        ));
+        for line in [
+            "wait-pane-exit",
+            "wait-pane-exit --pane 7 --after-exit-token -1",
+            "wait-pane-exit --pane 7 --after-exit-token 1 --after-exit-token 2",
+            "wait-pane-exit --pane 7 --after-generation 1",
+            "wait-pane-exit --pane 7 --timeout 3601",
+            "wait-ssh-connected --pane 7 --after-exit-token 1",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
     fn command_history_requires_the_listed_pane_id_and_generation_for_lookup() {
         use w11term::control::CommandStatus;
         let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
@@ -899,7 +1122,8 @@ mod tests {
                 Request::GetCommand {
                     pane: 2,
                     id: 53,
-                    connection_generation: 0
+                    connection_generation: 0,
+                    output_file: None
                 }
             )
         ));
@@ -918,6 +1142,112 @@ mod tests {
             "get-command --pane 2 --id foo --connection-generation 1",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn wait_command_requires_a_pane_and_explicit_cursor() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("wait-command --pane 7 --after-id 0 --connection-generation 0 --timeout 2")
+                .unwrap(),
+            (
+                None,
+                Request::WaitCommand {
+                    pane: 7,
+                    after_id: 0,
+                    connection_generation: 0,
+                    timeout_seconds: 2,
+                    command: None,
+                    output_file: None
+                }
+            )
+        ));
+        for line in [
+            "wait-command --pane 7 --connection-generation 0",
+            "wait-command --pane 7 --after-id 0",
+            "wait-command --after-id 0 --connection-generation 0",
+            "wait-command --pane 7 --after-id -1 --connection-generation 0",
+            "wait-command --pane 7 --after-id 0 --after-id 1 --connection-generation 0",
+            "wait-command --pane 7 --after-id 0 --connection-generation 0 --connection-generation 1",
+            "wait-command --pane 7 --after-id 0 --connection-generation 0 --timeout 0",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn exact_command_wait_preserves_text_and_can_check_shell_success() {
+        let command = "Build  Ω";
+        let invocation = parse_invocation(
+            [
+                "wait-command",
+                "--pane",
+                "7",
+                "--after-id",
+                "5",
+                "--connection-generation",
+                "1",
+                "--command",
+                command,
+                "--require-success",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(invocation.success_check, Some(SuccessCheck::Command));
+        let request = serde_json::to_value(invocation.request).unwrap();
+        assert_eq!(request["command"], command);
+        assert!(request.get("require_success").is_none());
+
+        for (code, expected) in [
+            (Some(0), ExitCode::SUCCESS),
+            (Some(17), ExitCode::from(2)),
+            (None, ExitCode::from(2)),
+        ] {
+            let reply = Reply::from_result(Ok(serde_json::json!({"exit_code":code})));
+            assert_eq!(cli_exit_code(&reply, Some(SuccessCheck::Command)), expected);
+            assert_eq!(cli_exit_code(&reply, None), ExitCode::SUCCESS);
+        }
+        let timeout = Reply::from_result(Err(anyhow::anyhow!("timeout")));
+        assert_eq!(
+            cli_exit_code(&timeout, Some(SuccessCheck::Command)),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn command_capture_file_flags_keep_paths_and_require_an_explicit_destination() {
+        let destination = "test folder/output.txt";
+        for options in [
+            ["get-command", "--id", "9"],
+            ["wait-command", "--after-id", "8"],
+        ] {
+            let parse_options = |extra: &[&str]| {
+                parse(
+                    options
+                        .into_iter()
+                        .chain(["--pane", "7", "--connection-generation", "1"])
+                        .chain(extra.iter().copied())
+                        .map(str::to_owned),
+                )
+            };
+            let (_, request) =
+                parse_options(&["--overwrite", "--output-file", destination]).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["output_file"],
+                serde_json::json!({"path": std::path::absolute(destination).unwrap(), "overwrite": true})
+            );
+            for extra in [
+                vec!["--overwrite"],
+                vec!["--output-file"],
+                vec!["--output-file", "--overwrite"],
+                vec!["--output-file", ""],
+                vec!["--output-file", destination, "--output-file", "duplicate"],
+            ] {
+                assert!(parse_options(&extra).is_err(), "{options:?} {extra:?}");
+            }
         }
     }
 
@@ -962,21 +1292,216 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_text_accepts_an_optional_positive_connection_generation() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (_, request) =
+            parse_line("wait-for-text --pane 7 --connection-generation 4 --regex ready").unwrap();
+        assert!(matches!(
+            request,
+            Request::WaitForText { pane: 7, connection_generation: Some(generation), regex: true, .. }
+                if generation.get() == 4
+        ));
+        let (_, unscoped) = parse_line("wait-for-text --pane 7 ready").unwrap();
+        assert!(
+            serde_json::to_value(unscoped)
+                .unwrap()
+                .get("connection_generation")
+                .is_none()
+        );
+        for line in [
+            "wait-for-text --pane 7 --connection-generation 0 ready",
+            "wait-for-text --pane 7 --connection-generation 1 --connection-generation 2 ready",
+            "find-text --pane 7 --connection-generation 4 ready",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn wait_for_text_parses_a_frame_cursor_alongside_connection_scope() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (_, request) =
+            parse_line("wait-for-text --pane 7 --after-frame 15 --connection-generation 4 ready")
+                .unwrap();
+        assert!(matches!(
+            request,
+            Request::WaitForText {
+                pane: 7,
+                after_frame: Some(15),
+                connection_generation: Some(generation),
+                ..
+            } if generation.get() == 4
+        ));
+        for line in [
+            "wait-for-text --pane 7 --after-frame -1 ready",
+            "wait-for-text --pane 7 --after-frame 1 --after-frame 2 ready",
+            "events --pane 7 --after-frame 15",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn close_pane_requires_one_explicit_positive_id() {
+        let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
+        assert!(matches!(
+            parse_args(&["--pid", "5", "close-pane", "--pane", "7"]).unwrap(),
+            (Some(5), Request::ClosePane { pane: 7 })
+        ));
+        for args in [
+            &["close-pane"][..],
+            &["close-pane", "--pane", "0"],
+            &["close-pane", "--pane", "3", "--pane", "7"],
+            &["--pane", "3", "--pane", "7", "close-pane"],
+            &["--pane", "3", "close-pane", "--pane", "7"],
+            &["close-pane", "--pane", "7", "--activate"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn events_accepts_one_exact_optional_kind() {
+        let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
+        let (_, request) = parse_args(&[
+            "events",
+            "--pane",
+            "7",
+            "--since",
+            "42",
+            "--kind",
+            "bell",
+            "--timeout",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::Events { pane: 7, since: 42, kind: Some(kind), timeout_seconds: 5 }
+                if kind == "bell"
+        ));
+        let (_, unfiltered) = parse_args(&["events", "--pane", "7"]).unwrap();
+        assert!(
+            serde_json::to_value(unfiltered)
+                .unwrap()
+                .get("kind")
+                .is_none()
+        );
+        for args in [
+            &["events", "--pane", "7", "--kind"][..],
+            &["events", "--pane", "7", "--kind", ""],
+            &["events", "--pane", "7", "--kind", "bell", "--kind", "sound"],
+            &["wait-for-text", "--pane", "7", "--kind", "bell", "ready"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn wait_for_text_resolves_its_optional_screenshot_path() {
+        let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
+        let (_, request) = parse_args(&[
+            "wait-for-text",
+            "--pane",
+            "7",
+            "--screenshot",
+            "match.png",
+            "--",
+            "ready",
+        ])
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::WaitForText { screenshot_path: Some(path), .. }
+                if path == std::path::absolute("match.png").unwrap()
+        ));
+        let (_, text_only) = parse_args(&["wait-for-text", "--pane", "7", "ready"]).unwrap();
+        assert!(
+            serde_json::to_value(text_only)
+                .unwrap()
+                .get("screenshot_path")
+                .is_none()
+        );
+        for args in [
+            &["wait-for-text", "--pane", "7", "ready", "--screenshot"][..],
+            &[
+                "wait-for-text",
+                "--pane",
+                "7",
+                "--screenshot",
+                "a",
+                "--screenshot",
+                "b",
+                "ready",
+            ],
+            &[
+                "find-text",
+                "--pane",
+                "7",
+                "--screenshot",
+                "match.png",
+                "ready",
+            ],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn raw_bytes_and_required_options() {
         let p = |a: &[&str]| parse(a.iter().map(|s| s.to_string()));
-        let (_, Request::SendText { data_base64, .. }) = p(&[
+        let (
+            _,
+            Request::SendText {
+                data_base64,
+                connection_generation,
+                ..
+            },
+        ) = p(&[
             "send-text",
             "--pane",
             "3",
             "--no-paste",
+            "--connection-generation",
+            "4",
             "--base64",
             "AAcbW0P/",
         ])
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!()
         };
         assert_eq!(STANDARD.decode(data_base64).unwrap(), b"\0\x07\x1b[C\xff");
+        assert_eq!(connection_generation.unwrap().get(), 4);
+        let (_, unscoped) = p(&["send-text", "--pane", "3", "--no-paste", "hello"]).unwrap();
+        let json = serde_json::to_value(unscoped).unwrap();
+        assert!(json.get("connection_generation").is_none());
         assert!(p(&["send-text", "--pane", "3", "hello"]).is_err());
+        for args in [
+            &[
+                "send-text",
+                "--pane",
+                "3",
+                "--no-paste",
+                "--connection-generation",
+                "0",
+                "hello",
+            ][..],
+            &[
+                "send-text",
+                "--pane",
+                "3",
+                "--no-paste",
+                "--connection-generation",
+                "4",
+                "--connection-generation",
+                "5",
+                "hello",
+            ],
+            &["get-text", "--pane", "3", "--connection-generation", "4"],
+        ] {
+            assert!(p(args).is_err(), "{args:?}");
+        }
         assert!(p(&["get-text"]).is_err());
         assert!(p(&["list", "--file", "missing"]).is_err());
     }

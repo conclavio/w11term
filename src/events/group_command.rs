@@ -115,7 +115,7 @@ impl GroupRun {
         &mut self,
         id: u64,
         label: Option<&str>,
-        output: LiveCommandOutput<'_>,
+        output: &LiveCommandOutput<'_>,
     ) {
         if self
             .started
@@ -281,7 +281,11 @@ mod tests {
             None,
             Some(&CompletedCommand {
                 id: 7,
+                start_token: None,
+                finished_at: finished,
+                timing: Default::default(),
                 command: Some("report".into()),
+                reported_directory: None,
                 exit_code: Some(17),
                 output: Ok(String::new()),
             }),
@@ -303,7 +307,11 @@ mod tests {
     fn group_preview_bounds_lines_and_preserves_utf8() {
         let mut command = CompletedCommand {
             id: 7,
+            start_token: None,
+            finished_at: std::time::Instant::now(),
+            timing: Default::default(),
             command: None,
+            reported_directory: None,
             exit_code: None,
             output: Ok("夜".repeat(PREVIEW_BYTES)),
         };

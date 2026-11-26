@@ -11,12 +11,12 @@ pub(super) struct State {
 
 struct Form {
     id: u64,
-    text: Arc<str>,
+    text: String,
     name: String,
 }
 
 pub enum Action {
-    Begin(Arc<str>),
+    Begin,
     Form(u64, FormAction),
 }
 
@@ -34,12 +34,12 @@ impl State {
         create: impl FnOnce(Entry) -> anyhow::Result<Commands>,
     ) -> Option<Commands> {
         match action {
-            Action::Begin(text) => {
-                if self.form.is_none() && text.as_ref() == current && valid_command_text(&text) {
+            Action::Begin => {
+                if self.can_save(current) {
                     self.next_form += 1;
                     self.form = Some(Form {
                         id: self.next_form,
-                        text,
+                        text: current.into(),
                         name: String::new(),
                     });
                     self.feedback.clear();
@@ -59,7 +59,7 @@ impl State {
                     FormAction::Save if !form.name.trim().is_empty() => {
                         let entry = Entry {
                             name: form.name.clone(),
-                            text: form.text.to_string(),
+                            text: form.text.clone(),
                         };
                         match create(entry) {
                             Ok(commands) => {
@@ -77,14 +77,8 @@ impl State {
         None
     }
 
-    pub(super) fn button(&self, tab: TabId, draft: &str, ctx: &ViewContext<TerminalApp>) -> View {
-        let text: Arc<str> = draft.into();
-        Button::new()
-            .is_enabled(self.form.is_none() && valid_command_text(draft))
-            .on_click(ctx.callback(move |_| {
-                Message::HostGroup(HostAction::SaveCommand(tab, Action::Begin(text.clone())))
-            }))
-            .content("Save as command…")
+    pub(super) fn can_save(&self, draft: &str) -> bool {
+        self.form.is_none() && valid_command_text(draft)
     }
 
     pub(super) fn view(&self, tab: TabId, ctx: &ViewContext<TerminalApp>) -> View {
@@ -109,7 +103,7 @@ impl State {
                 TextBlock::new()
                     .is_text_selection_enabled(true)
                     .text_wrapping(TextWrapping::Wrap)
-                    .text(form.text.as_ref()),
+                    .text(&form.text),
             ),
             saved_commands::name_form(
                 &form.name,
@@ -137,20 +131,12 @@ mod tests {
         })
         .unwrap();
         let mut naming = State::default();
-        naming.update(Action::Begin("old".into()), "changed", create);
+        naming.update(Action::Begin, "", create);
         assert!(naming.form.is_none());
-        naming.update(
-            Action::Begin("original  spacing".into()),
-            "original  spacing",
-            create,
-        );
+        naming.update(Action::Begin, "original  spacing", create);
         let canceled = naming.form.as_ref().unwrap().id;
         naming.update(Action::Form(canceled, FormAction::Cancel), "", create);
-        naming.update(
-            Action::Begin("original  spacing".into()),
-            "original  spacing",
-            create,
-        );
+        naming.update(Action::Begin, "original  spacing", create);
         let active = naming.form.as_ref().unwrap().id;
         naming.update(
             Action::Form(canceled, FormAction::Name("stale".into())),

@@ -179,30 +179,6 @@ fn message(id: TabId, action: Action) -> Message {
     Message::HostGroup(HostAction::Saved(id, super::Action::Definition(action)))
 }
 
-pub(super) fn buttons(
-    id: TabId,
-    selected: Option<&str>,
-    export_busy: bool,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    let export = selected.map_or_else(View::empty, |name| {
-        let name = name.to_owned();
-        Button::new()
-            .is_enabled(!export_busy)
-            .on_click(ctx.callback(move |_| message(id, Action::Export(name.clone()))))
-            .content("Export group definition…")
-    });
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(8.0)
-        .children((
-            export,
-            Button::new()
-                .on_click(ctx.callback(move |_| message(id, Action::Open)))
-                .content("Import group definition…"),
-        ))
-}
-
 impl TerminalApp {
     pub(super) fn handle_group_definition(
         &mut self,

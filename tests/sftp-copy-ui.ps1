@@ -43,12 +43,12 @@ try {
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
     Click 'archive/'
-    $null = Wait-Until 'folders do not offer the regular-file copy action' {
-        $action = Find-Element $copy $button
-        $action -and !$action.Current.IsEnabled
-    }
+    if ((Get-SftpEntryAction $copy -AllowDisabled).Current.IsEnabled) { throw 'A folder offered the regular-file copy action' }
+    $menu = [System.Windows.Automation.ControlType]::MenuItem
+    Invoke-Button (Wait-Until 'Properties for the selected archive folder' { Find-Element ('Properties' + [char]0x2026) $menu })
+    Click 'Close properties'
     Click 'copy-first.bin'
-    Click $copy
+    Invoke-SftpEntryAction $copy
     $null = Wait-Until 'the copy dialog shows the original file and destination editor' {
         (Find-Element 'Remote copy source') -and (Find-Element 'Destination folder' $edit)
     }
@@ -65,10 +65,7 @@ try {
     }
 
     Click ('Find files' + [char]0x2026)
-    $query = Wait-Until 'recursive filename query' {
-        $field = Find-Element 'Filename contains' $edit
-        if ($field -and $field.Current.HasKeyboardFocus) { $field }
-    }
+    $query = Wait-SftpSearchFocus 'recursive filename query'
     $query.GetCurrentPattern($value).SetValue('copy-nested.bin')
     Click 'Search'
     Click "Copy to folder $parent/sub/copy-nested.bin"
@@ -117,10 +114,7 @@ try {
     Click 'Exit selection'
 
     Click ('Find files' + [char]0x2026)
-    $query = Wait-Until 'batch filename query' {
-        $field = Find-Element 'Filename contains' $edit
-        if ($field -and $field.Current.HasKeyboardFocus) { $field }
-    }
+    $query = Wait-SftpSearchFocus 'batch filename query'
     $query.GetCurrentPattern($value).SetValue('scan-copy-')
     Click 'Search'
     $null = Wait-Until 'both search rows are ready' {
@@ -184,14 +178,14 @@ try {
         (Find-Element 'scan-copy-01.bin' $button) -and (Find-Element 'scan-copy-02.bin' $button)
     }
     Click 'scan-copy-01.bin'
-    Click $duplicate
+    Invoke-SftpEntryAction $duplicate
     $name = Wait-Until 'the listing duplicate dialog is open' { Find-Element 'New name' $edit }
     $name.GetCurrentPattern($value).SetValue('scan-copy-02.bin')
     Click 'Duplicate'
     $null = Wait-Until 'duplicate reports an occupied name in the same folder' {
         (Drawer-Status 'sftp-listing-status') -like "*An entry already exists at $parent/scan-copy-02.bin*"
     }
-    Click $duplicate
+    Invoke-SftpEntryAction $duplicate
     $null = Wait-Until 'the listing offers the original default again' {
         $field = Find-Element 'New name' $edit
         $field -and $field.GetCurrentPattern($value).Current.Value -ceq 'scan-copy-01 copy.bin'

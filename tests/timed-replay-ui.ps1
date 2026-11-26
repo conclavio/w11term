@@ -40,6 +40,14 @@ function Geometry {
     }
     return "$($m.cols)x$($m.rows) cells $($m.pixel_width)x$($m.pixel_height) px at $($m.dpi) DPI"
 }
+function Resize-Grid([int]$Cols, [int]$Rows) {
+    $reply = Control @('resize','--pane','1','--cols',"$Cols",'--rows',"$Rows")
+    $grid = Geometry
+    if ($reply.cols -ne $Cols -or $reply.rows -ne $Rows -or $grid -notlike "${Cols}x${Rows} cells *") {
+        throw "Resize to ${Cols}x${Rows} acknowledged a different live grid: $grid"
+    }
+    return $grid
+}
 function Frame-Interval {
     $journal = (Control @('events','--pane','1','--since','0','--timeout','0')).journal
     $titles = @($journal.events | Where-Object { $_.kind -ceq 'title' -and $_.data.title -in 'timed-first','timed-last' })
@@ -52,8 +60,8 @@ function Frame-Interval {
 try {
     Start-Fixture 'gui' @('--profile','palette-ssh','--cols','64','--rows','18')
     Wait-Text 'ready'
-    $null = Control @('resize','--pane','1','--cols','64','--rows','18')
-    $initial = Geometry
+    $null = Resize-Grid 68 19
+    $initial = Resize-Grid 64 18
     $null = Control @('record','--pane','1','--timed',$timed)
     [IO.File]::Delete($gate) # Release the SSH server's unsolicited first frame.
     Wait-Text 'FIRST-SSH-FRAME'
@@ -61,7 +69,7 @@ try {
     # Create a deliberate interval in the recording. Both title events persist in
     # the pane journal, even if the CLI connects after playback has already ended.
     Start-Sleep -Milliseconds 3500
-    $null = Control @('resize','--pane','1','--cols','72','--rows','20')
+    $null = Resize-Grid 72 20
     $red = '/wAA' * 64
     Send-Bytes ("${esc}]2;timed-last" + [char]7 + "${esc}[2;4H${esc}_Ga=T,i=49,f=24,s=8,v=8,c=1,r=1,C=1,q=2;$red${esc}\${esc}[3;1HLAST-SSH-FRAME")
     Wait-Text 'LAST-SSH-FRAME'

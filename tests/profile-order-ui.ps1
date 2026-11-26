@@ -60,6 +60,11 @@ function Wait-SettingsOrder([string]$First, [string]$Second) {
         $up[0].Current.BoundingRectangle.Top -lt $up[1].Current.BoundingRectangle.Top
     }
 }
+function Set-ProfileFilter([string]$Query) {
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    $filter = Wait-Until 'profile filter in Settings' { Find-Element 'Filter profiles' $edit }
+    $filter.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+}
 function Launch-FromMenu([string]$First, [string]$Last, [string]$Choice) {
     Click 'New tab' $button
     $null = Wait-Until "the + menu to display '$First' above '$Last'" {
@@ -94,7 +99,17 @@ for ($launch = 1; $launch -le 2; $launch++) {
             $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')
             Settings
             Wait-SettingsOrder $sshName $localName
-            Click "Move $localName up" $button
+            Set-ProfileFilter "$($ssh.port) $($ssh.user)@$($ssh.host)"
+            $null = Wait-Until 'filter keeps the SSH row and hides the neighboring local profile' {
+                (Find-Element "Move $sshName down" $button) -and
+                    !(Find-Element "Edit local profile $localName" $button)
+            }
+            Click "Move $sshName down" $button
+            $null = Wait-Until 'the filtered move uses the full profile order' {
+                $up = Find-Element "Move $sshName up" $button
+                $up -and $up.Current.IsEnabled
+            }
+            Set-ProfileFilter ''
             Wait-SettingsOrder $localName $sshName
 
             # Keep this row's original action while another writer restores SSH first.
@@ -123,12 +138,30 @@ for ($launch = 1; $launch -le 2; $launch++) {
         }
         Wait-SettingsOrder $localName $sshName
         if ($launch -eq 1) {
-            Launch-FromMenu $localLabel $sshLabel $sshLabel
+            Click "Pin $sshName to New Tab" $button
+            $null = Wait-Until 'pinned state for the SSH profile' {
+                Find-Element "Unpin $sshName from New Tab" $button
+            }
+            Launch-FromMenu $sshLabel 'Other profiles' $sshLabel
             $remote = Active-Pane $sshName
             $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
             foreach ($c in 'ordered-ssh'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
             $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','ordered-ssh')
         } else {
+            $null = Wait-Until 'SSH pin survives restart' {
+                Find-Element "Unpin $sshName from New Tab" $button
+            }
+            Invoke-Button (Get-NativeMenuAction 'New tab' $localLabel -Submenu 'Other profiles')
+            $other = Active-Pane $localName
+            if ($other -eq $startup) { throw 'The Other profiles menu did not start a new local shell' }
+            $null = Control @('wait-for-text','--pane',"$other",'--timeout','15','PS ')
+            $tab = [System.Windows.Automation.ControlType]::TabItem
+            $settingsTab = Wait-Until 'existing Settings tab' { Find-Element 'Settings' $tab }
+            $settingsTab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+            Click "Unpin $sshName from New Tab" $button
+            $null = Wait-Until 'unpinned state for the SSH profile' {
+                Find-Element "Pin $sshName to New Tab" $button
+            }
             Launch-FromMenu $localLabel $sshLabel $localLabel
             $local = Active-Pane $localName
             $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')

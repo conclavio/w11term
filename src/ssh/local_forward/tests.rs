@@ -55,10 +55,12 @@ async fn peer() -> Result<(ConnectionShare, mpsc::UnboundedReceiver<Offer>)> {
             .await?
             .await
     });
-    let (handle, fingerprint) =
-        transport::handshake(&options, None, &mut None, None, client).await?;
+    let (mut handle, verified) =
+        transport::key_exchange(&options, None, None, client, None).await?;
+    let authentication =
+        transport::authenticate(&mut handle, &options, None, &mut Default::default()).await?;
     Ok((
-        ConnectionShare::new(handle, options, None, fingerprint, None),
+        ConnectionShare::new(handle, options, None, verified, authentication, None),
         pending,
     ))
 }
@@ -68,7 +70,7 @@ async fn replacing_one_panes_publication_revokes_its_listeners_and_releases_its_
 {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (link, _offers) = peer().await?;
-        let owner = ShareSlot::default();
+        let owner = ShareSlot::for_pane(1);
         let first = Arc::new(link.clone());
         let first_lifetime = owner.shell_lifetime(&first);
         owner.publish(&first, 10);
@@ -77,8 +79,10 @@ async fn replacing_one_panes_publication_revokes_its_listeners_and_releases_its_
             .collect::<Result<Vec<_>>>()?;
         assert!(LocalForward::start(&owner, 10, 0, 10022).is_err());
         assert!(LocalForward::start(&owner, 11, 0, 10022).is_err());
-        let sibling = ShareSlot::default();
+        let sibling = ShareSlot::for_pane(2);
         sibling.publish(&first, 10);
+        let (_, original, _) = owner.inspect_transport(10).unwrap();
+        assert_eq!(original.pane_ids, [1, 2].into_iter().collect());
         let independent = LocalForward::start(&sibling, 10, 0, 10022)?;
 
         let next = Arc::new(link);
@@ -92,6 +96,9 @@ async fn replacing_one_panes_publication_revokes_its_listeners_and_releases_its_
         drop(first_lifetime);
         assert!(owner.forward_lease(11).is_some());
         assert!(rebound.status().running);
+        let (_, replacement, _) = owner.inspect_transport(11).unwrap();
+        assert_eq!(replacement, original);
+        assert!(owner.inspect_transport(10).is_none());
         anyhow::Ok(())
     })
     .await??;

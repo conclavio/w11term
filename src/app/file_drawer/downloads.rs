@@ -349,8 +349,7 @@ mod tests {
                 ..TransferQueue::default()
             };
             if completed > 0 {
-                queue.record_download(&item);
-                queue.completed_one();
+                queue.settle_item(&item, TransferOutcome::Completed, None);
             }
             let (sender, mut reply) = oneshot::channel();
             sender
@@ -360,7 +359,7 @@ mod tests {
             assert_eq!(outcome, TransferOutcome::Cancelled);
             assert!(status.ends_with(&format!("{completed} of 2 items completed.")));
             assert_eq!(
-                saved,
+                saved.saved,
                 (completed > 0).then(|| SavedDownload::BatchFolder(destination.clone()))
             );
         }

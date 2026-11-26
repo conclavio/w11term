@@ -123,6 +123,7 @@ impl Fixture {
             cwd: Some(cwd.path().into()),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             powershell_integration: false,
         };
@@ -148,6 +149,7 @@ impl Fixture {
                     Some(Event::Connected(_) | Event::Disconnected) => {}
                     Some(Event::HerdrViewer) => panic!("ConPTY supplied an SSH viewer stream"),
                     Some(Event::Reconnecting(_)) => panic!("ConPTY supplied an SSH retry"),
+                    Some(Event::ConnectionProgress(_)) => panic!("ConPTY supplied an SSH step"),
                     Some(Event::ConnectionFailed(_) | Event::ConnectionStopped) => {
                         panic!("ConPTY supplied an SSH exit")
                     }
@@ -275,6 +277,7 @@ async fn missing_executable_returns_a_launch_error_and_releases_endpoints() -> R
         cwd: None,
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         powershell_integration: false,
     };
@@ -296,6 +299,7 @@ async fn failed_local_launch_offers_one_fresh_restart_per_termination() -> Resul
         cwd: None,
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         powershell_integration: false,
     };

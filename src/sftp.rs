@@ -75,6 +75,7 @@ pub use permissions::{PERMISSIONS_OUTCOME_UNKNOWN, PermissionReview};
 
 pub const RENAME_OUTCOME_UNKNOWN: &str = "Rename outcome unknown; refresh to check";
 pub const MOVE_OUTCOME_UNKNOWN: &str = "Move outcome unknown; refresh both folders to check";
+pub const DELETE_OUTCOME_UNKNOWN: &str = "Delete outcome unknown; refresh to check";
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 pub fn normalize_sha256(value: &str) -> Result<String> {
@@ -1184,11 +1185,11 @@ impl Engine {
         Ok(())
     }
 
-    async fn check_search_parent(&self, parent: &str) -> Result<()> {
+    async fn check_entry_parent(&self, parent: &str) -> Result<()> {
         let expected = if parent.is_empty() { "/" } else { parent };
         ensure!(
             self.canonical_remote_path(expected).await? == expected,
-            "The search result's containing folder changed"
+            "The selected entry's containing folder changed"
         );
         Ok(())
     }
@@ -1288,7 +1289,7 @@ impl Engine {
                 .is_some_and(|(target, _)| target == parent),
             "The entry's containing folder changed"
         );
-        self.check_search_parent(parent).await?;
+        self.check_entry_parent(parent).await?;
         let attributes = self.raw.lstat(from).await?.attrs;
         ensure!(
             EntryKind::from_permissions(attributes.permissions) == Some(kind),
@@ -1880,8 +1881,8 @@ impl Engine {
                 if check_parent {
                     let (parent, _) = path
                         .rsplit_once('/')
-                        .context("Missing search result parent")?;
-                    self.check_search_parent(parent).await?;
+                        .context("Missing parent for the selected entry")?;
+                    self.check_entry_parent(parent).await?;
                 }
                 let attrs = self
                     .raw
@@ -1897,7 +1898,7 @@ impl Engine {
                 );
                 // v3 has no conditional unlink. Use exactly one request against
                 // this name; the server enforces directory emptiness for RMDIR.
-                *stage = JobStage::AwaitingStatus("Delete outcome unknown; refresh to check");
+                *stage = JobStage::AwaitingStatus(DELETE_OUTCOME_UNKNOWN);
                 match kind {
                     EntryKind::File | EntryKind::Symlink => self.raw.remove(path).await?,
                     EntryKind::Directory => self.raw.rmdir(path).await?,

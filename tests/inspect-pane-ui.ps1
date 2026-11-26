@@ -6,8 +6,10 @@ $ErrorActionPreference = 'Stop'
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
+$peer = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'
 $button = [System.Windows.Automation.ControlType]::Button
 $esc = [char]27
+$bell = [char]7
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -35,6 +37,32 @@ function Set-RemoteModes([string]$Bytes) {
     $data = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($Bytes))
     $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64',$data)
 }
+function Report-CommandStart([string]$Line) {
+    $encoded = [Uri]::EscapeDataString($Line)
+    Set-RemoteModes "$esc]133;C;cmdline_url=$encoded$bell"
+}
+function Read-RunningOutput([long]$Token) {
+    Control @('get-running-output','--pane',"$remote",'--start-token',"$Token")
+}
+function Assert-StaleOutput([long]$Pane, [long]$Token) {
+    $reply = & $Cli --pid $app.Id get-running-output --pane "$Pane" --start-token "$Token" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $reply.ok -or $reply.error -notmatch 'no longer running') {
+        throw "Expected stale command output to be rejected in pane ${Pane}: $($reply | ConvertTo-Json -Compress)"
+    }
+}
+function Assert-InterruptRejected([long]$Pane, [long]$Token, [string]$Reason) {
+    $reply = & $Cli --pid $app.Id interrupt-command --pane "$Pane" --start-token "$Token" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $reply.ok -or $reply.error -notlike "*$Reason*") {
+        throw "Expected interrupt to be rejected in pane ${Pane}: $($reply | ConvertTo-Json -Compress)"
+    }
+}
+function Count-PeerInterrupts {
+    $count = 0
+    foreach ($byte in (Read-PeerTrace $wire)) {
+        if ($byte -eq 3) { $count++ }
+    }
+    return $count
+}
 function Type-Line([string]$Line) {
     foreach ($ch in $Line.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     Press-Key 13
@@ -58,7 +86,16 @@ try {
         $null = [InspectDpi]::ShowWindowAsync($window, 4) # SW_SHOWNOACTIVATE
     }
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
-    $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
+    $remote = Wait-Until 'the SSH pane to appear' { ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id }
+    Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
+    $null = Wait-Until 'inspector and CLI show the SSH step while the server withholds the shell' {
+        $m = Inspect
+        $m.ssh_connection.phase -ceq 'connecting' -and $m.ssh_progress.step -ceq 'requesting-terminal' -and
+            $m.ssh_progress.host -ceq $peer.host -and $m.ssh_progress.port -eq $peer.port -and
+            !$m.ssh -and !$m.ssh_transport -and (Find-Element 'SSH connection   Connecting') -and (Find-Element 'Requesting PTY and shell')
+    }
+    $hold = [IO.File]::ReadAllText((Join-Path $State 'hold-shell-request'))
+    [IO.File]::Delete($hold)
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
     $null = Wait-Until 'default SSH parser modes' { Is-Default (Inspect) }
     $initial = Wait-Until 'measured geometry matching the live pane list and window DPI' {
@@ -70,8 +107,31 @@ try {
             $m.cols -eq $observed.list.cols -and $m.rows -eq $observed.list.rows -and $m.cols -gt 0 -and $m.rows -gt 0 -and
             $m.pixel_width -gt $m.cols -and $m.pixel_height -gt $m.rows -and $m.dpi -gt 0 -and $m.dpi -eq $observed.window_dpi) { $m }
     }
-    Invoke-Button (Wait-Until 'menu' { Find-Element 'Tab menu' $button })
-    Invoke-Button (Wait-Until 'open inspector' { Find-Element 'Terminal inspector: Off' })
+    $null = Wait-Until 'the connected inspector replaces progress with the verified state' {
+        $m = Inspect
+        $m.ssh_connection.phase -ceq 'connected' -and !$m.ssh_progress -and (Find-Element 'SSH connection   Connected')
+    }
+    Set-NativeExpansion 'Verified SSH route' $true
+    $null = Wait-Until 'the verified SSH key and destination match the control reply' {
+        $route = (Inspect).ssh
+        $destination = $route.destination
+        $algorithms = $destination.initial_algorithms
+        $strictKex = if ($algorithms.strict_key_exchange) { 'On' } else { 'Off' }
+        $destination.host -ceq $peer.host -and $destination.user -ceq $peer.user -and
+            $destination.port -eq $peer.port -and $destination.key_fingerprint -ceq $peer.host_key -and
+            $destination.authentication.method -ceq 'none' -and !$destination.authentication.key_fingerprint -and
+            $algorithms.host_key -ceq 'ssh-ed25519' -and $algorithms.cipher -and $algorithms.key_exchange -and
+            $algorithms.strict_key_exchange -is [bool] -and
+            @($route.jump_hosts).Count -eq 0 -and
+            (Find-Element "Destination   $($peer.user)@$($peer.host):$($peer.port)") -and
+            (Find-Element "Host key   $($peer.host_key)") -and
+            (Find-Element 'Authentication   None') -and
+            (Find-Element "Key exchange   $($algorithms.key_exchange)") -and
+            (Find-Element "Host-key algorithm   ssh-ed25519") -and
+            (Find-Element "Cipher   $($algorithms.cipher)") -and
+            (Find-Element "Strict key exchange   $strictKex")
+    }
+    Set-NativeExpansion 'Verified SSH route' $false
     $null = Wait-Until 'inspector geometry and resize mode match the CLI' {
         $m = Inspect
         $area = "Text area   $($m.pixel_width) $([char]0xd7) $($m.pixel_height) px at $($m.dpi) DPI"
@@ -85,12 +145,54 @@ try {
     }
     Set-RemoteModes "$esc[?2048l"
     $null = Wait-Until 'inspector observes resize reporting disabled' { Find-Element 'In-band resize   Off' }
+    if ((Inspect).running_command) { throw 'A shell without a command start reported a running command' }
+    $folder = 'file://127.0.0.1/build%20work'
+    Set-RemoteModes "$esc]7;$folder$bell"
+    Report-CommandStart 'compile fixture'
+    $running = Wait-Until 'native and CLI inspector show the started command and directory' {
+        $r = (Inspect).running_command
+        if ($r.id -gt 0 -and $r.start_token -gt 0 -and $r.command -ceq 'compile fixture' -and
+            $r.reported_directory -ceq $folder -and $r.started_unix_ms -gt 0 -and $r.elapsed_ms -ge 0 -and
+            (Find-Element 'Running command   compile fixture') -and (Find-Element "Starting directory   $folder")) { $r }
+    }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    $null = Wait-Until 'elapsed time advances without further shell output' {
+        $m = (Inspect).running_command
+        $m.elapsed_ms -ge 1000 -and $m.started_unix_ms -eq $running.started_unix_ms -and
+            ($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
+                Where-Object { $_.Current.Name -match '^Elapsed   [1-9][0-9]* s$' } | Select-Object -First 1)
+    }
+    Set-RemoteModes "$esc]7;file://127.0.0.1/after$bell$esc[?1049h"
+    $null = Wait-Until 'alternate screen keeps the outer command and its starting directory' {
+        $m = Inspect
+        $m.alternate_screen -and $m.running_command.id -eq $running.id -and
+            $m.running_command.reported_directory -ceq $folder -and (Find-Element 'Running command   compile fixture')
+    }
+    $alternate = Read-RunningOutput $running.start_token
+    if ($alternate.state -cne 'alternate-screen' -or $alternate.PSObject.Properties['text']) {
+        throw 'Running output exposed alternate-screen text'
+    }
+    Set-RemoteModes "$esc[?1049l$esc]133;D;17$bell"
+    $null = Wait-Until 'finish clears the readout and retains the same command identity' {
+        $m = Inspect
+        $list = Control @('list-commands','--pane',"$remote")
+        !$m.running_command -and !(Find-Element 'Running command   compile fixture') -and
+            $list.commands[0].id -eq $running.id -and $list.commands[0].exit_code -eq 17 -and
+            $list.commands[0].started_unix_ms -eq $running.started_unix_ms
+    }
+    Assert-StaleOutput $remote $running.start_token
     Invoke-Button (Wait-Until 'close inspector' { Find-Element 'Close terminal inspector' $button })
     $null = Wait-Until 'GUI inspection closed before inspecting the hidden tab' { !(Find-Element 'Close terminal inspector') }
 
     $localPane = (Control @('open','--profile','Palette PowerShell','--activate')).pane
     Wait-Focus $localPane
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','20','PS ')
+    $localInspect = Control @('inspect','--pane',"$localPane")
+    if ($localInspect.ssh -or $localInspect.ssh_transport -or $localInspect.ssh_progress -or $localInspect.ssh_connection) {
+        throw 'PowerShell reported SSH diagnostics'
+    }
     Type-Line '$inspectPid = $PID; "local-inspect-" + "ready"'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-ready')
     $before = (Control @('get-text','--pane',"$remote")).text
@@ -114,9 +216,239 @@ try {
     if ($sessions.Count -ne 2 -or ($sessions | Where-Object id -eq $remote).visible -or ($sessions | Where-Object active).id -ne $localPane) {
         throw 'Inspect changed the active pane, tab visibility, or open sessions'
     }
+    $cursor = (Control @('events','--pane',"$remote")).journal.next
+    Set-RemoteModes "$esc]133;C;cmdline_url=quick%20fixture$bell$esc]133;D;3$bell"
+    $starts = (Control @('events','--pane',"$remote",'--since',"$cursor",'--kind','command-started','--timeout','5')).journal
+    $started = $starts.events[0].data
+    if ($starts.lost -or $starts.events.Count -ne 1 -or $started.id -lt 1 -or
+        $started.connection_generation -ne $initial.connection_generation -or
+        $started.start_token -le 0 -or $started.started_unix_ms -le 0 -or @($started.PSObject.Properties).Count -ne 4) {
+        throw "Unexpected metadata for quick command start: $($starts | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    $record = Control @('wait-command','--pane',"$remote",'--after-id',"$($started.id - 1)",
+        '--connection-generation',"$($started.connection_generation)",'--command','quick fixture','--timeout','5')
+    if ($record.id -ne $started.id -or $record.started_unix_ms -ne $started.started_unix_ms -or
+        $record.exit_code -ne 3 -or (Inspect).running_command) {
+        throw "The quick command's start event did not match its completed capture"
+    }
+    $exact = & $Cli --pid $app.Id wait-command --pane "$remote" --start-token "$($started.start_token)" --require-success --timeout 5 |
+        ConvertFrom-Json
+    if ($LASTEXITCODE -ne 2 -or !$exact.ok -or $exact.result.id -ne $record.id -or
+        $exact.result.start_token -ne $started.start_token -or $exact.result.exit_code -ne 3) {
+        throw "The exact wait lost the completed failure or its exit status"
+    }
+    Report-CommandStart 'exact pending'
+    $pending = Wait-Until 'inspect returns the live token for exact completion' {
+        $r = (Inspect).running_command
+        if ($r.command -ceq 'exact pending') { $r }
+    }
+    $exactLog = Join-Path $State 'exact-completion.json'
+    $capturePath = Join-Path $State 'exact command output.txt'
+    $argsForWait = @('--pid',"$($app.Id)",'wait-command','--pane',"$remote",
+        '--start-token',"$($pending.start_token)",'--timeout','7','--require-success',
+        '--output-file',('"' + $capturePath + '"'))
+    $waiter = Start-Process -FilePath $Cli -ArgumentList $argsForWait -WindowStyle Hidden -PassThru -RedirectStandardOutput $exactLog
+    try {
+        if ($waiter.HasExited) { throw 'The exact command wait exited before the shell completed' }
+        Set-RemoteModes "saved-exact-output$esc]133;D;0$bell"
+        if (!$waiter.WaitForExit(9000)) { throw 'The exact command wait did not settle' }
+        $reply = [IO.File]::ReadAllText($exactLog) | ConvertFrom-Json
+        if (!$reply.ok -or $reply.result.id -ne $pending.id -or $reply.result.start_token -ne $pending.start_token -or
+            $reply.result.exit_code -ne 0 -or $reply.result.output -ne $null -or $reply.result.output_file.path -ne $capturePath -or
+            [IO.File]::ReadAllText($capturePath) -cne 'saved-exact-output') {
+            throw "The exact wait did not save its command output: $($reply | ConvertTo-Json -Depth 4 -Compress)"
+        }
+    } finally {
+        if (!$waiter.HasExited) { $waiter.Kill(); $waiter.WaitForExit() }
+        $waiter.Dispose()
+    }
+    Wait-Focus $localPane
     Type-Line 'if ($inspectPid -eq $PID) { "local-inspect-" + "still-live" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-still-live')
     if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains('local-inspect')) { throw 'PowerShell input landed in SSH' }
+    $cursor = (Control @('events','--pane',"$remote")).journal.next
+    Report-CommandStart 'interrupted fixture'
+    Set-RemoteModes "original-preview`r`n"
+    $first = ((Control @('events','--pane',"$remote",'--since',"$cursor",'--kind','command-started','--timeout','5')).journal.events)[0].data
+    $null = Wait-Until 'a command-started token reads the background shell output' {
+        $sample = Read-RunningOutput $first.start_token
+        $sample.pane -eq $remote -and $sample.id -eq $first.id -and $sample.start_token -eq $first.start_token -and
+            $sample.connection_generation -eq $first.connection_generation -and $sample.state -ceq 'ready' -and
+            $sample.earlier_omitted -eq $false -and $sample.text -clike '*original-preview*'
+    }
+    $match = Control @('wait-running-output','--pane',"$remote",'--start-token',"$($first.start_token)",
+        '--regex','--match-case','--timeout','5','^original-preview$')
+    if ($match.pane -ne $remote -or $match.id -ne $first.id -or $match.text -cne 'original-preview' -or
+        $match.start_token -ne $first.start_token -or $match.connection_generation -ne $first.connection_generation) {
+        throw "The CLI did not match the original command's retained output"
+    }
+    $waitLog = Join-Path $State 'running-output-wait.json'
+    $waitArgs = @('--pid',"$($app.Id)",'wait-running-output','--pane',"$remote",'--start-token',"$($first.start_token)",
+        '--regex','--timeout','8','^later-ready$')
+    $waiter = Start-Process -FilePath $Cli -ArgumentList $waitArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput $waitLog
+    try {
+        if ($waiter.HasExited) { throw 'The output waiter completed before the new line' }
+        Set-RemoteModes "later-ready`r`n"
+        if (!$waiter.WaitForExit(10000)) { throw 'The output waiter did not finish after the new line' }
+        $reply = [IO.File]::ReadAllText($waitLog) | ConvertFrom-Json
+        if (!$reply.ok -or $reply.result.text -cne 'later-ready' -or $reply.result.start_token -ne $first.start_token) {
+            throw "Unexpected live wait result: $($reply | ConvertTo-Json -Depth 4 -Compress)"
+        }
+    } finally {
+        if (!$waiter.HasExited) { $waiter.Kill(); $waiter.WaitForExit() }
+        $waiter.Dispose()
+    }
+    Assert-StaleOutput $localPane $first.start_token
+    Report-CommandStart 'interrupted fixture'
+    Set-RemoteModes 'replacement-preview'
+    $replacement = Wait-Until 'inspect reports a fresh token even when the history ID is reused' {
+        $r = (Inspect).running_command
+        if ($r.id -eq $first.id -and $r.start_token -gt 0 -and $r.start_token -ne $first.start_token) { $r }
+    }
+    Assert-StaleOutput $remote $first.start_token
+    $staleWait = & $Cli --pid $app.Id wait-running-output --pane "$remote" --start-token "$($first.start_token)" --timeout 5 'replacement-preview' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $staleWait.ok -or $staleWait.error -notmatch 'no longer running') {
+        throw 'An output wait accepted a replaced command token'
+    }
+    $staleCompletion = & $Cli --pid $app.Id wait-command --pane "$remote" --start-token "$($first.start_token)" --timeout 5 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $staleCompletion.ok -or $staleCompletion.error -notmatch 'no longer running or retained') {
+        throw 'A completion wait accepted a replaced command token'
+    }
+    $null = Wait-Until 'the replacement token reads only its own output' {
+        $sample = Read-RunningOutput $replacement.start_token
+        $sample.state -ceq 'ready' -and $sample.text -clike '*replacement-preview*' -and
+            $sample.text -cnotlike '*original-preview*'
+    }
+    $beforeInterrupt = Count-PeerInterrupts
+    Assert-InterruptRejected $remote $first.start_token 'no longer running'
+    Assert-InterruptRejected $localPane $replacement.start_token 'no longer running'
+    Assert-InterruptRejected $remote $started.start_token 'no longer running'
+    $ack = Control @('interrupt-command','--pane',"$remote",'--start-token',"$($replacement.start_token)")
+    if (!$ack.sent -or $ack.pane -ne $remote -or $ack.start_token -ne $replacement.start_token) {
+        throw 'The interrupt receipt did not identify the targeted SSH capture'
+    }
+    $null = Wait-Until 'the peer observes exactly one Ctrl+C from the verified command' {
+        (Count-PeerInterrupts) -eq ($beforeInterrupt + 1)
+    }
+    Wait-Focus $localPane
+    if ($foreground -ne $window -and [FixtureMessages]::GetForegroundWindow() -eq $window) { throw 'Running output activated the fixture window' }
+    Invoke-NativeMenuAction 'Tab menu' ('Find running commands' + [char]0x2026)
+    Wait-PickerEditor 'Search running commands' 'the running command picker'
+    $field = Find-Element 'Search running commands' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('INTERRUPTED FIXTURE')
+    $buttons = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
+    $null = Wait-Until 'the running SSH command appears by its reported name' {
+        $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons) |
+            Where-Object { $_.Current.Name.StartsWith('interrupted fixture') -and $_.Current.Name.Contains('palette-ssh') } |
+            Select-Object -First 1
+    }
+    Press-Key 0x79 # F10 reviews the current capture
+    $null = Wait-Until 'a separate review names the source pane' { Find-Element "Send Ctrl+C to pane ${remote}?" }
+    Press-Key 0x1b
+    $null = Wait-Until 'Escape cancels only the review' {
+        !(Find-Element 'Send Ctrl+C' $button) -and (Find-Element 'Search running commands')
+    }
+    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 1)) { throw 'Cancelled review sent Ctrl+C' }
+
+    $interrupt = Wait-Until 'the interrupt action is enabled' {
+        $item = Find-Element 'Interrupt selected command' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    Invoke-Button $interrupt
+    $null = Wait-Until 'the old command can be reviewed' { Find-Element 'Send Ctrl+C' $button }
+    Report-CommandStart 'interrupted fixture'
+    $reviewed = $replacement
+    $replacement = Wait-Until 'the reviewed command is replaced with the same history ID' {
+        $r = (Inspect).running_command
+        if ($r.id -eq $reviewed.id -and $r.start_token -gt 0 -and $r.start_token -ne $reviewed.start_token) { $r }
+    }
+    $null = Wait-Until 'the replaced capture cannot be confirmed' {
+        $item = Find-Element 'Send Ctrl+C' $button
+        $item -and !$item.Current.IsEnabled
+    }
+    Invoke-Button (Wait-Until 'cancel stale review' { Find-Element 'Cancel interrupt' $button })
+    $null = Wait-Until 'the new command can be reviewed' {
+        $item = Find-Element 'Interrupt selected command' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 1)) { throw 'Stale review sent Ctrl+C' }
+
+    Press-Key 0x79
+    Invoke-Button (Wait-Until 'confirm the new capture' {
+        $item = Find-Element 'Send Ctrl+C' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    })
+    $null = Wait-Until 'the GUI acknowledges one additional background write' {
+        (Find-Element "Ctrl+C sent to pane $remote.") -and
+            (Count-PeerInterrupts) -eq ($beforeInterrupt + 2)
+    }
+    Wait-Focus $localPane
+    $null = Wait-Until 'the picker waits for the interrupted command to finish' {
+        Find-Element ("Waiting for completion in pane " + $remote + [char]0x2026)
+    }
+    Set-RemoteModes "gui-interrupt-capture$esc]133;D;130$bell"
+    Set-RemoteModes "`r`n$esc]133;C;cmdline_url=later%20result${bell}other-output$esc]133;D;0$bell"
+    $null = Wait-Until 'the picker shows the exit code of the interrupted capture' {
+        Find-Element "Command in pane $remote finished with exit code 130."
+    }
+    Wait-Focus $localPane
+    Invoke-Button (Wait-Until 'the exact interrupted command output can be opened' {
+        $item = Find-Element 'View interrupted command output' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    })
+    $null = Wait-Until 'the earlier interrupted capture is selected instead of the later command' {
+        (Find-Element ("Selected, interrupted fixture " + [char]0xb7 + " exit 130")) -and
+            (Find-Element 'gui-interrupt-capture') -and
+            (Find-Element ("later result " + [char]0xb7 + " exit 0"))
+    }
+    Invoke-Button (Wait-Until 'return from the interrupted capture to its pane' { Find-Element 'Return to pane' $button })
+    Wait-Focus $remote
+    Report-CommandStart 'interrupted fixture'
+    $replacement = Wait-Until 'the pane has a fresh running capture for the input lock checks' {
+        $r = (Inspect).running_command
+        if ($r.command -ceq 'interrupted fixture' -and $r.start_token -gt 0) { $r }
+    }
+    Run-Palette 'Enable read-only pane input'
+    $null = Wait-Until 'SSH pane input is read-only' {
+        ((Control @('list')).sessions | Where-Object id -eq $remote).read_only
+    }
+    Assert-InterruptRejected $remote $replacement.start_token 'read-only'
+    Run-Palette 'Disable read-only pane input'
+    $null = Wait-Until 'SSH pane input is unlocked' {
+        !((Control @('list')).sessions | Where-Object id -eq $remote).read_only
+    }
+    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 2)) {
+        throw 'An invalid target wrote Ctrl+C to the peer'
+    }
+    $dpiScale = [InspectDpi]::WindowDpi($window) / 96.0
+    $null = Wait-Until 'New tab and More keep their full width with the History tab open' {
+        $newTab = Find-Element 'New tab' $button -Visible
+        $more = Find-Element 'Tab menu' $button -Visible
+        $caption = Find-Element 'Minimize' $button -Visible
+        if ($newTab -and $more -and $caption) {
+            $newBounds = $newTab.Current.BoundingRectangle
+            $moreBounds = $more.Current.BoundingRectangle
+            $newBounds.Width -ge (35.0 * $dpiScale) -and $moreBounds.Width -ge (35.0 * $dpiScale) -and
+                $newBounds.Right -le ($moreBounds.Left + 1) -and
+                $moreBounds.Right -le ($caption.Current.BoundingRectangle.Left + 1)
+        }
+    }
+    Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
+    $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
+    $null = Wait-Until 'the unfinished command is visible before disconnect' {
+        (Inspect).running_command.command -ceq 'interrupted fixture' -and (Find-Element 'Running command   interrupted fixture')
+    }
+    Set-RemoteModes ([string][char]4)
+    $null = Wait-Until 'a lost SSH transport retires the verified route and shows the failure' {
+        $m = Inspect
+        (Find-Element 'Close terminal inspector' $button) -and
+            !(Find-Element 'Verified SSH route') -and !(Find-Element 'Running command   interrupted fixture') -and
+            !$m.ssh -and !$m.ssh_transport -and !$m.ssh_progress -and !$m.running_command -and
+            $m.ssh_connection.phase -ceq 'failed' -and $m.ssh_connection.reason -and
+            (Find-Element 'SSH connection   Failed') -and (Find-Element $m.ssh_connection.reason)
+    }
+    Assert-StaleOutput $remote $replacement.start_token
 } catch {
     $failure = $_.Exception.Message
     try {
@@ -127,14 +459,20 @@ try {
         $text = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
         $observed.inspector_rows = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$text) |
-            ForEach-Object { $_.Current.Name } | Where-Object { $_ -like 'Text area *' -or $_ -like 'In-band resize *' })
+            ForEach-Object { $_.Current.Name } | Where-Object {
+                $_ -like 'Text area *' -or $_ -like 'In-band resize *' -or $_ -like '*SSH*' -or
+                $_ -like '*Ctrl+C*' -or $_ -like '*interrupt*'
+            })
+        $observed.peer_interrupts = Count-PeerInterrupts
+        $observed.title_controls = @(
+            foreach ($name in 'New tab','Tab menu','Terminal tools','Command palette','Pane layout','Attention inbox, 0 unread','Minimize','Maximize','Close') {
+                $item = Find-Element $name
+                if ($item) { "$name = $($item.Current.BoundingRectangle) (offscreen=$($item.Current.IsOffscreen))" }
+            }
+        )
     } catch { $observed.uia_error = $_.Exception.Message }
     throw "$failure. Last pane observations: $($observed | ConvertTo-Json -Compress -Depth 5)"
 } finally {
     $wire.Dispose()
-    if (!$app.HasExited) {
-        $null = $app.CloseMainWindow()
-        if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
-    }
-    $app.Dispose()
+    Close-FixtureApp $app
 }

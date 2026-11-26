@@ -34,7 +34,7 @@ function Enter-Folder([string]$Label) {
     Click 'Open folder'
 }
 function Bookmark-Panel {
-    Click $bookmarks
+    Invoke-SftpFolderAction $bookmarks
     $null = Wait-Until 'bookmark panel' { Find-Element 'Back to files' $button }
 }
 function Assert-NoBookmark {

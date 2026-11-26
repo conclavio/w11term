@@ -387,7 +387,11 @@ mod tests {
             (pane == 7).then(|| {
                 Arc::new(CompletedCommand {
                     id: link.id,
+                    start_token: None,
+                    finished_at: std::time::Instant::now(),
+                    timing: Default::default(),
                     command: Some("show".into()),
+                    reported_directory: None,
                     exit_code: Some(17),
                     output: Ok("full output\r\nsecond line".into()),
                 })

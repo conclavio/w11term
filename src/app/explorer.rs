@@ -122,6 +122,13 @@ fn check_saved_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn open_location(location: Location, context: &ComponentContext<TerminalApp>) {
+    context.spawn_background_with_rejection(
+        move |_| Message::ExplorerOpened(location.open().map_err(|error| format!("{error:#}"))),
+        Message::ExplorerOpened(Err("The Explorer request could not start.".into())),
+    );
+}
+
 pub(super) fn reveal_saved_file(path: &Path) -> Result<()> {
     check_saved_path(path)?;
     let metadata = std::fs::symlink_metadata(path)

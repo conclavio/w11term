@@ -56,12 +56,55 @@ try {
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','command-started')
     $since = (Control @('events','--pane',"$remote",'--since','0','--timeout','0')).journal.next
-    Run-Palette $arm
     Run-Palette "New tab with Palette PowerShell $dot Local"
     $local = Wait-Until 'new PowerShell pane' { ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id }
     Wait-Focus $local
     $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')
     $shellPid = Read-ActiveShellPid 'shell-before'
+
+    Run-Palette ('Find running commands' + [char]0x2026)
+    Wait-PickerEditor 'Search running commands' 'the background SSH command picker'
+    $field = Find-Element 'Search running commands' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('build')
+    $preview = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'recent-command-output')
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $null = Wait-Until 'output preview action' { Find-Element 'Show recent command output' }
+    Press-Key 0x78 # F9 opens the running output preview
+    $null = Wait-Until 'preview is open' { Find-Element 'Hide recent command output' }
+    try {
+        $null = Wait-Until 'recent SSH command output appears from the background pane' {
+            $text = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $preview)
+            $text -and ($text.Current.Name -split '\r?\n') -ccontains 'command-started'
+        }
+    } catch {
+        $visible = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+            ForEach-Object { "$($_.Current.AutomationId)=$($_.Current.Name)" } | Select-Object -First 45
+        throw "$_ Controls: $($visible -join ', ')"
+    }
+    Send-PeerOutput 'preview-update'
+    $null = Wait-Until 'new output appears in the same preview without changing panes' {
+        $text = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $preview)
+        if ($text) {
+            $lines = $text.Current.Name -split '\r?\n'
+            $lines -ccontains 'command-started' -and $lines[-1] -ceq 'preview-update'
+        }
+    }
+    Wait-Focus $local
+    Invoke-Button (Wait-Until 'hide the running output preview' { Find-Element 'Hide recent command output' })
+    $null = Wait-Until 'closing the preview removes the output text' {
+        !$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $preview)
+    }
+    $armSelected = 'Notify when selected command finishes'
+    $cancelSelected = 'Cancel selected command notification'
+    Invoke-Button (Wait-Until 'arm the selected SSH command' { Find-Element $armSelected })
+    Invoke-Button (Wait-Until 'cancel the selected SSH command notification' { Find-Element $cancelSelected })
+    $null = Wait-Until 'can rearm the same SSH command' { Find-Element $armSelected }
+    Press-Key 0x77 # F8 arms the highlighted command
+    $null = Wait-Until 'the SSH notification is armed again' { Find-Element $cancelSelected }
+    Press-Key 0x1b
+    $null = Wait-Until 'close the notification picker' { !(Find-Element 'Search running commands') }
+    Wait-Focus $local
 
     Send-PeerOutput 'first-complete'
     $null = Wait-Until 'completion badge while PowerShell is active' { Find-Element 'Attention inbox, 1 unread' }

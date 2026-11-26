@@ -1,22 +1,39 @@
-use super::SESSION_SETUP_TIMEOUT;
 use super::durability::{LifecycleError, Program};
 use super::game_resume;
+use super::negotiation::{InitialSshAlgorithms, VerifiedHandshake};
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
+use super::{
+    AdditionalSshAuthentication, ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT,
+    SshKeySource, VerifiedSshAuthentication, agent,
+};
 use crate::{
-    events::{AttemptGuard, Events, SshAttemptOutcome},
-    options::{Authentication, SshOptions},
+    events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
+    options::{AgentFingerprint, AgentPipe, Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
 };
 use anyhow::{Context, Result, ensure};
 use russh::{
-    client,
-    keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
+    AgentAuthError, client,
+    keys::{
+        Certificate, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate,
+        ssh_key::{Kdf, certificate::CertType},
+    },
 };
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{mpsc, oneshot};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 use wezterm_term::TerminalSize;
 use zeroize::Zeroizing;
+
+mod handshake_deadline;
+
+const WORKSPACE_COMMAND_INTERRUPTED: &str =
+    "Workspace command interrupted; reopen the workspace to run it again";
 
 #[derive(Debug)]
 pub enum Event {
@@ -26,6 +43,7 @@ pub enum Event {
     Status(String),
     SessionListUpdated(String),
     Connected(u64),
+    ConnectionProgress(Arc<ConnectionProgress>),
     /// A retry has been scheduled and supersedes the previous transport.
     Reconnecting(u32),
     /// Final SSH failure from the transport launcher.
@@ -44,6 +62,71 @@ impl std::fmt::Display for Permanent {
 impl std::error::Error for Permanent {}
 fn stop(message: impl Into<String>) -> anyhow::Error {
     Permanent(message.into()).into()
+}
+
+async fn wait_for_retry_deadline(deadline: Option<Instant>, ready: Option<&OnceLock<Instant>>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+        if ready.is_none_or(|ready| ready.get().is_none()) {
+            return;
+        }
+    }
+    std::future::pending().await
+}
+
+fn ceil_seconds(duration: Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn headless_encrypted_identity_reports_the_unlock_requirement() {
+        use russh::keys::{Algorithm, ssh_key::LineEnding};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .unwrap()
+            .encrypt(&mut rand::rng(), "fixture passphrase")
+            .unwrap();
+        std::fs::write(
+            file.path(),
+            key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let error = identity_key(file.path(), None, &mut None)
+            .await
+            .unwrap_err();
+        assert!(error.is::<Permanent>());
+        assert!(
+            error
+                .to_string()
+                .contains("requires the GUI or an unlocked SSH agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_reconnect_deadline_leaves_a_ready_shell_running() {
+        let now = Instant::now();
+        let ready = OnceLock::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_retry_deadline(Some(now), Some(&ready)),
+        )
+        .await
+        .unwrap();
+        ready.set(now).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                wait_for_retry_deadline(Some(now), Some(&ready))
+            )
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -95,8 +178,16 @@ pub(crate) struct Handler {
     options: SshOptions,
     prompts: Option<Prompts>,
     known_hosts: std::path::PathBuf,
-    fingerprint: Arc<std::sync::OnceLock<String>>,
+    presented_host: Arc<OnceLock<PresentedHost>>,
+    initial_algorithms: Arc<OnceLock<russh::Names>>,
     durable_peer: Option<String>,
+    handshake_clock: watch::Sender<Option<Instant>>,
+    pause_trust_deadline: bool,
+}
+
+struct PresentedHost {
+    fingerprint: String,
+    certificate: bool,
 }
 
 // OpenSSH uses a host-key alias verbatim, even for a connection on another
@@ -141,6 +232,17 @@ impl Handler {
 }
 impl client::Handler for Handler {
     type Error = anyhow::Error;
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        names: &russh::Names,
+        _: &mut client::Session,
+    ) -> Result<()> {
+        self.initial_algorithms.get_or_init(|| names.clone());
+        Ok(())
+    }
+
     async fn check_server_key(&mut self, presented: &PublicKeyOrCertificate) -> Result<bool> {
         let key = presented.public_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
@@ -152,7 +254,13 @@ impl client::Handler for Handler {
             return Err(stop("SSH host key differs from the saved durable session"));
         }
         ensure!(
-            self.fingerprint.get_or_init(|| fingerprint.clone()) == &fingerprint,
+            self.presented_host
+                .get_or_init(|| PresentedHost {
+                    fingerprint: fingerprint.clone(),
+                    certificate: presented.certificate().is_some(),
+                })
+                .fingerprint
+                == fingerprint,
             Permanent("SSH peer changed its host key during this connection".into())
         );
         match self.known(presented) {
@@ -173,16 +281,32 @@ impl client::Handler for Handler {
                 self.options.host, self.options.port
             ))
         })?;
-        let answer = prompts
-            .ask(Question::HostKey {
-                host: self.options.host.clone(),
-                port: self.options.port,
-                host_key_alias: self.options.host_key_alias.clone(),
-                algorithm: key.algorithm().to_string(),
-                fingerprint,
-            })
-            .await
-            .map_err(|e| stop(e.to_string()))?;
+        let question = Question::HostKey {
+            host: self.options.host.clone(),
+            port: self.options.port,
+            host_key_alias: self.options.host_key_alias.clone(),
+            algorithm: key.algorithm().to_string(),
+            fingerprint,
+        };
+        let remaining = if self.pause_trust_deadline {
+            self.handshake_clock
+                .send_replace(None)
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        } else {
+            None
+        };
+        ensure!(
+            !remaining.is_some_and(|duration| duration.is_zero()),
+            "SSH handshake timed out"
+        );
+        let answer = tokio::select! {
+            answer = prompts.ask(question) => answer.map_err(|e| stop(e.to_string())),
+            () = self.handshake_clock.closed() => Err(stop("SSH handshake ended")),
+        }?;
+        if let Some(remaining) = remaining {
+            self.handshake_clock
+                .send_replace(Some(Instant::now() + remaining));
+        }
         ensure!(
             matches!(answer, Answer::Trust(true)),
             Permanent("host key was not accepted".into())
@@ -201,203 +325,588 @@ impl client::Handler for Handler {
         Ok(true)
     }
 }
-async fn authenticate(
+struct UnlockedIdentity {
+    path: PathBuf,
+    encrypted_digest: [u8; 32],
+    key: Arc<PrivateKey>,
+}
+
+#[derive(Default)]
+pub(super) struct EndpointCredentials {
+    password: Option<Zeroizing<String>>,
+    unlocked_identity: Option<UnlockedIdentity>,
+}
+
+async fn identity_key(
+    identity: &Path,
+    prompts: Option<&Prompts>,
+    cached: &mut Option<UnlockedIdentity>,
+) -> Result<(Arc<PrivateKey>, Option<[u8; 32]>)> {
+    let (key, encrypted_digest) = crate::keys::read_identity(identity).map_err(|error| {
+        *cached = None;
+        stop(format!(
+            "loading identity {}: {error:#}",
+            identity.display()
+        ))
+    })?;
+    let Some(encrypted_digest) = encrypted_digest else {
+        *cached = None;
+        return Ok((Arc::new(key), None));
+    };
+    if let Some(saved) = cached
+        .as_ref()
+        .filter(|saved| saved.path == identity && saved.encrypted_digest == encrypted_digest)
+    {
+        return Ok((saved.key.clone(), None));
+    }
+    *cached = None;
+    // Each pane owns its runtime and joins its worker on close. Keep local
+    // decryption work bounded, including when a key file's KDF is malformed.
+    ensure!(
+        matches!(
+            key.kdf(),
+            Kdf::Bcrypt {
+                rounds: 1..=1024,
+                ..
+            }
+        ),
+        Permanent("OpenSSH key must use 1 to 1024 bcrypt rounds for local unlock".into())
+    );
+    let prompts = prompts.ok_or_else(|| {
+        stop("encrypted OpenSSH identity requires the GUI or an unlocked SSH agent")
+    })?;
+    let key = Arc::new(key);
+    for attempt in 0..3 {
+        let answer = prompts
+            .ask(Question::IdentityPassphrase {
+                identity: identity.to_string_lossy().into_owned(),
+                retry: attempt > 0,
+            })
+            .await
+            .map_err(|error| stop(error.to_string()))?;
+        let Answer::IdentityPassphrase {
+            passphrase,
+            remember,
+        } = answer
+        else {
+            return Err(stop("SSH identity unlock cancelled"));
+        };
+        let encrypted = key.clone();
+        let decrypted =
+            tokio::task::spawn_blocking(move || encrypted.decrypt(passphrase.as_bytes()))
+                .await
+                .map_err(|_| stop("SSH identity unlock worker failed"))?;
+        if let Ok(key) = decrypted {
+            return Ok((Arc::new(key), remember.then_some(encrypted_digest)));
+        }
+    }
+    Err(stop(
+        "could not unlock the OpenSSH private key after three attempts",
+    ))
+}
+
+fn authentication_title(options: &SshOptions, additional: bool) -> String {
+    let action = if additional {
+        "Verify sign-in as"
+    } else {
+        "Sign in as"
+    };
+    format!(
+        "{action} {}@{}:{}",
+        options.user, options.host, options.port
+    )
+}
+
+async fn password_authentication(
+    session: &mut client::Handle<Handler>,
+    options: &SshOptions,
+    prompts: &Prompts,
+    mut saved: Option<&mut Option<Zeroizing<String>>>,
+) -> Result<client::AuthResult> {
+    let additional = saved.is_none();
+    let mut attempt = 1;
+    loop {
+        let candidate = if let Some(value) = saved.as_deref_mut().and_then(Option::take) {
+            value
+        } else {
+            let instructions = match (attempt, additional) {
+                (1, true) => {
+                    "The server accepted your SSH key and requires a password to finish signing in."
+                }
+                (1, false) => {
+                    "Password is kept in memory for reconnection, never saved to the profile."
+                }
+                _ => "Password rejected. Try again.",
+            };
+            let answer = prompts
+                .ask(Question::Authentication {
+                    name: authentication_title(options, additional),
+                    instructions: instructions.into(),
+                    challenges: vec![Challenge {
+                        label: "Password".into(),
+                        echo: false,
+                    }],
+                })
+                .await
+                .map_err(|e| stop(e.to_string()))?;
+            let Answer::Authentication(mut values) = answer else {
+                return Err(stop("authentication cancelled"));
+            };
+            ensure!(
+                values.len() == 1,
+                Permanent("invalid password answer".into())
+            );
+            values.remove(0)
+        };
+
+        let reply = session
+            .authenticate_password(&options.user, candidate.as_str())
+            .await;
+        let closed = session.is_closed();
+        if let Some(saved) = saved.as_deref_mut()
+            && (closed || reply.as_ref().map_or(true, client::AuthResult::success))
+        {
+            *saved = Some(candidate);
+        }
+
+        let result = reply?;
+        if let client::AuthResult::Failure {
+            remaining_methods,
+            partial_success: false,
+        } = &result
+        {
+            ensure!(
+                !closed,
+                "SSH transport closed during password authentication"
+            );
+            if attempt < 3
+                && (!additional || remaining_methods.contains(&russh::MethodKind::Password))
+            {
+                attempt += 1;
+                continue;
+            }
+        }
+        return Ok(result);
+    }
+}
+
+async fn keyboard_interactive_authentication(
+    session: &mut client::Handle<Handler>,
+    options: &SshOptions,
+    prompts: &Prompts,
+    additional: bool,
+) -> Result<client::AuthResult> {
+    use client::KeyboardInteractiveAuthResponse as Response;
+    let mut result = session
+        .authenticate_keyboard_interactive_start(&options.user, None)
+        .await?;
+    let mut rounds = 0;
+    loop {
+        match result {
+            Response::Success => return Ok(client::AuthResult::Success),
+            Response::Failure {
+                remaining_methods,
+                partial_success,
+            } => {
+                ensure!(
+                    !session.is_closed(),
+                    "SSH transport closed during keyboard-interactive authentication"
+                );
+                return Ok(client::AuthResult::Failure {
+                    remaining_methods,
+                    partial_success,
+                });
+            }
+            Response::InfoRequest {
+                name,
+                instructions,
+                prompts: questions,
+            } => {
+                rounds += 1;
+                ensure!(
+                    rounds <= 16 && questions.len() <= 16,
+                    Permanent("too many keyboard-interactive challenges".into())
+                );
+                let count = questions.len();
+                let answer = if count == 0 {
+                    Answer::Authentication(Vec::new())
+                } else {
+                    ensure!(
+                        name.len() <= 1024
+                            && instructions.len() <= 8192
+                            && questions.iter().all(|p| p.prompt.len() <= 4096),
+                        Permanent("authentication challenge exceeds display limits".into())
+                    );
+                    let remote_name = crate::prompts::sanitize_single_line(&name, 256);
+                    let remote_instructions =
+                        crate::prompts::sanitize_multiline(&instructions, 2048, 24);
+                    let attributed_instructions =
+                        match (remote_name.is_empty(), remote_instructions.is_empty()) {
+                            (false, false) => {
+                                format!("Remote server ({remote_name}):\n{remote_instructions}")
+                            }
+                            (false, true) => format!("Remote server: {remote_name}"),
+                            (true, false) => {
+                                format!("Remote server message:\n{remote_instructions}")
+                            }
+                            (true, true) => "Remote server requested authentication.".into(),
+                        };
+                    prompts
+                        .ask(Question::Authentication {
+                            // Keep the dialog title strictly local so remote server
+                            // text cannot spoof or reorder the verified endpoint.
+                            name: authentication_title(options, additional),
+                            instructions: attributed_instructions,
+                            challenges: questions
+                                .into_iter()
+                                .map(|p| Challenge {
+                                    label: crate::prompts::sanitize_single_line(&p.prompt, 256),
+                                    echo: p.echo,
+                                })
+                                .collect(),
+                        })
+                        .await
+                        .map_err(|e| stop(e.to_string()))?
+                };
+                let Answer::Authentication(values) = answer else {
+                    return Err(stop("authentication cancelled"));
+                };
+                ensure!(
+                    values.len() == count,
+                    Permanent("incorrect challenge answer count".into())
+                );
+                result = session
+                    .authenticate_keyboard_interactive_respond(
+                        values.iter().map(|v| v.to_string()).collect(),
+                    )
+                    .await?;
+            }
+        }
+    }
+}
+
+async fn finish_public_key_authentication(
     session: &mut client::Handle<Handler>,
     options: &SshOptions,
     prompts: Option<&Prompts>,
-    password: &mut Option<Zeroizing<String>>,
-) -> Result<()> {
-    match &options.authentication {
-        Authentication::None => ensure!(
-            session.authenticate_none(&options.user).await?.success(),
-            Permanent("server rejected SSH none authentication".into())
-        ),
-        Authentication::Identity { identity } => {
-            let hash = session.best_supported_rsa_hash().await?.flatten();
-            let key = crate::keys::load(identity)
-                .map_err(|e| stop(format!("loading identity {}: {e:#}", identity.display())))?;
+    result: client::AuthResult,
+    rejection: &'static str,
+) -> Result<Vec<AdditionalSshAuthentication>> {
+    use client::AuthResult;
+    use russh::MethodKind::{KeyboardInteractive, Password};
+
+    let mut available = match result {
+        AuthResult::Success => return Ok(Vec::new()),
+        AuthResult::Failure {
+            remaining_methods,
+            partial_success: true,
+        } => remaining_methods,
+        AuthResult::Failure { .. } => {
             ensure!(
-                session
-                    .authenticate_publickey(
-                        &options.user,
-                        PrivateKeyWithHashAlg::new(Arc::new(key), hash)
-                    )
-                    .await?
-                    .success(),
-                Permanent("public-key authentication rejected".into())
+                !session.is_closed(),
+                "SSH transport closed during key authentication"
             );
+            return Err(stop(rejection));
         }
-        Authentication::Agent => {
+    };
+
+    let mut attempted = russh::MethodSet::empty();
+    let mut accepted = Vec::new();
+    let mut rejection = None;
+    loop {
+        let method = [KeyboardInteractive, Password]
+            .into_iter()
+            .find(|method| available.contains(method) && !attempted.contains(method))
+            .ok_or_else(|| stop(rejection.unwrap_or(
+                "SSH key accepted, but the server requires an unsupported additional authentication method",
+            )))?;
+        let prompts = prompts.ok_or_else(|| {
+            stop("SSH key accepted, but additional authentication requires the GUI")
+        })?;
+        attempted.push(method);
+        let (result, completed_method, method_rejection) = if method == KeyboardInteractive {
+            (
+                keyboard_interactive_authentication(session, options, prompts, true).await?,
+                AdditionalSshAuthentication::KeyboardInteractive,
+                "additional keyboard-interactive authentication rejected",
+            )
+        } else {
+            (
+                password_authentication(session, options, prompts, None).await?,
+                AdditionalSshAuthentication::Password,
+                "additional password authentication rejected",
+            )
+        };
+        match result {
+            AuthResult::Success => {
+                accepted.push(completed_method);
+                return Ok(accepted);
+            }
+            AuthResult::Failure {
+                remaining_methods,
+                partial_success,
+            } => {
+                available = remaining_methods;
+                if partial_success {
+                    accepted.push(completed_method);
+                }
+                rejection = (!partial_success).then_some(method_rejection);
+            }
+        }
+    }
+}
+
+fn load_user_certificate(path: &Path) -> Result<Certificate> {
+    let mut cert = russh::keys::load_openssh_certificate(path).map_err(|error| {
+        stop(format!(
+            "reading SSH user certificate {}: {error}",
+            path.display()
+        ))
+    })?;
+    ensure!(
+        cert.cert_type() == CertType::User,
+        Permanent("the SSH certificate must be a user certificate".into())
+    );
+    // The text comment is absent from a certificate advertised by an agent.
+    cert.set_comment("");
+    Ok(cert)
+}
+
+async fn open_authentication_agent(agent_pipe: Option<&AgentPipe>) -> Result<agent::WindowsAgent> {
+    agent::connect(agent_pipe).await.map_err(|error| {
+        stop(format!(
+            "{error:#}. Choose a device key or password if the agent is unavailable."
+        ))
+    })
+}
+
+pub(super) async fn authenticate(
+    session: &mut client::Handle<Handler>,
+    options: &SshOptions,
+    prompts: Option<&Prompts>,
+    credentials: &mut EndpointCredentials,
+) -> Result<VerifiedSshAuthentication> {
+    use VerifiedSshAuthentication as Verified;
+    let authentication = match &options.authentication {
+        Authentication::None => {
+            ensure!(
+                session.authenticate_none(&options.user).await?.success(),
+                Permanent("server rejected SSH none authentication".into())
+            );
+            Verified::None
+        }
+        Authentication::Identity {
+            identity,
+            certificate,
+        } => {
+            let (key, remember) =
+                identity_key(identity, prompts, &mut credentials.unlocked_identity).await?;
+            let (result, certificate_authority_fingerprint, rejection) =
+                if let Some(path) = certificate {
+                    let cert = load_user_certificate(path)?;
+                    ensure!(
+                        cert.public_key() == key.public_key().key_data(),
+                        Permanent("the SSH user certificate does not match the private key".into())
+                    );
+                    let authority = Verified::certificate_authority(&cert);
+                    (
+                        session
+                            .authenticate_openssh_cert(&options.user, key.clone(), cert)
+                            .await?,
+                        Some(authority),
+                        "SSH user certificate authentication rejected",
+                    )
+                } else {
+                    let hash = session.best_supported_rsa_hash().await?.flatten();
+                    (
+                        session
+                            .authenticate_publickey(
+                                &options.user,
+                                PrivateKeyWithHashAlg::new(key.clone(), hash),
+                            )
+                            .await?,
+                        None,
+                        "public-key authentication rejected",
+                    )
+                };
+            let additional_methods =
+                finish_public_key_authentication(session, options, prompts, result, rejection)
+                    .await?;
+            let key_fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+            if let Some(encrypted_digest) = remember {
+                credentials.unlocked_identity = Some(UnlockedIdentity {
+                    path: identity.as_path().to_owned(),
+                    encrypted_digest,
+                    key,
+                });
+            }
+            Verified::PublicKey {
+                source: SshKeySource::File,
+                key_fingerprint,
+                certificate_authority_fingerprint,
+                additional_methods,
+            }
+        }
+        Authentication::AgentCertificate {
+            certificate,
+            agent_fingerprint,
+        } => {
+            let certificate = load_user_certificate(certificate)?;
+            let public = PublicKey::new(certificate.public_key().clone(), "");
+            let actual_fingerprint = AgentFingerprint::for_key(&public);
+            let authority = Verified::certificate_authority(&certificate);
+            ensure!(
+                agent_fingerprint
+                    .as_ref()
+                    .is_none_or(|pinned| *pinned == actual_fingerprint),
+                Permanent("the SSH user certificate does not match the selected agent key".into())
+            );
             let hash = session.best_supported_rsa_hash().await?.flatten();
-            let pipe = std::env::var_os("SSH_AUTH_SOCK")
-                .unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into());
-            let mut agent = russh::keys::agent::client::AgentClient::connect_named_pipe(pipe)
+            let mut agent = open_authentication_agent(options.agent_pipe.as_ref()).await?;
+            let identities = agent.request_identities().await?;
+            let mut signer = agent::CertificateSigner::matching(
+                &mut agent,
+                &identities,
+                &certificate,
+            )
+            .ok_or_else(|| {
+                stop(format!(
+                    "Windows SSH agent does not hold the key for the SSH user certificate ({})",
+                    actual_fingerprint.as_str()
+                ))
+            })?;
+            let result = session
+                .authenticate_certificate_with(&options.user, certificate, hash, &mut signer)
                 .await
-                .map_err(|e| {
-                    stop(format!(
-                        "cannot connect to Windows SSH agent: {e}; choose a device key or password"
-                    ))
+                .map_err(|error| match error {
+                    AgentAuthError::Key(_) => stop(format!(
+                        "Windows SSH agent could not sign for the SSH user certificate: {error}"
+                    )),
+                    _ => error.into(),
                 })?;
-            let mut accepted = false;
-            for identity in agent.request_identities().await? {
-                if session
+            let additional_methods = finish_public_key_authentication(
+                session,
+                options,
+                prompts,
+                result,
+                "the server rejected the SSH user certificate",
+            )
+            .await?;
+            Verified::PublicKey {
+                source: SshKeySource::Agent,
+                key_fingerprint: actual_fingerprint.as_str().to_owned(),
+                certificate_authority_fingerprint: Some(authority),
+                additional_methods,
+            }
+        }
+        Authentication::Agent | Authentication::AgentKey { .. } => {
+            use russh::keys::agent::AgentIdentity;
+
+            let hash = session.best_supported_rsa_hash().await?.flatten();
+            let mut agent = open_authentication_agent(options.agent_pipe.as_ref()).await?;
+            let identities = agent.request_identities().await?;
+            if let Authentication::AgentKey { agent_fingerprint } = &options.authentication {
+                let Some(key) = identities.into_iter().find_map(|identity| match identity {
+                    AgentIdentity::PublicKey { key, .. }
+                        if AgentFingerprint::for_key(&key) == *agent_fingerprint =>
+                    {
+                        Some(key)
+                    }
+                    _ => None,
+                }) else {
+                    return Err(stop(format!(
+                        "Windows SSH agent does not hold the selected key {}",
+                        agent_fingerprint.as_str()
+                    )));
+                };
+                let result = session
+                    .authenticate_publickey_with(&options.user, key, hash, &mut agent)
+                    .await?;
+                let additional_methods = finish_public_key_authentication(
+                    session,
+                    options,
+                    prompts,
+                    result,
+                    "the server rejected the selected SSH agent key",
+                )
+                .await?;
+                return Ok(Verified::PublicKey {
+                    source: SshKeySource::Agent,
+                    key_fingerprint: agent_fingerprint.as_str().to_owned(),
+                    certificate_authority_fingerprint: None,
+                    additional_methods,
+                });
+            }
+            for identity in identities {
+                let result = session
                     .authenticate_publickey_with(
                         &options.user,
                         identity.public_key().into_owned(),
                         hash,
                         &mut agent,
                     )
-                    .await?
-                    .success()
+                    .await?;
+                if session.is_closed()
+                    || !matches!(
+                        result,
+                        client::AuthResult::Failure {
+                            partial_success: false,
+                            ..
+                        }
+                    )
                 {
-                    accepted = true;
-                    break;
+                    let additional_methods = finish_public_key_authentication(
+                        session,
+                        options,
+                        prompts,
+                        result,
+                        "SSH agent supplied no accepted identity",
+                    )
+                    .await?;
+                    return Ok(Verified::PublicKey {
+                        source: SshKeySource::Agent,
+                        key_fingerprint: identity
+                            .public_key()
+                            .fingerprint(HashAlg::Sha256)
+                            .to_string(),
+                        certificate_authority_fingerprint: None,
+                        additional_methods,
+                    });
                 }
             }
-            ensure!(
-                accepted,
-                Permanent("SSH agent supplied no accepted identity".into())
-            );
+            return Err(stop("SSH agent supplied no accepted identity"));
         }
         Authentication::Password => {
             let prompts =
                 prompts.ok_or_else(|| stop("password authentication requires the GUI"))?;
-            let mut accepted = false;
-            for attempt in 0..3 {
-                let candidate = if let Some(value) = password.take() {
-                    value
-                } else {
-                    let answer=prompts.ask(Question::Authentication{name:format!("Sign in as {}@{}:{}",options.user,options.host,options.port),instructions:if attempt==0{"Password is kept in memory for reconnection, never saved to the profile."}else{"Password rejected. Try again."}.into(),challenges:vec![Challenge{label:"Password".into(),echo:false}]}).await.map_err(|e|stop(e.to_string()))?;
-                    let Answer::Authentication(mut values) = answer else {
-                        return Err(stop("authentication cancelled"));
-                    };
-                    ensure!(
-                        values.len() == 1,
-                        Permanent("invalid password answer".into())
-                    );
-                    values.remove(0)
-                };
-                match session
-                    .authenticate_password(&options.user, candidate.as_str())
-                    .await
-                {
-                    Ok(result) if result.success() => {
-                        *password = Some(candidate);
-                        accepted = true;
-                        break;
-                    }
-                    Ok(_) if session.is_closed() => {
-                        *password = Some(candidate);
-                        anyhow::bail!("SSH transport closed during password authentication");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        *password = Some(candidate);
-                        return Err(error.into());
-                    }
-                }
-            }
             ensure!(
-                accepted,
+                password_authentication(session, options, prompts, Some(&mut credentials.password))
+                    .await?
+                    .success(),
                 Permanent("password authentication rejected".into())
             );
+            Verified::Password
         }
         Authentication::KeyboardInteractive => {
-            use client::KeyboardInteractiveAuthResponse as Response;
             let prompts = prompts
                 .ok_or_else(|| stop("keyboard-interactive authentication requires the GUI"))?;
-            let mut result = session
-                .authenticate_keyboard_interactive_start(&options.user, None)
-                .await?;
-            let mut rounds = 0;
-            loop {
-                match result {
-                    Response::Success => break,
-                    Response::Failure { .. } => {
-                        return Err(stop("keyboard-interactive authentication rejected"));
-                    }
-                    Response::InfoRequest {
-                        name,
-                        instructions,
-                        prompts: questions,
-                    } => {
-                        rounds += 1;
-                        ensure!(
-                            rounds <= 16 && questions.len() <= 16,
-                            Permanent("too many keyboard-interactive challenges".into())
-                        );
-                        let count = questions.len();
-                        let answer = if count == 0 {
-                            Answer::Authentication(Vec::new())
-                        } else {
-                            ensure!(
-                                name.len() <= 1024
-                                    && instructions.len() <= 8192
-                                    && questions.iter().all(|p| p.prompt.len() <= 4096),
-                                Permanent("authentication challenge exceeds display limits".into())
-                            );
-                            let remote_name = crate::prompts::sanitize_single_line(&name, 256);
-                            let remote_instructions =
-                                crate::prompts::sanitize_multiline(&instructions, 2048, 24);
-                            let attributed_instructions =
-                                match (remote_name.is_empty(), remote_instructions.is_empty()) {
-                                    (false, false) => format!(
-                                        "Remote server ({remote_name}):\n{remote_instructions}"
-                                    ),
-                                    (false, true) => format!("Remote server: {remote_name}"),
-                                    (true, false) => {
-                                        format!("Remote server message:\n{remote_instructions}")
-                                    }
-                                    (true, true) => {
-                                        "Remote server requested authentication.".into()
-                                    }
-                                };
-                            prompts
-                                .ask(Question::Authentication {
-                                    // Keep the dialog title strictly local so remote server
-                                    // text cannot spoof or reorder the verified endpoint.
-                                    name: format!(
-                                        "Sign in as {}@{}:{}",
-                                        options.user, options.host, options.port
-                                    ),
-                                    instructions: attributed_instructions,
-                                    challenges: questions
-                                        .into_iter()
-                                        .map(|p| Challenge {
-                                            label: crate::prompts::sanitize_single_line(
-                                                &p.prompt, 256,
-                                            ),
-                                            echo: p.echo,
-                                        })
-                                        .collect(),
-                                })
-                                .await
-                                .map_err(|e| stop(e.to_string()))?
-                        };
-                        let Answer::Authentication(values) = answer else {
-                            return Err(stop("authentication cancelled"));
-                        };
-                        ensure!(
-                            values.len() == count,
-                            Permanent("incorrect challenge answer count".into())
-                        );
-                        result = session
-                            .authenticate_keyboard_interactive_respond(
-                                values.iter().map(|v| v.to_string()).collect(),
-                            )
-                            .await?;
-                    }
-                }
-            }
+            ensure!(
+                keyboard_interactive_authentication(session, options, prompts, false)
+                    .await?
+                    .success(),
+                Permanent("keyboard-interactive authentication rejected".into())
+            );
+            Verified::KeyboardInteractive
         }
-    }
-    Ok(())
+    };
+    Ok(authentication)
 }
 async fn connect(
     options: &SshOptions,
     prompts: Option<&Prompts>,
-    passwords: &mut [Option<Zeroizing<String>>],
+    credentials: &mut [EndpointCredentials],
     durable_peer: Option<&str>,
+    output: Option<&mpsc::Sender<Event>>,
 ) -> Result<ConnectionShare> {
     let route = options
         .proxy_jump
@@ -406,17 +915,25 @@ async fn connect(
         .map(SshOptions::from)
         .chain(std::iter::once(options.clone()));
     let mut upstream: Option<ConnectionShare> = None;
-    for (index, (endpoint, password)) in route.zip(passwords).enumerate() {
+    for (index, (endpoint, credentials)) in route.zip(credentials).enumerate() {
         let expected_peer = if index == options.proxy_jump.len() {
             durable_peer
         } else {
             None
         };
         let address = format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port);
-        let (handle, fingerprint) = if let Some(hop) = &upstream {
+        let jump = (index < options.proxy_jump.len()).then_some(index + 1);
+        let report = |step| report_connection_step(output, &endpoint, jump, step);
+        let now = Instant::now();
+        let deadline = endpoint
+            .connect_timeout_seconds
+            .map(|seconds| now + Duration::from_secs(seconds.get().into()));
+        let open_deadline = deadline.unwrap_or_else(|| now + Duration::from_secs(15));
+        let (mut handle, verified) = if let Some(hop) = &upstream {
+            report(ConnectionStep::OpeningJumpChannel).await?;
             let handle = hop.handle();
-            let channel = tokio::time::timeout(
-                Duration::from_secs(15),
+            let channel = tokio::time::timeout_at(
+                open_deadline,
                 handle.channel_open_direct_tcpip(
                     &endpoint.host,
                     u32::from(endpoint.port),
@@ -436,44 +953,72 @@ async fn connect(
                     _ => anyhow::Error::from(error).context(message),
                 }
             })?;
-            handshake(
+            report(ConnectionStep::KeyExchange).await?;
+            key_exchange(
                 &endpoint,
                 prompts,
-                password,
                 expected_peer,
                 channel.into_stream(),
+                deadline,
             )
             .await
         } else {
-            let stream = tokio::time::timeout(
-                Duration::from_secs(15),
+            report(ConnectionStep::OpeningTcp).await?;
+            let stream = tokio::time::timeout_at(
+                open_deadline,
                 tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
             )
             .await
             .with_context(|| format!("SSH TCP connection to {address} timed out"))?
             .with_context(|| format!("connecting to {address}"))?;
             stream.set_nodelay(true)?;
-            handshake(&endpoint, prompts, password, expected_peer, stream).await
+            report(ConnectionStep::KeyExchange).await?;
+            key_exchange(&endpoint, prompts, expected_peer, stream, deadline).await
         }
-        .with_context(|| format!("SSH handshake or authentication for {address}"))?;
+        .with_context(|| format!("SSH handshake for {address}"))?;
+        report(ConnectionStep::Authenticating).await?;
+        let authentication = authenticate(&mut handle, &endpoint, prompts, credentials)
+            .await
+            .with_context(|| format!("SSH authentication for {address}"))?;
         upstream = Some(ConnectionShare::new(
             handle,
             endpoint,
             prompts,
-            fingerprint,
+            verified,
+            authentication,
             upstream,
         ));
     }
     upstream.context("missing SSH destination")
 }
 
-pub(super) async fn handshake(
+async fn report_connection_step(
+    output: Option<&mpsc::Sender<Event>>,
+    endpoint: &SshOptions,
+    jump: Option<usize>,
+    step: ConnectionStep,
+) -> Result<()> {
+    if let Some(output) = output {
+        output
+            .send(Event::ConnectionProgress(Arc::new(ConnectionProgress {
+                step,
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                user: endpoint.user.clone(),
+                jump,
+            })))
+            .await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn key_exchange(
     options: &SshOptions,
     prompts: Option<&Prompts>,
-    password: &mut Option<Zeroizing<String>>,
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-) -> Result<(client::Handle<Handler>, String)> {
+    deadline: Option<Instant>,
+) -> Result<(client::Handle<Handler>, VerifiedHandshake)> {
     let known_hosts = match prompts.and_then(Prompts::known_hosts) {
         Some(path) => std::path::PathBuf::from(path),
         None => {
@@ -501,40 +1046,53 @@ pub(super) async fn handshake(
     let config = Arc::new(client::Config {
         preferred: super::negotiation::preferred(trust_host_ca),
         nodelay: true,
-        keepalive_interval: Some(Duration::from_secs(5)),
-        keepalive_max: 2,
+        keepalive_interval: options.keepalive.interval(),
+        keepalive_max: options.keepalive.max_unanswered.get() as usize,
         ..Default::default()
     });
-    let fingerprint = Arc::new(std::sync::OnceLock::new());
-    let mut session = tokio::time::timeout(
-        Duration::from_secs(300),
-        client::connect_stream(
-            config,
-            stream,
-            Handler {
-                options: options.clone(),
-                prompts: prompts.cloned(),
-                known_hosts,
-                fingerprint: fingerprint.clone(),
-                durable_peer: durable_peer.map(str::to_owned),
-            },
-        ),
-    )
-    .await
-    .context("SSH handshake timed out")??;
-    authenticate(&mut session, options, prompts, password).await?;
+    let presented_host = Arc::new(OnceLock::new());
+    let initial_algorithms = Arc::new(OnceLock::new());
+    let (handshake_clock, mut clock) = watch::channel(Some(
+        deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(300)),
+    ));
+    let (stream, complete) = handshake_deadline::HandshakeStream::new(stream);
+    let connecting = client::connect_stream(
+        config,
+        stream,
+        Handler {
+            options: options.clone(),
+            prompts: prompts.cloned(),
+            known_hosts,
+            presented_host: presented_host.clone(),
+            initial_algorithms: initial_algorithms.clone(),
+            durable_peer: durable_peer.map(str::to_owned),
+            handshake_clock,
+            pause_trust_deadline: deadline.is_some(),
+        },
+    );
+    let session = tokio::select! {
+        biased;
+        result = connecting => result?,
+        () = handshake_deadline::expired(&mut clock) => anyhow::bail!("SSH handshake timed out"),
+    };
+    let _ = complete.send(());
+    let host = presented_host
+        .get()
+        .context("SSH peer did not supply an authenticated host key")?;
     Ok((
         session,
-        fingerprint
-            .get()
-            .context("SSH peer did not supply an authenticated host key")?
-            .clone(),
+        VerifiedHandshake {
+            fingerprint: host.fingerprint.clone(),
+            initial_algorithms: initial_algorithms
+                .get()
+                .map(|names| InitialSshAlgorithms::read(names, host.certificate)),
+        },
     ))
 }
 fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOptions) {
     match input {
         TransportInput::Resize(new) => *size = new,
-        TransportInput::Authenticate(auth) => options.authentication = auth,
+        TransportInput::Authenticate(auth) => options.set_authentication(auth),
         TransportInput::Data(_) | TransportInput::Automatic(_) => {}
         message @ TransportInput::DisconnectShell { .. } => {
             message.reject_input("The SSH shell changed before disconnect.");
@@ -607,12 +1165,22 @@ pub(super) async fn request_terminal(
 async fn connect_shell(
     options: SshOptions,
     prompts: Option<Prompts>,
-    passwords: &mut [Option<Zeroizing<String>>],
+    credentials: &mut [EndpointCredentials],
     source: Option<ConnectionShare>,
     published: ShareSlot,
     durable_peer: Option<String>,
+    output: &mpsc::Sender<Event>,
 ) -> Result<OpenShell> {
+    let opening_session = || {
+        report_connection_step(
+            Some(output),
+            &options,
+            None,
+            ConnectionStep::OpeningSessionChannel,
+        )
+    };
     if let Some(link) = source.filter(|link| link.matches(&options, prompts.as_ref())) {
+        opening_session().await?;
         match link.open_shell().await {
             Ok(channel) => {
                 return Ok(OpenShell {
@@ -632,11 +1200,13 @@ async fn connect_shell(
         connect(
             &options,
             prompts.as_ref(),
-            passwords,
+            credentials,
             durable_peer.as_deref(),
+            Some(output),
         )
         .await?,
     );
+    opening_session().await?;
     let channel = link.open_shell().await?;
     Ok(OpenShell {
         link,
@@ -655,7 +1225,9 @@ pub(crate) async fn run_with_sharing(
     mut sharing: Sharing,
 ) -> Result<()> {
     options.validate_route()?;
-    let passwords = vec![None; options.proxy_jump.len() + 1];
+    let credentials = (0..=options.proxy_jump.len())
+        .map(|_| EndpointCredentials::default())
+        .collect();
     if let Some(startup) = &sharing.startup {
         startup.check_target(&options)?;
     }
@@ -669,7 +1241,7 @@ pub(crate) async fn run_with_sharing(
         prompts,
         events,
         sharing,
-        passwords,
+        credentials,
         generation: 0,
         command_dispatched: false,
         game,
@@ -689,7 +1261,7 @@ pub(super) struct Driver {
     prompts: Option<Prompts>,
     events: Events,
     sharing: Sharing,
-    passwords: Vec<Option<Zeroizing<String>>>,
+    credentials: Vec<EndpointCredentials>,
     generation: u64,
     command_dispatched: bool,
     game: Option<game_resume::Pane>,
@@ -711,7 +1283,16 @@ impl Driver {
         let scan = async {
             let link = match offered {
                 Some(link) => link,
-                None => connect(&options, self.prompts.as_ref(), &mut self.passwords, None).await?,
+                None => {
+                    connect(
+                        &options,
+                        self.prompts.as_ref(),
+                        &mut self.credentials,
+                        None,
+                        None,
+                    )
+                    .await?
+                }
             };
             let entries = if herdr {
                 tokio::time::timeout(
@@ -787,19 +1368,26 @@ impl Driver {
         attempt: &mut PendingAttempt,
     ) -> Result<()> {
         let mut failures = 0u32;
-        let mut dropped_at: Option<tokio::time::Instant> = None;
+        let mut deadline = None;
+        let window = Duration::from_secs(self.options.player.reconnect_window_seconds.get().into());
+        let expired = || {
+            format!(
+                "automatic reconnection stopped after {} seconds",
+                window.as_secs()
+            )
+        };
         loop {
-            let deadline = dropped_at.map(|since| since + Duration::from_secs(300));
             let connected = {
                 let launch_gate = self.sharing.launch_gate.take();
                 let events = &self.events;
                 let connect = connect_shell(
                     self.options.clone(),
                     self.prompts.clone(),
-                    &mut self.passwords,
+                    &mut self.credentials,
                     self.sharing.offered.take(),
                     self.sharing.published.clone(),
                     program.peer_fingerprint(),
+                    &self.output,
                 );
                 let future = async {
                     // The slot covers login and opening the SSH channel. Active
@@ -822,7 +1410,7 @@ impl Driver {
                     tokio::select! {
                         biased;
                         _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
-                        _ = tokio::time::sleep_until(deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))), if deadline.is_some() => anyhow::bail!("automatic reconnection stopped after 300 seconds"),
+                        _ = wait_for_retry_deadline(deadline, None) => anyhow::bail!("{}", expired()),
                         result = &mut future => break result,
                         message = self.input.recv() => match message {
                             Some(message) => offline(message, &mut self.size, &mut self.options),
@@ -834,21 +1422,33 @@ impl Driver {
             let result = match connected {
                 Ok(session) => {
                     self.generation = self.sharing.next_generation();
-                    let started = tokio::time::Instant::now();
-                    let result = tokio::select! {
+                    let ready = OnceLock::new();
+                    let completed = tokio::select! {
                         biased;
                         _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => {
                             return Err(AttemptStopped.into());
                         }
-                        result = run_channel(session, self, program, &mut attempt.guard) => result,
+                        _ = wait_for_retry_deadline(deadline, Some(&ready)) => None,
+                        result = run_channel(session, self, program, &mut attempt.guard, &ready) => Some(result),
+                    };
+                    let Some(result) = completed else {
+                        let error = anyhow::anyhow!("{}", expired());
+                        return Err(if self.command_dispatched {
+                            error.context(WORKSPACE_COMMAND_INTERRUPTED)
+                        } else {
+                            error
+                        });
                     };
                     self.output.send(Event::Disconnected).await?;
                     if let Some(game) = &mut self.game {
                         game.disconnected();
                     }
-                    if started.elapsed() > Duration::from_secs(30) {
+                    if ready
+                        .get()
+                        .is_some_and(|since| since.elapsed() > Duration::from_secs(30))
+                    {
                         failures = 0;
-                        dropped_at = None;
+                        deadline = None;
                     }
                     result
                 }
@@ -862,9 +1462,7 @@ impl Driver {
                 return Err(error);
             }
             if self.command_dispatched && error.downcast_ref::<Permanent>().is_none() {
-                return Err(error.context(
-                    "Workspace command interrupted; reopen the workspace to run it again",
-                ));
+                return Err(error.context(WORKSPACE_COMMAND_INTERRUPTED));
             }
             if program.herdr_reference().is_some()
                 || matches!(program, Program::End(_))
@@ -874,42 +1472,68 @@ impl Driver {
             {
                 return Err(error);
             }
-            let since = *dropped_at.get_or_insert_with(tokio::time::Instant::now);
-            if since.elapsed() >= Duration::from_secs(300) {
-                return Err(error.context("automatic reconnection stopped after 300 seconds"));
+            let now = Instant::now();
+            let expires_at = *deadline.get_or_insert(now + window);
+            if expires_at <= now {
+                return Err(error.context(expired()));
             }
             failures += 1;
             if can_stop && attempt.guard.is_none() {
                 attempt.begin(&self.events);
             }
             program.reconnecting(&format!("Link lost: {error:#}"));
-            let delay = Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
+            let next_attempt =
+                now + Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
+            let will_retry = next_attempt < expires_at;
+            let wake_at = next_attempt.min(expires_at);
+            let delay_seconds = ceil_seconds(wake_at - now);
             self.events.push(
                 "reconnecting",
-                serde_json::json!({"attempt":failures,"delay_seconds":delay.as_secs()}),
+                serde_json::json!({
+                    "attempt": failures,
+                    "delay_seconds": delay_seconds,
+                    "retry_remaining_seconds": ceil_seconds(expires_at - now),
+                    "will_retry": will_retry
+                }),
             );
             self.output.send(Event::Reconnecting(failures)).await?;
+            let action = if will_retry {
+                format!("reconnecting in {delay_seconds} s (attempt {failures})")
+            } else {
+                format!("retry window expires in {delay_seconds} s")
+            };
             self.output
-                .send(Event::Status(format!(
-                    "Link lost · reconnecting in {} s (attempt {failures}) · {error:#}",
-                    delay.as_secs()
-                )))
+                .send(Event::Status(format!("Link lost · {action} · {error:#}")))
                 .await?;
-            let wait = tokio::time::sleep(
-                delay.min(Duration::from_secs(300).saturating_sub(since.elapsed())),
-            );
+            let wait = tokio::time::sleep_until(wake_at);
             tokio::pin!(wait);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
-                    _ = &mut wait => break,
-                    message = self.input.recv() => match message {
-                        Some(message) => self.discard_input(message),
-                        None => return Ok(()),
+            let mut retry = attempt
+                .guard
+                .as_ref()
+                .and_then(|attempt| attempt.offer_retry(wake_at));
+            {
+                let request = RetryWait::requested(retry.as_mut());
+                tokio::pin!(request);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
+                        _ = &mut request => break,
+                        _ = &mut wait => break,
+                        message = self.input.recv() => match message {
+                            Some(message) => self.discard_input(message),
+                            None => return Ok(()),
+                        }
                     }
                 }
             }
+            drop(retry);
+            if Instant::now() >= expires_at {
+                return Err(error.context(expired()));
+            }
+            self.output
+                .send(Event::Status(format!("Reconnecting · attempt {failures}")))
+                .await?;
         }
     }
 }
@@ -918,8 +1542,16 @@ async fn run_channel(
     driver: &mut Driver,
     program: &Program,
     attempt: &mut Option<AttemptGuard>,
+    ready: &OnceLock<Instant>,
 ) -> Result<()> {
     let _published = shell.published.shell_lifetime(&shell.link);
+    let managed = !matches!(program, Program::Shell(_));
+    let step = if managed {
+        ConnectionStep::PreparingRemoteProgram
+    } else {
+        ConnectionStep::RequestingTerminal
+    };
+    report_connection_step(Some(&driver.output), &driver.options, None, step).await?;
     if let Some(reference) = program.herdr_reference() {
         return run_herdr_channel(shell, driver, program, &reference).await;
     }
@@ -937,7 +1569,6 @@ async fn run_channel(
     } = driver;
     let generation = *generation;
     let original_size = *size;
-    let managed = !matches!(program, Program::Shell(_));
     let probe = game
         .as_mut()
         .filter(|_| !managed)
@@ -1027,6 +1658,7 @@ async fn run_channel(
     tokio::pin!(sideband);
     if managed {
         shell.published.publish(&shell.link, generation);
+        let _ = ready.set(Instant::now());
         program.ready();
         events.push(
             "connected",
@@ -1111,11 +1743,14 @@ async fn run_channel(
                             let _ = reply.send(Err("The SSH shell changed before disconnect.".into()));
                         } else {
                             // The channel guard closes this shell. A sibling may still own the link.
+                            events.push("ssh-disconnect-requested", serde_json::json!({
+                                "connection_generation": generation
+                            }));
                             let _ = reply.send(Ok(()));
                             return Ok(());
                         }
                     }
-                    Some(TransportInput::Authenticate(auth)) => options.authentication = auth,
+                    Some(TransportInput::Authenticate(auth)) => options.set_authentication(auth),
                     Some(TransportInput::Sftp(job)) => {
                         forward_sftp(&sftp_tx,&cleanup_tx,job);
                     }
@@ -1130,6 +1765,10 @@ async fn run_channel(
                     Some(TransportInput::Scoped { kind: ScopedInput::GroupInterrupt(link), reply, .. })
                         if !events.group_command_running(link) => {
                         let _ = reply.send(Err(crate::terminal::GROUP_COMMAND_ENDED.into()));
+                    }
+                    Some(TransportInput::Scoped { kind: ScopedInput::CommandInterrupt(permit), reply, .. })
+                        if reply.is_closed() || !permit.claim() => {
+                        let _ = reply.send(Err(crate::terminal::COMMAND_INTERRUPT_EXPIRED.into()));
                     }
                     Some(TransportInput::Scoped { kind: ScopedInput::GroupCommand(receipt), bytes, reply, .. }) => {
                         // A failed write can follow a partial send. Dropping the
@@ -1158,6 +1797,7 @@ async fn run_channel(
                     if pending == 0 {
                         PendingAttempt::finish(attempt, SshAttemptOutcome::Connected)?;
                         shell.published.publish(&shell.link, generation);
+                        let _ = ready.set(Instant::now());
                         program.ready();
                         events.push("connected", serde_json::json!({"generation":generation}));
                         output.send(Event::Connected(generation)).await?;
@@ -1240,6 +1880,9 @@ async fn run_herdr_channel(
                 }
                 Some(TransportInput::Scoped {kind:ScopedInput::GroupInterrupt(_),reply,..}) => {
                     let _=reply.send(Err("Group interrupts require a direct SSH shell.".into()));
+                }
+                Some(TransportInput::Scoped {kind:ScopedInput::CommandInterrupt(_),reply,..}) => {
+                    let _=reply.send(Err("A command interrupt requires a live shell.".into()));
                 }
                 Some(TransportInput::Raw(data,reply) | TransportInput::Scoped {bytes:data,reply,..})=>{
                     let result=viewer.input(&data).await;

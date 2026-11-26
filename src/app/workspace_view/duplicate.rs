@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::{Result, bail, ensure};
+use w11term::tabs::TabTitle;
 
 const CLOSED_TAB_LIMIT: usize = 10;
 
@@ -84,6 +85,7 @@ struct NewShell {
     pane_name: Option<TabTitle>,
     profile: Option<String>,
     size: TerminalSize,
+    pane_font_size: Option<f32>,
     read_only: bool,
     startup: Option<Box<SshStartup>>,
 }
@@ -105,6 +107,7 @@ impl NewShell {
             label: tab.label.clone(),
             pane_name: live.pane_name.clone(),
             size: live.last_size.get().unwrap_or_default(),
+            pane_font_size: live.pane_font_size.get(),
             read_only: live.read_only.get(),
             startup: live.startup.clone(),
         })
@@ -146,6 +149,7 @@ impl NewShell {
         .with_profile(self.profile);
         if let Page::Terminal(live) = &mut tab.page {
             live.pane_name = self.pane_name;
+            live.pane_font_size.set(self.pane_font_size);
             KeyboardBridge::set_read_only(&live.session.input, &live.read_only, self.read_only);
         }
         tab
@@ -304,6 +308,7 @@ mod tests {
             powershell_integration: false,
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
         })
     }
@@ -373,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicated_and_reopened_panes_keep_their_own_display_names() {
+    fn duplicated_and_reopened_panes_keep_display_names_and_text_size() {
         let mut tabs = Tabs::default();
         let shell = local("powershell.exe", &["-NoProfile"]);
         let original = tabs.insert(live_tab(source_label(&shell), shell, false));
@@ -382,6 +387,7 @@ mod tests {
             unreachable!()
         };
         pane.pane_name = Some(name.clone());
+        pane.pane_font_size.set(Some(18.5));
         let group = tabs.group_id(original).unwrap();
         let closed_recipe = tabs
             .capture_group(group, NewShell::capture)
@@ -398,6 +404,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(pane.pane_name.take().as_ref(), Some(&name));
+        assert_eq!(pane.pane_font_size.replace(None), Some(18.5));
         assert_eq!(tabs.get(original).unwrap().pane_name(), Some(&name));
         assert!(tabs.remove_group(original));
         tabs.reopen_group(
@@ -409,6 +416,10 @@ mod tests {
         let reopened = tabs.active_id().unwrap();
         assert_ne!(reopened, original);
         assert_eq!(tabs.get(reopened).unwrap().pane_name(), Some(&name));
+        let Some(Page::Terminal(pane)) = tabs.get(reopened).map(|tab| &tab.page) else {
+            unreachable!()
+        };
+        assert_eq!(pane.pane_font_size.get(), Some(18.5));
         assert!(tabs.get(duplicate).unwrap().pane_name().is_none());
     }
 
@@ -424,12 +435,14 @@ mod tests {
             label: "test".into(),
             pane_name: Some("Deploy console".to_owned().try_into().unwrap()),
             size: TerminalSize::default(),
+            pane_font_size: Some(18.5),
             read_only: true,
             startup: None,
         };
         let prepared = recipe.clone().prepare(Some(&catalog)).unwrap();
         assert!(prepared.profile.is_none());
         assert_eq!(prepared.pane_name, recipe.pane_name);
+        assert_eq!(prepared.pane_font_size, recipe.pane_font_size);
         assert_eq!(prepared.label, source_label(&prepared.source));
         assert!(matches!(prepared.source, Source::Ssh(ref options) if options == &ssh()));
         assert!(prepared.read_only);

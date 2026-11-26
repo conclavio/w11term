@@ -10,7 +10,6 @@ $fixture = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $statsPath = Join-Path $fixture 'fixture-space.json'
 $button = [System.Windows.Automation.ControlType]::Button
 $space = 'Filesystem space' + [char]0x2026
-$properties = 'Properties' + [char]0x2026
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -37,7 +36,7 @@ try {
     Run-Palette 'Open files here'
 
     Click 'keep.txt'
-    Click $space
+    Invoke-SftpFolderAction $space
     Wait-Row 'folder' '/shell directory'
     Wait-Row 'available' '1 GiB (1073741824 bytes)'
     Wait-Row 'used' '2 GiB (2147483648 bytes)'
@@ -55,14 +54,14 @@ try {
     $null = Wait-Until 'the refreshed filesystem is read-only' { Find-Element 'Read-only filesystem' }
     Click 'Close space report'
     $null = Wait-Until 'the selected file remains active' {
-        $item = Find-Element $properties $button
+        $item = Find-Element 'Selected entry actions' $button
         $item -and $item.Current.IsEnabled
     }
 
     Click 'child/'
     Click 'Open folder'
     $null = Wait-Until 'child is the displayed folder' { Find-Element '/shell directory/child' }
-    Click $space
+    Invoke-SftpFolderAction $space
     Wait-Row 'folder' '/shell directory/child'
     Wait-Row 'available' '512 MiB (536870912 bytes)'
     [IO.File]::Delete($statsPath)

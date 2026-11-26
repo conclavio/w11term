@@ -1966,6 +1966,14 @@ impl WinUiRuntime {
                     (result, observation)
                 });
                 result?;
+                if matches!(
+                    property,
+                    PropertyId::Width | PropertyId::TabViewSelectedIndex
+                )
+                    && let Some(Handle::TabView(tabs)) = self.handles.get(node)
+                {
+                    reveal_selected_tab_after_layout(tabs);
+                }
                 if controlled_collection_for_property(*property).is_some()
                     && let PropertyValue::I32(value) = value
                 {
@@ -3534,6 +3542,31 @@ fn is_internal_detach(command: &Command, destroyed: &HashSet<NodeId>) -> bool {
         } => destroyed.contains(parent),
         _ => false,
     }
+}
+
+fn reveal_selected_tab_after_layout(tabs: &bindings::TabView) {
+    let Ok(tabs) = tabs.downgrade() else {
+        return;
+    };
+    // Selection and the title bar width can change in the same update.
+    let handler = DispatcherQueueHandler::new(move || {
+        let Some(tabs) = tabs.upgrade() else {
+            return;
+        };
+        let reveal = || -> windows_core::Result<()> {
+            let index = tabs.SelectedIndex()?;
+            if let Ok(index) = u32::try_from(index) {
+                let element = tabs.TabItems()?.GetAt(index)?.cast::<IUIElement>()?;
+                element.UpdateLayout()?;
+                element.StartBringIntoView()?;
+            }
+            Ok(())
+        };
+        let _ = reveal();
+    });
+    let _ = DispatcherQueue::GetForCurrentThread().and_then(|queue| {
+        queue.TryEnqueueWithPriority(DispatcherQueuePriority::Low, &handler)
+    });
 }
 
 impl NativeRuntime for WinUiRuntime {

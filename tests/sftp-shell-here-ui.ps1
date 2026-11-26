@@ -58,7 +58,7 @@ try {
     Click "Pilot's Work/"
     Click 'Open folder'
     Listing $target 'bookmark-witness.txt'
-    Click $bookmarks
+    Invoke-SftpFolderAction $bookmarks
     Click 'Bookmark this folder'
     $null = Wait-Until 'bookmark saved' { Find-Element "Open bookmark $target" $button }
     Click 'Back to files'
@@ -71,7 +71,7 @@ try {
     }
     [IO.File]::Delete($gate)
     Listing "$target/deeper" 'child-witness.txt'
-    Click $bookmarks
+    Invoke-SftpFolderAction $bookmarks
     Click "Open bookmark $target"
     Listing $target 'bookmark-witness.txt'
     Click $action

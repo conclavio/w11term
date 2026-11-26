@@ -24,19 +24,26 @@ pub(super) enum Purpose {
     SshConfig(PathBuf),
     OpenSshHostList,
     OpenSshGroupDefinition,
-    SshIdentity(Option<PathBuf>),
+    SshIdentity {
+        current: Option<PathBuf>,
+        certificate: bool,
+    },
     Folder,
+    DefaultDownloadFolder,
     DownloadFolder,
     Save(String),
     SaveSearchResults,
     Scrollback,
     PaneImage,
     CommandOutput(String),
+    CommandOutputDiff(String),
+    WindowCommandHistory,
     GroupReport(String),
     SshLoginReport(String),
     GroupJsonReport(String),
     GroupRunComparison(String),
     FolderComparison,
+    SftpTransferHistory,
     GroupOutputExcerpt(String),
     GroupOutputDiff(String),
     GroupLiveRecording(String),
@@ -46,7 +53,7 @@ pub(super) enum Purpose {
     OpenRecording,
 }
 
-fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
+fn is_local_folder(folder: &Path) -> bool {
     use std::path::{Component, Prefix};
     if !folder.is_absolute() {
         return false;
@@ -58,11 +65,15 @@ fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
         return false;
     };
     let drive = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
+    // A typed UNC path or disconnected mapped drive is not a starting folder.
+    (unsafe { matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) }) && folder.is_dir()
+}
+
+fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
+    if !is_local_folder(folder) {
+        return false;
+    }
     unsafe {
-        // A typed UNC path or disconnected mapped drive is not a starting folder.
-        if !matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) || !folder.is_dir() {
-            return false;
-        }
         let wide: Vec<_> = folder.as_os_str().encode_wide().chain(Some(0)).collect();
         // The proposed parent (such as ~/.ssh) may not exist yet. In that case
         // leave the file dialog's normal starting directory available.
@@ -141,29 +152,41 @@ impl IFileDialogEvents_Impl for Overwrite_Impl {
 }
 
 pub(super) fn pick(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
-    let mut selected = pick_items(owner, purpose)?;
+    let mut selected = pick_items(owner, purpose, None)?;
     anyhow::ensure!(selected.len() <= 1, "Expected a single selection");
     Ok(selected.pop())
 }
 
 pub(super) fn pick_paths(owner: usize, purpose: Purpose) -> Result<Vec<PathBuf>> {
-    Ok(pick_items(owner, purpose)?
+    pick_paths_from_folder(owner, purpose, None)
+}
+
+pub(super) fn pick_paths_from_folder(
+    owner: usize,
+    purpose: Purpose,
+    initial_folder: Option<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    Ok(pick_items(owner, purpose, initial_folder)?
         .into_iter()
         .map(|item| item.path)
         .collect())
 }
 
-fn pick_items(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
+fn pick_items(
+    owner: usize,
+    purpose: Purpose,
+    initial_folder: Option<PathBuf>,
+) -> Result<Vec<Selection>> {
     // The modal dialog needs its own STA independently of the Reactor UI and worker threads.
     std::thread::Builder::new()
         .name("w11term file picker".into())
-        .spawn(move || show(owner, purpose))
+        .spawn(move || show(owner, purpose, initial_folder))
         .context("Starting file picker")?
         .join()
         .map_err(|_| anyhow!("File picker stopped"))?
 }
 
-fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
+fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Result<Vec<Selection>> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         struct Apartment;
@@ -183,8 +206,9 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 | Purpose::SshConfig(_)
                 | Purpose::OpenSshHostList
                 | Purpose::OpenSshGroupDefinition
-                | Purpose::SshIdentity(_)
+                | Purpose::SshIdentity { .. }
                 | Purpose::Folder
+                | Purpose::DefaultDownloadFolder
                 | Purpose::DownloadFolder
         ) {
             FileOpenDialog
@@ -195,6 +219,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let mut options = dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR;
         let confirmed = Rc::new(RefCell::new(None));
         let multiple = matches!(purpose, Purpose::UploadFiles);
+        let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
             Purpose::StartRecording | Purpose::OpenRecording => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
@@ -265,8 +290,15 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")?;
                 None
             }
-            Purpose::SshIdentity(current) => {
-                dialog.SetTitle(w!("Choose SSH private key"))?;
+            Purpose::SshIdentity {
+                current,
+                certificate,
+            } => {
+                dialog.SetTitle(if certificate {
+                    w!("Choose SSH user certificate")
+                } else {
+                    w!("Choose SSH private key")
+                })?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 // OpenSSH private keys often have no extension.
                 let seeded = current
@@ -279,10 +311,12 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 None
             }
             Purpose::Folder
+            | Purpose::DefaultDownloadFolder
             | Purpose::DownloadFolder
             | Purpose::UploadFolder
             | Purpose::CompareLocalFolder => {
                 dialog.SetTitle(match purpose {
+                    Purpose::DefaultDownloadFolder => w!("Choose the default SFTP download folder"),
                     Purpose::DownloadFolder => w!("Choose a download destination folder"),
                     Purpose::UploadFolder => w!("Choose a folder to upload"),
                     Purpose::CompareLocalFolder => w!("Choose a Windows folder for comparison"),
@@ -336,11 +370,14 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             Purpose::Scrollback
             | Purpose::PaneImage
             | Purpose::CommandOutput(_)
+            | Purpose::CommandOutputDiff(_)
+            | Purpose::WindowCommandHistory
             | Purpose::GroupReport(_)
             | Purpose::SshLoginReport(_)
             | Purpose::GroupJsonReport(_)
             | Purpose::GroupRunComparison(_)
             | Purpose::FolderComparison
+            | Purpose::SftpTransferHistory
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
             | Purpose::SshGroupDefinition
@@ -355,6 +392,16 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                         w!("Save command output as text"),
                         suggestion.as_str(),
                         w!("txt"),
+                    ),
+                    Purpose::CommandOutputDiff(suggestion) => (
+                        w!("Save command output differences"),
+                        suggestion.as_str(),
+                        w!("txt"),
+                    ),
+                    Purpose::WindowCommandHistory => (
+                        w!("Save command history results as JSON"),
+                        "w11term-command-history.json",
+                        w!("json"),
                     ),
                     Purpose::GroupReport(suggestion) => (
                         w!("Save SSH group results as text"),
@@ -377,6 +424,11 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                     Purpose::FolderComparison => (
                         w!("Save folder comparison as JSON"),
                         "sftp-folder-comparison.json",
+                        w!("json"),
+                    ),
+                    Purpose::SftpTransferHistory => (
+                        w!("Save recent SFTP transfers as JSON"),
+                        "sftp-transfers.json",
                         w!("json"),
                     ),
                     Purpose::GroupOutputExcerpt(suggestion) => (
@@ -411,6 +463,9 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             }
         };
         dialog.SetOptions(options)?;
+        if let Some(folder) = initial_folder {
+            local_folder(&dialog, &folder);
+        }
         let shown = dialog.Show(Some(HWND(owner as *mut _)));
         if let Some(cookie) = cookie {
             dialog.Unadvise(cookie)?;
@@ -433,6 +488,12 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 .collect();
         }
         let path = shell_path(&dialog.GetResult()?)?;
+        if setting_download_folder {
+            anyhow::ensure!(
+                is_local_folder(&path),
+                "Choose a folder on a local Windows drive"
+            );
+        }
         let overwrite = confirmed.borrow().as_ref() == Some(&path);
         Ok(vec![Selection { path, overwrite }])
     }

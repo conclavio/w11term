@@ -51,7 +51,7 @@ async fn inspector_reports_parser_modes_while_rendered_output_is_held() {
     let old = feed(&session, "committed").await;
     session.input.send(Command::Inspect(true)).unwrap();
     capture(&session).await;
-    let initial = session.frames.inspection().unwrap();
+    let initial = session.frames.inspection().unwrap().modes;
     assert_eq!((initial.cols, initial.rows), (old.size.cols, old.size.rows));
     assert!(!initial.alternate && !initial.synchronized && !initial.bracketed_paste);
     assert_eq!(initial.keyboard, KeyboardEncoding::Xterm);
@@ -62,7 +62,8 @@ async fn inspector_reports_parser_modes_while_rendered_output_is_held() {
     )
     .await;
     assert_eq!(pending.generation, old.generation);
-    let active = session.frames.inspection().unwrap();
+    let observed = session.frames.inspection().unwrap();
+    let active = observed.modes;
     assert!(active.synchronized && active.alternate && active.bracketed_paste && active.mouse_drag);
     assert!(!active.mouse_click && !active.mouse_motion);
     assert_eq!(active.mouse_encoding, wezterm_term::MouseEncoding::SGR);
@@ -76,14 +77,14 @@ async fn inspector_reports_parser_modes_while_rendered_output_is_held() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     session
         .frames
-        .wait_for_view(old.generation, Some(Some(active)), || {
+        .wait_for_view(old.generation, Some(Some(observed)), || {
             std::time::Instant::now() >= deadline
         });
     capture(&session).await;
-    assert!(!session.frames.inspection().unwrap().synchronized);
+    assert!(!session.frames.inspection().unwrap().modes.synchronized);
     assert!(text(&session.frames.load()).contains("private update"));
     feed(&session, "\x1b[?1049l\x1b[?1002;1006;2004l").await;
-    assert_eq!(session.frames.inspection().unwrap(), initial);
+    assert_eq!(session.frames.inspection().unwrap().modes, initial);
     let resized = TerminalSize {
         cols: 99,
         rows: 36,
@@ -91,7 +92,7 @@ async fn inspector_reports_parser_modes_while_rendered_output_is_held() {
     };
     session.input.send(Command::Resize(resized)).unwrap();
     capture(&session).await;
-    let modes = session.frames.inspection().unwrap();
+    let modes = session.frames.inspection().unwrap().modes;
     assert_eq!((modes.cols, modes.rows), (99, 36));
     session.input.send(Command::Inspect(false)).unwrap();
     feed(&session, "\x1b[?2004h").await;

@@ -43,9 +43,7 @@ try {
     foreach ($pane in ($origin | Where-Object label -in 'East','West')) {
         $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','ready')
     }
-    Invoke-Button (Wait-Until 'the saved group window action' {
-        Find-Element 'Open group in new window' ([System.Windows.Automation.ControlType]::Button)
-    })
+    Invoke-NativeMenuAction 'Saved group actions' 'Open group in new window'
     $childHwnd = Wait-Until 'a second top-level window in the same process' {
         [FixtureDialog]::Windows($app.Id) | Where-Object {
             $_ -ne $originHwnd -and [FixtureDialog]::GetWindow($_, 4) -eq [IntPtr]::Zero
@@ -64,6 +62,10 @@ try {
         $null = Wait-CheckBox "$($pane.label)${dot}test@127.0.0.1:${port}${dot}Pane $($pane.id)" On
         $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','ready')
     }
+    $null = Wait-Until 'the child shows its saved readiness setting when collapsed' {
+        Find-Element 'All recipients must be ready' -Visible
+    }
+    Set-NativeExpansion 'Dispatch settings' $true
     $null = Wait-Until 'the child roster uses the saved readiness default' {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($childHwnd)
         $name = [System.Windows.Automation.PropertyCondition]::new(
@@ -118,16 +120,16 @@ try {
     }
     $window = $subsetHwnd
     $null = Wait-CheckBox "East${dot}test@127.0.0.1:$($portByName.East.port)${dot}Pane $($subset.id)" On
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($subsetHwnd)
-    $update = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty, ('Update saved group' + [char]0x2026))
-    if ($root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $update)) {
+    $null = Get-NativeMenuAction 'Group panes' 'Show all window SSH panes'
+    $update = 'Update saved group' + [char]0x2026
+    if (Find-Element $update ([System.Windows.Automation.ControlType]::MenuItem) -Visible) {
         throw 'The partial roster offered to replace saved group membership'
     }
+    Close-NativeMenu 'Show all window SSH panes'
     Close-TestWindow $subsetHwnd
     $window = $originHwnd
     $null = Wait-Until 'closing the reviewed window restores the unchanged source roster' {
-        (Find-Element 'Open group in new window' $button) -and
+        (Find-Element 'Saved group actions' $button) -and
             !(Find-Element 'Find launch profiles' ([System.Windows.Automation.ControlType]::Edit)) -and
             (@((Control @('list')).sessions).id | Sort-Object) -join ',' -ceq (($origin.id | Sort-Object) -join ',')
     }

@@ -26,9 +26,9 @@ function Bell-Cursor([int]$Pane) {
     (Control @('events','--pane',"$Pane",'--since','0','--timeout','0')).journal.next
 }
 function Wait-BellEvent([int]$Pane, [uint64]$Since) {
-    $null = Wait-Until "BEL journal event on pane $Pane" {
-        (Control @('events','--pane',"$Pane",'--since',"$Since",'--timeout','0')).journal.events |
-            Where-Object kind -eq 'bell'
+    $journal = (Control @('events','--pane',"$Pane",'--since',"$Since",'--kind','bell','--timeout','15')).journal
+    if ($journal.lost -or !$journal.events.Count -or @($journal.events | Where-Object kind -ne 'bell').Count) {
+        throw "Expected only new BEL journal events on pane $Pane"
     }
 }
 function Measure-TopEdge([int]$Pane, [string]$Marker) {
@@ -88,6 +88,16 @@ try {
     Wait-Focus $right
 
     $since = Bell-Cursor $left
+    Send-Sequence $left "$esc]2;UnrelatedTitle$esc\"
+    $title = (Control @('events','--pane',"$left",'--since',"$since",'--kind','title','--timeout','15')).journal
+    if ($title.lost -or !($title.events | Where-Object { $_.data.title -eq 'UnrelatedTitle' })) {
+        throw 'The background SSH pane did not publish its title event'
+    }
+    $withoutBell = (Control @('events','--pane',"$left",'--since',"$since",'--kind','bell','--timeout','1')).journal
+    if ($withoutBell.lost -or $withoutBell.events.Count -or $withoutBell.next -lt $title.next) {
+        throw 'The filtered bell wait returned a title event or failed to advance its cursor'
+    }
+    $since = $withoutBell.next
     Send-Sequence $left $bell
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.ElapsedMilliseconds -lt 650) {
@@ -95,6 +105,10 @@ try {
         Start-Sleep -Milliseconds 20
     }
     Wait-BellEvent $left $since
+    $sound = (Control @('events','--pane',"$left",'--since',"$since",'--kind','sound','--timeout','15')).journal
+    if ($sound.lost -or !($sound.events | Where-Object { $_.data.outcome -eq 'muted' })) {
+        throw 'The muted bell did not publish its sound outcome'
+    }
 
     Run-Palette 'Settings'
     $setting = Wait-Until 'visual bell setting defaults to off' {

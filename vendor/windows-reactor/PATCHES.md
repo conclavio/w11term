@@ -12,3 +12,11 @@ patch when upgrading to a release that provides Border::pointer_cursor.
 
 The local element reference can request scrolling after layout for the SFTP
 log tail. [WinUI StartBringIntoView](https://learn.microsoft.com/windows/windows-app-sdk/api/winrt/microsoft.ui.xaml.uielement.startbringintoview)
+
+Compact toolbar buttons and toggle buttons can set native
+[Control.Padding](https://learn.microsoft.com/windows/windows-app-sdk/api/winrt/microsoft.ui.xaml.controls.control.padding)
+to reserve the content area for their icons.
+
+An explicit tab strip width or selection change queues a scroll to the
+selected header after layout. This keeps the selected header visible when
+the native title bar narrows.

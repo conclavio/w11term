@@ -1,7 +1,14 @@
 use super::*;
 use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
+mod running_commands;
+mod running_interrupt;
+pub(in crate::app) use running_interrupt::Action as RunningInterruptAction;
+pub(in crate::app) use running_interrupt::Pending as PendingRunningInterrupt;
 mod text_search;
+mod window_history;
 pub use text_search::Action as TextAction;
+pub use window_history::Action as WindowHistoryAction;
+pub(super) use window_history::WindowHistoryReturn;
 pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
 
 struct Preview {
@@ -15,7 +22,7 @@ struct Preview {
 }
 
 impl Preview {
-    fn new(pane: u64, frames: FrameStore, appearance: &Appearance) -> Self {
+    fn new(pane: u64, frames: FrameStore, appearance: &Appearance, font_size: Option<f32>) -> Self {
         let snapshot = frames.load();
         let summary = preview_summary(&snapshot);
         let frame = Rc::new(RefCell::new(snapshot));
@@ -23,7 +30,7 @@ impl Preview {
         let canvas = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size(),
+            appearance.terminal_font_size_for(font_size),
         )
         .map(|renderer| {
             let renderer = RefCell::new(renderer);
@@ -248,8 +255,12 @@ pub(super) struct Picker {
     commands: Vec<command_palette::Row>,
     bookmarks: Option<Result<Vec<BookmarkEntry>, &'static str>>,
     text: text_search::Results,
+    window_history: window_history::Search,
     selected: usize,
     preview: Option<Preview>,
+    running_output: Option<running_commands::OutputPreview>,
+    running_interrupt: running_interrupt::State,
+    _running_timer: Option<crate::ui_timer::RetryTimer>,
 }
 
 impl Picker {
@@ -632,6 +643,30 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
+    pub(super) fn open_window_command_history(&mut self, ctx: &ComponentContext<Self>) {
+        self.start_picker(Mode::Commands(command_palette::Search::CommandHistory), ctx);
+    }
+
+    pub(super) fn open_profile_search(&mut self, axis: Option<Axis>, ctx: &ComponentContext<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
+        let destination = match axis {
+            None => command_palette::ProfileDestination::Tab,
+            Some(axis) => {
+                let Some(origin) = self.move_source() else {
+                    return;
+                };
+                command_palette::ProfileDestination::Split { axis, origin }
+            }
+        };
+        self.start_picker(
+            Mode::Commands(command_palette::Search::Profiles(destination)),
+            ctx,
+        );
+        self.restore_picker_focus_after_menu(ctx);
+    }
+
     pub(super) fn open_bookmark_search(
         &mut self,
         origin: clipboard_paste::Origin,
@@ -809,6 +844,25 @@ impl TerminalApp {
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
+            Mode::Commands(command_palette::Search::RunningCommands) => {
+                self.running_command_rows(query)
+            }
+            Mode::Commands(command_palette::Search::CommandHistory) => {
+                let options = self
+                    .picker
+                    .as_ref()
+                    .filter(|p| p.mode == mode)
+                    .map(|p| p.window_history.options)
+                    .unwrap_or_default();
+                self.window_command_history_rows(query, options)
+            }
+            Mode::Commands(command_palette::Search::Profiles(destination)) => {
+                if self.profile_error.is_some() {
+                    Vec::new()
+                } else {
+                    command_palette::profile_search_rows(&self.catalog, destination, query)
+                }
+            }
             Mode::Commands(command_palette::Search::Bookmarks(origin, screen)) => {
                 self.bookmark_rows(origin, screen, query)
             }
@@ -832,6 +886,9 @@ impl TerminalApp {
         let Some(picker) = self.picker.as_ref().filter(|p| p.mode.has_commands()) else {
             return;
         };
+        if picker.uses_history_output() {
+            return;
+        }
         let commands = self.picker_command_rows(picker.mode, &picker.query);
         let selected = picker
             .commands
@@ -853,9 +910,24 @@ impl TerminalApp {
             return;
         }
         // A profile, pane, selection, or remote connection can change while the palette is open.
+        if matches!(picker.mode, Mode::Commands(search) if search.is_profiles()) {
+            self.refresh_profiles();
+        }
+        let Some(picker) = &self.picker else { return };
+        if picker.uses_history_output() {
+            if let command_palette::CommandId::OpenWindowCommand(pane, link, _) = &id
+                && self
+                    .history_frame(*pane)
+                    .is_some_and(|frame| frame.has_command(*link))
+            {
+                self.run_palette_command(id, ctx);
+            } else {
+                self.search_window_history(None, ctx);
+            }
+            return;
+        }
         let rows = self.picker_command_rows(picker.mode, &picker.query);
         if rows.iter().any(|r| r.id == id && r.enabled) {
-            self.close_picker(ctx);
             self.run_palette_command(id, ctx);
         } else if let Some(picker) = &mut self.picker {
             picker.commands = rows;
@@ -902,6 +974,10 @@ impl TerminalApp {
             return;
         }
         self.update(Message::Shortcut(shortcut), ctx);
+        self.restore_picker_focus_after_menu(ctx);
+    }
+
+    fn restore_picker_focus_after_menu(&self, ctx: &ComponentContext<Self>) {
         if let Some(picker) = &self.picker {
             let launch = picker.launch.clone();
             // WinUI's MenuFlyout restores focus to its owner when it closes.
@@ -952,6 +1028,15 @@ impl TerminalApp {
     }
 
     fn start_picker(&mut self, mode: Mode, ctx: &ComponentContext<Self>) {
+        self.start_picker_from(mode, None, ctx);
+    }
+
+    fn start_picker_from(
+        &mut self,
+        mode: Mode,
+        previous: Option<WindowHistoryReturn>,
+        ctx: &ComponentContext<Self>,
+    ) {
         self.close_copy_mode();
         self.close_hints();
         if self.picker.is_some() {
@@ -960,8 +1045,15 @@ impl TerminalApp {
         if self.switcher.is_some() {
             self.finish_switcher(false, ctx);
         }
-        let (matches, commands) = if mode.has_commands() {
-            if mode == Mode::Commands(command_palette::Search::Window) {
+        let (matches, commands) = if previous.is_some() {
+            (vec![], vec![])
+        } else if mode.has_commands() {
+            if matches!(
+                mode,
+                Mode::Commands(
+                    command_palette::Search::Window | command_palette::Search::Profiles(_)
+                )
+            ) {
                 self.refresh_profiles();
             }
             if matches!(
@@ -990,9 +1082,21 @@ impl TerminalApp {
         let selected = selected_tab
             .or_else(|| matches.iter().position(|row| Some(row.pane) == active))
             .unwrap_or(0);
+        let launch = Arc::new(());
+        let running_timer = if mode == Mode::Commands(command_palette::Search::RunningCommands) {
+            let sender = ctx.sender();
+            let launch = launch.clone();
+            crate::ui_timer::RetryTimer::with_next_delay(1000, move || {
+                sender.send(Message::RunningCommandsTick(launch.clone()));
+                1000
+            })
+            .ok()
+        } else {
+            None
+        };
         self.picker = Some(Picker {
             mode,
-            launch: Arc::new(()),
+            launch,
             input: ElementRef::new(),
             default_side: ElementRef::new(),
             query: String::new(),
@@ -1000,14 +1104,27 @@ impl TerminalApp {
             commands,
             bookmarks: None,
             text: text_search::Results::default(),
+            window_history: window_history::Search::default(),
             selected,
             preview: None,
+            running_output: None,
+            running_interrupt: Default::default(),
+            _running_timer: running_timer,
         });
+        if let Some(previous) = previous {
+            let picker = self.picker.as_mut().unwrap();
+            picker.query = previous.query;
+            picker.window_history.options = previous.options;
+            self.search_window_history(Some(previous.selection), ctx);
+        }
         self.sync_picker_preview(ctx);
-        self.keyboard.set_picker(Some(if mode.has_commands() {
-            PickerStage::Commands
-        } else {
-            PickerStage::Search
+        self.keyboard.set_picker(Some(match mode {
+            Mode::Commands(command_palette::Search::CommandHistory) => PickerStage::CommandHistory,
+            Mode::Commands(command_palette::Search::RunningCommands) => {
+                PickerStage::RunningCommands
+            }
+            Mode::Commands(_) => PickerStage::Commands,
+            _ => PickerStage::Search,
         }));
         self.focus_picker_input(0, ctx);
     }
@@ -1038,12 +1155,20 @@ impl TerminalApp {
         if picker.placement().is_some() || picker.query == query || picker.mode == Mode::Text {
             return;
         }
+        if picker.mode == Mode::Commands(command_palette::Search::CommandHistory)
+            && picker.window_history.options.include_output
+        {
+            self.picker.as_mut().unwrap().query = query;
+            self.search_window_history(None, ctx);
+            return;
+        }
         if picker.mode.has_commands() {
             let rows = self.picker_command_rows(picker.mode, &query);
             let picker = self.picker.as_mut().unwrap();
             picker.commands = rows;
             picker.query = query;
             picker.selected = 0;
+            self.refresh_running_command_output(false);
             return;
         }
         let matches = Picker::filter(self.picker_choices(picker.mode), &query);
@@ -1090,6 +1215,7 @@ impl TerminalApp {
                 pane,
                 live.session.frames.clone(),
                 &self.appearance.read().unwrap(),
+                live.font_size_override(),
             ))
         });
         self.picker.as_mut().unwrap().preview = preview;

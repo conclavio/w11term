@@ -39,13 +39,20 @@ impl wezterm_term::AlertHandler for Alerts {
         self.events.group_command_line(id, label);
     }
 
+    fn shell_command_started(&mut self, id: u64, start_token: u64, started_unix_ms: u64) {
+        self.events
+            .shell_command_started(id, start_token, started_unix_ms);
+    }
+
     fn live_shell_output(
         &mut self,
         id: u64,
         label: Option<&str>,
+        start_token: Option<u64>,
         output: wezterm_term::LiveCommandOutput<'_>,
     ) {
-        self.events.live_shell_output(id, label, output);
+        self.events
+            .live_shell_output(id, label, start_token, output);
     }
 
     fn alert(&mut self, alert: wezterm_term::Alert) {

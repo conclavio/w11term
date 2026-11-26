@@ -141,13 +141,11 @@ try {
     if (!(Get-ExitToken $west)) { throw 'Closing the shown pane also changed the hidden West pane' }
 
     Set-HostQuery ''
-    $preview = 'Show current terminal line'
     $line = "Pane $live${dot}Live line${dot}live-witness"
-    $toggle = Wait-CheckBox $preview Off
     Send-Display $live ('live-witness' + [char]27 + '[8mconcealed' + [char]27 + '[28m')
     $null = Control @('wait-for-text','--pane',"$live",'--timeout','10','live-witness')
     if (Find-Element $line) { throw 'The terminal line was visible before opting in' }
-    $toggle.Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Show current terminal line'
     $null = Wait-Until 'the unmarked shell line without concealed cells' { Find-Element $line }
     Send-Display $live ([string][char]27 + '[?1049halt-screen-witness')
     $null = Control @('wait-for-text','--pane',"$live",'--timeout','10','alt-screen-witness')
@@ -157,7 +155,7 @@ try {
     }
     Send-Display $live ([string][char]27 + '[?1049l')
     $null = Wait-Until 'the original primary line returns' { Find-Element $line }
-    (Wait-CheckBox $preview On).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Hide current terminal line'
     $null = Wait-Until 'the preview hides after opting out' { !(Find-Element $line) }
     $listed = (Control @('list')).sessions | Where-Object id -eq $live
     if ($listed.connection_generation -ne $generation -or $listed.ssh_connection.phase -ne 'connected' -or

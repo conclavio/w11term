@@ -985,6 +985,8 @@ impl Performer<'_> {
                 self.command_history = Default::default();
                 self.capturing_shell_input = false;
                 self.command_label = None;
+                self.command_started = None;
+                self.command_directory = None;
                 self.vscode_command = VscodeCommand::Idle;
                 self.current_dir = None;
                 self.forget_iterm_reported_host();
@@ -1064,6 +1066,7 @@ impl Performer<'_> {
     fn semantic_prompt(&mut self, marker: FinalTermSemanticPrompt, fresh_line: bool) {
         let primary = !self.is_alt_screen_active();
         let previous_command_id = self.next_command_id;
+        let was_running = self.command_started.is_some();
         let had_output_start = !self.capturing_shell_input && self.screen.command_start.is_some();
         match &marker {
             FinalTermSemanticPrompt::FreshLine => self.fresh_line(),
@@ -1117,6 +1120,11 @@ impl Performer<'_> {
                 )
                 .then_some((state.next_command_id, state.command_label.as_deref()));
                 handler.semantic_prompt(&marker, started, completed);
+                if let (false, Some((id, _)), Some(start)) =
+                    (was_running, started, state.command_started)
+                {
+                    handler.shell_command_started(id, start.token, start.clock.unix_ms);
+                }
             }
         }
     }
@@ -1167,7 +1175,7 @@ impl Performer<'_> {
                         if status.is_some()
                             && !command.as_ref().is_some_and(|line| line.trim().is_empty()) =>
                     {
-                        self.command_label = command
+                        self.command_label = command.map(Into::into)
                     }
                     VscodeCommand::Pending(_) if self.capturing_shell_input => {
                         self.next_shell_prompt();
@@ -1181,10 +1189,12 @@ impl Performer<'_> {
                 if matches!(self.vscode_command, VscodeCommand::Running) {
                     if command.trim().is_empty() {
                         self.command_label = None;
+                        self.command_started = None;
+                        self.command_directory = None;
                         self.screen.command_start = None;
                         self.vscode_command = VscodeCommand::Idle;
                     } else {
-                        self.command_label = Some(command);
+                        self.command_label = Some(command.into());
                     }
                     let state = &mut *self.state;
                     if let Some(handler) = state.alert_handler.as_mut() {

@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 mod definition;
 mod duplicate;
 mod roster_update;
+mod toolbar;
 pub use roster_update::Action as RosterUpdateAction;
-pub(super) use roster_update::update_button;
 
 #[derive(Default)]
 pub(super) struct SavedUi {
@@ -157,6 +157,10 @@ impl SavedUi {
         self.roster_update.can_update()
     }
 
+    pub(super) fn has_unsaved_roster_defaults(&self, current: SshRosterDefaults) -> bool {
+        self.roster_defaults != current
+    }
+
     pub(super) fn origin(&self) -> Option<(&str, &[String])> {
         self.roster_update.origin()
     }
@@ -214,30 +218,6 @@ pub enum Action {
         group: String,
         defaults: SshRosterDefaults,
     },
-}
-
-pub(super) fn roster_defaults_button(
-    id: TabId,
-    page: &HostGroup,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    let Some((name, _)) = page.saved.origin() else {
-        return View::empty();
-    };
-    let group = name.to_owned();
-    let defaults = page.roster_preferences;
-    Button::new()
-        .is_enabled(defaults != page.saved.roster_defaults)
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(HostAction::Saved(
-                id,
-                Action::SaveRosterDefaults {
-                    group: group.clone(),
-                    defaults,
-                },
-            ))
-        }))
-        .content("Save roster defaults")
 }
 
 pub enum DraftAction {
@@ -845,169 +825,6 @@ impl TerminalApp {
             self.refresh_profiles();
             self.window_error = Some(format!("{error:#}"));
         }
-    }
-
-    pub(super) fn saved_host_group_toolbar(
-        &self,
-        id: TabId,
-        page: &HostGroup,
-        ctx: &ViewContext<Self>,
-    ) -> View {
-        let saved = &page.saved;
-        let names: Vec<_> = self.catalog.ssh_host_groups.keys().cloned().collect();
-        let selected = saved.name(&self.catalog);
-        let selection = selected.and_then(|name| names.iter().position(|item| item == name));
-        let members = selected.and_then(|name| self.catalog.ssh_host_groups.get(name));
-        let review_actions = selected
-            .zip(members)
-            .map_or_else(View::empty, |(name, members)| {
-                let launch = reuse::button(id, name, members, ctx);
-                let duplicate = duplicate::button(id, name, ctx);
-                let group_window = name.to_owned();
-                let group_window_members = members.clone();
-                let name = name.to_owned();
-                let members = members.clone();
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        launch,
-                        Button::new()
-                            .is_enabled(!members.is_empty())
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(HostAction::HostListExport(
-                                    id,
-                                    host_list_export::Action::OpenSaved {
-                                        name: name.clone(),
-                                        members: members.clone(),
-                                    },
-                                ))
-                            }))
-                            .content("Export saved group hosts…"),
-                        duplicate,
-                        Button::new()
-                            .is_enabled(!group_window_members.is_empty())
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(HostAction::Saved(
-                                    id,
-                                    Action::OpenWindow {
-                                        name: group_window.clone(),
-                                        members: group_window_members.clone(),
-                                    },
-                                ))
-                            }))
-                            .content("Open group in new window"),
-                    ))
-            });
-        let action = move |action| Message::HostGroup(HostAction::Saved(id, action));
-        let mut items = Vec::new();
-        if let Some((name, members)) = selected.zip(members) {
-            let choices = names.clone();
-            let edit = name.to_owned();
-            items.push(KeyedView::new(
-                "choose",
-                ComboBox::new()
-                    .automation_name("Saved SSH groups")
-                    .max_width(240.0)
-                    .items_source(names)
-                    .selected_index(selection)
-                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                        index
-                            .and_then(|index| choices.get(index))
-                            .map_or(Message::ControlIdle, |name| {
-                                action(Action::Select(name.clone()))
-                            })
-                    })),
-            ));
-            for (key, label, new_tab) in [
-                ("open", "Open group", false),
-                ("open-new-tab", "Open in new tab", true),
-            ] {
-                let name = name.to_owned();
-                let members = members.clone();
-                items.push(KeyedView::new(
-                    key,
-                    Button::new()
-                        .is_enabled(!members.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            action(Action::Open {
-                                name: name.clone(),
-                                members: members.clone(),
-                                new_tab,
-                            })
-                        }))
-                        .content(label),
-                ));
-            }
-            items.push(KeyedView::new(
-                "edit",
-                Button::new()
-                    .on_click(ctx.callback(move |_| action(Action::Edit(edit.clone()))))
-                    .content("Edit group"),
-            ));
-        }
-        items.push(KeyedView::new(
-            "new",
-            Button::new()
-                .on_click(ctx.callback(move |_| action(Action::New)))
-                .content("New group"),
-        ));
-        items.push(KeyedView::new("import", import::State::button(id, ctx)));
-        let members = members
-            .map(|members| {
-                if members.is_empty() {
-                    "This group has no SSH profiles.".into()
-                } else {
-                    members.join(", ")
-                }
-            })
-            .unwrap_or_default();
-        let mut details = vec![KeyedView::new(
-            "actions",
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .keyed_children(items),
-        )];
-        if !members.is_empty() {
-            details.push(KeyedView::new(
-                "members",
-                TextBlock::new()
-                    .text(members)
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-            ));
-        }
-        details.push(KeyedView::new(
-            "review-group-actions",
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((review_actions, import::saved_profiles_button(id, ctx))),
-        ));
-        details.push(KeyedView::new(
-            "group-definition-actions",
-            definition::buttons(id, selected, self.export.pending.is_some(), ctx),
-        ));
-        if !saved.feedback.is_empty() {
-            details.push(KeyedView::new(
-                "feedback",
-                TextBlock::new()
-                    .text(&saved.feedback)
-                    .text_wrapping(TextWrapping::Wrap),
-            ));
-        }
-        if !page.import.feedback.is_empty() {
-            details.push(KeyedView::new(
-                "import-feedback",
-                TextBlock::new()
-                    .text(&page.import.feedback)
-                    .text_wrapping(TextWrapping::Wrap),
-            ));
-        }
-        StackPanel::new()
-            .grid_row(1)
-            .spacing(4.0)
-            .keyed_children(details)
     }
 
     pub(super) fn saved_host_group_editor(

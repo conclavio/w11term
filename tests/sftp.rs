@@ -49,6 +49,12 @@ impl server::Handler for Peer {
     type Error = anyhow::Error;
     async fn auth_none(&mut self, _user: &str) -> anyhow::Result<server::Auth> {
         #[cfg(feature = "ui-smoke")]
+        if self.root.join("authorized-key").is_file()
+            || self.root.join("authorized-certificate").is_file()
+        {
+            return Ok(server::Auth::reject());
+        }
+        #[cfg(feature = "ui-smoke")]
         if self.root.join("authenticated-users").is_file() {
             writeln!(
                 fs::OpenOptions::new()
@@ -58,6 +64,56 @@ impl server::Handler for Peer {
             )?;
         }
         Ok(server::Auth::Accept)
+    }
+    #[cfg(feature = "ui-smoke")]
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        key: &russh::keys::PublicKey,
+    ) -> anyhow::Result<server::Auth> {
+        let path = self.root.join("offered-key-trace");
+        if path.is_file() {
+            writeln!(
+                fs::OpenOptions::new().append(true).open(path)?,
+                "{}",
+                key.fingerprint(russh::keys::HashAlg::Sha256)
+            )?;
+        }
+        Ok(server::Auth::Accept)
+    }
+    #[cfg(feature = "ui-smoke")]
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        key: &russh::keys::PublicKey,
+    ) -> anyhow::Result<server::Auth> {
+        let allowed = self.root.join("authorized-key");
+        if !allowed.is_file() {
+            return Ok(server::Auth::reject());
+        }
+        let expected = russh::keys::PublicKey::from_openssh(&fs::read_to_string(allowed)?)?;
+        Ok(if key.key_data() == expected.key_data() {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
+    }
+    #[cfg(feature = "ui-smoke")]
+    async fn auth_openssh_certificate(
+        &mut self,
+        _user: &str,
+        certificate: &russh::keys::Certificate,
+    ) -> anyhow::Result<server::Auth> {
+        let path = self.root.join("authorized-certificate");
+        if !path.is_file() {
+            return Ok(server::Auth::reject());
+        }
+        let expected = russh::keys::load_openssh_certificate(path)?;
+        Ok(if *certificate == expected {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
     }
     async fn channel_open_session(
         &mut self,
@@ -204,6 +260,7 @@ impl server::Handler for Peer {
         #[cfg(feature = "ui-smoke")]
         {
             if self.root.join("withhold-shell-reply").is_file() {
+                fs::write(self.root.join("shell-reply-withheld"), [])?;
                 return Ok(());
             }
             let gate = self.root.join("hold-shell-request");
@@ -212,6 +269,14 @@ impl server::Handler for Peer {
             }
             if self.root.join("reject-shell-request").is_file() {
                 s.channel_failure(c)?;
+                return Ok(());
+            }
+            if self.root.join("drop-shell-before-ready").is_file() {
+                s.disconnect(
+                    russh::Disconnect::ByApplication,
+                    "fixture drops login before the shell is ready",
+                    "en",
+                )?;
                 return Ok(());
             }
         }
@@ -227,12 +292,24 @@ impl server::Handler for Peer {
         #[cfg(feature = "ui-smoke")]
         if self.root.join("hold-shell-output").is_file() {
             let gate = self.root.join("hold-shell-output");
-            let bytes = fs::read(self.root.join("deferred-output.vt"))?;
+            let output = self.root.join("deferred-output.vt");
+            // Reserve prewritten output for this shell. A fixture that needs
+            // the measured PTY can instead write the data before releasing it.
+            let prepared = match fs::read(&output) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
             let peer = s.handle();
             tokio::spawn(async move {
                 while gate.is_file() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                let bytes = match prepared {
+                    Some(bytes) => bytes,
+                    None => fs::read(output)
+                        .expect("write deferred fixture output before releasing its gate"),
+                };
                 let _ = peer.data(c, bytes).await;
             });
         }
@@ -489,6 +566,7 @@ impl Files {
         } else {
             fs::remove_file(path).map_err(io)?;
         }
+        self.hold_response("hold-delete-reply").await;
         if self.root.join("disconnect-after-delete").is_file() {
             let _ = self
                 .ssh
@@ -1070,12 +1148,16 @@ async fn fixture_with_wire(
     let source = Source::Ssh(SshOptions {
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        connect_timeout_seconds: None,
+        keepalive: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         terminal_type: Default::default(),
         host: "127.0.0.1".into(),
         user: "test".into(),
         port,
         authentication: Authentication::None,
+        agent_pipe: None,
         host_key: Some(pin),
         host_key_alias: None,
         proxy_jump: Vec::new(),
@@ -1106,6 +1188,258 @@ async fn fixture(
     .await
     .expect("SSH fixture did not connect");
     (session, source, root, opens, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_keepalives_detect_a_silent_tcp_peer_at_the_profile_threshold() {
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::watch,
+    };
+    use w11term::events::SshConnectionPhase;
+    let (Source::Ssh(options), _root, _opens, server) = fixture_connections(false, 3).await else {
+        unreachable!()
+    };
+    let (stall, gate) = watch::channel(false);
+    let mut relays = tokio::task::JoinSet::new();
+    let mut panes = Vec::new();
+    for (interval, unanswered) in [(1, 1), (1, 4), (0, 1)] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut profile = options.clone();
+        profile.port = listener.local_addr().unwrap().port();
+        profile.keepalive.interval_seconds = interval;
+        profile.keepalive.max_unanswered = unanswered.try_into().unwrap();
+        let server_port = options.port;
+        let mut gate = gate.clone();
+        relays.spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut peer = TcpStream::connect(("127.0.0.1", server_port))
+                .await
+                .unwrap();
+            tokio::select! {
+                result = tokio::io::copy_bidirectional(&mut client, &mut peer) => {
+                    panic!("fixture link closed before stalling: {result:?}");
+                }
+                result = gate.changed() => result.unwrap(),
+            }
+            // Keep both sockets open, including the listening socket, while no
+            // more bytes flow. A clean close would exercise a different path.
+            std::future::pending::<()>().await;
+        });
+        panes.push(Session::start(Source::Ssh(profile)));
+    }
+    let [fast, slow, disabled] = panes.as_slice() else {
+        unreachable!()
+    };
+    let reconnecting = |pane: &Session| {
+        matches!(
+            pane.events.ssh_connection_phase(),
+            Some(SshConnectionPhase::Reconnecting { .. })
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while [fast, slow, disabled]
+            .iter()
+            .any(|pane| pane.ssh_connection_generation().is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all three SSH panes should authenticate");
+    stall.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reconnecting(fast) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("one unanswered keepalive should trigger a reconnect");
+    assert!(
+        slow.ssh_connection_generation().is_some(),
+        "a larger limit should keep its original link longer"
+    );
+    tokio::time::timeout(Duration::from_secs(7), async {
+        while !reconnecting(slow) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the larger unanswered limit should eventually trigger a reconnect");
+    assert!(
+        disabled.ssh_connection_generation().is_some(),
+        "disabled keepalives should leave the silent connection open"
+    );
+    relays.abort_all();
+    server.abort();
+}
+
+#[cfg(feature = "ui-smoke")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_window_expires_during_shell_setup_and_preserves_manual_restart() {
+    use in_band_resize::Wire;
+    use w11term::events::SshConnectionPhase;
+
+    let (wire, mut messages) = tokio::sync::mpsc::unbounded_channel();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut options), root, _, server) =
+        fixture_with_wire(false, 3, accepted.clone(), Some(wire)).await
+    else {
+        unreachable!()
+    };
+    options.player.reconnect_window_seconds = 3.try_into().unwrap();
+    let pane = Session::start(Source::Ssh(options));
+    let Wire::Shell(_, first) = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("first connection did not reach the shell");
+    };
+    let first_generation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(generation) = pane.ssh_connection_generation() {
+                break generation;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let gate = root.path().join("withhold-shell-reply");
+    fs::write(&gate, []).unwrap();
+    first
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "retry fixture disconnect".into(),
+            "en".into(),
+        )
+        .await
+        .unwrap();
+
+    let restart = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(token) = pane.events.restart_token() {
+                break token;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the configured retry deadline should expire during remote shell setup");
+    assert!(root.path().join("shell-reply-withheld").is_file());
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert!(matches!(
+        pane.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Failed(reason)) if reason.contains("after 3 seconds")
+    ));
+    let retry = pane
+        .events
+        .since(0)
+        .events
+        .into_iter()
+        .find(|event| event.kind == "reconnecting")
+        .unwrap();
+    assert_eq!(retry.data["delay_seconds"], 1);
+    assert_eq!(retry.data["retry_remaining_seconds"], 3);
+    assert_eq!(retry.data["will_retry"], true);
+
+    fs::remove_file(gate).unwrap();
+    pane.restart_exited(restart).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pane
+            .ssh_connection_generation()
+            .is_none_or(|generation| generation <= first_generation)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("manual restart should have a fresh retry window");
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconnect_window_can_expire_before_the_next_login() {
+    reconnect_window_with_closing_peer(false).await;
+}
+
+#[tokio::test]
+async fn retry_now_keeps_the_original_reconnect_window() {
+    reconnect_window_with_closing_peer(true).await;
+}
+
+async fn reconnect_window_with_closing_peer(retry_early: bool) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::Relaxed);
+            drop(socket);
+        }
+    });
+    let options = serde_json::from_value(json!({
+        "host": "127.0.0.1",
+        "user": "fixture",
+        "port": port,
+        "auth": "none",
+        "player": {"reconnect_window_seconds": 1},
+    }))
+    .unwrap();
+    let pane = Session::start(Source::Ssh(options));
+    if retry_early {
+        let token = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(token) = pane.events.pending_ssh_retry() {
+                    break token;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the remaining retry window should allow a manual attempt");
+        assert!(pane.events.retry_ssh_now(token));
+    }
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while pane.events.restart_token().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let journal = pane.events.since(0);
+    let mut waits = journal
+        .events
+        .iter()
+        .filter(|event| event.kind == "reconnecting");
+    let wait = waits.next().unwrap();
+    assert_eq!(wait.data["delay_seconds"], 1);
+    assert_eq!(wait.data["retry_remaining_seconds"], 1);
+    assert_eq!(wait.data["will_retry"], false);
+    if retry_early {
+        let second = waits.next().unwrap();
+        assert_eq!(second.data["attempt"], 2);
+        assert_eq!(second.data["retry_remaining_seconds"], 1);
+        assert_eq!(second.data["will_retry"], false);
+        assert!(
+            journal
+                .events
+                .iter()
+                .any(|event| { event.kind == "ssh-retry-wait" && event.data["requested"] == true })
+        );
+    }
+    assert!(waits.next().is_none());
+    assert!(pane.events.pending_ssh_retry().is_none());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1 + usize::from(retry_early)
+    );
+    server.abort();
 }
 
 fn directory_junction(root: &std::path::Path, name: &str, target: &str) {
@@ -1254,25 +1588,27 @@ async fn lost_workspace_exec_reply_does_not_dispatch_command_again() {
     let command = "make deploy";
     let startup = w11term::workspace::SshStartup::new(&ssh, String::new(), command.into()).unwrap();
     let session = Session::start_workspace_ssh(ssh, Default::default(), false, startup);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !session
-            .frames
-            .load()
-            .status
-            .contains("Workspace command interrupted")
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "Expected final interruption status, got {:?}; channels {}, recorded {:?}",
-            session.frames.load().status,
-            opens.load(Ordering::Relaxed),
-            fs::read_to_string(&trace)
+    let exit = registry(&session)
+        .execute(
+            Request::WaitPaneExit {
+                pane: 1,
+                after_exit_token: 0,
+                timeout_seconds: 10,
+            },
+            Arc::new(|_, _, _| unreachable!()),
         )
-    });
+        .await
+        .unwrap();
+    assert_eq!(exit["pane"], 1);
+    assert_eq!(exit["exit_token"], 1);
+    assert_eq!(exit["restart_token"], Value::Null);
+    assert!(exit["ssh_connection"].is_object(), "{exit}");
+    let frame = session.frames.load();
+    assert!(
+        frame.status.contains("Workspace command interrupted"),
+        "exit wait returned before the final screen: {:?}",
+        frame.status
+    );
     assert_eq!(opens.load(Ordering::Relaxed), 1);
     assert_eq!(fs::read(trace).unwrap(), command.as_bytes());
     drop(session);
@@ -1388,6 +1724,7 @@ fn registry(session: &Session) -> Registry {
         active: false,
         visible: false,
         read_only: false,
+        capture: None,
         input: session.input.clone(),
     }]);
     r
@@ -1418,6 +1755,15 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
 
     // The fixture accepts exactly one TCP connection.
     let (original, source, root, opens, server) = fixture(false).await;
+    let Source::Ssh(mut incompatible) = source.clone() else {
+        unreachable!()
+    };
+    {
+        let link = original.ssh_connection().unwrap();
+        assert!(link.matches(&incompatible, None));
+        incompatible.keepalive.interval_seconds += 1;
+        assert!(!link.matches(&incompatible, None));
+    }
     fs::write(root.path().join("from-second-pane"), b"").unwrap();
     let child = Session::start_configured_with_connection(
         source,
@@ -1610,7 +1956,7 @@ async fn queued_group_connection_can_be_stopped_before_using_a_launch_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "ui-smoke")]
 async fn ssh_shell_setup_times_out_and_releases_the_group_login_slot() {
-    use w11term::events::SshConnectionPhase;
+    use w11term::{events::SshConnectionPhase, ssh::ConnectionStep};
 
     async fn failure(pane: &Session) -> Arc<str> {
         loop {
@@ -1682,6 +2028,20 @@ async fn ssh_shell_setup_times_out_and_releases_the_group_login_slot() {
         setup_error.contains("SSH PTY or shell setup timed out"),
         "{setup_error}"
     );
+    for (pane, step) in [
+        (&opening, ConnectionStep::OpeningSessionChannel),
+        (&setting_up, ConnectionStep::RequestingTerminal),
+    ] {
+        let (reply, inspection) = tokio::sync::oneshot::channel();
+        pane.input.send(Command::ReadModes(reply)).unwrap();
+        let inspection = inspection.await.unwrap();
+        assert!(matches!(
+            inspection.ssh_connection,
+            Some(SshConnectionPhase::Failed(_))
+        ));
+        assert!(inspection.ssh.is_none());
+        assert_eq!(inspection.ssh_progress.unwrap().step, step);
+    }
     assert_eq!(healthy_opens.load(Ordering::Relaxed), 1);
     assert_eq!(gate.available_permits(), 1);
     open_server.abort();
@@ -2160,6 +2520,9 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
                 pane: 1,
                 pattern: "fps=144".into(),
                 regex: false,
+                connection_generation: None,
+                after_frame: None,
+                screenshot_path: None,
                 timeout_seconds: 3,
             },
             capture.clone(),

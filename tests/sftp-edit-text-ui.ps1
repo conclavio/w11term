@@ -49,7 +49,7 @@ function Wait-Draft([string]$Expected, [string]$Step) {
 }
 function Open-Editor {
     Click $name
-    Click $preview
+    Invoke-SftpEntryAction $preview
     Click 'Edit'
 }
 function Replace-Word([string]$Old, [string]$New) {
@@ -172,7 +172,7 @@ try {
     Check-File $file $externalBytes
     Click 'Back to files'
 
-    Click $newTextFile
+    Invoke-SftpFolderAction $newTextFile
     $newDraft = Wait-Draft '' 'blank new file'
     $field = Wait-Until 'new file name editor' { By-Id 'sftp-editor-filename' }
     $field.GetCurrentPattern($getValue).SetValue($name)
@@ -208,7 +208,7 @@ try {
     }
     Check-File $newPath $newText
 
-    Click $newTextFile
+    Invoke-SftpFolderAction $newTextFile
     $null = Wait-Draft '' 'empty new file'
     $emptyName = 'empty.txt'
     $field = Wait-Until 'empty file name editor' { By-Id 'sftp-editor-filename' }
@@ -220,7 +220,7 @@ try {
     Check-File (Join-Path $folder $emptyName) ''
 
     Run-Palette 'SFTP files'
-    $null = Wait-Until 'drawer closed' { !(Find-Element $preview $button) }
+    $null = Wait-Until 'drawer closed' { !(Find-Element 'Selected entry actions' $button) }
     foreach ($ch in 'after-editor'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-editor')
     $session = (Control @('list')).sessions | Where-Object id -eq $remote

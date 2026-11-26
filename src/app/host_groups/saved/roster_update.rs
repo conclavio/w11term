@@ -1,7 +1,5 @@
 use super::*;
 
-const LABEL: &str = "Update saved group…";
-
 #[derive(Default)]
 pub(super) struct State {
     origin: Option<Origin>,
@@ -179,15 +177,6 @@ impl State {
 
 fn action(id: TabId, action: Action) -> Message {
     Message::HostGroup(HostAction::Saved(id, super::Action::UpdateRoster(action)))
-}
-
-pub(in crate::app::host_groups) fn update_button(
-    id: TabId,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    Button::new()
-        .on_click(ctx.callback(move |_| action(id, Action::Open)))
-        .content(LABEL)
 }
 
 impl TerminalApp {

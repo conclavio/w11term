@@ -6,7 +6,7 @@ use std::{future::poll_fn, pin::Pin, task::Poll};
 async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
     assert!(
         poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await,
-        "wait-for-text completed before the synchronized update was committed"
+        "control wait completed before the synchronized update was committed"
     );
 }
 
@@ -30,6 +30,7 @@ async fn inspect_reads_live_modes_during_a_held_frame_without_enabling_the_gui_i
             active: false,
             visible: false,
             read_only: true,
+            capture: None,
             input: input.clone(),
         }]);
         let old = feed(&input, "shell").await;
@@ -142,11 +143,18 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
             active: true,
             visible: true,
             read_only: false,
+            capture: None,
             input: input.clone(),
         }]);
 
         let old = feed(&input, "old HUD").await;
-        for piece in ["\x1b[?20", "26h", "\rnew HUD", "\x1b[2;1Hnew picture"] {
+        for piece in [
+            "\x1b[?20",
+            "26h",
+            "\rnew HUD",
+            "\x1b[2;1Hnew picture",
+            "\x1b]133;C\x07\x1b]133;D;4\x07",
+        ] {
             let partial = feed(&input, piece).await;
             assert_eq!(partial.generation, old.generation);
             assert_eq!(text(&partial), text(&old));
@@ -157,43 +165,112 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
             assert_eq!(text(frame), expected);
             Ok((400, 160))
         });
-        let screen = registry
-            .execute(Request::GetText { pane: 1 }, screenshot.clone())
+        let screen = Box::pin(registry.execute(Request::GetText { pane: 1 }, screenshot.clone()))
             .await
             .unwrap();
         assert!(screen["text"].as_str().unwrap().contains("old HUD"));
         assert_eq!(screen["generation"], old.generation);
+        assert_eq!(screen["connection_generation"], 0);
         // The callback inspects the snapshot without writing a PNG. No
         // temporary directory or filesystem access is needed for this capture.
-        let image = registry
-            .execute(
-                Request::Screenshot {
-                    pane: 1,
-                    path: std::env::temp_dir().join("unused.png"),
-                },
-                screenshot.clone(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(image["generation"], old.generation);
-        let waiting = registry.execute(
-            Request::WaitForText {
+        let image = Box::pin(registry.execute(
+            Request::Screenshot {
                 pane: 1,
-                pattern: "new picture".into(),
-                regex: false,
-                timeout_seconds: 1,
+                path: std::env::temp_dir().join("unused.png"),
             },
-            screenshot,
-        );
-        tokio::pin!(waiting);
+            screenshot.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(image["generation"], old.generation);
+        // Keep the concurrent request dispatcher futures off the Windows test stack.
+        let matched_path = std::env::temp_dir().join("matched.png");
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let saved = Arc::clone(&captured);
+        let expected_path = matched_path.clone();
+        let capture_match: CapturePng = Arc::new(move |frame, captured_size, path| {
+            assert_eq!(path, expected_path);
+            assert_eq!(captured_size, size);
+            *saved.lock().unwrap() = Some((frame.generation, text(frame)));
+            Ok((400, 160))
+        });
+        let wait = |pattern: &str, after_frame, screenshot_path: Option<_>| {
+            let capture_png = if screenshot_path.is_some() {
+                capture_match.clone()
+            } else {
+                screenshot.clone()
+            };
+            Box::pin(registry.execute(
+                Request::WaitForText {
+                    pane: 1,
+                    pattern: pattern.into(),
+                    regex: false,
+                    connection_generation: None,
+                    after_frame: Some(after_frame),
+                    screenshot_path,
+                    timeout_seconds: 1,
+                },
+                capture_png,
+            ))
+        };
+        let future_cursor = wait("HUD", old.generation + 1, None).await.unwrap_err();
+        assert!(future_cursor.to_string().contains("ahead of this pane"));
+        let relative_path = wait("HUD", old.generation, Some("relative.png".into()))
+            .await
+            .unwrap_err();
+        assert!(relative_path.to_string().contains("path must be absolute"));
+        let mut waiting = wait("new picture", old.generation, Some(matched_path.clone()));
+        let mut recurring = wait("HUD", old.generation, None);
+        let mut completion = Box::pin(registry.execute(
+            Request::WaitCommand {
+                pane: 1,
+                after_id: old.latest_command_id,
+                connection_generation: 0,
+                command: None,
+                timeout_seconds: 1,
+                output_file: None,
+            },
+            screenshot.clone(),
+        ));
         assert_pending(waiting.as_mut()).await; // queues Command::Frames
+        assert_pending(recurring.as_mut()).await;
+        assert_pending(completion.as_mut()).await;
         capture(&input).await; // FIFO barrier: the worker has replied to Frames
         assert_pending(waiting.as_mut()).await; // matcher has checked the held frame
+        assert_pending(recurring.as_mut()).await; // HUD already appears in the held frame
+        assert_pending(completion.as_mut()).await;
         let done = feed(&input, "\x1b[?2026l").await;
-        let found = waiting.await.unwrap();
+        let completed = completion.await.unwrap();
+        assert_eq!(completed["id"], old.latest_command_id + 1);
+        assert_eq!(completed["exit_code"], 4);
+        // Let the wait choose the committed match. The renderer then runs
+        // off-thread, while the terminal remains free to publish another frame.
+        let next = recurring.await.unwrap();
+        // Poll once to latch the frame. The blocking renderer can finish
+        // before the poll returns, so this poll need not return Pending.
+        let capture_reply = poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await;
+        let later = feed(&input, "\r\x1b[2Jlater frame").await;
+        assert!(later.generation > done.generation);
+        let found = match capture_reply {
+            Poll::Ready(result) => result,
+            Poll::Pending => waiting.await,
+        }
+        .unwrap();
         assert!(text(&done).contains("new HUD\nnew picture"));
         assert_eq!(done.generation, old.generation + 1);
         assert_eq!(found["generation"], done.generation);
+        assert_eq!(
+            found["screenshot"],
+            serde_json::json!({
+                "path": matched_path, "width": 400, "height": 160
+            })
+        );
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some((done.generation, text(&done)))
+        );
+        assert_eq!(next["generation"], done.generation);
+        assert!(next.get("screenshot").is_none());
     })
     .await;
 }

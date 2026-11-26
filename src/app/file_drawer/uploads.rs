@@ -102,7 +102,7 @@ impl TransferQueue {
             let remote = remote_child(parent, &name)?;
             queue.remaining.push_back((
                 Operation::Put {
-                    local,
+                    local: local.clone(),
                     remote: remote.clone(),
                     overwrite,
                     atomic,
@@ -111,6 +111,7 @@ impl TransferQueue {
                 TransferFile::Upload {
                     name,
                     remote,
+                    local,
                     atomic,
                 },
             ));
@@ -137,6 +138,7 @@ impl TransferQueue {
             let name = basename(source.path())?;
             let remote = entry_path(&target.parent, &name)?;
             let folder = source.is_directory();
+            let local = source.path().to_owned();
             let op = source.into_operation(
                 remote.clone(),
                 !folder && target.overwrite_files,
@@ -144,11 +146,12 @@ impl TransferQueue {
                 target.preserve_times,
             );
             let transfer = if folder {
-                TransferFile::UploadFolder { remote }
+                TransferFile::UploadFolder { remote, local }
             } else {
                 TransferFile::Upload {
                     name,
                     remote,
+                    local,
                     atomic: target.atomic_files,
                 }
             };
@@ -331,7 +334,10 @@ mod tests {
             );
         }
         assert_eq!(drawer.queue.remaining.len(), 3);
-        drawer.queue.completed_one();
+        let (_, first) = drawer.queue.remaining.pop_front().unwrap();
+        drawer
+            .queue
+            .settle_item(&first, TransferOutcome::Completed, None);
         assert!(drawer.transfer_id(captured.pane) == token);
         let mut status = "Stopped on second item.".to_owned();
         drawer.queue.finish(&mut status);
@@ -344,6 +350,7 @@ mod tests {
     fn reconnect_counts_an_acknowledged_current_item_only_once() {
         let file = TransferFile::UploadFolder {
             remote: "/logs/tree".into(),
+            local: r"C:\upload\tree".into(),
         };
         for reply_value in [None, Some(true), Some(false)] {
             let (sender, mut response) = oneshot::channel();
@@ -359,7 +366,7 @@ mod tests {
                     .unwrap();
             }
             let (status, saved, _) = file.reconnect_status(&mut response, 0, &mut queue);
-            assert!(saved.is_none());
+            assert!(saved.saved.is_none());
             let completed = if reply_value == Some(false) { 2 } else { 1 };
             assert!(
                 status.ends_with(&format!("{completed} of 4 items completed.")),

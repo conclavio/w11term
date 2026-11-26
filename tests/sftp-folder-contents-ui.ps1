@@ -11,7 +11,6 @@ $gate = Join-Path $fixture 'hold-opendir'
 $paused = Join-Path $fixture 'opendir-paused'
 $button = [System.Windows.Automation.ControlType]::Button
 $contents = 'Folder contents' + [char]0x2026
-$properties = 'Properties' + [char]0x2026
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -37,7 +36,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
     Click 'payload.bin'
-    Click $contents
+    Invoke-SftpFolderAction $contents
     Wait-Row 'folder' '/shell directory'
     Wait-Row 'logical-bytes' '5 KiB (5120 bytes)'
     Wait-Row 'files' 'Regular files 2'
@@ -55,7 +54,7 @@ try {
     Wait-Row 'files' 'Regular files 1'
     Click 'Close contents report'
     $null = Wait-Until 'the selected file stays active after closing' {
-        $item = Find-Element $properties $button
+        $item = Find-Element 'Selected entry actions' $button
         $item -and $item.Current.IsEnabled
     }
 } catch {

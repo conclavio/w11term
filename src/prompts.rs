@@ -123,6 +123,10 @@ pub enum Question {
         instructions: String,
         challenges: Vec<Challenge>,
     },
+    IdentityPassphrase {
+        identity: String,
+        retry: bool,
+    },
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Prompt {
@@ -132,6 +136,10 @@ pub struct Prompt {
 pub enum Answer {
     Trust(bool),
     Authentication(Vec<Zeroizing<String>>),
+    IdentityPassphrase {
+        passphrase: Zeroizing<String>,
+        remember: bool,
+    },
     Cancel,
 }
 impl std::fmt::Debug for Answer {
@@ -203,6 +211,9 @@ impl Prompts {
             for challenge in challenges.iter_mut() {
                 challenge.label = sanitize_single_line(&challenge.label, 256);
             }
+        }
+        if let Question::IdentityPassphrase { identity, .. } = &mut question {
+            *identity = sanitize_single_line(identity, 1024);
         }
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let (reply, response) = oneshot::channel();

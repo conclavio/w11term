@@ -94,14 +94,16 @@ pub(super) fn button(
     has_recipients: bool,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
-    Button::new()
+    let (label, glyph) = if open {
+        ("Back to roster and results", "\u{e72b}")
+    } else {
+        ("Preview send order", "\u{e8fd}")
+    };
+    title_tools::button(label)
         .is_enabled(open || has_recipients)
         .on_click(ctx.callback(move |_| Message::HostGroup(Action::PreviewCommandOrder(id, !open))))
-        .content(if open {
-            "Back to roster and results"
-        } else {
-            "Preview send order"
-        })
+        .content(FontIcon::new().glyph(glyph))
+        .tooltip_with(title_tools::below(label))
 }
 
 pub(super) fn preview(

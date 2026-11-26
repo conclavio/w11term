@@ -295,17 +295,31 @@ impl TerminalApp {
 
     pub(super) fn inbox_button(&self, ctx: &ViewContext<Self>) -> View {
         let unread = self.inbox.unread_count();
-        let text = if unread == 0 {
-            "Inbox".into()
+        let name = format!("Attention inbox, {unread} unread");
+        let icon = FontIcon::new().glyph("\u{e7e7}");
+        let content: View = if unread == 0 {
+            icon.into()
         } else {
-            format!("Inbox ({unread})")
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(3.0)
+                .children((
+                    icon,
+                    TextBlock::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .font_size(11.0)
+                        .text(if unread > 9 {
+                            "9+".into()
+                        } else {
+                            unread.to_string()
+                        }),
+                ))
         };
-        Button::new()
-            .style(ButtonStyle::Subtle)
-            .height(36.0)
-            .automation_name(format!("Attention inbox, {unread} unread"))
+        title_tools::button(&name)
+            .width(title_tools::INBOX_WIDTH)
             .on_click(ctx.callback(|_| Message::Attention(Action::Open)))
-            .content(text)
+            .content(content)
+            .tooltip_with(title_tools::below(name))
     }
 
     pub(super) fn attention_view(&self, page: &AttentionPage, ctx: &ViewContext<Self>) -> View {

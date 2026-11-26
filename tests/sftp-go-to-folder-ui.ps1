@@ -66,7 +66,7 @@ try {
     Enter-Path 'missing'
     Wait-FolderError 'missing'
     Listing "$parent/$child" 'witness.txt'
-    if (!(Find-Element 'Copy selected path' $button).Current.IsEnabled) { throw 'Failed navigation cleared the selection' }
+    if (!(Find-Element 'Selected entry actions' $button).Current.IsEnabled) { throw 'Failed navigation cleared the selection' }
     Click 'Back'
     Listing $parent "$child/"
     History-Buttons $false $true

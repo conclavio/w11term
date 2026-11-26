@@ -69,7 +69,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','src/trace.rs')
     Run-Palette 'Open files here'
     Click $filename
-    Click ('Preview text' + [char]0x2026)
+    Invoke-SftpEntryAction ('Preview text' + [char]0x2026)
     Wait-RemotePreview
     [IO.File]::WriteAllText($remoteFile, 'external change after preview', [Text.UTF8Encoding]::new($false))
 

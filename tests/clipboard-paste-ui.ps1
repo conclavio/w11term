@@ -48,8 +48,15 @@ $utf8 = [Text.UTF8Encoding]::new($false,$true)
 $esc = [string][char]27
 $snow = [string][char]0x96ea
 $button = [System.Windows.Automation.ControlType]::Button
+$menu = [System.Windows.Automation.ControlType]::MenuItem
 $profiles = Join-Path $State 'profiles.json'
 $account = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'
+$pasteNotices = @{
+    'multiple lines' = 'The clipboard contains multiple lines.'
+    '5,120' = 'The clipboard exceeds 5,120 UTF-16 code units.'
+    'both' = 'The clipboard contains multiple lines and exceeds 5,120 UTF-16 code units.'
+    'control characters' = 'The clipboard contains control or escape characters.'
+}
 
 function Set-FixtureClipboard([string]$Value) {
     if (!$realClipboard) { [IO.File]::WriteAllText($env:W11TERM_TEST_PASTE_FILE,$Value,$utf8); return }
@@ -79,10 +86,19 @@ function Fence([string]$Text) {
     $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64',[Convert]::ToBase64String($utf8.GetBytes($Text)))
     Expect-Bytes $Text
 }
+function Terminal-Marker([string]$Text) {
+    foreach ($char in $Text.ToCharArray()) { Post-Key 0x102 ([uint32]$char) }
+    Expect-Bytes $Text
+}
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" { $b = Find-Element $Name $button; if ($b -and $b.Current.IsEnabled) { $b } })
 }
 function Start-Paste([string]$Route) {
+    if ($realClipboard) {
+        $null = Wait-Until "the fixture window to own foreground before $Route paste" {
+            [FixtureMessages]::GetForegroundWindow() -eq $window
+        }
+    }
     if ($realClipboard -and $Route -eq 'Right') { [PastePointer]::RightClick($window); return }
     if ($realClipboard -and $Route -in 'CtrlV','CtrlAltV') {
         if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'Fixture does not own keyboard input' }
@@ -92,26 +108,45 @@ function Start-Paste([string]$Route) {
     }
     $raw = $Route -in 'Raw','CtrlAltV'
     $name = if ($raw) { 'Paste raw (no bracketed paste)' } else { 'Paste' }
-    Click 'Tab menu'
-    Invoke-Button (Wait-Until "caret action '$name'" {
-        $item = Find-Element $name ([System.Windows.Automation.ControlType]::MenuItem)
-        if ($item -and $item.Current.IsEnabled) { $item }
-    })
+    Invoke-Button (Get-NativeMenuAction 'Tab menu' $name -Submenu 'Clipboard' -VisibleItem)
+    $null = Wait-Until 'the paste flyout closes' {
+        !(Find-Element $name $menu -Visible) -and !(Find-Element 'Clipboard' $menu -Visible)
+    }
 }
 function Wait-Prompt([string]$Primary, [string]$Reason) {
-    $notice = switch ($Reason) {
-        'multiple lines' { 'The clipboard contains multiple lines.' }
-        '5,120' { 'The clipboard exceeds 5,120 UTF-16 code units.' }
-        default { throw "Unknown confirmation reason '$Reason'" }
-    }
-    $null = Wait-Until 'native paste confirmation for the source SSH pane' {
-        (Find-Element 'Confirm paste') -and (Find-Element $Primary $button) -and
-            (Find-Element "Paste into $($account.user)@$($account.host):$($account.port) (pane $remote).") -and
-            (Find-Element $notice)
+    $notice = $pasteNotices[$Reason]
+    if (!$notice) { throw "Unknown confirmation reason '$Reason'" }
+    $destination = "Paste into $($account.user)@$($account.host):$($account.port) (pane $remote)."
+    try {
+        $null = Wait-Until "'$Primary' confirmation for pane $remote with '$Reason' warning" {
+            (Find-Element 'Confirm paste' -Visible) -and (Find-Element $Primary $button -Visible) -and
+                (Find-Element $destination -Visible) -and (Find-Element $notice -Visible)
+        }
+    } catch {
+        $dialog = [bool](Find-Element 'Confirm paste' -Visible)
+        $action = [bool](Find-Element $Primary $button -Visible)
+        $matchesPane = [bool](Find-Element $destination -Visible)
+        $warnings = @($pasteNotices.Keys | Sort-Object | Where-Object {
+            Find-Element $pasteNotices[$_] -Visible
+        }) -join ', '
+        throw "$_ Dialog=$dialog Action=$action Destination=$matchesPane Warnings=[$warnings] Foreground=$([FixtureMessages]::GetForegroundWindow()) Fixture=$window"
     }
 }
 function Wait-NoPrompt {
     $null = Wait-Until 'paste confirmation dismissed' { !(Find-Element 'Confirm paste') }
+}
+function Wait-TerminalInput {
+    Wait-NoPrompt
+    # The dialog can disappear from UI Automation before WinUI delivers Closed
+    # and restores the terminal key handler. Probe it with a local shortcut.
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    $null = Wait-Until 'terminal shortcuts restored after paste confirmation' {
+        if (Find-Element 'Search commands' $edit) { return $true }
+        Press-Key 0x76
+    }
+    $null = Wait-PickerEditor 'Search commands' 'terminal input probe'
+    Press-Key 27
+    $null = Wait-Until 'terminal input probe closed' { !(Find-Element 'Search commands' $edit) }
 }
 function Finish-ObsoletePrompt($OldButton) {
     if (Find-Element 'Confirm paste') {
@@ -120,11 +155,35 @@ function Finish-ObsoletePrompt($OldButton) {
     }
     Wait-NoPrompt
 }
+function Get-MultilinePasteChoice {
+    Find-Element 'Multiline paste warning' ([System.Windows.Automation.ControlType]::ComboBox)
+}
+function Get-SelectedMultilinePasteChoice {
+    $field = Get-MultilinePasteChoice
+    if ($field) {
+        $selection = @($field.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection())
+        if ($selection.Count -eq 1) { $selection[0].Current.Name }
+    }
+}
 function Choose-Setting([string]$Name) {
-    $choice = Wait-Until "multiline paste preference '$Name'" {
-        Find-Element $Name ([System.Windows.Automation.ControlType]::RadioButton)
+    $field = Wait-Until 'multiline paste warning dropdown' { Get-MultilinePasteChoice }
+    $field.SetFocus()
+    $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $choice = Wait-Until "visible multiline paste option '$Name'" {
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem) -Visible
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until "multiline paste option '$Name' selected" {
+        (Get-SelectedMultilinePasteChoice) -ceq $Name
+    }
+    $dropdown = (Get-MultilinePasteChoice).GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($dropdown.Current.ExpandCollapseState -eq 'Expanded') { $dropdown.Collapse() }
+}
+function Read-InteractionSettings {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($env:W11TERM_SETTINGS_PATH, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $reader = [IO.StreamReader]::new($stream)
+    try { ($reader.ReadToEnd() | ConvertFrom-Json).interaction } finally { $reader.Dispose() }
 }
 function Back-ToSsh {
     $tab = Wait-Until 'SSH terminal tab' { Find-Element 'palette-ssh' ([System.Windows.Automation.ControlType]::TabItem) }
@@ -147,8 +206,8 @@ try {
     Start-Paste 'CtrlV'
     Wait-Prompt 'Paste' 'multiple lines'
     Click 'Cancel'
-    Wait-NoPrompt
-    Fence 'after-cancel/'
+    Wait-TerminalInput
+    Terminal-Marker 'after-cancel/'
     Start-Paste 'CtrlV'
     Wait-Prompt 'Paste' 'multiple lines'
     Set-FixtureClipboard 'discard-replacement'
@@ -181,20 +240,23 @@ try {
     Start-Paste 'Raw'
     Wait-Prompt 'Paste raw' '5,120'
     Click 'Cancel'
-    Wait-NoPrompt
-    Fence 'after-large/'
+    Wait-TerminalInput
+    Terminal-Marker 'after-large/'
 
     Run-Palette 'Settings'
+    $null = Wait-Until 'Automatic multiline paste option selected by default' {
+        (Get-SelectedMultilinePasteChoice) -ceq 'Automatic'
+    }
     Choose-Setting 'Always'
     $null = Wait-Until 'saved Always multiline preference' {
-        (Get-Content $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).interaction.multiLinePasteWarning -ceq 'always'
+        (Read-InteractionSettings).multiLinePasteWarning -ceq 'always'
     }
     Back-ToSsh
     Set-FixtureClipboard $wrapped
     Start-Paste 'Normal'
     Wait-Prompt 'Paste' 'multiple lines'
     Click 'Cancel'
-    Wait-NoPrompt
+    Wait-TerminalInput
 
     # A reconnect may close the dialog immediately or invalidate its ticket
     # on acceptance. Either path must leave the new transport untouched.
@@ -221,15 +283,21 @@ try {
     if ((Control @('get-text','--pane',"$local")).text.Contains('discard-focus')) { throw 'Pending SSH text reached PowerShell' }
     Back-ToSsh
     Run-Palette 'Settings'
+    $null = Wait-Until 'saved Always multiline paste option restored in Settings' {
+        (Get-SelectedMultilinePasteChoice) -ceq 'Always'
+    }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $byName = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Warn about large pastes')
     $canToggle = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::IsTogglePatternAvailableProperty,$true)
     $condition = [System.Windows.Automation.AndCondition]::new($byName,$canToggle)
     $toggle = Wait-Until 'large paste warning switch' { $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition) }
     $toggle.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+    $null = Wait-Until 'saved large paste warning is off' {
+        (Read-InteractionSettings).largePasteWarning -eq $false
+    }
     Choose-Setting 'Never'
     $null = Wait-Until 'both warning preferences saved' {
-        $settings = (Get-Content $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).interaction
+        $settings = Read-InteractionSettings
         $settings.multiLinePasteWarning -ceq 'never' -and $settings.largePasteWarning -eq $false
     }
     Back-ToSsh

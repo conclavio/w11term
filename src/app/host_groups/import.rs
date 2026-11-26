@@ -8,10 +8,9 @@ mod profiles;
 mod ranges;
 mod review;
 mod save_group;
-pub(super) use profiles::button as saved_profiles_button;
 use review::{Approval, Review};
 
-const LABEL: &str = "Import host list…";
+pub(super) const LABEL: &str = "Import host list…";
 
 #[derive(Default)]
 pub(super) struct State {
@@ -68,8 +67,8 @@ impl Draft {
         if let Some(profiles) = &self.profiles {
             return profiles.rows(catalog);
         }
-        let auth =
-            ssh_authentication(self.authentication, &self.identity).map_err(|e| e.to_string());
+        let auth = ssh_authentication(self.authentication, &self.identity, "", "")
+            .map_err(|e| e.to_string());
         list::build(&self.text, &self.default_user, catalog, path, auth)
     }
 
@@ -115,14 +114,6 @@ impl State {
             Ok(None) => {}
             Err(error) => draft.error = Some(format!("Could not open the host list. {error}")),
         }
-    }
-
-    pub(super) fn button(id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
-        Button::new()
-            .on_click(
-                ctx.callback(move |_| Message::HostGroup(super::Action::Import(id, Action::Begin))),
-            )
-            .content(LABEL)
     }
 
     pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> Option<View> {
@@ -192,7 +183,7 @@ impl State {
                 TextBlock::new().text("Authentication for new hosts"),
                 ComboBox::new()
                     .automation_name("Authentication for new hosts")
-                    .items_source(SSH_AUTH_LABELS)
+                    .items_source(SSH_AUTH_LABELS[..SPECIFIC_AGENT_KEY_AUTH].to_vec())
                     .selected_index(draft.authentication)
                     .on_selection_changed(ctx.callback(move |value: Option<usize>| {
                         value.map_or(Message::ControlIdle, |index| action(Change::Authentication(index)))

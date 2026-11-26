@@ -232,6 +232,7 @@ impl TerminalApp {
     }
 
     pub(super) fn window_tick(&mut self, ctx: &ComponentContext<Self>) {
+        self.poll_running_interrupt();
         if let Some(offer) = self
             .incoming
             .as_ref()
@@ -284,7 +285,11 @@ impl TerminalApp {
                 TransferPhase::Opening | TransferPhase::Offered => {}
             }
         }
-        if self.native_bound && self.outgoing.is_none() && self.incoming.is_none() {
+        if self.native_bound
+            && self.outgoing.is_none()
+            && self.incoming.is_none()
+            && self.running_interrupt_pending.is_none()
+        {
             self.window_timer = None;
         } else {
             self.arm_window_tick(ctx);

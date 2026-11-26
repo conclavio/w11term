@@ -451,7 +451,7 @@ impl TerminalApp {
         let mut renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size(),
+            appearance.terminal_font_size_for(tab.font_size_override()),
         )?;
         renderer.live_cursor = Some(surface.cursor_blink.clone());
         let renderer = RefCell::new(renderer);
@@ -465,6 +465,7 @@ impl TerminalApp {
         let windows = self.windows.clone();
         let window_size = surface.window_size.clone();
         let window_grid = surface.window_grid.clone();
+        let remember_grid = tab.pane_font_size.get().is_none();
         let area = surface.area.clone();
         let selection = tab.selection.clone();
         let read_only = tab.read_only.clone();
@@ -536,7 +537,10 @@ impl TerminalApp {
             );
             let window_mode = window_grid.get();
             if matches!(window_mode, WindowGrid::Terminal) {
-                if initial_grid
+                if !remember_grid {
+                    // The next launch will use the profile or window text size again.
+                    windows.borrow_mut().grid = None;
+                } else if initial_grid
                     .get()
                     .is_none_or(|grid| grid == (measured.cols, measured.rows))
                 {
@@ -550,20 +554,38 @@ impl TerminalApp {
                     measured.scale,
                 );
             }
-            if !matches!(window_mode, WindowGrid::Off)
-                && let Some(((cols, rows), first)) =
-                    initial_grid.correction((measured.cols, measured.rows))
-            {
-                let (width, height) = window_size.get();
-                geometry_sender.send(Message::Geometry(
-                    width + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width) as f64,
-                    height
-                        + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
-                            - ctx.height) as f64,
-                    initial_grid.epoch(),
-                    first,
-                ));
-                return Ok(());
+            if !matches!(window_mode, WindowGrid::Off) && initial_grid.get().is_some() {
+                use crate::window_state::GridCorrection;
+                let scale = measured.scale;
+                let pixels = (
+                    (ctx.width * scale).round() as u32,
+                    (ctx.height * scale).round() as u32,
+                    (96.0 * scale).round() as u32,
+                );
+                match initial_grid.correction((measured.cols, measured.rows), pixels) {
+                    GridCorrection::Publish => {}
+                    GridCorrection::Wait => return Ok(()),
+                    GridCorrection::Resize { cols, rows, first } => {
+                        let (width, height) = native_window.hwnd()
+                            .and_then(|hwnd| crate::window_state::client_extent(hwnd, scale))
+                            .unwrap_or_else(|| window_size.get());
+                        log::debug!(
+                            "Correcting pane grid {}x{} to {cols}x{rows} from viewport {}x{} and client {width}x{height}",
+                            measured.cols, measured.rows, ctx.width, ctx.height
+                        );
+                        // Aim inside each cell to tolerate native pixel rounding.
+                        geometry_sender.send(Message::Geometry {
+                            client: (width, height),
+                            delta: (
+                                f64::from((cols as f32 + 0.5) * measured.cell_width + PADDING * 2.0 - ctx.width),
+                                f64::from((rows as f32 + 0.5) * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT - ctx.height),
+                            ),
+                            epoch: initial_grid.epoch(),
+                            first,
+                        });
+                        return Ok(());
+                    }
+                }
             }
             let size = terminal_size(measured);
             if last_size.replace(Some(size)) != Some(size) {

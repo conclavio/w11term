@@ -27,7 +27,11 @@ function Menu-Route([string[]]$Path) {
     Click 'Tab menu'
     $menu = [System.Windows.Automation.ControlType]::MenuItem
     foreach ($name in $Path) {
-        $item = Wait-Until "menu item '$name'" { Find-Element $name $menu }
+        $item = Wait-Until "enabled menu item '$name'" {
+            # Long native submenus expose invokable entries outside their scroll viewport.
+            $entry = Find-Element $name $menu -Visible:($name -ceq $Path[0])
+            if ($entry -and $entry.Current.IsEnabled) { $entry }
+        }
         if ($name -ceq $Path[-1]) { Invoke-Button $item }
         else { $item.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand() }
     }
@@ -134,6 +138,14 @@ try {
     Finish-Editor 'Use default' 'Tab name' $right
     Caption $alias
 
+    $baselineHeight = Wait-Until 'measured cells before pane zoom' { Get-PaneCellHeight $right }
+    Wait-Focus $right
+    Run-Palette 'Increase pane text size'
+    $zoomedHeight = Wait-Until 'larger cells in the named pane' {
+        $height = Get-PaneCellHeight $right
+        if ($height -gt $baselineHeight) { $height }
+    }
+
     Menu-Route @($workspaces)
     $workspaceName = Wait-Until 'workspace name' { Find-Element 'Workspace name' $edit }
     $workspaceName.GetCurrentPattern($value).SetValue('pane-names')
@@ -143,6 +155,9 @@ try {
     $saved = $catalog.workspaces.'pane-names'.tabs[0]
     if ($saved.layout.second.pane_name -cne $alias -or $saved.layout.first.PSObject.Properties.Name -contains 'pane_name' -or
         $saved.title -or $saved.focused -ne $saved.layout.second.slot) { throw 'Pane name or focus serialized on the wrong workspace leaf' }
+    if (!$saved.layout.second.font_size -or $saved.layout.first.PSObject.Properties.Name -contains 'font_size') {
+        throw 'Workspace should record text size only for the pane with explicit zoom'
+    }
 
     Picker-Query $alias
     Press-Key 13
@@ -152,6 +167,9 @@ try {
     $field.SetValue('Discarded')
     Finish-Editor 'Cancel' 'Pane name' $right
     Wait-Names $right $left $alias 'changed-by-shell'
+    # Prove the window has handed typing back to the terminal before opening
+    # another native flyout. The dialog can disappear before that happens.
+    Marker $right $left 'rename-cancel-return/'
     $field = Open-Editor $paneRename 'Pane name'
     if ($field.Current.Value -cne $alias) { throw 'Cancelling persisted the pending name' }
     Finish-Editor 'Use default' 'Pane name' $right
@@ -172,6 +190,10 @@ try {
     $restoredRight = ($restored | Where-Object pane_name -ceq $alias).id
     $restoredLeft = ($restored | Where-Object id -ne $restoredRight).id
     Wait-Names $restoredRight $restoredLeft $alias $shared
+    $null = Wait-Until 'workspace restores just the named pane at its saved text size' {
+        (Get-PaneCellHeight $restoredRight) -eq $zoomedHeight -and
+            (Get-PaneCellHeight $restoredLeft) -eq $baselineHeight
+    }
     Caption $alias
     Marker $restoredRight $restoredLeft 'restored-input/'
     Wait-Names $right $left '' 'changed-by-shell'

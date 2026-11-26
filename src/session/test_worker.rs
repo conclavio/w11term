@@ -297,7 +297,8 @@ pub(super) async fn with_worker(
     let initial = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
     let frames = FrameStore::new(initial.clone());
     let (_notices, notices) = mpsc::channel(1);
-    let worker = run(
+    // Keep the worker future out of the paused-clock driver's stack frame.
+    let worker = Box::pin(run(
         source,
         terminal,
         commands,
@@ -315,7 +316,7 @@ pub(super) async fn with_worker(
             durable: None,
             replay_ready: true,
         },
-    );
+    ));
     let client = async {
         exercise(input.clone(), frames).await;
         input.send(Command::Shutdown).unwrap();

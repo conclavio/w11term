@@ -125,10 +125,15 @@ impl Appearance {
     }
 
     pub fn terminal_font_size(&self) -> f32 {
+        self.terminal_font_size_for(None)
+    }
+
+    pub fn terminal_font_size_for(&self, base: Option<f32>) -> f32 {
+        let size = base.unwrap_or(self.font_size);
         if self.follow_windows_text_size {
-            self.font_size * self.windows_text_scale
+            size * self.windows_text_scale
         } else {
-            self.font_size
+            size
         }
     }
 

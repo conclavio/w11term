@@ -2,7 +2,7 @@ use super::{Action as HostAction, address, *};
 use anyhow::{Context, Result, ensure};
 use std::{fmt, io::Write};
 
-const LABEL: &str = "Export host list…";
+pub(super) const LABEL: &str = "Export host list…";
 
 #[derive(Default)]
 pub(super) struct State {
@@ -97,22 +97,6 @@ fn word(value: &str, extra: &[u8]) -> bool {
     value
         .bytes()
         .all(|ch| ch.is_ascii_alphanumeric() || extra.contains(&ch))
-}
-
-pub(super) fn button(id: TabId, selected: &[Target], ctx: &ViewContext<TerminalApp>) -> View {
-    let selected = selected
-        .iter()
-        .map(|target| target.pane)
-        .collect::<BTreeSet<_>>();
-    Button::new()
-        .is_enabled(!selected.is_empty())
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(HostAction::HostListExport(
-                id,
-                Action::Open(selected.clone()),
-            ))
-        }))
-        .content(LABEL)
 }
 
 impl State {

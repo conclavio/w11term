@@ -611,7 +611,7 @@ impl Registry {
 
     pub(super) async fn follow_ssh_group_output(
         &self,
-        pipe: &mut NamedPipeServer,
+        pipe: &mut (impl AsyncWrite + Unpin),
         follow: GroupOutputFollow,
     ) -> Result<()> {
         let GroupOutputFollow {
@@ -684,10 +684,8 @@ impl Registry {
         }
         let mut next_after_line = output.latest_line;
         if let (Some(mut incoming), Some(mut retained)) = (output.incoming, retained) {
-            let mut disconnect = [0];
             loop {
                 let received = tokio::select! {
-                    _ = pipe.read(&mut disconnect) => return Ok(()),
                     _ = retained.changed() => {
                         return write_reply(pipe, Err(anyhow::anyhow!(
                             "SSH group run {run} is no longer retained in tab {tab} of window {window}"

@@ -1,3 +1,4 @@
+use super::{ChildrenControl, KeyedView, StackPanel, TextBlock, TextWrapping, View};
 use std::{
     collections::HashMap,
     io::{self, Write},
@@ -284,6 +285,44 @@ pub(super) fn write_changes(
         let (body, ending) = line_parts(text);
         writeln!(file, "{} line {line} · {body}{ending}\r", edit.verb())
     })
+}
+
+pub(super) fn output_view(
+    result: Option<&Result<Difference, &'static str>>,
+    identical: &str,
+) -> View {
+    let text = |value: &str| {
+        TextBlock::new()
+            .text(value)
+            .text_wrapping(TextWrapping::Wrap)
+    };
+    match result {
+        None => text("Comparing output lines…").into(),
+        Some(Err(message)) => text(message).into(),
+        Some(Ok(diff)) if diff.changes.is_empty() => text(identical).into(),
+        Some(Ok(diff)) => StackPanel::new().spacing(5.0).children((
+            if diff.unaligned {
+                text("The changed sections are too large to align. Lines are shown by source.")
+                    .into()
+            } else {
+                View::empty()
+            },
+            if diff.limited {
+                text("More changed lines are available in the full output.").into()
+            } else {
+                View::empty()
+            },
+            StackPanel::new()
+                .spacing(4.0)
+                .keyed_children(diff.changes.iter().enumerate().map(|(index, change)| {
+                    let verb = change.edit.verb();
+                    KeyedView::new(
+                        index,
+                        text(&format!("{verb} line {} · {}", change.line, change.text)),
+                    )
+                })),
+        )),
+    }
 }
 
 #[cfg(test)]

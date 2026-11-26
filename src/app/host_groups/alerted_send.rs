@@ -171,20 +171,6 @@ impl State {
     }
 }
 
-pub(super) fn button(
-    id: TabId,
-    offer: CommandOffer,
-    enabled: bool,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    Button::new()
-        .is_enabled(enabled)
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(super::Action::AlertedSend(id, Action::Open(offer.clone())))
-        }))
-        .content("Send with alert…")
-}
-
 impl TerminalApp {
     pub(super) fn handle_alerted_send(
         &mut self,

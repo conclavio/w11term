@@ -9,7 +9,9 @@ $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 $fingerprint = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.host_key
 $aliasName = 'imported-loopback'
-$localPort = [int][IO.File]::ReadAllText((Join-Path $State 'local-port'))
+$importedPort = [int][IO.File]::ReadAllText((Join-Path $State 'local-port'))
+$manualPort = [int][IO.File]::ReadAllText((Join-Path $State 'manual-port'))
+$localPort = $importedPort
 $remotePort = [int][IO.File]::ReadAllText((Join-Path $State 'target-port'))
 $wildcard = [int][IO.File]::ReadAllText((Join-Path $State 'wildcard-port'))
 $token = [IO.File]::ReadAllText((Join-Path $State 'token'))
@@ -63,9 +65,16 @@ function Select-Keyless {
         Find-Element 'None (keyless server)' ([System.Windows.Automation.ControlType]::ListItem)
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'keyless authentication selected in the profile editor' {
+        $current = Find-Element 'Authentication' ([System.Windows.Automation.ControlType]::ComboBox)
+        if ($current) {
+            $selected = $current.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            $selected.Count -eq 1 -and $selected[0].Current.Name -ceq 'None (keyless server)'
+        }
+    }
 }
 function Saved-Profile { ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.$aliasName }
-function Assert-OnlySupportedPair {
+function Assert-OnlyPair {
     $pairs = @( (Saved-Profile).local_forwards )
     if ($pairs.Count -ne 1 -or $pairs[0].local_port -ne $localPort -or $pairs[0].remote_port -ne $remotePort) {
         throw "Unexpected saved forwarding presets: $($pairs | ConvertTo-Json -Compress)"
@@ -74,8 +83,10 @@ function Assert-OnlySupportedPair {
 function Apply-Preset {
     Click $use
     Click $preset $menu
-    $null = Wait-Until 'preset fills both draft fields' {
-        (Field 'Remote localhost port').Current.Value -ceq "$remotePort" -and (Field 'Windows local port').Current.Value -ceq "$localPort"
+    $route = "Windows 127.0.0.1:$localPort " + [char]0x2192 + " remote 127.0.0.1:$remotePort"
+    $null = Wait-Until 'preset fills both draft fields and previews the route' {
+        (Field 'Remote localhost port').Current.Value -ceq "$remotePort" -and
+            (Field 'Windows local port').Current.Value -ceq "$localPort" -and (Find-Element $route $text)
     }
     if (Find-Element "Stop forwarding port $localPort" $button) { throw 'Selecting a preset created a listener' }
     Expect-Refused $localPort
@@ -114,7 +125,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
             if (Saved-Profile) { throw 'Preview saved a profile before confirmation' }
             Click 'Save profile'
             $null = Wait-Until 'saved imported profile' { Find-Element "Saved profile $aliasName" $text }
-            Assert-OnlySupportedPair
+            Assert-OnlyPair
             Expect-Refused $localPort
             Expect-Refused $wildcard
             # The imported config defaults to the Windows agent. Configure the
@@ -123,12 +134,56 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Click "Edit profile $aliasName"
             Select-Keyless
             (Field 'Host fingerprint').SetValue($fingerprint)
-            Click 'Save profile changes'
-            $null = Wait-Until 'pinned keyless profile saved' {
-                $saved = Saved-Profile
-                $saved.auth -ceq 'none' -and $saved.host_key -ceq $fingerprint
+            $null = Wait-Until 'the editor displays the fixture host fingerprint' {
+                (Field 'Host fingerprint').Current.Value -ceq $fingerprint
             }
-            Assert-OnlySupportedPair
+            Click 'Save profile changes'
+            # Await commit feedback before opening the catalog. ReadAllText can
+            # otherwise deny delete sharing while the editor replaces that file.
+            $null = Wait-Until 'keyless profile save completed' { Find-Element 'Changes saved.' $text }
+            $saved = Saved-Profile
+            if ($saved.auth -cne 'none' -or $saved.host_key -cne $fingerprint) {
+                throw "The editor saved the wrong authentication or fingerprint for $aliasName"
+            }
+            Assert-OnlyPair
+
+            Set-NativeExpansion 'Saved local forwards' $true
+            $removeImported = "Remove $preset"
+            $null = Wait-Until 'imported pair has a Remove action' { Find-Element $removeImported $button }
+            $windowsPort = Field 'Saved forward Windows port'
+            (Field 'Saved forward remote port').SetValue("$remotePort")
+            $windowsPort.SetValue("$manualPort")
+            $null = Wait-Until 'manual pair can be added' {
+                (Find-Element 'Add saved forward' $button).Current.IsEnabled
+            }
+            $windowsPort.SetValue('0')
+            $null = Wait-Until 'zero cannot be saved as a port' {
+                $add = Find-Element 'Add saved forward' $button
+                $add -and !$add.Current.IsEnabled
+            }
+            $windowsPort.SetValue("$importedPort")
+            $null = Wait-Until 'the existing pair still cannot be added' {
+                $add = Find-Element 'Add saved forward' $button
+                $add -and !$add.Current.IsEnabled -and $windowsPort.Current.Value -ceq "$importedPort"
+            }
+            $windowsPort.SetValue("$manualPort")
+            Click 'Add saved forward'
+            $localPort = $manualPort
+            $preset = "Windows $localPort " + [char]0x2192 + " remote $remotePort"
+            $null = Wait-Until 'the manually entered pair is staged' { Find-Element "Remove $preset" $button }
+            $localPort = $importedPort
+            Assert-OnlyPair
+            Click $removeImported
+            $null = Wait-Until 'imported pair has been removed from the draft' {
+                !(Find-Element $removeImported $button)
+            }
+            Set-NativeExpansion 'Saved local forwards' $false
+            Click 'Save profile changes'
+            $null = Wait-Until 'edited pairs saved with the profile' { Find-Element 'Changes saved.' $text }
+            $localPort = $manualPort
+            Assert-OnlyPair
+            Expect-Refused $importedPort
+            Expect-Refused $localPort
             continue
         }
         $pane = ((Control @('list')).sessions | Where-Object label -eq $aliasName).id
@@ -142,6 +197,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
         $client = Open-Client $localPort
         Confirm-HttpEcho $client
         Expect-Refused $wildcard
+        Expect-Refused $importedPort
         [IO.File]::Delete([IO.File]::ReadAllText((Join-Path $State 'disconnect-gate')))
         Expect-Closed $client
         $null = Wait-Until 'same imported pane on a new SSH transport' {
@@ -154,7 +210,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
         Wait-Focus $pane
         Run-Palette $action
         Apply-Preset
-        Assert-OnlySupportedPair
+        Assert-OnlyPair
     } catch {
         $failure = "$_ on launch $launch at $($_.ScriptStackTrace)"
         if ($launch -eq 1 -and !$app.HasExited) {

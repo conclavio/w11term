@@ -54,6 +54,16 @@ public static class FixtureDialog {
         return String.Equals(DiskPath(selected), DiskPath(reported), StringComparison.OrdinalIgnoreCase);
     }
 
+    public static bool SameDestination(string expected, string reported) {
+        if (!String.Equals(Path.GetFileName(expected), Path.GetFileName(reported), StringComparison.OrdinalIgnoreCase)) {
+            return false;
+        }
+        // A cancelled transfer can report a destination that was never created.
+        string parent = Path.GetDirectoryName(reported);
+        return Directory.Exists(parent) && String.Equals(
+            DirectoryPath(Path.GetDirectoryName(expected)), DirectoryPath(parent), StringComparison.OrdinalIgnoreCase);
+    }
+
     public static IntPtr[] Windows(uint process) {
         var result = new List<IntPtr>();
         EnumWindows((hwnd, _) => {

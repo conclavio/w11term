@@ -1,8 +1,8 @@
-use super::{reconnect::Attempt, *};
+use super::*;
 use w11term::events::{SshAttemptCompletion, SshLoginResult};
 
 pub enum Action {
-    Arm(Vec<Attempt>),
+    Arm(Vec<PendingPaneAttempt>),
     Cancel(u64),
 }
 
@@ -18,7 +18,7 @@ struct Watch {
 }
 
 struct WatchedHost {
-    attempt: Attempt,
+    attempt: PendingPaneAttempt,
     host: String,
     completion: SshAttemptCompletion,
 }
@@ -31,7 +31,7 @@ impl State {
     pub(super) fn button(
         &self,
         id: TabId,
-        pending: &[Attempt],
+        pending: &[PendingPaneAttempt],
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         if let Some(watch) = &self.watch {
