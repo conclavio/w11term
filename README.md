@@ -665,6 +665,8 @@ Choose **Open in new window** beside a saved workspace to restore its layout in 
 
 Choose **Manage…** beside a saved workspace to rename or remove it. A renamed workspace still switches to its existing window. Removing the saved layout asks for confirmation and leaves any open windows and sessions running. If you save a new workspace under the old name, it has its own identity.
 
+In **Manage…**, choose **Duplicate…** to save the recipe under another name. The copy keeps the original tab layout and profile references, has its own identity for **Switch workspace**, and can be managed independently. Saving the copy does not open it.
+
 Existing catalogs load automatically. Saving or editing a workspace writes catalog version 2, which requires a build with workspace management support.
 
 Each restored pane receives a new process-local control ID. SSH panes normally start a fresh shell. A saved durable pane can return to its original shell. Named profile references use the current profile settings. Ad-hoc SSH panes retain their connection options and key paths. Replay panes reference their original capture files. Workspaces are stored in `%LOCALAPPDATA%\w11term\workspaces.json`, or in `W11TERM_DATA_DIR` when set.

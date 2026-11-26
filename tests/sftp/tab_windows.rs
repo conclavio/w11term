@@ -112,6 +112,12 @@ async fn native_workspace_replacement_requires_a_current_review() {
     run("ReplaceWorkspace", b"after-review/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "duplicates the saved recipe before opening it in an independently registered window"]
+async fn native_duplicate_saved_workspace_registers_independently_when_opened() {
+    run("CopyWorkspace", b"copy-recipe/original-recipe/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -159,7 +165,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         "shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}})
     };
     let leaf = |slot, source: Value| json!({"type":"leaf","slot":slot,"source":source});
-    let workspace = json!({"active_tab": usize::from(matches!(first_close, "Context" | "WorkspaceWindow")),"tabs":[
+    let workspace = json!({"active_tab": usize::from(matches!(first_close, "Context" | "WorkspaceWindow" | "CopyWorkspace")),"tabs":[
         {"title":"Cockpit tools","focused":1,"layout":{"type":"split","axis":"columns","ratio":0.375,
             "first":leaf(1,json!({"kind":"saved_profile","value":"window-ssh"})),
             "second":leaf(2,local("Moved PowerShell"))}},
@@ -169,6 +175,11 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     if matches!(first_close, "WorkspaceWindow" | "ManageWorkspace") {
         workspaces["broken-copy"] = json!({"active_tab":0,"tabs":[
             {"focused":1,"layout":leaf(1,json!({"kind":"saved_profile","value":"missing-window-profile"}))}
+        ]});
+    }
+    if first_close == "CopyWorkspace" {
+        workspaces["two-windows copy"] = json!({"active_tab":0,"tabs":[
+            {"focused":1,"layout":leaf(1,json!({"kind":"demo"}))}
         ]});
     }
     fs::write(
@@ -201,7 +212,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     );
     let expected_ssh = 1 + usize::from(matches!(
         first_close,
-        "ProfileWindow" | "DuplicateWindow" | "WorkspaceWindow"
+        "ProfileWindow" | "DuplicateWindow" | "WorkspaceWindow" | "CopyWorkspace"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

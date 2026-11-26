@@ -543,6 +543,10 @@ pub enum WorkspaceIdentity {
 }
 
 impl WorkspaceIdentity {
+    fn fresh() -> Self {
+        Self::Unique(format!("{:032x}", rand::random::<u128>()))
+    }
+
     fn validate(&self) -> Result<()> {
         match self {
             Self::Legacy(name) => validate_name(name),
@@ -710,7 +714,7 @@ impl WorkspaceStore {
             let identity = if catalog.workspaces.contains_key(name) {
                 catalog.identity(name)
             } else {
-                WorkspaceIdentity::Unique(format!("{:032x}", rand::random::<u128>()))
+                WorkspaceIdentity::fresh()
             };
             let registration = prepare(&identity)?;
             catalog
@@ -735,6 +739,30 @@ impl WorkspaceStore {
             catalog
                 .identities
                 .insert(new.to_owned(), expected.identity.clone());
+            Ok(catalog.workspaces.keys().cloned().collect())
+        })
+    }
+
+    /// Copy a saved recipe without launching it or changing the source's registration.
+    pub fn duplicate(
+        &self,
+        source: &str,
+        name: &str,
+        expected: &WorkspaceEntry,
+    ) -> Result<Vec<String>> {
+        validate_name(name)?;
+        self.edit(|catalog| {
+            catalog.check_entry(source, expected)?;
+            ensure!(
+                !catalog.workspaces.contains_key(name),
+                "Workspace {name} already exists"
+            );
+            catalog
+                .workspaces
+                .insert(name.to_owned(), expected.layout.clone());
+            catalog
+                .identities
+                .insert(name.to_owned(), WorkspaceIdentity::fresh());
             Ok(catalog.workspaces.keys().cloned().collect())
         })
     }
@@ -1344,6 +1372,34 @@ mod tests {
         assert_eq!(updated.identity, original.identity);
         assert_eq!(updated.layout, changed);
         assert!(store.rename("desk", "renamed", &updated).is_ok());
+    }
+
+    #[test]
+    fn duplication_preserves_the_saved_recipe_and_checks_both_names_under_the_catalog_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
+        let original = Workspace::capture([(&Layout::Leaf(5), 5)], 0, |_| {
+            Ok(SavedSource::SavedProfile("not currently configured".into()))
+        })
+        .unwrap();
+        store.save("ops", &original).unwrap();
+        store.save("occupied", &demo()).unwrap();
+        let source = store.entry("ops").unwrap();
+        assert!(store.duplicate("ops", "occupied", &source).is_err());
+        assert_eq!(store.entry("occupied").unwrap().layout, demo());
+        assert_eq!(
+            store.duplicate("ops", "ops copy", &source).unwrap(),
+            ["occupied", "ops", "ops copy"]
+        );
+        let copy = store.entry("ops copy").unwrap();
+        assert_ne!(copy.identity, source.identity);
+        assert_eq!(copy.layout, source.layout);
+        assert_eq!(store.entry("ops").unwrap(), source);
+
+        store.save("ops", &demo()).unwrap();
+        assert!(store.duplicate("ops", "stale", &source).is_err());
+        assert!(store.entry("stale").is_err());
+        assert_eq!(store.entry("ops copy").unwrap(), copy);
     }
 
     #[test]

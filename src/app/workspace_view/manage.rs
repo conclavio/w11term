@@ -5,7 +5,19 @@ pub(super) struct Editor {
     original: String,
     entry: WorkspaceEntry,
     name: String,
-    confirm_removal: bool,
+    mode: Mode,
+}
+
+enum Mode {
+    Manage,
+    ConfirmRemoval,
+    Duplicate(String),
+}
+
+enum Change {
+    Rename(String),
+    Duplicate(String),
+    Remove,
 }
 
 #[derive(Clone)]
@@ -13,8 +25,11 @@ pub enum Action {
     Open(String),
     Name(String),
     Rename,
+    ReviewDuplicate,
+    CopyName(String),
+    SaveCopy,
     ReviewRemoval,
-    CancelRemoval,
+    Cancel,
     Remove,
     Back,
 }
@@ -30,7 +45,7 @@ impl WorkspacePage {
                             original: name.clone(),
                             name,
                             entry,
-                            confirm_removal: false,
+                            mode: Mode::Manage,
                         });
                     }
                     Err(error) => self.status = format!("{error:#}"),
@@ -47,35 +62,65 @@ impl WorkspacePage {
                 };
                 self.status.clear();
                 let change = match action {
-                    Action::Name(name) => {
+                    Action::Name(name) if matches!(editor.mode, Mode::Manage) => {
                         editor.name = name;
                         return;
                     }
-                    Action::ReviewRemoval | Action::CancelRemoval => {
-                        editor.confirm_removal = matches!(action, Action::ReviewRemoval);
+                    Action::ReviewDuplicate if matches!(editor.mode, Mode::Manage) => {
+                        editor.mode = Mode::Duplicate(copy_name(&editor.original, &self.names));
                         return;
                     }
-                    Action::Rename if !editor.confirm_removal => {
-                        Some(editor.name.trim().to_owned())
+                    Action::CopyName(name) => {
+                        if let Mode::Duplicate(current) = &mut editor.mode {
+                            *current = name;
+                        }
+                        return;
                     }
-                    Action::Remove if editor.confirm_removal => None,
+                    Action::ReviewRemoval if matches!(editor.mode, Mode::Manage) => {
+                        editor.mode = Mode::ConfirmRemoval;
+                        return;
+                    }
+                    Action::Cancel => {
+                        editor.mode = Mode::Manage;
+                        return;
+                    }
+                    Action::Rename if matches!(editor.mode, Mode::Manage) => {
+                        Change::Rename(editor.name.trim().to_owned())
+                    }
+                    Action::SaveCopy if let Mode::Duplicate(name) = &editor.mode => {
+                        Change::Duplicate(name.trim().to_owned())
+                    }
+                    Action::Remove if matches!(editor.mode, Mode::ConfirmRemoval) => Change::Remove,
                     _ => return,
                 };
                 let result = WorkspaceStore::open().and_then(|store| match &change {
-                    Some(name) => store.rename(&editor.original, name, &editor.entry),
-                    None => store.remove(&editor.original, &editor.entry),
+                    Change::Rename(name) => store.rename(&editor.original, name, &editor.entry),
+                    Change::Duplicate(name) => {
+                        store.duplicate(&editor.original, name, &editor.entry)
+                    }
+                    Change::Remove => store.remove(&editor.original, &editor.entry),
                 });
                 match result {
                     Ok(names) => {
-                        if self.name.trim() == editor.original {
-                            self.name = change.clone().unwrap_or_default();
-                        }
+                        let updates_entered_name = self.name.trim() == editor.original;
                         self.status = match change {
-                            Some(name) => {
+                            Change::Rename(name) => {
+                                if updates_entered_name {
+                                    self.name = name.clone();
+                                }
                                 self.query.clear();
                                 format!("Renamed {} to {name}", editor.original)
                             }
-                            None => format!("Removed saved workspace {}", editor.original),
+                            Change::Duplicate(name) => {
+                                self.query.clear();
+                                format!("Duplicated {} as {name}", editor.original)
+                            }
+                            Change::Remove => {
+                                if updates_entered_name {
+                                    self.name.clear();
+                                }
+                                format!("Removed saved workspace {}", editor.original)
+                            }
                         };
                         self.names = names;
                         self.editor = None;
@@ -85,6 +130,17 @@ impl WorkspacePage {
             }
         }
     }
+}
+
+fn copy_name(source: &str, names: &[String]) -> String {
+    let base = format!("{source} copy");
+    if names.binary_search(&base).is_err() {
+        return base;
+    }
+    (2..)
+        .map(|number| format!("{base} {number}"))
+        .find(|name| names.binary_search(name).is_err())
+        .expect("finite workspace catalog")
 }
 
 pub(super) fn view(
@@ -110,46 +166,72 @@ pub(super) fn view(
     let status = TextBlock::new()
         .text(&page.status)
         .text_wrapping(TextWrapping::Wrap);
-    let content = if editor.confirm_removal {
-        panel.children((
+    let content = match &editor.mode {
+        Mode::ConfirmRemoval => panel.children((
             heading.text(format!("Remove saved workspace {}?", editor.original)),
             TextBlock::new()
                 .text("This removes the saved layout. Open windows and their sessions stay open.")
                 .text_wrapping(TextWrapping::Wrap),
             buttons.children((
                 Button::new()
-                    .on_click(click(Action::CancelRemoval))
+                    .on_click(click(Action::Cancel))
                     .content("Cancel"),
                 Button::new()
                     .on_click(click(Action::Remove))
                     .content("Remove workspace"),
             )),
             status,
-        ))
-    } else {
-        let name = editor.name.trim();
-        panel.children((
-            heading.text(format!("Manage workspace {}", editor.original)),
+        )),
+        Mode::Duplicate(name) => panel.children((
+            heading.text(format!("Duplicate saved workspace {}", editor.original)),
             TextBox::new()
                 .width(340.0)
                 .horizontal_alignment(HorizontalAlignment::Left)
-                .automation_name("New workspace name")
-                .text(&editor.name)
+                .automation_name("Workspace copy name")
+                .text(name)
                 .on_text_changed(context.callback(move |name| {
-                    Message::Workspace(WorkspaceAction::Manage(id, Action::Name(name)))
+                    Message::Workspace(WorkspaceAction::Manage(id, Action::CopyName(name)))
                 })),
             buttons.children((
                 Button::new()
-                    .is_enabled(!name.is_empty() && name != editor.original)
-                    .on_click(click(Action::Rename))
-                    .content("Rename workspace"),
+                    .on_click(click(Action::Cancel))
+                    .content("Cancel"),
                 Button::new()
-                    .on_click(click(Action::ReviewRemoval))
-                    .content("Remove saved workspace…"),
-                Button::new().on_click(click(Action::Back)).content("Back"),
+                    .is_enabled(!name.trim().is_empty() && name.trim() != editor.original)
+                    .on_click(click(Action::SaveCopy))
+                    .content("Save workspace copy"),
             )),
             status,
-        ))
+        )),
+        Mode::Manage => {
+            let name = editor.name.trim();
+            panel.children((
+                heading.text(format!("Manage workspace {}", editor.original)),
+                TextBox::new()
+                    .width(340.0)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name("New workspace name")
+                    .text(&editor.name)
+                    .on_text_changed(context.callback(move |name| {
+                        Message::Workspace(WorkspaceAction::Manage(id, Action::Name(name)))
+                    })),
+                buttons.children((
+                    Button::new()
+                        .is_enabled(!name.is_empty() && name != editor.original)
+                        .on_click(click(Action::Rename))
+                        .content("Rename workspace"),
+                    Button::new()
+                        .automation_name("Duplicate saved workspace")
+                        .on_click(click(Action::ReviewDuplicate))
+                        .content("Duplicate…"),
+                    Button::new()
+                        .on_click(click(Action::ReviewRemoval))
+                        .content("Remove saved workspace…"),
+                    Button::new().on_click(click(Action::Back)).content("Back"),
+                )),
+                status,
+            ))
+        }
     };
     ScrollViewer::new().content(content)
 }
