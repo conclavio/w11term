@@ -275,6 +275,7 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
             pane: 1,
             data_base64: base64::engine::general_purpose::STANDARD.encode(b"capacity-marker"),
             no_paste: true,
+            connection_generation: None,
         },
     )
     .await

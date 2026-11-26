@@ -10,6 +10,7 @@ async fn raw(pane: u64, bytes: &[u8]) -> Result<()> {
         pane,
         data_base64: STANDARD.encode(bytes),
         no_paste: true,
+        connection_generation: None,
     })
     .await?;
     Ok(())

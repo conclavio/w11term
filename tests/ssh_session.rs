@@ -448,6 +448,8 @@ async fn roundtrip(
             assert_eq!(sessions[0]["cols"], 100);
             assert_eq!(sessions[0]["active"], false);
             assert_eq!(sessions[0]["visible"], false);
+            let generation = sessions[0]["connection_generation"].as_u64().unwrap();
+            let generation = std::num::NonZeroU64::new(generation).unwrap();
             let bytes = b"BOARD\r\x07\x1b[C\0\xff";
             let reply = control::call(
                 pid,
@@ -455,12 +457,15 @@ async fn roundtrip(
                     pane: 7,
                     data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
                     no_paste: true,
+                    connection_generation: Some(generation),
                 },
             )
             .await
             .unwrap();
             assert!(reply.ok, "{reply:?}");
-            assert_eq!(reply.result.unwrap()["bytes_written"], bytes.len());
+            let written = reply.result.unwrap();
+            assert_eq!(written["bytes_written"], bytes.len());
+            assert_eq!(written["connection_generation"], generation.get());
             assert_eq!(
                 next(&mut observed, &session).await,
                 Observed::Data(bytes.to_vec())
@@ -486,6 +491,7 @@ async fn roundtrip(
                     pane: 7,
                     data_base64: "eA==".into(),
                     no_paste: false,
+                    connection_generation: None,
                 },
             )
             .await
@@ -638,17 +644,21 @@ async fn verify_read_only(
     ] {
         session.input.send(input).unwrap();
     }
-    let reply = control::call(
-        pid,
-        &Request::SendText {
-            pane: 7,
-            data_base64: "eA==".into(),
-            no_paste: true,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(!reply.ok && reply.error.unwrap().contains("read-only"));
+    let current = std::num::NonZeroU64::new(session.ssh_connection_generation().unwrap()).unwrap();
+    for connection_generation in [None, Some(current)] {
+        let reply = control::call(
+            pid,
+            &Request::SendText {
+                pane: 7,
+                data_base64: "eA==".into(),
+                no_paste: true,
+                connection_generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!reply.ok && reply.error.unwrap().contains("read-only"));
+    }
     session
         .input
         .send(Command::Resize(TerminalSize {

@@ -2779,7 +2779,10 @@ async fn native_retry_ssh_now_skips_the_current_wait_and_keeps_pane_history() {
     drive_mixed_gui("retry-ssh-now-ui.ps1", &ssh, state.path());
     assert_eq!(accepted.load(Ordering::Relaxed), 6);
     assert_eq!(channels.load(Ordering::Relaxed), 6);
-    assert_eq!(fs::read(trace).unwrap(), b"before-retry/");
+    assert_eq!(
+        fs::read(trace).unwrap(),
+        b"before-retry/scoped-after-retry/"
+    );
     server.abort();
 }
 

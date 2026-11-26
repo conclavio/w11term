@@ -102,6 +102,17 @@ try {
     $ready = Get-RemotePane
     if ($ready.tab_id -ne $tabId -or $ready.ssh_retry_token -or $ready.ssh_attempt_token -or
         $ready.connection_generation -ne $connected.result.connection_generation) { throw 'Unexpected state of the restored pane' }
+    $staleWrite = & $Cli --pid $app.Id send-text --pane $remote --no-paste --connection-generation $generation 'discarded-stale-ssh/' | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $staleWrite.ok -or $staleWrite.error -notmatch 'connection changed') {
+        throw 'The previous SSH generation could still send input'
+    }
+    $current = $connected.result.connection_generation
+    $marker = 'scoped-after-retry/'
+    $written = Control @('send-text','--pane',"$remote",'--no-paste','--connection-generation',"$current",$marker)
+    if ($written.pane -ne $remote -or $written.connection_generation -ne $current -or $written.bytes_written -ne $marker.Length) {
+        throw 'Scoped SSH write did not acknowledge the replacement generation'
+    }
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15',$marker)
     Reject-Retry $palette.ssh_retry_token
     Wait-RetryAccepted $background.ssh_retry_token
     $output = Join-Path $State 'ssh-history.txt'

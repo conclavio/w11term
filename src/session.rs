@@ -99,6 +99,11 @@ pub enum Command {
     ClipboardPaste(ClipboardPaste, ClipboardReply),
     Text(String),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
+    ScopedRaw {
+        connection: u64,
+        bytes: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     SendGroupCommand {
         prompt: crate::events::PromptToken,
         text: Arc<str>,
@@ -1128,7 +1133,7 @@ async fn run(
                             continue;
                         }
                         Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
-                        Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
+                        Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::NotificationReply(_)) => continue,
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
@@ -1151,7 +1156,7 @@ async fn run(
                             continue;
                         }
                         Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
-                        Some(Command::Raw(_, reply)) => {
+                        Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
                         }
@@ -1161,6 +1166,20 @@ async fn run(
                         other => other,
                     }
                 } else { command };
+                let command = match command {
+                    Some(Command::ScopedRaw { connection, reply, .. })
+                        if !interactive || connection != connection_generation =>
+                    {
+                        let reason = if interactive {
+                            terminal::ScopedInput::Raw.stale_error()
+                        } else {
+                            "raw input requires an SSH or local shell"
+                        };
+                        let _ = reply.send(Err(reason.into()));
+                        continue;
+                    }
+                    other => other,
+                };
                 if group_shell && (prompt_matcher.is_some() || matches!(events.shell_prompt(), Some(
                     ShellPrompt::Ready(_) | ShellPrompt::Matched(_) | ShellPrompt::Opening
                 ))) && match &command {
@@ -1171,7 +1190,7 @@ async fn run(
                         terminal::encode_key_input(&terminal, *key, *modifiers, *down, *repeat, details)
                             .is_ok_and(|wire| !wire.is_empty()),
                     Some(Command::Paste(text) | Command::Text(text) | Command::Composed(text)) => !text.is_empty(),
-                    Some(Command::Raw(bytes, _)) => !bytes.is_empty(),
+                    Some(Command::Raw(bytes, _) | Command::ScopedRaw { bytes, .. }) => !bytes.is_empty(),
                     Some(Command::Mouse(_) | Command::MouseLeave { .. } | Command::Wheel(..)) => terminal.is_mouse_grabbed(),
                     Some(Command::Focus(_)) => terminal.focus_tracking_enabled(),
                     _ => false,
@@ -1417,6 +1436,18 @@ async fn run(
                             if let Err(error) = writer.send(TransportInput::Raw(bytes, reply))
                                 && let TransportInput::Raw(_, reply) = error.0 { let _ = reply.send(Err("Terminal connection is closed".into())); }
                         } else { let _ = reply.send(Err("raw input requires an SSH or local shell".into())); }
+                        Ok(())
+                    }
+                    Some(Command::ScopedRaw { connection, bytes, reply }) => {
+                        let input = TransportInput::Scoped {
+                            connection,
+                            bytes,
+                            reply,
+                            kind: terminal::ScopedInput::Raw,
+                        };
+                        if let Err(error) = writer.send(input) {
+                            error.0.reject_input("Terminal connection is closed");
+                        }
                         Ok(())
                     }
                     Some(Command::Capture(reply)) => {

@@ -149,8 +149,21 @@ try {
     Wait-NextGeneration $originalPs
     Wait-Focus $local
     if ((Shell-Pid 'replacement') -eq $oldPid) { throw 'PowerShell restart did not launch a fresh process' }
-    Type-Line '"new-shell-" + ($null -eq $restartValue)'
+    $stalePayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(('Write-Output ("stale-" + "scope")' + "`r")))
+    $staleWrite = & $Cli --pid $app.Id send-text --pane $local --no-paste --connection-generation $originalPs.connection_generation --base64 $stalePayload | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $staleWrite.ok -or $staleWrite.error -notmatch 'connection changed') {
+        throw 'The previous PowerShell generation could still send input'
+    }
+    $current = ((Control @('list')).sessions | Where-Object id -eq $local).connection_generation
+    $wire = [Text.Encoding]::UTF8.GetBytes(('"new-shell-" + ($null -eq $restartValue)' + "`r"))
+    $written = Control @('send-text','--pane',"$local",'--no-paste','--connection-generation',"$current",'--base64',[Convert]::ToBase64String($wire))
+    if ($written.pane -ne $local -or $written.connection_generation -ne $current -or $written.bytes_written -ne $wire.Length) {
+        throw 'Scoped PowerShell write did not acknowledge the replacement process'
+    }
     Wait-Text $local 'new-shell-True'
+    if ((Control @('get-text','--pane',"$local")).text.Contains('stale-scope')) {
+        throw 'A stale write reached the replacement PowerShell process'
+    }
     Assert-Transcript $local @('local-history-4021',"neighbor-value-4021",'new-shell-True') 'restarted-ssh'
     Assert-Layout
     Assert-LiveRestartDisabled $local

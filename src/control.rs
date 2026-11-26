@@ -266,6 +266,8 @@ pub enum Request {
         pane: u64,
         data_base64: String,
         no_paste: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_generation: Option<std::num::NonZeroU64>,
     },
     GetText {
         pane: u64,
@@ -1064,6 +1066,7 @@ impl Registry {
                 pane,
                 data_base64,
                 no_paste,
+                connection_generation,
             } => {
                 ensure!(
                     no_paste,
@@ -1079,16 +1082,28 @@ impl Registry {
                 ensure!(bytes.len() <= MAX_BYTES, "input exceeds 1 MiB");
                 let count = bytes.len();
                 let (tx, rx) = oneshot::channel();
+                let command = match connection_generation {
+                    Some(generation) => Command::ScopedRaw {
+                        connection: generation.get(),
+                        bytes,
+                        reply: tx,
+                    },
+                    None => Command::Raw(bytes, tx),
+                };
                 self.pane(pane)?
                     .input
-                    .send(Command::Raw(bytes, tx))
+                    .send(command)
                     .context("pane is closed")?;
                 tokio::time::timeout(TIMEOUT, rx)
                     .await
                     .context("SSH write timed out; delivery is unknown, do not blindly retry")?
                     .context("SSH connection closed before acknowledging the write")?
                     .map_err(anyhow::Error::msg)?;
-                Ok(json!({"pane":pane,"bytes_written":count}))
+                let mut result = json!({"pane":pane,"bytes_written":count});
+                if let Some(generation) = connection_generation {
+                    result["connection_generation"] = json!(generation);
+                }
+                Ok(result)
             }
             Request::FindText {
                 pattern,

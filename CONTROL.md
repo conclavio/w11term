@@ -48,7 +48,13 @@ $found.result.panes | Where-Object { !$_.error -and $_.count -gt 0 }
 & $ctl --pid 12345 save-text --pane $pane .\shell-transcript.txt
 ```
 
-`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8; the limit is 1 MiB per command. A successful reply acknowledges the write to the SSH channel or local ConPTY input pipe. The receiving program may still be processing it. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown; retrying could duplicate input. Demo/replay panes reject raw input. Reconnecting panes reject raw writes and SFTP work rather than queuing them for a later connection.
+`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel or local ConPTY input pipe, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8. The limit is 1 MiB per command. A successful reply acknowledges the write. The receiving program may still be processing it. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown and retrying could duplicate input. Demo and replay panes reject raw input. Writes and SFTP requests during reconnect return errors.
+
+Pass `--connection-generation N` to bind the write to the live session you
+inspected. Use the generation from `list`, or from `wait-ssh-connected` for SSH,
+with the same process and pane ID. A stale generation returns an error before
+any bytes reach the replacement session. A successful scoped reply includes
+`connection_generation` alongside `pane` and `bytes_written`.
 
 `get-text` returns the current live screen, including alternate-screen TUI content. It excludes scrollback, trims trailing ASCII spaces on each row, and preserves the row count as `lines`. `text` joins those lines with LF. Graphics are not OCRed. Both text and screenshots include a snapshot generation to help correlate results. Reading does not change the user's scrollback position.
 
@@ -78,6 +84,7 @@ Open a new pipe connection for each command. Write one UTF-8 JSON object followe
 ```json
 {"verb":"list"}
 {"verb":"send-text","pane":1,"no_paste":true,"data_base64":"Qk9BUkQN"}
+{"verb":"send-text","pane":1,"no_paste":true,"connection_generation":2,"data_base64":"Qk9BUkQN"}
 {"verb":"get-text","pane":1}
 {"verb":"inspect","pane":1}
 {"verb":"save-text","pane":1,"path":"C:\\tests\\shell-transcript.txt","overwrite":false}

@@ -234,6 +234,7 @@ async fn check_split_control(
                 pane,
                 data_base64: STANDARD.encode(format!("\r\n{marker}\r\n")),
                 no_paste: true,
+                connection_generation: None,
             })
             .await?;
             split_control(Request::WaitForText {

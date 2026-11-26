@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-text --pane ID --no-paste [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -37,6 +37,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
     let mut verb = None;
     let mut pane = None;
     let mut no_paste = false;
+    let mut connection_generation = None;
     let mut payload = None;
     let mut path = None;
     while let Some(arg) = args.next() {
@@ -98,6 +99,17 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             "--pid" => pid = Some(value(&mut args)?.parse()?),
             "--pane" => pane = Some(value(&mut args)?.parse()?),
             "--no-paste" => no_paste = true,
+            "--connection-generation" if verb.as_deref() == Some("send-text") => {
+                ensure!(
+                    connection_generation.is_none(),
+                    "specify --connection-generation only once"
+                );
+                connection_generation = Some(
+                    value(&mut args)?
+                        .parse()
+                        .context("--connection-generation requires a positive integer")?,
+                );
+            }
             "--base64" | "--file" | "--stdin" => {
                 ensure!(payload.is_none(), "choose one input source");
                 let bytes = match arg.as_str() {
@@ -162,6 +174,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                 pane: pane.context("--pane is required")?,
                 data_base64: STANDARD.encode(bytes),
                 no_paste,
+                connection_generation,
             }
         }
         "screenshot" => {
@@ -1045,19 +1058,58 @@ mod tests {
     #[test]
     fn raw_bytes_and_required_options() {
         let p = |a: &[&str]| parse(a.iter().map(|s| s.to_string()));
-        let (_, Request::SendText { data_base64, .. }) = p(&[
+        let (
+            _,
+            Request::SendText {
+                data_base64,
+                connection_generation,
+                ..
+            },
+        ) = p(&[
             "send-text",
             "--pane",
             "3",
             "--no-paste",
+            "--connection-generation",
+            "4",
             "--base64",
             "AAcbW0P/",
         ])
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!()
         };
         assert_eq!(STANDARD.decode(data_base64).unwrap(), b"\0\x07\x1b[C\xff");
+        assert_eq!(connection_generation.unwrap().get(), 4);
+        let (_, unscoped) = p(&["send-text", "--pane", "3", "--no-paste", "hello"]).unwrap();
+        let json = serde_json::to_value(unscoped).unwrap();
+        assert!(json.get("connection_generation").is_none());
         assert!(p(&["send-text", "--pane", "3", "hello"]).is_err());
+        for args in [
+            &[
+                "send-text",
+                "--pane",
+                "3",
+                "--no-paste",
+                "--connection-generation",
+                "0",
+                "hello",
+            ][..],
+            &[
+                "send-text",
+                "--pane",
+                "3",
+                "--no-paste",
+                "--connection-generation",
+                "4",
+                "--connection-generation",
+                "5",
+                "hello",
+            ],
+            &["get-text", "--pane", "3", "--connection-generation", "4"],
+        ] {
+            assert!(p(args).is_err(), "{args:?}");
+        }
         assert!(p(&["get-text"]).is_err());
         assert!(p(&["list", "--file", "missing"]).is_err());
     }

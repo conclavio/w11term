@@ -155,6 +155,7 @@ impl TransportInput {
 #[derive(Clone, Debug)]
 pub enum ScopedInput {
     Clipboard,
+    Raw,
     Notification,
     GroupCommand(crate::events::GroupWriteReceipt),
     GroupInterrupt(crate::events::GroupInterruptTarget),
@@ -177,6 +178,7 @@ impl ScopedInput {
             Self::Clipboard => {
                 "The pane connection changed. Paste again to use the new connection."
             }
+            Self::Raw => "The pane connection changed before the write; input was not sent.",
             Self::Notification => "The terminal connection changed before the notification reply.",
             Self::GroupCommand(_) => "The host reconnected before the command was sent.",
             Self::GroupInterrupt(_) => "The host reconnected before Ctrl+C was sent.",
