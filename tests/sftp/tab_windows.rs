@@ -164,6 +164,12 @@ async fn native_cli_moves_live_panes_without_focus_or_reconnect() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "selects and zooms exact SSH and PowerShell panes in active, hidden and sibling tabs without taking desktop focus"]
+async fn native_cli_selects_and_zooms_exact_panes() {
+    run("CliPaneView", b"origin-zoom/child-zoom/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -304,6 +310,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "CliWorkspaceWindow"
             | "CliProfiles"
             | "CliSplit"
+            | "CliPaneView"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

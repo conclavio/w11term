@@ -68,6 +68,18 @@ The destination keeps its selection and zoom by default. Use `--activate` to sel
 
 Direct pipe clients can send `{"verb":"move-pane","pane":42,"target_pane":57,"direction":"right"}`.
 
+`focus-pane --pane ID` selects that pane and its tab in the owning window. If the tab is zoomed, the selected pane fills it. The command follows the pane across window moves and preserves desktop focus.
+
+`zoom-pane --pane ID --on` selects and enlarges the pane within its split tab. `--off` restores the target tab's split layout while keeping its selection and the window's current tab. Both settings can be applied repeatedly. Each reply includes `pane`, `window_id`, `tab_id`, `active` for selection within that window, and `zoomed` for the target tab's resulting state.
+
+```powershell
+& $ctl --pid 12345 focus-pane --pane $pane
+& $ctl --pid 12345 zoom-pane --pane $pane --on
+& $ctl --pid 12345 zoom-pane --pane $pane --off
+```
+
+Direct pipe clients can send `{"verb":"focus-pane","pane":42}` or `{"verb":"zoom-pane","pane":42,"zoomed":true}`.
+
 ```powershell
 # Literal UTF-8, including a carriage return supplied by PowerShell.
 & $ctl --pid 12345 send-text --pane $pane --no-paste "BOARD`r"

@@ -139,6 +139,13 @@ pub enum Request {
         #[serde(default)]
         activate: bool,
     },
+    FocusPane {
+        pane: u64,
+    },
+    ZoomPane {
+        pane: u64,
+        zoomed: bool,
+    },
     Sftp {
         pane: u64,
         #[serde(default = "sftp_default_timeout")]
@@ -521,6 +528,11 @@ pub enum UiRequest {
         activate: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    SelectPaneView {
+        pane: u64,
+        zoom: Option<bool>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Resize {
         pane: u64,
         cols: usize,
@@ -535,6 +547,7 @@ impl UiRequest {
             | Self::ClosePane { reply, .. }
             | Self::SplitPane { reply, .. }
             | Self::MovePane { reply, .. }
+            | Self::SelectPaneView { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
@@ -575,7 +588,8 @@ impl UiRequest {
             Self::Resize { pane, .. }
             | Self::ClosePane { pane, .. }
             | Self::SplitPane { pane, .. }
-            | Self::MovePane { pane, .. } => Some(*pane),
+            | Self::MovePane { pane, .. }
+            | Self::SelectPaneView { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
         }
@@ -587,6 +601,7 @@ impl UiRequest {
             | Self::ClosePane { reply, .. }
             | Self::SplitPane { reply, .. }
             | Self::MovePane { reply, .. }
+            | Self::SelectPaneView { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             if reply.is_closed()
         )
@@ -646,6 +661,16 @@ pub struct Pane {
     pub capture: Option<CapturePng>,
 }
 impl Registry {
+    async fn select_pane_view(&self, pane: u64, zoom: Option<bool>) -> Result<Value> {
+        let (reply, response) = oneshot::channel();
+        self.post_pane_request(pane, UiRequest::SelectPaneView { pane, zoom, reply });
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("pane selection timed out; use list to check visibility")?
+            .context("GUI is closed")?
+            .map_err(anyhow::Error::msg)
+    }
+
     async fn pane_events(pane: &Pane) -> Result<crate::events::Events> {
         let (reply, response) = oneshot::channel();
         pane.input
@@ -792,6 +817,8 @@ impl Registry {
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }
+            Request::FocusPane { pane } => self.select_pane_view(pane, None).await,
+            Request::ZoomPane { pane, zoomed } => self.select_pane_view(pane, Some(zoomed)).await,
             Request::Resize { pane, cols, rows } => {
                 validate_grid(cols, rows)?;
                 let (reply, response) = oneshot::channel();

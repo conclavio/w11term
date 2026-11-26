@@ -68,6 +68,8 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "close-pane"
             | "split-pane"
             | "move-pane"
+            | "focus-pane"
+            | "zoom-pane"
             | "list-commands"
             | "get-command"
             | "get-running-output"
@@ -366,6 +368,44 @@ mod tests {
             "open --profile desk --window 0",
             "open --profile desk --window 1 --window 2",
             "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn selects_an_exact_pane_and_requires_an_explicit_zoom_state() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 3 focus-pane --pane 42").unwrap(),
+            (Some(3), Request::FocusPane { pane: 42 })
+        ));
+        let (_, request) = parse_line("zoom-pane --pane 42 --on").unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"zoom-pane","pane":42,"zoomed":true})
+        );
+        assert!(matches!(
+            parse_line("zoom-pane --off --pane 42").unwrap(),
+            (
+                _,
+                Request::ZoomPane {
+                    pane: 42,
+                    zoomed: false
+                }
+            )
+        ));
+        for invalid in [
+            "focus-pane --pane 0",
+            "focus-pane --pane 1 --pane 2",
+            "focus-pane --pane 1 --on",
+            "focus-pane --pane 1 --window 2",
+            "zoom-pane --pane 1",
+            "zoom-pane --on",
+            "zoom-pane --pane 0 --on",
+            "zoom-pane --pane 1 --pane 2 --on",
+            "zoom-pane --pane 1 --on --off",
+            "zoom-pane --pane 1 --off --off",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

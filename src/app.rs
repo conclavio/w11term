@@ -3554,6 +3554,51 @@ impl TerminalApp {
         }
     }
 
+    fn control_select_pane_view(
+        &mut self,
+        pane: u64,
+        zoom: Option<bool>,
+        context: &ComponentContext<Self>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let entry = self
+            .tab_for_pane(pane)
+            .with_context(|| format!("unknown pane {pane}"))?;
+        let tab_id = self.tabs.group_id(entry).context("the pane has no tab")?;
+        let select = zoom != Some(false) && self.tabs.active_id() != Some(entry);
+        anyhow::ensure!(
+            !select || (self.incoming.is_none() && !self.existing_destination_blocked()),
+            "This window is busy. Try again after its current action finishes."
+        );
+        let zoom_changed = zoom
+            .map(|zoomed| {
+                self.tabs
+                    .set_zoom(entry, zoomed)
+                    .context("Only split tabs can be zoomed")
+            })
+            .transpose()?
+            .unwrap_or(false);
+
+        if select {
+            self.tabs.select(entry);
+            self.sync_selection(context);
+            self.activate(context);
+        } else if zoom_changed && self.tabs.active_group_id() == Some(tab_id) {
+            if zoom == Some(true) {
+                self.activate(context);
+            } else {
+                self.refresh_split_layout(context);
+            }
+        }
+
+        Ok(serde_json::json!({
+            "pane": pane,
+            "window_id": self.registry.window_id(),
+            "tab_id": tab_id,
+            "active": self.tabs.active_id() == Some(entry),
+            "zoomed": self.tabs.group_zoomed(tab_id),
+        }))
+    }
+
     fn split_pane(
         &mut self,
         axis: Axis,
@@ -6775,6 +6820,12 @@ impl Component for TerminalApp {
             }) => {
                 if !reply.is_closed() {
                     self.control_move_pane(pane, target_pane, direction, activate, reply, context);
+                }
+            }
+            Message::Control(w11term::control::UiRequest::SelectPaneView { pane, zoom, reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_select_pane_view(pane, zoom, context);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
             Message::Control(w11term::control::UiRequest::Resize {
