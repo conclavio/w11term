@@ -3,6 +3,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -13,6 +14,11 @@ $edit = [System.Windows.Automation.ControlType]::Edit
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
 $separator = [char]0xb7
+$keyField = 'Jump host private key file'
+$browseLabel = 'Browse for jump host private key'
+$pickerTitle = 'Choose SSH private key'
+$typedKey = 'jump keys\typed key'
+$selectedKey = Join-Path $State 'jump keys\selected key'
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -32,7 +38,7 @@ function Set-Field([string]$Name, [string]$Text) {
         (Find-Element $Name $edit).GetCurrentPattern($value).Current.Value -ceq $Text
     }
 }
-function Select-Keyless {
+function Select-JumpAuth([string]$Name) {
     $combo = [System.Windows.Automation.ControlType]::ComboBox
     $listItem = [System.Windows.Automation.ControlType]::ListItem
     $selection = [System.Windows.Automation.SelectionPattern]::Pattern
@@ -43,14 +49,27 @@ function Select-Keyless {
     }
     $popup = $field.GetCurrentPattern($expand)
     $popup.Expand()
-    $choice = Wait-Until 'keyless jump authentication option' { Find-Element 'None (keyless server)' $listItem -Visible }
+    $choice = Wait-Until "'$Name' jump authentication option" { Find-Element $Name $listItem -Visible }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    $null = Wait-Until 'keyless authentication selected for the draft hop' {
+    $null = Wait-Until "'$Name' selected for the draft hop" {
         $current = (Find-Element 'Jump host authentication' $combo).GetCurrentPattern($selection)
         $selected = $current.Current.GetSelection()
-        $selected.Count -eq 1 -and $selected[0].Current.Name -ceq 'None (keyless server)'
+        $selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Name
     }
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+function Key-Value {
+    $field = Wait-Until 'jump host key field' { Find-Element $keyField $edit }
+    return $field.GetCurrentPattern($value).Current.Value
+}
+function Pick-JumpKey([string]$Name) {
+    Click $browseLabel
+    $dialog = Wait-Until 'owned jump host key picker' { Find-OwnedDialog $pickerTitle }
+    $action = if ($Name) { Select-DialogItem $dialog $Name; 1 } else { 2 }
+    $null = Wait-Until 'activate jump host key picker button' { [FixtureDialog]::ClickButton($dialog, $action) }
+    $null = Wait-Until 'jump host key picker closed' {
+        !(Find-OwnedDialog $pickerTitle) -and (Find-Element $browseLabel $button).Current.IsEnabled
+    }
 }
 function Wait-EditorClosed {
     $null = Wait-Until 'jump editor closed' { !(Find-Element 'Jump host address' $edit) }
@@ -60,7 +79,7 @@ function Add-Jump($Peer, [switch]$CheckInvalidPort) {
     Set-Field 'Jump host address' $Peer.host
     Set-Field 'Jump host user' $Peer.user
     Set-Field 'Jump host fingerprint' $Peer.host_key
-    Select-Keyless
+    Select-JumpAuth 'None (keyless server)'
     if ($CheckInvalidPort) {
         Set-Field 'Jump host port' '0'
         Click 'Apply jump host'
@@ -76,9 +95,9 @@ function Add-Jump($Peer, [switch]$CheckInvalidPort) {
 function Jump-Action([int]$Index, [string]$Name) {
     Invoke-Button (Get-ScrollableMenuAction "Jump host $Index actions" $Name -VisibleItem)
 }
-function Wait-Jump([int]$Index, $Peer, [string]$Alias) {
+function Wait-Jump([int]$Index, $Peer, [string]$Alias, [string]$Auth = 'none') {
     $trust = if ($Alias) { ", host key alias $Alias" } else { '' }
-    $label = "Jump host $Index $separator $($Peer.user)@$($Peer.host):$($Peer.port) (none$trust)"
+    $label = "Jump host $Index $separator $($Peer.user)@$($Peer.host):$($Peer.port) ($Auth$trust)"
     try {
         $null = Wait-Until "'$label' in the route" { Find-Element $label }
     } catch {
@@ -113,14 +132,29 @@ try {
     Set-Field 'Jump host connection timeout (seconds)' '9'
     Set-Field 'Jump host keepalive interval (seconds)' '11'
     Set-Field 'Jump host unanswered keepalives allowed' '4'
+    Select-JumpAuth 'Private key file'
+    Set-Field $keyField $typedKey
+    Pick-JumpKey
+    if ((Key-Value) -cne $typedKey) { throw 'Cancelling Browse changed the typed jump key path' }
+    Pick-JumpKey 'selected key'
+    $chosenKey = Wait-Until 'the jump draft holds the chosen key path' {
+        $path = Key-Value
+        if ([FixtureDialog]::SameFile($selectedKey, $path)) { $path }
+    }
+    if (Find-Element 'Private key file' $edit) {
+        throw 'Browsing for a jump key changed the destination authentication editor'
+    }
     Click 'Apply jump host'
     Wait-EditorClosed
-    Wait-Jump 1 $outer 'outer.bastion.test'
+    Wait-Jump 1 $outer 'outer.bastion.test' "key file $chosenKey"
     Jump-Action 1 'Edit jump host'
+    if (![FixtureDialog]::SameFile($selectedKey, (Key-Value))) {
+        throw 'Reopening the jump draft lost the selected identity'
+    }
     Set-Field 'Jump host user' 'discarded'
     Click 'Cancel jump host edit'
     Wait-EditorClosed
-    Wait-Jump 1 $outer 'outer.bastion.test'
+    Wait-Jump 1 $outer 'outer.bastion.test' "key file $chosenKey"
 
     Add-Jump $inner
     Wait-Jump 3 $inner
@@ -148,7 +182,8 @@ try {
     if ($saved.Count -ne 2 -or $saved[0].user -cne $outer.user -or $saved[0].port -ne $outer.port -or
         $saved[1].user -cne $inner.user -or $saved[1].port -ne $inner.port -or
         $saved[0].connect_timeout_seconds -ne 9 -or $saved[0].keepalive.interval_seconds -ne 11 -or
-        $saved[0].keepalive.max_unanswered -ne 4 -or $saved[0].auth -cne 'none' -or
+        $saved[0].keepalive.max_unanswered -ne 4 -or $saved[0].auth -cne 'identity' -or
+        ![FixtureDialog]::SameFile($selectedKey, $saved[0].identity) -or
         $saved[1].auth -cne 'none') {
         throw "Wrong saved route: $($saved | ConvertTo-Json -Compress)"
     }

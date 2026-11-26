@@ -167,7 +167,7 @@ pub(super) fn view(
         fields.push(KeyedView::new(
             "identity",
             identity_picker::field(
-                id,
+                identity_picker::Target::Endpoint(id),
                 &draft.identity,
                 can_browse,
                 context.callback(move |value| Message::QuickConnect(Action::Identity(id, value))),

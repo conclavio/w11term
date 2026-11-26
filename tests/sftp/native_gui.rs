@@ -21,8 +21,10 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "edits a profile's jump route in WinUI and connects through two loopback peers"]
+#[ignore = "edits a profile's jump route and authenticates with a browsed key through two loopback peers"]
 async fn native_profile_jump_editor_saves_and_connects_the_ordered_route() {
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
+
     let (Source::Ssh(destination), _destination_root, shells, destination_server) =
         fixture_connections(false, 2).await
     else {
@@ -48,12 +50,27 @@ async fn native_profile_jump_editor_saves_and_connects_the_ordered_route() {
         fs::write(root.join("forward-trace"), []).unwrap();
     }
     let state = tempfile::tempdir().unwrap();
+    let key_directory = state.path().join("jump keys");
+    fs::create_dir(&key_directory).unwrap();
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let pem = key.to_openssh(LineEnding::LF).unwrap();
+    let key_path = key_directory.join("selected key");
+    fs::write(&key_path, pem.as_bytes()).unwrap();
+    fs::write(
+        outer_root.path().join("authorized-key"),
+        key.public_key().to_openssh().unwrap(),
+    )
+    .unwrap();
     fs::write(
         state.path().join("fixture-jumps.json"),
         serde_json::to_vec(&[&outer, &inner]).unwrap(),
     )
     .unwrap();
     drive_mixed_gui("profile-jumps-ui.ps1", &destination, state.path());
+    assert!(
+        fs::read(&key_path).unwrap() == pem.as_bytes(),
+        "the file picker modified the fixture key"
+    );
     for (root, port) in [
         (outer_root.path(), inner.port),
         (inner_root.path(), destination.port),

@@ -4798,7 +4798,7 @@ impl TerminalApp {
         );
         if draft.authentication == PRIVATE_KEY_AUTH {
             fields.push(identity_picker::field(
-                id,
+                identity_picker::Target::Endpoint(id),
                 &draft.identity,
                 self.identity_picker.is_none() && !draft.generating,
                 context.callback(move |value| Message::Edit(id, Field::Identity, value)),
@@ -4817,7 +4817,12 @@ impl TerminalApp {
                     ),
             )),
         );
-        fields.push(draft.jump_editor.view(id, &draft.proxy_jump, context));
+        fields.push(draft.jump_editor.view(
+            id,
+            &draft.proxy_jump,
+            self.identity_picker.is_none(),
+            context,
+        ));
         fields.push(
             draft
                 .forward_editor

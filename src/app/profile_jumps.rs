@@ -6,6 +6,7 @@ const TITLE: &str = "SSH jump hosts";
 #[derive(Clone, Default)]
 pub(super) struct Editor {
     expanded: bool,
+    edit: u64,
     pending: Option<Box<Draft>>,
 }
 
@@ -64,7 +65,7 @@ struct Draft {
     timeout: String,
     interval: String,
     unanswered: String,
-    error: String,
+    error: Option<String>,
 }
 
 impl Draft {
@@ -93,7 +94,7 @@ impl Draft {
                 .unwrap_or_default(),
             interval: keepalive.interval_seconds.to_string(),
             unanswered: keepalive.max_unanswered.to_string(),
-            error: String::new(),
+            error: None,
         }
     }
 
@@ -128,10 +129,16 @@ impl Draft {
             Field::Interval => &mut self.interval,
             Field::Unanswered => &mut self.unanswered,
         } = value;
-        self.error.clear();
+        self.error = None;
     }
 
-    fn view(&self, id: TabId, context: &ViewContext<TerminalApp>) -> View {
+    fn view(
+        &self,
+        id: TabId,
+        edit: u64,
+        can_browse: bool,
+        context: &ViewContext<TerminalApp>,
+    ) -> View {
         let text_box =
             |field, label: &str, value: &str, placeholder: &str| {
                 StackPanel::new().spacing(4.0).children((
@@ -181,11 +188,14 @@ impl Draft {
             )),
         ];
         fields.push(if self.authentication == PRIVATE_KEY_AUTH {
-            text_box(
-                Field::Identity,
-                "Jump host private key path",
+            identity_picker::field(
+                identity_picker::Target::Jump { tab: id, edit },
                 &self.identity,
-                "Path relative to profiles.json or an absolute path",
+                can_browse,
+                context.callback(move |value| {
+                    Message::ProfileJump(id, Edit::Text(Field::Identity, value))
+                }),
+                context,
             )
         } else {
             View::empty()
@@ -222,7 +232,7 @@ impl Draft {
                 "1 or more",
             ),
             TextBlock::new()
-                .text(&self.error)
+                .text(self.error.as_deref().unwrap_or_default())
                 .foreground(Color::rgb(255, 160, 150))
                 .text_wrapping(TextWrapping::Wrap)
                 .into(),
@@ -248,10 +258,20 @@ impl Editor {
         self.pending.is_some()
     }
 
+    pub(super) fn identity_fields(
+        &mut self,
+        edit: u64,
+    ) -> Option<(&mut String, &mut Option<String>)> {
+        let draft = self.pending.as_mut()?;
+        (self.edit == edit && draft.authentication == PRIVATE_KEY_AUTH)
+            .then_some((&mut draft.identity, &mut draft.error))
+    }
+
     pub(super) fn update(&mut self, hops: &mut Vec<JumpHost>, edit: Edit) -> bool {
         match edit {
             Edit::Expand(expanded) => self.expanded = expanded,
             Edit::Add if !self.editing() && hops.len() < MAX_JUMPS => {
+                self.edit += 1;
                 self.pending = Some(Box::new(Draft::new(None, None)));
             }
             Edit::Row(index, expected, action)
@@ -259,6 +279,7 @@ impl Editor {
             {
                 match action {
                     RowAction::Edit => {
+                        self.edit += 1;
                         self.pending = Some(Box::new(Draft::new(Some(index), Some(&expected))));
                     }
                     RowAction::Earlier if index > 0 => {
@@ -286,8 +307,9 @@ impl Editor {
                     && index < SSH_AUTH_LABELS.len()
                     && index != draft.authentication
                 {
+                    self.edit += 1;
                     draft.authentication = index;
-                    draft.error.clear();
+                    draft.error = None;
                 }
             }
             Edit::Apply => return self.apply(hops),
@@ -304,7 +326,7 @@ impl Editor {
         let hop = match draft.jump() {
             Ok(hop) => hop,
             Err(error) => {
-                draft.error = format!("{error:#}");
+                draft.error = Some(format!("{error:#}"));
                 return false;
             }
         };
@@ -322,6 +344,7 @@ impl Editor {
         &self,
         id: TabId,
         hops: &[JumpHost],
+        can_browse: bool,
         context: &ViewContext<TerminalApp>,
     ) -> View {
         let rows = hops
@@ -361,7 +384,7 @@ impl Editor {
             })
             .collect::<Vec<_>>();
         let actions = if let Some(draft) = &self.pending {
-            draft.view(id, context)
+            draft.view(id, self.edit, can_browse, context)
         } else if hops.len() < MAX_JUMPS {
             Button::new()
                 .horizontal_alignment(HorizontalAlignment::Left)
@@ -503,6 +526,39 @@ mod tests {
     }
 
     #[test]
+    fn identity_picker_is_scoped_to_one_edit_and_authentication_choice() {
+        let mut editor = Editor::default();
+        let mut hops = vec![sample(), sample()];
+        let first = hops[0].clone();
+        editor.update(&mut hops, Edit::Row(0, first, RowAction::Edit));
+        let cancelled_edit = editor.edit;
+        assert!(editor.identity_fields(cancelled_edit).is_some());
+        editor.update(&mut hops, Edit::Cancel);
+        assert!(editor.identity_fields(cancelled_edit).is_none());
+
+        let second = hops[1].clone();
+        editor.update(&mut hops, Edit::Row(1, second, RowAction::Edit));
+        let former_auth = editor.edit;
+        assert!(editor.identity_fields(cancelled_edit).is_none());
+        editor.update(&mut hops, Edit::Auth(3));
+        assert!(editor.identity_fields(editor.edit).is_none());
+        editor.update(&mut hops, Edit::Auth(PRIVATE_KEY_AUTH));
+        assert!(editor.identity_fields(former_auth).is_none());
+        let (path, error) = editor.identity_fields(editor.edit).unwrap();
+        assert_eq!(path, "keys/bastion");
+        *path = "other key".into();
+        assert!(error.is_none());
+        assert!(editor.update(&mut hops, Edit::Apply));
+        assert_eq!(hops[0], sample());
+        assert_eq!(
+            hops[1].authentication,
+            Authentication::Identity {
+                identity: "other key".into()
+            }
+        );
+    }
+
+    #[test]
     fn route_edits_validate_before_staging_and_respect_the_hop_limit() {
         let mut editor = Editor::default();
         let mut hops = vec![sample(); MAX_JUMPS];
@@ -514,7 +570,7 @@ mod tests {
         assert!(editor.editing());
         assert!(!editor.update(&mut hops, Edit::Apply));
         assert_eq!(hops.len(), MAX_JUMPS - 1);
-        assert!(!editor.pending.as_ref().unwrap().error.is_empty());
+        assert!(editor.pending.as_ref().unwrap().error.is_some());
 
         editor.update(
             &mut hops,

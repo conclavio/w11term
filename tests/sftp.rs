@@ -49,6 +49,10 @@ impl server::Handler for Peer {
     type Error = anyhow::Error;
     async fn auth_none(&mut self, _user: &str) -> anyhow::Result<server::Auth> {
         #[cfg(feature = "ui-smoke")]
+        if self.root.join("authorized-key").is_file() {
+            return Ok(server::Auth::reject());
+        }
+        #[cfg(feature = "ui-smoke")]
         if self.root.join("authenticated-users").is_file() {
             writeln!(
                 fs::OpenOptions::new()
@@ -58,6 +62,23 @@ impl server::Handler for Peer {
             )?;
         }
         Ok(server::Auth::Accept)
+    }
+    #[cfg(feature = "ui-smoke")]
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        key: &russh::keys::PublicKey,
+    ) -> anyhow::Result<server::Auth> {
+        let allowed = self.root.join("authorized-key");
+        if !allowed.is_file() {
+            return Ok(server::Auth::reject());
+        }
+        let expected = russh::keys::PublicKey::from_openssh(&fs::read_to_string(allowed)?)?;
+        Ok(if key.key_data() == expected.key_data() {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
     }
     async fn channel_open_session(
         &mut self,
