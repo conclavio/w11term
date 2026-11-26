@@ -85,7 +85,7 @@ function Run-WindowCommand([IntPtr]$Hwnd, [string]$Action) {
     Use-Window $Hwnd
     $window = $Hwnd
     Press-Key 0x76 # F7, fixture command palette
-    $field = Wait-Until 'focused command palette in the requested HWND' {
+    $field = Wait-Until "focused command palette for '$Action' in the requested HWND" {
         $element = Find-Here $Hwnd 'Search commands'
         if ($element -and $element.Current.HasKeyboardFocus) { $element }
     }
@@ -95,6 +95,10 @@ function Run-WindowCommand([IntPtr]$Hwnd, [string]$Action) {
         if ($item -and $item.Current.IsEnabled) { $item }
     }
     Press-Key 13
+    $null = Wait-Until "command palette closes after '$Action'" {
+        [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $Hwnd -or
+            !(Find-Here $Hwnd 'Search commands')
+    }
 }
 
 function Open-TabSearch([IntPtr]$Hwnd, [string]$Query, [string]$Result) {
