@@ -1,7 +1,7 @@
 use crate::{
     clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     demo,
-    events::{ShellPrompt, SshConnectionPhase},
+    events::ShellPrompt,
     options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
@@ -264,9 +264,7 @@ impl Command {
 #[derive(Debug)]
 pub struct PaneDescription {
     pub(crate) frame: Arc<Snapshot>,
-    pub(crate) restart_token: Option<u64>,
-    pub(crate) ssh_phase: Option<SshConnectionPhase>,
-    pub(crate) ssh_attempt: Option<crate::events::PendingSshAttempt>,
+    pub(crate) connection: crate::events::SshConnectionSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1341,12 +1339,9 @@ async fn run(
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
                     Some(Command::DescribePane(reply)) => {
-                        let (restart_token, ssh_phase, ssh_attempt) = events.connection_snapshot();
                         let _ = reply.send(PaneDescription {
                             frame: live_frames.load(),
-                            restart_token,
-                            ssh_phase,
-                            ssh_attempt,
+                            connection: events.connection_snapshot(),
                         });
                         Ok(())
                     }

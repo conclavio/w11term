@@ -653,6 +653,19 @@ An accepted stop returns `pane`, `attempt_token`, and `accepted: true`. Wait
 for the pane's `stopped` phase or a `restart_token` before restarting it. A
 retired token returns an error. The pane, its history, and desktop focus stay in place.
 
+During an automatic retry wait for a direct SSH pane, `list` and `events`
+include `ssh_retry_token`. Use it to start that specific retry early.
+
+```powershell
+& $ctl --pid 12345 retry-ssh-now --pane 2 --retry-token 3
+```
+
+A successful reply includes `pane`, `retry_token`, and `accepted: true`.
+The `ssh-retry-wait` journal event records when each token becomes available
+or retires. A successful early request retires the token with `requested: true`.
+Each wait has its own token. The retry window and input behavior are the same
+as for a scheduled retry.
+
 To end a connected direct SSH shell, use the `connection_generation` from
 `list` for the same process and pane.
 

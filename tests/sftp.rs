@@ -215,6 +215,14 @@ impl server::Handler for Peer {
                 s.channel_failure(c)?;
                 return Ok(());
             }
+            if self.root.join("drop-shell-before-ready").is_file() {
+                s.disconnect(
+                    russh::Disconnect::ByApplication,
+                    "fixture drops login before the shell is ready",
+                    "en",
+                )?;
+                return Ok(());
+            }
         }
         s.channel_success(c)?;
         if let Some(wire) = &self.wire {
@@ -1284,6 +1292,15 @@ async fn reconnect_window_expires_during_shell_setup_and_preserves_manual_restar
 
 #[tokio::test]
 async fn reconnect_window_can_expire_before_the_next_login() {
+    reconnect_window_with_closing_peer(false).await;
+}
+
+#[tokio::test]
+async fn retry_now_keeps_the_original_reconnect_window() {
+    reconnect_window_with_closing_peer(true).await;
+}
+
+async fn reconnect_window_with_closing_peer(retry_early: bool) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -1305,6 +1322,19 @@ async fn reconnect_window_can_expire_before_the_next_login() {
     }))
     .unwrap();
     let pane = Session::start(Source::Ssh(options));
+    if retry_early {
+        let token = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(token) = pane.events.pending_ssh_retry() {
+                    break token;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the remaining retry window should allow a manual attempt");
+        assert!(pane.events.retry_ssh_now(token));
+    }
     tokio::time::timeout(Duration::from_secs(6), async {
         while pane.events.restart_token().is_none() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1321,8 +1351,24 @@ async fn reconnect_window_can_expire_before_the_next_login() {
     assert_eq!(wait.data["delay_seconds"], 1);
     assert_eq!(wait.data["retry_remaining_seconds"], 1);
     assert_eq!(wait.data["will_retry"], false);
+    if retry_early {
+        let second = waits.next().unwrap();
+        assert_eq!(second.data["attempt"], 2);
+        assert_eq!(second.data["retry_remaining_seconds"], 1);
+        assert_eq!(second.data["will_retry"], false);
+        assert!(
+            journal
+                .events
+                .iter()
+                .any(|event| { event.kind == "ssh-retry-wait" && event.data["requested"] == true })
+        );
+    }
     assert!(waits.next().is_none());
-    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert!(pane.events.pending_ssh_retry().is_none());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1 + usize::from(retry_early)
+    );
     server.abort();
 }
 

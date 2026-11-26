@@ -36,6 +36,7 @@ const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 const RESTART_EXITED_PANE: &str = "Restart exited pane";
 const STOP_SSH_ATTEMPT: &str = "Stop SSH attempt";
+const RETRY_SSH_NOW: &str = "Retry SSH now";
 const PIN_TAB: &str = "Pin tab";
 const UNPIN_TAB: &str = "Unpin tab";
 
@@ -445,6 +446,16 @@ impl AppTab {
         Some(PendingPaneAttempt {
             pane: live.session.pane_id,
             token: live.session.events.pending_ssh_attempt()?,
+        })
+    }
+
+    fn pending_pane_retry(&self) -> Option<PendingPaneRetry> {
+        let Page::Terminal(live) = &self.page else {
+            return None;
+        };
+        Some(PendingPaneRetry {
+            pane: live.session.pane_id,
+            token: live.session.events.pending_ssh_retry()?,
         })
     }
 
@@ -1044,6 +1055,7 @@ struct CaretMenuBinding {
     closed_pane: Option<TabId>,
     exited: Option<ExitedPane>,
     pending_ssh: Option<PendingPaneAttempt>,
+    pending_retry: Option<PendingPaneRetry>,
     disconnect_ssh: Option<disconnect_ssh::Target>,
     on_click: Callback<String>,
 }
@@ -1197,6 +1209,12 @@ pub struct PendingPaneAttempt {
     token: w11term::events::PendingSshAttempt,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingPaneRetry {
+    pane: u64,
+    token: w11term::events::PendingSshRetry,
+}
+
 pub enum Message {
     LocalForward(local_forwards::Action),
     ProfileForward(TabId, profile_forwards::Edit),
@@ -1205,6 +1223,7 @@ pub enum Message {
     FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
     StopSshAttempt(PendingPaneAttempt),
+    RetrySshNow(PendingPaneRetry),
     DisconnectSsh(disconnect_ssh::Action),
     Export(text_export::Action),
     Recording(recordings::Action),
@@ -3674,6 +3693,7 @@ impl TerminalApp {
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let pending_ssh = self.tabs.active().and_then(AppTab::pending_pane_attempt);
+        let pending_retry = self.tabs.active().and_then(AppTab::pending_pane_retry);
         let disconnect_ssh = self.disconnect_target();
         let paste = self.paste_origin();
         let group = self.tabs.active_group_id();
@@ -3700,6 +3720,7 @@ impl TerminalApp {
             && binding.directory_split == directory_split
             && binding.exited == exited
             && binding.pending_ssh == pending_ssh
+            && binding.pending_retry == pending_retry
             && binding.disconnect_ssh == disconnect_ssh
         {
             return binding.on_click.clone();
@@ -3758,6 +3779,7 @@ impl TerminalApp {
             value if recordings::is_command(value) => recordings::invoke(recordings.target(value)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
             STOP_SSH_ATTEMPT => pending_ssh.map_or(Message::ControlIdle, Message::StopSshAttempt),
+            RETRY_SSH_NOW => pending_retry.map_or(Message::ControlIdle, Message::RetrySshNow),
             disconnect_ssh::LABEL => disconnect_ssh.map_or(Message::ControlIdle, |target| {
                 Message::DisconnectSsh(disconnect_ssh::Action::Review(target))
             }),
@@ -3818,6 +3840,7 @@ impl TerminalApp {
             arrangement,
             exited,
             pending_ssh,
+            pending_retry,
             disconnect_ssh,
             on_click: on_click.clone(),
         });
@@ -4425,6 +4448,14 @@ impl TerminalApp {
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
             self.broadcast_menu(),
         ]);
+        if self
+            .tabs
+            .active()
+            .and_then(AppTab::pending_pane_retry)
+            .is_some()
+        {
+            items.push(MenuItem::item("retry-ssh-now", RETRY_SSH_NOW));
+        }
         if self
             .tabs
             .active()
@@ -5457,6 +5488,15 @@ impl Component for TerminalApp {
                     && let Page::Terminal(live) = &tab.page
                 {
                     live.session.events.cancel_ssh_attempt(attempt.token);
+                }
+                self.refresh_open_commands();
+            }
+            Message::RetrySshNow(retry) => {
+                if let Some(tab) = self.tabs.active()
+                    && tab.pending_pane_retry() == Some(retry)
+                    && let Page::Terminal(live) = &tab.page
+                {
+                    live.session.events.retry_ssh_now(retry.token);
                 }
                 self.refresh_open_commands();
             }

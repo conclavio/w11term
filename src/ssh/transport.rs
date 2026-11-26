@@ -3,7 +3,7 @@ use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use crate::{
-    events::{AttemptGuard, Events, SshAttemptOutcome},
+    events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
     options::{Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
@@ -1014,20 +1014,33 @@ impl Driver {
                 .await?;
             let wait = tokio::time::sleep_until(wake_at);
             tokio::pin!(wait);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
-                    _ = &mut wait => break,
-                    message = self.input.recv() => match message {
-                        Some(message) => self.discard_input(message),
-                        None => return Ok(()),
+            let mut retry = attempt
+                .guard
+                .as_ref()
+                .and_then(|attempt| attempt.offer_retry(wake_at));
+            {
+                let request = RetryWait::requested(retry.as_mut());
+                tokio::pin!(request);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
+                        _ = &mut request => break,
+                        _ = &mut wait => break,
+                        message = self.input.recv() => match message {
+                            Some(message) => self.discard_input(message),
+                            None => return Ok(()),
+                        }
                     }
                 }
             }
+            drop(retry);
             if Instant::now() >= expires_at {
                 return Err(error.context(expired()));
             }
+            self.output
+                .send(Event::Status(format!("Reconnecting · attempt {failures}")))
+                .await?;
         }
     }
 }

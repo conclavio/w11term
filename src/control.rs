@@ -61,6 +61,10 @@ pub enum Request {
         pane: u64,
         attempt_token: crate::events::PendingSshAttempt,
     },
+    RetrySshNow {
+        pane: u64,
+        retry_token: crate::events::PendingSshRetry,
+    },
     DisconnectSshShell {
         pane: u64,
         connection_generation: std::num::NonZeroU64,
@@ -595,6 +599,14 @@ impl Registry {
                 );
                 Ok(json!({"pane":pane,"attempt_token":attempt_token,"accepted":true}))
             }
+            Request::RetrySshNow { pane, retry_token } => {
+                let events = Self::pane_events(&self.pane(pane)?).await?;
+                ensure!(
+                    events.retry_ssh_now(retry_token),
+                    "SSH retry is no longer waiting in this pane"
+                );
+                Ok(json!({"pane":pane,"retry_token":retry_token,"accepted":true}))
+            }
             Request::DisconnectSshShell {
                 pane,
                 connection_generation,
@@ -633,14 +645,17 @@ impl Registry {
                 let journal = events
                     .wait(since, Duration::from_secs(timeout_seconds))
                     .await;
-                let (restart_token, ssh_phase, ssh_attempt) = events.connection_snapshot();
+                let connection = events.connection_snapshot();
                 let mut result =
-                    json!({"pane":pane,"journal":journal,"restart_token":restart_token});
-                if let Some(phase) = ssh_phase {
+                    json!({"pane":pane,"journal":journal,"restart_token":connection.restart_token});
+                if let Some(phase) = connection.phase {
                     result["ssh_connection"] = phase.as_json();
                 }
-                if let Some(attempt) = ssh_attempt {
+                if let Some(attempt) = connection.attempt {
                     result["ssh_attempt_token"] = json!(attempt);
+                }
+                if let Some(retry) = connection.retry {
+                    result["ssh_retry_token"] = json!(retry);
                 }
                 Ok(result)
             }
@@ -938,12 +953,7 @@ impl Registry {
                 let mut sessions = Vec::new();
                 for (window_id, pane) in self.listing() {
                     let mut session = match Self::describe_pane(&pane).await {
-                        Ok(PaneDescription {
-                            frame,
-                            restart_token,
-                            ssh_phase,
-                            ssh_attempt,
-                        }) => {
+                        Ok(PaneDescription { frame, connection }) => {
                             let mut session = json!({
                                 "title": frame.title,
                                 "status": frame.status,
@@ -952,12 +962,15 @@ impl Registry {
                                 "prompt": frame.prompt,
                                 "connection_generation": frame.connection_generation,
                             });
-                            if let Some(phase) = ssh_phase {
+                            if let Some(phase) = connection.phase {
                                 session["ssh_connection"] = phase.as_json();
-                                session["restart_token"] = json!(restart_token);
+                                session["restart_token"] = json!(connection.restart_token);
                             }
-                            if let Some(attempt) = ssh_attempt {
+                            if let Some(attempt) = connection.attempt {
                                 session["ssh_attempt_token"] = json!(attempt);
+                            }
+                            if let Some(retry) = connection.retry {
+                                session["ssh_retry_token"] = json!(retry);
                             }
                             session
                         }

@@ -29,8 +29,10 @@ pub use group_transcript::{
 pub(crate) use inbox::display_field;
 pub use inbox::{Inbox, InboxWake, NoticeTarget, SshLoginResult};
 pub use kitty_notification::{NotificationChoice, NotificationResponse};
-pub(crate) use ssh_attempt::AttemptGuard;
-pub use ssh_attempt::{PendingSshAttempt, SshAttemptCompletion, SshAttemptOutcome};
+pub(crate) use ssh_attempt::{AttemptGuard, RetryWait, SshConnectionSnapshot};
+pub use ssh_attempt::{
+    PendingSshAttempt, PendingSshRetry, SshAttemptCompletion, SshAttemptOutcome,
+};
 
 const CAPACITY: usize = 4096;
 const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);
@@ -1183,7 +1185,10 @@ mod tests {
         events.pane_exited(6, Some(Stopped));
         assert_eq!(
             events.connection_snapshot(),
-            (None, Some(Disconnected), None)
+            SshConnectionSnapshot {
+                phase: Some(Disconnected),
+                ..Default::default()
+            }
         );
     }
 
@@ -1192,18 +1197,31 @@ mod tests {
         use SshConnectionPhase::*;
         use serde_json::json;
         let events = Events::default();
-        assert_eq!(events.connection_snapshot(), (None, None, None));
+        assert_eq!(
+            events.connection_snapshot(),
+            SshConnectionSnapshot::default()
+        );
         events.set_ssh_connection_phase(Connecting);
         events.set_ssh_connection_phase(Connecting);
         events.set_ssh_connection_phase(Reconnecting { attempt: Some(2) });
         events.pane_exited(7, Some(Stopped));
-        assert_eq!(events.connection_snapshot(), (Some(7), Some(Stopped), None));
+        assert_eq!(
+            events.connection_snapshot(),
+            SshConnectionSnapshot {
+                restart_token: Some(7),
+                phase: Some(Stopped),
+                ..Default::default()
+            }
+        );
 
         let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
         events.restart_exited(&commands, 7).unwrap();
         assert_eq!(
             events.connection_snapshot(),
-            (None, Some(Reconnecting { attempt: None }), None)
+            SshConnectionSnapshot {
+                phase: Some(Reconnecting { attempt: None }),
+                ..Default::default()
+            }
         );
         events.set_ssh_connection_phase(Connected);
         events.set_ssh_connection_phase(Disconnected);

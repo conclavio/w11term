@@ -2660,6 +2660,32 @@ async fn native_disconnect_ssh_shell_leaves_its_pane_and_powershell_neighbor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "skips SSH reconnect waits from the native pane and CLI without replacing the pane"]
+async fn native_retry_ssh_now_skips_the_current_wait_and_keeps_pane_history() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 7, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let state = tempfile::tempdir().unwrap();
+    fs::write(remote.path().join("keep-first-connection"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("retry-ssh-now-ui.ps1", &ssh, state.path());
+    assert_eq!(accepted.load(Ordering::Relaxed), 6);
+    assert_eq!(channels.load(Ordering::Relaxed), 6);
+    assert_eq!(fs::read(trace).unwrap(), b"before-retry/");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stops initial and retrying SSH attempts from pane actions and the CLI"]
 async fn native_stop_ssh_attempt_preserves_the_pane_and_rejects_stale_tokens() {
     let accepted = Arc::new(AtomicUsize::new(0));
