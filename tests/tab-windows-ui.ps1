@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -915,6 +915,70 @@ function Test-ControlPaneView {
     }
     Expect-Focus $origin $ssh.id 'Selection and zoom in the sibling window preserve desktop focus'
     Close-FixtureWindow $hwnd
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlTerminalNames {
+    Expect-Focus $origin $ssh.id 'SSH is selected before assigning tab and pane names' -PrepareWindow
+    $name = 'Fleet ' + [char]0x0394
+    $tabArgs = @('rename-tab','--window',"$($ssh.window_id)",'--tab',"$($ssh.tab_id)",'--name',$name)
+    $renamed = Control $tabArgs
+    if (!$renamed.changed -or $renamed.window_id -ne $ssh.window_id -or $renamed.tab_id -ne $ssh.tab_id -or
+        $renamed.name -cne $name -or (Control $tabArgs).changed) { throw 'Renaming the tab was not exact or idempotent' }
+    $hidden = Control @('rename-tab','--window',"$($ssh.window_id)",'--tab',"$($anchor.tab_id)",'--name','Local Scratch')
+    $paneName = Control @('rename-pane','--pane',"$($moved.id)",'--name','Build Logs')
+    $null = Wait-Until 'the native tab header reflects the CLI title' {
+        Find-Here $origin $name ([System.Windows.Automation.ControlType]::TabItem)
+    }
+    $tabs = (Control @('list-tabs','--window',"$($ssh.window_id)")).tabs
+    $panes = (Control @('list')).sessions
+    $local = $panes | Where-Object id -eq $moved.id
+    $remote = $panes | Where-Object id -eq $ssh.id
+    if (!$hidden.changed -or !$paneName.changed -or $paneName.pane -ne $moved.id -or
+        ($tabs | Where-Object tab_id -eq $anchor.tab_id).title -cne 'Local Scratch' -or
+        $local.pane_name -cne 'Build Logs' -or $local.tab_title -cne $name -or
+        $remote.tab_title -cne $name -or $null -ne $remote.pane_name) {
+        throw 'Renaming one pane did not keep its name independent of the tab and other pane'
+    }
+    Expect-Focus $origin $ssh.id 'Naming the hidden tab and inactive pane preserves desktop focus'
+    Type-In $origin 'named/'
+    Expect-Text $ssh.id 'named/'
+
+    $other = Control @('open','--profile','Destination PowerShell','--new-window')
+    $otherWindow = Wait-DetachedWindow $origin
+    $null = Control @('move-tab','--pane',"$($ssh.id)",'--window',"$($other.window_id)")
+    $stale = & $Cli --pid $app.Id @tabArgs | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $stale.ok -or $stale.error -notlike 'unknown tab *') {
+        throw 'A stale source window renamed a tab after it moved'
+    }
+    $paneName = Control @('rename-pane','--pane',"$($moved.id)",'--name','Build Local')
+    $tabs = (Control @('list-tabs','--window',"$($other.window_id)")).tabs
+    $movedTab = $tabs | Where-Object tab_id -eq $ssh.tab_id
+    if ($paneName.window_id -ne $other.window_id -or $paneName.tab_id -ne $ssh.tab_id -or
+        $movedTab.title -cne $name -or $movedTab.selected) { throw 'The moved tab lost its name or became selected' }
+    $savedName = 'CLI terminal names'
+    $null = Control @('save-workspace','--window',"$($other.window_id)",'--name',$savedName)
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $saved = ([IO.File]::ReadAllText($catalog, [Text.Encoding]::UTF8) | ConvertFrom-Json).workspaces.$savedName
+    $savedTab = $saved.tabs | Where-Object title -ceq $name
+    if (!$savedTab -or $savedTab.layout.second.pane_name -cne 'Build Local' -or $null -ne $savedTab.layout.first.pane_name) {
+        throw 'The saved workspace did not retain the split title and its exact pane name'
+    }
+    $null = Control @('focus-pane','--pane',"$($moved.id)")
+    $tabReset = Control @('rename-tab','--window',"$($other.window_id)",'--tab',"$($ssh.tab_id)",'--reset')
+    $fallback = (Control @('list-tabs','--window',"$($other.window_id)")).tabs | Where-Object tab_id -eq $ssh.tab_id
+    if (!$tabReset.changed -or $null -ne $tabReset.name -or $fallback.title -cne 'Build Local') {
+        throw 'Resetting the tab did not fall back to the focused pane name'
+    }
+    $resetArgs = @('rename-pane','--pane',"$($moved.id)",'--reset')
+    $reset = Control $resetArgs
+    $local = (Control @('list')).sessions | Where-Object id -eq $moved.id
+    if (!$reset.changed -or $null -ne $reset.name -or (Control $resetArgs).changed -or
+        $null -ne $local.pane_name -or $null -ne $local.tab_title) { throw 'Reset did not clear both explicit names' }
+    Expect-Focus $origin $anchor.id 'Renaming and resetting another window keep the original window focused'
+    $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','renamed/')
+    Expect-Text $ssh.id 'renamed/'
+    Close-FixtureWindow $otherWindow
     Close-FixtureWindow $origin
 }
 
@@ -2007,7 +2071,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -2021,6 +2085,7 @@ try {
             'CliSaveWorkspace' { Test-ControlSaveWorkspace }
             'CliMoveTab' { Test-ControlMoveTab }
             'CliTabOrder' { Test-ControlTabOrder }
+            'CliTerminalNames' { Test-ControlTerminalNames }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

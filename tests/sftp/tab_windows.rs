@@ -200,6 +200,12 @@ async fn native_cli_lists_and_reorders_a_window_tab_strip() {
     run("CliTabOrder", b"after-order/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "names exact background terminals and panes, moves their live split, and saves their independent names"]
+async fn native_cli_names_and_resets_live_tabs_and_panes() {
+    run("CliTerminalNames", b"named/renamed/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
