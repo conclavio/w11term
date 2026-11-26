@@ -767,6 +767,16 @@ function Test-ControlWorkspaceWindow {
     $sourceSplit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before the CLI opens a window'
 
+    $background = Control @('open-workspace','--new-window','--name','Background local')
+    $backgroundWindow = Wait-DetachedWindow $origin
+    Expect-Text $background.workspace_active_pane 'PS '
+    Expect-Focus $origin $ssh.id 'The local workspace opens without activation'
+    Close-FixtureWindow $backgroundWindow
+    $null = Wait-Until 'closing an unactivated window leaves the original pipe running' {
+        $handles = [TabFixtureWindows]::OwnedBy($app.Id)
+        $handles.Count -eq 1 -and $handles -contains $origin -and @((Control @('list')).sessions).Count -eq 3
+    }
+
     $failed = & $Cli --pid $app.Id open-workspace --new-window --name 'broken-copy' | ConvertFrom-Json
     if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*missing-window-profile*') {
         throw 'Opening an invalid workspace in a new window did not name the missing profile'
@@ -819,7 +829,13 @@ function Test-ControlWorkspaceWindow {
     Use-Window $child
     $childSplit = Wait-Until 'native split tab in the window opened from the CLI' { Find-Here $child 'Cockpit tools' }
     $childSplit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    Expect-Focus $child $remote 'The CLI-created window accepts normal keyboard input after activation'
+    $null = Wait-Until 'the restored SSH split is active and its window can take focus' {
+        $pane = (Control @('list')).sessions | Where-Object id -eq $remote
+        if ($pane.active -and $pane.visible) {
+            Use-Window $child
+            [TabFixtureWindows]::GetForegroundWindow() -eq $child
+        }
+    }
     Expect-Text $remote 'ready'
     Type-In $child 'new-window/'
     Expect-Text $remote 'new-window/'
@@ -1332,6 +1348,10 @@ try {
         }
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'The CLI window fixture did not shut down cleanly'
+        }
+        [uint32]$code = 0
+        if (![TabFixtureWindows]::GetExitCodeProcess($processHandle, [ref]$code) -or $code -ne 0) {
+            throw "The CLI window fixture exited with code $code"
         }
         return
     }

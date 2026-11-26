@@ -5433,6 +5433,17 @@ impl Component for TerminalApp {
             });
         })
         .expect("installing terminal input adapter");
+        if matches!(
+            child.map(|child| &child.launch),
+            Some(tab_windows::ChildLaunch::Workspace {
+                control: Some(_),
+                ..
+            })
+        ) {
+            // WinUI can close a window shown without activation through its window API.
+            let sender = context.sender();
+            keyboard.on_close_request(move || sender.send(Message::CloseWindow));
+        }
         let _native = keyboard.scope().enter();
         let store = ProfileStore::new(options.profiles_path.clone())
             .expect("resolving profile configuration path");

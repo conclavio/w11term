@@ -118,6 +118,7 @@ struct State {
     native_late_char: Option<KeySlot>,
     game_mode: bool,
     close_handler: Option<Box<dyn Fn()>>,
+    close_request: Option<Box<dyn Fn() -> bool>>,
 }
 
 pub(crate) struct BroadcastTarget {
@@ -734,6 +735,15 @@ impl KeyboardBridge {
             }
         });
     }
+
+    pub fn on_close_request(&self, handler: impl Fn() -> bool + 'static) {
+        let _native = self.scope.enter();
+        with_input_mut(|input| {
+            if let Some(state) = input {
+                state.close_request = Some(Box::new(handler));
+            }
+        });
+    }
     pub fn reset_keys(&self, sender: &mpsc::UnboundedSender<Command>) {
         let _native = self.scope.enter();
         let owns_input = with_input_mut(|input| {
@@ -1001,6 +1011,18 @@ unsafe extern "system" fn window_proc(
     let _guard = scope.enter();
     if message == WM_ACTIVATE {
         window::activated((wparam.0 & 0xffff) != WA_INACTIVE as usize);
+    }
+    if message == WM_CLOSE
+        && with_input(|state| {
+            state.try_borrow().ok().is_some_and(|state| {
+                state
+                    .as_ref()
+                    .and_then(|state| state.close_request.as_ref())
+                    .is_some_and(|request| request())
+            })
+        })
+    {
+        return LRESULT(0);
     }
     // Persist before native destruction; a queued component message can be
     // retired with the window before it gets a chance to inspect its HWND.
@@ -1336,6 +1358,7 @@ impl State {
             native_late_char: None,
             game_mode: false,
             close_handler: None,
+            close_request: None,
         }
     }
 

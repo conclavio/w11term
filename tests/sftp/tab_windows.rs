@@ -209,6 +209,11 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         broken["tabs"][0]["layout"]["first"]["source"]["value"] = json!("missing-window-profile");
         workspaces["broken-copy"] = broken;
     }
+    if first_close == "CliWorkspaceWindow" {
+        workspaces["Background local"] = json!({"active_tab":0,"tabs":[
+            {"focused":1,"layout":leaf(1,local("Background local shell"))}
+        ]});
+    }
     if first_close == "CliWorkspace" {
         let mut broken = workspaces["two-windows"].clone();
         broken["tabs"][0]["layout"]["first"]["source"]["value"] = json!("missing-window-profile");
