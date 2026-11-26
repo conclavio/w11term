@@ -321,7 +321,9 @@ impl Mode {
 
     fn window_search(self) -> Option<SearchScope> {
         match self {
-            Self::Commands(command_palette::Search::Tabs) => Some(SearchScope::Tabs),
+            Self::Commands(command_palette::Search::Tabs | command_palette::Search::Windows) => {
+                Some(SearchScope::Tabs)
+            }
             Self::Focus | Self::Destination { .. } => Some(SearchScope::Panes),
             _ => None,
         }
@@ -789,6 +791,10 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
+    pub(super) fn open_window_picker(&mut self, ctx: &ComponentContext<Self>) {
+        self.start_picker(Mode::Commands(command_palette::Search::Windows), ctx);
+    }
+
     pub(super) fn open_closed_tab_search(&mut self, ctx: &ComponentContext<Self>) {
         self.start_picker(Mode::Commands(command_palette::Search::ClosedTabs), ctx);
     }
@@ -1024,6 +1030,7 @@ impl TerminalApp {
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
+            Mode::Commands(command_palette::Search::Windows) => self.window_search_rows(query),
             Mode::Commands(command_palette::Search::ClosedTabs) => self.closed_tab_rows(query),
             Mode::Commands(command_palette::Search::RunningCommands) => {
                 self.running_command_rows(query)

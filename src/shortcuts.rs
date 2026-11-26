@@ -39,6 +39,7 @@ pub enum Action {
     CommandPalette,
     PanePicker,
     FindTab,
+    FindWindow,
     FindClosedTab,
     FindCommandHistory,
     Find,
@@ -194,6 +195,7 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
     Binding::new(FindTab, "find_tab", "Find tab", 0, Mods::NONE),
+    Binding::new(FindWindow, "find_window", "Find window", 0, Mods::NONE),
     Binding::new(
         FindClosedTab,
         "find_closed_tab",
