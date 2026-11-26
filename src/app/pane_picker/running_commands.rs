@@ -43,7 +43,6 @@ impl Picker {
                 Message::WatchRunningCommand(Arc::clone(&launch), pane, target, arm)
             }))
             .content(format!("{label}  (F8)"))
-            .into()
     }
 }
 
