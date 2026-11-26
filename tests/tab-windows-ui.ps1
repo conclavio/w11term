@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -595,6 +595,96 @@ function Invoke-WorkspaceButton([IntPtr]$Hwnd, [string]$Name) {
     })
 }
 
+function Test-CopySavedWorkspace {
+    $workspaceCommand = 'Workspaces' + [char]0x2026
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $original = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces.'two-windows'
+    $originalClaim = Wait-Until 'the original saved workspace claim' {
+        (Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows |
+            Where-Object { $_.window_id -eq $ssh.window_id -and $_.workspace }
+    }
+    Run-WindowCommand $origin $workspaceCommand
+    Invoke-WorkspaceButton $origin 'Manage workspace two-windows'
+    Invoke-WorkspaceButton $origin 'Duplicate saved workspace'
+    $field = Wait-Until 'the unused name is suggested for the saved copy' {
+        $entry = Find-Here $origin 'Workspace copy name'
+        if ($entry -and $entry.GetCurrentPattern($value).Current.Value -ceq 'two-windows copy 2') { $entry }
+    }
+    Invoke-WorkspaceButton $origin 'Cancel'
+    Invoke-WorkspaceButton $origin 'Duplicate saved workspace'
+    $field = Wait-Until 'the copy name field reopens' { Find-Here $origin 'Workspace copy name' }
+    $field.GetCurrentPattern($value).SetValue('two-windows')
+    $null = Wait-Until 'copying onto the original name is disabled' {
+        $save = Find-Here $origin 'Save workspace copy'
+        $save -and !$save.Current.IsEnabled
+    }
+    $field = Find-Here $origin 'Workspace copy name'
+    $field.GetCurrentPattern($value).SetValue('two-windows copy')
+    Invoke-WorkspaceButton $origin 'Save workspace copy'
+    $null = Wait-Until 'an occupied destination name is refused' {
+        Find-Here $origin 'Workspace two-windows copy already exists'
+    }
+    $copyName = 'Cockpit sandbox'
+    $field = Find-Here $origin 'Workspace copy name'
+    $field.GetCurrentPattern($value).SetValue($copyName)
+    Invoke-WorkspaceButton $origin 'Save workspace copy'
+    $null = Wait-Until 'the copy and original appear in the saved list' {
+        (Find-Here $origin "Duplicated two-windows as $copyName") -and
+            (Find-Here $origin "Switch to workspace $copyName") -and (Find-Here $origin 'Switch to workspace two-windows')
+    }
+    $stored = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces
+    $sourceAfter = $stored.'two-windows'
+    if (($stored.$copyName | ConvertTo-Json -Depth 12 -Compress) -cne
+            ($sourceAfter | ConvertTo-Json -Depth 12 -Compress) -or
+        $sourceAfter.active_tab -ne $original.active_tab -or
+        $sourceAfter.tabs[0].layout.ratio -ne $original.tabs[0].layout.ratio -or
+        $stored.'two-windows copy'.tabs[0].layout.source.kind -cne 'demo' -or $stored.'two-windows copy 2') {
+        throw 'The copied recipe, source recipe or existing destination changed unexpectedly'
+    }
+    $claims = @((Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows)
+    if ($claims.Count -ne 1 -or $claims[0].workspace -cne $originalClaim.workspace -or
+        @((Control @('list')).sessions).Count -ne 3 -or [TabFixtureWindows]::OwnedBy($app.Id).Count -ne 1) {
+        throw 'Saving a workspace copy opened panes or changed the original window registration'
+    }
+
+    Invoke-WorkspaceButton $origin "Open workspace $copyName in new window"
+    $copied = Wait-DetachedWindow $origin
+    $panes = @(Wait-Until 'all panes of the duplicate are open' {
+        $new = @((Control @('list')).sessions | Where-Object window_id -ne $ssh.window_id)
+        if ($new.Count -eq 3) { $new }
+    })
+    $copySsh = $panes | Where-Object label -eq 'window-ssh'
+    $copyAnchor = $panes | Where-Object label -eq 'Source PowerShell'
+    Expect-Focus $copied $copyAnchor.id 'The copy restores the saved active tab'
+    $claims = @(Wait-Until 'both saved workspace windows are registered' {
+        $records = @((Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows)
+        if ($records.Count -eq 2) { $records }
+    })
+    $copyClaim = $claims | Where-Object window_id -eq $copySsh.window_id
+    $sourceClaim = $claims | Where-Object window_id -eq $ssh.window_id
+    if (!$copyClaim.workspace -or $copyClaim.workspace -ceq $originalClaim.workspace -or
+        $sourceClaim.workspace -cne $originalClaim.workspace) {
+        throw 'The copy shares the original workspace identity'
+    }
+    (Find-Here $copied 'Cockpit tools').GetCurrentPattern($select).Select()
+    Expect-Focus $copied $copySsh.id 'The copied split has its own SSH pane'
+    Expect-Text $copySsh.id 'ready'
+    Type-In $copied 'copy-recipe/'
+    Expect-Text $copySsh.id 'copy-recipe/'
+    Use-Window $origin
+    (Find-Here $origin 'Cockpit tools').GetCurrentPattern($select).Select()
+    Expect-Focus $origin $ssh.id 'The original remains available after duplication'
+    Run-WindowCommand $copied $workspaceCommand
+    Invoke-WorkspaceButton $copied 'Switch to workspace two-windows'
+    Expect-Focus $origin $ssh.id 'Switching from the copy reaches the original window'
+    Type-In $origin 'original-recipe/'
+    Expect-Text $ssh.id 'original-recipe/'
+    Close-FixtureWindow $copied
+    Close-FixtureWindow $origin
+}
+
 function Test-WorkspaceReplacement {
     $window = $origin
     $workspaceCommand = 'Workspaces' + [char]0x2026
@@ -919,6 +1009,13 @@ try {
         Test-WorkspaceReplacement
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'The workspace review windows did not close normally'
+        }
+        return
+    }
+    if ($FirstClose -eq 'CopyWorkspace') {
+        Test-CopySavedWorkspace
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'The original and duplicated workspace windows did not close normally'
         }
         return
     }
