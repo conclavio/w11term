@@ -506,6 +506,7 @@ struct ProfileDraft {
     port: String,
     keepalive_interval: String,
     keepalive_max: String,
+    reconnect_window: String,
     color_scheme: ColorScheme,
     font_size: String,
     tab_color: TabColor,
@@ -526,6 +527,7 @@ struct ProfileDraft {
 impl Default for ProfileDraft {
     fn default() -> Self {
         let keepalive = SshKeepalive::default();
+        let player = w11term::options::PlayerOptions::default();
         Self {
             origin: DraftOrigin::New,
             folder_revoke: Default::default(),
@@ -541,6 +543,7 @@ impl Default for ProfileDraft {
             port: "22".into(),
             keepalive_interval: keepalive.interval_seconds.to_string(),
             keepalive_max: keepalive.max_unanswered.to_string(),
+            reconnect_window: player.reconnect_window_seconds.to_string(),
             color_scheme: ColorScheme::default(),
             font_size: String::new(),
             tab_color: TabColor::default(),
@@ -553,7 +556,7 @@ impl Default for ProfileDraft {
             group_prompt: String::new(),
             authentication: 0,
             error: None,
-            player: Default::default(),
+            player,
             device: None,
             generating: false,
         }
@@ -581,6 +584,14 @@ impl ProfileDraft {
             .map_err(|_| anyhow::anyhow!("Port must be between 1 and 65535"))?
             .get();
         let authentication = ssh_authentication(self.authentication, &self.identity)?;
+        let mut player = self.player.clone();
+        match self.reconnect_window.trim().parse() {
+            Ok(seconds) => player.reconnect_window_seconds = seconds,
+            Err(error) if player.reconnect => {
+                return Err(error).context("Enter a positive SSH retry window in whole seconds");
+            }
+            Err(_) => {}
+        }
         Ok(SshOptions {
             host: host.into(),
             terminal_type: self.terminal_type()?,
@@ -603,7 +614,7 @@ impl ProfileDraft {
             authentication,
             host_key: (!self.fingerprint.trim().is_empty()).then(|| self.fingerprint.trim().into()),
             host_key_alias: self.host_key_alias(),
-            player: self.player.clone(),
+            player,
             proxy_jump: self.proxy_jump.clone(),
             local_forwards: self.local_forwards.clone(),
             group_prompt: (!self.group_prompt.trim().is_empty())
@@ -645,6 +656,7 @@ impl ProfileDraft {
             port: options.port.to_string(),
             keepalive_interval: options.keepalive.interval_seconds.to_string(),
             keepalive_max: options.keepalive.max_unanswered.to_string(),
+            reconnect_window: options.player.reconnect_window_seconds.to_string(),
             color_scheme: options.color_scheme,
             font_size: options
                 .font_size
@@ -976,6 +988,7 @@ pub enum Field {
     Port,
     KeepaliveInterval,
     KeepaliveMax,
+    ReconnectWindow,
     ScrollbackLines,
     FontSize,
     CustomTerminal,
@@ -4731,6 +4744,28 @@ impl TerminalApp {
                 )
                 .content("Keep the remote shell running with zmx (Linux)"),
         );
+        fields.push(
+            StackPanel::new().spacing(6.0).children((
+                CheckBox::new()
+                    .is_checked(draft.player.reconnect)
+                    .on_is_checked_changed(
+                        context.callback(move |value| {
+                            Message::DraftPlayer(id, "reconnect".into(), value)
+                        }),
+                    )
+                    .content("Reconnect after a network interruption"),
+                TextBlock::new().text("SSH retry window (seconds)"),
+                TextBox::new()
+                    .automation_name("SSH retry window (seconds)")
+                    .is_enabled(draft.player.reconnect)
+                    .text(&draft.reconnect_window)
+                    .on_text_changed(
+                        context.callback(move |value| {
+                            Message::Edit(id, Field::ReconnectWindow, value)
+                        }),
+                    ),
+            )),
+        );
         for (name, label, value) in [
             (
                 "rustmush",
@@ -4741,11 +4776,6 @@ impl TerminalApp {
                 "game_mode",
                 "Game mode (suppress held-key repeats)",
                 draft.player.game_mode,
-            ),
-            (
-                "reconnect",
-                "Reconnect after a network interruption",
-                draft.player.reconnect,
             ),
             ("mute", "Mute this profile", draft.player.mute),
             (
@@ -7115,6 +7145,7 @@ impl Component for TerminalApp {
                         Field::Port => &mut draft.port,
                         Field::KeepaliveInterval => &mut draft.keepalive_interval,
                         Field::KeepaliveMax => &mut draft.keepalive_max,
+                        Field::ReconnectWindow => &mut draft.reconnect_window,
                         Field::ScrollbackLines => &mut draft.scrollback_lines,
                         Field::FontSize => &mut draft.font_size,
                         Field::CustomTerminal => &mut draft.custom_terminal,

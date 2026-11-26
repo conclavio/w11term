@@ -13,10 +13,17 @@ use russh::{
     client,
     keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use wezterm_term::TerminalSize;
 use zeroize::Zeroizing;
+
+const WORKSPACE_COMMAND_INTERRUPTED: &str =
+    "Workspace command interrupted; reopen the workspace to run it again";
 
 #[derive(Debug)]
 pub enum Event {
@@ -44,6 +51,46 @@ impl std::fmt::Display for Permanent {
 impl std::error::Error for Permanent {}
 fn stop(message: impl Into<String>) -> anyhow::Error {
     Permanent(message.into()).into()
+}
+
+async fn wait_for_retry_deadline(deadline: Option<Instant>, ready: Option<&OnceLock<Instant>>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+        if ready.is_none_or(|ready| ready.get().is_none()) {
+            return;
+        }
+    }
+    std::future::pending().await
+}
+
+fn ceil_seconds(duration: Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_expired_reconnect_deadline_leaves_a_ready_shell_running() {
+        let now = Instant::now();
+        let ready = OnceLock::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_retry_deadline(Some(now), Some(&ready)),
+        )
+        .await
+        .unwrap();
+        ready.set(now).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                wait_for_retry_deadline(Some(now), Some(&ready))
+            )
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -787,9 +834,15 @@ impl Driver {
         attempt: &mut PendingAttempt,
     ) -> Result<()> {
         let mut failures = 0u32;
-        let mut dropped_at: Option<tokio::time::Instant> = None;
+        let mut deadline = None;
+        let window = Duration::from_secs(self.options.player.reconnect_window_seconds.get().into());
+        let expired = || {
+            format!(
+                "automatic reconnection stopped after {} seconds",
+                window.as_secs()
+            )
+        };
         loop {
-            let deadline = dropped_at.map(|since| since + Duration::from_secs(300));
             let connected = {
                 let launch_gate = self.sharing.launch_gate.take();
                 let events = &self.events;
@@ -822,7 +875,7 @@ impl Driver {
                     tokio::select! {
                         biased;
                         _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
-                        _ = tokio::time::sleep_until(deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))), if deadline.is_some() => anyhow::bail!("automatic reconnection stopped after 300 seconds"),
+                        _ = wait_for_retry_deadline(deadline, None) => anyhow::bail!("{}", expired()),
                         result = &mut future => break result,
                         message = self.input.recv() => match message {
                             Some(message) => offline(message, &mut self.size, &mut self.options),
@@ -834,21 +887,33 @@ impl Driver {
             let result = match connected {
                 Ok(session) => {
                     self.generation = self.sharing.next_generation();
-                    let started = tokio::time::Instant::now();
-                    let result = tokio::select! {
+                    let ready = OnceLock::new();
+                    let completed = tokio::select! {
                         biased;
                         _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => {
                             return Err(AttemptStopped.into());
                         }
-                        result = run_channel(session, self, program, &mut attempt.guard) => result,
+                        _ = wait_for_retry_deadline(deadline, Some(&ready)) => None,
+                        result = run_channel(session, self, program, &mut attempt.guard, &ready) => Some(result),
+                    };
+                    let Some(result) = completed else {
+                        let error = anyhow::anyhow!("{}", expired());
+                        return Err(if self.command_dispatched {
+                            error.context(WORKSPACE_COMMAND_INTERRUPTED)
+                        } else {
+                            error
+                        });
                     };
                     self.output.send(Event::Disconnected).await?;
                     if let Some(game) = &mut self.game {
                         game.disconnected();
                     }
-                    if started.elapsed() > Duration::from_secs(30) {
+                    if ready
+                        .get()
+                        .is_some_and(|since| since.elapsed() > Duration::from_secs(30))
+                    {
                         failures = 0;
-                        dropped_at = None;
+                        deadline = None;
                     }
                     result
                 }
@@ -862,9 +927,7 @@ impl Driver {
                 return Err(error);
             }
             if self.command_dispatched && error.downcast_ref::<Permanent>().is_none() {
-                return Err(error.context(
-                    "Workspace command interrupted; reopen the workspace to run it again",
-                ));
+                return Err(error.context(WORKSPACE_COMMAND_INTERRUPTED));
             }
             if program.herdr_reference().is_some()
                 || matches!(program, Program::End(_))
@@ -874,30 +937,40 @@ impl Driver {
             {
                 return Err(error);
             }
-            let since = *dropped_at.get_or_insert_with(tokio::time::Instant::now);
-            if since.elapsed() >= Duration::from_secs(300) {
-                return Err(error.context("automatic reconnection stopped after 300 seconds"));
+            let now = Instant::now();
+            let expires_at = *deadline.get_or_insert(now + window);
+            if expires_at <= now {
+                return Err(error.context(expired()));
             }
             failures += 1;
             if can_stop && attempt.guard.is_none() {
                 attempt.begin(&self.events);
             }
             program.reconnecting(&format!("Link lost: {error:#}"));
-            let delay = Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
+            let next_attempt =
+                now + Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
+            let will_retry = next_attempt < expires_at;
+            let wake_at = next_attempt.min(expires_at);
+            let delay_seconds = ceil_seconds(wake_at - now);
             self.events.push(
                 "reconnecting",
-                serde_json::json!({"attempt":failures,"delay_seconds":delay.as_secs()}),
+                serde_json::json!({
+                    "attempt": failures,
+                    "delay_seconds": delay_seconds,
+                    "retry_remaining_seconds": ceil_seconds(expires_at - now),
+                    "will_retry": will_retry
+                }),
             );
             self.output.send(Event::Reconnecting(failures)).await?;
+            let action = if will_retry {
+                format!("reconnecting in {delay_seconds} s (attempt {failures})")
+            } else {
+                format!("retry window expires in {delay_seconds} s")
+            };
             self.output
-                .send(Event::Status(format!(
-                    "Link lost · reconnecting in {} s (attempt {failures}) · {error:#}",
-                    delay.as_secs()
-                )))
+                .send(Event::Status(format!("Link lost · {action} · {error:#}")))
                 .await?;
-            let wait = tokio::time::sleep(
-                delay.min(Duration::from_secs(300).saturating_sub(since.elapsed())),
-            );
+            let wait = tokio::time::sleep_until(wake_at);
             tokio::pin!(wait);
             loop {
                 tokio::select! {
@@ -910,6 +983,9 @@ impl Driver {
                     }
                 }
             }
+            if Instant::now() >= expires_at {
+                return Err(error.context(expired()));
+            }
         }
     }
 }
@@ -918,6 +994,7 @@ async fn run_channel(
     driver: &mut Driver,
     program: &Program,
     attempt: &mut Option<AttemptGuard>,
+    ready: &OnceLock<Instant>,
 ) -> Result<()> {
     let _published = shell.published.shell_lifetime(&shell.link);
     if let Some(reference) = program.herdr_reference() {
@@ -1027,6 +1104,7 @@ async fn run_channel(
     tokio::pin!(sideband);
     if managed {
         shell.published.publish(&shell.link, generation);
+        let _ = ready.set(Instant::now());
         program.ready();
         events.push(
             "connected",
@@ -1158,6 +1236,7 @@ async fn run_channel(
                     if pending == 0 {
                         PendingAttempt::finish(attempt, SshAttemptOutcome::Connected)?;
                         shell.published.publish(&shell.link, generation);
+                        let _ = ready.set(Instant::now());
                         program.ready();
                         events.push("connected", serde_json::json!({"generation":generation}));
                         output.send(Event::Connected(generation)).await?;

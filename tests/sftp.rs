@@ -204,6 +204,7 @@ impl server::Handler for Peer {
         #[cfg(feature = "ui-smoke")]
         {
             if self.root.join("withhold-shell-reply").is_file() {
+                fs::write(self.root.join("shell-reply-withheld"), [])?;
                 return Ok(());
             }
             let gate = self.root.join("hold-shell-request");
@@ -1191,6 +1192,136 @@ async fn ssh_keepalives_detect_a_silent_tcp_peer_at_the_profile_threshold() {
         "disabled keepalives should leave the silent connection open"
     );
     relays.abort_all();
+    server.abort();
+}
+
+#[cfg(feature = "ui-smoke")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_window_expires_during_shell_setup_and_preserves_manual_restart() {
+    use in_band_resize::Wire;
+    use w11term::events::SshConnectionPhase;
+
+    let (wire, mut messages) = tokio::sync::mpsc::unbounded_channel();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut options), root, _, server) =
+        fixture_with_wire(false, 3, accepted.clone(), Some(wire)).await
+    else {
+        unreachable!()
+    };
+    options.player.reconnect_window_seconds = 3.try_into().unwrap();
+    let pane = Session::start(Source::Ssh(options));
+    let Wire::Shell(_, first) = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("first connection did not reach the shell");
+    };
+    let first_generation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(generation) = pane.ssh_connection_generation() {
+                break generation;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let gate = root.path().join("withhold-shell-reply");
+    fs::write(&gate, []).unwrap();
+    first
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "retry fixture disconnect".into(),
+            "en".into(),
+        )
+        .await
+        .unwrap();
+
+    let restart = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(token) = pane.events.restart_token() {
+                break token;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the configured retry deadline should expire during remote shell setup");
+    assert!(root.path().join("shell-reply-withheld").is_file());
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert!(matches!(
+        pane.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Failed(reason)) if reason.contains("after 3 seconds")
+    ));
+    let retry = pane
+        .events
+        .since(0)
+        .events
+        .into_iter()
+        .find(|event| event.kind == "reconnecting")
+        .unwrap();
+    assert_eq!(retry.data["delay_seconds"], 1);
+    assert_eq!(retry.data["retry_remaining_seconds"], 3);
+    assert_eq!(retry.data["will_retry"], true);
+
+    fs::remove_file(gate).unwrap();
+    pane.restart_exited(restart).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pane
+            .ssh_connection_generation()
+            .is_none_or(|generation| generation <= first_generation)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("manual restart should have a fresh retry window");
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconnect_window_can_expire_before_the_next_login() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::Relaxed);
+            drop(socket);
+        }
+    });
+    let options = serde_json::from_value(json!({
+        "host": "127.0.0.1",
+        "user": "fixture",
+        "port": port,
+        "auth": "none",
+        "player": {"reconnect_window_seconds": 1},
+    }))
+    .unwrap();
+    let pane = Session::start(Source::Ssh(options));
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while pane.events.restart_token().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let journal = pane.events.since(0);
+    let mut waits = journal
+        .events
+        .iter()
+        .filter(|event| event.kind == "reconnecting");
+    let wait = waits.next().unwrap();
+    assert_eq!(wait.data["delay_seconds"], 1);
+    assert_eq!(wait.data["retry_remaining_seconds"], 1);
+    assert_eq!(wait.data["will_retry"], false);
+    assert!(waits.next().is_none());
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
     server.abort();
 }
 

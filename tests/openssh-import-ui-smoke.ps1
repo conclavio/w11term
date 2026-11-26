@@ -238,21 +238,25 @@ Host web
     Click 'Edit profile via'
     $interval = Field 'SSH keepalive interval (seconds)'
     $unanswered = Field 'Unanswered keepalives allowed'
+    $retryWindow = Field 'SSH retry window (seconds)'
     if ($interval.Current.Value -cne '15' -or $unanswered.Current.Value -cne '3') {
         throw 'The profile editor did not show the imported keepalive values'
     }
+    if ($retryWindow.Current.Value -cne '300') { throw 'The editor did not load the default retry window' }
     $interval.SetValue('40')
     $unanswered.SetValue('6')
-    $null = Wait-Until 'edited SSH keepalive fields' {
+    $retryWindow.SetValue('45')
+    $null = Wait-Until 'edited SSH recovery fields' {
         (Field 'SSH keepalive interval (seconds)').Current.Value -ceq '40' -and
-            (Field 'Unanswered keepalives allowed').Current.Value -ceq '6'
+            (Field 'Unanswered keepalives allowed').Current.Value -ceq '6' -and
+            (Field 'SSH retry window (seconds)').Current.Value -ceq '45'
     }
     Click 'Save profile changes'
     $null = Wait-Until 'saved keepalive changes' { Find-Element 'Changes saved.' }
     $updated = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.via
     if ($updated.keepalive.interval_seconds -ne 40 -or $updated.keepalive.max_unanswered -ne 6 -or
-        $updated.proxy_jump[0].keepalive.interval_seconds -ne 0) {
-        throw "Editing destination keepalive changed the wrong policy. See $profiles"
+        $updated.proxy_jump[0].keepalive.interval_seconds -ne 0 -or $updated.player.reconnect_window_seconds -ne 45) {
+        throw "Editing destination recovery changed the wrong policy. See $profiles"
     }
     Write-Output "OpenSSH import native smoke passed. Artifacts in $state"
 } finally {

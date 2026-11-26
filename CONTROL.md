@@ -635,6 +635,11 @@ a slot in a group launch. Failed includes a short
 with the same data shape. The connection snapshot and restart token describe
 the pane at reply time, including when recorded transitions have aged out.
 
+The `reconnecting` journal event records the scheduled wait's `attempt`,
+`delay_seconds`, `retry_remaining_seconds`, and `will_retry`. The two time
+values round up to whole seconds. When `will_retry` is false, the wait ends
+at the retry deadline and the client starts no further automatic attempt.
+
 A command completion watch armed in the GUI adds one `command-finished` event to
 the originating pane. Its data is `{"exit_code":17}` for a reported status or
 `{"exit_code":null}` when the shell supplied none. Command lines and output stay

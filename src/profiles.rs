@@ -2004,6 +2004,36 @@ mod order_tests {
     }
 
     #[test]
+    fn reconnect_windows_round_trip_with_the_legacy_default_and_opt_out() {
+        let (_dir, store) = fixture();
+        let initial = store.inspect("Alpha").unwrap().1.options;
+        assert!(initial.player.reconnect);
+        assert_eq!(initial.player.reconnect_window_seconds.get(), 300);
+        let mut custom = initial.clone();
+        custom.player.reconnect = false;
+        custom.player.reconnect_window_seconds = 45.try_into().unwrap();
+        store.edit("Alpha", "Alpha", &custom, &initial).unwrap();
+        let saved = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(saved.player, custom.player);
+        assert_eq!(
+            disk(&store)["profiles"]["Alpha"]["player"]["reconnect_window_seconds"],
+            45
+        );
+        store.edit("Alpha", "Alpha", &initial, &saved).unwrap();
+        assert!(
+            disk(&store)["profiles"]["Alpha"]["player"]
+                .get("reconnect_window_seconds")
+                .is_none()
+        );
+        assert!(
+            serde_json::from_value::<crate::options::PlayerOptions>(
+                json!({"reconnect_window_seconds": 0})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn scrollback_limits_round_trip_for_both_backends_and_can_return_to_default() {
         let (_dir, store) = fixture();
         for (limit, disk_value) in [(0, Some(0)), (32_767, Some(32_767)), (10_000, None)] {

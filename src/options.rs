@@ -146,6 +146,8 @@ pub enum Authentication {
 #[serde(default, deny_unknown_fields)]
 pub struct PlayerOptions {
     pub reconnect: bool,
+    #[serde(skip_serializing_if = "default_reconnect_window")]
+    pub reconnect_window_seconds: NonZeroU32,
     pub game_mode: bool,
     /// None follows game mode: compatible cursor-key scrolling outside games.
     pub alternate_scroll: Option<bool>,
@@ -160,6 +162,7 @@ impl Default for PlayerOptions {
     fn default() -> Self {
         Self {
             reconnect: true,
+            reconnect_window_seconds: DEFAULT_RECONNECT_WINDOW,
             game_mode: false,
             alternate_scroll: None,
             rustmush: false,
@@ -170,6 +173,12 @@ impl Default for PlayerOptions {
             device_key: None,
         }
     }
+}
+
+const DEFAULT_RECONNECT_WINDOW: NonZeroU32 = NonZeroU32::new(300).unwrap();
+
+fn default_reconnect_window(seconds: &NonZeroU32) -> bool {
+    *seconds == DEFAULT_RECONNECT_WINDOW
 }
 
 impl PlayerOptions {
