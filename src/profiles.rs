@@ -958,6 +958,9 @@ impl ProfileStore {
             if options.terminal_type.is_default() {
                 object.remove("terminal_type");
             }
+            if options.keepalive.is_default() {
+                object.remove("keepalive");
+            }
             if options.color_scheme.is_default() {
                 object.remove("color_scheme");
             }
@@ -1337,6 +1340,7 @@ mod tests {
             host: "new.test".into(),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            keepalive: Default::default(),
             font_size: None,
             tab_color: Default::default(),
             terminal_type: Default::default(),
@@ -1976,6 +1980,27 @@ mod order_tests {
         assert_eq!(entries["Local copy"]["font_size"], 72);
         assert_eq!(entries["SSH copy"]["extra"], 7);
         assert_eq!(entries["Local copy"]["extra"], "local");
+    }
+
+    #[test]
+    fn editing_keepalive_can_save_a_custom_policy_and_restore_the_default() {
+        let (_dir, store) = fixture();
+        let initial = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(initial.keepalive, Default::default());
+        let mut custom = initial.clone();
+        custom.keepalive.interval_seconds = 0;
+        custom.keepalive.max_unanswered = 7.try_into().unwrap();
+        store.edit("Alpha", "Alpha", &custom, &initial).unwrap();
+        let saved = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(saved.keepalive, custom.keepalive);
+        assert_eq!(
+            disk(&store)["profiles"]["Alpha"]["keepalive"],
+            json!({
+                "interval_seconds": 0, "max_unanswered": 7
+            })
+        );
+        store.edit("Alpha", "Alpha", &initial, &saved).unwrap();
+        assert!(disk(&store)["profiles"]["Alpha"].get("keepalive").is_none());
     }
 
     #[test]

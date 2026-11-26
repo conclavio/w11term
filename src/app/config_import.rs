@@ -163,8 +163,23 @@ pub(super) fn jump_summary(hops: &[JumpHost]) -> String {
             &hop.authentication,
             hop.host_key_alias.as_deref(),
         ));
+        if hop.keepalive != SshKeepalive::default() {
+            text.push_str("\n  ");
+            text.push_str(&keepalive_summary(hop.keepalive));
+        }
     }
     text
+}
+
+fn keepalive_summary(keepalive: SshKeepalive) -> String {
+    if keepalive.interval_seconds == 0 {
+        "SSH keepalives disabled".into()
+    } else {
+        format!(
+            "SSH keepalive every {} s · {} unanswered allowed",
+            keepalive.interval_seconds, keepalive.max_unanswered
+        )
+    }
 }
 
 impl TerminalApp {
@@ -423,6 +438,9 @@ impl TerminalApp {
                         )
                     ),
                 ));
+                if options.keepalive != SshKeepalive::default() {
+                    fields.push(text("keepalive", keepalive_summary(options.keepalive)));
+                }
                 if !options.proxy_jump.is_empty() {
                     fields.push(text("hops", jump_summary(&options.proxy_jump)));
                 }
@@ -554,13 +572,9 @@ impl TerminalApp {
                 assert_eq!(options.user, "pilot");
                 assert_eq!(options.port, 2222);
                 assert_eq!(options.proxy_jump[0].host, "gateway.test");
-                assert!(
-                    alias
-                        .warnings
-                        .iter()
-                        .any(|w| w.contains("10-destination.conf:6")
-                            && w.to_lowercase().contains("serveraliveinterval"))
-                );
+                assert_eq!(options.keepalive.interval_seconds, 15);
+                assert_eq!(options.keepalive.max_unanswered.get(), 3);
+                assert_eq!(options.proxy_jump[0].keepalive.interval_seconds, 0);
                 self.update(
                     Message::ImportConfig(Action::Save(id, revision, selected)),
                     context,
@@ -595,11 +609,15 @@ impl TerminalApp {
                 };
                 let hops = draft.proxy_jump.clone();
                 assert_eq!(hops.len(), 1);
+                assert_eq!(draft.keepalive_interval, "15");
+                assert_eq!(draft.keepalive_max, "3");
                 self.update(Message::TerminalPreset(id, Some(1)), context);
                 self.save_profile_action(id, false, context);
                 let saved = self.store.load().unwrap();
                 assert_eq!(saved.len(), 1);
                 assert_eq!(saved["via"].proxy_jump, hops);
+                assert_eq!(saved["via"].keepalive.interval_seconds, 15);
+                assert_eq!(saved["via"].keepalive.max_unanswered.get(), 3);
                 assert_eq!(saved["via"].terminal_type.as_str(), TerminalType::SIXEL);
                 eprintln!("OpenSSH import UI smoke passed");
                 self.update(Message::CloseWindow, context);

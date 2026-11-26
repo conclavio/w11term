@@ -1070,6 +1070,7 @@ async fn fixture_with_wire(
     let source = Source::Ssh(SshOptions {
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        keepalive: Default::default(),
         font_size: None,
         tab_color: Default::default(),
         terminal_type: Default::default(),
@@ -1107,6 +1108,90 @@ async fn fixture(
     .await
     .expect("SSH fixture did not connect");
     (session, source, root, opens, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_keepalives_detect_a_silent_tcp_peer_at_the_profile_threshold() {
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::watch,
+    };
+    use w11term::events::SshConnectionPhase;
+    let (Source::Ssh(options), _root, _opens, server) = fixture_connections(false, 3).await else {
+        unreachable!()
+    };
+    let (stall, gate) = watch::channel(false);
+    let mut relays = tokio::task::JoinSet::new();
+    let mut panes = Vec::new();
+    for (interval, unanswered) in [(1, 1), (1, 4), (0, 1)] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut profile = options.clone();
+        profile.port = listener.local_addr().unwrap().port();
+        profile.keepalive.interval_seconds = interval;
+        profile.keepalive.max_unanswered = unanswered.try_into().unwrap();
+        let server_port = options.port;
+        let mut gate = gate.clone();
+        relays.spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut peer = TcpStream::connect(("127.0.0.1", server_port))
+                .await
+                .unwrap();
+            tokio::select! {
+                result = tokio::io::copy_bidirectional(&mut client, &mut peer) => {
+                    panic!("fixture link closed before stalling: {result:?}");
+                }
+                result = gate.changed() => result.unwrap(),
+            }
+            // Keep both sockets open, including the listening socket, while no
+            // more bytes flow. A clean close would exercise a different path.
+            std::future::pending::<()>().await;
+        });
+        panes.push(Session::start(Source::Ssh(profile)));
+    }
+    let [fast, slow, disabled] = panes.as_slice() else {
+        unreachable!()
+    };
+    let reconnecting = |pane: &Session| {
+        matches!(
+            pane.events.ssh_connection_phase(),
+            Some(SshConnectionPhase::Reconnecting { .. })
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while [fast, slow, disabled]
+            .iter()
+            .any(|pane| pane.ssh_connection_generation().is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all three SSH panes should authenticate");
+    stall.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reconnecting(fast) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("one unanswered keepalive should trigger a reconnect");
+    assert!(
+        slow.ssh_connection_generation().is_some(),
+        "a larger limit should keep its original link longer"
+    );
+    tokio::time::timeout(Duration::from_secs(7), async {
+        while !reconnecting(slow) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the larger unanswered limit should eventually trigger a reconnect");
+    assert!(
+        disabled.ssh_connection_generation().is_some(),
+        "disabled keepalives should leave the silent connection open"
+    );
+    relays.abort_all();
+    server.abort();
 }
 
 fn directory_junction(root: &std::path::Path, name: &str, target: &str) {
@@ -1420,6 +1505,15 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
 
     // The fixture accepts exactly one TCP connection.
     let (original, source, root, opens, server) = fixture(false).await;
+    let Source::Ssh(mut incompatible) = source.clone() else {
+        unreachable!()
+    };
+    {
+        let link = original.ssh_connection().unwrap();
+        assert!(link.matches(&incompatible, None));
+        incompatible.keepalive.interval_seconds += 1;
+        assert!(!link.matches(&incompatible, None));
+    }
     fs::write(root.path().join("from-second-pane"), b"").unwrap();
     let child = Session::start_configured_with_connection(
         source,

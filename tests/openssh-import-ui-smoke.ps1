@@ -29,7 +29,9 @@ function Ssh-Reference([string]$Alias) {
     if ($LASTEXITCODE -ne 0) { throw "ssh.exe -G failed for fixture alias $Alias ($LASTEXITCODE)" }
     $endpoint = @{}
     foreach ($line in $lines) {
-        if ($line -cmatch '^(hostname|user|port|proxyjump|hostkeyalias) (.*)$') { $endpoint[$Matches[1]] = $Matches[2] }
+        if ($line -cmatch '^(hostname|user|port|proxyjump|hostkeyalias|serveraliveinterval|serveralivecountmax) (.*)$') {
+            $endpoint[$Matches[1]] = $Matches[2]
+        }
     }
     return $endpoint
 }
@@ -64,6 +66,7 @@ Host gateway
     HostKeyAlias Bastion.Key.Test
     User jump
     Port 2201
+    ServerAliveInterval 0
 '@
     Write-Config (Join-Path $fragments '30-blocked.conf') @'
 # This alias cannot be represented by a native SSH profile.
@@ -119,16 +122,21 @@ Host web
     $hop = $via.proxy_jump[0]
     if ($hop.host -cne 'gateway.test' -or $hop.user -cne 'jump' -or $hop.port -ne 2201) { throw "Unexpected saved included gateway. See $profiles" }
     if ($via.host_key_alias -cne 'build.key.test' -or $hop.host_key_alias -cne 'bastion.key.test') { throw "Host key aliases were lost during import or edit. See $profiles" }
+    if ($via.keepalive.interval_seconds -ne 15 -or $via.keepalive.max_unanswered -ne 3 -or
+        $hop.keepalive.interval_seconds -ne 0) { throw "Keepalive policy was lost during import or edit. See $profiles" }
     $sshExe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
     if (Test-Path -LiteralPath $sshExe -PathType Leaf) {
         $expected = Ssh-Reference 'via'
         $gateway = Ssh-Reference 'gateway'
         if ($expected.proxyjump -cne 'gateway' -or $expected.hostname -cne $via.host -or $expected.user -cne $via.user -or [int]$expected.port -ne $via.port -or
             $gateway.hostname -cne $hop.host -or $gateway.user -cne $hop.user -or [int]$gateway.port -ne $hop.port -or
-            $expected.hostkeyalias -cne $via.host_key_alias -or $gateway.hostkeyalias -cne $hop.host_key_alias) {
+            $expected.hostkeyalias -cne $via.host_key_alias -or $gateway.hostkeyalias -cne $hop.host_key_alias -or
+            [int]$expected.serveraliveinterval -ne $via.keepalive.interval_seconds -or
+            [int]$expected.serveralivecountmax -ne $via.keepalive.max_unanswered -or
+            [int]$gateway.serveraliveinterval -ne $hop.keepalive.interval_seconds) {
             throw "Saved profile differs from Windows OpenSSH -G. See $profiles"
         }
-        Write-Output 'Windows OpenSSH -G independently confirmed the destination and gateway.'
+        Write-Output 'Windows OpenSSH -G independently confirmed the destination, gateway and keepalive policy.'
     }
 
     Remove-Item Env:W11TERM_UI_SMOKE, Env:W11TERM_IMPORT_SMOKE
@@ -224,6 +232,27 @@ Host web
         $catalog.profiles.'via with jump'.host_key_alias -cne 'build.key.test' -or
         $catalog.profiles.'via with jump'.proxy_jump[0].host_key_alias -cne 'bastion.key.test') {
         throw "Unexpected saved group membership or profile options. See $profiles"
+    }
+
+    Run-Palette 'Settings'
+    Click 'Edit profile via'
+    $interval = Field 'SSH keepalive interval (seconds)'
+    $unanswered = Field 'Unanswered keepalives allowed'
+    if ($interval.Current.Value -cne '15' -or $unanswered.Current.Value -cne '3') {
+        throw 'The profile editor did not show the imported keepalive values'
+    }
+    $interval.SetValue('40')
+    $unanswered.SetValue('6')
+    $null = Wait-Until 'edited SSH keepalive fields' {
+        (Field 'SSH keepalive interval (seconds)').Current.Value -ceq '40' -and
+            (Field 'Unanswered keepalives allowed').Current.Value -ceq '6'
+    }
+    Click 'Save profile changes'
+    $null = Wait-Until 'saved keepalive changes' { Find-Element 'Changes saved.' }
+    $updated = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.via
+    if ($updated.keepalive.interval_seconds -ne 40 -or $updated.keepalive.max_unanswered -ne 6 -or
+        $updated.proxy_jump[0].keepalive.interval_seconds -ne 0) {
+        throw "Editing destination keepalive changed the wrong policy. See $profiles"
     }
     Write-Output "OpenSSH import native smoke passed. Artifacts in $state"
 } finally {

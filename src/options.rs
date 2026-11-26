@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -234,12 +235,41 @@ pub struct LocalForwardPreset {
     pub remote_port: std::num::NonZeroU16,
 }
 
+/// Transport keepalives for one authenticated SSH endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshKeepalive {
+    pub interval_seconds: u32,
+    pub max_unanswered: NonZeroU32,
+}
+
+impl Default for SshKeepalive {
+    fn default() -> Self {
+        Self {
+            interval_seconds: 5,
+            max_unanswered: NonZeroU32::new(2).unwrap(),
+        }
+    }
+}
+
+impl SshKeepalive {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn interval(self) -> Option<Duration> {
+        (self.interval_seconds != 0).then(|| Duration::from_secs(self.interval_seconds.into()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SshOptions {
     pub host: String,
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "SshKeepalive::is_default")]
+    pub keepalive: SshKeepalive,
     #[serde(default, skip_serializing_if = "TerminalType::is_default")]
     pub terminal_type: TerminalType,
     #[serde(default, skip_serializing_if = "ScrollbackLines::is_default")]
@@ -279,6 +309,8 @@ pub struct JumpHost {
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "SshKeepalive::is_default")]
+    pub keepalive: SshKeepalive,
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
@@ -296,6 +328,7 @@ impl From<JumpHost> for SshOptions {
             host: hop.host,
             user: hop.user,
             port: hop.port,
+            keepalive: hop.keepalive,
             terminal_type: TerminalType::default(),
             scrollback_lines: ScrollbackLines::default(),
             color_scheme: ColorScheme::default(),
@@ -1525,6 +1558,7 @@ mod tests {
             host_key_alias: None,
             terminal_type: TerminalType::default(),
             color_scheme: Default::default(),
+            keepalive: Default::default(),
             font_size: None,
             tab_color: Default::default(),
             scrollback_lines: ScrollbackLines::default(),
@@ -1541,6 +1575,7 @@ mod tests {
             host: "*".into(),
             user: "jump".into(),
             port: 22,
+            keepalive: Default::default(),
             authentication: Authentication::Agent,
             host_key: None,
             host_key_alias: None,

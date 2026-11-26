@@ -875,6 +875,7 @@ async fn durable_reference_checks_the_destination_key_through_a_jump() {
         host: "127.0.0.1".into(),
         user: "gate".into(),
         port,
+        keepalive: Default::default(),
         host_key: Some(fingerprint),
         host_key_alias: None,
         authentication: Authentication::None,

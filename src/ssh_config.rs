@@ -1,5 +1,7 @@
 //! Import a selected OpenSSH client configuration into editable native profiles.
-use crate::options::{Authentication, JumpHost, MAX_JUMPS, SshOptions, validate_host_key_alias};
+use crate::options::{
+    Authentication, JumpHost, MAX_JUMPS, SshKeepalive, SshOptions, validate_host_key_alias,
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -392,7 +394,13 @@ impl Config<'_> {
             for d in &section.directives {
                 let key = d.key.as_str();
                 match key {
-                    "hostname" | "hostkeyalias" | "user" | "port" | "identitiesonly" => {
+                    "hostname"
+                    | "hostkeyalias"
+                    | "user"
+                    | "port"
+                    | "identitiesonly"
+                    | "serveraliveinterval"
+                    | "serveralivecountmax" => {
                         scalars.entry(key).or_insert(d);
                     }
                     "identityfile" => identities.push(d),
@@ -451,6 +459,22 @@ impl Config<'_> {
         let port = match spec.port {
             Some(p) => p,
             None => configured(scalars.get("port").copied(), "22", parse_port)?,
+        };
+        let interval = scalars.get("serveraliveinterval").copied();
+        let max_unanswered = scalars.get("serveralivecountmax").copied();
+        let keepalive = if interval.is_none() && max_unanswered.is_none() {
+            SshKeepalive::default()
+        } else {
+            // When an alias supplies a keepalive directive, use OpenSSH's
+            // complementary default for any directive it leaves unspecified.
+            SshKeepalive {
+                interval_seconds: configured(interval, "0", parse_interval)?,
+                max_unanswered: configured(max_unanswered, "3", |value| {
+                    value
+                        .parse()
+                        .context("ServerAliveCountMax must be a positive whole number")
+                })?,
+            }
         };
         let port_text = port.to_string();
         let tokens = [
@@ -535,6 +559,7 @@ impl Config<'_> {
                 host,
                 user: user.into(),
                 port,
+                keepalive,
                 authentication,
                 host_key: None,
                 host_key_alias,
@@ -542,6 +567,30 @@ impl Config<'_> {
             via,
         ))
     }
+}
+
+fn parse_interval(mut value: &str) -> Result<u32> {
+    ensure!(!value.is_empty(), "Missing ServerAliveInterval");
+    let mut seconds = 0_u32;
+    while !value.is_empty() {
+        let digits = value.len() - value.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let (number, suffix) = value.split_at(digits);
+        let number: u32 = number.parse().context("Invalid ServerAliveInterval")?;
+        let factor = match suffix.as_bytes().first().map(u8::to_ascii_lowercase) {
+            None | Some(b's') => 1,
+            Some(b'm') => 60,
+            Some(b'h') => 3_600,
+            Some(b'd') => 86_400,
+            Some(b'w') => 604_800,
+            _ => bail!("Invalid ServerAliveInterval unit"),
+        };
+        seconds = number
+            .checked_mul(factor)
+            .and_then(|part| seconds.checked_add(part))
+            .context("ServerAliveInterval is too large")?;
+        value = suffix.get(1..).unwrap_or_default();
+    }
+    Ok(seconds)
 }
 
 fn warn(warnings: &mut BTreeSet<String>, message: impl FnOnce() -> String) {
@@ -701,16 +750,35 @@ mod tests {
             }
         );
         assert!(options.proxy_jump.is_empty());
-        assert!(
-            admin
-                .warnings
-                .iter()
-                .any(|s| s.contains("serveraliveinterval"))
-        );
+        assert_eq!(options.keepalive.interval_seconds, 15);
+        assert_eq!(options.keepalive.max_unanswered.get(), 3);
+        assert!(admin.warnings.is_empty());
         let dev = alias(&report, "admin-dev").options.as_ref().unwrap();
         assert_eq!(dev.proxy_jump[0].host, "gateway.example");
         assert_eq!(dev.proxy_jump[0].port, 22);
         assert_eq!(dev.proxy_jump[0].authentication, Authentication::Agent);
+        assert_eq!(dev.proxy_jump[0].keepalive, options.keepalive);
+    }
+
+    #[test]
+    fn keepalives_respect_each_hop_and_first_value_with_openssh_time_units() {
+        let report = parse_config(
+            "Host target\n ProxyJump gateway\n ServerAliveInterval 1m15s\n ServerAliveCountMax 6\n Host gateway\n ServerAliveInterval 0\n Host *\n ServerAliveInterval 25",
+        );
+        let target = alias(&report, "target").options.as_ref().unwrap();
+        assert_eq!(target.keepalive.interval_seconds, 75);
+        assert_eq!(target.keepalive.max_unanswered.get(), 6);
+        assert_eq!(target.proxy_jump[0].keepalive.interval(), None);
+        assert_eq!(target.proxy_jump[0].keepalive.max_unanswered.get(), 3);
+        for directive in [
+            "ServerAliveInterval -1",
+            "ServerAliveInterval 5x",
+            "ServerAliveInterval 999999w",
+            "ServerAliveInterval 5\n ServerAliveCountMax 0",
+        ] {
+            let report = parse_config(&format!("Host bad\n {directive}"));
+            assert!(alias(&report, "bad").options.is_none(), "{directive}");
+        }
     }
     #[test]
     fn resolves_nested_and_explicit_jump_routes_with_independent_flags() {

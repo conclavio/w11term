@@ -206,6 +206,7 @@ impl Fixture {
             endpoints.push(JumpHost {
                 host: HOSTS[index].into(),
                 port: address.port(),
+                keepalive: Default::default(),
                 user: USERS[index].into(),
                 authentication: Authentication::Identity { identity: path },
                 host_key: Some(host.public_key().fingerprint(HashAlg::Sha256).to_string()),

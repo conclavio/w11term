@@ -20,7 +20,7 @@ use w11term::{
     },
     options::{
         Authentication, ColorScheme, LocalOptions, ProfileTextSize, Profiles, ScrollbackLines,
-        Source, SshOptions, TabColor, TerminalType,
+        Source, SshKeepalive, SshOptions, TabColor, TerminalType,
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
@@ -504,6 +504,8 @@ struct ProfileDraft {
     host: String,
     user: String,
     port: String,
+    keepalive_interval: String,
+    keepalive_max: String,
     color_scheme: ColorScheme,
     font_size: String,
     tab_color: TabColor,
@@ -523,6 +525,7 @@ struct ProfileDraft {
 
 impl Default for ProfileDraft {
     fn default() -> Self {
+        let keepalive = SshKeepalive::default();
         Self {
             origin: DraftOrigin::New,
             folder_revoke: Default::default(),
@@ -536,6 +539,8 @@ impl Default for ProfileDraft {
             host: String::new(),
             user: String::new(),
             port: "22".into(),
+            keepalive_interval: keepalive.interval_seconds.to_string(),
+            keepalive_max: keepalive.max_unanswered.to_string(),
             color_scheme: ColorScheme::default(),
             font_size: String::new(),
             tab_color: TabColor::default(),
@@ -585,6 +590,16 @@ impl ProfileDraft {
             scrollback_lines: self.scrollback_lines.parse()?,
             user: user.into(),
             port,
+            keepalive: SshKeepalive {
+                interval_seconds: self.keepalive_interval.trim().parse().context(
+                    "Enter the SSH keepalive interval in whole seconds. Use 0 to disable it",
+                )?,
+                max_unanswered: self
+                    .keepalive_max
+                    .trim()
+                    .parse()
+                    .context("Enter a positive whole number of unanswered SSH keepalives")?,
+            },
             authentication,
             host_key: (!self.fingerprint.trim().is_empty()).then(|| self.fingerprint.trim().into()),
             host_key_alias: self.host_key_alias(),
@@ -628,6 +643,8 @@ impl ProfileDraft {
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
+            keepalive_interval: options.keepalive.interval_seconds.to_string(),
+            keepalive_max: options.keepalive.max_unanswered.to_string(),
             color_scheme: options.color_scheme,
             font_size: options
                 .font_size
@@ -957,6 +974,8 @@ pub enum Field {
     Host,
     User,
     Port,
+    KeepaliveInterval,
+    KeepaliveMax,
     ScrollbackLines,
     FontSize,
     CustomTerminal,
@@ -4573,6 +4592,18 @@ impl TerminalApp {
                 &draft.group_prompt,
                 "Full appliance prompt, for example racadm>>",
             ),
+            (
+                Field::KeepaliveInterval,
+                "SSH keepalive interval (seconds)",
+                &draft.keepalive_interval,
+                "0 disables keepalives",
+            ),
+            (
+                Field::KeepaliveMax,
+                "Unanswered keepalives allowed",
+                &draft.keepalive_max,
+                "1 or more",
+            ),
         ] {
             fields.push(
                 StackPanel::new().spacing(5.0).children((
@@ -7082,6 +7113,8 @@ impl Component for TerminalApp {
                         Field::Host => &mut draft.host,
                         Field::User => &mut draft.user,
                         Field::Port => &mut draft.port,
+                        Field::KeepaliveInterval => &mut draft.keepalive_interval,
+                        Field::KeepaliveMax => &mut draft.keepalive_max,
                         Field::ScrollbackLines => &mut draft.scrollback_lines,
                         Field::FontSize => &mut draft.font_size,
                         Field::CustomTerminal => &mut draft.custom_terminal,
@@ -8570,6 +8603,10 @@ mod profile_ui_tests {
                 host: "test.invalid".into(),
                 terminal_type: Default::default(),
                 color_scheme: ColorScheme::OneHalfLight,
+                keepalive: SshKeepalive {
+                    interval_seconds: 17,
+                    max_unanswered: 4.try_into().unwrap(),
+                },
                 font_size: Some(22.try_into().unwrap()),
                 tab_color: TabColor::Purple,
                 scrollback_lines: "0".parse().unwrap(),
@@ -8591,6 +8628,8 @@ mod profile_ui_tests {
             let mut draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
+            assert_eq!(draft.keepalive_interval, "17");
+            assert_eq!(draft.keepalive_max, "4");
             assert_eq!(draft.scrollback_lines, "0");
             assert_eq!(draft.color_scheme, ColorScheme::OneHalfLight);
             assert_eq!(draft.font_size, "22");

@@ -501,8 +501,8 @@ pub(super) async fn handshake(
     let config = Arc::new(client::Config {
         preferred: super::negotiation::preferred(trust_host_ca),
         nodelay: true,
-        keepalive_interval: Some(Duration::from_secs(5)),
-        keepalive_max: 2,
+        keepalive_interval: options.keepalive.interval(),
+        keepalive_max: options.keepalive.max_unanswered.get() as usize,
         ..Default::default()
     });
     let fingerprint = Arc::new(std::sync::OnceLock::new());
