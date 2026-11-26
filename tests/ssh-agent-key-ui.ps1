@@ -69,24 +69,31 @@ try {
         $field -and $field.GetCurrentPattern($value).Current.Value -ceq $fixture.wanted
     }
     Click 'Save and connect'
-    $null = Wait-Until 'the profile persists the selected key' {
-        $entry = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'Agent profile'
-        $entry.auth -eq 'agent-key' -and $entry.agent_fingerprint -ceq $fixture.wanted -and
-            $entry.agent_pipe -ceq $fixture.selected_pipe
-    }
+    # Wait for the editor to finish saving before opening the atomically replaced file.
     $pane = Wait-Until 'the saved SSH pane' {
         ((Control @('list')).sessions | Where-Object label -eq 'Agent profile').id
+    }
+    $entry = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'Agent profile'
+    if ($entry.auth -ne 'agent-key' -or $entry.agent_fingerprint -cne $fixture.wanted -or
+        $entry.agent_pipe -cne $fixture.selected_pipe) {
+        throw 'The profile did not persist the selected key and pipe'
     }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
     Wait-AuthFailure 'Missing agent key' 'does not hold the selected key'
     Wait-AuthFailure 'Rejected agent key' 'rejected the selected SSH agent key'
     Run-Palette 'Settings'
     Click 'Edit profile Agent profile'
+    Click 'Load agent keys'
+    $null = Wait-Until 'inventory from the saved pipe' { Find-Element 'Keys in the SSH agent' $combo }
     Set-AgentPipe ''
+    $null = Wait-Until 'clearing the pipe invalidates the saved inventory' {
+        !(Find-Element 'Keys in the SSH agent' $combo)
+    }
     Click 'Save profile changes'
-    $null = Wait-Until 'clearing the field removes the saved pipe override' {
-        $entry = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'Agent profile'
-        !$entry.agent_pipe -and $entry.agent_fingerprint -ceq $fixture.wanted
+    $null = Wait-Until 'confirmation that the cleared pipe was saved' { Find-Element 'Changes saved.' }
+    $entry = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'Agent profile'
+    if ($entry.agent_pipe -or $entry.agent_fingerprint -cne $fixture.wanted) {
+        throw 'Clearing the pipe must remove the override and retain the saved fingerprint'
     }
     Wait-AuthFailure 'Agent profile' 'does not hold the selected key'
     $automatic = (Control @('open','--profile','Automatic agent')).pane
