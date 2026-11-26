@@ -23,6 +23,11 @@ public static class TabFixtureWindows {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    public static string Describe(IntPtr hwnd) {
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        return String.Format("HWND {0}, PID {1}", hwnd, pid);
+    }
     public static string Title(IntPtr hwnd) {
         var title = new StringBuilder(512);
         GetWindowText(hwnd, title, title.Capacity);
@@ -226,16 +231,21 @@ function Expect-Text([int]$Pane, [string]$Value) {
     $null = Control @('wait-for-text','--pane',"$Pane",'--timeout','15',$Value)
 }
 
-function Expect-Focus([IntPtr]$Hwnd, [int]$Pane, [string]$Stage) {
+function Expect-Focus([IntPtr]$Hwnd, [int]$Pane, [string]$Stage, [switch]$PrepareWindow) {
     try {
         $null = Wait-Until "$Stage (pane $Pane, HWND $Hwnd)" {
+            # Only reacquire focus for fixture setup. Action results are observed without intervention.
+            if ($PrepareWindow -and [TabFixtureWindows]::GetForegroundWindow() -ne $Hwnd) {
+                Use-Window $Hwnd
+            }
             $active = @((Control @('list')).sessions | Where-Object active)
             $active.Count -eq 1 -and $active[0].id -eq $Pane -and
                 [TabFixtureWindows]::GetForegroundWindow() -eq $Hwnd
         }
     } catch {
         $panes = (Control @('list')).sessions | Select-Object id,label,window_id,tab_id,active,visible,cols,rows
-        throw "$Stage expected pane $Pane in HWND $Hwnd; foreground $([TabFixtureWindows]::GetForegroundWindow()); panes: $($panes | ConvertTo-Json -Compress)"
+        $foreground = [TabFixtureWindows]::Describe([TabFixtureWindows]::GetForegroundWindow())
+        throw "$Stage expected pane $Pane in HWND $Hwnd; foreground $foreground; panes: $($panes | ConvertTo-Json -Compress)"
     }
 }
 
@@ -295,7 +305,7 @@ function Test-PaneInNewWindow {
     Use-Window $origin
     $window = $origin
     Press-Key 0x77 # F8 focuses the PowerShell half of the split.
-    Expect-Focus $origin $moved.id 'Right PowerShell pane before detaching'
+    Expect-Focus $origin $moved.id 'Right PowerShell pane before detaching' -PrepareWindow
     Run-WindowCommand $origin 'Move pane to new window    F2'
     $child = Wait-DetachedWindow $origin
     Expect-Focus $child $moved.id 'The detached PowerShell pane receives focus'
@@ -322,7 +332,7 @@ function Test-PaneInNewWindow {
     Expect-Focus $origin $moved.id 'PowerShell returns to the original tab'
     $window = $origin
     Press-Key 0x78 # F9 focuses the SSH pane again.
-    Expect-Focus $origin $ssh.id 'Left SSH pane before detaching'
+    Expect-Focus $origin $ssh.id 'Left SSH pane before detaching' -PrepareWindow
     Press-Key 0x71 # F2 runs the action directly.
     $child = Wait-DetachedWindow $origin
     Expect-Focus $child $ssh.id 'The remapped action detaches the active SSH pane'
@@ -641,8 +651,7 @@ function Test-ExplicitControlWindow {
     } catch {
         throw "$_ Windows: $(Control @('list-windows') | ConvertTo-Json -Depth 4 -Compress)"
     }
-    Use-Window $origin
-    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground for CLI tests'
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground for CLI tests' -PrepareWindow
 
     $local = Control @('open','--window',"$targetId",'--profile','Destination PowerShell')
     if ($local.window_id -ne $targetId -or $local.active) {
@@ -832,8 +841,7 @@ function Test-ControlMove {
 }
 
 function Test-ControlSplit {
-    Use-Window $origin
-    Expect-Focus $origin $ssh.id 'SSH is focused before the CLI splits any pane'
+    Expect-Focus $origin $ssh.id 'SSH is focused before the CLI splits any pane' -PrepareWindow
     $invalid = & $Cli --pid $app.Id split-pane --pane "$($moved.id)" --profile 'missing profile' --axis rows | ConvertFrom-Json
     if ($LASTEXITCODE -eq 0 -or $invalid.ok -or $invalid.error -cne 'unknown profile missing profile' -or
         @((Control @('list')).sessions).Count -ne 3) {
@@ -903,8 +911,7 @@ function Test-ControlSplit {
 }
 
 function Test-ControlProfileWindows {
-    Use-Window $origin
-    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before profile discovery'
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before profile discovery' -PrepareWindow
     $saved = Control @('list-profiles')
     $remoteEntry = $saved.profiles | Where-Object name -ceq 'window-ssh'
     $localEntry = $saved.profiles | Where-Object name -ceq 'Destination PowerShell'
@@ -995,8 +1002,7 @@ function Test-ControlWorkspace {
         (Control @('list')).sessions | Where-Object label -eq 'Destination PowerShell'
     }
     $targetId = $initialChild.window_id
-    Use-Window $origin
-    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before workspace restore'
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before workspace restore' -PrepareWindow
 
     $catalog = @((Control @('list-workspaces')).workspaces)
     $mixed = $catalog | Where-Object name -ceq 'two-windows'
@@ -1056,7 +1062,7 @@ function Test-ControlWorkspaceWindow {
     Use-Window $origin
     $sourceSplit = Wait-Until 'original SSH split' { Find-Here $origin 'Cockpit tools' }
     $sourceSplit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before the CLI opens a window'
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before the CLI opens a window' -PrepareWindow
 
     $background = Control @('open-workspace','--new-window','--name','Background local')
     $backgroundWindow = Wait-DetachedWindow $origin
@@ -1475,9 +1481,8 @@ function Test-MoveAllTerminalTabs {
 }
 
 function Test-DuplicateInNewWindow {
-    Use-Window $origin
     $window = $origin
-    Expect-Focus $origin $ssh.id 'The source SSH pane starts selected'
+    Expect-Focus $origin $ssh.id 'The source SSH pane starts selected' -PrepareWindow
     Type-In $origin 'source-layout/'
     Expect-Text $ssh.id 'source-layout/'
     Press-Key 0x77 # F8 focuses the right split before capturing the layout.
