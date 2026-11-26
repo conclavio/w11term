@@ -87,6 +87,7 @@ mod pane_colors;
 mod pane_picker;
 mod pane_view;
 mod previous_pane;
+mod profile_query;
 mod quick_connect;
 mod recordings;
 mod scrollback_bar;
@@ -1028,6 +1029,7 @@ pub struct TerminalApp {
     store: ProfileStore,
     profile_error: Option<String>,
     profile_action_error: Option<String>,
+    profile_filter: String,
     width: f64,
     selection_pending: bool,
     selection_epoch: u64,
@@ -1175,6 +1177,7 @@ pub enum Message {
     QuickConnect(quick_connect::Action),
     SshIdentity(identity_picker::Action),
     MoveProfile(String, isize, Arc<[String]>),
+    FilterProfiles(String),
     StartupProfile(String),
     WindowActivation(bool),
     SettingsMenu,
@@ -2300,59 +2303,93 @@ impl TerminalApp {
                     context.callback(Message::StartupProfile),
                 )),
         );
+        profiles.push(
+            TextBox::new()
+                .automation_name("Filter profiles")
+                .placeholder_text("Filter by profile name or SSH address")
+                .text(&self.profile_filter)
+                .on_text_changed(context.callback(Message::FilterProfiles))
+                .into(),
+        );
+        let query = profile_query::Query::new(&self.profile_filter);
         let mut rows = Vec::with_capacity(order.len());
         for (index, name) in order.iter().enumerate() {
+            let ssh = self.catalog.profiles.get(name);
+            let endpoint = ssh.map(profile_query::address);
+            let details = endpoint.as_deref().unwrap_or("Local");
+            if query.rank(name, details).is_none() {
+                continue;
+            }
             let edit_name = name.clone();
-            let (label, edit) = if let Some(ssh) = self.catalog.profiles.get(name) {
-                (
-                    profile_label(name, ssh),
-                    Button::new()
-                        .automation_name(format!("Edit profile {name}"))
-                        .on_click(
-                            context.callback(move |_| Message::EditProfile(edit_name.clone())),
-                        ),
-                )
+            let edit = if ssh.is_some() {
+                Button::new()
+                    .automation_name(format!("Edit profile {name}"))
+                    .on_click(context.callback(move |_| Message::EditProfile(edit_name.clone())))
             } else {
-                (
-                    format!("{name} · Local"),
-                    Button::new()
-                        .automation_name(format!("Edit local profile {name}"))
-                        .on_click(context.callback(move |_| {
-                            Message::LocalProfile(local_profile::Action::Open(Some(
-                                edit_name.clone(),
-                            )))
-                        })),
-                )
+                Button::new()
+                    .automation_name(format!("Edit local profile {name}"))
+                    .on_click(context.callback(move |_| {
+                        Message::LocalProfile(local_profile::Action::Open(Some(edit_name.clone())))
+                    }))
             };
-            let movement = |direction, delta, enabled| {
+            let movement = |direction, glyph, delta, enabled| {
                 let order = order.clone();
                 let name = name.clone();
-                Button::new()
-                    .automation_name(format!("Move {name} {direction}"))
+                title_tools::button(&format!("Move {name} {direction}"))
                     .is_enabled(enabled)
                     .on_click(context.callback(move |_| {
                         Message::MoveProfile(name.clone(), delta, order.clone())
                     }))
-                    .content(format!("Move {direction}"))
+                    .content(TextBlock::new().font_size(16.0).text(glyph).tooltip_with(
+                        title_tools::below(format!("Move {direction} in profile order")),
+                    ))
             };
+            let label = format!("{name} · {details}");
             rows.push(KeyedView::new(
                 name.clone(),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(8.0)
                     .children((
-                        edit.content("Edit…"),
-                        movement("up", -1, index > 0),
-                        movement("down", 1, index + 1 < order.len()),
                         TextBlock::new()
-                            .text(label)
-                            .vertical_alignment(VerticalAlignment::Center),
+                            .text(&label)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .tooltip_with(title_tools::below(label)),
+                        StackPanel::new()
+                            .grid_column(1)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(2.0)
+                            .children((
+                                edit.content("Edit…"),
+                                movement("up", "↑", -1, index > 0),
+                                movement("down", "↓", 1, index + 1 < order.len()),
+                            )),
                     )),
             ));
         }
         if rows.is_empty() {
-            profiles.push(TextBlock::new().text("No saved profiles yet.").into());
+            profiles.push(
+                TextBlock::new()
+                    .text(if query.is_empty() {
+                        "No saved profiles yet."
+                    } else {
+                        "No profiles match this filter."
+                    })
+                    .into(),
+            );
         } else {
+            if !query.is_empty() {
+                profiles.push(
+                    TextBlock::new()
+                        .text(format!(
+                            "Showing {} of {} profiles",
+                            rows.len(),
+                            order.len()
+                        ))
+                        .into(),
+                );
+            }
             profiles.push(StackPanel::new().spacing(8.0).keyed_children(rows));
         }
         profiles.push(
@@ -4955,6 +4992,7 @@ impl Component for TerminalApp {
             store,
             profile_error,
             profile_action_error: None,
+            profile_filter: String::new(),
             width: client_size.0,
             window_height: client_size.1,
             client_size,
@@ -5059,6 +5097,7 @@ impl Component for TerminalApp {
                 | Message::TabTitle(_)
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
+                | Message::FilterProfiles(_)
                 | Message::Patterns(
                     pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
                 )
@@ -6587,6 +6626,14 @@ impl Component for TerminalApp {
                     {
                         shares.refresh_profile();
                     }
+                }
+            }
+            Message::FilterProfiles(query) => {
+                if matches!(
+                    self.tabs.active().map(|tab| &tab.page),
+                    Some(Page::Settings(None))
+                ) {
+                    self.profile_filter = query;
                 }
             }
             Message::MoveProfile(name, delta, order) => {

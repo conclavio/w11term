@@ -60,6 +60,11 @@ function Wait-SettingsOrder([string]$First, [string]$Second) {
         $up[0].Current.BoundingRectangle.Top -lt $up[1].Current.BoundingRectangle.Top
     }
 }
+function Set-ProfileFilter([string]$Query) {
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    $filter = Wait-Until 'profile filter in Settings' { Find-Element 'Filter profiles' $edit }
+    $filter.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+}
 function Launch-FromMenu([string]$First, [string]$Last, [string]$Choice) {
     Click 'New tab' $button
     $null = Wait-Until "the + menu to display '$First' above '$Last'" {
@@ -94,7 +99,17 @@ for ($launch = 1; $launch -le 2; $launch++) {
             $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')
             Settings
             Wait-SettingsOrder $sshName $localName
-            Click "Move $localName up" $button
+            Set-ProfileFilter "$($ssh.port) $($ssh.user)@$($ssh.host)"
+            $null = Wait-Until 'filter keeps the SSH row and hides the neighboring local profile' {
+                (Find-Element "Move $sshName down" $button) -and
+                    !(Find-Element "Edit local profile $localName" $button)
+            }
+            Click "Move $sshName down" $button
+            $null = Wait-Until 'the filtered move uses the full profile order' {
+                $up = Find-Element "Move $sshName up" $button
+                $up -and $up.Current.IsEnabled
+            }
+            Set-ProfileFilter ''
             Wait-SettingsOrder $localName $sshName
 
             # Keep this row's original action while another writer restores SSH first.

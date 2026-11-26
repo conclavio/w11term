@@ -81,6 +81,38 @@ try {
     if ($ids.Count -ne 3 -or $origin -notin $ids -or $remote -notin $ids) {
         throw 'The profile finder changed the previous live panes'
     }
+
+    Run-Palette 'Settings'
+    $filter = Wait-Until 'profile filter in Settings' { Find-Element 'Filter profiles' $edit -Visible }
+    $filter.SetFocus()
+    $filter.GetCurrentPattern($value).SetValue('no matches here')
+    $null = Wait-Until 'Settings reports no matching profiles' {
+        (Find-Element 'No profiles match this filter.') -and !(Find-Element 'Edit profile Fleet North' $button)
+    }
+    $filter.GetCurrentPattern($value).SetValue('local PALETTE')
+    $null = Wait-Until 'Settings filters local profiles by name and kind' {
+        (Find-Element 'Edit local profile Palette PowerShell' $button) -and
+            !(Find-Element 'Edit profile Fleet North' $button)
+    }
+    $filter.GetCurrentPattern($value).SetValue("$port NORTH TEST@127.0.0.1")
+    Invoke-Button (Wait-Until 'only the matching SSH profile can be edited' {
+        $editProfile = Find-Element 'Edit profile Fleet North' $button
+        if ($editProfile -and !(Find-Element 'Edit local profile Palette PowerShell' $button) -and
+            !(Find-Element 'Edit profile Fleet 01' $button)) { $editProfile }
+    })
+    $null = Wait-Until 'the existing SSH profile opens with its saved values' {
+        $name = Find-Element 'Profile name' $edit
+        $hostField = Find-Element 'Host' $edit
+        $portField = Find-Element 'Port' $edit
+        $name -and $hostField -and $portField -and
+            $name.GetCurrentPattern($value).Current.Value -ceq 'Fleet North' -and
+            $hostField.GetCurrentPattern($value).Current.Value -ceq '127.0.0.1' -and
+            $portField.GetCurrentPattern($value).Current.Value -ceq "$port"
+    }
+    $afterEdit = @((Control @('list')).sessions.id | Sort-Object)
+    if (($afterEdit -join ',') -cne (($ids | Sort-Object) -join ',')) {
+        throw 'Editing from the filtered list changed the running sessions'
+    }
 } catch {
     throw "$_ at $($_.ScriptStackTrace)"
 } finally {

@@ -240,22 +240,12 @@ fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
 }
 
 pub(super) fn profile_search_rows(catalog: &Profiles, query: &str) -> Vec<Row> {
-    let query = query.trim().to_lowercase();
-    let words: Vec<_> = query.split_whitespace().collect();
+    let query = profile_query::Query::new(query);
     let mut matches = Vec::new();
     for name in &catalog.profile_order {
-        let endpoint = catalog
-            .profiles
-            .get(name)
-            .map(|ssh| host_groups::ssh_address(&ssh.user, &ssh.host, ssh.port));
+        let endpoint = catalog.profiles.get(name).map(profile_query::address);
         let details = endpoint.as_deref().unwrap_or("Local");
-        let lower_name = name.to_lowercase();
-        let lower_details = details.to_lowercase();
-        if words
-            .iter()
-            .all(|word| lower_name.contains(word) || lower_details.contains(word))
-        {
-            let rank = (lower_name != query, !lower_name.starts_with(&query));
+        if let Some(rank) = query.rank(name, details) {
             matches.push((
                 rank,
                 Row {
