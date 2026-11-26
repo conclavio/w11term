@@ -12,6 +12,23 @@ struct Window {
     hwnd: usize,
     ui: Option<UiHandler>,
     capture: Option<CapturePng>,
+    details: Option<WindowDetails>,
+}
+
+struct WindowDetails {
+    name: Option<String>,
+    active_tab_title: Option<String>,
+    tab_count: usize,
+}
+
+#[derive(Serialize)]
+struct WindowListing<'a> {
+    window_id: WindowId,
+    name: Option<&'a str>,
+    active_tab_title: Option<&'a str>,
+    tab_count: usize,
+    pane_count: usize,
+    active: bool,
 }
 
 #[derive(Default)]
@@ -236,6 +253,21 @@ impl Registry {
         }
     }
 
+    pub fn set_window_details(
+        &self,
+        name: Option<&str>,
+        active_tab_title: Option<&str>,
+        tab_count: usize,
+    ) {
+        if let Some(window) = self.state.lock().unwrap().windows.get_mut(&self.id) {
+            window.details = Some(WindowDetails {
+                name: name.map(str::to_owned),
+                active_tab_title: active_tab_title.map(str::to_owned),
+                tab_count,
+            });
+        }
+    }
+
     pub fn set_capture(&self, capture: CapturePng) {
         if let Some(window) = self.state.lock().unwrap().windows.get_mut(&self.id) {
             window.capture = Some(capture);
@@ -419,6 +451,31 @@ impl Registry {
             .collect()
     }
 
+    pub(super) fn list_windows(&self) -> Value {
+        let state = self.state.lock().unwrap();
+        let mut pane_counts = BTreeMap::new();
+        for (owner, _) in state.panes.values() {
+            *pane_counts.entry(*owner).or_insert(0) += 1;
+        }
+        let active = state.recent.last();
+        let windows: Vec<_> = state
+            .windows
+            .iter()
+            .filter_map(|(id, window)| {
+                let details = window.details.as_ref()?;
+                Some(WindowListing {
+                    window_id: *id,
+                    name: details.name.as_deref(),
+                    active_tab_title: details.active_tab_title.as_deref(),
+                    tab_count: details.tab_count,
+                    pane_count: pane_counts.get(id).copied().unwrap_or(0),
+                    active: active == Some(id),
+                })
+            })
+            .collect();
+        json!({ "windows": windows })
+    }
+
     pub fn pane_input_in_window(
         &self,
         window: WindowId,
@@ -574,13 +631,16 @@ mod tests {
         assert!(panels.iter().all(|p| p["visible"] == true));
         assert_eq!(panels[0]["active"], false);
         assert_eq!(panels[1]["active"], true);
-        let open = || Request::Open {
+        let open = |window_id| Request::Open {
             profile: "fixture".into(),
+            window_id,
             cols: None,
             rows: None,
             activate: false,
         };
-        assert_eq!(one.execute(open(), capture()).await.unwrap(), 2);
+        assert_eq!(one.execute(open(None), capture()).await.unwrap(), 2);
+        assert_eq!(one.execute(open(Some(1)), capture()).await.unwrap(), 1);
+        assert_eq!(one.execute(open(None), capture()).await.unwrap(), 2);
         assert_eq!(
             two.execute(
                 Request::Resize {
@@ -595,8 +655,45 @@ mod tests {
             1
         );
         two.unregister().unwrap();
-        assert_eq!(two.execute(open(), capture()).await.unwrap(), 1);
+        assert_eq!(two.execute(open(None), capture()).await.unwrap(), 1);
+        assert_eq!(
+            two.execute(open(Some(2)), capture())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "unknown window 2"
+        );
         assert!(one.register_window(2, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn window_listing_keeps_utility_only_windows_and_removes_closed_windows() {
+        let one = Registry::default();
+        let two = one.register_window(2, None).unwrap();
+        let starting = one.register_window(3, None).unwrap();
+        window_control(&one);
+        window_control(&two);
+        one.set_window_details(Some("Operations"), Some("Terminal"), 2);
+        two.set_window_details(None, Some("Settings"), 1);
+        one.replace([pane(11), pane(12)]);
+        two.activate();
+
+        let list = one.execute(Request::ListWindows, capture()).await.unwrap();
+        assert_eq!(
+            list,
+            json!({"windows":[
+                {"window_id":1,"name":"Operations","active_tab_title":"Terminal","tab_count":2,"pane_count":2,"active":false},
+                {"window_id":2,"name":null,"active_tab_title":"Settings","tab_count":1,"pane_count":0,"active":true},
+            ]})
+        );
+        two.unregister().unwrap();
+        let list = starting
+            .execute(Request::ListWindows, capture())
+            .await
+            .unwrap();
+        assert_eq!(list["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(list["windows"][0]["window_id"], 1);
+        assert_eq!(list["windows"][0]["active"], true);
     }
 
     #[tokio::test]
