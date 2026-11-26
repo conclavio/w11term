@@ -146,6 +146,9 @@ pub enum Request {
         pane: u64,
         zoomed: bool,
     },
+    GetTabLayout {
+        pane: u64,
+    },
     Sftp {
         pane: u64,
         #[serde(default = "sftp_default_timeout")]
@@ -533,6 +536,10 @@ pub enum UiRequest {
         zoom: Option<bool>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    GetTabLayout {
+        pane: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Resize {
         pane: u64,
         cols: usize,
@@ -548,6 +555,7 @@ impl UiRequest {
             | Self::SplitPane { reply, .. }
             | Self::MovePane { reply, .. }
             | Self::SelectPaneView { reply, .. }
+            | Self::GetTabLayout { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
@@ -589,7 +597,8 @@ impl UiRequest {
             | Self::ClosePane { pane, .. }
             | Self::SplitPane { pane, .. }
             | Self::MovePane { pane, .. }
-            | Self::SelectPaneView { pane, .. } => Some(*pane),
+            | Self::SelectPaneView { pane, .. }
+            | Self::GetTabLayout { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
         }
@@ -602,6 +611,7 @@ impl UiRequest {
             | Self::SplitPane { reply, .. }
             | Self::MovePane { reply, .. }
             | Self::SelectPaneView { reply, .. }
+            | Self::GetTabLayout { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             if reply.is_closed()
         )
@@ -819,6 +829,15 @@ impl Registry {
             }
             Request::FocusPane { pane } => self.select_pane_view(pane, None).await,
             Request::ZoomPane { pane, zoomed } => self.select_pane_view(pane, Some(zoomed)).await,
+            Request::GetTabLayout { pane } => {
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(pane, UiRequest::GetTabLayout { pane, reply });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("reading the tab layout timed out")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::Resize { pane, cols, rows } => {
                 validate_grid(cols, rows)?;
                 let (reply, response) = oneshot::channel();

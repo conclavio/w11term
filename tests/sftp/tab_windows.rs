@@ -170,6 +170,12 @@ async fn native_cli_selects_and_zooms_exact_panes() {
     run("CliPaneView", b"origin-zoom/child-zoom/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reads nested, hidden and zoomed layouts and follows a live pane to another window"]
+async fn native_cli_reads_exact_live_tab_layouts() {
+    run("CliLayout", b"layout-ssh/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =

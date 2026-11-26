@@ -80,6 +80,27 @@ Direct pipe clients can send `{"verb":"move-pane","pane":42,"target_pane":57,"di
 
 Direct pipe clients can send `{"verb":"focus-pane","pane":42}` or `{"verb":"zoom-pane","pane":42,"zoomed":true}`.
 
+`get-tab-layout --pane ID` reads the terminal tab containing that pane. It works for a hidden tab, a zoomed split, or another window and preserves desktop focus. The reply gives `window_id`, `tab_id`, the tab's remembered `focused_pane`, `selected` within its window, and `zoomed`. A zoomed tab still reports its entire split tree.
+
+The `layout` array starts at index 0. A node of kind `pane` contains a live pane ID. A node of kind `split` contains an `axis` (`columns` or `rows`), the fraction `ratio` assigned to its first child, and the zero-based indices `first` and `second`. Children are ordered left to right or top to bottom. The ratio is the stored divider weight. Measured cells are available through `list`. Node indices apply only to that reply.
+
+```json
+{
+  "window_id": 1,
+  "tab_id": 9,
+  "focused_pane": 42,
+  "selected": true,
+  "zoomed": false,
+  "layout": [
+    {"kind":"split","axis":"columns","ratio":0.375,"first":1,"second":2},
+    {"kind":"pane","pane":42},
+    {"kind":"pane","pane":57}
+  ]
+}
+```
+
+Direct pipe clients can send `{"verb":"get-tab-layout","pane":42}`.
+
 ```powershell
 # Literal UTF-8, including a carriage return supplied by PowerShell.
 & $ctl --pid 12345 send-text --pane $pane --no-paste "BOARD`r"
