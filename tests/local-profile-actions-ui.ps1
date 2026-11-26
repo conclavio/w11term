@@ -62,11 +62,14 @@ try {
     }
     Set-Field 'Scrollback lines' '27'
     Click 'Save copy'
-    $null = Wait-Until 'copy saved independently' { (Catalog).$copy.scrollback_lines -eq 27 }
+    # Verify the on-disk document only after Settings reports that the
+    # replacement succeeded. An open reader can race Windows' atomic rename.
+    $null = Wait-Until 'saved copy appears in Settings' { Find-Element "Edit local profile $copy" $button }
     $entries = Catalog
     if ($entries.$source.executable -cne $saved.executable -or $entries.$source.scrollback_lines -ne $saved.scrollback_lines -or
-        $entries.$copy.executable -cne $saved.executable -or ($entries.$copy.args -join '|') -cne ($saved.args -join '|')) {
-        throw 'Duplicating the saved profile changed its source or lost its launch settings'
+        $entries.$copy.executable -cne $saved.executable -or ($entries.$copy.args -join '|') -cne ($saved.args -join '|') -or
+        $entries.$copy.scrollback_lines -ne 27) {
+        throw 'Duplicating the saved profile changed its source or failed to save the copy'
     }
     $pane = (Control @('open','--profile',$copy,'--activate')).pane
     Wait-Focus $pane
@@ -93,11 +96,13 @@ try {
     Click "Edit local profile $installed"
     Set-Field 'Scrollback lines' '11'
     Click 'Save profile'
-    $null = Wait-Until 'saved installed override' { (Catalog).$installed.scrollback_lines -eq 11 }
+    $null = Wait-Until 'overridden profile appears in Settings' { Find-Element "Edit local profile $installed" $button }
+    if ((Catalog).$installed.scrollback_lines -ne 11) { throw 'The installed override was not saved' }
     Click "Edit local profile $installed"
     Click ('Restore defaults' + [char]0x2026)
     Click "Restore defaults $installed"
-    $null = Wait-Until 'installed shell rediscovered' { !(Catalog).$installed -and (Find-Element "Edit local profile $installed" $button) }
+    $null = Wait-Until 'installed shell rediscovered' { Find-Element "Edit local profile $installed" $button }
+    if ((Catalog).$installed) { throw 'Restoring defaults left the installed override in the catalog' }
     Click "Edit local profile $installed"
     if ((Text-Value 'Scrollback lines').Current.Value -cne '10000') { throw 'Installed profile kept the override' }
     foreach ($action in 'Delete profile','Restore defaults') {

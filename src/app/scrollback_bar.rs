@@ -239,6 +239,19 @@ impl ScrollBar {
         self.shown.set(rail);
     }
 
+    #[cfg(feature = "ui-smoke")]
+    pub(super) fn painted_track(&self, frame: &Snapshot) -> Option<(f32, f32, f32)> {
+        let rail = self
+            .shown
+            .get()
+            .filter(|rail| Some(rail.view) == frame.scrollback_view())?;
+        Some((
+            rail.width - PADDING / 2.0,
+            PADDING + 1.0,
+            PADDING + rail.height - 1.0,
+        ))
+    }
+
     pub(super) fn draw(
         &self,
         ctx: &DrawContext<'_>,
