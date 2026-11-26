@@ -133,7 +133,7 @@ pub enum CommandId {
     GroupRun(TabId, u64),
     SearchWindowGroupRuns(WindowRunScope),
     WindowGroupRun(WindowRunScope, TabId, u64),
-    FocusTab(TabId),
+    FocusTab(u64, TabId),
     FocusRunningCommand(u64, w11term::events::RunningCommandTarget),
     OpenWindowCommand(
         u64,
@@ -310,37 +310,47 @@ pub(super) fn profile_search_rows(
     matches.into_iter().map(|(_, row)| row).collect()
 }
 
-impl TerminalApp {
-    pub(super) fn tab_search_rows(&self, query: &str) -> Vec<Row> {
-        let follow_titles = self
-            .appearance
-            .read()
-            .unwrap()
-            .interaction
-            .application_tab_titles;
-        let active = self.tabs.active_group_id();
-        let query = query.trim().to_lowercase();
-        let words: Vec<_> = query.split_whitespace().collect();
-        let mut matches = Vec::new();
-        for (index, tab) in self.tabs.headers().into_iter().enumerate() {
-            let group = tab.group_id();
-            let label = self.tab_label(tab.id, follow_titles).into_owned();
-            let title = label.to_lowercase();
+#[derive(PartialEq, Eq)]
+pub(super) struct SearchTab {
+    group: TabId,
+    title: String,
+}
+
+fn search_tabs(
+    query: &str,
+    source: u64,
+    active: Option<TabId>,
+    windows: impl IntoIterator<Item = (u64, Rc<[SearchTab]>)>,
+) -> Vec<Row> {
+    let Some((window_filter, query)) = tab_windows::window_query(query) else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    for (window, entries) in windows {
+        if window_filter.is_some_and(|id| id != window) {
+            continue;
+        }
+        let sibling = window != source;
+        for (index, tab) in entries.iter().enumerate() {
+            let title = tab.title.to_lowercase();
             let position = format!("Tab {}", index + 1);
             let position_query = position.to_lowercase();
             let terms = format!("{title} {position_query}");
-            if words.iter().all(|word| terms.contains(word)) {
+            if query.split_whitespace().all(|word| terms.contains(word)) {
                 let rank = (
                     title != query,
                     position_query != query,
                     !title.starts_with(&query),
+                    sibling,
                 );
                 matches.push((
                     rank,
                     Row {
-                        id: CommandId::FocusTab(group),
-                        label,
-                        chord: if Some(group) == active {
+                        id: CommandId::FocusTab(window, tab.group),
+                        label: tab.title.clone(),
+                        chord: if sibling {
+                            format!("Window {window} · {position}")
+                        } else if Some(tab.group) == active {
                             format!("{position} · Current")
                         } else {
                             position
@@ -350,8 +360,38 @@ impl TerminalApp {
                 ));
             }
         }
-        matches.sort_by_key(|(rank, _)| *rank);
-        matches.into_iter().map(|(_, row)| row).collect()
+    }
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, row)| row).collect()
+}
+
+impl TerminalApp {
+    pub(super) fn tab_search_entries(&self, follow_titles: bool) -> Vec<SearchTab> {
+        self.tabs
+            .headers()
+            .into_iter()
+            .map(|tab| SearchTab {
+                group: tab.group_id(),
+                title: self.tab_label(tab.id, follow_titles).into_owned(),
+            })
+            .collect()
+    }
+
+    pub(super) fn tab_search_rows(&self, query: &str) -> Vec<Row> {
+        let follow_titles = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .application_tab_titles;
+        let source = self.registry.window_id();
+        let local = (source, self.tab_search_entries(follow_titles).into());
+        search_tabs(
+            query,
+            source,
+            self.tabs.active_group_id(),
+            std::iter::once(local).chain(self.sibling_tab_search_entries()),
+        )
     }
 
     pub(super) fn command_rows(&self, query: &str) -> Vec<Row> {
@@ -889,7 +929,9 @@ impl TerminalApp {
                 self.open_window_group_run(scope, group, run, ctx);
                 return;
             }
-            CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
+            CommandId::FocusTab(window, group) => {
+                return self.request_window_tab(window, group, ctx);
+            }
             CommandId::FocusRunningCommand(pane, target) => {
                 self.focus_running_command(pane, target, ctx);
                 return;
@@ -1197,6 +1239,35 @@ pub(super) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_search_disambiguates_duplicate_titles_and_exact_window_numbers() {
+        let tab = |group, title: &str| SearchTab {
+            group,
+            title: title.into(),
+        };
+        let windows: [(u64, Rc<[SearchTab]>); 3] = [
+            (1, [tab(8, "Build")].into()),
+            (2, [tab(9, "Other"), tab(10, "Build")].into()),
+            (12, [tab(11, "Build")].into()),
+        ];
+
+        let all = search_tabs("build", 1, Some(8), windows.clone());
+        assert_eq!(
+            all.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            [
+                &CommandId::FocusTab(1, 8),
+                &CommandId::FocusTab(2, 10),
+                &CommandId::FocusTab(12, 11),
+            ]
+        );
+        assert_eq!(all[0].chord, "Tab 1 · Current");
+        assert_eq!(all[1].chord, "Window 2 · Tab 2");
+
+        let selected = search_tabs("  BUILD  window 2  tab 2  ", 1, Some(8), windows);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, CommandId::FocusTab(2, 10));
+    }
 
     #[test]
     fn profile_search_keeps_catalog_order_and_matches_names_and_addresses() {

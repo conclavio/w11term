@@ -419,6 +419,16 @@ impl Registry {
             .collect()
     }
 
+    pub fn pane_input_in_window(
+        &self,
+        window: WindowId,
+        id: u64,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<Command>> {
+        let state = self.state.lock().unwrap();
+        let (owner, pane) = state.panes.get(&id)?;
+        (*owner == window && !state.moving.contains_key(&id)).then(|| pane.input.clone())
+    }
+
     pub(super) fn legacy_workspace(&self) -> Option<String> {
         self.state.lock().unwrap().legacy_workspace()
     }

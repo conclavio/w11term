@@ -1317,6 +1317,7 @@ pub struct TerminalApp {
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
     running_interrupt_pending: Option<pane_picker::PendingRunningInterrupt>,
+    remote_text_reveal: Option<u64>,
     title_editor: Option<tab_title::Editor>,
     disconnect_review: Option<Arc<disconnect_ssh::Review>>,
     name_edit_serial: u64,
@@ -1381,6 +1382,11 @@ pub enum Message {
     WatchRunningCommand(Arc<()>, u64, w11term::events::RunningCommandTarget, bool),
     WindowHistory(pane_picker::WindowHistoryAction),
     PaneText(pane_picker::TextAction),
+    StartRemoteText(Arc<pane_picker::RemoteReveal>),
+    FinishRemoteText(
+        Arc<pane_picker::RemoteReveal>,
+        Option<w11term::copy_mode::ScreenId>,
+    ),
     PickerHover(u64),
     PickerFrame(u64, u64),
     BookmarksRead(Arc<()>, Option<Vec<w11term::terminal::BookmarkEntry>>),
@@ -1421,6 +1427,9 @@ pub enum Message {
     CloseTabs(bulk_tab_close::Offer),
     WindowTick,
     WindowTargetsChanged,
+    WindowSearchChanged,
+    FocusWindowResult(u64, tab_windows::SearchTarget),
+    WindowFocusFailed(&'static str),
     DismissWindowError,
     TransferRequest(u64, u64),
     TransferReady(u64),
@@ -2944,6 +2953,7 @@ impl TerminalApp {
         )
     }
     fn publish_panes(&self) {
+        self.publish_pane_search_entries();
         let titles = tab_title::followed_headers(
             &self.tabs,
             self.appearance
@@ -3019,6 +3029,7 @@ impl TerminalApp {
         Ok(true)
     }
     fn sync_selection(&mut self, context: &ComponentContext<Self>) {
+        self.publish_pane_search_entries();
         // Native collection resets select the first item after Reactor's property pass.
         // Reapply our selected index after mounting, and ignore intermediate reset events.
         self.selection_pending = true;
@@ -4105,6 +4116,7 @@ impl TerminalApp {
     }
 
     fn header_view(&self, context: &ViewContext<Self>, application_titles: bool) -> View {
+        self.publish_tab_search_entries(application_titles);
         let mut progress = BTreeMap::new();
         let mut programs: BTreeMap<u64, (u64, Arc<wezterm_term::ProgramStatus>)> = BTreeMap::new();
         for entry in self.tabs.entries() {
@@ -5597,6 +5609,7 @@ impl Component for TerminalApp {
             switcher: None,
             picker: None,
             running_interrupt_pending: None,
+            remote_text_reveal: None,
             title_editor: None,
             disconnect_review: None,
             name_edit_serial: 0,
@@ -5704,6 +5717,7 @@ impl Component for TerminalApp {
                 | Message::HostGroup(host_groups::Action::Tick | host_groups::Action::Edit(..))
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
+                | Message::WindowSearchChanged
                 | Message::BookmarksRead(..)
                 | Message::PickerFocus(..)
                 | Message::PickerFocusAfterMenu(..)
@@ -5898,7 +5912,15 @@ impl Component for TerminalApp {
             }
             Message::CloseTabs(offer) => self.close_tabs_from_offer(offer, context),
             Message::WindowTick => self.window_tick(context),
-            Message::WindowTargetsChanged => self.refresh_open_commands(),
+            Message::WindowTargetsChanged => {
+                self.refresh_open_commands();
+                self.refresh_window_pane_search(context);
+            }
+            Message::WindowSearchChanged => self.refresh_window_search(context),
+            Message::FocusWindowResult(source, target) => {
+                self.focus_window_result(source, target, context);
+            }
+            Message::WindowFocusFailed(error) => self.window_error = Some(error.into()),
             Message::TransferRequest(source, id) => self.accept_transfer(source, id, context),
             Message::TransferReady(id) => self.offer_group(id, context),
             Message::TransferClaim(id) => self.claim_group(id, context),
@@ -5958,6 +5980,10 @@ impl Component for TerminalApp {
             }
             Message::WindowHistory(action) => self.window_history_action(action, context),
             Message::PaneText(action) => self.pane_text_action(action, context),
+            Message::StartRemoteText(request) => self.start_remote_text(request, context),
+            Message::FinishRemoteText(request, screen) => {
+                self.finish_remote_text(request, screen, context)
+            }
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::BookmarksRead(launch, entries) => self.bookmarks_received(&launch, entries),

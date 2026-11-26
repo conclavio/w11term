@@ -1,5 +1,8 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{mpsc, oneshot};
 use w11term::copy_mode::ScreenId;
 use w11term::search::{MAX_QUERY_BYTES, PaneSearchAnchor, PaneSearchPreview, PaneSearchQuery};
@@ -17,12 +20,14 @@ pub enum Action {
     Invalid(u64, String),
     Choose(u64, u64),
     Revealed(u64, u64, ScreenId, bool),
+    RemoteFinished(u64, u64, bool),
     Unavailable(u64),
     Refresh(u64),
 }
 
 struct Target {
     pane: u64,
+    window: u64,
     order: usize,
     caption: String,
     input: mpsc::UnboundedSender<Command>,
@@ -30,6 +35,7 @@ struct Target {
 
 pub(super) struct Row {
     pane: u64,
+    window: u64,
     order: usize,
     caption: String,
     anchor: PaneSearchAnchor,
@@ -60,6 +66,7 @@ impl Report {
             );
             self.rows.push(Row {
                 pane: target.pane,
+                window: target.window,
                 order: target.order,
                 caption,
                 anchor,
@@ -108,18 +115,65 @@ async fn scan(targets: Vec<Target>, query: PaneSearchQuery) -> Report {
     report
 }
 
-fn wait_for_query<T>(work: impl Future<Output = T>, stop: oneshot::Receiver<()>) -> Option<T> {
+fn wait_for_query<T>(
+    work: impl Future<Output = T>,
+    stop: Option<oneshot::Receiver<()>>,
+) -> Option<T> {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .ok()?
         .block_on(async {
-            tokio::select! {
-                biased;
-                _ = stop => None,
-                result = work => Some(result),
+            if let Some(stop) = stop {
+                tokio::select! {
+                    biased;
+                    _ = stop => None,
+                    result = work => Some(result),
+                }
+            } else {
+                Some(work.await)
             }
         })
+}
+
+async fn reveal_confirmed(mut receiver: oneshot::Receiver<bool>, timeout: Duration) -> bool {
+    match tokio::time::timeout(timeout, &mut receiver).await {
+        Ok(reply) => reply.unwrap_or(false),
+        Err(_) => {
+            // A simultaneous successful send has committed local Find.
+            receiver.close();
+            receiver.try_recv().unwrap_or(false)
+        }
+    }
+}
+
+pub struct RemoteReveal {
+    epoch: u64,
+    pane: u64,
+    query: String,
+    anchor: PaneSearchAnchor,
+    sensitive: bool,
+    regex: bool,
+    lease: std::sync::Weak<()>,
+    reply: Mutex<Option<oneshot::Sender<bool>>>,
+}
+
+impl RemoteReveal {
+    fn pending(&self) -> bool {
+        self.lease.strong_count() != 0
+            && self
+                .reply
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|reply| !reply.is_closed())
+    }
+
+    fn complete(&self, accepted: bool) {
+        if let Some(reply) = self.reply.lock().unwrap().take() {
+            let _ = reply.send(accepted);
+        }
+    }
 }
 
 pub(super) struct Results {
@@ -131,6 +185,7 @@ pub(super) struct Results {
     regex: bool,
     task: Option<ComponentTask>,
     stop: Option<oneshot::Sender<()>>,
+    remote_lease: Option<Arc<()>>,
     pub(super) revealing: bool,
 }
 
@@ -146,6 +201,7 @@ impl Default for Results {
             regex: false,
             task: None,
             stop: None,
+            remote_lease: None,
             revealing: false,
         }
     }
@@ -154,6 +210,7 @@ impl Default for Results {
 impl Results {
     fn cancel(&mut self) {
         self.stop.take();
+        self.remote_lease.take();
         self.revealing = false;
         if let Some(task) = self.task.take() {
             task.cancel();
@@ -213,7 +270,7 @@ impl Picker {
                     .element_ref(&self.input)
                     .text(&self.query)
                     .is_enabled(!self.text.revealing)
-                    .placeholder_text("Find text in this window’s panes")
+                    .placeholder_text("Find text across windows")
                     .automation_name("Find in all panes")
                     .on_text_changed(
                         ctx.callback(move |text| Message::PaneText(Action::Edit(instance, text))),
@@ -411,7 +468,8 @@ impl TerminalApp {
             | Action::Unavailable(e)
             | Action::Ready(e, _)
             | Action::Choose(e, _)
-            | Action::Revealed(e, ..) => *e == epoch,
+            | Action::Revealed(e, ..)
+            | Action::RemoteFinished(e, ..) => *e == epoch,
         };
         if !current {
             return;
@@ -442,21 +500,19 @@ impl TerminalApp {
                 let query = picker.query.clone();
                 let sensitive = picker.text.sensitive;
                 let regex = picker.text.regex;
+                let current_window = self.registry.window_id();
                 let targets = self
-                    .picker_choices(Mode::Text)
+                    .picker_choices(Mode::Text, "")
                     .into_iter()
                     .enumerate()
                     .filter_map(|(order, choice)| {
-                        let Page::Terminal(live) =
-                            &self.tabs.get(self.tab_for_pane(choice.pane)?)?.page
-                        else {
-                            return None;
-                        };
+                        let window = choice.window.unwrap_or(current_window);
                         Some(Target {
                             pane: choice.pane,
+                            window,
                             order,
                             caption: choice.caption(),
-                            input: live.session.input.clone(),
+                            input: self.registry.pane_input_in_window(window, choice.pane)?,
                         })
                     })
                     .collect();
@@ -469,10 +525,12 @@ impl TerminalApp {
                             Ok(query) => query,
                             Err(error) => return Message::PaneText(Action::Invalid(epoch, error)),
                         };
-                        Message::PaneText(match wait_for_query(scan(targets, query), cancelled) {
-                            Some(report) => Action::Ready(epoch, report),
-                            None => Action::Unavailable(epoch),
-                        })
+                        Message::PaneText(
+                            match wait_for_query(scan(targets, query), Some(cancelled)) {
+                                Some(report) => Action::Ready(epoch, report),
+                                None => Action::Unavailable(epoch),
+                            },
+                        )
                     },
                     Message::PaneText(Action::Unavailable(epoch)),
                 ));
@@ -504,7 +562,45 @@ impl TerminalApp {
                 };
                 picker.selected = row;
                 let query = picker.query.clone();
-                let anchor = picker.text.rows[row].anchor.clone();
+                let row = &picker.text.rows[row];
+                let anchor = row.anchor.clone();
+                let source = self.registry.window_id();
+                if row.window != source {
+                    let lease = Arc::new(());
+                    let (stop, cancelled) = oneshot::channel();
+                    let (reply, receiver) = oneshot::channel();
+                    let request = Arc::new(RemoteReveal {
+                        epoch,
+                        pane,
+                        query,
+                        anchor,
+                        sensitive: picker.text.sensitive,
+                        regex: picker.text.regex,
+                        lease: Arc::downgrade(&lease),
+                        reply: Mutex::new(Some(reply)),
+                    });
+                    let task = ctx.spawn_background_with_rejection(
+                        move |_| {
+                            let accepted = wait_for_query(
+                                reveal_confirmed(receiver, PANE_TIMEOUT + Duration::from_secs(2)),
+                                Some(cancelled),
+                            )
+                            .unwrap_or(false);
+                            Message::PaneText(Action::RemoteFinished(epoch, pane, accepted))
+                        },
+                        Message::PaneText(Action::RemoteFinished(epoch, pane, false)),
+                    );
+                    if task.status() != ComponentTaskStatus::Rejected {
+                        // An unavailable destination drops the reply sender.
+                        tab_windows::send_to_window(row.window, Message::StartRemoteText(request));
+                    }
+                    picker.text.stop = Some(stop);
+                    picker.text.remote_lease = Some(lease);
+                    picker.text.revealing = true;
+                    picker.text.status = "Opening match…".into();
+                    picker.text.task = Some(task);
+                    return;
+                }
                 let Some((input, screen)) = self.search_target(pane).map(|(_, live)| {
                     (
                         live.session.input.clone(),
@@ -515,22 +611,13 @@ impl TerminalApp {
                     self.focus_picker_input(0, ctx);
                     return;
                 };
-                let (reply, mut receiver) = oneshot::channel();
+                let (reply, receiver) = oneshot::channel();
                 let (stop, cancelled) = oneshot::channel();
                 let task = ctx.spawn_background_with_rejection(
                     move |_| {
                         let accepted = wait_for_query(
-                            async {
-                                match tokio::time::timeout(PANE_TIMEOUT, &mut receiver).await {
-                                    Ok(reply) => reply.unwrap_or(false),
-                                    Err(_) => {
-                                        // A simultaneous successful send has committed local Find.
-                                        receiver.close();
-                                        receiver.try_recv().unwrap_or(false)
-                                    }
-                                }
-                            },
-                            cancelled,
+                            reveal_confirmed(receiver, PANE_TIMEOUT),
+                            Some(cancelled),
                         )
                         .unwrap_or(false);
                         Message::PaneText(Action::Revealed(epoch, pane, screen, accepted))
@@ -569,24 +656,122 @@ impl TerminalApp {
                     self.focus_picker_input(0, ctx);
                     return;
                 };
-                let Some(AppTab {
-                    page: Page::Terminal(live),
-                    ..
-                }) = self.tabs.get_mut(id)
-                else {
+                self.open_text_match(id, query, sensitive, regex, ctx);
+            }
+            Action::RemoteFinished(_, pane, accepted) => {
+                if picker.text.remote_lease.is_none() {
                     return;
-                };
-                live.find.epoch += 1;
-                live.find.open = true;
-                live.find.query = query;
-                live.find.sensitive = sensitive;
-                live.find.regex = regex;
-                live.find.pending = false;
-                self.tabs.select(id);
-                self.sync_selection(ctx);
-                self.close_picker(ctx);
+                }
+                picker.text.cancel();
+                if accepted {
+                    self.picker.take();
+                    self.keyboard.set_picker(None);
+                    self.sync_ime_surface();
+                } else {
+                    self.stale_text_result(pane);
+                    self.focus_picker_input(0, ctx);
+                }
             }
         }
+    }
+
+    fn open_text_match(
+        &mut self,
+        id: TabId,
+        query: String,
+        sensitive: bool,
+        regex: bool,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some(Page::Terminal(live)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
+            return;
+        };
+        live.find.epoch += 1;
+        live.find.open = true;
+        live.find.query = query;
+        live.find.sensitive = sensitive;
+        live.find.regex = regex;
+        live.find.pending = false;
+        self.tabs.select(id);
+        self.sync_selection(ctx);
+        self.activate(ctx);
+    }
+
+    fn remote_text_target(&self, request: &RemoteReveal) -> Option<(TabId, &LiveTab)> {
+        if !request.pending()
+            || self.picker.is_some()
+            || self.incoming.is_some()
+            || self.existing_destination_blocked()
+        {
+            return None;
+        }
+        self.search_target(request.pane)
+    }
+
+    pub(in crate::app) fn start_remote_text(
+        &mut self,
+        request: Arc<RemoteReveal>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.remote_text_reveal.is_some() {
+            request.complete(false);
+            return;
+        }
+        let Some((_, live)) = self.remote_text_target(&request) else {
+            request.complete(false);
+            return;
+        };
+        let screen = ScreenId::from(live.session.frames.load().as_ref());
+        let input = live.session.input.clone();
+        let (reply, receiver) = oneshot::channel();
+        let rejected = Message::FinishRemoteText(request.clone(), None);
+        let pending = request.clone();
+        self.remote_text_reveal = Some(request.epoch);
+        let task = ctx.spawn_background_with_rejection(
+            move |_| {
+                let accepted =
+                    wait_for_query(reveal_confirmed(receiver, PANE_TIMEOUT), None).unwrap_or(false);
+                Message::FinishRemoteText(pending, accepted.then_some(screen))
+            },
+            rejected,
+        );
+        if task.status() != ComponentTaskStatus::Rejected {
+            let _ = input.send(Command::SearchReveal {
+                query: request.query.clone(),
+                anchor: request.anchor.clone(),
+                reply,
+            });
+        }
+    }
+
+    pub(in crate::app) fn finish_remote_text(
+        &mut self,
+        request: Arc<RemoteReveal>,
+        screen: Option<ScreenId>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.remote_text_reveal != Some(request.epoch) {
+            return;
+        }
+        self.remote_text_reveal = None;
+        let target = screen.and_then(|screen| {
+            let (id, live) = self.remote_text_target(&request)?;
+            (ScreenId::from(live.session.frames.load().as_ref()) == screen).then_some(id)
+        });
+        let accepted = if let Some((id, hwnd)) = target.zip(self.keyboard.hwnd()) {
+            self.open_text_match(
+                id,
+                request.query.clone(),
+                request.sensitive,
+                request.regex,
+                ctx,
+            );
+            tab_windows::foreground(hwnd);
+            true
+        } else {
+            false
+        };
+        request.complete(accepted);
     }
 
     fn search_target(&self, pane: u64) -> Option<(TabId, &LiveTab)> {
@@ -625,6 +810,7 @@ mod tests {
         let targets = (0..=PARALLEL_PANES)
             .map(|order| Target {
                 pane: order as u64,
+                window: 1,
                 order,
                 caption: String::new(),
                 input: input.clone(),
