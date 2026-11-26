@@ -189,6 +189,22 @@ try {
     if ($sessions.Count -ne 2 -or ($sessions | Where-Object id -eq $remote).visible -or ($sessions | Where-Object active).id -ne $localPane) {
         throw 'Inspect changed the active pane, tab visibility, or open sessions'
     }
+    $cursor = (Control @('events','--pane',"$remote")).journal.next
+    Set-RemoteModes "$esc]133;C;cmdline_url=quick%20fixture$bell$esc]133;D;3$bell"
+    $starts = (Control @('events','--pane',"$remote",'--since',"$cursor",'--kind','command-started','--timeout','5')).journal
+    $started = $starts.events[0].data
+    if ($starts.lost -or $starts.events.Count -ne 1 -or $started.id -lt 1 -or
+        $started.connection_generation -ne $initial.connection_generation -or
+        $started.started_unix_ms -le 0 -or @($started.PSObject.Properties).Count -ne 3) {
+        throw "Unexpected metadata for quick command start: $($starts | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    $record = Control @('wait-command','--pane',"$remote",'--after-id',"$($started.id - 1)",
+        '--connection-generation',"$($started.connection_generation)",'--command','quick fixture','--timeout','5')
+    if ($record.id -ne $started.id -or $record.started_unix_ms -ne $started.started_unix_ms -or
+        $record.exit_code -ne 3 -or (Inspect).running_command) {
+        throw "The quick command's start event did not match its completed capture"
+    }
+    Wait-Focus $localPane
     Type-Line 'if ($inspectPid -eq $PID) { "local-inspect-" + "still-live" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-still-live')
     if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains('local-inspect')) { throw 'PowerShell input landed in SSH' }

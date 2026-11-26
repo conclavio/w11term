@@ -840,6 +840,16 @@ stale generation is rejected. Deliberate disconnect leaves the pane, scrollback,
 place and skips automatic reconnect. Other shells on the same authenticated
 transport can continue.
 
+A live shell's integration start marker adds a `command-started` event to the pane's
+journal. Its data contains `id`, `connection_generation`, and
+`started_unix_ms` from the first observed start. Wait for it with
+`events --pane ID --since CURSOR --kind command-started --timeout SECONDS`.
+The journal records starts even when a command starts and finishes in one
+read. Duplicate markers during the same capture produce one event. The ID
+identifies the completed capture in that generation if the shell finishes it.
+If the capture is abandoned before completion, the next command can reuse
+that ID. Event data contains metadata only.
+
 A command completion watch armed in the GUI adds one `command-finished` event to
 the originating pane. Its data is `{"exit_code":17}` for a reported status or
 `{"exit_code":null}` when the shell supplied none. Command lines and output stay

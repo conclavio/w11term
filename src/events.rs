@@ -751,6 +751,19 @@ impl Events {
         state.refresh_watch(previous);
     }
 
+    pub(crate) fn shell_command_started(&self, id: u64, started_unix_ms: u64) {
+        let state = self.state.lock().unwrap();
+        let Some(watch) = &state.command_watch else {
+            return;
+        };
+        let data = serde_json::json!({
+            "id": id,
+            "connection_generation": watch.generation,
+            "started_unix_ms": started_unix_ms,
+        });
+        self.append(state, "command-started", data, None);
+    }
+
     pub(crate) fn semantic_prompt(
         &self,
         marker: &wezterm_term::FinalTermSemanticPrompt,

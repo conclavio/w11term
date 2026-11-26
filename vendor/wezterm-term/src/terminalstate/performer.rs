@@ -1066,6 +1066,7 @@ impl Performer<'_> {
     fn semantic_prompt(&mut self, marker: FinalTermSemanticPrompt, fresh_line: bool) {
         let primary = !self.is_alt_screen_active();
         let previous_command_id = self.next_command_id;
+        let was_running = self.command_started.is_some();
         let had_output_start = !self.capturing_shell_input && self.screen.command_start.is_some();
         match &marker {
             FinalTermSemanticPrompt::FreshLine => self.fresh_line(),
@@ -1119,6 +1120,11 @@ impl Performer<'_> {
                 )
                 .then_some((state.next_command_id, state.command_label.as_deref()));
                 handler.semantic_prompt(&marker, started, completed);
+                if let (false, Some((id, _)), Some(clock)) =
+                    (was_running, started, state.command_started)
+                {
+                    handler.shell_command_started(id, clock.unix_ms);
+                }
             }
         }
     }

@@ -11,6 +11,7 @@
 - VS Code OSC 633 prompt, command and working-directory markers feed the shared shell integration. Prompt markers preserve cursor position. A nonce has no bearing on the trust of a reported command.
 - The embedding can read the latest assigned command capture ID after terminal reset or history eviction.
 - The embedding can also read the current shell command's identity and start metadata. The running label is shared with inspector snapshots.
+- The alert handler can observe the first start marker for a primary-screen command, including commands that complete before the next rendered frame.
 
 Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term
 

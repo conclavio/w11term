@@ -1881,6 +1881,51 @@ mod tests {
     }
 
     #[test]
+    fn command_start_events_ignore_replay_and_alternate_screen_markers() {
+        let (mut term, events) = watched_terminal();
+        term.advance_bytes(b"\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert!(events.since(0).events.is_empty());
+        events.command_stream(Some(2));
+        term.advance_bytes(b"\x1b[?1049h\x1b]133;C\x07\x1b[?1049l");
+        assert!(events.since(0).events.is_empty());
+
+        term.advance_bytes(b"\x1b]633;E;original\x07\x1b]633;C\x07");
+        let first = term.running_command().unwrap();
+        term.advance_bytes(b"\x1b]633;E;amended\x07\x1b]133;C\x07\x1b]133;D;7\x07");
+        let history = term.last_command().unwrap();
+        let batch = events.since(0);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "command-started");
+        assert_eq!(history.id, first.id);
+        assert_eq!(
+            batch.events[0].data,
+            serde_json::json!({
+                "id": history.id, "connection_generation": 2, "started_unix_ms": first.started_unix_ms,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_command_start_observes_a_finish_in_the_same_byte_batch() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(7));
+        let cursor = events.cursor();
+        let wait = events.wait_kind(cursor, Duration::from_secs(1), Some("command-started"));
+        let run = async {
+            term.advance_bytes(b"\x1b]133;C;cmdline_url=fast%20check\x07\x1b]133;D;0\x07");
+        };
+        let (batch, ()) = tokio::join!(wait, run);
+        assert_eq!(batch.events.len(), 1);
+        assert!(term.running_command().is_none());
+        let record = term.last_command().unwrap();
+        assert_eq!(batch.events[0].data["id"], record.id);
+        assert_eq!(
+            batch.events[0].data["started_unix_ms"],
+            record.timing.started_unix_ms.unwrap()
+        );
+    }
+
+    #[test]
     fn running_command_handles_late_shell_metadata_prompt_and_terminal_reset() {
         let (mut term, _) = engine();
         term.advance_bytes(b"\x1b]633;A\x07\x1b]633;B\x07");
