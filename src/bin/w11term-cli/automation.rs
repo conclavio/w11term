@@ -61,7 +61,7 @@ pub(super) fn parse(
     let mut stop_on_failure = None;
     let mut expected_query = None;
     let mut record_output = None;
-    let mut group_name = None;
+    let mut name = None;
     let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
@@ -157,11 +157,11 @@ pub(super) fn parse(
                 rows = Some(value(&mut args)?.parse()?)
             }
             "--profile" if verb == "open" => profile = Some(value(&mut args)?),
-            "--name" if verb == "open-ssh-group" => {
-                ensure!(group_name.is_none(), "specify --name only once");
-                group_name = Some(value(&mut args)?);
+            "--name" if matches!(verb, "open-ssh-group" | "open-workspace") => {
+                ensure!(name.is_none(), "specify --name only once");
+                name = Some(value(&mut args)?);
             }
-            "--activate" if verb == "open" => activate = true,
+            "--activate" if matches!(verb, "open" | "open-workspace") => activate = true,
             "--regex"
                 if matches!(
                     verb,
@@ -343,8 +343,10 @@ pub(super) fn parse(
                 connection_generation = Some(value(&mut args)?.parse()?);
             }
             "--window" | "--tab" | "--run"
-                if (matches!(verb, "open" | "open-ssh-group" | "list-saved-ssh-groups")
-                    && arg == "--window")
+                if (matches!(
+                    verb,
+                    "open" | "open-workspace" | "open-ssh-group" | "list-saved-ssh-groups"
+                ) && arg == "--window")
                     || matches!(
                         verb,
                         "get-ssh-group-roster"
@@ -438,6 +440,16 @@ pub(super) fn parse(
                 window_id,
                 cols,
                 rows,
+                activate,
+            }
+        }
+        "open-workspace" => {
+            ensure!(pane.is_none(), "open-workspace does not accept --pane");
+            let name = name.context("--name is required")?;
+            ensure!(!name.trim().is_empty(), "provide a saved workspace name");
+            Request::OpenWorkspace {
+                window_id: window_id.context("--window is required (from list-windows)")?,
+                name,
                 activate,
             }
         }
@@ -617,7 +629,7 @@ pub(super) fn parse(
         }
         "open-ssh-group" => {
             ensure!(pane.is_none(), "open-ssh-group does not accept --pane");
-            let name = group_name.context("--name is required")?;
+            let name = name.context("--name is required")?;
             ensure!(!name.trim().is_empty(), "provide a saved SSH group name");
             Request::OpenSshGroup {
                 window_id: window_id.context("--window is required (from list-ssh-groups)")?,

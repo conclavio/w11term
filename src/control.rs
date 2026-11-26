@@ -144,6 +144,13 @@ pub enum Request {
     },
     List,
     ListWindows,
+    ListWorkspaces,
+    OpenWorkspace {
+        window_id: WindowId,
+        name: String,
+        #[serde(default)]
+        activate: bool,
+    },
     ListSshGroups,
     ListSavedSshGroups {
         window_id: WindowId,
@@ -392,6 +399,11 @@ pub enum UiRequest {
         name: String,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    OpenWorkspace {
+        name: String,
+        activate: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     GetSshGroupRoster {
         tab_id: u64,
         readiness: Option<SshGroupReadiness>,
@@ -474,6 +486,7 @@ impl UiRequest {
             | Self::ListSshGroups { reply }
             | Self::ListSavedSshGroups { reply }
             | Self::OpenSshGroup { reply, .. }
+            | Self::OpenWorkspace { reply, .. }
             | Self::GetSshGroupRoster { reply, .. }
             | Self::SubmitSshGroupCommand { reply, .. }
             | Self::GetSshGroupRun { reply, .. }
@@ -1167,6 +1180,43 @@ impl Registry {
                 anyhow::bail!("follow-ssh-group-output requires a streaming reply")
             }
             Request::ListWindows => Ok(self.list_windows()),
+            Request::ListWorkspaces => {
+                let workspaces: Vec<_> = crate::workspace::WorkspaceStore::open()?
+                    .load()?
+                    .into_iter()
+                    .map(|(name, workspace)| {
+                        let pane_count: usize = workspace
+                            .tabs
+                            .iter()
+                            .map(|tab| tab.layout.pane_count())
+                            .sum();
+                        json!({
+                            "name": name,
+                            "tab_count": workspace.tabs.len(),
+                            "pane_count": pane_count,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "workspaces": workspaces }))
+            }
+            Request::OpenWorkspace {
+                window_id,
+                name,
+                activate,
+            } => {
+                let ui = self.window_ui(window_id)?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::OpenWorkspace {
+                    name,
+                    activate,
+                    reply,
+                });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("open-workspace timed out; tabs may have been created")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::List => {
                 let mut sessions = Vec::new();
                 for (window_id, pane) in self.listing() {
