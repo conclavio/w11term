@@ -1,5 +1,6 @@
 //! Embedded SSH transport, interactive authentication, and reconnect lifecycle.
 pub mod agent;
+mod authentication;
 mod durability;
 #[cfg(test)]
 mod folder_mount_fixture;
@@ -11,6 +12,7 @@ mod local_forward;
 mod negotiation;
 mod sharing;
 mod transport;
+pub use authentication::{AdditionalSshAuthentication, SshKeySource, VerifiedSshAuthentication};
 pub(crate) use durability::DurableControl;
 pub(crate) use durability::Start as DurableStart;
 pub use durability::{DurableAction, DurablePhase, DurableState};

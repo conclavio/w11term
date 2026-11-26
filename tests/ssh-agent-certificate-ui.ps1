@@ -62,6 +62,24 @@ try {
         ((Control @('list')).sessions | Where-Object label -eq 'Agent certificate route').id
     }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
+    $route = (Control @('inspect','--pane',"$pane")).ssh
+    $destination = $route.destination.authentication
+    $gateway = $route.jump_hosts[0].authentication
+    if ($destination.method -cne 'public-key' -or $destination.source -cne 'agent' -or
+        $destination.key_fingerprint -cne $fixture.destination_pin -or $destination.certificate_authority_fingerprint -cne $fixture.destination_ca -or
+        $gateway.method -cne 'public-key' -or $gateway.source -cne 'agent' -or
+        $gateway.key_fingerprint -cne $fixture.gateway_pin -or $gateway.certificate_authority_fingerprint -cne $fixture.gateway_ca) {
+        throw 'The authenticated route did not report the accepted user certificate at each endpoint'
+    }
+    Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
+    Set-NativeExpansion 'Verified SSH route' $true
+    $null = Wait-Until 'inspector shows the two user certificate fingerprints' {
+        (Find-Element 'Authentication   User certificate (SSH agent)') -and
+            (Find-Element "User key   $($fixture.destination_pin)") -and
+            (Find-Element "User key   $($fixture.gateway_pin)") -and
+            (Find-Element "User certificate CA key   $($fixture.destination_ca)") -and
+            (Find-Element "User certificate CA key   $($fixture.gateway_ca)")
+    }
     Wait-AuthFailure 'Mismatched certificate pin' 'does not match the selected agent key'
     Wait-AuthFailure 'Missing certificate key' 'does not hold the key for the SSH user certificate'
     Wait-AuthFailure 'Rejected certificate' 'rejected the SSH user certificate'

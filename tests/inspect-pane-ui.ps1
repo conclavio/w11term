@@ -92,11 +92,13 @@ try {
         $strictKex = if ($algorithms.strict_key_exchange) { 'On' } else { 'Off' }
         $destination.host -ceq $peer.host -and $destination.user -ceq $peer.user -and
             $destination.port -eq $peer.port -and $destination.key_fingerprint -ceq $peer.host_key -and
+            $destination.authentication.method -ceq 'none' -and !$destination.authentication.key_fingerprint -and
             $algorithms.host_key -ceq 'ssh-ed25519' -and $algorithms.cipher -and $algorithms.key_exchange -and
             $algorithms.strict_key_exchange -is [bool] -and
             @($route.jump_hosts).Count -eq 0 -and
             (Find-Element "Destination   $($peer.user)@$($peer.host):$($peer.port)") -and
             (Find-Element "Host key   $($peer.host_key)") -and
+            (Find-Element 'Authentication   None') -and
             (Find-Element "Key exchange   $($algorithms.key_exchange)") -and
             (Find-Element "Host-key algorithm   ssh-ed25519") -and
             (Find-Element "Cipher   $($algorithms.cipher)") -and

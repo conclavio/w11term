@@ -2,7 +2,10 @@ use super::*;
 use termwiz::input::KeyboardEncoding;
 use w11term::events::SshConnectionPhase;
 use w11term::session::PaneInspection;
-use w11term::ssh::{ConnectionStep, SshTransport, VerifiedSshPeer, VerifiedSshRoute};
+use w11term::ssh::{
+    AdditionalSshAuthentication, ConnectionStep, SshKeySource, SshTransport,
+    VerifiedSshAuthentication, VerifiedSshPeer, VerifiedSshRoute,
+};
 use w11term::terminal::TerminalModes;
 use wezterm_input_types::KittyKeyboardFlags as Flags;
 use wezterm_term::MouseEncoding;
@@ -179,6 +182,52 @@ fn ssh_status_view(value: &PaneInspection) -> View {
     ))
 }
 
+fn ssh_authentication_view(authentication: &VerifiedSshAuthentication) -> View {
+    let row = |label: &str, value: &str| {
+        TextBlock::new()
+            .text(format!("{label}   {value}"))
+            .text_wrapping(TextWrapping::Wrap)
+    };
+    let method = match authentication {
+        VerifiedSshAuthentication::None => "None",
+        VerifiedSshAuthentication::Password => "Password",
+        VerifiedSshAuthentication::KeyboardInteractive => "Keyboard-interactive",
+        VerifiedSshAuthentication::PublicKey {
+            source,
+            key_fingerprint,
+            certificate_authority_fingerprint,
+            additional_methods,
+        } => {
+            let key_source = match source {
+                SshKeySource::File => "key file",
+                SshKeySource::Agent => "SSH agent",
+            };
+            let kind = if certificate_authority_fingerprint.is_some() {
+                "User certificate"
+            } else {
+                "Public key"
+            };
+            let mut method = format!("{kind} ({key_source})");
+            for additional in additional_methods {
+                method.push_str(match additional {
+                    AdditionalSshAuthentication::Password => " + Password",
+                    AdditionalSshAuthentication::KeyboardInteractive => " + Keyboard-interactive",
+                });
+            }
+            return StackPanel::new().spacing(3.0).children((
+                row("Authentication", &method),
+                row("User key", key_fingerprint),
+                certificate_authority_fingerprint
+                    .as_deref()
+                    .map_or_else(View::empty, |fingerprint| {
+                        row("User certificate CA key", fingerprint).into()
+                    }),
+            ));
+        }
+    };
+    row("Authentication", method).into()
+}
+
 fn ssh_route_view(
     route: &VerifiedSshRoute,
     pane: u64,
@@ -195,6 +244,7 @@ fn ssh_route_view(
             TextBlock::new()
                 .text(format!("Host key   {}", peer.key_fingerprint))
                 .text_wrapping(TextWrapping::Wrap),
+            ssh_authentication_view(&peer.authentication),
             peer.host_key_alias
                 .as_ref()
                 .map_or_else(View::empty, |alias| {

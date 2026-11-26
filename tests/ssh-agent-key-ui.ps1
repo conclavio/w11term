@@ -89,6 +89,24 @@ try {
         !$entry.agent_pipe -and $entry.agent_fingerprint -ceq $fixture.wanted
     }
     Wait-AuthFailure 'Agent profile' 'does not hold the selected key'
+    $automatic = (Control @('open','--profile','Automatic agent')).pane
+    $null = Control @('wait-for-text','--pane',"$automatic",'--timeout','15','ready')
+    $inspection = Control @('inspect','--pane',"$automatic")
+    $auth = $inspection.ssh.destination.authentication
+    if ($auth.method -cne 'public-key' -or $auth.source -cne 'agent' -or
+        $auth.key_fingerprint -cne $fixture.wanted -or $auth.certificate_authority_fingerprint) {
+        throw 'The route did not report the accepted agent key after the rejected candidate'
+    }
+    [IO.File]::WriteAllText($fixture.authorized_key_path, $fixture.rotated_key)
+    $generation = $inspection.connection_generation
+    $null = Control @('send-text','--pane',"$automatic",'--connection-generation',"$generation",'--no-paste','--base64','BA==')
+    $reconnected = Control @('wait-ssh-connected','--pane',"$automatic",'--after-generation',"$generation",'--timeout','15')
+    $null = Control @('wait-for-text','--pane',"$automatic",'--connection-generation',"$($reconnected.connection_generation)",'--timeout','15','ready')
+    $after = Control @('inspect','--pane',"$automatic")
+    if ($after.connection_generation -ne $reconnected.connection_generation -or
+        $after.ssh.destination.authentication.key_fingerprint -cne $fixture.rotated_fingerprint) {
+        throw 'The reconnected route retained an old authentication fingerprint'
+    }
 } finally {
     Close-FixtureApp $app
 }

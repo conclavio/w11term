@@ -679,6 +679,8 @@ Choose **More → Terminal inspector** to see the focused pane’s cell grid, te
 
 For an SSH pane, the inspector shows the connection state and the current step and endpoint during login or reconnection. If the connection ends during a failed step, the inspector keeps the step and error visible. Once connected, expand **Verified SSH route** to see the destination and each jump host with its verified SHA256 host-key fingerprint and any configured host-key alias. Each peer shows the initial key exchange, host-key algorithm, cipher, and whether strict key exchange was negotiated. The route disappears when the authenticated connection ends.
 
+For each peer, the same view shows the sign-in method the server accepted. For public-key sign-in it includes the user key fingerprint, whether it came from a key file or agent, and the issuing CA fingerprint for a user certificate. It also shows any completed password or keyboard-interactive steps after the key. Scripts can read the same details from `w11term-cli inspect`. [Control reply fields](CONTROL.md#waiting-geometry-tabs-and-events)
+
 **SSH transport** shows the connection’s ID, and **Other panes** lists the other live panes sharing that login. A split that reuses the connection shows the same transport ID. A separate login to the same profile gets a different one. The list updates as panes connect and disconnect.
 
 Move the pointer over the focused pane to read its column and row, counted from 1 at the top-left of the visible grid, including while viewing scrollback. **Hyperlink** shows the allowed OSC 8 target or a detected URL under that cell. Moving into the padding or another pane clears the readout. Hovering leaves keyboard focus and the link destination alone.

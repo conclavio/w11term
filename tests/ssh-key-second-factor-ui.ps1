@@ -18,6 +18,7 @@ try {
         $question = ((Control @('list')).sessions | Where-Object id -eq $pane).prompt.question
         $question.kind -eq 'authentication' -and $question.name -like 'Verify sign-in as pilot+character@127.0.0.1:*'
     }
+    if ((Control @('inspect','--pane',"$pane")).ssh) { throw 'An unfinished login appeared as verified' }
     $field = Wait-Until 'masked password field for the second factor' {
         $element = Find-Element 'Password' $edit -Visible
         if ($element -and $element.Current.IsPassword) { $element }
@@ -37,6 +38,13 @@ try {
     $null = Control @('wait-ssh-connected','--pane',"$pane",'--timeout','15')
     $terminal = Control @('wait-for-text','--pane',"$pane",'--timeout','15','mfa-fixture-ready')
     if ($terminal.text -match 'fixture-password') { throw 'The password reached the terminal' }
+    $authentication = (Control @('inspect','--pane',"$pane")).ssh.destination.authentication
+    if ($authentication.method -cne 'public-key' -or $authentication.source -cne 'file' -or
+        $authentication.key_fingerprint -notlike 'SHA256:*' -or
+        ($authentication.additional_methods -join ',') -cne 'password' -or
+        $authentication.certificate_authority_fingerprint) {
+        throw 'The verified route did not report key and password authentication'
+    }
 } finally {
     Close-FixtureApp $app
 }

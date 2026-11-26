@@ -120,7 +120,7 @@ fn fingerprint(key: &PrivateKey) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a Windows desktop and serves fixture keys over an isolated agent pipe"]
 async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::Result<()> {
-    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 4).await else {
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 6).await else {
         unreachable!()
     };
     let state = tempfile::tempdir()?;
@@ -131,10 +131,10 @@ async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::
         fingerprint(&decoy),
         fingerprint(&fixture_key()),
     );
-    fs::write(
-        remote.path().join("authorized-key"),
-        selected.public_key().to_openssh()?,
-    )?;
+    let authorized_key = remote.path().join("authorized-key");
+    fs::write(&authorized_key, selected.public_key().to_openssh()?)?;
+    fs::write(remote.path().join("disconnect-on-eot"), [])?;
+    let rotated_key = decoy.public_key().to_openssh()?;
     let trace = remote.path().join("offered-key-trace");
     fs::write(&trace, "")?;
     let agent = AgentFixture::start(vec![
@@ -158,12 +158,16 @@ async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::
         profile.agent_pipe = Some(agent.pipe.parse().unwrap());
         profile
     };
+    let mut automatic = ssh.clone();
+    automatic.agent_pipe = Some(agent.pipe.parse()?);
+    automatic.player.reconnect = true;
     fs::write(
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({"profiles":{
             "Agent profile": ssh,
             "Rejected agent key": with_key(&rejected),
             "Missing agent key": with_key(&missing),
+            "Automatic agent": automatic,
         }}))?,
     )?;
     fs::write(
@@ -171,14 +175,17 @@ async fn native_agent_key_picker_offers_only_the_saved_fingerprint() -> anyhow::
         serde_json::to_vec(&json!({
             "pipe": inherited.pipe, "selected_pipe": agent.pipe,
             "wanted": wanted, "inherited_fingerprint": inherited_fingerprint,
+            "authorized_key_path": authorized_key,
+            "rotated_key": rotated_key,
+            "rotated_fingerprint": rejected,
         }))?,
     )?;
     drive_gui("ssh-agent-key-ui.ps1", state.path());
     assert_eq!(
         fs::read_to_string(&trace)?.lines().collect::<Vec<_>>(),
-        [&wanted, &rejected],
+        [&wanted, &rejected, &rejected, &wanted, &rejected],
     );
-    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(opens.load(Ordering::Relaxed), 3);
     assert!(inherited.signed.lock().unwrap().is_empty());
     server.abort();
     Ok(())
@@ -295,6 +302,9 @@ async fn native_agent_user_certificates_use_the_correct_signer_at_each_endpoint(
             "pipe": format!(r"\\.\pipe\w11term-no-agent-{}", rand::random::<u64>()),
             "certificate": destination_path,
             "gateway_pin": gateway_pin,
+            "gateway_ca": gateway_certificate.signature_key().fingerprint(HashAlg::Sha256).to_string(),
+            "destination_pin": destination_pin,
+            "destination_ca": destination_certificate.signature_key().fingerprint(HashAlg::Sha256).to_string(),
             "gateway_pipe": gateway_agent.pipe,
             "destination_pipe": destination_agent.pipe,
         }))?,

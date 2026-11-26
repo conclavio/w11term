@@ -2,7 +2,10 @@ use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::negotiation::{InitialSshAlgorithms, VerifiedHandshake};
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
-use super::{ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT, agent};
+use super::{
+    AdditionalSshAuthentication, ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT,
+    SshKeySource, VerifiedSshAuthentication, agent,
+};
 use crate::{
     events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
     options::{AgentFingerprint, AgentPipe, Authentication, SshOptions},
@@ -588,12 +591,12 @@ async fn finish_public_key_authentication(
     prompts: Option<&Prompts>,
     result: client::AuthResult,
     rejection: &'static str,
-) -> Result<()> {
+) -> Result<Vec<AdditionalSshAuthentication>> {
     use client::AuthResult;
     use russh::MethodKind::{KeyboardInteractive, Password};
 
     let mut available = match result {
-        AuthResult::Success => return Ok(()),
+        AuthResult::Success => return Ok(Vec::new()),
         AuthResult::Failure {
             remaining_methods,
             partial_success: true,
@@ -608,6 +611,7 @@ async fn finish_public_key_authentication(
     };
 
     let mut attempted = russh::MethodSet::empty();
+    let mut accepted = Vec::new();
     let mut rejection = None;
     loop {
         let method = [KeyboardInteractive, Password]
@@ -620,24 +624,32 @@ async fn finish_public_key_authentication(
             stop("SSH key accepted, but additional authentication requires the GUI")
         })?;
         attempted.push(method);
-        let (result, method_rejection) = if method == KeyboardInteractive {
+        let (result, completed_method, method_rejection) = if method == KeyboardInteractive {
             (
                 keyboard_interactive_authentication(session, options, prompts, true).await?,
+                AdditionalSshAuthentication::KeyboardInteractive,
                 "additional keyboard-interactive authentication rejected",
             )
         } else {
             (
                 password_authentication(session, options, prompts, None).await?,
+                AdditionalSshAuthentication::Password,
                 "additional password authentication rejected",
             )
         };
         match result {
-            AuthResult::Success => return Ok(()),
+            AuthResult::Success => {
+                accepted.push(completed_method);
+                return Ok(accepted);
+            }
             AuthResult::Failure {
                 remaining_methods,
                 partial_success,
             } => {
                 available = remaining_methods;
+                if partial_success {
+                    accepted.push(completed_method);
+                }
                 rejection = (!partial_success).then_some(method_rejection);
             }
         }
@@ -673,49 +685,66 @@ pub(super) async fn authenticate(
     options: &SshOptions,
     prompts: Option<&Prompts>,
     credentials: &mut EndpointCredentials,
-) -> Result<()> {
-    match &options.authentication {
-        Authentication::None => ensure!(
-            session.authenticate_none(&options.user).await?.success(),
-            Permanent("server rejected SSH none authentication".into())
-        ),
+) -> Result<VerifiedSshAuthentication> {
+    use VerifiedSshAuthentication as Verified;
+    let authentication = match &options.authentication {
+        Authentication::None => {
+            ensure!(
+                session.authenticate_none(&options.user).await?.success(),
+                Permanent("server rejected SSH none authentication".into())
+            );
+            Verified::None
+        }
         Authentication::Identity {
             identity,
             certificate,
         } => {
             let (key, remember) =
                 identity_key(identity, prompts, &mut credentials.unlocked_identity).await?;
-            let (result, rejection) = if let Some(path) = certificate {
-                let cert = load_user_certificate(path)?;
-                ensure!(
-                    cert.public_key() == key.public_key().key_data(),
-                    Permanent("the SSH user certificate does not match the private key".into())
-                );
-                (
-                    session
-                        .authenticate_openssh_cert(&options.user, key.clone(), cert)
-                        .await?,
-                    "SSH user certificate authentication rejected",
-                )
-            } else {
-                let hash = session.best_supported_rsa_hash().await?.flatten();
-                (
-                    session
-                        .authenticate_publickey(
-                            &options.user,
-                            PrivateKeyWithHashAlg::new(key.clone(), hash),
-                        )
-                        .await?,
-                    "public-key authentication rejected",
-                )
-            };
-            finish_public_key_authentication(session, options, prompts, result, rejection).await?;
+            let (result, certificate_authority_fingerprint, rejection) =
+                if let Some(path) = certificate {
+                    let cert = load_user_certificate(path)?;
+                    ensure!(
+                        cert.public_key() == key.public_key().key_data(),
+                        Permanent("the SSH user certificate does not match the private key".into())
+                    );
+                    let authority = Verified::certificate_authority(&cert);
+                    (
+                        session
+                            .authenticate_openssh_cert(&options.user, key.clone(), cert)
+                            .await?,
+                        Some(authority),
+                        "SSH user certificate authentication rejected",
+                    )
+                } else {
+                    let hash = session.best_supported_rsa_hash().await?.flatten();
+                    (
+                        session
+                            .authenticate_publickey(
+                                &options.user,
+                                PrivateKeyWithHashAlg::new(key.clone(), hash),
+                            )
+                            .await?,
+                        None,
+                        "public-key authentication rejected",
+                    )
+                };
+            let additional_methods =
+                finish_public_key_authentication(session, options, prompts, result, rejection)
+                    .await?;
+            let key_fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
             if let Some(encrypted_digest) = remember {
                 credentials.unlocked_identity = Some(UnlockedIdentity {
                     path: identity.as_path().to_owned(),
                     encrypted_digest,
                     key,
                 });
+            }
+            Verified::PublicKey {
+                source: SshKeySource::File,
+                key_fingerprint,
+                certificate_authority_fingerprint,
+                additional_methods,
             }
         }
         Authentication::AgentCertificate {
@@ -725,6 +754,7 @@ pub(super) async fn authenticate(
             let certificate = load_user_certificate(certificate)?;
             let public = PublicKey::new(certificate.public_key().clone(), "");
             let actual_fingerprint = AgentFingerprint::for_key(&public);
+            let authority = Verified::certificate_authority(&certificate);
             ensure!(
                 agent_fingerprint
                     .as_ref()
@@ -754,7 +784,7 @@ pub(super) async fn authenticate(
                     )),
                     _ => error.into(),
                 })?;
-            finish_public_key_authentication(
+            let additional_methods = finish_public_key_authentication(
                 session,
                 options,
                 prompts,
@@ -762,6 +792,12 @@ pub(super) async fn authenticate(
                 "the server rejected the SSH user certificate",
             )
             .await?;
+            Verified::PublicKey {
+                source: SshKeySource::Agent,
+                key_fingerprint: actual_fingerprint.as_str().to_owned(),
+                certificate_authority_fingerprint: Some(authority),
+                additional_methods,
+            }
         }
         Authentication::Agent | Authentication::AgentKey { .. } => {
             use russh::keys::agent::AgentIdentity;
@@ -786,14 +822,20 @@ pub(super) async fn authenticate(
                 let result = session
                     .authenticate_publickey_with(&options.user, key, hash, &mut agent)
                     .await?;
-                return finish_public_key_authentication(
+                let additional_methods = finish_public_key_authentication(
                     session,
                     options,
                     prompts,
                     result,
                     "the server rejected the selected SSH agent key",
                 )
-                .await;
+                .await?;
+                return Ok(Verified::PublicKey {
+                    source: SshKeySource::Agent,
+                    key_fingerprint: agent_fingerprint.as_str().to_owned(),
+                    certificate_authority_fingerprint: None,
+                    additional_methods,
+                });
             }
             for identity in identities {
                 let result = session
@@ -813,14 +855,23 @@ pub(super) async fn authenticate(
                         }
                     )
                 {
-                    return finish_public_key_authentication(
+                    let additional_methods = finish_public_key_authentication(
                         session,
                         options,
                         prompts,
                         result,
                         "SSH agent supplied no accepted identity",
                     )
-                    .await;
+                    .await?;
+                    return Ok(Verified::PublicKey {
+                        source: SshKeySource::Agent,
+                        key_fingerprint: identity
+                            .public_key()
+                            .fingerprint(HashAlg::Sha256)
+                            .to_string(),
+                        certificate_authority_fingerprint: None,
+                        additional_methods,
+                    });
                 }
             }
             return Err(stop("SSH agent supplied no accepted identity"));
@@ -834,6 +885,7 @@ pub(super) async fn authenticate(
                     .success(),
                 Permanent("password authentication rejected".into())
             );
+            Verified::Password
         }
         Authentication::KeyboardInteractive => {
             let prompts = prompts
@@ -844,9 +896,10 @@ pub(super) async fn authenticate(
                     .success(),
                 Permanent("keyboard-interactive authentication rejected".into())
             );
+            Verified::KeyboardInteractive
         }
-    }
-    Ok(())
+    };
+    Ok(authentication)
 }
 async fn connect(
     options: &SshOptions,
@@ -924,11 +977,16 @@ async fn connect(
         }
         .with_context(|| format!("SSH handshake for {address}"))?;
         report(ConnectionStep::Authenticating).await?;
-        authenticate(&mut handle, &endpoint, prompts, credentials)
+        let authentication = authenticate(&mut handle, &endpoint, prompts, credentials)
             .await
             .with_context(|| format!("SSH authentication for {address}"))?;
         upstream = Some(ConnectionShare::new(
-            handle, endpoint, prompts, verified, upstream,
+            handle,
+            endpoint,
+            prompts,
+            verified,
+            authentication,
+            upstream,
         ));
     }
     upstream.context("missing SSH destination")

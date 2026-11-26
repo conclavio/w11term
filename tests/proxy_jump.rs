@@ -574,6 +574,19 @@ async fn inspection_reports_each_verified_peer_in_connection_order() {
         );
         assert_eq!(Some(&peer.key_fingerprint), expected.host_key.as_ref());
         assert_eq!(peer.host_key_alias, expected.host_key_alias);
+        let Authentication::Identity { identity, .. } = expected.authentication else {
+            panic!("expected fixture identity file");
+        };
+        let key = russh::keys::load_secret_key(identity.as_path(), None).unwrap();
+        assert_eq!(
+            peer.authentication,
+            w11term::ssh::VerifiedSshAuthentication::PublicKey {
+                source: w11term::ssh::SshKeySource::File,
+                key_fingerprint: key.public_key().fingerprint(HashAlg::Sha256).to_string(),
+                certificate_authority_fingerprint: None,
+                additional_methods: Vec::new(),
+            }
+        );
         let algorithms = peer.initial_algorithms.as_ref().unwrap();
         assert_eq!(algorithms.key_exchange, INSPECTION_KEX[index].as_ref());
         assert_eq!(algorithms.host_key, expected_host_keys[index]);

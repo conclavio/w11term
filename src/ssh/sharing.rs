@@ -1,6 +1,9 @@
 //! A pane can explicitly lend an authenticated connection to a new shell
 //! channel. No global host cache or saved authentication answers are involved.
-use super::{Handler, InitialSshAlgorithms, SESSION_SETUP_TIMEOUT, negotiation::VerifiedHandshake};
+use super::{
+    Handler, InitialSshAlgorithms, SESSION_SETUP_TIMEOUT, VerifiedSshAuthentication,
+    negotiation::VerifiedHandshake,
+};
 use crate::{events::SshConnectionPhase, options::SshOptions, prompts::Prompts};
 use anyhow::{Context, Result};
 use russh::{Channel, client};
@@ -28,6 +31,7 @@ struct Link {
     upstream: Option<ConnectionShare>,
     handle: Arc<client::Handle<Handler>>,
     verified: VerifiedHandshake,
+    authentication: VerifiedSshAuthentication,
     verified_route: OnceLock<Arc<VerifiedSshRoute>>,
     transport: watch::Sender<Arc<SshTransport>>,
     options: SshOptions,
@@ -64,6 +68,7 @@ pub struct VerifiedSshPeer {
     pub user: String,
     pub port: u16,
     pub key_fingerprint: String,
+    pub authentication: VerifiedSshAuthentication,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key_alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -82,12 +87,14 @@ impl ConnectionShare {
         options: SshOptions,
         prompts: Option<&Prompts>,
         verified: VerifiedHandshake,
+        authentication: VerifiedSshAuthentication,
         upstream: Option<ConnectionShare>,
     ) -> Self {
         static NEXT_TRANSPORT_ID: AtomicU64 = AtomicU64::new(1);
         Self(Arc::new(Link {
             handle: Arc::new(handle),
             verified,
+            authentication,
             verified_route: OnceLock::new(),
             transport: watch::Sender::new(Arc::new(SshTransport {
                 id: NEXT_TRANSPORT_ID.fetch_add(1, Ordering::Relaxed),
@@ -175,6 +182,7 @@ impl ConnectionShare {
             user: user.into(),
             port,
             key_fingerprint: key_fingerprint.into(),
+            authentication: self.0.authentication.clone(),
             host_key_alias: self.0.options.host_key_alias.clone(),
             initial_algorithms: self.0.verified.initial_algorithms.clone(),
         }
