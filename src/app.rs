@@ -1287,6 +1287,7 @@ pub struct TerminalApp {
     _control: Arc<Server>,
     window_launch: w11term::options::Options,
     opening: Option<Rc<crate::workspace_window::Opening>>,
+    workspace_open_reply: Option<(Rc<workspace_view::ControlWindowOpen>, serde_json::Value)>,
     reopening_tab_window: Option<Rc<workspace_view::ClosedTabWindow>>,
     incoming: Option<Rc<tab_windows::Transfer>>,
     outgoing: Option<Rc<tab_windows::Transfer>>,
@@ -5377,7 +5378,7 @@ impl Component for TerminalApp {
             .opening
             .clone()
             .or_else(|| match child.map(|child| &child.launch) {
-                Some(tab_windows::ChildLaunch::Workspace(opening)) => Some(opening.clone()),
+                Some(tab_windows::ChildLaunch::Workspace { opening, .. }) => Some(opening.clone()),
                 _ => None,
             });
         let child_window = moving || child.is_some();
@@ -5432,6 +5433,17 @@ impl Component for TerminalApp {
             });
         })
         .expect("installing terminal input adapter");
+        if matches!(
+            child.map(|child| &child.launch),
+            Some(tab_windows::ChildLaunch::Workspace {
+                control: Some(_),
+                ..
+            })
+        ) {
+            // WinUI can close a window shown without activation through its window API.
+            let sender = context.sender();
+            keyboard.on_close_request(move || sender.send(Message::CloseWindow));
+        }
         let _native = keyboard.scope().enter();
         let store = ProfileStore::new(options.profiles_path.clone())
             .expect("resolving profile configuration path");
@@ -5523,34 +5535,38 @@ impl Component for TerminalApp {
             })
             .unwrap_or((1120.0, 760.0));
         let osc52 = appearance.read().unwrap().pane_preferences();
-        if let Some(workspace) = opening.as_ref().map(|window| &window.layout) {
+        let restored_groups = if let Some(workspace) = opening.as_ref().map(|window| &window.layout)
+        {
             workspace_view::append_resolved_workspace(
                 &mut tabs,
                 &workspace.layout,
                 workspace.sources.clone(),
                 osc52,
-            );
-        } else if !child_window {
-            tabs.insert(
-                live_tab_sized(
-                    label.clone(),
-                    options.source.clone(),
-                    size,
-                    osc52,
-                    None,
-                    None,
-                )
-                .with_profile(options.initial_profile.clone()),
-            );
-            for name in &options.extra_profiles {
-                if let Some(source) = catalog.source(name) {
-                    tabs.insert(
-                        live_tab_sized(name.clone(), source, size, osc52, None, None)
-                            .with_profile(Some(name.clone())),
-                    );
+            )
+        } else {
+            if !child_window {
+                tabs.insert(
+                    live_tab_sized(
+                        label.clone(),
+                        options.source.clone(),
+                        size,
+                        osc52,
+                        None,
+                        None,
+                    )
+                    .with_profile(options.initial_profile.clone()),
+                );
+                for name in &options.extra_profiles {
+                    if let Some(source) = catalog.source(name) {
+                        tabs.insert(
+                            live_tab_sized(name.clone(), source, size, osc52, None, None)
+                                .with_profile(Some(name.clone())),
+                        );
+                    }
                 }
             }
-        }
+            Vec::new()
+        };
         // The initial cell target sizes the whole window. A split layout derives
         // its individual PTY grids from the measured rectangle of each canvas.
         let grid = grid.filter(|_| {
@@ -5624,6 +5640,7 @@ impl Component for TerminalApp {
             _control: control,
             window_launch: options.clone(),
             opening: opening.clone(),
+            workspace_open_reply: None,
             reopening_tab_window: None,
             incoming: input.transfer.clone(),
             outgoing: None,
@@ -5712,7 +5729,14 @@ impl Component for TerminalApp {
                 app.reopening_tab_window = reopening.clone();
                 app.start_prepared_tab(layout, context);
             }
-            Some(tab_windows::ChildLaunch::Workspace(_)) | None => app.activate(context),
+            Some(tab_windows::ChildLaunch::Workspace { control, .. }) => {
+                if let Some(control) = control {
+                    let result = app.workspace_opened(&control.name, restored_groups, true);
+                    app.workspace_open_reply = Some((control.clone(), result));
+                }
+                app.activate(context);
+            }
+            None => app.activate(context),
         }
         app.watch_control(context);
         if child.is_none() || opening.is_some() {
@@ -6584,6 +6608,11 @@ impl Component for TerminalApp {
                 if !reply.is_closed() {
                     let result = self.control_open_workspace(&name, activate, context);
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::OpenWorkspaceWindow { name, reply }) => {
+                if !reply.is_closed() {
+                    self.control_open_workspace_window(name, reply, context);
                 }
             }
             Message::Control(w11term::control::UiRequest::ClosePane { pane, reply }) => {
@@ -7953,7 +7982,7 @@ impl Component for TerminalApp {
         self.reconcile_broadcast();
     }
 
-    fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
+    fn view(&self, input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         let _native = self.keyboard.scope().enter();
         if let Some(AppTab {
             label,
@@ -8030,6 +8059,13 @@ impl Component for TerminalApp {
             WindowVisuals::new()
                 .client_size(self.client_size.0, self.client_size.1)
                 .theme(WindowTheme::Dark)
+                .preserve_focus_on_show(matches!(
+                    input.child.as_ref().map(|child| &child.launch),
+                    Some(tab_windows::ChildLaunch::Workspace {
+                        control: Some(_),
+                        ..
+                    })
+                ))
                 .constraints(WindowConstraints {
                     min_width: Some(640.0_f64.min(self.client_size.0)),
                     min_height: Some(360.0_f64.min(self.client_size.1)),

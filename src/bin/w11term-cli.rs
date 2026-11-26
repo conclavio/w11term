@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] open-workspace --window ID --name NAME [--activate]\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -393,6 +393,13 @@ mod tests {
                 "verb": "open-workspace", "window_id": 12, "name": "Fleet Ops", "activate": true,
             })
         );
+        let (_, request) =
+            parse(["open-workspace", "--new-window", "--name", "Fleet Ops"].map(str::to_owned))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb": "open-workspace-window", "name": "Fleet Ops"})
+        );
         for invalid in [
             "list-workspaces --window 1",
             "open-workspace --name fleet",
@@ -401,6 +408,10 @@ mod tests {
             "open-workspace --window 1 --window 2 --name fleet",
             "open-workspace --window 1 --name fleet --name another",
             "open-workspace --window 1 --name fleet --pane 2",
+            "open-workspace --new-window",
+            "open-workspace --new-window --window 1 --name fleet",
+            "open-workspace --new-window --activate --name fleet",
+            "open-workspace --new-window --new-window --name fleet",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

@@ -251,7 +251,10 @@ pub(super) enum ChildLaunch {
         source: Box<Source>,
     },
     Group(host_groups::WindowGroup),
-    Workspace(Rc<crate::workspace_window::Opening>),
+    Workspace {
+        opening: Rc<crate::workspace_window::Opening>,
+        control: Option<Rc<workspace_view::ControlWindowOpen>>,
+    },
     Tab {
         layout: Box<workspace_view::PreparedTabLayout>,
         reopening: Option<Rc<workspace_view::ClosedTabWindow>>,
@@ -302,7 +305,7 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) -> anyhow::Result<()> {
         let workspace = match &launch {
-            ChildLaunch::Workspace(opening) => Some(opening.key.clone()),
+            ChildLaunch::Workspace { opening, .. } => Some(opening.key.clone()),
             _ => None,
         };
         let window = self.reserve_child_window(workspace)?;
@@ -498,6 +501,9 @@ impl TerminalApp {
                     if let Some(reopening) = self.reopening_tab_window.take() {
                         reopening.published();
                     }
+                    if let Some((control, result)) = self.workspace_open_reply.take() {
+                        control.finish(Ok(result));
+                    }
                     if let Some(offer) = &self.incoming {
                         if offer.phase.get() != TransferPhase::Opening
                             || !offer.source.send(Message::TransferReady(offer.id()))
@@ -510,7 +516,13 @@ impl TerminalApp {
                         self.restore_window();
                     }
                 }
-                Err(error) => self.window_error = Some(format!("Registering window: {error}")),
+                Err(error) => {
+                    let error = format!("Registering window: {error}");
+                    if let Some((control, _)) = self.workspace_open_reply.take() {
+                        control.finish(Err(error.clone()));
+                    }
+                    self.window_error = Some(error);
+                }
             }
         }
         if let Some(offer) = self.outgoing.clone() {

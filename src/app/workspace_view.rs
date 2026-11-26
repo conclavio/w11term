@@ -22,6 +22,55 @@ impl TerminalApp {
         let previous = self.tabs.active_id();
         let groups =
             append_resolved_workspace(&mut self.tabs, &launch.layout, launch.sources, preferences);
+        let active = activate || previous.is_none();
+        let result = self.workspace_opened(name, groups, active);
+        if !activate && let Some(previous) = previous {
+            self.tabs.select(previous);
+        }
+        self.sync_selection(context);
+        if active {
+            self.activate(context);
+        } else {
+            self.publish_panes();
+        }
+        Ok(result)
+    }
+
+    pub(super) fn control_open_workspace_window(
+        &self,
+        name: String,
+        reply: WorkspaceReply,
+        context: &ComponentContext<Self>,
+    ) {
+        let opening = match crate::workspace_window::prepare_copy(&name, self.store.path()) {
+            Ok(opening) => opening,
+            Err(error) => {
+                let _ = reply.send(Err(format!("{error:#}")));
+                return;
+            }
+        };
+        let control = Rc::new(ControlWindowOpen {
+            name,
+            reply: RefCell::new(Some(reply)),
+        });
+        let result = self.open_child_window(
+            tab_windows::ChildLaunch::Workspace {
+                opening,
+                control: Some(control.clone()),
+            },
+            context,
+        );
+        if let Err(error) = result {
+            control.finish(Err(format!("{error:#}")));
+        }
+    }
+
+    pub(super) fn workspace_opened(
+        &self,
+        name: &str,
+        groups: Vec<TabId>,
+        active: bool,
+    ) -> serde_json::Value {
         let workspace_active_pane = self.tabs.active().and_then(AppTab::pane_id);
         let tabs: Vec<_> = groups
             .into_iter()
@@ -37,23 +86,36 @@ impl TerminalApp {
                 serde_json::json!({ "tab_id": tab_id, "panes": panes })
             })
             .collect();
-        let active = activate || previous.is_none();
-        if !activate && let Some(previous) = previous {
-            self.tabs.select(previous);
-        }
-        self.sync_selection(context);
-        if active {
-            self.activate(context);
-        } else {
-            self.publish_panes();
-        }
-        Ok(serde_json::json!({
+        serde_json::json!({
             "name": name,
             "window_id": self.registry.window_id(),
             "tabs": tabs,
             "workspace_active_pane": workspace_active_pane,
             "active": active,
-        }))
+        })
+    }
+}
+
+type WorkspaceReply = tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>;
+
+pub(super) struct ControlWindowOpen {
+    pub(super) name: String,
+    reply: RefCell<Option<WorkspaceReply>>,
+}
+
+impl ControlWindowOpen {
+    pub(super) fn finish(&self, result: Result<serde_json::Value, String>) {
+        if let Some(reply) = self.reply.borrow_mut().take() {
+            let _ = reply.send(result);
+        }
+    }
+}
+
+impl Drop for ControlWindowOpen {
+    fn drop(&mut self) {
+        self.finish(Err(
+            "Workspace window closed before it could be registered".into()
+        ));
     }
 }
 
@@ -333,7 +395,10 @@ impl TerminalApp {
                 let result = crate::workspace_window::prepare_copy(&name, self.store.path())
                     .and_then(|opening| {
                         self.open_child_window(
-                            tab_windows::ChildLaunch::Workspace(opening),
+                            tab_windows::ChildLaunch::Workspace {
+                                opening,
+                                control: None,
+                            },
                             context,
                         )
                     });

@@ -30,11 +30,14 @@ Omit `--pid` when exactly one process is running. Each process serves all its wi
 
 `open-workspace --window ID --name NAME` appends a fresh copy of a saved layout to the specified window. The existing selection stays in place by default. Pass `--activate` to select the saved tab and pane within that window while preserving desktop focus. Missing SSH profiles cause the entire request to fail before any tabs are added.
 
+`open-workspace --new-window --name NAME` opens a fresh copy in a new window of the same process and selects its saved pane while preserving desktop focus. The reply arrives after the new window has registered with the control pipe. The window has the usual saved workspace identity and can be found by the workspace switcher. For direct pipe clients, send `{"verb":"open-workspace-window","name":"Fleet Ops"}`.
+
 The reply contains `name`, `window_id`, and `tabs` in saved order. Each tab contains its new `tab_id` and `panes` (new pane IDs in layout order). `workspace_active_pane` identifies the saved active pane's new ID, and `active` reports whether the new workspace selection took effect in that window.
 
 ```powershell
 & $ctl --pid 12345 list-workspaces
 & $ctl --pid 12345 open-workspace --window 2 --name 'Fleet Ops' --activate
+& $ctl --pid 12345 open-workspace --new-window --name 'Fleet Ops'
 ```
 
 `resize` routes to the window that owns the pane, including after a live tab transfer. Closing one window leaves the process pipe and the remaining windows’ sessions accessible.

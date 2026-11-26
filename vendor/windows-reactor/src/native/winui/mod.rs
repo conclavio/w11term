@@ -1343,11 +1343,23 @@ impl WinUiRuntime {
                 self.windows.insert(*node, window);
             }
             Command::ActivateWindow { node } => {
-                self.windows
+                let window = self
+                    .windows
                     .get(node)
-                    .ok_or(RuntimeError::MissingNode(*node))?
-                    .Activate()
-                    .map_err(native_error)?;
+                    .ok_or(RuntimeError::MissingNode(*node))?;
+                if self
+                    .window_visuals
+                    .get(node)
+                    .is_some_and(|visuals| visuals.preserve_focus_on_show)
+                {
+                    window
+                        .cast::<IWindow2>()
+                        .and_then(|window| window.AppWindow())
+                        .and_then(|window| window.ShowWithActivation(false))
+                        .map_err(native_error)?;
+                } else {
+                    window.Activate().map_err(native_error)?;
+                }
             }
             Command::CloseWindow { node } => {
                 self.windows

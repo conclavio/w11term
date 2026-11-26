@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -761,6 +761,87 @@ function Test-ControlWorkspace {
     Close-FixtureWindow $origin
 }
 
+function Test-ControlWorkspaceWindow {
+    Use-Window $origin
+    $sourceSplit = Wait-Until 'original SSH split' { Find-Here $origin 'Cockpit tools' }
+    $sourceSplit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before the CLI opens a window'
+
+    $background = Control @('open-workspace','--new-window','--name','Background local')
+    $backgroundWindow = Wait-DetachedWindow $origin
+    Expect-Text $background.workspace_active_pane 'PS '
+    Expect-Focus $origin $ssh.id 'The local workspace opens without activation'
+    Close-FixtureWindow $backgroundWindow
+    $null = Wait-Until 'closing an unactivated window leaves the original pipe running' {
+        $handles = [TabFixtureWindows]::OwnedBy($app.Id)
+        $handles.Count -eq 1 -and $handles -contains $origin -and @((Control @('list')).sessions).Count -eq 3
+    }
+
+    $failed = & $Cli --pid $app.Id open-workspace --new-window --name 'broken-copy' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*missing-window-profile*') {
+        throw 'Opening an invalid workspace in a new window did not name the missing profile'
+    }
+    if (@((Control @('list-windows')).windows).Count -ne 1 -or @((Control @('list')).sessions).Count -ne 3) {
+        throw 'An invalid workspace added a window or panes'
+    }
+
+    $restored = Control @('open-workspace','--new-window','--name','two-windows')
+    $id = $restored.window_id
+    $remote = $restored.tabs[0].panes[0]
+    $shell = $restored.tabs[0].panes[1]
+    $selected = $restored.tabs[1].panes[0]
+    if ($id -eq $ssh.window_id -or !$restored.active -or $restored.workspace_active_pane -ne $selected -or
+        @($restored.tabs).Count -ne 2 -or @($restored.tabs[0].panes).Count -ne 2 -or
+        @($restored.tabs[1].panes).Count -ne 1) {
+        throw "Unexpected new workspace reply: $($restored | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    $child = Wait-DetachedWindow $origin
+    $null = Wait-Until 'the background window lays out its native tabs without activation' {
+        $tab = Find-Here $child 'Source PowerShell' ([System.Windows.Automation.ControlType]::TabItem)
+        $tab -and $tab.Current.BoundingRectangle.Width -gt 0
+    }
+    Expect-Focus $origin $ssh.id 'The new workspace leaves keyboard focus on the source SSH pane'
+    $windows = @((Control @('list-windows')).windows)
+    $copy = $windows | Where-Object window_id -eq $id
+    if ($windows.Count -ne 2 -or $copy.tab_count -ne 2 -or $copy.pane_count -ne 3 -or
+        $copy.active -or $copy.active_tab_title -cne 'Source PowerShell') {
+        throw 'The new window was not ready with the saved selection when the CLI returned'
+    }
+    $claims = @((Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows |
+        Where-Object window_id -in @($ssh.window_id,$id))
+    if ($claims.Count -ne 2 -or @($claims.workspace | Select-Object -Unique).Count -ne 1 -or !$claims[0].workspace) {
+        throw 'The new window did not register its workspace identity'
+    }
+    Expect-Text $selected 'PS '
+    Expect-Text $shell 'PS '
+    if ((Shell-State $selected 'workspaceWindowCli' -Init) -eq $anchorIdentity) {
+        throw 'The CLI workspace reused the original PowerShell process'
+    }
+    Type-In $origin 'source-stays-focused/'
+    Expect-Text $ssh.id 'source-stays-focused/'
+
+    Close-FixtureWindow $origin
+    $null = Wait-Until 'the new workspace retains all sessions and the shared control pipe' {
+        $panes = @((Control @('list')).sessions)
+        $panes.Count -eq 3 -and $remote -in $panes.id -and $shell -in $panes.id -and
+            $selected -in $panes.id -and @($panes | Where-Object window_id -ne $id).Count -eq 0
+    }
+    Use-Window $child
+    $childSplit = Wait-Until 'native split tab in the window opened from the CLI' { Find-Here $child 'Cockpit tools' }
+    $childSplit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'the restored SSH split is active and its window can take focus' {
+        $pane = (Control @('list')).sessions | Where-Object id -eq $remote
+        if ($pane.active -and $pane.visible) {
+            Use-Window $child
+            [TabFixtureWindows]::GetForegroundWindow() -eq $child
+        }
+    }
+    Expect-Text $remote 'ready'
+    Type-In $child 'new-window/'
+    Expect-Text $remote 'new-window/'
+    Close-FixtureWindow $child
+}
+
 function Test-RepairWorkspace {
     $window = $origin
     Run-WindowCommand $origin ('Workspaces' + [char]0x2026)
@@ -1259,14 +1340,18 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace')) {
-        if ($FirstClose -eq 'CliWorkspace') {
-            Test-ControlWorkspace
-        } else {
-            Test-ExplicitControlWindow
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow')) {
+        switch ($FirstClose) {
+            'CliWindows' { Test-ExplicitControlWindow }
+            'CliWorkspace' { Test-ControlWorkspace }
+            'CliWorkspaceWindow' { Test-ControlWorkspaceWindow }
         }
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'The CLI window fixture did not shut down cleanly'
+        }
+        [uint32]$code = 0
+        if (![TabFixtureWindows]::GetExitCodeProcess($processHandle, [ref]$code) -or $code -ne 0) {
+            throw "The CLI window fixture exited with code $code"
         }
         return
     }

@@ -4824,6 +4824,15 @@ impl IAppWindow {
             .ok()
         }
     }
+    pub(crate) fn ShowWithActivation(&self, activate_window: bool) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).ShowWithActivation)(
+                windows_core::Interface::as_raw(self),
+                activate_window,
+            )
+            .ok()
+        }
+    }
 }
 #[repr(C)]
 pub struct IAppWindow_Vtbl {
@@ -4856,6 +4865,12 @@ pub struct IAppWindow_Vtbl {
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
+    SetIconWithId: usize,
+    SetPresenter: usize,
+    SetPresenterByKind: usize,
+    Show: usize,
+    pub ShowWithActivation:
+        unsafe extern "system" fn(*mut core::ffi::c_void, bool) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IAppWindow2,
