@@ -26,6 +26,8 @@ if ($pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyC
     $labels += 'Fixture PowerShell 7'
 }
 [IO.File]::WriteAllText($profiles, ($catalog | ConvertTo-Json -Depth 12))
+$explorer = $null
+$priorExplorerWindows = @()
 
 function Click([string]$Name) {
     try {
@@ -113,12 +115,6 @@ try {
         }
         $dot = ' ' + [char]0xb7 + ' '
         $null = Wait-Until "$label recorded working directory is shown" { Find-Element "Working directory${dot}$cwd" }
-        [IO.File]::Delete($env:W11TERM_TEST_EXPLORER_TRACE)
-        Click 'Open command directory'
-        $null = Wait-Until "$label opens its recorded working directory in Explorer" {
-            try { $trace = [IO.File]::ReadAllText($env:W11TERM_TEST_EXPLORER_TRACE) | ConvertFrom-Json } catch { return }
-            $trace.action -ceq 'explore' -and [IO.File]::Exists((Join-Path $trace.path 'history-folder-proof'))
-        }
         Click 'Return to pane'
         Wait-Focus $pane
         Write-Output "Verified $label"
@@ -285,7 +281,37 @@ try {
     $wire = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($proof + [char]13))
     $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64',$wire)
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','interrupt-recovered')
+
+    # Explorer can take the foreground on the hosted desktop. Do the native
+    # handoff after the keyboard and picker focus assertions.
+    Picker-Query $label
+    Press-Key 13
+    Wait-Focus $pane
+    Run-Palette 'Command history'
+    $inputType = [System.Windows.Automation.ControlType]::Edit
+    $query = Wait-Until 'local command history search' { Find-Element 'Search command history' $inputType }
+    $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($line)
+    $null = Wait-Until 'the original PowerShell command is selected' { Find-Element $selected }
+    $explorer = New-Object -ComObject Shell.Application
+    $priorExplorerWindows = @($explorer.Windows() | ForEach-Object { $_.HWND })
+    Click 'Open command directory'
+    $null = Wait-Until 'the recorded local command directory opens in Explorer' {
+        try { $trace = [IO.File]::ReadAllText($env:W11TERM_TEST_EXPLORER_TRACE) | ConvertFrom-Json } catch { return }
+        $trace.action -ceq 'explore' -and [IO.File]::Exists((Join-Path $trace.path 'history-folder-proof'))
+    }
 } finally {
+    if ($explorer) {
+        try { $views = @($explorer.Windows()) } catch { $views = @() }
+        foreach ($view in $views) {
+            try {
+                $folder = $view.Document.Folder.Self.Path
+                if ($view.HWND -notin $priorExplorerWindows -and $folder -and
+                    [IO.Path]::GetFullPath($folder) -ieq [IO.Path]::GetFullPath($startFolder)) {
+                    $view.Quit()
+                }
+            } catch { }
+        }
+    }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
