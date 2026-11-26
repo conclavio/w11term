@@ -367,9 +367,9 @@ try {
             (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
             !(Find-Element 'Approve remaining hosts' $button)
     }
-    Click 'Notify when run finishes'
+    Invoke-RunAction 'Notify when run finishes'
     $null = Wait-Until 'both notifications are armed' {
-        (Find-Element 'Cancel run notification' $button) -and (Find-Element 'Cancel canary notification' $button)
+        (Find-Element 'Run notification armed') -and (Find-Element 'Cancel canary notification' $button)
     }
     Click 'Preview send order'
     $null = Wait-Until 'the preview is open before leaving the group' { Find-Element 'Back to roster and results' $button }
@@ -557,8 +557,8 @@ try {
             (Find-Element "$($labels.North)${dot}Queued") -and
             !(Find-Element "Skip queued pane $($panes.East)" $button)
     }
-    Click 'Notify when run finishes'
-    $null = Wait-Until 'the skip completion notice is armed' { Find-Element 'Cancel run notification' $button }
+    Invoke-RunAction 'Notify when run finishes'
+    $null = Wait-Until 'the skip completion notice is armed' { Find-Element 'Run notification armed' }
     New-Item -ItemType File -Path (Join-Path $State 'release-skip-middle') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.North)",'--timeout','10','North finished skip-middle')
 
@@ -590,9 +590,9 @@ try {
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started deadline')
     $elapsed = [Diagnostics.Stopwatch]::StartNew()
     Click 'Pause queue'
-    Click 'Notify when run finishes'
+    Invoke-RunAction 'Notify when run finishes'
     $null = Wait-Until 'the queue is paused and waiting for the run notice' {
-        (Find-Element 'Command queue paused') -and (Find-Element 'Cancel run notification' $button)
+        (Find-Element 'Command queue paused') -and (Find-Element 'Run notification armed')
     }
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the deadline passes with the paused group in the background' { $elapsed.ElapsedMilliseconds -ge 5200 }

@@ -167,13 +167,19 @@ function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Typ
 function Invoke-Button($Element) {
     $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }
-function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Submenu, [switch]$AllowDisabled) {
+function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Submenu, [switch]$AllowDisabled, [scriptblock]$Reveal) {
     $button = [System.Windows.Automation.ControlType]::Button
     $menu = [System.Windows.Automation.ControlType]::MenuItem
-    Invoke-Button (Wait-Until "'$TriggerName' button" {
-        $trigger = Find-Element $TriggerName $button -Visible
-        if ($trigger -and $trigger.Current.IsEnabled) { $trigger }
-    })
+    try {
+        Invoke-Button (Wait-Until "'$TriggerName' button" {
+            $trigger = Find-Element $TriggerName $button -Visible
+            if ($trigger -and $trigger.Current.IsEnabled) { return $trigger }
+            if ($Reveal) { & $Reveal }
+        })
+    } catch {
+        $trigger = Find-Element $TriggerName $button
+        throw "$_ Trigger=$($trigger.Current.Name) Enabled=$($trigger.Current.IsEnabled) Offscreen=$($trigger.Current.IsOffscreen) Bounds=$($trigger.Current.BoundingRectangle)"
+    }
     if ($Submenu) {
         $category = Wait-Until "'$Submenu' submenu" { Find-Element $Submenu $menu }
         $category.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
@@ -203,6 +209,37 @@ function Invoke-SftpEntryAction([string]$Name) {
 }
 function Invoke-NativeMenuAction([string]$Trigger, [string]$Name) {
     Invoke-Button (Get-NativeMenuAction $Trigger $Name)
+}
+function Get-RunAction([string]$Name) {
+    $button = [System.Windows.Automation.ControlType]::Button
+    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    $search = @{ scroll = $null }
+    Get-NativeMenuAction 'Run actions' $Name -Reveal {
+        $trigger = Find-Element 'Run actions' $button
+        if (!$trigger -or !$trigger.Current.IsEnabled -or !$trigger.Current.IsOffscreen) { return }
+        if ($search.scroll) {
+            if ($search.scroll.Current.VerticalScrollPercent -lt 100) {
+                $search.scroll.Scroll([System.Windows.Automation.ScrollAmount]::NoAmount,
+                    [System.Windows.Automation.ScrollAmount]::SmallIncrement)
+            }
+            return
+        }
+        $parent = $walker.GetParent($trigger)
+        while ($parent -and $parent.Current.ProcessId -eq $app.Id) {
+            $pattern = $null
+            if ($parent.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$pattern) -and
+                $pattern.Current.VerticallyScrollable) {
+                $search.scroll = $pattern
+                $pattern.SetScrollPercent(-1, 0)
+                return
+            }
+            $parent = $walker.GetParent($parent)
+        }
+        throw 'The run toolbar is offscreen without a scrollable ancestor'
+    }
+}
+function Invoke-RunAction([string]$Name) {
+    Invoke-Button (Get-RunAction $Name)
 }
 function Close-NativeMenu([string]$ItemName) {
     $null = Press-FocusedKey 27

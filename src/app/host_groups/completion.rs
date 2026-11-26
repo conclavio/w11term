@@ -35,16 +35,10 @@ impl TerminalApp {
     }
 }
 
-pub(super) fn button(id: TabId, submission: &Submission, ctx: &ViewContext<TerminalApp>) -> View {
-    let (label, armed) = match submission.transcript.completion_state() {
-        GroupCompletionState::Available => ("Notify when run finishes", true),
-        GroupCompletionState::Armed => ("Cancel run notification", false),
-        GroupCompletionState::Settled => return View::empty(),
-    };
-    let run = submission.id;
-    Button::new()
-        .on_click(
-            ctx.callback(move |_| Message::HostGroup(Action::NotifyCompletion(id, run, armed))),
-        )
-        .content(label)
+pub(super) fn status(notice: GroupCompletionState) -> View {
+    if notice == GroupCompletionState::Armed {
+        TextBlock::new().text("Run notification armed").into()
+    } else {
+        View::empty()
+    }
 }

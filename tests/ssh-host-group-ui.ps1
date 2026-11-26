@@ -405,11 +405,12 @@ try {
     Outcome $westName 'Sent to SSH channel'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Running'
-    Click 'Notify when run finishes'
-    Click 'Cancel run notification'
-    Click 'Notify when run finishes'
+    Invoke-RunAction 'Notify when run finishes'
+    Invoke-RunAction 'Cancel run notification'
+    $null = Wait-Until 'canceling disarms the notification' { !(Find-Element 'Run notification armed') }
+    Invoke-RunAction 'Notify when run finishes'
     $null = Wait-Until 'the current run is armed for completion' {
-        Find-Element 'Cancel run notification' $button
+        Find-Element 'Run notification armed'
     }
     $runningPrefix = [regex]::Escape("$westName${dot}Running for ")
     $null = Wait-Until 'the held West result reports live elapsed time' {
@@ -755,7 +756,7 @@ try {
     $null = Wait-Until 'the full East output is retained' { Find-Element "View output for pane $east" $button }
     Set-RecipientSearch 'east'
     Expect-ResultOrder @($east)
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'the current report contains full output and both host outcomes' {
         $report = Read-ClipboardFixture
         $report -and $report.StartsWith("Submitted${dot}while-slow") -and
@@ -768,12 +769,12 @@ try {
     Click 'Clear recipient search'
     $saveResults = 'Save results' + [char]0x2026
     $destination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3.txt'
-    Click $saveResults
+    Invoke-RunAction $saveResults
     $dialog = Wait-Until 'owned group results save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
     $null = Wait-Until 'cancel the group results export' { [FixtureDialog]::ClickButton($dialog, 2) }
     $null = Wait-Until 'group results dialog closes after cancel' { !(Find-OwnedDialog 'Save SSH group results as text') }
     if ([IO.File]::Exists($destination)) { throw 'Cancelling the save published a report' }
-    Click $saveResults
+    Invoke-RunAction $saveResults
     $dialog = Wait-Until 'owned group results save dialog reopens' { Find-OwnedDialog 'Save SSH group results as text' }
     $null = Wait-Until 'save the group results report' { [FixtureDialog]::ClickButton($dialog, 1) }
     $savedStatus = Wait-Until 'report was saved with its submission name' {
@@ -805,7 +806,7 @@ try {
             (Find-Element "Added line 1${dot}east-accepted while-slow")
     }
     Click 'Back to results'
-    Click ('Compare runs' + [char]0x2026)
+    Invoke-RunAction ('Compare runs' + [char]0x2026)
     $null = Wait-Until 'group run comparison opens' { Find-Element 'SSH group run comparison' }
     Select-ComboValue 'Earlier group run' "Run 1${dot}one"
     Click 'Compare runs'
@@ -903,7 +904,7 @@ try {
         (Find-Element "Focus result pane $east" $button) -and !(Find-Element "Focus result pane $west" $button)
     }
     $jsonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'group results.json'
-    Click ('Save results as JSON' + [char]0x2026)
+    Invoke-RunAction ('Save results as JSON' + [char]0x2026)
     $dialog = Wait-Until 'owned group JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
     $null = Wait-Until 'enter the JSON destination' {
         [FixtureDialog]::SetFilename($dialog, $jsonPath, 'ssh-group-submission-3.json')
@@ -939,18 +940,23 @@ try {
         throw 'The full report was marked as a subset'
     }
     Set-RecipientSearch 'west'
-    $null = Wait-Until 'an empty result filter has no shown export' {
-        (Find-Element 'Showing 0 of 2 recipients') -and !(Find-Element 'Copy shown results' $button)
+    $null = Wait-Until 'the result filter leaves no recipients' {
+        Find-Element 'Showing 0 of 2 recipients'
     }
+    $null = Get-RunAction 'Copy results'
+    if (Find-Element 'Copy shown results' ([System.Windows.Automation.ControlType]::MenuItem) -Visible) {
+        throw 'An empty result filter offered to copy shown results'
+    }
+    Close-NativeMenu 'Copy results'
     Click 'Clear recipient search'
-    Click 'Copy shown results'
+    Invoke-RunAction 'Copy shown results'
     $shownText = Wait-Until 'clipboard holds only the successful result' {
         $report = Read-ClipboardFixture
         if ($report -and $report.Contains("Shown results${dot}1 of 2 recipients") -and
             $report.Contains("$eastName${dot}Sent to SSH channel") -and
             $report.Contains('east-report-tail') -and !$report.Contains($westName)) { $report }
     }
-    Click ('Save shown results' + [char]0x2026)
+    Invoke-RunAction ('Save shown results' + [char]0x2026)
     $dialog = Wait-Until 'shown group text Save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
     $null = Wait-Until 'save the shown group text report' { [FixtureDialog]::ClickButton($dialog, 1) }
     $shownTextPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.txt'
@@ -958,7 +964,7 @@ try {
         [IO.File]::Exists($shownTextPath) -and
             [IO.File]::ReadAllText($shownTextPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $shownText
     }
-    Click ('Save shown results as JSON' + [char]0x2026)
+    Invoke-RunAction ('Save shown results as JSON' + [char]0x2026)
     $dialog = Wait-Until 'shown group JSON Save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
     $null = Wait-Until 'save the shown group JSON report' { [FixtureDialog]::ClickButton($dialog, 1) }
     $shownJsonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3-shown.json'
@@ -1012,7 +1018,7 @@ try {
     $null = Wait-CheckBox $westName On
     Outcome $westName 'Running'
     $compareButton = 'Compare results' + [char]0x2026
-    Click $compareButton
+    Invoke-RunAction $compareButton
     $null = Wait-Until 'the comparison separates the still-running host' {
         (Find-Element 'SSH group result comparison') -and
         (Find-Element "1 distinct result${dot}1 host compared${dot}1 pending or unavailable") -and
@@ -1151,7 +1157,7 @@ try {
     $null = Wait-Until 'show only the failed result' {
         (Find-Element "Focus result pane $west" $button) -and !(Find-Element "Focus result pane $east" $button)
     }
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'the earlier report contains its own outputs and exit statuses' {
         $report = Read-ClipboardFixture
         $report -and $report.StartsWith("Submitted${dot}both") -and
@@ -1462,11 +1468,11 @@ try {
         Find-Element '1 selected host is hidden by the filter.'
     }
     (Command-Editor).SetValue('unsent notes')
-    Click 'Load command'
+    Invoke-RunAction 'Load command'
     Wait-CommandDraft 'after-reconnect'
     Click 'Restore draft'
     Wait-CommandDraft 'unsent notes'
-    Click 'Load command'
+    Invoke-RunAction 'Load command'
     Wait-CommandDraft 'after-reconnect'
     Submit 'after-reconnect-review' 'Send to 1 host'
     Outcome $westName 'Exit 17'
@@ -1628,7 +1634,7 @@ try {
     Submit 'shared-status' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Exit 0'
-    Click $compareButton
+    Invoke-RunAction $compareButton
     $null = Wait-Until 'identical complete results from both hosts share one group' {
         (Find-Element "1 distinct result${dot}2 hosts compared${dot}0 pending or unavailable") -and
         (Find-Element 'fleet-status-ok') -and (Find-Element "Focus compared pane $east" $button) -and
@@ -1636,7 +1642,7 @@ try {
     }
     Click 'Back to results'
     Set-HostFilter 'west'
-    Click $compareButton
+    Invoke-RunAction $compareButton
     $firstComparedPane = [Math]::Min($east, $west)
     Click "Prepare follow-up for result group starting at pane $firstComparedPane${dot}Prepare follow-up (1 of 2 hosts in roster)"
     Wait-CommandDraft 'shared-status'
@@ -2023,14 +2029,14 @@ try {
             !(Find-Element "Expected output missing${dot}$eastName") -and
             (Find-Element 'Attention inbox, 0 unread' $button)
     }
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'the text report includes the expected output check and both outcomes' {
         $text = Read-ClipboardFixture
         $text -and $text.Contains("Expected output${dot}$expectedLine") -and
             $text.Contains("  Expected output matched`r`n") -and $text.Contains("  Expected output missing`r`n")
     }
     $expectedJson = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'output check.json'
-    Click ('Save results as JSON' + [char]0x2026)
+    Invoke-RunAction ('Save results as JSON' + [char]0x2026)
     $dialog = Wait-Until 'owned expected output JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
     $null = Wait-Until 'enter the expected output JSON destination' {
         [FixtureDialog]::SetFilename($dialog, $expectedJson, "ssh-group-submission-$everyHostRun.json")

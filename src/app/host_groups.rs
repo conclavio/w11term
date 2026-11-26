@@ -40,6 +40,7 @@ mod recipient_sets;
 mod reconnect;
 mod recorded_send;
 mod report;
+mod result_toolbar;
 mod retry;
 mod reuse;
 mod roster_commands;
@@ -2411,16 +2412,16 @@ impl TerminalApp {
                 ))
             }))
             .content(interrupt_label);
-        let navigate = |label, destination: Option<&Submission>| {
+        let navigate = |label, glyph, destination: Option<&Submission>| {
             let destination = destination.map(|item| item.id);
-            Button::new()
+            title_tools::button(label)
                 .is_enabled(destination.is_some())
                 .on_click(ctx.callback(move |_| {
                     destination.map_or(Message::ControlIdle, |next| {
                         Message::HostGroup(Action::ViewSubmission(id, next))
                     })
                 }))
-                .content(label)
+                .content(result_toolbar::icon(label, glyph))
         };
         let result_filter = ComboBox::new()
             .automation_name("Filter submission results")
@@ -2487,47 +2488,62 @@ impl TerminalApp {
         } else {
             View::empty()
         };
-        let copy = |label, offered: Option<Arc<[u64]>>| {
-            Button::new()
-                .on_click(ctx.callback(move |_| {
-                    Message::HostGroup(Action::CopyResults(id, submission_id, offered.clone()))
-                }))
-                .content(label)
-        };
-        let save = |label, format, offered: Option<Arc<[u64]>>| {
-            Button::new()
-                .is_enabled(self.export.pending.is_none())
-                .on_click(ctx.callback(move |_| {
-                    Message::HostGroup(Action::SaveResults(
-                        id,
-                        submission_id,
-                        format,
-                        offered.clone(),
-                    ))
-                }))
-                .content(label)
-        };
-        let shown_exports = if !shown.is_empty() && shown.len() < summary.total() {
-            let offered: Arc<[u64]> = shown.iter().map(|(row, _)| row.target.pane).collect();
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    copy("Copy shown results", Some(offered.clone())),
-                    save(
-                        text_export::GROUP_SHOWN_REPORT_LABEL,
-                        text_export::GroupReportFormat::Text,
-                        Some(offered.clone()),
-                    ),
-                    save(
-                        text_export::GROUP_SHOWN_JSON_LABEL,
-                        text_export::GroupReportFormat::Json,
-                        Some(offered),
-                    ),
-                ))
-        } else {
-            View::empty()
-        };
+        let shown_exports = (!shown.is_empty() && shown.len() < summary.total())
+            .then(|| shown.iter().map(|(row, _)| row.target.pane).collect());
+        let notice = submission.transcript.completion_state();
+        let run_actions = result_toolbar::menu(
+            id,
+            submission,
+            index > 0,
+            shown_exports,
+            self.export.pending.is_some(),
+            notice,
+            ctx,
+        );
+        let history = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(4.0)
+            .children((
+                navigate(
+                    "Previous submission",
+                    "\u{e72b}",
+                    index.checked_sub(1).and_then(|i| page.submissions.get(i)),
+                ),
+                navigate(
+                    "Next submission",
+                    "\u{e72a}",
+                    page.submissions.get(index + 1),
+                ),
+                title_tools::button("Find run…")
+                    .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenRunPicker(id))))
+                    .content(result_toolbar::icon("Find run…", "\u{e721}")),
+                TextBlock::new()
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text(format!("{} of {}", index + 1, page.submissions.len())),
+            ));
+        let run_tools = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(8.0)
+            .children((
+                history,
+                StackPanel::new()
+                    .grid_column(1)
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .children((
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::LiveOutput(
+                                    id,
+                                    submission_id,
+                                    live_output::Action::Open,
+                                ))
+                            }))
+                            .content("Live output…"),
+                        interrupt,
+                        run_actions,
+                    )),
+            ));
         details.push(KeyedView::new(
             "results",
             StackPanel::new().spacing(4.0).children((
@@ -2549,6 +2565,7 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap),
                 StackPanel::new().spacing(4.0).children((
                     output_recording::status_view(id, submission, ctx),
+                    completion::status(notice),
                     submission
                         .transcript
                         .output_alert_rule()
@@ -2561,95 +2578,13 @@ impl TerminalApp {
                     .automation_name("SSH group submission progress")
                     .maximum(summary.total().max(1) as f64)
                     .value(summary.settled() as f64),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        navigate(
-                            "Previous submission",
-                            index.checked_sub(1).and_then(|i| page.submissions.get(i)),
-                        ),
-                        navigate("Next submission", page.submissions.get(index + 1)),
-                        Button::new()
-                            .on_click(
-                                ctx.callback(move |_| {
-                                    Message::HostGroup(Action::OpenRunPicker(id))
-                                }),
-                            )
-                            .content("Find run…"),
-                        TextBlock::new().text(format!(
-                            "{} of {}",
-                            index + 1,
-                            page.submissions.len()
-                        )),
-                    )),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        if submission.content.command().is_some() {
-                            Button::new()
-                                .on_click(ctx.callback(move |_| {
-                                    Message::HostGroup(Action::LoadCommand(id, submission_id))
-                                }))
-                                .content("Load command")
-                        } else {
-                            View::empty()
-                        },
-                        copy("Copy results", None),
-                        save(
-                            text_export::GROUP_REPORT_LABEL,
-                            text_export::GroupReportFormat::Text,
-                            None,
-                        ),
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::LiveOutput(
-                                    id,
-                                    submission_id,
-                                    live_output::Action::Open,
-                                ))
-                            }))
-                            .content("Live output…"),
-                        interrupt,
-                    )),
+                run_tools,
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
                     .children((result_filter, result_order)),
                 recipient_search,
                 result_count,
-                shown_exports,
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::Compare(
-                                    id,
-                                    submission_id,
-                                    compare::Action::Open,
-                                ))
-                            }))
-                            .content("Compare results…"),
-                        Button::new()
-                            .is_enabled(index > 0)
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::Compare(
-                                    id,
-                                    submission_id,
-                                    compare::Action::RunOverview(compare::RunOverviewAction::Open),
-                                ))
-                            }))
-                            .content("Compare runs…"),
-                        save(
-                            text_export::GROUP_JSON_LABEL,
-                            text_export::GroupReportFormat::Json,
-                            None,
-                        ),
-                        completion::button(id, submission, ctx),
-                    )),
                 command_queue::controls(id, submission, ctx),
                 queue_activity::view(id, submission, ctx),
                 retry::button(

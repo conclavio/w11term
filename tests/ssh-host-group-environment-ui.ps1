@@ -61,7 +61,11 @@ function Wait-SendResult {
     foreach ($name in @('Fleet East', 'Fleet West')) {
         $null = Wait-Until "successful export to $name" { Find-Element "$($targets[$name])$($dot)Exit 0" }
     }
-    if (Find-Element 'Load command' $button) { throw 'Per-host assignments cannot load as a shared draft' }
+    $null = Get-RunAction 'Copy results'
+    if (Find-Element 'Load command' ([System.Windows.Automation.ControlType]::MenuItem) -Visible) {
+        throw 'Per-host assignments cannot load as a shared draft'
+    }
+    Close-NativeMenu 'Copy results'
     if (Find-Element $targets['Witness']) { throw 'The hidden host appeared in the export' }
 }
 
@@ -126,8 +130,29 @@ try {
     Open-EnvironmentReview
     Click 'Export to 2 hosts'
     Wait-SendResult
+    $resize.Resize([Math]::Round(620 * $scale), $original.Height)
+    $null = Wait-Until 'run navigation, live output, and actions fit on a single row' {
+        $previous = Find-Element 'Previous submission' $button -Visible
+        $find = Find-Element ('Find run' + [char]0x2026) $button -Visible
+        $live = Find-Element ('Live output' + [char]0x2026) $button -Visible
+        $interrupt = Find-Element 'Interrupt selected' $button -Visible
+        $actions = Find-Element 'Run actions' $button -Visible
+        if (!$previous -or !$find -or !$live -or !$interrupt -or !$actions) { return }
+        $left = $previous.Current.BoundingRectangle
+        $search = $find.Current.BoundingRectangle
+        $output = $live.Current.BoundingRectangle
+        $stop = $interrupt.Current.BoundingRectangle
+        $menu = $actions.Current.BoundingRectangle
+        $bounds = $root.Current.BoundingRectangle
+        $bounds.Width -lt $original.Width -and $left.Top -lt $menu.Bottom -and
+            $menu.Top -lt $left.Bottom -and $left.Left -ge $bounds.Left -and
+            $left.Right -le $search.Left -and $search.Right -le $output.Left -and
+            $output.Right -le $stop.Left -and $stop.Right -le $menu.Left -and
+            $menu.Right -le $bounds.Right
+    }
+    $resize.Resize($original.Width, $original.Height)
     if ((Field 'Group command').Current.Value -cne 'working draft') { throw 'The group draft changed' }
-    Click 'Copy results'
+    Invoke-RunAction 'Copy results'
     $null = Wait-Until 'export report includes each reviewed assignment' {
         $report = Read-ClipboardFixture
         $report -and $report.Contains($eastPosix) -and $report.Contains($westPosix)
