@@ -241,7 +241,7 @@ try {
     }
 
     $saveDefaults = 'Save roster defaults'
-    $showOutput = 'Show last command output'
+    $hideOutput = 'Hide last command output'
     $allReady = 'Require all recipients ready'
     Roster-Choice 'Tab order'
     Roster-Choice 'Host label' -Choose
@@ -255,10 +255,9 @@ try {
     (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
     $null = Wait-CheckBox 'Stop queue on failure' On
     (Wait-CheckBox $allReady Off).Toggle()
-    (Wait-CheckBox $showOutput Off).Toggle()
     $null = Wait-CheckBox $allReady On
     Set-NativeExpansion 'Dispatch settings' $false
-    $null = Wait-CheckBox $showOutput On
+    Invoke-NativeMenuAction 'Roster display' 'Show last command output'
     Click $saveDefaults
     $null = Wait-Until 'the defaults are saved for Fleet' {
         if (!(Find-Element 'Saved roster defaults')) { return }
@@ -268,8 +267,7 @@ try {
             $savedDefaults.show_last_output -and $savedDefaults.require_all_ready -and
             $savedDefaults.stop_command_queue_on_failure
     }
-    (Wait-CheckBox $showOutput On).Toggle()
-    $null = Wait-CheckBox $showOutput Off
+    Invoke-NativeMenuAction 'Roster display' $hideOutput
     Set-NativeExpansion 'Dispatch settings' $true
     Roster-Choice '10 seconds' -ControlName 'Time between sends' -Choose
     Close-GroupWindow
@@ -288,7 +286,8 @@ try {
     $null = Wait-CheckBox 'Stop queue on failure' On
     $null = Wait-CheckBox $allReady On
     Set-NativeExpansion 'Dispatch settings' $false
-    $null = Wait-CheckBox $showOutput On
+    $null = Get-NativeMenuAction 'Roster display' $hideOutput
+    Close-NativeMenu $hideOutput
     $null = Wait-Until 'the loaded preferences match the saved defaults' {
         $save = Find-Element $saveDefaults $button
         $save -and !$save.Current.IsEnabled
@@ -457,20 +456,20 @@ try {
     $changed = Catalog
     $changed.profiles.PSObject.Properties.Remove('East')
     [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
-    Click $saveSelection
+    Invoke-NativeMenuAction 'Roster actions' $saveSelection
     $null = Wait-CheckBox 'Group member West' On
     $null = Wait-Until 'a selected pane has lost its saved profile' {
         Find-Element '1 selected pane has no available saved SSH profile.'
     }
     Click 'Cancel'
-    $null = Wait-Until 'selection draft canceled' { Find-Element $saveSelection $button }
+    $null = Wait-Until 'selection draft canceled' { Find-Element 'Roster actions' $button -Visible }
     if ((Catalog).ssh_host_groups) { throw 'Canceling the selection draft saved a group' }
     [IO.File]::WriteAllBytes($profiles, $withProfiles)
     Filter-Roster 'west'
     $null = Wait-Until 'East is hidden from the selectable roster' {
         (Find-Element "Focus pane $westPane" $button) -and !(Find-Element "Focus pane $eastPane" $button)
     }
-    Click $saveSelection
+    Invoke-NativeMenuAction 'Roster actions' $saveSelection
     $null = Wait-CheckBox 'Group member West' On
     Filter-GroupProfiles 'east'
     $null = Wait-CheckBox 'Group member East' Off

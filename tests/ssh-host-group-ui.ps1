@@ -376,11 +376,10 @@ try {
     }
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
-    $showLastOutput = 'Show last command output'
     $openEastOutput = "Open last command for pane $east"
     $openWestOutput = "Open last command for pane $west"
     if (Find-Element $openEastOutput $button) { throw 'The roster output preview was on by default' }
-    (Wait-CheckBox $showLastOutput Off).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Show last command output'
     $null = Wait-Until 'the checked preview shows the last completed output on East' {
         Find-Element "Pane $east${dot}Last command${dot}Exit 0${dot}east-accepted one"
     }
@@ -389,7 +388,7 @@ try {
         Find-Element "Selected, one${dot}exit 0" $button
     }
     Run-Palette 'SSH host group'
-    (Wait-CheckBox $showLastOutput On).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Hide last command output'
     $null = Wait-Until 'turning off the preview hides the history shortcut' {
         !(Find-Element $openEastOutput $button)
     }
@@ -701,7 +700,7 @@ try {
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
     $readyButton = 'Select only ready shown'
     $null = Wait-Until 'only one selected host is ready' { Find-Element '1 of 2 selected hosts ready' }
-    Click $readyButton
+    Invoke-NativeMenuAction 'Roster actions' $readyButton
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName Off
     $null = Wait-Until 'the ready selection matches the send scope' {
@@ -714,7 +713,7 @@ try {
         (Find-Element '1 selected host is hidden by the filter.') -and
             (Find-Element '0 of 1 selected host ready')
     }
-    Click $readyButton
+    Invoke-NativeMenuAction 'Roster actions' $readyButton
     $null = Wait-CheckBox $westName Off
     Set-HostFilter ''
     $null = Wait-CheckBox $eastName On
@@ -1214,7 +1213,7 @@ try {
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Alternate screen"
     Expect-ResultOrder @($east, $west)
-    (Wait-CheckBox $showLastOutput Off).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Show last command output'
     $null = Wait-Until 'the alternate-screen host has no roster preview' {
         (Find-Element $openEastOutput $button) -and !(Find-Element $openWestOutput $button)
     }
@@ -1379,7 +1378,7 @@ try {
     $null = Wait-Until 'the roster preview uses the replacement SSH connection output' {
         Find-Element "Pane $west${dot}Last command${dot}Exit 17${dot}west-accepted after-reconnect"
     }
-    (Wait-CheckBox $showLastOutput On).Toggle()
+    Invoke-NativeMenuAction 'Roster display' 'Hide last command output'
     Set-GroupReadiness $false
     $null = Wait-Until 'finished results cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button

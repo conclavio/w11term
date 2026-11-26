@@ -93,7 +93,7 @@ Use **Host filter** to find SSH panes by profile, pane name, or address. **Selec
 
 Turn on **Use wildcards** for a list such as `web-[01][0-9], db-??, !*-canary`. Patterns match whole hostnames, SSH addresses with or without ports, pane names, or profile names. Separate patterns with commas. Use `*` for any number of characters, `?` for one character, brackets for sets or ranges, and `!` before a pattern to exclude matching hosts. Use `*, !*-canary` to include every host except canaries. A backslash escapes a special character. Matching ignores case. An incomplete pattern keeps the target list empty until you fix it.
 
-The command bar above the host filter shows how many selected, visible hosts are ready. The Send button shows the recipient count, and its adjacent **Send options** menu offers recording and alerts. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
+The command bar above the host filter shows how many selected, visible hosts are ready. The Send button shows the recipient count, and its adjacent **Send options** menu offers recording and alerts. From **Roster actions**, choose **Select only ready shown** to check visible hosts with a fresh shell marker or a configured prompt match and uncheck the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
 
 Expand **Dispatch settings** to configure readiness, parallelism, pacing, expiry, and canary behavior. The collapsed header shows the active non-default settings. The adjacent **Preview send order** button shows how the current draft would run.
 
@@ -135,9 +135,9 @@ Choose **Close ended SSH panes…** to review and close checked, visible panes w
 
 Choose **Open next SSH prompt** to open the first pending host-key or sign-in prompt in the displayed roster. The button shows how many visible hosts are waiting and follows the roster filters and sort order. Select the group tab to return to the roster.
 
-Turn on **Show last command output** in a group tab to see the exit status and a short excerpt from each visible host’s latest completed shell capture. **Open history** opens that capture in the host’s command history. The preview uses the current SSH connection and hides during authentication and alternate-screen applications.
+Choose **Show last command output** under **Roster display** to see the exit status and a short excerpt from each visible host’s latest completed shell capture. **Open history** opens that capture in the host’s command history. The preview uses the current SSH connection and hides during authentication and alternate-screen applications.
 
-Turn on **Show current terminal line** to see the bottommost text line in each shown host’s live screen, including shells without integration. The preview masks concealed cells and hides during authentication and alternate-screen applications.
+Choose **Show current terminal line** under **Roster display** to see the bottommost text line in each shown host’s live screen, including shells without integration. The preview masks concealed cells and hides during authentication and alternate-screen applications. When a preview is on, its menu entry changes to **Hide**.
 
 Choose **Roster actions → Copy shown roster** to copy a plain-text status report. It includes every host shown by the current filters, its check state, SSH address, pane ID, and connection or prompt status.
 
@@ -301,7 +301,7 @@ From a terminal, search the command palette for **Review SSH group** and the gro
 
 In a named tab, check the shown recipients you want to keep and open **Roster actions → Recipient sets…**. Save a name such as *Canaries* or *Full fleet*. From that tab, you can also search the command palette for **Apply recipient set** and the name, then press Enter. Applying a set replaces the checks, clears the filter, and returns to the named roster. Each saved profile must match exactly one pane in that roster. If a profile is missing or ambiguous, adjust the live roster before applying the set. Applying a set leaves the command ready for a separate **Send** action.
 
-Use **Save selection as group…** to start a new group from the shown, checked panes. The editor preselects each available saved profile once, in roster order, and reports how many selected panes lack an available profile. Review the members and name the group before saving.
+From **Roster actions**, choose **Save selection as group…** to start a new group from the shown, checked panes. The editor preselects each available saved profile once, in roster order, and reports how many selected panes lack an available profile. Review the members and name the group before saving.
 
 Use **Saved group actions → Import host list…** to paste a fleet into the SSH group or choose **Open host list file…** to load it from disk. The editor accepts UTF-8 and BOM-marked UTF-16 files. Enter one saved profile name, host, or SSH address per line. Use `#` for comments and put a space before a comment following an `ssh://` address. Numeric groups such as `ops@rack<1,3>-web<03-01,07>.example:2222` expand left to right, preserving zero padding and the order written. A list can expand to 64 entries. [Polysh host syntax](https://github.com/innogames/polysh/blob/master/tests/test_host_syntax.py)
 

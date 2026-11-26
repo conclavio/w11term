@@ -91,17 +91,21 @@ try {
     $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
     $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
     $resize.Resize([Math]::Round(620 * $scale), $original.Height)
-    $null = Wait-Until 'selection rows wrap and roster actions remain visible in a narrow window' {
+    $null = Wait-Until 'selection, display, and roster actions fit on one row in a narrow window' {
         $select = Find-Element 'Select shown' $button -Visible
-        $save = Find-Element ('Save selection as group' + [char]0x2026) $button -Visible
+        $deselect = Find-Element 'Deselect shown' $button -Visible
+        $display = Find-Element 'Roster display' $button -Visible
         $more = Find-Element 'Roster actions' $button -Visible
-        if (!$select -or !$save -or !$more) { return }
+        if (!$select -or !$deselect -or !$display -or !$more) { return }
         $bounds = $root.Current.BoundingRectangle
         $first = $select.Current.BoundingRectangle
-        $second = $save.Current.BoundingRectangle
+        $second = $deselect.Current.BoundingRectangle
+        $preview = $display.Current.BoundingRectangle
         $menu = $more.Current.BoundingRectangle
-        $first.Bottom -le $second.Top -and
-            $first.Right -le $menu.Left -and $second.Right -le $menu.Left -and $menu.Right -le $bounds.Right
+        $first.Bottom -gt $menu.Top -and $first.Top -lt $menu.Bottom -and
+            $first.Left -ge $bounds.Left -and $first.Right -le $second.Left -and
+            $second.Right -le $preview.Left -and $preview.Right -le $menu.Left -and
+            $menu.Right -le $bounds.Right
     }
     Open-EnvironmentReview
     $eastPosix = "export POLYSH_NR_SHELLS=2 POLYSH_RANK=0 POLYSH_NAME='127.0.0.1' POLYSH_DISPLAY_NAME='Fleet East'"

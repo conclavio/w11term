@@ -5,26 +5,69 @@ const DOWNLOAD: &str = "Download files…";
 const EXPORT_VARIABLES: &str = "Export group variables…";
 const COPY: &str = "Copy shown roster";
 const RECIPIENT_SETS: &str = "Recipient sets…";
+const SELECT_READY: &str = "Select only ready shown";
+const SAVE_SELECTION: &str = "Save selection as group…";
 
-pub(super) fn button(
+pub(super) fn view(
     id: TabId,
     page: &HostGroup,
     selected: &[Target],
-    shown: BTreeSet<u64>,
+    shown: &[&Target],
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
-    View::component::<RosterMenu>(Input {
+    let shown_ids: BTreeSet<_> = shown.iter().map(|target| target.pane).collect();
+    let bulk = |label, selection, enabled| {
+        let panes = shown_ids.clone();
+        Button::new()
+            .is_enabled(enabled)
+            .on_click(ctx.callback(move |_| {
+                Message::HostGroup(Action::SelectShown(id, panes.clone(), selection))
+            }))
+            .content(label)
+    };
+    let selection = StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(6.0)
+        .children((
+            bulk(
+                "Select shown",
+                ShownSelection::All,
+                selected.len() < shown.len(),
+            ),
+            bulk("Deselect shown", ShownSelection::None, !selected.is_empty()),
+        ));
+    let actions = View::component::<RosterMenu>(Input {
         sender: ctx.sender(),
         scope: Scope {
             id,
-            shown,
+            select_ready: shown
+                .iter()
+                .any(|target| page.selected.contains(&target.pane) != target.state.is_ready()),
+            shown: shown_ids,
             checked: selected.iter().map(|target| target.pane).collect(),
             upload: transfer::Direction::Upload.available(selected),
             download: transfer::Direction::Download.available(selected),
             export_variables: environment::available(page, selected),
             recipient_sets: page.saved.origin().is_some(),
         },
-    })
+    });
+    let display = View::component::<RosterDisplay>(DisplayInput {
+        sender: ctx.sender(),
+        id,
+        last_output: page.roster_preferences.show_last_output,
+        terminal_line: page.roster_preferences.show_terminal_line,
+    });
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(8.0)
+        .children((
+            selection,
+            StackPanel::new()
+                .grid_column(1)
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .children((display, actions)),
+        ))
 }
 
 struct RosterMenu(LocalSender<Message>);
@@ -47,6 +90,7 @@ struct Scope {
     id: TabId,
     shown: BTreeSet<u64>,
     checked: BTreeSet<u64>,
+    select_ready: bool,
     upload: bool,
     download: bool,
     export_variables: bool,
@@ -57,6 +101,12 @@ impl Scope {
     fn activate(&self, label: &str) -> Message {
         let id = self.id;
         let action = match label {
+            SELECT_READY if self.select_ready => {
+                Action::SelectShown(id, self.shown.clone(), ShownSelection::Ready)
+            }
+            SAVE_SELECTION if !self.checked.is_empty() => {
+                Action::Saved(id, saved::Action::NewFromSelection(self.checked.clone()))
+            }
             UPLOAD if self.upload => {
                 Action::Transfer(id, transfer::Action::Open(transfer::Direction::Upload))
             }
@@ -90,6 +140,9 @@ impl Component for RosterMenu {
     fn view(&self, input: &Input, _: &mut ViewContext<Self>) -> View {
         let scope = input.scope.clone();
         let mut items = vec![
+            command_menu_item("ready", SELECT_READY, scope.select_ready),
+            command_menu_item("save", SAVE_SELECTION, !scope.checked.is_empty()),
+            MenuItem::separator("selection-end"),
             command_menu_item("upload", UPLOAD, scope.upload),
             command_menu_item("download", DOWNLOAD, scope.download),
             MenuItem::separator("transfer-end"),
@@ -112,6 +165,72 @@ impl Component for RosterMenu {
             .menu(Menu::new(
                 items,
                 self.0.callback(move |label: String| scope.activate(&label)),
+            ))
+    }
+}
+
+struct RosterDisplay(LocalSender<Message>);
+
+#[derive(Clone)]
+struct DisplayInput {
+    sender: LocalSender<Message>,
+    id: TabId,
+    last_output: bool,
+    terminal_line: bool,
+}
+
+impl PartialEq for DisplayInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.last_output == other.last_output
+            && self.terminal_line == other.terminal_line
+    }
+}
+
+impl Component for RosterDisplay {
+    type Input = DisplayInput;
+    type Message = ();
+
+    fn create(input: &DisplayInput, _: &ComponentContext<Self>) -> Self {
+        Self(input.sender.clone())
+    }
+
+    fn view(&self, input: &DisplayInput, _: &mut ViewContext<Self>) -> View {
+        let DisplayInput {
+            id,
+            last_output,
+            terminal_line,
+            ..
+        } = *input;
+        let output = if last_output {
+            "Hide last command output"
+        } else {
+            "Show last command output"
+        };
+        let line = if terminal_line {
+            "Hide current terminal line"
+        } else {
+            "Show current terminal line"
+        };
+        title_tools::button("Roster display")
+            .content(
+                FontIcon::new()
+                    .glyph("\u{e890}")
+                    .tooltip_with(title_tools::below("Roster display")),
+            )
+            .menu(Menu::new(
+                [
+                    MenuItem::item("output", output),
+                    MenuItem::item("line", line),
+                ],
+                self.0.callback(move |label: String| {
+                    let action = match label.as_str() {
+                        label if label == output => Action::ShowLastOutput(id, !last_output),
+                        label if label == line => Action::ShowTerminalLine(id, !terminal_line),
+                        _ => return Message::ControlIdle,
+                    };
+                    Message::HostGroup(action)
+                }),
             ))
     }
 }

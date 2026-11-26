@@ -2188,49 +2188,6 @@ impl TerminalApp {
                     && !selected_shown.contains(&target.pane)
             })
             .count();
-        let shown_ids: BTreeSet<_> = shown.iter().map(|target| target.pane).collect();
-        let bulk = |label, selection: ShownSelection| {
-            let panes = shown_ids.clone();
-            Button::new()
-                .is_enabled(shown.iter().any(|target| {
-                    page.selected.contains(&target.pane) != selection.includes(target.state)
-                }))
-                .on_click(ctx.callback(move |_| {
-                    Message::HostGroup(Action::SelectShown(id, panes.clone(), selection))
-                }))
-                .content(label)
-        };
-        let selection_actions = StackPanel::new()
-            .orientation(if self.width >= 680.0 {
-                Orientation::Horizontal
-            } else {
-                Orientation::Vertical
-            })
-            .spacing(6.0)
-            .children((
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(6.0)
-                    .children((
-                        bulk("Select shown", ShownSelection::All),
-                        bulk("Deselect shown", ShownSelection::None),
-                    )),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(6.0)
-                    .children((
-                        bulk("Select only ready shown", ShownSelection::Ready),
-                        Button::new()
-                            .is_enabled(!selected_shown.is_empty())
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::Saved(
-                                    id,
-                                    saved::Action::NewFromSelection(selected_shown.clone()),
-                                ))
-                            }))
-                            .content("Save selection as group…"),
-                    )),
-            ));
         let filter_input = Grid::new()
             .column_spacing(8.0)
             .columns([
@@ -2335,16 +2292,7 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             }),
-            Grid::new()
-                .columns([GridLength::STAR, GridLength::Auto])
-                .column_spacing(8.0)
-                .children((
-                    selection_actions,
-                    Border::new()
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Top)
-                        .content(roster_toolbar::button(id, page, &selected, shown_ids, ctx)),
-                )),
+            roster_toolbar::view(id, page, &selected, &shown, ctx),
             reconnect::selection_controls(
                 id,
                 page,
@@ -2357,25 +2305,6 @@ impl TerminalApp {
             page.disconnect
                 .controls(id, self.disconnect_recipients(selected.iter()), ctx),
             next_prompt,
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    CheckBox::new()
-                        .automation_name("Show last command output")
-                        .is_checked(page.roster_preferences.show_last_output)
-                        .on_is_checked_changed(ctx.callback(move |show| {
-                            Message::HostGroup(Action::ShowLastOutput(id, show))
-                        }))
-                        .content("Show last command output"),
-                    CheckBox::new()
-                        .automation_name("Show current terminal line")
-                        .is_checked(page.roster_preferences.show_terminal_line)
-                        .on_is_checked_changed(ctx.callback(move |show| {
-                            Message::HostGroup(Action::ShowTerminalLine(id, show))
-                        }))
-                        .content("Show current terminal line"),
-                )),
             if page.roster_copy_feedback.is_empty() {
                 View::empty()
             } else {
