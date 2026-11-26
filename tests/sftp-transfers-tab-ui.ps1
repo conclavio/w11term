@@ -7,6 +7,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_SFTP_PICKER_SMOKE_DIR = Join-Path $State 'picker'
+$env:W11TERM_EXPORT_SMOKE_DIR = $State
 $profiles = Join-Path $State 'profiles.json'
 $alphaRoot = [IO.File]::ReadAllText((Join-Path $State 'alpha-root'))
 $betaRoot = [IO.File]::ReadAllText((Join-Path $State 'beta-root'))
@@ -227,6 +228,48 @@ try {
         $remote = Find-Element $remoteAction $button
         $remote -and !$remote.Current.IsEnabled -and
             (Find-Element "Show download in File Explorer for transfer $secondId" $button).Current.IsEnabled
+    }
+    $export = "Save recent transfers as JSON$ellipsis"
+    $reportPath = Join-Path $State 'sftp-transfers.json'
+    Click $export
+    $dialog = Wait-Until 'owned transfer history save dialog' {
+        Find-OwnedDialog 'Save recent SFTP transfers as JSON'
+    }
+    $null = Wait-Until 'cancel the export' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'export available after cancel' {
+        $item = Find-Element $export $button
+        $item -and $item.Current.IsEnabled
+    }
+    if ([IO.File]::Exists($reportPath)) { throw 'Cancelled export created a history file' }
+    Click $export
+    $dialog = Wait-Until 'owned transfer history save dialog reopens' {
+        Find-OwnedDialog 'Save recent SFTP transfers as JSON'
+    }
+    $null = Control @('close-pane','--pane',"$beta")
+    $null = Wait-Until 'confirm the export' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the history report has been published' { [IO.File]::Exists($reportPath) }
+
+    $report = [IO.File]::ReadAllText($reportPath) | ConvertFrom-Json
+    if ($report.schema_version -ne 1 -or $report.transfers.Count -ne 2) {
+        throw 'Export did not capture both visible results exactly once'
+    }
+    $saved = $report.transfers[0]
+    if ($saved.transfer_id -cne $secondId -or $saved.pane.id -ne $beta -or
+        $saved.pane.label -cne 'second-ssh' -or $saved.ssh.host -cne $profile.host -or
+        $saved.ssh.user -cne $profile.user -or $saved.ssh.port -ne $profile.port -or
+        $saved.finished_unix_ms -ne $finished.timestamp_ms -or $saved.outcome -cne 'completed' -or
+        $saved.saved_download.kind -cne 'folder' -or $saved.saved_download.path -ine $betaLocal -or
+        $saved.details.completed.Count -ne 1 -or
+        $saved.details.completed[0].remote -cne '/shell directory/beta folder' -or
+        $saved.details.completed[0].bytes_transferred -le 0) {
+        throw "Unexpected completed transfer report: $($saved | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    $stopped = $report.transfers[1]
+    if ($stopped.transfer_id -cne $firstId -or $stopped.outcome -cne 'cancelled' -or !$stopped.background -or
+        $stopped.finished_unix_ms -ne $cancelled[0].timestamp_ms -or $stopped.saved_download -or
+        $stopped.details.stopped.local -ine $alphaLocal -or
+        $stopped.details.stopped.outcome -cne 'cancelled' -or $stopped.details.not_started -ne 1) {
+        throw "Unexpected stopped transfer report: $($stopped | ConvertTo-Json -Depth 8 -Compress)"
     }
 } catch {
     $alphaWire = if ($alphaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $alphaTrace)) }

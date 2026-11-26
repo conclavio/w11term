@@ -14,7 +14,10 @@ use w11term::{
     sftp::{TransferOperation, TransferOutcome, TransferPhase},
 };
 
+mod report;
+
 pub(super) const LABEL: &str = "SFTP transfers";
+const SAVE_HISTORY: &str = "Save recent transfers as JSON…";
 
 pub enum Action {
     Open,
@@ -24,6 +27,14 @@ pub enum Action {
     ShowDownloadedItem(TransferId, usize),
     ShowRemoteItem(TransferId, usize),
     ExpandDetails(TransferId, bool),
+    SaveHistory,
+}
+
+struct Recent<'a> {
+    label: &'a str,
+    ssh: &'a SshOptions,
+    pane: &'a LiveTab,
+    result: RecentSftpTransfer,
 }
 
 impl TerminalApp {
@@ -135,6 +146,23 @@ impl TerminalApp {
                     }
                 }
             }
+            Action::SaveHistory => {
+                if self.export.pending.is_some() {
+                    return;
+                }
+                let rows: Vec<_> = self
+                    .window_sftp_history()
+                    .into_iter()
+                    .map(|row| report::Row::capture(row.label, row.ssh, row.result))
+                    .collect();
+                if !rows.is_empty() {
+                    self.begin_text_export(
+                        text_export::Subject::SftpTransferHistory,
+                        move |output| report::write_json(&rows, output),
+                        ctx,
+                    );
+                }
+            }
         }
     }
 
@@ -155,39 +183,41 @@ impl TerminalApp {
                 TextBlock::new().text("No active SFTP transfers in this window"),
             ));
         }
-        let mut recent: Vec<_> = self
-            .window_sftp_panes()
-            .flat_map(|(_, label, tab, ssh)| {
-                tab.session
-                    .events
-                    .recent_sftp_transfers()
-                    .into_iter()
-                    .map(move |result| (label, ssh, tab, result))
-            })
-            .collect();
-        recent.sort_unstable_by_key(|(_, _, _, result)| Reverse((result.finished_at, result.id)));
+        let recent = self.window_sftp_history();
         if !recent.is_empty() {
             rows.push(KeyedView::new(
                 "recent-heading",
-                TextBlock::new().text("Recent transfers").font_size(18.0),
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto])
+                    .column_spacing(8.0)
+                    .children((
+                        TextBlock::new()
+                            .text("Recent transfers")
+                            .font_size(18.0)
+                            .vertical_alignment(VerticalAlignment::Center),
+                        Button::new()
+                            .grid_column(1)
+                            .automation_name(SAVE_HISTORY)
+                            .is_enabled(self.export.pending.is_none())
+                            .on_click(ctx.callback(|_| Message::SftpTransfers(Action::SaveHistory)))
+                            .content("Save as JSON…"),
+                    )),
             ));
-            rows.extend(recent.into_iter().take(RECENT_SFTP_TRANSFER_LIMIT).map(
-                |(label, ssh, tab, result)| {
-                    let show_details = expanded == Some(result.id);
-                    let remote_blocker = if show_details {
-                        remote_reveal_blocker(tab, result.id)
-                    } else {
-                        None
-                    };
-                    result_row(
-                        transfer_source(label, ssh, result.id.pane),
-                        result,
-                        show_details,
-                        remote_blocker,
-                        ctx,
-                    )
-                },
-            ));
+            rows.extend(recent.into_iter().map(|row| {
+                let show_details = expanded == Some(row.result.id);
+                let remote_blocker = if show_details {
+                    remote_reveal_blocker(row.pane, row.result.id)
+                } else {
+                    None
+                };
+                result_row(
+                    transfer_source(row.label, row.ssh, row.result.id.pane),
+                    row.result,
+                    show_details,
+                    remote_blocker,
+                    ctx,
+                )
+            }));
         }
         Grid::new()
             .margin(16.0)
@@ -201,6 +231,27 @@ impl TerminalApp {
                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                     .content(StackPanel::new().spacing(12.0).keyed_children(rows)),
             ))
+    }
+
+    fn window_sftp_history(&self) -> Vec<Recent<'_>> {
+        let mut recent: Vec<_> = self
+            .window_sftp_panes()
+            .flat_map(|(_, label, pane, ssh)| {
+                pane.session
+                    .events
+                    .recent_sftp_transfers()
+                    .into_iter()
+                    .map(move |result| Recent {
+                        label,
+                        ssh,
+                        pane,
+                        result,
+                    })
+            })
+            .collect();
+        recent.sort_unstable_by_key(|row| Reverse((row.result.finished_at, row.result.id)));
+        recent.truncate(RECENT_SFTP_TRANSFER_LIMIT);
+        recent
     }
 
     fn retained_sftp_transfer(

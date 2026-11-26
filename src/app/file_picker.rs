@@ -41,6 +41,7 @@ pub(super) enum Purpose {
     GroupJsonReport(String),
     GroupRunComparison(String),
     FolderComparison,
+    SftpTransferHistory,
     GroupOutputExcerpt(String),
     GroupOutputDiff(String),
     GroupLiveRecording(String),
@@ -372,6 +373,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             | Purpose::GroupJsonReport(_)
             | Purpose::GroupRunComparison(_)
             | Purpose::FolderComparison
+            | Purpose::SftpTransferHistory
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
             | Purpose::SshGroupDefinition
@@ -408,6 +410,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     Purpose::FolderComparison => (
                         w!("Save folder comparison as JSON"),
                         "sftp-folder-comparison.json",
+                        w!("json"),
+                    ),
+                    Purpose::SftpTransferHistory => (
+                        w!("Save recent SFTP transfers as JSON"),
+                        "sftp-transfers.json",
                         w!("json"),
                     ),
                     Purpose::GroupOutputExcerpt(suggestion) => (

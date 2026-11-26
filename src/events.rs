@@ -62,8 +62,10 @@ pub enum SavedDownload {
 pub struct RecentSftpTransfer {
     pub id: TransferId,
     pub finished_at: Instant,
+    pub finished_unix_ms: u64,
     pub outcome: TransferOutcome,
     pub message: Arc<str>,
+    pub background: bool,
     pub saved_download: Option<SavedDownload>,
     pub details: Option<Arc<SftpTransferDetails>>,
 }
@@ -980,23 +982,26 @@ impl Events {
         if state.recent_sftp_transfers.len() == RECENT_SFTP_TRANSFER_LIMIT {
             state.recent_sftp_transfers.pop_front();
         }
-        state.recent_sftp_transfers.push_back(RecentSftpTransfer {
-            id: transfer_id,
-            finished_at: Instant::now(),
-            outcome,
-            message: Arc::from(message.as_str()),
-            saved_download: saved_download.clone(),
-            details,
-        });
-        Self::append_locked(
+        let finished_at = Instant::now();
+        let finished_unix_ms = Self::append_locked(
             &mut state,
             "sftp-transfer",
             serde_json::json!({ "transfer_id": transfer_id, "outcome": outcome, "message": message, "background": background }),
             EventLinks {
-                saved_download,
+                saved_download: saved_download.clone(),
                 ..EventLinks::default()
             },
         );
+        state.recent_sftp_transfers.push_back(RecentSftpTransfer {
+            id: transfer_id,
+            finished_at,
+            finished_unix_ms,
+            outcome,
+            message: Arc::from(message.as_str()),
+            background,
+            saved_download,
+            details,
+        });
         drop(state);
         self.changed.notify_waiters();
     }
@@ -1103,7 +1108,7 @@ impl Events {
         self.changed.notify_waiters();
     }
 
-    fn append_locked(state: &mut State, kind: &str, data: Value, links: EventLinks) {
+    fn append_locked(state: &mut State, kind: &str, data: Value, links: EventLinks) -> u64 {
         state.next += 1;
         let sequence = state.next;
         let timestamp_ms = SystemTime::now()
@@ -1128,6 +1133,7 @@ impl Events {
         if state.events.len() > CAPACITY {
             state.events.pop_front();
         }
+        timestamp_ms
     }
     pub(crate) fn cursor(&self) -> u64 {
         self.state.lock().unwrap().next

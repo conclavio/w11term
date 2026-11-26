@@ -427,6 +427,8 @@ Expand **Transfer item details** to see what happened to each attempted upload o
 
 For a completed item, **Show remote entry** returns to the originating pane and selects its current path in the SFTP drawer while the original SSH connection is available. **Show in File Explorer** beside a completed batch download selects that exact saved item. **Open download folder** still opens the batch’s destination folder.
 
+Choose **Save as JSON…** beside **Recent transfers** to save the current window’s displayed results, newest first. The versioned report includes transfer IDs and finish times, SSH accounts and addresses, Windows and remote paths, outcomes, saved download locations, and the available item details. It captures the history when you choose Save and remains readable after the panes close.
+
 Scripts can list, cancel, and wait for drawer transfers with `w11term-cli sftp list-transfers`, `cancel-transfer`, and `wait-transfer`. [SFTP control commands](CONTROL.md#control-drawer-transfers)
 
 After a file or folder is saved, choose **Show download in File Explorer** in the drawer or beside its inbox result to select it. Use **Open download folder** for a batch that saved at least one item. Each inbox result keeps its own destination so you can find earlier downloads.
