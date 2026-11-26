@@ -643,6 +643,21 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
+    pub(super) fn active_tab_search(&self) -> std::sync::Weak<()> {
+        self.picker
+            .as_ref()
+            .filter(|picker| picker.mode == Mode::Commands(command_palette::Search::Tabs))
+            .map_or_else(std::sync::Weak::new, |picker| {
+                Arc::downgrade(&picker.launch)
+            })
+    }
+
+    pub(super) fn refresh_tab_search(&mut self) {
+        if self.active_tab_search().strong_count() > 0 {
+            self.refresh_open_commands();
+        }
+    }
+
     pub(super) fn open_window_command_history(&mut self, ctx: &ComponentContext<Self>) {
         self.start_picker(Mode::Commands(command_palette::Search::CommandHistory), ctx);
     }
@@ -1075,14 +1090,17 @@ impl TerminalApp {
             .then(|| self.tabs.active_group_id())
             .flatten()
             .and_then(|group| {
-                commands
-                    .iter()
-                    .position(|row| row.id == command_palette::CommandId::FocusTab(group))
+                commands.iter().position(|row| {
+                    row.id == command_palette::CommandId::FocusTab(self.registry.window_id(), group)
+                })
             });
         let selected = selected_tab
             .or_else(|| matches.iter().position(|row| Some(row.pane) == active))
             .unwrap_or(0);
         let launch = Arc::new(());
+        if mode == Mode::Commands(command_palette::Search::Tabs) {
+            self.watch_tab_search(&launch);
+        }
         let running_timer = if mode == Mode::Commands(command_palette::Search::RunningCommands) {
             let sender = ctx.sender();
             let launch = launch.clone();
