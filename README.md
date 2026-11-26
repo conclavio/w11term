@@ -77,6 +77,8 @@ The native WinUI tab strip sits in the title bar. Click **+** to open a profile 
 
 Choose **+ → Find profile…** to search launchable profiles by name or SSH address, including the username and port. Search words can appear in any order. Press Enter to open the selected profile in a new tab or Escape to return without opening anything. Local shell profiles appear alongside SSH profiles. **Find profile…** is also available in the command palette.
 
+Choose **+ → Open profile in new window…** or use the same command in the palette to start a fresh SSH login or local shell in another window. The new window uses the profile’s saved placement when available. Both windows appear in **Find window…**, and the source window keeps its tabs and sessions.
+
 To reorder the selected tab, drag it or use **Move tab left** or **Move tab right** in **More** or the command palette. Both actions can be assigned shortcuts under **Settings → Keyboard**. Moving a tab keeps the same pane focused. Numbered tab shortcuts follow the new order. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Choose **More → Find tab…** or search for **Find tab** in the command palette. Search by tab title or position across the windows in this w11term instance, including SSH groups and utility tabs beyond the visible strip. Results from another window show its **Window N** label. Include that label in the query to search just that window. Use Up and Down to choose a match, Enter to bring its window forward and switch tabs, and Escape to keep your current tab. Assign a shortcut for **Find tab** under **Settings → Keyboard**.

@@ -76,6 +76,12 @@ async fn native_find_window_preserves_the_current_tab_and_drops_closed_windows()
     run("WindowSearch", b"ssh-probe/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens fresh SSH and PowerShell profiles in new native windows on the same pipe"]
+async fn native_open_profiles_in_new_windows_preserves_the_original_sessions() {
+    run("ProfileWindow", b"fresh-window/source-window/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -86,6 +92,13 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     let state = tempfile::tempdir().unwrap();
     let data = state.path().join("data");
     fs::create_dir(&data).unwrap();
+    if first_close == "ProfileWindow" {
+        fs::write(
+            data.join("windows.json"),
+            br#"{"Destination PowerShell":{"x":32,"y":40,"width":850,"height":600,"maximized":false,"cols":96,"rows":28}}"#,
+        )
+        .unwrap();
+    }
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
     fs::write(
@@ -143,12 +156,17 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         fs::read_to_string(state.path().join("gui.log")).unwrap_or_default(),
         fs::read_to_string(&trace).unwrap_or_default()
     );
+    let expected_ssh = 1 + usize::from(first_close == "ProfileWindow");
     assert_eq!(
         transports.load(Ordering::Relaxed),
-        1,
-        "SSH transport restarted"
+        expected_ssh,
+        "SSH transport count"
     );
-    assert_eq!(sessions.load(Ordering::Relaxed), 1, "SSH channel restarted");
+    assert_eq!(
+        sessions.load(Ordering::Relaxed),
+        expected_ssh,
+        "SSH channel count"
+    );
     assert_eq!(
         fs::read(trace).unwrap(),
         expected_wire,

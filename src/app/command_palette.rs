@@ -10,12 +10,14 @@ pub(super) const FIND_COMMAND_HISTORY_LABEL: &str = "Find command history…";
 pub(super) const FIND_RUNNING_COMMANDS_LABEL: &str = "Find running commands…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
 pub(super) const FIND_PROFILE_LABEL: &str = "Find profile…";
+pub(super) const WINDOW_PROFILE_LABEL: &str = "Open profile in new window…";
 pub(super) const SPLIT_RIGHT_PROFILE_LABEL: &str = "Find profile to split right…";
 pub(super) const SPLIT_BELOW_PROFILE_LABEL: &str = "Find profile to split below…";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileDestination {
     Tab,
+    Window,
     Split { axis: Axis, origin: TabId },
 }
 
@@ -49,6 +51,7 @@ impl Search {
             Self::CommandHistory => "Search commands across panes",
             Self::RunningCommands => "Search running commands",
             Self::Profiles(ProfileDestination::Tab) => "Search profiles",
+            Self::Profiles(ProfileDestination::Window) => "Search profiles for a new window",
             Self::Profiles(ProfileDestination::Split {
                 axis: Axis::Columns,
                 ..
@@ -241,6 +244,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                         if key != "new-profile".into()
                             && key != "quick-connect".into()
                             && key != "find-profile".into()
+                            && key != "window-profile".into()
                             && key != "lab".into() =>
                     {
                         (format!("New tab with {label}"), String::new())
@@ -1074,6 +1078,19 @@ impl TerminalApp {
                             self.open(name.clone(), source, Some(name), ctx);
                         }
                     }
+                    ProfileDestination::Window => {
+                        if let Some(source) = self.catalog.source(&name)
+                            && let Err(error) = self.open_child_window(
+                                tab_windows::ChildLaunch::Profile {
+                                    name,
+                                    source: Box::new(source),
+                                },
+                                ctx,
+                            )
+                        {
+                            self.window_error = Some(format!("Opening another window: {error}"));
+                        }
+                    }
                     ProfileDestination::Split { axis, origin }
                         if self.move_source() == Some(origin) =>
                     {
@@ -1152,10 +1169,11 @@ pub(super) fn view(
             TextBox::new()
                 .element_ref(input)
                 .text(query)
-                .placeholder_text(if mode.is_profiles() {
-                    "Search by profile name or SSH address"
-                } else {
-                    search_label
+                .placeholder_text(match mode {
+                    Search::Profiles(
+                        ProfileDestination::Tab | ProfileDestination::Split { .. },
+                    ) => "Search by profile name or SSH address",
+                    _ => search_label,
                 })
                 .automation_name(search_label)
                 .on_text_changed(ctx.callback(Message::PickerQuery)),
@@ -1402,6 +1420,21 @@ mod tests {
                 "West    lab".into(),
                 Some("ops@[2001:db8::1]:6792".into())
             )
+        );
+        assert_eq!(
+            profile_search_rows(&catalog, ProfileDestination::Window, "local lab")[0].id,
+            CommandId::LaunchProfile(ProfileDestination::Window, "Terminal lab".into(), None)
+        );
+        let mut commands = Vec::new();
+        menu_rows(
+            vec![MenuItem::item("window-profile", WINDOW_PROFILE_LABEL)],
+            true,
+            &mut commands,
+        );
+        assert_eq!(commands[0].label, WINDOW_PROFILE_LABEL);
+        assert_eq!(
+            commands[0].id,
+            CommandId::Profile(WINDOW_PROFILE_LABEL.into())
         );
     }
 
