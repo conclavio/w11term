@@ -291,6 +291,17 @@ pub enum Request {
         pane: u64,
         start_token: std::num::NonZeroU64,
     },
+    WaitRunningOutput {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
+        pattern: String,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default)]
+        match_case: bool,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     Playback {
         pane: u64,
         #[serde(default)]
@@ -1257,6 +1268,44 @@ impl Registry {
                 result["pane"] = pane.into();
                 Ok(result)
             }
+            Request::WaitRunningOutput {
+                pane,
+                start_token,
+                pattern,
+                regex,
+                match_case,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "wait timeout must be 1..=3600 seconds"
+                );
+                let pattern = ssh_groups::output_pattern(&pattern, regex, match_case)?;
+                let (reply, response) = oneshot::channel();
+                let mut pending = PendingRunningOutput {
+                    input: self.pane(pane)?.input,
+                    response,
+                };
+                pending
+                    .input
+                    .send(Command::WaitRunningOutput {
+                        start_token: start_token.get(),
+                        pattern,
+                        reply,
+                    })
+                    .context("pane is closed")?;
+                let matched = tokio::time::timeout(
+                    Duration::from_secs(timeout_seconds),
+                    &mut pending.response,
+                )
+                .await
+                .context("wait-running-output timed out without a matching line")?
+                .context("pane closed before the output matched")?
+                .map_err(anyhow::Error::msg)?;
+                let mut result = serde_json::to_value(matched)?;
+                result["pane"] = pane.into();
+                Ok(result)
+            }
             Request::GetCommand {
                 pane,
                 id,
@@ -1580,6 +1629,7 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitCommand { .. }
+                        | Request::WaitRunningOutput { .. }
                         | Request::WaitSshConnected { .. }
                         | Request::WaitPaneExit { .. }
                         | Request::WaitSftpTransfer { .. }
@@ -1651,6 +1701,18 @@ async fn while_client_waits<T>(
         biased;
         _ = reader.read(&mut probe) => None,
         result = wait => Some(result),
+    }
+}
+
+struct PendingRunningOutput {
+    input: mpsc::UnboundedSender<Command>,
+    response: oneshot::Receiver<crate::events::RunningOutputResult>,
+}
+
+impl Drop for PendingRunningOutput {
+    fn drop(&mut self) {
+        self.response.close();
+        let _ = self.input.send(Command::PruneRunningOutputWaits);
     }
 }
 
@@ -1952,6 +2014,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitCommand {
+                timeout_seconds, ..
+            }
+            | Request::WaitRunningOutput {
                 timeout_seconds, ..
             }
             | Request::WaitSshConnected {

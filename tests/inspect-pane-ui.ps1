@@ -224,13 +224,35 @@ try {
     if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains('local-inspect')) { throw 'PowerShell input landed in SSH' }
     $cursor = (Control @('events','--pane',"$remote")).journal.next
     Report-CommandStart 'interrupted fixture'
-    Set-RemoteModes 'original-preview'
+    Set-RemoteModes "original-preview`r`n"
     $first = ((Control @('events','--pane',"$remote",'--since',"$cursor",'--kind','command-started','--timeout','5')).journal.events)[0].data
     $null = Wait-Until 'a command-started token reads the background shell output' {
         $sample = Read-RunningOutput $first.start_token
         $sample.pane -eq $remote -and $sample.id -eq $first.id -and $sample.start_token -eq $first.start_token -and
             $sample.connection_generation -eq $first.connection_generation -and $sample.state -ceq 'ready' -and
             $sample.earlier_omitted -eq $false -and $sample.text -clike '*original-preview*'
+    }
+    $match = Control @('wait-running-output','--pane',"$remote",'--start-token',"$($first.start_token)",
+        '--regex','--match-case','--timeout','5','^original-preview$')
+    if ($match.pane -ne $remote -or $match.id -ne $first.id -or $match.text -cne 'original-preview' -or
+        $match.start_token -ne $first.start_token -or $match.connection_generation -ne $first.connection_generation) {
+        throw "The CLI did not match the original command's retained output"
+    }
+    $waitLog = Join-Path $State 'running-output-wait.json'
+    $waitArgs = @('--pid',"$($app.Id)",'wait-running-output','--pane',"$remote",'--start-token',"$($first.start_token)",
+        '--regex','--timeout','8','^later-ready$')
+    $waiter = Start-Process -FilePath $Cli -ArgumentList $waitArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput $waitLog
+    try {
+        if ($waiter.HasExited) { throw 'The output waiter completed before the new line' }
+        Set-RemoteModes "later-ready`r`n"
+        if (!$waiter.WaitForExit(10000)) { throw 'The output waiter did not finish after the new line' }
+        $reply = [IO.File]::ReadAllText($waitLog) | ConvertFrom-Json
+        if (!$reply.ok -or $reply.result.text -cne 'later-ready' -or $reply.result.start_token -ne $first.start_token) {
+            throw "Unexpected live wait result: $($reply | ConvertTo-Json -Depth 4 -Compress)"
+        }
+    } finally {
+        if (!$waiter.HasExited) { $waiter.Kill(); $waiter.WaitForExit() }
+        $waiter.Dispose()
     }
     Assert-StaleOutput $localPane $first.start_token
     Report-CommandStart 'interrupted fixture'
@@ -240,6 +262,10 @@ try {
         if ($r.id -eq $first.id -and $r.start_token -gt 0 -and $r.start_token -ne $first.start_token) { $r }
     }
     Assert-StaleOutput $remote $first.start_token
+    $staleWait = & $Cli --pid $app.Id wait-running-output --pane "$remote" --start-token "$($first.start_token)" --timeout 5 'replacement-preview' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $staleWait.ok -or $staleWait.error -notmatch 'no longer running') {
+        throw 'An output wait accepted a replaced command token'
+    }
     $null = Wait-Until 'the replacement token reads only its own output' {
         $sample = Read-RunningOutput $replacement.start_token
         $sample.state -ceq 'ready' -and $sample.text -clike '*replacement-preview*' -and

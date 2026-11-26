@@ -48,9 +48,11 @@ impl wezterm_term::AlertHandler for Alerts {
         &mut self,
         id: u64,
         label: Option<&str>,
+        start_token: Option<u64>,
         output: wezterm_term::LiveCommandOutput<'_>,
     ) {
-        self.events.live_shell_output(id, label, output);
+        self.events
+            .live_shell_output(id, label, start_token, output);
     }
 
     fn alert(&mut self, alert: wezterm_term::Alert) {

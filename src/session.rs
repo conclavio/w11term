@@ -80,6 +80,12 @@ pub enum Command {
         u64,
         tokio::sync::oneshot::Sender<Result<RunningCommandSample, &'static str>>,
     ),
+    WaitRunningOutput {
+        start_token: u64,
+        pattern: regex::Regex,
+        reply: tokio::sync::oneshot::Sender<crate::events::RunningOutputResult>,
+    },
+    PruneRunningOutputWaits,
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<PaneInspection>),
     Replay {
@@ -959,6 +965,7 @@ async fn run(
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let mut inspecting = false;
     let mut published_running = None;
+    let mut waiting_for_output = false;
     let mut replay_label = None;
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
@@ -1062,7 +1069,7 @@ async fn run(
                 .running_command()
                 .map(|command| (connection_generation, command));
             if running != published_running {
-                events.retain_running_command_watch(
+                events.retain_running_capture(
                     running.as_ref().map(|(generation, command)| {
                         RunningCommandTarget::new(*generation, command)
                     }),
@@ -1479,6 +1486,26 @@ async fn run(
                         }
                         Ok(())
                     }
+                    Some(Command::WaitRunningOutput { start_token, pattern, reply }) => {
+                        if !reply.is_closed() {
+                            match find_running_command(&terminal, &events, connection_generation, start_token) {
+                                Ok(command) => {
+                                    events.watch_running_output(
+                                        RunningCommandTarget::new(connection_generation, &command),
+                                        pattern, reply,
+                                    );
+                                    terminal.notify_running_shell_output();
+                                    waiting_for_output = events.prune_running_output_waits();
+                                }
+                                Err(reason) => { let _ = reply.send(Err(reason)); }
+                            }
+                        }
+                        Ok(())
+                    }
+                    Some(Command::PruneRunningOutputWaits) => {
+                        waiting_for_output = events.prune_running_output_waits();
+                        Ok(())
+                    }
                     Some(Command::ReadModes(reply)) => {
                         if !reply.is_closed() {
                             let (inspection, _) = PaneInspection::read(
@@ -1864,8 +1891,11 @@ async fn run(
                             let program_before = terminal.program_status().cloned();
                             let seq_before = terminal.current_seqno();
                             scroll_offset = presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
-                            if group_shell {
+                            if group_shell || waiting_for_output {
                                 terminal.notify_running_shell_output();
+                                if waiting_for_output {
+                                    waiting_for_output = events.prune_running_output_waits();
+                                }
                             }
                             if let Some(matcher) = &mut prompt_matcher
                                 && connection_generation != 0
@@ -1938,17 +1968,26 @@ fn read_running_output(
     generation: u64,
     start_token: u64,
 ) -> Result<RunningCommandSample, &'static str> {
-    let running = terminal
-        .running_command()
-        .filter(|command| command.start_token == start_token)
-        .filter(|_| events.shell_generation() == Some(generation))
-        .ok_or("that command capture is no longer running in this pane")?;
+    let running = find_running_command(terminal, events, generation, start_token)?;
     Ok(RunningCommandSample {
         id: running.id,
         start_token,
         connection_generation: generation,
         output: sample_running_output(terminal),
     })
+}
+
+fn find_running_command(
+    terminal: &wezterm_term::TerminalState,
+    events: &crate::events::Events,
+    generation: u64,
+    start_token: u64,
+) -> Result<wezterm_term::RunningCommand, &'static str> {
+    terminal
+        .running_command()
+        .filter(|command| command.start_token == start_token)
+        .filter(|_| events.shell_generation() == Some(generation))
+        .ok_or("that command capture is no longer running in this pane")
 }
 
 fn sample_running_output(terminal: &wezterm_term::TerminalState) -> RunningCommandOutput {

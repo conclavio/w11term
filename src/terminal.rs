@@ -1935,6 +1935,87 @@ mod tests {
     }
 
     #[test]
+    fn running_output_waits_match_retained_live_and_final_lines() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(6));
+        term.advance_bytes(b"$ build\r\n\x1b]133;C\x07cached ready\r\n");
+        let running = term.running_command().unwrap();
+        let wait = |pattern: &str| {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            events.watch_running_output(
+                crate::events::RunningCommandTarget::new(6, &running),
+                regex::Regex::new(pattern).unwrap(),
+                reply,
+            );
+            response
+        };
+        let mut cached = wait("^cached ready$");
+        let mut live = wait("^next line$");
+        let mut finished = wait("^last line$");
+        let mut missing = wait("^missing$");
+        term.notify_running_shell_output();
+        assert_eq!(cached.try_recv().unwrap().unwrap().text, "cached ready");
+
+        term.advance_bytes(b"next line");
+        term.notify_running_shell_output();
+        assert!(matches!(
+            live.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        term.advance_bytes(b"\r\n");
+        term.notify_running_shell_output();
+        let hit = live.try_recv().unwrap().unwrap();
+        assert_eq!(hit.text, "next line");
+        assert_eq!(
+            (hit.connection_generation, hit.id, hit.start_token),
+            (6, running.id, running.start_token)
+        );
+
+        term.advance_bytes(b"last line\x1b]133;D;17\x07");
+        assert_eq!(finished.try_recv().unwrap().unwrap().text, "last line");
+        assert_eq!(
+            missing.try_recv().unwrap().unwrap_err(),
+            "command finished without a matching output line"
+        );
+        assert!(!events.prune_running_output_waits());
+    }
+
+    #[test]
+    fn running_output_waits_reject_gaps_and_retire_when_the_capture_changes() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(1));
+        term.advance_bytes(b"\x1b]133;C\x07");
+        let original =
+            crate::events::RunningCommandTarget::new(1, &term.running_command().unwrap());
+        let watch = |target| {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            events.watch_running_output(target, regex::Regex::new("^ready$").unwrap(), reply);
+            response
+        };
+        let mut gap = watch(original);
+        term.advance_bytes(format!("{}ready\r\n", "noise\r\n".repeat(130)).as_bytes());
+        term.notify_running_shell_output();
+        assert!(gap.try_recv().unwrap().unwrap_err().contains("incomplete"));
+
+        let mut stale = watch(original);
+        term.advance_bytes(b"\x1b]133;C\x07ready\r\n");
+        term.notify_running_shell_output();
+        let current = crate::events::RunningCommandTarget::new(1, &term.running_command().unwrap());
+        events.retain_running_capture(Some(current));
+        assert_eq!(
+            stale.try_recv().unwrap().unwrap_err(),
+            "command capture ended before an output match"
+        );
+
+        let mut disconnected = watch(current);
+        events.command_stream(None);
+        assert_eq!(
+            disconnected.try_recv().unwrap().unwrap_err(),
+            "shell connection changed before an output match"
+        );
+    }
+
+    #[test]
     fn running_command_handles_late_shell_metadata_prompt_and_terminal_reset() {
         let (mut term, _) = engine();
         term.advance_bytes(b"\x1b]633;A\x07\x1b]633;B\x07");

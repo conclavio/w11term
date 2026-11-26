@@ -115,6 +115,7 @@ pub trait AlertHandler: Send + Sync {
         &mut self,
         _id: u64,
         _label: Option<&str>,
+        _start_token: Option<u64>,
         _output: crate::LiveCommandOutput<'_>,
     ) {
     }

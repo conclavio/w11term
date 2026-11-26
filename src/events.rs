@@ -15,6 +15,7 @@ mod group_command;
 mod group_transcript;
 mod inbox;
 mod kitty_notification;
+mod running_output;
 mod ssh_attempt;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
@@ -29,6 +30,7 @@ pub use group_transcript::{
 pub(crate) use inbox::display_field;
 pub use inbox::{Inbox, InboxWake, NoticeTarget, SshLoginResult};
 pub use kitty_notification::{NotificationChoice, NotificationResponse};
+pub use running_output::RunningOutputResult;
 pub(crate) use ssh_attempt::{AttemptGuard, RetryWait, SshConnectionSnapshot};
 pub use ssh_attempt::{
     PendingSshAttempt, PendingSshRetry, SshAttemptCompletion, SshAttemptOutcome,
@@ -179,6 +181,7 @@ struct State {
     inbox: Option<(u64, Arc<str>, Inbox)>,
     kitty_notifications: kitty_notification::Notifications,
     command_watch: Option<CommandWatch>,
+    running_output: Vec<running_output::Waiter>,
     group_run: Option<GroupRun>,
     group_prompt_pattern: Option<GroupPromptPattern>,
     group_serial: u64,
@@ -721,11 +724,49 @@ impl Events {
         &self,
         id: u64,
         label: Option<&str>,
+        start_token: Option<u64>,
         output: wezterm_term::LiveCommandOutput<'_>,
     ) {
-        if let Some(run) = &mut self.state.lock().unwrap().group_run {
-            run.live_output(id, label, output);
+        let mut state = self.state.lock().unwrap();
+        if let Some(run) = &mut state.group_run {
+            run.live_output(id, label, &output);
         }
+        state.running_output.retain(|wait| !wait.reply.is_closed());
+        let mut index = 0;
+        while let Some(wait) = state.running_output.get_mut(index) {
+            if Some(wait.target.start_token) == start_token
+                && let Some(result) = wait.observe(&output)
+            {
+                let wait = state.running_output.swap_remove(index);
+                let _ = wait.reply.send(result);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    pub(crate) fn watch_running_output(
+        &self,
+        target: RunningCommandTarget,
+        pattern: regex::Regex,
+        reply: tokio::sync::oneshot::Sender<RunningOutputResult>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state.running_output.retain(|wait| !wait.reply.is_closed());
+        if !reply.is_closed() {
+            state.running_output.push(running_output::Waiter {
+                target,
+                reply,
+                pattern,
+                cursor: Default::default(),
+            });
+        }
+    }
+
+    pub(crate) fn prune_running_output_waits(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.running_output.retain(|wait| !wait.reply.is_closed());
+        !state.running_output.is_empty()
     }
 
     pub(crate) fn group_command_line(&self, id: u64, label: Option<&str>) {
@@ -776,7 +817,7 @@ impl Events {
         }
     }
 
-    pub(crate) fn retain_running_command_watch(&self, running: Option<RunningCommandTarget>) {
+    pub(crate) fn retain_running_capture(&self, running: Option<RunningCommandTarget>) {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
         if let Some(watch) = &mut state.command_watch
@@ -785,6 +826,13 @@ impl Events {
             watch.armed = None;
             state.refresh_watch(previous);
         }
+        for wait in state.running_output.extract_if(.., |wait| {
+            wait.reply.is_closed() || Some(wait.target) != running
+        }) {
+            let _ = wait
+                .reply
+                .send(Err("command capture ended before an output match"));
+        }
     }
 
     pub(crate) fn command_stream(&self, generation: Option<u64>) {
@@ -792,6 +840,11 @@ impl Events {
         let previous = state.watch_state();
         if let Some(run) = state.group_run.take() {
             run.abandon("The connection closed before the shell reported a result.");
+        }
+        for wait in state.running_output.drain(..) {
+            let _ = wait
+                .reply
+                .send(Err("shell connection changed before an output match"));
         }
         state.command_watch = generation.map(CommandWatch::new);
         state.refresh_watch(previous);
@@ -802,6 +855,11 @@ impl Events {
         let previous = state.watch_state();
         if let Some(run) = state.group_run.take() {
             run.abandon("The terminal reset before the shell reported a result.");
+        }
+        for wait in state.running_output.drain(..) {
+            let _ = wait
+                .reply
+                .send(Err("terminal reset before an output match"));
         }
         if let Some(watch) = &mut state.command_watch {
             watch.reset();

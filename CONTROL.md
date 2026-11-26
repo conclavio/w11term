@@ -187,6 +187,27 @@ The read preserves focus and scroll position, including on background and
 read-only panes. The equivalent pipe request is
 `{"verb":"get-running-output","pane":2,"start_token":27}`.
 
+`wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case]
+[--timeout SECONDS] [--] TEXT` waits for a completed logical line in that
+same active command. It checks retained output first, then watches lines as
+the parser receives them. Soft wraps are joined, and the shell's completion
+marker makes the final line eligible even without a newline. Matching is a
+case-insensitive literal search by default. It runs on parsed primary-screen
+output independently of when a synchronized update is painted.
+
+The timeout defaults to 30 seconds and accepts 1–3600. A match returns
+`pane`, `id`, `connection_generation`, `start_token`, and the matched line
+as `text` without its newline. If the capture ends without a match, is
+replaced, or disconnects, the wait fails immediately. An already stale token
+is rejected. Each scan can read at most 128 physical rows and 1,024 UTF-8 bytes
+per logical line. Dropped or reflowed rows and overlong lines return an
+incomplete-output error. Alternate-screen contents are excluded.
+
+The pipe request uses `verb: "wait-running-output"` with `pane`,
+`start_token`, and `pattern`. Optional fields are `regex`, `match_case`,
+and `timeout_seconds`. It uses the same wait capacity as `wait-for-text` and
+leaves focus, scroll position, and shell input in place.
+
 ## Completed shell commands
 
 `list-commands --pane ID` reads the pane’s OSC 133 or OSC 633 command history. It

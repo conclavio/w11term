@@ -6,6 +6,56 @@ use w11term::{
 };
 
 #[tokio::test(start_paused = true)]
+async fn timed_out_running_output_wait_closes_its_reader_and_prunes_the_worker() {
+    let registry = Registry::default();
+    let (input, mut worker) = tokio::sync::mpsc::unbounded_channel();
+    registry.replace([Pane {
+        id: 3,
+        tab_id: 1,
+        tab_title: None,
+        pane_name: None,
+        label: "background".into(),
+        active: false,
+        visible: false,
+        read_only: true,
+        capture: None,
+        input,
+    }]);
+    let wait = registry.execute(
+        Request::WaitRunningOutput {
+            pane: 3,
+            start_token: 25.try_into().unwrap(),
+            pattern: "ready [ok]".into(),
+            regex: false,
+            match_case: false,
+            timeout_seconds: 1,
+        },
+        Arc::new(|_, _, _| anyhow::bail!("unexpected screen capture")),
+    );
+    let verify = async {
+        let Some(Command::WaitRunningOutput {
+            start_token,
+            pattern,
+            reply,
+        }) = worker.recv().await
+        else {
+            panic!("expected a running output wait");
+        };
+        assert_eq!(start_token, 25);
+        assert!(pattern.is_match("READY [ok]"));
+        assert!(!pattern.is_match("ready o"));
+        assert!(!reply.is_closed());
+        assert!(matches!(
+            worker.recv().await,
+            Some(Command::PruneRunningOutputWaits)
+        ));
+        assert!(reply.is_closed());
+    };
+    let (result, ()) = tokio::join!(wait, verify);
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable_pane() {
     let registry = Registry::window(10, None);
     let second_window = registry.register_window(20, None).unwrap();

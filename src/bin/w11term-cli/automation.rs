@@ -5,7 +5,7 @@ use w11term::control::{
     SshGroupReportFormat, validate_group_panes, validate_group_submission,
 };
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] get-running-output --pane ID --start-token TOKEN\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] [--connection-generation N] [--after-frame N] [--screenshot PATH] [--] TEXT\nw11term-cli [--pid PID] wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]\nw11term-cli [--pid PID] wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--kind KIND] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] close-pane --pane ID\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --after-id ID --connection-generation N [--timeout SECONDS] [--command TEXT] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN\nw11term-cli [--pid PID] stop-ssh-attempt --pane ID --attempt-token TOKEN\nw11term-cli [--pid PID] retry-ssh-now --pane ID --retry-token TOKEN\nw11term-cli [--pid PID] disconnect-ssh-shell --pane ID --connection-generation N";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] get-running-output --pane ID --start-token TOKEN\nw11term-cli [--pid PID] wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] [--connection-generation N] [--after-frame N] [--screenshot PATH] [--] TEXT\nw11term-cli [--pid PID] wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]\nw11term-cli [--pid PID] wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--kind KIND] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] close-pane --pane ID\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --after-id ID --connection-generation N [--timeout SECONDS] [--command TEXT] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN\nw11term-cli [--pid PID] stop-ssh-attempt --pane ID --attempt-token TOKEN\nw11term-cli [--pid PID] retry-ssh-now --pane ID --retry-token TOKEN\nw11term-cli [--pid PID] disconnect-ssh-shell --pane ID --connection-generation N";
 pub(super) fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -18,6 +18,7 @@ pub(super) fn parse(
         "wait-ssh-connected" | "wait-pane-exit" | "wait-command"
     );
     let command_detail = matches!(verb, "get-command" | "wait-command");
+    let running_output = matches!(verb, "get-running-output" | "wait-running-output");
     let mut cols = None;
     let mut rows = None;
     let mut profile = None;
@@ -79,12 +80,10 @@ pub(super) fn parse(
             }
             "--pane"
                 if pane_wait
+                    || running_output
                     || matches!(
                         verb,
-                        "close-pane"
-                            | "ssh-group-queue"
-                            | "interrupt-ssh-group-command"
-                            | "get-running-output"
+                        "close-pane" | "ssh-group-queue" | "interrupt-ssh-group-command"
                     ) =>
             {
                 ensure!(pane.is_none(), "specify --pane only once");
@@ -165,6 +164,7 @@ pub(super) fn parse(
                     verb,
                     "find-text"
                         | "wait-for-text"
+                        | "wait-running-output"
                         | "wait-ssh-group-output"
                         | "submit-ssh-group-command"
                 ) =>
@@ -174,7 +174,10 @@ pub(super) fn parse(
             "--match-case"
                 if matches!(
                     verb,
-                    "find-text" | "wait-ssh-group-output" | "submit-ssh-group-command"
+                    "find-text"
+                        | "wait-running-output"
+                        | "wait-ssh-group-output"
+                        | "submit-ssh-group-command"
                 ) =>
             {
                 match_case = true
@@ -194,6 +197,7 @@ pub(super) fn parse(
                     || matches!(
                         verb,
                         "wait-for-text"
+                            | "wait-running-output"
                             | "events"
                             | "wait-ssh-group-run"
                             | "wait-ssh-group-approval"
@@ -202,7 +206,7 @@ pub(super) fn parse(
                             | "follow-ssh-group-output"
                     ) =>
             {
-                if pane_wait {
+                if pane_wait || verb == "wait-running-output" {
                     ensure!(timeout.is_none(), "specify --timeout only once");
                 }
                 timeout = Some(value(&mut args)?.parse()?)
@@ -303,7 +307,7 @@ pub(super) fn parse(
                 retry_token = Some(value(&mut args)?.parse::<std::num::NonZeroU64>()?.into());
             }
             "--id" if verb == "get-command" => command_id = Some(value(&mut args)?.parse()?),
-            "--start-token" if verb == "get-running-output" => {
+            "--start-token" if running_output => {
                 ensure!(start_token.is_none(), "specify --start-token only once");
                 start_token = Some(
                     value(&mut args)?
@@ -389,7 +393,7 @@ pub(super) fn parse(
             }
             "--" if matches!(
                 verb,
-                "find-text" | "wait-for-text" | "wait-ssh-group-output"
+                "find-text" | "wait-for-text" | "wait-running-output" | "wait-ssh-group-output"
             ) =>
             {
                 ensure!(text.is_none(), "only one pattern is accepted");
@@ -401,6 +405,7 @@ pub(super) fn parse(
                     verb,
                     "find-text"
                         | "wait-for-text"
+                        | "wait-running-output"
                         | "wait-ssh-group-output"
                         | "record"
                         | "save-text"
@@ -504,13 +509,37 @@ pub(super) fn parse(
         "inspect" => Request::Inspect {
             pane: pane.context("--pane is required")?,
         },
-        "get-running-output" => Request::GetRunningOutput {
-            pane: pane
+        "get-running-output" | "wait-running-output" => {
+            let pane = pane
                 .filter(|id| *id > 0)
-                .context("provide a positive --pane ID")?,
-            start_token: start_token
-                .context("--start-token is required (from inspect or command-started)")?,
-        },
+                .context("provide a positive --pane ID")?;
+            let start_token = start_token
+                .context("--start-token is required (from inspect or command-started)")?;
+            if verb == "get-running-output" {
+                Request::GetRunningOutput { pane, start_token }
+            } else {
+                let pattern = text.context("search text or regular expression is required")?;
+                ensure!(!pattern.is_empty(), "search text is empty");
+                ensure!(
+                    pattern.len() <= w11term::search::MAX_QUERY_BYTES,
+                    "search text exceeds {} UTF-8 bytes",
+                    w11term::search::MAX_QUERY_BYTES
+                );
+                let timeout_seconds = timeout.unwrap_or(30);
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "--timeout must be 1..=3600 seconds"
+                );
+                Request::WaitRunningOutput {
+                    pane,
+                    start_token,
+                    pattern,
+                    regex,
+                    match_case,
+                    timeout_seconds,
+                }
+            }
+        }
         "playback" => Request::Playback {
             pane: pane.context("--pane is required")?,
             action: playback.unwrap_or_default(),

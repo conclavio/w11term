@@ -115,7 +115,7 @@ impl GroupRun {
         &mut self,
         id: u64,
         label: Option<&str>,
-        output: LiveCommandOutput<'_>,
+        output: &LiveCommandOutput<'_>,
     ) {
         if self
             .started

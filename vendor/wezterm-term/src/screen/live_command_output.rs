@@ -42,6 +42,10 @@ impl Screen {
 }
 
 impl LiveCommandOutput<'_> {
+    pub fn is_finishing(&self) -> bool {
+        self.finishing
+    }
+
     /// Offer completed logical lines once. The current line can still be
     /// rewritten by the shell, so offer it only when the command finishes.
     pub fn read(&self, cursor: &mut LiveOutputCursor) -> LiveOutputBatch {

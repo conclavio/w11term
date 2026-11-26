@@ -69,6 +69,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "list-commands"
             | "get-command"
             | "get-running-output"
+            | "wait-running-output"
             | "wait-command"
             | "inspect"
             | "playback"
@@ -936,6 +937,26 @@ mod tests {
             "get-running-output --pane 8 --start-token -1",
             "get-running-output --pane 8 --start-token 27 --start-token 28",
             "get-running-output --pane 8 --pane 9 --start-token 27",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn running_output_wait_accepts_match_options_and_valid_timeout() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (_, request) = parse_line("wait-running-output --pane 8 --start-token 27 --regex --match-case --timeout 7 -- ^ready$").unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"wait-running-output","pane":8,"start_token":27,"pattern":"^ready$","regex":true,"match_case":true,"timeout_seconds":7})
+        );
+        for line in [
+            "wait-running-output --pane 8 --start-token 0 ready",
+            "wait-running-output --pane 8 --start-token 27",
+            "wait-running-output --pane 8 --start-token 27 --timeout 0 ready",
+            "wait-running-output --pane 8 --start-token 27 --timeout 3601 ready",
+            "wait-running-output --pane 8 --start-token 27 --timeout 1 --timeout 2 ready",
+            "get-running-output --pane 8 --start-token 27 --regex ready",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
         }

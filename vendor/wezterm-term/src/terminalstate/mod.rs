@@ -1221,12 +1221,13 @@ impl TerminalState {
     fn finish_command_output(&mut self, exit_code: Option<i32>) {
         if !self.is_alt_screen_active() {
             let finished = CommandClock::now();
-            let timing = finished.timing(self.command_started.take().map(|start| start.clock));
+            let timing = finished.timing(self.command_started.map(|start| start.clock));
             if self.capturing_shell_input {
                 self.screen.command_start = None;
                 self.capturing_shell_input = false;
             }
             self.notify_live_shell_output(true);
+            self.command_started = None;
             let col = self.shell_column();
             self.screen
                 .remember_command_output(self.next_command_id, (self.cursor.y, col));
@@ -1270,7 +1271,12 @@ impl TerminalState {
         ) else {
             return;
         };
-        handler.live_shell_output(self.next_command_id, self.command_label.as_deref(), output);
+        handler.live_shell_output(
+            self.next_command_id,
+            self.command_label.as_deref(),
+            self.command_started.map(|start| start.token),
+            output,
+        );
     }
 
     pub fn command_output_row(&self, id: u64) -> Option<StableRowIndex> {
