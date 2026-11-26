@@ -42,8 +42,7 @@ impl LiveTab {
     }
 
     pub(super) fn font_size_override(&self) -> Option<f32> {
-        self.surface
-            .font_size
+        self.pane_font_size
             .get()
             .or_else(|| self.profile_font_size())
     }
@@ -68,7 +67,7 @@ impl TerminalApp {
         let base = tab
             .profile_font_size()
             .unwrap_or_else(|| self.appearance.read().unwrap().font_size);
-        let current = tab.surface.font_size.get();
+        let current = tab.pane_font_size.get();
         MenuItem::submenu(
             "pane-text-size",
             "Pane text size",
@@ -88,7 +87,7 @@ impl TerminalApp {
             return;
         };
         let appearance = self.appearance.read().unwrap();
-        let current = tab.surface.font_size.get();
+        let current = tab.pane_font_size.get();
         let profile = tab.profile_font_size();
         let next = change.next(profile.unwrap_or(appearance.font_size), current);
         if next == current {
@@ -106,7 +105,7 @@ impl TerminalApp {
             }
         };
         drop(appearance);
-        tab.surface.font_size.set(next);
+        tab.pane_font_size.set(next);
         tab.remeasure_font(&mut renderer);
         self.keyboard.set_selection(false);
         self.publish_panes();

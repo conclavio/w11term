@@ -129,6 +129,7 @@ struct LiveTab {
     color_scheme: ColorScheme,
     source: Source,
     profile_name: Option<String>,
+    pane_font_size: Cell<Option<f32>>,
     surface: PaneSurface,
     device_busy: bool,
     device_message: Option<String>,
@@ -1373,6 +1374,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             confirm_end: false,
             durable_phase: None,
             profile_name: None,
+            pane_font_size: Cell::new(None),
             surface: PaneSurface::default(),
             device_busy: false,
             read_only: Rc::default(),
@@ -3070,7 +3072,7 @@ impl TerminalApp {
             }
             if windows.restore(name).is_ok()
                 && matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(tab))
-                    if tab.surface.font_size.get().is_none())
+                    if tab.pane_font_size.get().is_none())
                 && let Some(placement) = windows.profiles.get(name)
                 && let Some((cols, rows)) = placement.cols.zip(placement.rows)
                 && (1..=1000).contains(&cols)

@@ -26,6 +26,16 @@ try {
     $sourcePid = $original[1].Value
     Send-Remote $sourceSsh.id 'source-before/'
     Wait-Focus $sourceShell.id
+    $baselineHeight = Wait-Until 'measured original PowerShell cells' { Get-PaneCellHeight $sourceShell.id }
+    Run-Palette 'Increase pane text size'
+    $zoomedHeight = Wait-Until 'larger original PowerShell cells' {
+        $height = Get-PaneCellHeight $sourceShell.id
+        if ($height -gt $baselineHeight) { $height }
+    }
+    $sourceShell = Wait-Until 'the adjusted PowerShell split grid to be published' {
+        $current = (Sessions) | Where-Object id -eq $sourceShell.id
+        if ($current.cols -lt $sourceShell.cols -or $current.rows -lt $sourceShell.rows) { $current }
+    }
     Press-Key 0x75 # F6 zooms the right pane before cloning the group
     Wait-Zoom $sourceShell.id $sourceSsh.id
 
@@ -47,6 +57,9 @@ try {
     Wait-Zoom $copyShell.id $copySsh.id
     Wait-Text $copySsh.id 'ready'
     Wait-Text $copyShell.id 'PS '
+    $null = Wait-Until 'PowerShell text size copied into the duplicated layout' {
+        (Get-PaneCellHeight $copyShell.id) -eq $zoomedHeight
+    }
     $fresh = Identity $copyShell.id 'Fresh' 'if ($null -eq $global:DupValue) { $global:DupValue="copy" }; '
     if ($fresh[1].Value -eq $sourcePid -or $fresh[2].Value -cne 'copy') { throw 'Duplicate reused PowerShell runtime state' }
     $foreground = [FixtureMessages]::GetForegroundWindow()

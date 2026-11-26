@@ -144,6 +144,12 @@ function Control([string[]]$Command) {
     if ($LASTEXITCODE -ne 0 -or -not $reply.ok) { throw "Control request failed: $Command $($reply.error)" }
     return $reply.result
 }
+function Get-PaneCellHeight([int]$Pane) {
+    $geometry = Control @('inspect','--pane',"$Pane")
+    if ($geometry.dpi -gt 0 -and $geometry.rows -gt 0 -and $geometry.pixel_height -gt 0) {
+        $geometry.pixel_height / $geometry.rows
+    }
+}
 function Copy-ModeOpen {
     $dot = ' ' + [char]0xb7 + ' '
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)

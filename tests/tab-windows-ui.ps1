@@ -77,7 +77,7 @@ function Use-Window([IntPtr]$Hwnd) {
     }
 }
 
-function Move-Tab([IntPtr]$Hwnd, [string]$Action = 'Move tab to new window') {
+function Run-WindowCommand([IntPtr]$Hwnd, [string]$Action) {
     Use-Window $Hwnd
     $window = $Hwnd
     Press-Key 0x76 # F7, fixture command palette
@@ -149,9 +149,13 @@ function Expect-Group([int]$Count, [long]$OldWindow) {
             $remote.tab_id -eq $ssh.tab_id -and $local.tab_id -eq $ssh.tab_id -and
             $remote.visible -and $local.visible -and $remote.connection_generation -eq $ssh.connection_generation -and
             $remote.tab_title -eq 'Cockpit tools' -and $local.tab_title -eq $remote.tab_title -and
-            $remote.cols -gt 4 -and $local.cols -gt 4 -and
-            [Math]::Abs($remote.cols - 0.375 * ($remote.cols + $local.cols)) -le 2) {
-            return $remote.window_id
+            $remote.cols -gt 4 -and $local.cols -gt 4) {
+            # Cell counts no longer reflect divider proportions when the fonts differ.
+            $left = (Control @('inspect','--pane',"$($remote.id)")).pixel_width
+            $right = (Control @('inspect','--pane',"$($local.id)")).pixel_width
+            if ($left -gt 0 -and $right -gt 0 -and [Math]::Abs($left / ($left + $right) - 0.375) -le 0.04) {
+                return $remote.window_id
+            }
         }
     }
 }
@@ -187,7 +191,7 @@ try {
     $anchorIdentity = Shell-State $anchor.id 'anchorBefore' -Init
     if ($localIdentity -eq $anchorIdentity) { throw 'Expected independent PowerShell children' }
     Write-Output "Moving split from source $origin"
-    Move-Tab $origin
+    Run-WindowCommand $origin 'Move tab to new window'
     $destination = Wait-Until 'two distinct native HWNDs owned by the same process' {
         $handles = [TabFixtureWindows]::OwnedBy($app.Id)
         if ($handles.Count -eq 2 -and $handles -contains $origin) {
@@ -220,8 +224,14 @@ try {
     if ($FirstClose -eq 'Existing') {
         # The two-pane tab is the detached window's only tab. Move it into
         # the original window, which still has its own PowerShell tab.
+        $baselineHeight = Wait-Until 'SSH cells before pane zoom' { Get-PaneCellHeight $ssh.id }
+        Run-WindowCommand $destination 'Increase pane text size'
+        $zoomedHeight = Wait-Until 'SSH cells enlarged before moving to the existing window' {
+            $height = Get-PaneCellHeight $ssh.id
+            if ($height -gt $baselineHeight) { $height }
+        }
         Write-Output "Moving the live split back into existing window $origin"
-        Move-Tab $destination "Move tab to existing window $($anchor.window_id) $([char]0x00b7) Source PowerShell"
+        Run-WindowCommand $destination "Move tab to existing window $($anchor.window_id) $([char]0x00b7) Source PowerShell"
         $returned = Expect-Group 3 $newOwner
         if ($returned -ne $anchor.window_id) { throw 'Split moved to a different window ID' }
         $last = $origin
@@ -230,6 +240,13 @@ try {
             $handles.Count -eq 1 -and $handles[0] -eq $origin
         }
         Expect-Focus $origin $ssh.id 'Existing destination receives the moved tab and keyboard focus'
+        $null = Wait-Until 'the moved pane still renders at its enlarged text size' {
+            $grid = Control @('inspect','--pane',"$($ssh.id)")
+            if ($grid.rows -gt 0 -and $grid.pixel_height / $grid.rows -eq $zoomedHeight) {
+                $png = Control @('screenshot','--pane',"$($ssh.id)",(Join-Path $State 'moved-zoom.png'))
+                $png.height -eq $grid.pixel_height
+            }
+        }
         Expect-Text $ssh.id 'ssh-probe/'
         Type-In $origin 'existing-window/'
         Expect-Text $ssh.id 'existing-window/'
@@ -254,7 +271,7 @@ try {
         Type-In $destination 'origin-survived/'
         Expect-Text $ssh.id 'origin-survived/'
         # Move the only remaining tab too. The empty source HWND must close only after handoff.
-        Move-Tab $destination
+        Run-WindowCommand $destination 'Move tab to new window'
         $last = Wait-Until 'only the replacement HWND to remain' {
             $handles = [TabFixtureWindows]::OwnedBy($app.Id)
             if ($handles.Count -eq 1 -and $handles[0] -ne $destination) { $handles[0] }
