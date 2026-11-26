@@ -6,9 +6,11 @@ use std::cmp::Reverse;
 use w11term::{
     control::SftpTransferStatus,
     events::{
-        RECENT_SFTP_TRANSFER_LIMIT, RecentSftpTransfer, SftpTransferDetails, SftpTransferItem,
+        RECENT_SFTP_TRANSFER_LIMIT, RecentSftpTransfer, SavedDownload, SftpTransferDetails,
+        SftpTransferItem,
     },
     options::SshOptions,
+    profiles::bookmark_directory,
     sftp::{TransferOperation, TransferOutcome, TransferPhase},
 };
 
@@ -19,6 +21,8 @@ pub enum Action {
     Visit(TransferId),
     Cancel(TransferId),
     ShowDownload(TransferId),
+    ShowDownloadedItem(TransferId, usize),
+    ShowRemoteItem(TransferId, usize),
     ExpandDetails(TransferId, bool),
 }
 
@@ -79,17 +83,44 @@ impl TerminalApp {
                 }
             }
             Action::ShowDownload(id) => {
-                if let Some(tab) = self.tab_for_pane(id.pane)
-                    && let Some(Page::Terminal(tab)) = self.tabs.get(tab).map(|tab| &tab.page)
-                    && let Some(saved) = tab
-                        .session
-                        .events
-                        .recent_sftp_transfers()
-                        .into_iter()
-                        .find(|result| result.id == id)
-                        .and_then(|result| result.saved_download)
+                if let Some((_, _, result)) = self.retained_sftp_transfer(id)
+                    && let Some(saved) = result.saved_download
                 {
                     explorer::show_download(saved, ctx);
+                }
+            }
+            Action::ShowDownloadedItem(id, index) => {
+                if let Some((_, _, result)) = self.retained_sftp_transfer(id)
+                    && matches!(result.saved_download, Some(SavedDownload::BatchFolder(_)))
+                    && let Some(item) = completed_item(&result, index)
+                    && let Some(saved) = save_location(item)
+                {
+                    explorer::show_download(saved, ctx);
+                }
+            }
+            Action::ShowRemoteItem(id, index) => {
+                let Some((tab_id, tab, result)) = self.retained_sftp_transfer(id) else {
+                    return;
+                };
+                let Some((directory, name)) =
+                    completed_item(&result, index).and_then(|item| remote_location(&item.remote))
+                else {
+                    return;
+                };
+                if let Some(reason) = remote_reveal_blocker(tab, id) {
+                    self.window_error = Some(reason.into());
+                } else if self.tabs.select(tab_id) {
+                    self.file_action(
+                        FileAction::Reveal(
+                            id.pane,
+                            id.generation,
+                            directory.into(),
+                            name.map(str::to_owned),
+                        ),
+                        ctx,
+                    );
+                    self.sync_selection(ctx);
+                    self.activate(ctx);
                 }
             }
             Action::ExpandDetails(transfer, expanded) => {
@@ -131,22 +162,28 @@ impl TerminalApp {
                     .events
                     .recent_sftp_transfers()
                     .into_iter()
-                    .map(move |result| (label, ssh, result))
+                    .map(move |result| (label, ssh, tab, result))
             })
             .collect();
-        recent.sort_unstable_by_key(|(_, _, result)| Reverse((result.finished_at, result.id)));
+        recent.sort_unstable_by_key(|(_, _, _, result)| Reverse((result.finished_at, result.id)));
         if !recent.is_empty() {
             rows.push(KeyedView::new(
                 "recent-heading",
                 TextBlock::new().text("Recent transfers").font_size(18.0),
             ));
             rows.extend(recent.into_iter().take(RECENT_SFTP_TRANSFER_LIMIT).map(
-                |(label, ssh, result)| {
+                |(label, ssh, tab, result)| {
                     let show_details = expanded == Some(result.id);
+                    let remote_blocker = if show_details {
+                        remote_reveal_blocker(tab, result.id)
+                    } else {
+                        None
+                    };
                     result_row(
                         transfer_source(label, ssh, result.id.pane),
                         result,
                         show_details,
+                        remote_blocker,
                         ctx,
                     )
                 },
@@ -164,6 +201,23 @@ impl TerminalApp {
                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                     .content(StackPanel::new().spacing(12.0).keyed_children(rows)),
             ))
+    }
+
+    fn retained_sftp_transfer(
+        &self,
+        id: TransferId,
+    ) -> Option<(TabId, &LiveTab, RecentSftpTransfer)> {
+        let tab_id = self.tab_for_pane(id.pane)?;
+        let Page::Terminal(tab) = &self.tabs.get(tab_id)?.page else {
+            return None;
+        };
+        let result = tab
+            .session
+            .events
+            .recent_sftp_transfers()
+            .into_iter()
+            .find(|result| result.id == id)?;
+        Some((tab_id, tab, result))
     }
 
     fn window_sftp_panes(&self) -> impl Iterator<Item = (TabId, &str, &LiveTab, &SshOptions)> {
@@ -291,9 +345,11 @@ fn result_row(
     source: String,
     result: RecentSftpTransfer,
     expanded: bool,
+    remote_blocker: Option<&str>,
     ctx: &ViewContext<TerminalApp>,
 ) -> KeyedView {
     let id = result.id;
+    let batch_download = matches!(result.saved_download, Some(SavedDownload::BatchFolder(_)));
     let outcome = outcome_label(result.outcome);
     let mut details = vec![
         KeyedView::new(
@@ -325,7 +381,10 @@ fn result_row(
             TextBlock::new().text("Transfer item details"),
         )];
         if expanded {
-            slots.push(SlotView::new(ExpanderSlot::Content, item_details(&items)));
+            slots.push(SlotView::new(
+                ExpanderSlot::Content,
+                item_details(&items, id, batch_download, remote_blocker, ctx),
+            ));
         }
         details.push(KeyedView::new(
             "item-details",
@@ -356,12 +415,46 @@ fn outcome_label(outcome: TransferOutcome) -> &'static str {
     }
 }
 
-fn item_details(details: &SftpTransferDetails) -> View {
+fn item_details(
+    details: &SftpTransferDetails,
+    transfer: TransferId,
+    batch_download: bool,
+    remote_blocker: Option<&str>,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
     let mut rows: Vec<_> = details
         .completed
         .iter()
         .enumerate()
-        .map(|(index, item)| KeyedView::new(index.to_string(), item_row(item)))
+        .map(|(index, item)| {
+            let suffix = format!("for item {} of transfer {transfer}", index + 1);
+            let mut actions = Vec::new();
+            if remote_location(&item.remote).is_some() {
+                let mut button = Button::new()
+                    .automation_name(format!("Show remote entry {suffix}"))
+                    .is_enabled(remote_blocker.is_none())
+                    .on_click(ctx.callback(move |_| {
+                        Message::SftpTransfers(Action::ShowRemoteItem(transfer, index))
+                    }))
+                    .content("Show remote entry");
+                if let Some(reason) = remote_blocker {
+                    button = button.tooltip_with(title_tools::below(reason));
+                }
+                actions.push(KeyedView::new("remote", button));
+            }
+            if batch_download && download_item(item) {
+                actions.push(KeyedView::new(
+                    "local",
+                    Button::new()
+                        .automation_name(format!("Show in File Explorer {suffix}"))
+                        .on_click(ctx.callback(move |_| {
+                            Message::SftpTransfers(Action::ShowDownloadedItem(transfer, index))
+                        }))
+                        .content("Show in File Explorer"),
+                ));
+            }
+            KeyedView::new(index.to_string(), item_row(item, actions))
+        })
         .collect();
     if details.omitted_completed != 0 {
         rows.push(KeyedView::new(
@@ -373,7 +466,7 @@ fn item_details(details: &SftpTransferDetails) -> View {
         ));
     }
     if let Some(item) = &details.stopped {
-        rows.push(KeyedView::new("stopped", item_row(item)));
+        rows.push(KeyedView::new("stopped", item_row(item, Vec::new())));
     }
     if details.not_started != 0 {
         let label = if details.not_started == 1 {
@@ -389,7 +482,7 @@ fn item_details(details: &SftpTransferDetails) -> View {
     StackPanel::new().spacing(10.0).keyed_children(rows)
 }
 
-fn item_row(item: &SftpTransferItem) -> View {
+fn item_row(item: &SftpTransferItem, actions: Vec<KeyedView>) -> View {
     let operation = match item.operation {
         TransferOperation::UploadFile => "File upload",
         TransferOperation::UploadFolder => "Folder upload",
@@ -402,13 +495,72 @@ fn item_row(item: &SftpTransferItem) -> View {
         use std::fmt::Write;
         let _ = write!(title, " · {bytes} bytes");
     }
-    StackPanel::new().spacing(2.0).children((
-        TextBlock::new()
-            .text(title)
-            .text_wrapping(TextWrapping::Wrap),
-        path_text("Remote", &item.remote),
-        path_text("Windows", &item.local.to_string_lossy()),
-    ))
+    let mut children = vec![
+        KeyedView::new(
+            "title",
+            TextBlock::new()
+                .text(title)
+                .text_wrapping(TextWrapping::Wrap),
+        ),
+        KeyedView::new("remote-path", path_text("Remote", &item.remote)),
+        KeyedView::new(
+            "windows-path",
+            path_text("Windows", &item.local.to_string_lossy()),
+        ),
+    ];
+    if !actions.is_empty() {
+        children.push(KeyedView::new(
+            "actions",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .keyed_children(actions),
+        ));
+    }
+    StackPanel::new().spacing(2.0).keyed_children(children)
+}
+
+fn completed_item(result: &RecentSftpTransfer, index: usize) -> Option<&SftpTransferItem> {
+    let item = result.details.as_ref()?.completed.get(index)?;
+    (item.outcome == TransferOutcome::Completed).then_some(item)
+}
+
+fn download_item(item: &SftpTransferItem) -> bool {
+    matches!(
+        item.operation,
+        TransferOperation::DownloadFile | TransferOperation::DownloadFolder
+    )
+}
+
+fn save_location(item: &SftpTransferItem) -> Option<SavedDownload> {
+    match item.operation {
+        TransferOperation::DownloadFile => {
+            Some(SavedDownload::File(Arc::from(item.local.as_path())))
+        }
+        TransferOperation::DownloadFolder => {
+            Some(SavedDownload::Folder(Arc::from(item.local.as_path())))
+        }
+        _ => None,
+    }
+}
+
+fn remote_location(path: &str) -> Option<(&str, Option<&str>)> {
+    let path = bookmark_directory(path)?;
+    if path == "/" {
+        return Some(("/", None));
+    }
+    let (parent, name) = path.rsplit_once('/')?;
+    Some((if parent.is_empty() { "/" } else { parent }, Some(name)))
+}
+
+fn remote_reveal_blocker(tab: &LiveTab, id: TransferId) -> Option<&'static str> {
+    if tab.session.ssh_connection_generation() != Some(id.generation) {
+        Some("The original SSH connection is unavailable.")
+    } else if !tab.files.ready_for_transfer_reveal() {
+        Some("Finish the active operation in the SFTP drawer first.")
+    } else {
+        None
+    }
 }
 
 fn path_text(label: &str, path: &str) -> TextBlock {
@@ -427,4 +579,29 @@ fn path_text(label: &str, path: &str) -> TextBlock {
         .text(line)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_location;
+
+    #[test]
+    fn transfer_reveal_keeps_literal_names_and_requires_an_absolute_path() {
+        assert_eq!(remote_location("/"), Some(("/", None)));
+        assert_eq!(remote_location("/report"), Some(("/", Some("report"))));
+        assert_eq!(
+            remote_location("/some  folder/Ångström $batch/"),
+            Some(("/some  folder", Some("Ångström $batch")))
+        );
+        for invalid in [
+            "",
+            "relative/file",
+            "/a/../b",
+            "/a//file",
+            "/a/./file",
+            "/a/line\nname",
+        ] {
+            assert_eq!(remote_location(invalid), None, "{invalid:?}");
+        }
+    }
 }

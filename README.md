@@ -425,6 +425,8 @@ Open **SFTP transfers** from the More menu or command palette to see active draw
 
 Expand **Transfer item details** to see what happened to each attempted upload or download at the top level. The details show selectable Windows and remote paths, the item outcome, and any byte count reported by the transfer. A folder is one item. Large batches show the first 64 completed items and always include the item that stopped the batch, if any. The report counts any remaining items that never started.
 
+For a completed item, **Show remote entry** returns to the originating pane and selects its current path in the SFTP drawer while the original SSH connection is available. **Show in File Explorer** beside a completed batch download selects that exact saved item. **Open download folder** still opens the batch’s destination folder.
+
 Scripts can list, cancel, and wait for drawer transfers with `w11term-cli sftp list-transfers`, `cancel-transfer`, and `wait-transfer`. [SFTP control commands](CONTROL.md#control-drawer-transfers)
 
 After a file or folder is saved, choose **Show download in File Explorer** in the drawer or beside its inbox result to select it. Use **Open download folder** for a batch that saved at least one item. Each inbox result keeps its own destination so you can find earlier downloads.

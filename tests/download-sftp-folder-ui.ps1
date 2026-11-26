@@ -265,6 +265,11 @@ try {
             (Find-Element "Remote${dot}/shell directory/verified.bin") -and
             (Find-Element "Windows${dot}$failedDestination")
     }
+    $batchId = $results[1].data.transfer_id
+    Assert-Explorer "Show in File Explorer for item 1 of transfer $batchId" 'select' $completed
+    if (Find-Element "Show in File Explorer for item 2 of transfer $batchId" $button) {
+        throw 'A failed download offered to reveal the existing file'
+    }
 } catch {
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
     throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"

@@ -2046,6 +2046,10 @@ impl FileDrawer {
         self.awaiting_native_result() || self.pending.is_some()
     }
 
+    pub(super) fn ready_for_transfer_reveal(&self) -> bool {
+        !self.busy() && !self.parsing && !self.entry_dialog_open()
+    }
+
     fn transfer_file(&self) -> Option<&TransferFile> {
         match &self.pending.as_ref()?.step {
             Step::Transfer(file) => Some(file),

@@ -166,6 +166,9 @@ try {
     if (Find-Element "Remote${dot}/shell directory/queued-alpha" $text) {
         throw 'A queued item was shown as attempted'
     }
+    if (Find-Element "Show remote entry for item 1 of transfer $firstId" $button) {
+        throw 'A cancelled transfer offered a completed-item shortcut'
+    }
     if (!$waiting.WaitForExit(15000)) { throw 'The named-pipe waiter did not return' }
     $waitReply = [IO.File]::ReadAllText($waitPath) | ConvertFrom-Json
     if ($waiting.ExitCode -ne 0 -or !$waitReply.ok -or
@@ -205,6 +208,25 @@ try {
         (Find-Element "Remote${dot}/shell directory/beta folder" $text) -and
             (Find-Element "Windows${dot}$betaLocal" $text) -and
             !(Find-Element '1 item did not start' $text)
+    }
+    $remoteAction = "Show remote entry for item 1 of transfer $secondId"
+    Click $remoteAction
+    Wait-Focus $beta
+    $null = Wait-Until 'transferred folder selected in its original SSH drawer' {
+        $open = Find-Element 'Open folder' $button
+        (Find-Element '/shell directory' $text) -and $open -and $open.Current.IsEnabled
+    }
+    Click 'Open folder'
+    $null = Wait-Until 'the selected entry was the transferred folder' {
+        (Find-Element '/shell directory/beta folder' $text) -and (Find-Element 'payload' $button)
+    }
+
+    $null = Control @('send-text','--pane',"$beta",'--no-paste','--base64','BA==')
+    Run-Palette 'SFTP transfers'
+    $null = Wait-Until 'completed history cannot browse a disconnected transport' {
+        $remote = Find-Element $remoteAction $button
+        $remote -and !$remote.Current.IsEnabled -and
+            (Find-Element "Show download in File Explorer for transfer $secondId" $button).Current.IsEnabled
     }
 } catch {
     $alphaWire = if ($alphaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $alphaTrace)) }

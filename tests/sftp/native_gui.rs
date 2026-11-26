@@ -3280,10 +3280,12 @@ async fn native_sftp_transfers_tab_routes_cancellation_and_drawer_focus() {
     else {
         unreachable!()
     };
-    let (Source::Ssh(beta_ssh), beta, beta_channels, beta_server) = fixture_server(false).await
+    let (Source::Ssh(mut beta_ssh), beta, beta_channels, beta_server) = fixture_server(false).await
     else {
         unreachable!()
     };
+    beta_ssh.player.reconnect = false;
+    fs::write(beta.path().join("disconnect-on-eot"), []).unwrap();
     let state = tempfile::tempdir().unwrap();
     let picker = state.path().join("picker");
     let alpha_target = picker.join("alpha");
