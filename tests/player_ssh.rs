@@ -1159,9 +1159,7 @@ async fn stock_openssh_host_certificate() -> Result<()> {
         let (mut client, prompts) = connect(
             host,
             alias,
-            Authentication::Identity {
-                identity: identity.clone().into(),
-            },
+            Authentication::identity(identity.clone(), None),
         );
         let mut transcript = Vec::new();
         tokio::time::timeout(Duration::from_secs(40), async {

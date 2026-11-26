@@ -269,9 +269,7 @@ async fn roundtrip(
                 authentication: if allow_none {
                     Authentication::None
                 } else {
-                    Authentication::Identity {
-                        identity: key_file.path().into(),
-                    }
+                    Authentication::identity(key_file.path(), None)
                 },
                 host_key: Some(pin),
                 host_key_alias: None,

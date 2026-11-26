@@ -191,11 +191,10 @@ fn options() -> Result<SshOptions> {
         host: "127.0.0.1".into(),
         port,
         user: "w11fixture".into(),
-        authentication: Authentication::Identity {
-            identity: env::var_os("W11TERM_MOUNT_TEST_IDENTITY")
-                .context("missing temporary client key")?
-                .into(),
-        },
+        authentication: Authentication::identity(
+            env::var_os("W11TERM_MOUNT_TEST_IDENTITY").context("missing temporary client key")?,
+            None,
+        ),
         host_key: Some(fingerprint),
         host_key_alias: None,
         proxy_jump: vec![],

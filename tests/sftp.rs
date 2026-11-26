@@ -49,7 +49,9 @@ impl server::Handler for Peer {
     type Error = anyhow::Error;
     async fn auth_none(&mut self, _user: &str) -> anyhow::Result<server::Auth> {
         #[cfg(feature = "ui-smoke")]
-        if self.root.join("authorized-key").is_file() {
+        if self.root.join("authorized-key").is_file()
+            || self.root.join("authorized-certificate").is_file()
+        {
             return Ok(server::Auth::reject());
         }
         #[cfg(feature = "ui-smoke")]
@@ -75,6 +77,23 @@ impl server::Handler for Peer {
         }
         let expected = russh::keys::PublicKey::from_openssh(&fs::read_to_string(allowed)?)?;
         Ok(if key.key_data() == expected.key_data() {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
+    }
+    #[cfg(feature = "ui-smoke")]
+    async fn auth_openssh_certificate(
+        &mut self,
+        _user: &str,
+        certificate: &russh::keys::Certificate,
+    ) -> anyhow::Result<server::Auth> {
+        let path = self.root.join("authorized-certificate");
+        if !path.is_file() {
+            return Ok(server::Auth::reject());
+        }
+        let expected = russh::keys::load_openssh_certificate(path)?;
+        Ok(if *certificate == expected {
             server::Auth::Accept
         } else {
             server::Auth::reject()

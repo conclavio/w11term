@@ -540,6 +540,7 @@ struct ProfileDraft {
     terminal_preset: usize,
     custom_terminal: String,
     identity: String,
+    certificate: String,
     fingerprint: String,
     host_key_alias: String,
     group_prompt: String,
@@ -579,6 +580,7 @@ impl Default for ProfileDraft {
             terminal_preset: 0,
             custom_terminal: String::new(),
             identity: String::new(),
+            certificate: String::new(),
             fingerprint: String::new(),
             host_key_alias: String::new(),
             group_prompt: String::new(),
@@ -598,7 +600,8 @@ impl ProfileDraft {
             "Apply or cancel the pending edit under SSH jump hosts"
         );
         let (host, user, port) = parse_ssh_address(&self.host, &self.user, &self.port)?;
-        let authentication = ssh_authentication(self.authentication, &self.identity)?;
+        let authentication =
+            ssh_authentication(self.authentication, &self.identity, &self.certificate)?;
         let mut player = self.player.clone();
         match self.reconnect_window.trim().parse() {
             Ok(seconds) => player.reconnect_window_seconds = seconds,
@@ -646,7 +649,7 @@ impl ProfileDraft {
     }
 
     fn from_options(name: String, options: &SshOptions) -> Self {
-        let (authentication, identity) = ssh_auth_fields(&options.authentication);
+        let (authentication, identity, certificate) = ssh_auth_fields(&options.authentication);
         Self {
             proxy_jump: options.proxy_jump.clone(),
             local_forwards: options.local_forwards.clone(),
@@ -676,6 +679,7 @@ impl ProfileDraft {
             },
             custom_terminal: options.terminal_type.as_str().into(),
             identity,
+            certificate,
             fingerprint: options.host_key.clone().unwrap_or_default(),
             host_key_alias: options.host_key_alias.clone().unwrap_or_default(),
             group_prompt: options
@@ -741,26 +745,41 @@ fn parse_ssh_keepalive(interval: &str, max: &str) -> anyhow::Result<SshKeepalive
     })
 }
 
-fn ssh_auth_fields(authentication: &Authentication) -> (usize, String) {
+fn ssh_auth_fields(authentication: &Authentication) -> (usize, String, String) {
+    let without_files = |index| (index, String::new(), String::new());
     match authentication {
-        Authentication::Agent => (0, String::new()),
-        Authentication::Identity { identity } => {
-            (PRIVATE_KEY_AUTH, identity.to_string_lossy().into_owned())
-        }
-        Authentication::None => (2, String::new()),
-        Authentication::Password => (3, String::new()),
-        Authentication::KeyboardInteractive => (4, String::new()),
+        Authentication::Agent => without_files(0),
+        Authentication::Identity {
+            identity,
+            certificate,
+        } => (
+            PRIVATE_KEY_AUTH,
+            identity.to_string_lossy().into_owned(),
+            certificate
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        Authentication::None => without_files(2),
+        Authentication::Password => without_files(3),
+        Authentication::KeyboardInteractive => without_files(4),
     }
 }
 
-fn ssh_authentication(index: usize, identity: &str) -> anyhow::Result<Authentication> {
+fn ssh_authentication(
+    index: usize,
+    identity: &str,
+    certificate: &str,
+) -> anyhow::Result<Authentication> {
     Ok(match index {
         PRIVATE_KEY_AUTH => {
             let identity = identity.trim();
+            let certificate = certificate.trim();
             anyhow::ensure!(!identity.is_empty(), "Enter the private key file path");
-            Authentication::Identity {
-                identity: identity.into(),
-            }
+            Authentication::identity(
+                identity,
+                (!certificate.is_empty()).then(|| certificate.into()),
+            )
         }
         2 => Authentication::None,
         3 => Authentication::Password,
@@ -1053,6 +1072,7 @@ pub enum Field {
     FontSize,
     CustomTerminal,
     Identity,
+    Certificate,
     Fingerprint,
     HostKeyAlias,
     GroupPrompt,
@@ -4890,13 +4910,24 @@ impl TerminalApp {
             )),
         );
         if draft.authentication == PRIVATE_KEY_AUTH {
-            fields.push(identity_picker::field(
-                identity_picker::Target::Endpoint(id),
-                &draft.identity,
-                self.identity_picker.is_none() && !draft.generating,
-                context.callback(move |value| Message::Edit(id, Field::Identity, value)),
-                context,
-            ));
+            use identity_picker::{Kind, Target};
+            let can_browse = self.identity_picker.is_none() && !draft.generating;
+            fields.extend([
+                identity_picker::field(
+                    Target::Endpoint(id, Kind::PrivateKey),
+                    &draft.identity,
+                    can_browse,
+                    context.callback(move |value| Message::Edit(id, Field::Identity, value)),
+                    context,
+                ),
+                identity_picker::field(
+                    Target::Endpoint(id, Kind::UserCertificate),
+                    &draft.certificate,
+                    can_browse,
+                    context.callback(move |value| Message::Edit(id, Field::Certificate, value)),
+                    context,
+                ),
+            ]);
         }
         fields.push(
             StackPanel::new().spacing(5.0).children((
@@ -5928,13 +5959,14 @@ impl Component for TerminalApp {
                                 let auth = if remove {
                                     Authentication::Password
                                 } else {
-                                    Authentication::Identity {
-                                        identity: cached
+                                    Authentication::identity(
+                                        cached
                                             .player
                                             .device_key
                                             .clone()
                                             .context("device key path missing")?,
-                                    }
+                                        None,
+                                    )
                                 };
                                 let mut updated = cached.clone();
                                 updated.authentication = auth.clone();
@@ -6351,6 +6383,7 @@ impl Component for TerminalApp {
                     match result {
                         Ok(key) => {
                             draft.identity = key.path.to_string_lossy().into_owned();
+                            draft.certificate.clear();
                             draft.player.device_key = Some(key.path.clone());
                             draft.saved = false;
                             draft.authentication = if draft.player.rustmush { 3 } else { 1 };
@@ -7393,6 +7426,7 @@ impl Component for TerminalApp {
                         Field::FontSize => &mut draft.font_size,
                         Field::CustomTerminal => &mut draft.custom_terminal,
                         Field::Identity => &mut draft.identity,
+                        Field::Certificate => &mut draft.certificate,
                         Field::Fingerprint => &mut draft.fingerprint,
                         Field::HostKeyAlias => &mut draft.host_key_alias,
                         Field::GroupPrompt => &mut draft.group_prompt,
@@ -8881,9 +8915,7 @@ mod profile_ui_tests {
             (0, Authentication::Agent),
             (
                 1,
-                Authentication::Identity {
-                    identity: "key".into(),
-                },
+                Authentication::identity("key", Some("key-cert.pub".into())),
             ),
             (2, Authentication::None),
             (3, Authentication::Password),

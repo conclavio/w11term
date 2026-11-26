@@ -136,11 +136,19 @@ impl SavedSource {
             (Source::Ssh(options), None) => {
                 let mut options = options.clone();
                 for auth in options.authentications_mut() {
-                    let Authentication::Identity { identity } = auth else {
+                    let Authentication::Identity {
+                        identity,
+                        certificate,
+                    } = auth
+                    else {
                         continue;
                     };
-                    ensure!(!identity.as_os_str().is_empty(), "Empty identity path");
-                    *identity = std::path::absolute(&*identity)?;
+                    for path in std::iter::once(identity.as_mut())
+                        .chain(certificate.iter_mut().map(Box::as_mut))
+                    {
+                        ensure!(!path.as_os_str().is_empty(), "Empty SSH credential path");
+                        *path = std::path::absolute(&*path)?;
+                    }
                 }
                 if let Some(path) = &mut options.player.device_key {
                     ensure!(!path.as_os_str().is_empty(), "Empty device key path");
@@ -213,10 +221,18 @@ impl SavedSource {
                 for auth in std::iter::once(&options.authentication)
                     .chain(options.proxy_jump.iter().map(|hop| &hop.authentication))
                 {
-                    let Authentication::Identity { identity } = auth else {
+                    let Authentication::Identity {
+                        identity,
+                        certificate,
+                    } = auth
+                    else {
                         continue;
                     };
                     ensure!(identity.is_absolute(), "Expected an absolute identity path");
+                    ensure!(
+                        certificate.as_ref().is_none_or(|path| path.is_absolute()),
+                        "Expected an absolute SSH user certificate path"
+                    );
                 }
                 if let Some(path) = &options.player.device_key {
                     ensure!(path.is_absolute(), "Expected an absolute device key path");
@@ -1146,17 +1162,15 @@ mod tests {
     #[test]
     fn ad_hoc_sources_keep_only_options_with_absolute_paths() {
         let mut options = ssh("dev.example");
-        options.authentication = Authentication::Identity {
-            identity: "keys/dev".into(),
-        };
+        options.authentication = Authentication::identity("keys/dev", None);
         let saved = SavedSource::capture(&Source::Ssh(options), None).unwrap();
         let Source::Ssh(options) = saved.resolve(&BTreeMap::new()).unwrap() else {
             panic!()
         };
-        let Authentication::Identity { identity } = options.authentication else {
+        let Authentication::Identity { identity, .. } = options.authentication else {
             panic!()
         };
-        assert_eq!(identity, std::path::absolute("keys/dev").unwrap());
+        assert_eq!(*identity, std::path::absolute("keys/dev").unwrap());
         assert!(SavedSource::capture(&Source::Replay("some-capture.vt".into()), None).is_ok());
     }
 }

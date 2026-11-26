@@ -24,7 +24,10 @@ pub(super) enum Purpose {
     SshConfig(PathBuf),
     OpenSshHostList,
     OpenSshGroupDefinition,
-    SshIdentity(Option<PathBuf>),
+    SshIdentity {
+        current: Option<PathBuf>,
+        certificate: bool,
+    },
     Folder,
     DownloadFolder,
     Save(String),
@@ -183,7 +186,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 | Purpose::SshConfig(_)
                 | Purpose::OpenSshHostList
                 | Purpose::OpenSshGroupDefinition
-                | Purpose::SshIdentity(_)
+                | Purpose::SshIdentity { .. }
                 | Purpose::Folder
                 | Purpose::DownloadFolder
         ) {
@@ -265,8 +268,15 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")?;
                 None
             }
-            Purpose::SshIdentity(current) => {
-                dialog.SetTitle(w!("Choose SSH private key"))?;
+            Purpose::SshIdentity {
+                current,
+                certificate,
+            } => {
+                dialog.SetTitle(if certificate {
+                    w!("Choose SSH user certificate")
+                } else {
+                    w!("Choose SSH private key")
+                })?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 // OpenSSH private keys often have no extension.
                 let seeded = current

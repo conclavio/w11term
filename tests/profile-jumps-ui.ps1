@@ -19,6 +19,8 @@ $browseLabel = 'Browse for jump host private key'
 $pickerTitle = 'Choose SSH private key'
 $typedKey = 'jump keys\typed key'
 $selectedKey = Join-Path $State 'jump keys\selected key'
+$certField = 'Jump host user certificate file (optional)'
+$selectedCert = Join-Path $State 'jump keys\selected key-cert.pub'
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -58,17 +60,17 @@ function Select-JumpAuth([string]$Name) {
     }
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
-function Key-Value {
-    $field = Wait-Until 'jump host key field' { Find-Element $keyField $edit }
+function Key-Value([string]$Label = $keyField) {
+    $field = Wait-Until "jump credential field '$Label'" { Find-Element $Label $edit }
     return $field.GetCurrentPattern($value).Current.Value
 }
-function Pick-JumpKey([string]$Name) {
-    Click $browseLabel
-    $dialog = Wait-Until 'owned jump host key picker' { Find-OwnedDialog $pickerTitle }
+function Pick-JumpKey([string]$Name, [string]$Browse = $browseLabel, [string]$Title = $pickerTitle) {
+    Click $Browse
+    $dialog = Wait-Until 'owned jump host credential picker' { Find-OwnedDialog $Title }
     $action = if ($Name) { Select-DialogItem $dialog $Name; 1 } else { 2 }
     $null = Wait-Until 'activate jump host key picker button' { [FixtureDialog]::ClickButton($dialog, $action) }
     $null = Wait-Until 'jump host key picker closed' {
-        !(Find-OwnedDialog $pickerTitle) -and (Find-Element $browseLabel $button).Current.IsEnabled
+        !(Find-OwnedDialog $Title) -and (Find-Element $Browse $button).Current.IsEnabled
     }
 }
 function Wait-EditorClosed {
@@ -141,20 +143,28 @@ try {
         $path = Key-Value
         if ([FixtureDialog]::SameFile($selectedKey, $path)) { $path }
     }
+    Set-Field $certField 'jump keys\typed-cert.pub'
+    Pick-JumpKey 'selected key-cert.pub' 'Browse for jump host user certificate' 'Choose SSH user certificate'
+    $chosenCert = Wait-Until 'the jump draft holds the chosen certificate path' {
+        $path = Key-Value $certField
+        if ([FixtureDialog]::SameFile($selectedCert, $path)) { $path }
+    }
+    if ((Key-Value) -cne $chosenKey) { throw 'Browsing for a certificate changed the private key path' }
     if (Find-Element 'Private key file' $edit) {
         throw 'Browsing for a jump key changed the destination authentication editor'
     }
     Click 'Apply jump host'
     Wait-EditorClosed
-    Wait-Jump 1 $outer 'outer.bastion.test' "key file $chosenKey"
+    Wait-Jump 1 $outer 'outer.bastion.test' "key file $chosenKey with user certificate $chosenCert"
     Jump-Action 1 'Edit jump host'
-    if (![FixtureDialog]::SameFile($selectedKey, (Key-Value))) {
-        throw 'Reopening the jump draft lost the selected identity'
+    if (![FixtureDialog]::SameFile($selectedKey, (Key-Value)) -or
+        ![FixtureDialog]::SameFile($selectedCert, (Key-Value $certField))) {
+        throw 'Reopening the jump draft lost the selected identity or certificate'
     }
     Set-Field 'Jump host user' 'discarded'
     Click 'Cancel jump host edit'
     Wait-EditorClosed
-    Wait-Jump 1 $outer 'outer.bastion.test' "key file $chosenKey"
+    Wait-Jump 1 $outer 'outer.bastion.test' "key file $chosenKey with user certificate $chosenCert"
 
     Add-Jump $inner
     Wait-Jump 3 $inner
@@ -184,6 +194,7 @@ try {
         $saved[0].connect_timeout_seconds -ne 9 -or $saved[0].keepalive.interval_seconds -ne 11 -or
         $saved[0].keepalive.max_unanswered -ne 4 -or $saved[0].auth -cne 'identity' -or
         ![FixtureDialog]::SameFile($selectedKey, $saved[0].identity) -or
+        ![FixtureDialog]::SameFile($selectedCert, $saved[0].certificate) -or
         $saved[1].auth -cne 'none') {
         throw "Wrong saved route: $($saved | ConvertTo-Json -Compress)"
     }

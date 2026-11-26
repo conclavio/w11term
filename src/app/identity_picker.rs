@@ -2,15 +2,40 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    PrivateKey,
+    UserCertificate,
+}
+
+impl Kind {
+    pub(super) fn field<'a>(
+        self,
+        identity: &'a mut String,
+        certificate: &'a mut String,
+    ) -> &'a mut String {
+        match self {
+            Self::PrivateKey => identity,
+            Self::UserCertificate => certificate,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Target {
-    Endpoint(TabId),
-    Jump { tab: TabId, edit: u64 },
+    Endpoint(TabId, Kind),
+    Jump { tab: TabId, edit: u64, kind: Kind },
 }
 
 impl Target {
     fn tab(self) -> TabId {
         match self {
-            Self::Endpoint(tab) | Self::Jump { tab, .. } => tab,
+            Self::Endpoint(tab, _) | Self::Jump { tab, .. } => tab,
+        }
+    }
+
+    fn kind(self) -> Kind {
+        match self {
+            Self::Endpoint(_, kind) | Self::Jump { kind, .. } => kind,
         }
     }
 }
@@ -39,10 +64,24 @@ pub(super) fn field(
     context: &ViewContext<TerminalApp>,
 ) -> View {
     let (label, browse) = match target {
-        Target::Endpoint(_) => ("Private key file", "Browse for private key"),
-        Target::Jump { .. } => (
+        Target::Endpoint(_, Kind::PrivateKey) => ("Private key file", "Browse for private key"),
+        Target::Endpoint(_, Kind::UserCertificate) => (
+            "User certificate file (optional)",
+            "Browse for user certificate",
+        ),
+        Target::Jump {
+            kind: Kind::PrivateKey,
+            ..
+        } => (
             "Jump host private key file",
             "Browse for jump host private key",
+        ),
+        Target::Jump {
+            kind: Kind::UserCertificate,
+            ..
+        } => (
+            "Jump host user certificate file (optional)",
+            "Browse for jump host user certificate",
         ),
     };
     StackPanel::new().spacing(5.0).children((
@@ -53,7 +92,10 @@ pub(super) fn field(
             .children((
                 TextBox::new()
                     .text(value)
-                    .placeholder_text("C:\\path\\to\\key or a path beside profiles.json")
+                    .placeholder_text(match target.kind() {
+                        Kind::PrivateKey => "C:\\path\\to\\key or a path beside profiles.json",
+                        Kind::UserCertificate => "C:\\path\\to\\id-cert.pub",
+                    })
                     .automation_name(label)
                     .on_text_changed(on_changed),
                 Button::new()
@@ -74,17 +116,17 @@ impl TerminalApp {
         }
         match &mut self.tabs.get_mut(id)?.page {
             Page::NewProfile(draft) => match target {
-                Target::Endpoint(_)
+                Target::Endpoint(_, kind)
                     if draft.authentication == PRIVATE_KEY_AUTH && !draft.generating =>
                 {
                     Some(Field {
-                        value: &mut draft.identity,
+                        value: kind.field(&mut draft.identity, &mut draft.certificate),
                         error: &mut draft.error,
                         saved: Some(&mut draft.saved),
                     })
                 }
-                Target::Jump { edit, .. } => {
-                    let (value, error) = draft.jump_editor.identity_fields(edit)?;
+                Target::Jump { edit, kind, .. } => {
+                    let (value, error) = draft.jump_editor.identity_fields(edit, kind)?;
                     Some(Field {
                         value,
                         error,
@@ -94,11 +136,13 @@ impl TerminalApp {
                 _ => None,
             },
             Page::QuickConnect(draft)
-                if matches!(target, Target::Endpoint(_))
+                if matches!(target, Target::Endpoint(..))
                     && draft.authentication == PRIVATE_KEY_AUTH =>
             {
                 Some(Field {
-                    value: &mut draft.identity,
+                    value: target
+                        .kind()
+                        .field(&mut draft.identity, &mut draft.certificate),
                     error: &mut draft.error,
                     saved: None,
                 })
@@ -136,9 +180,15 @@ impl TerminalApp {
                         let result = if cancel.is_cancelled() {
                             Ok(None)
                         } else {
-                            file_picker::pick(owner, file_picker::Purpose::SshIdentity(current))
-                                .map(|chosen| chosen.map(|file| file.path))
-                                .map_err(|error| format!("{error:#}"))
+                            file_picker::pick(
+                                owner,
+                                file_picker::Purpose::SshIdentity {
+                                    current,
+                                    certificate: target.kind() == Kind::UserCertificate,
+                                },
+                            )
+                            .map(|chosen| chosen.map(|file| file.path))
+                            .map_err(|error| format!("{error:#}"))
                         };
                         Message::SshIdentity(Action::Reply(target, result))
                     },
@@ -164,8 +214,9 @@ impl TerminalApp {
                 match result {
                     Ok(Some(path)) => {
                         let Some(path) = path.to_str() else {
-                            *field.error =
-                                Some("The selected key path cannot be represented as text.".into());
+                            *field.error = Some(
+                                "The selected file path cannot be represented as text.".into(),
+                            );
                             return;
                         };
                         if *field.value != path {

@@ -12,7 +12,10 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use russh::{
     client,
-    keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate, ssh_key::Kdf},
+    keys::{
+        HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
+        ssh_key::{Kdf, certificate::CertType},
+    },
 };
 use std::{
     path::Path,
@@ -379,19 +382,47 @@ pub(super) async fn authenticate(
             session.authenticate_none(&options.user).await?.success(),
             Permanent("server rejected SSH none authentication".into())
         ),
-        Authentication::Identity { identity } => {
-            let hash = session.best_supported_rsa_hash().await?.flatten();
-            let key = identity_key(identity, prompts).await?;
-            ensure!(
-                session
-                    .authenticate_publickey(
-                        &options.user,
-                        PrivateKeyWithHashAlg::new(Arc::new(key), hash)
-                    )
-                    .await?
-                    .success(),
-                Permanent("public-key authentication rejected".into())
-            );
+        Authentication::Identity {
+            identity,
+            certificate,
+        } => {
+            let key = Arc::new(identity_key(identity, prompts).await?);
+            if let Some(path) = certificate {
+                let cert =
+                    russh::keys::load_openssh_certificate(path.as_path()).map_err(|error| {
+                        stop(format!(
+                            "reading SSH user certificate {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                ensure!(
+                    cert.cert_type() == CertType::User,
+                    Permanent("the SSH certificate must be a user certificate".into())
+                );
+                ensure!(
+                    cert.public_key() == key.public_key().key_data(),
+                    Permanent("the SSH user certificate does not match the private key".into())
+                );
+                ensure!(
+                    session
+                        .authenticate_openssh_cert(&options.user, key, cert)
+                        .await?
+                        .success(),
+                    Permanent("SSH user certificate authentication rejected".into())
+                );
+            } else {
+                let hash = session.best_supported_rsa_hash().await?.flatten();
+                ensure!(
+                    session
+                        .authenticate_publickey(
+                            &options.user,
+                            PrivateKeyWithHashAlg::new(key, hash)
+                        )
+                        .await?
+                        .success(),
+                    Permanent("public-key authentication rejected".into())
+                );
+            }
         }
         Authentication::Agent => {
             let hash = session.best_supported_rsa_hash().await?.flatten();

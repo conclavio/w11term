@@ -21,7 +21,7 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "edits a profile's jump route and authenticates with a browsed key through two loopback peers"]
+#[ignore = "edits a profile's jump route and authenticates with a browsed key and certificate"]
 async fn native_profile_jump_editor_saves_and_connects_the_ordered_route() {
     use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 
@@ -56,9 +56,23 @@ async fn native_profile_jump_editor_saves_and_connects_the_ordered_route() {
     let pem = key.to_openssh(LineEnding::LF).unwrap();
     let key_path = key_directory.join("selected key");
     fs::write(&key_path, pem.as_bytes()).unwrap();
+    let ca = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let mut certificate = russh::keys::ssh_key::certificate::Builder::new_with_random_nonce(
+        &mut rand::rng(),
+        key.public_key().key_data().clone(),
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    certificate
+        .cert_type(russh::keys::ssh_key::certificate::CertType::User)
+        .unwrap();
+    certificate.valid_principal(outer.user.as_str()).unwrap();
+    let certificate = certificate.sign(&ca).unwrap().to_openssh().unwrap();
+    fs::write(key_directory.join("selected key-cert.pub"), &certificate).unwrap();
     fs::write(
-        outer_root.path().join("authorized-key"),
-        key.public_key().to_openssh().unwrap(),
+        outer_root.path().join("authorized-certificate"),
+        &certificate,
     )
     .unwrap();
     fs::write(
@@ -1304,7 +1318,7 @@ async fn native_encrypted_ssh_identity_can_retry_cancel_and_unlock() {
         encrypted.to_openssh(LineEnding::LF).unwrap().as_bytes(),
     )
     .unwrap();
-    ssh.authentication = Authentication::Identity { identity };
+    ssh.authentication = Authentication::identity(identity, None);
     ssh.player.reconnect = false;
 
     drive_mixed_gui("ssh-identity-passphrase-ui.ps1", &ssh, state.path());

@@ -137,9 +137,22 @@ impl std::str::FromStr for ScrollbackLines {
 pub enum Authentication {
     Agent,
     None,
-    Identity { identity: PathBuf },
+    Identity {
+        identity: Box<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        certificate: Option<Box<PathBuf>>,
+    },
     Password,
     KeyboardInteractive,
+}
+
+impl Authentication {
+    pub fn identity(identity: impl Into<PathBuf>, certificate: Option<PathBuf>) -> Self {
+        Self::Identity {
+            identity: Box::new(identity.into()),
+            certificate: certificate.map(Box::new),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -420,10 +433,17 @@ impl SshOptions {
             *key = base.join(&*key);
         }
         for auth in self.authentications_mut() {
-            if let Authentication::Identity { identity } = auth {
-                ensure!(!identity.as_os_str().is_empty(), "identity path is empty");
-                if identity.is_relative() {
-                    *identity = base.join(&*identity);
+            if let Authentication::Identity {
+                identity,
+                certificate,
+            } = auth
+            {
+                for path in std::iter::once(identity.as_mut())
+                    .chain(certificate.iter_mut().map(Box::as_mut))
+                {
+                    if path.is_relative() {
+                        *path = base.join(&*path);
+                    }
                 }
             }
         }
@@ -432,6 +452,23 @@ impl SshOptions {
 
     pub(crate) fn validate_route(&self) -> Result<()> {
         validate_ssh_host(&self.host)?;
+        for auth in std::iter::once(&self.authentication)
+            .chain(self.proxy_jump.iter().map(|hop| &hop.authentication))
+        {
+            if let Authentication::Identity {
+                identity,
+                certificate,
+            } = auth
+            {
+                ensure!(!identity.as_os_str().is_empty(), "identity path is empty");
+                ensure!(
+                    certificate
+                        .as_ref()
+                        .is_none_or(|path| !path.as_os_str().is_empty()),
+                    "SSH user certificate path is empty"
+                );
+            }
+        }
         ensure!(
             self.proxy_jump.len() <= MAX_JUMPS,
             "at most {MAX_JUMPS} SSH jump hosts are supported"
@@ -864,6 +901,7 @@ impl Options {
         let mut paused = false;
         let mut port = None;
         let mut authentication = None;
+        let mut certificate = None;
         let mut host_key = None;
         let mut host_key_alias = None;
         let mut benchmark = false;
@@ -879,7 +917,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY [--certificate FILE] | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -920,9 +958,11 @@ impl Options {
                         authentication.is_none(),
                         "choose only one of --identity and --auth"
                     );
-                    authentication = Some(Authentication::Identity {
-                        identity: value(&mut args, &arg)?.into(),
-                    });
+                    authentication = Some(Authentication::identity(value(&mut args, &arg)?, None));
+                }
+                "--certificate" => {
+                    ensure!(certificate.is_none(), "specify --certificate only once");
+                    certificate = Some(PathBuf::from(value(&mut args, &arg)?));
                 }
                 "--auth" => {
                     ensure!(
@@ -992,6 +1032,7 @@ impl Options {
         }
         let ssh_override = port.is_some()
             || authentication.is_some()
+            || certificate.is_some()
             || host_key.is_some()
             || host_key_alias.is_some();
         let mut initial_profile = profile.clone().filter(|_| !ssh_override);
@@ -1023,6 +1064,12 @@ impl Options {
             }
             if let Some(authentication) = authentication {
                 ssh.authentication = authentication;
+            }
+            if let Some(path) = certificate {
+                let Authentication::Identity { certificate, .. } = &mut ssh.authentication else {
+                    bail!("--certificate requires private-key file authentication");
+                };
+                *certificate = Some(Box::new(path));
             }
             if let Some(host_key) = host_key {
                 ssh.host_key = Some(host_key);
@@ -1168,6 +1215,69 @@ mod tests {
         dest["proxy_jump"] = serde_json::json!([]);
         dest["host_key_alias"] = "!host".into();
         assert!(parse(dest).is_err());
+    }
+
+    #[test]
+    fn explicitly_configured_user_certificates_follow_identity_path_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(&path, br#"{"profiles":{"pilot":{"host":"localhost","user":"pilot",
+            "auth":"identity","identity":"id","certificate":"id-cert.pub",
+            "proxy_jump":[{"host":"gate","user":"pilot","auth":"identity","identity":"hop","certificate":"hop-cert.pub"}]}}}"#).unwrap();
+        let profile = load_profiles(&path)
+            .unwrap()
+            .profiles
+            .remove("pilot")
+            .unwrap();
+        assert_eq!(
+            profile.authentication,
+            Authentication::identity(
+                directory.path().join("id"),
+                Some(directory.path().join("id-cert.pub"))
+            )
+        );
+        assert_eq!(
+            profile.proxy_jump[0].authentication,
+            Authentication::identity(
+                directory.path().join("hop"),
+                Some(directory.path().join("hop-cert.pub"))
+            )
+        );
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                args.iter()
+                    .map(|arg| arg.to_string())
+                    .chain(["--profiles".into(), path.to_string_lossy().into_owned()]),
+            )
+        };
+        let options = parse(&[
+            "ssh",
+            "pilot@localhost",
+            "--identity",
+            "id",
+            "--certificate",
+            "cert.pub",
+        ])
+        .unwrap()
+        .unwrap();
+        let Source::Ssh(ssh) = options.source else {
+            panic!("expected SSH")
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::identity("id", Some("cert.pub".into()))
+        );
+        let replaced = parse(&["--profile", "pilot", "--identity", "unrelated"])
+            .unwrap()
+            .unwrap();
+        let Source::Ssh(ssh) = replaced.source else {
+            panic!("expected SSH")
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::identity("unrelated", None)
+        );
+        assert!(parse(&["ssh", "pilot@localhost", "--certificate", "cert.pub"]).is_err());
     }
 
     #[test]
@@ -1370,9 +1480,7 @@ mod tests {
         let profiles = load_profiles(&config).unwrap().profiles;
         assert_eq!(
             profiles["root"].authentication,
-            Authentication::Identity {
-                identity: directory.path().join("hostinger")
-            }
+            Authentication::identity(directory.path().join("hostinger"), None)
         );
         for (name, port) in [("play-6789", 6789), ("play-6792", 6792)] {
             assert_eq!(profiles[name].authentication, Authentication::None);

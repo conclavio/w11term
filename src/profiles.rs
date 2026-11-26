@@ -942,14 +942,31 @@ impl ProfileStore {
             {
                 replace_share_epoch(object);
             }
-            let keep_identity = expected
-                .is_some_and(|previous| previous.authentication == options.authentication)
-                && matches!(
-                    options.authentication,
-                    crate::options::Authentication::Identity { .. }
-                );
+            use crate::options::Authentication::Identity;
+            let (keep_identity, keep_certificate) = match (
+                expected.map(|previous| &previous.authentication),
+                &options.authentication,
+            ) {
+                (
+                    Some(Identity {
+                        identity: old_identity,
+                        certificate: old_certificate,
+                    }),
+                    Identity {
+                        identity,
+                        certificate,
+                    },
+                ) => (
+                    identity == old_identity,
+                    certificate.is_some() && certificate == old_certificate,
+                ),
+                _ => (false, false),
+            };
             if !keep_identity {
                 object.remove("identity");
+            }
+            if !keep_certificate {
+                object.remove("certificate");
             }
             let keep_route =
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
@@ -990,6 +1007,7 @@ impl ProfileStore {
             }
             for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
                 if (key == "identity" && keep_identity)
+                    || (key == "certificate" && keep_certificate)
                     || (key == "proxy_jump" && keep_route)
                     || (key == "local_forwards" && keep_forwards)
                 {
@@ -1350,9 +1368,7 @@ mod tests {
             terminal_type: Default::default(),
             user: "root".into(),
             port: 22,
-            authentication: Authentication::Identity {
-                identity: "local-key".into(),
-            },
+            authentication: Authentication::identity("local-key", None),
             host_key: None,
             host_key_alias: None,
             proxy_jump: Vec::new(),
@@ -1368,9 +1384,7 @@ mod tests {
         assert_eq!(doc["profiles"]["existing"]["custom"], 42);
         assert_eq!(
             store.load().unwrap()["new"].authentication,
-            Authentication::Identity {
-                identity: dir.path().join("local-key")
-            }
+            Authentication::identity(dir.path().join("local-key"), None)
         );
         assert!(store.add("new", &options).is_err());
         assert_eq!(std::fs::read(path).unwrap(), saved);
@@ -2291,6 +2305,40 @@ mod edit_tests {
         assert_eq!(std::fs::read(&key).unwrap(), b"fixture");
     }
     #[test]
+    fn edit_preserves_each_relative_ssh_credential_independently_and_clears_removed_certificates() {
+        use crate::options::Authentication::{Identity, Password};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{"pilot":{"host":"localhost","user":"pilot",
+            "auth":"identity","identity":"keys/id","certificate":"keys/old-cert.pub"}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let read_document =
+            || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+
+        let initial = store.load().unwrap().remove("pilot").unwrap();
+        let mut updated = initial.clone();
+        let Identity { certificate, .. } = &mut updated.authentication else {
+            panic!("expected key authentication")
+        };
+        *certificate = Some(dir.path().join("keys/new-cert.pub").into());
+        store.edit("pilot", "pilot", &updated, &initial).unwrap();
+        assert_eq!(read_document()["profiles"]["pilot"]["identity"], "keys/id");
+
+        updated.authentication = Password;
+        let current = store.load().unwrap().remove("pilot").unwrap();
+        store.edit("pilot", "pilot", &updated, &current).unwrap();
+        let saved = read_document();
+        let profile = &saved["profiles"]["pilot"];
+        assert!(profile.get("identity").is_none());
+        assert!(profile.get("certificate").is_none());
+    }
+
+    #[test]
     fn edit_renames_preserves_relative_keys_and_metadata_and_refuses_collisions_or_stale_edits() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
@@ -2362,9 +2410,7 @@ mod jump_tests {
         let old = store.load().unwrap()["destination"].clone();
         assert_eq!(
             old.proxy_jump[0].authentication,
-            Authentication::Identity {
-                identity: dir.path().join("keys/jump")
-            }
+            Authentication::identity(dir.path().join("keys/jump"), None)
         );
         let mut edited = old.clone();
         edited.port = 2200;

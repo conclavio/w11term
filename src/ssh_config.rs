@@ -360,6 +360,7 @@ impl Config<'_> {
     ) -> Result<(JumpHost, Option<(String, Location)>)> {
         let mut scalars = BTreeMap::new();
         let mut identities = Vec::new();
+        let mut certificates = Vec::new();
         let mut proxy = None;
         for section in &self.sections {
             match &section.scope {
@@ -405,6 +406,7 @@ impl Config<'_> {
                         scalars.entry(key).or_insert(d);
                     }
                     "identityfile" => identities.push(d),
+                    "certificatefile" => certificates.push(d),
                     "addressfamily" => warn(warnings, || {
                         format!(
                             "Host {}, {}: the SSH connection does not import AddressFamily. Local forward presets are checked separately.",
@@ -509,44 +511,12 @@ impl Config<'_> {
         } else {
             None
         };
-        let mut identity = None;
-        for d in identities {
-            let value = argument(d)?;
-            if value.eq_ignore_ascii_case("none") {
-                continue;
-            }
-            let mut tokens = tokens.to_vec();
-            let home = self.home.to_str().context("non-Unicode home path")?;
-            tokens.extend([
-                ('d', home),
-                ('u', self.user),
-                ('k', host_key_alias.as_deref().unwrap_or(alias)),
-            ]);
-            let path =
-                expand(value, &tokens).with_context(|| format!("{}: IdentityFile", d.line))?;
-            let path =
-                if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-                    self.home.join(rest)
-                } else {
-                    ensure!(
-                        !path.starts_with('~'),
-                        "{}: unsupported named-user home in IdentityFile",
-                        d.line
-                    );
-                    PathBuf::from(path)
-                };
-            ensure!(
-                path.is_absolute(),
-                "{}: relative IdentityFile is ambiguous; use ~/ or an absolute path",
-                d.line
-            );
-            ensure!(
-                identity.as_ref().is_none_or(|first| first == &path),
-                "{}: multiple IdentityFile entries are additive in OpenSSH; select one identity for this profile",
-                d.line
-            );
-            identity = Some(path);
-        }
+        let identity = self.credential_file(
+            identities,
+            &tokens,
+            host_key_alias.as_deref().unwrap_or(alias),
+            "IdentityFile",
+        )?;
         configured(scalars.get("identitiesonly").copied(), "no", |value| {
             ensure!(
                 value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("no"),
@@ -558,8 +528,18 @@ impl Config<'_> {
             );
             Ok(())
         })?;
+        let certificate = self.credential_file(
+            certificates,
+            &tokens,
+            host_key_alias.as_deref().unwrap_or(alias),
+            "CertificateFile",
+        )?;
+        ensure!(
+            certificate.is_none() || identity.is_some(),
+            "CertificateFile import requires an explicit IdentityFile for the matching private key"
+        );
         let authentication = match identity {
-            Some(identity) => Authentication::Identity { identity },
+            Some(identity) => Authentication::identity(identity, certificate),
             None => Authentication::Agent,
         };
         Ok((
@@ -575,6 +555,49 @@ impl Config<'_> {
             },
             via,
         ))
+    }
+
+    fn credential_file(
+        &self,
+        directives: Vec<&Directive>,
+        endpoint_tokens: &[(char, &str)],
+        host_key_name: &str,
+        label: &str,
+    ) -> Result<Option<PathBuf>> {
+        let mut selected = None;
+        for d in directives {
+            let value = argument(d)?;
+            if value.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let mut tokens = endpoint_tokens.to_vec();
+            let home = self.home.to_str().context("non-Unicode home path")?;
+            tokens.extend([('d', home), ('u', self.user), ('k', host_key_name)]);
+            let path = expand(value, &tokens).with_context(|| format!("{}: {label}", d.line))?;
+            let path =
+                if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+                    self.home.join(rest)
+                } else {
+                    ensure!(
+                        !path.starts_with('~'),
+                        "{}: unsupported named-user home in {label}",
+                        d.line
+                    );
+                    PathBuf::from(path)
+                };
+            ensure!(
+                path.is_absolute(),
+                "{}: relative {label} is ambiguous; use ~/ or an absolute path",
+                d.line
+            );
+            ensure!(
+                selected.as_ref().is_none_or(|first| first == &path),
+                "{}: multiple {label} entries are additive in OpenSSH; select one file for this profile",
+                d.line
+            );
+            selected = Some(path);
+        }
+        Ok(selected)
     }
 }
 
@@ -671,6 +694,35 @@ mod tests {
             .unwrap()
     }
     #[test]
+    fn certificate_import_rejects_multiple_files_or_no_matching_identity_option() {
+        let report = parse_config(
+            r#"
+            Host multiple
+                IdentityFile ~/id
+                CertificateFile ~/first-cert.pub
+                CertificateFile ~/second-cert.pub
+            Host agent-only
+                CertificateFile ~/id-cert.pub
+        "#,
+        );
+        for (name, diagnostic) in [
+            ("multiple", "multiple CertificateFile"),
+            ("agent-only", "requires an explicit IdentityFile"),
+        ] {
+            let entry = alias(&report, name);
+            assert!(entry.options.is_none());
+            assert!(
+                entry
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(diagnostic)),
+                "{:?}",
+                entry.warnings
+            );
+        }
+    }
+
+    #[test]
     fn host_key_alias_is_literal_per_hop_and_available_as_identity_file_token() {
         let report = parse_config(
             r#"
@@ -696,8 +748,8 @@ mod tests {
         let dest = alias(&report, "dest").options.as_ref().unwrap();
         assert_eq!(dest.host_key_alias.as_deref(), Some("dev-%h"));
         assert_eq!((dest.host.as_str(), dest.port), ("127.0.0.1", 2200));
-        let identity = |key: &str| Authentication::Identity {
-            identity: Path::new(r"C:\Users\pilot").join("keys").join(key),
+        let identity = |key: &str| {
+            Authentication::identity(Path::new(r"C:\Users\pilot").join("keys").join(key), None)
         };
         assert_eq!(dest.authentication, identity("dev-%h"));
         assert_eq!(
@@ -754,9 +806,10 @@ mod tests {
         );
         assert_eq!(
             options.authentication,
-            Authentication::Identity {
-                identity: Path::new(r"C:\Users\pilot").join(".ssh/with space #1")
-            }
+            Authentication::identity(
+                Path::new(r"C:\Users\pilot").join(".ssh/with space #1"),
+                None
+            )
         );
         assert!(options.proxy_jump.is_empty());
         assert_eq!(options.keepalive.interval_seconds, 15);
@@ -840,9 +893,7 @@ mod tests {
         );
         assert_eq!(
             dest.proxy_jump[1].authentication,
-            Authentication::Identity {
-                identity: Path::new(r"C:\Users\pilot").join("keys/alice-2201")
-            }
+            Authentication::identity(Path::new(r"C:\Users\pilot").join("keys/alice-2201"), None)
         );
     }
     #[test]

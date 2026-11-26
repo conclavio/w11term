@@ -7,6 +7,7 @@ pub(super) struct Draft {
     destination: String,
     pub(super) authentication: usize,
     pub(super) identity: String,
+    pub(super) certificate: String,
     pub(super) error: Option<String>,
     input: ElementRef<TextBox>,
 }
@@ -16,6 +17,7 @@ pub enum Action {
     Address(TabId, String),
     Authentication(TabId, Option<usize>),
     Identity(TabId, String),
+    Certificate(TabId, String),
     Connect(TabId),
 }
 
@@ -76,6 +78,7 @@ impl TerminalApp {
             Action::Address(id, _)
             | Action::Authentication(id, _)
             | Action::Identity(id, _)
+            | Action::Certificate(id, _)
             | Action::Connect(id) => *id,
         };
         let active = self.tabs.active_id() == Some(id);
@@ -98,11 +101,18 @@ impl TerminalApp {
                 draft.identity = value;
                 draft.error = None;
             }
+            Action::Certificate(_, value) if draft.certificate != value => {
+                draft.certificate = value;
+                draft.error = None;
+            }
             Action::Connect(_) if active => {
                 let result =
                     SshOptions::from_destination(&draft.destination).and_then(|mut options| {
-                        options.authentication =
-                            ssh_authentication(draft.authentication, &draft.identity)?;
+                        options.authentication = ssh_authentication(
+                            draft.authentication,
+                            &draft.identity,
+                            &draft.certificate,
+                        )?;
                         options.prepare_profile_connection(self.store.path())?;
                         Ok(options)
                     });
@@ -164,16 +174,32 @@ pub(super) fn view(
             ),
         ];
     if draft.authentication == PRIVATE_KEY_AUTH {
-        fields.push(KeyedView::new(
-            "identity",
-            identity_picker::field(
-                identity_picker::Target::Endpoint(id),
-                &draft.identity,
-                can_browse,
-                context.callback(move |value| Message::QuickConnect(Action::Identity(id, value))),
-                context,
+        use identity_picker::{Kind, Target};
+        fields.extend([
+            KeyedView::new(
+                "identity",
+                identity_picker::field(
+                    Target::Endpoint(id, Kind::PrivateKey),
+                    &draft.identity,
+                    can_browse,
+                    context
+                        .callback(move |value| Message::QuickConnect(Action::Identity(id, value))),
+                    context,
+                ),
             ),
-        ));
+            KeyedView::new(
+                "certificate",
+                identity_picker::field(
+                    Target::Endpoint(id, Kind::UserCertificate),
+                    &draft.certificate,
+                    can_browse,
+                    context.callback(move |value| {
+                        Message::QuickConnect(Action::Certificate(id, value))
+                    }),
+                    context,
+                ),
+            ),
+        ]);
     }
     if let Some(error) = &draft.error {
         fields.push(KeyedView::new(

@@ -68,7 +68,7 @@ impl Draft {
             return profiles.rows(catalog);
         }
         let auth =
-            ssh_authentication(self.authentication, &self.identity).map_err(|e| e.to_string());
+            ssh_authentication(self.authentication, &self.identity, "").map_err(|e| e.to_string());
         list::build(&self.text, &self.default_user, catalog, path, auth)
     }
 

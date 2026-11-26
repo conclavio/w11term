@@ -16,6 +16,7 @@ pub enum Field {
     User,
     Port,
     Identity,
+    Certificate,
     Fingerprint,
     Alias,
     Timeout,
@@ -60,6 +61,7 @@ struct Draft {
     port: String,
     authentication: usize,
     identity: String,
+    certificate: String,
     fingerprint: String,
     alias: String,
     timeout: String,
@@ -71,8 +73,8 @@ struct Draft {
 impl Draft {
     fn new(index: Option<usize>, existing: Option<&JumpHost>) -> Self {
         let keepalive = existing.map_or_else(SshKeepalive::default, |hop| hop.keepalive);
-        let (authentication, identity) = existing.map_or_else(
-            || (0, String::new()),
+        let (authentication, identity, certificate) = existing.map_or_else(
+            || (0, String::new(), String::new()),
             |hop| ssh_auth_fields(&hop.authentication),
         );
         Self {
@@ -82,6 +84,7 @@ impl Draft {
             port: existing.map_or(22, |hop| hop.port).to_string(),
             authentication,
             identity,
+            certificate,
             fingerprint: existing
                 .and_then(|hop| hop.host_key.clone())
                 .unwrap_or_default(),
@@ -109,7 +112,11 @@ impl Draft {
             host,
             user,
             port,
-            authentication: ssh_authentication(self.authentication, &self.identity)?,
+            authentication: ssh_authentication(
+                self.authentication,
+                &self.identity,
+                &self.certificate,
+            )?,
             host_key: (!fingerprint.is_empty()).then(|| fingerprint.to_owned()),
             host_key_alias: (!alias.is_empty()).then(|| alias.to_ascii_lowercase()),
             connect_timeout_seconds: parse_ssh_connect_timeout(&self.timeout)?,
@@ -123,6 +130,7 @@ impl Draft {
             Field::User => &mut self.user,
             Field::Port => &mut self.port,
             Field::Identity => &mut self.identity,
+            Field::Certificate => &mut self.certificate,
             Field::Fingerprint => &mut self.fingerprint,
             Field::Alias => &mut self.alias,
             Field::Timeout => &mut self.timeout,
@@ -187,19 +195,37 @@ impl Draft {
                     })),
             )),
         ];
-        fields.push(if self.authentication == PRIVATE_KEY_AUTH {
-            identity_picker::field(
-                identity_picker::Target::Jump { tab: id, edit },
-                &self.identity,
-                can_browse,
-                context.callback(move |value| {
-                    Message::ProfileJump(id, Edit::Text(Field::Identity, value))
-                }),
-                context,
-            )
-        } else {
-            View::empty()
-        });
+        if self.authentication == PRIVATE_KEY_AUTH {
+            use identity_picker::{Kind, Target};
+            fields.extend([
+                identity_picker::field(
+                    Target::Jump {
+                        tab: id,
+                        edit,
+                        kind: Kind::PrivateKey,
+                    },
+                    &self.identity,
+                    can_browse,
+                    context.callback(move |value| {
+                        Message::ProfileJump(id, Edit::Text(Field::Identity, value))
+                    }),
+                    context,
+                ),
+                identity_picker::field(
+                    Target::Jump {
+                        tab: id,
+                        edit,
+                        kind: Kind::UserCertificate,
+                    },
+                    &self.certificate,
+                    can_browse,
+                    context.callback(move |value| {
+                        Message::ProfileJump(id, Edit::Text(Field::Certificate, value))
+                    }),
+                    context,
+                ),
+            ]);
+        }
         fields.extend([
             text_box(
                 Field::Fingerprint,
@@ -261,10 +287,12 @@ impl Editor {
     pub(super) fn identity_fields(
         &mut self,
         edit: u64,
+        kind: identity_picker::Kind,
     ) -> Option<(&mut String, &mut Option<String>)> {
         let draft = self.pending.as_mut()?;
+        let field = kind.field(&mut draft.identity, &mut draft.certificate);
         (self.edit == edit && draft.authentication == PRIVATE_KEY_AUTH)
-            .then_some((&mut draft.identity, &mut draft.error))
+            .then_some((field, &mut draft.error))
     }
 
     pub(super) fn update(&mut self, hops: &mut Vec<JumpHost>, edit: Edit) -> bool {
@@ -497,9 +525,7 @@ mod tests {
             host: "2001:db8::9".into(),
             user: "admin".into(),
             port: 2222,
-            authentication: Authentication::Identity {
-                identity: "keys/bastion".into(),
-            },
+            authentication: Authentication::identity("keys/bastion", None),
             host_key: Some("SHA256:fixture".into()),
             host_key_alias: Some("bastion.internal".into()),
             connect_timeout_seconds: std::num::NonZeroU32::new(15),
@@ -532,19 +558,41 @@ mod tests {
         let first = hops[0].clone();
         editor.update(&mut hops, Edit::Row(0, first, RowAction::Edit));
         let cancelled_edit = editor.edit;
-        assert!(editor.identity_fields(cancelled_edit).is_some());
+        assert!(
+            editor
+                .identity_fields(cancelled_edit, identity_picker::Kind::PrivateKey)
+                .is_some()
+        );
         editor.update(&mut hops, Edit::Cancel);
-        assert!(editor.identity_fields(cancelled_edit).is_none());
+        assert!(
+            editor
+                .identity_fields(cancelled_edit, identity_picker::Kind::PrivateKey)
+                .is_none()
+        );
 
         let second = hops[1].clone();
         editor.update(&mut hops, Edit::Row(1, second, RowAction::Edit));
         let former_auth = editor.edit;
-        assert!(editor.identity_fields(cancelled_edit).is_none());
+        assert!(
+            editor
+                .identity_fields(cancelled_edit, identity_picker::Kind::PrivateKey)
+                .is_none()
+        );
         editor.update(&mut hops, Edit::Auth(3));
-        assert!(editor.identity_fields(editor.edit).is_none());
+        assert!(
+            editor
+                .identity_fields(editor.edit, identity_picker::Kind::PrivateKey)
+                .is_none()
+        );
         editor.update(&mut hops, Edit::Auth(PRIVATE_KEY_AUTH));
-        assert!(editor.identity_fields(former_auth).is_none());
-        let (path, error) = editor.identity_fields(editor.edit).unwrap();
+        assert!(
+            editor
+                .identity_fields(former_auth, identity_picker::Kind::PrivateKey)
+                .is_none()
+        );
+        let (path, error) = editor
+            .identity_fields(editor.edit, identity_picker::Kind::PrivateKey)
+            .unwrap();
         assert_eq!(path, "keys/bastion");
         *path = "other key".into();
         assert!(error.is_none());
@@ -552,9 +600,7 @@ mod tests {
         assert_eq!(hops[0], sample());
         assert_eq!(
             hops[1].authentication,
-            Authentication::Identity {
-                identity: "other key".into()
-            }
+            Authentication::identity("other key", None)
         );
     }
 

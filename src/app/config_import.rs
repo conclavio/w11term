@@ -137,7 +137,17 @@ pub(super) fn endpoint(
     let auth = match auth {
         Authentication::None => "none".to_owned(),
         Authentication::Agent => "SSH agent".to_owned(),
-        Authentication::Identity { identity } => format!("key file {}", identity.display()),
+        Authentication::Identity {
+            identity,
+            certificate,
+        } => match certificate {
+            Some(path) => format!(
+                "key file {} with user certificate {}",
+                identity.display(),
+                path.display()
+            ),
+            None => format!("key file {}", identity.display()),
+        },
         Authentication::Password => "password".to_owned(),
         Authentication::KeyboardInteractive => "keyboard-interactive".to_owned(),
     };
