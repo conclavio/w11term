@@ -1087,6 +1087,7 @@ fn tab_menu_message(label: String) -> Message {
         "Enable read-only pane input" => Message::SetPaneReadOnly(true),
         "Disable read-only pane input" => Message::SetPaneReadOnly(false),
         "Move pane to new tab" => Message::MovePaneToTab,
+        "Move pane to new window" => Message::Shortcut(Shortcut::MovePaneToNewWindow),
         tab_windows::NEW_WINDOW_LABEL => Message::MoveTabToWindow,
         "Move pane to existing tab…" => Message::Shortcut(Shortcut::MovePaneToExistingTab),
         "Paste" => Message::Paste,
@@ -1416,6 +1417,7 @@ pub enum Message {
     ZoomPane,
     ClosePane,
     MovePaneToTab,
+    MovePaneToNewWindow(Option<u64>),
     MoveTabToWindow,
     MoveTabToExistingWindow(Option<TabId>, u64),
     DuplicateTabLayout(TabId),
@@ -4074,6 +4076,9 @@ impl TerminalApp {
                 Message::Shortcut(Shortcut::ReopenClosedPane) => {
                     Message::ReopenClosedPane(closed_pane)
                 }
+                Message::Shortcut(Shortcut::MovePaneToNewWindow) => {
+                    Message::MovePaneToNewWindow(pane)
+                }
                 Message::Shortcut(Shortcut::FocusPreviousPane) => previous_pane::message(previous),
                 Message::Shortcut(Shortcut::SwapPane(direction)) => offered.message(direction),
                 Message::Shortcut(Shortcut::RotateSplit) => offered.rotate(),
@@ -4896,6 +4901,13 @@ impl TerminalApp {
                 self.can_close_active_pane(),
             ));
             items.push(self.binding_menu("move-pane", "Move pane to new tab", KeyAction::MovePane));
+            let detach = KeyAction::MovePaneToNewWindow.binding();
+            items.push(self.binding_menu_enabled(
+                detach.id,
+                detach.label,
+                detach.action,
+                self.can_detach_pane_to_window(),
+            ));
         }
         MenuItem::submenu("panes", "Panes", items)
     }
@@ -5875,6 +5887,14 @@ impl Component for TerminalApp {
             }
             Message::DismissWindowError => self.window_error = None,
             Message::MoveTabToWindow => self.move_tab_window(None, context),
+            Message::MovePaneToNewWindow(pane) => {
+                if pane.is_some()
+                    && self.tabs.active().and_then(AppTab::pane_id) == pane
+                    && let Some(source) = self.move_source()
+                {
+                    self.move_pane_to_window(source, None, context);
+                }
+            }
             Message::MoveTabToExistingWindow(group, window) => {
                 if group.is_some() && self.tabs.active_group_id() == group {
                     self.move_tab_window(Some(window), context);
@@ -7058,6 +7078,10 @@ impl Component for TerminalApp {
                 Shortcut::ZoomPane => self.update(Message::ZoomPane, context),
                 Shortcut::ClosePane => self.update(Message::ClosePane, context),
                 Shortcut::MovePane => self.update(Message::MovePaneToTab, context),
+                Shortcut::MovePaneToNewWindow => self.update(
+                    Message::MovePaneToNewWindow(self.tabs.active().and_then(AppTab::pane_id)),
+                    context,
+                ),
                 Shortcut::Workspaces => self.update(
                     Message::Workspace(workspace_view::WorkspaceAction::Show),
                     context,

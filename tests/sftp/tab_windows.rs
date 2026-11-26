@@ -58,6 +58,12 @@ async fn native_move_live_panes_to_a_sibling_tab() {
     run("PaneMove", b"ssh-probe/split-stays/only-pane-moved/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "detaches live SSH and PowerShell panes into their own native windows"]
+async fn native_move_split_pane_to_a_new_window() {
+    run("PaneWindow", b"ssh-stays/ssh-moved/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -83,7 +89,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     .unwrap();
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12","pane_picker":"F6","find_all_panes":"F4","move_pane_to_existing_tab":"F3"}}"#,
+        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12","pane_picker":"F6","find_all_panes":"F4","move_pane_to_existing_tab":"F3","move_pane_to_new_window":"F2"}}"#,
     )
     .unwrap();
     let local = |name| {

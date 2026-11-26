@@ -262,6 +262,7 @@ pub enum Shortcut {
     SelectAll,
     CopyKey(w11term::copy_mode::CopyKey),
     MovePane,
+    MovePaneToNewWindow,
     MovePaneToExistingTab,
     Workspaces,
 }
@@ -2223,6 +2224,7 @@ impl From<Action> for Shortcut {
             Action::BalancePanes => Self::BalancePanes,
             Action::ClosePane => Self::ClosePane,
             Action::MovePane => Self::MovePane,
+            Action::MovePaneToNewWindow => Self::MovePaneToNewWindow,
             Action::MovePaneToExistingTab => Self::MovePaneToExistingTab,
             Action::Workspaces => Self::Workspaces,
             Action::CommandPalette => Self::CommandPalette,

@@ -1514,7 +1514,7 @@ impl TerminalApp {
             PlacementTarget::Local(target) => target,
             PlacementTarget::Sibling(target) => {
                 self.close_picker(ctx);
-                self.move_pane_to_window(source, target, side, ctx);
+                self.move_pane_to_window(source, Some((target, side)), ctx);
                 return;
             }
         };

@@ -156,8 +156,7 @@ enum TransferKind {
     Tab,
     Pane {
         source: TabId,
-        target: PaneDestination,
-        side: Direction,
+        placement: Option<(PaneDestination, Direction)>,
     },
 }
 
@@ -661,12 +660,14 @@ impl TerminalApp {
     pub(super) fn move_pane_to_window(
         &mut self,
         source: TabId,
-        target: PaneDestination,
-        side: Direction,
+        placement: Option<(PaneDestination, Direction)>,
         ctx: &ComponentContext<Self>,
     ) {
         if self.incoming.is_some() || self.outgoing.is_some() || self.move_source() != Some(source)
         {
+            return;
+        }
+        if placement.is_none() && !self.active_tab_has_split() {
             return;
         }
         if let Some(reason) = self.tab_move_blocker(&[source]) {
@@ -682,14 +683,26 @@ impl TerminalApp {
         self.start_window_transfer(
             group,
             vec![pane],
-            Some(target.window),
-            TransferKind::Pane {
-                source,
-                target,
-                side,
-            },
+            placement.map(|(target, _)| target.window),
+            TransferKind::Pane { source, placement },
             ctx,
         );
+    }
+
+    fn active_tab_has_split(&self) -> bool {
+        matches!(
+            self.tabs.active_layout(),
+            Some(w11term::pane_layout::Layout::Split { .. })
+        )
+    }
+
+    pub(super) fn can_detach_pane_to_window(&self) -> bool {
+        self.incoming.is_none()
+            && self.outgoing.is_none()
+            && self.active_tab_has_split()
+            && self
+                .move_source()
+                .is_some_and(|id| self.tab_move_blocker(&[id]).is_none())
     }
 
     fn start_window_transfer(
@@ -795,7 +808,7 @@ impl TerminalApp {
         };
         if self.incoming.is_some()
             || self.existing_destination_blocked()
-            || matches!(offer.kind, TransferKind::Pane { target, .. } if self.pane_transfer_target(target).is_none())
+            || matches!(offer.kind, TransferKind::Pane { placement: Some((target, _)), .. } if self.pane_transfer_target(target).is_none())
         {
             offer.phase.set(TransferPhase::Canceled);
             offer.source.send(Message::TransferCanceled(id));
@@ -824,9 +837,10 @@ impl TerminalApp {
         };
         let leaves = match offer.kind {
             TransferKind::Tab => self.tabs.layout_for(headers[index].id).unwrap().leaves(),
-            TransferKind::Pane { source, .. }
+            TransferKind::Pane { source, placement }
                 if self.tabs.group_id(source) == Some(offer.group)
-                    && self.move_source() == Some(source) =>
+                    && self.move_source() == Some(source)
+                    && (placement.is_some() || self.active_tab_has_split()) =>
             {
                 vec![source]
             }
@@ -913,14 +927,14 @@ impl TerminalApp {
             return;
         };
         let existing = offer.new_window.is_none();
-        let target = match offer.kind {
+        let placement = match offer.kind {
+            TransferKind::Pane { placement, .. } => placement,
             TransferKind::Tab => None,
-            TransferKind::Pane { target, side, .. } => {
-                self.pane_transfer_target(target).map(|id| (id, side))
-            }
         };
+        let target = placement
+            .and_then(|(target, side)| self.pane_transfer_target(target).map(|id| (id, side)));
         if (existing && self.existing_destination_blocked())
-            || (matches!(offer.kind, TransferKind::Pane { .. }) && target.is_none())
+            || (placement.is_some() && target.is_none())
         {
             self.reject_claim(&offer, ctx);
             return;
@@ -936,14 +950,17 @@ impl TerminalApp {
                 leaves
             }
             TransferPayload::Pane(pane) => {
-                let (target, side) = target.expect("validated destination");
-                match self.tabs.insert_detached_pane(pane, target, side) {
-                    Ok(id) => vec![id],
-                    Err(pane) => {
-                        offer.payload.replace(Some(TransferPayload::Pane(pane)));
-                        self.reject_claim(&offer, ctx);
-                        return;
+                if let Some((target, side)) = target {
+                    match self.tabs.insert_detached_pane(pane, target, side) {
+                        Ok(id) => vec![id],
+                        Err(pane) => {
+                            offer.payload.replace(Some(TransferPayload::Pane(pane)));
+                            self.reject_claim(&offer, ctx);
+                            return;
+                        }
                     }
+                } else {
+                    vec![self.tabs.open_detached_pane_as_tab(*pane)]
                 }
             }
         };
