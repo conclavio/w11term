@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -69,6 +69,8 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "split-pane"
             | "move-pane"
             | "move-tab"
+            | "list-tabs"
+            | "reorder-tabs"
             | "focus-pane"
             | "zoom-pane"
             | "get-tab-layout"
@@ -456,6 +458,32 @@ mod tests {
             "zoom-pane --pane 1 --pane 2 --on",
             "zoom-pane --pane 1 --on --off",
             "zoom-pane --pane 1 --off --off",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn lists_tabs_and_accepts_the_requested_order_in_one_window() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 7 list-tabs --window 12").unwrap(),
+            (Some(7), Request::ListTabs { window_id: 12 })
+        ));
+        let (_, request) = parse_line("reorder-tabs --window 12 --tab 14 --tab 2 --tab 6").unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"reorder-tabs","window_id":12,"tab_ids":[14,2,6]})
+        );
+        for invalid in [
+            "list-tabs",
+            "list-tabs --window 0",
+            "list-tabs --window 12 --tab 14",
+            "reorder-tabs --tab 14",
+            "reorder-tabs --window 12",
+            "reorder-tabs --window 12 --tab 0",
+            "reorder-tabs --window 12 --tab 14 --window 13",
+            "reorder-tabs --window 12 --tab 14 --activate",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

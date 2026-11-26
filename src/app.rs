@@ -6821,6 +6821,15 @@ impl Component for TerminalApp {
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
+            Message::Control(w11term::control::UiRequest::TabOrder { order, reply }) => {
+                if !reply.is_closed() {
+                    let result = match order {
+                        Some(order) => self.control_reorder_tabs(&order, context),
+                        None => Ok(self.control_list_tabs()),
+                    };
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::OpenWorkspace {
                 name,
                 activate,
