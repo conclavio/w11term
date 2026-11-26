@@ -151,6 +151,9 @@ pub enum Request {
         #[serde(default)]
         activate: bool,
     },
+    OpenWorkspaceWindow {
+        name: String,
+    },
     ListSshGroups,
     ListSavedSshGroups {
         window_id: WindowId,
@@ -404,6 +407,10 @@ pub enum UiRequest {
         activate: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    OpenWorkspaceWindow {
+        name: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     GetSshGroupRoster {
         tab_id: u64,
         readiness: Option<SshGroupReadiness>,
@@ -487,6 +494,7 @@ impl UiRequest {
             | Self::ListSavedSshGroups { reply }
             | Self::OpenSshGroup { reply, .. }
             | Self::OpenWorkspace { reply, .. }
+            | Self::OpenWorkspaceWindow { reply, .. }
             | Self::GetSshGroupRoster { reply, .. }
             | Self::SubmitSshGroupCommand { reply, .. }
             | Self::GetSshGroupRun { reply, .. }
@@ -1214,6 +1222,16 @@ impl Registry {
                 tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("open-workspace timed out; tabs may have been created")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::OpenWorkspaceWindow { name } => {
+                let ui = self.active_ui()?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::OpenWorkspaceWindow { name, reply });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("open-workspace timed out; the window may have been created")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }

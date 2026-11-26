@@ -1740,6 +1740,7 @@ pub struct WindowVisuals {
     pub(crate) constraints: Option<WindowConstraints>,
     pub(crate) icon: Option<&'static str>,
     pub(crate) theme: WindowTheme,
+    pub(crate) preserve_focus_on_show: bool,
 }
 
 impl WindowVisuals {
@@ -1790,6 +1791,12 @@ impl WindowVisuals {
 
     pub fn theme(mut self, theme: WindowTheme) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Shows a newly mounted window without activating it.
+    pub fn preserve_focus_on_show(mut self, preserve: bool) -> Self {
+        self.preserve_focus_on_show = preserve;
         self
     }
 }

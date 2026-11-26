@@ -136,6 +136,12 @@ async fn native_cli_opens_a_saved_workspace_in_an_explicit_window() {
     run("CliWorkspace", b"targeted-workspace/original-workspace/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a saved workspace in a new native window without taking focus and keeps the shared pipe alive"]
+async fn native_cli_opens_a_saved_workspace_in_a_new_window_without_focus() {
+    run("CliWorkspaceWindow", b"source-stays-focused/new-window/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -183,14 +189,17 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         "shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}})
     };
     let leaf = |slot, source: Value| json!({"type":"leaf","slot":slot,"source":source});
-    let workspace = json!({"active_tab": usize::from(matches!(first_close, "Context" | "WorkspaceWindow" | "CopyWorkspace")),"tabs":[
+    let workspace = json!({"active_tab": usize::from(matches!(first_close, "Context" | "WorkspaceWindow" | "CopyWorkspace" | "CliWorkspaceWindow")),"tabs":[
         {"title":"Cockpit tools","focused":1,"layout":{"type":"split","axis":"columns","ratio":0.375,
             "first":leaf(1,json!({"kind":"saved_profile","value":"window-ssh"})),
             "second":leaf(2,local("Moved PowerShell"))}},
         {"focused":3,"layout":leaf(3,local("Source PowerShell"))}
     ]});
     let mut workspaces = json!({"two-windows":workspace});
-    if matches!(first_close, "WorkspaceWindow" | "ManageWorkspace") {
+    if matches!(
+        first_close,
+        "WorkspaceWindow" | "ManageWorkspace" | "CliWorkspaceWindow"
+    ) {
         workspaces["broken-copy"] = json!({"active_tab":0,"tabs":[
             {"focused":1,"layout":leaf(1,json!({"kind":"saved_profile","value":"missing-window-profile"}))}
         ]});
@@ -252,6 +261,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "RepairWorkspace"
             | "CliWindows"
             | "CliWorkspace"
+            | "CliWorkspaceWindow"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

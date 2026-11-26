@@ -62,6 +62,7 @@ pub(super) fn parse(
     let mut expected_query = None;
     let mut record_output = None;
     let mut name = None;
+    let mut new_window = false;
     let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
@@ -162,6 +163,10 @@ pub(super) fn parse(
                 name = Some(value(&mut args)?);
             }
             "--activate" if matches!(verb, "open" | "open-workspace") => activate = true,
+            "--new-window" if verb == "open-workspace" => {
+                ensure!(!new_window, "specify --new-window only once");
+                new_window = true;
+            }
             "--regex"
                 if matches!(
                     verb,
@@ -447,10 +452,19 @@ pub(super) fn parse(
             ensure!(pane.is_none(), "open-workspace does not accept --pane");
             let name = name.context("--name is required")?;
             ensure!(!name.trim().is_empty(), "provide a saved workspace name");
-            Request::OpenWorkspace {
-                window_id: window_id.context("--window is required (from list-windows)")?,
-                name,
-                activate,
+            if new_window {
+                ensure!(
+                    window_id.is_none() && !activate,
+                    "--new-window cannot be combined with --window or --activate"
+                );
+                Request::OpenWorkspaceWindow { name }
+            } else {
+                Request::OpenWorkspace {
+                    window_id: window_id
+                        .context("--window (from list-windows) or --new-window is required")?,
+                    name,
+                    activate,
+                }
             }
         }
         "close-pane" => Request::ClosePane {

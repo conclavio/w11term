@@ -15,6 +15,7 @@ windows_core::link!("kernel32.dll" "system" fn GetModuleHandleW(name: *const u16
 windows_core::link!("kernel32.dll" "system" fn LoadResource(module: *mut std::ffi::c_void, resource: *mut std::ffi::c_void) -> *mut std::ffi::c_void);
 windows_core::link!("kernel32.dll" "system" fn LockResource(resource: *mut std::ffi::c_void) -> *mut std::ffi::c_void);
 windows_core::link!("kernel32.dll" "system" fn SizeofResource(module: *mut std::ffi::c_void, resource: *mut std::ffi::c_void) -> u32);
+windows_core::link!("user32.dll" "system" fn SetWindowPos(hwnd: *mut std::ffi::c_void, insert_after: *mut std::ffi::c_void, x: i32, y: i32, width: i32, height: i32, flags: u32) -> i32);
 
 #[cfg_attr(not(feature = "test"), allow(dead_code))]
 #[allow(
@@ -1343,11 +1344,33 @@ impl WinUiRuntime {
                 self.windows.insert(*node, window);
             }
             Command::ActivateWindow { node } => {
-                self.windows
+                let window = self
+                    .windows
                     .get(node)
-                    .ok_or(RuntimeError::MissingNode(*node))?
-                    .Activate()
-                    .map_err(native_error)?;
+                    .ok_or(RuntimeError::MissingNode(*node))?;
+                if self
+                    .window_visuals
+                    .get(node)
+                    .is_some_and(|visuals| visuals.preserve_focus_on_show)
+                {
+                    const SWP_NOSIZE: u32 = 0x0001;
+                    const SWP_NOMOVE: u32 = 0x0002;
+                    const SWP_NOZORDER: u32 = 0x0004;
+                    const SWP_NOACTIVATE: u32 = 0x0010;
+                    const SWP_SHOWWINDOW: u32 = 0x0040;
+                    let mut hwnd = std::ptr::null_mut();
+                    let native = window.cast::<IWindowNative>().map_err(native_error)?;
+                    let flags =
+                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+                    unsafe {
+                        native.WindowHandle(&mut hwnd).ok().map_err(native_error)?;
+                        if SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, flags) == 0 {
+                            return Err(native_error(windows_core::Error::from_thread()));
+                        }
+                    }
+                } else {
+                    window.Activate().map_err(native_error)?;
+                }
             }
             Command::CloseWindow { node } => {
                 self.windows
