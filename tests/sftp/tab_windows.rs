@@ -130,6 +130,12 @@ async fn native_cli_opens_profiles_in_an_explicit_window() {
     run("CliWindows", b"targeted-ssh/original-ssh/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "restores a saved SSH and PowerShell layout in a background native window through the CLI"]
+async fn native_cli_opens_a_saved_workspace_in_an_explicit_window() {
+    run("CliWorkspace", b"targeted-workspace/original-workspace/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -194,6 +200,16 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         broken["tabs"][0]["layout"]["first"]["source"]["value"] = json!("missing-window-profile");
         workspaces["broken-copy"] = broken;
     }
+    if first_close == "CliWorkspace" {
+        let mut broken = workspaces["two-windows"].clone();
+        broken["tabs"][0]["layout"]["first"]["source"]["value"] = json!("missing-window-profile");
+        // An earlier valid tab must also stay unopened when the SSH split is invalid.
+        broken["tabs"].as_array_mut().unwrap().swap(0, 1);
+        workspaces["broken-copy"] = broken;
+        workspaces["Local Ops"] = json!({"active_tab":0,"tabs":[
+            {"title":"Local Ops shell","focused":1,"layout":leaf(1,local("Local Ops shell"))}
+        ]});
+    }
     if first_close == "CopyWorkspace" {
         workspaces["two-windows copy"] = json!({"active_tab":0,"tabs":[
             {"focused":1,"layout":leaf(1,json!({"kind":"demo"}))}
@@ -235,6 +251,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "CopyWorkspace"
             | "RepairWorkspace"
             | "CliWindows"
+            | "CliWorkspace"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

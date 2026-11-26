@@ -6576,6 +6576,16 @@ impl Component for TerminalApp {
                 })();
                 let _ = reply.send(result.map_err(|e| format!("{e:#}")));
             }
+            Message::Control(w11term::control::UiRequest::OpenWorkspace {
+                name,
+                activate,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = self.control_open_workspace(&name, activate, context);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::ClosePane { pane, reply }) => {
                 if !reply.is_closed() {
                     let result = self.control_close_pane(pane, context);

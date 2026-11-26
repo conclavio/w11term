@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -691,6 +691,76 @@ function Test-ExplicitControlWindow {
     Close-FixtureWindow $origin
 }
 
+function Test-ControlWorkspace {
+    $window = $origin
+    $field = Open-ProfileWindowPicker $origin -FromPalette
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Destination PowerShell')
+    $null = Wait-Until 'local profile to open in the destination window' {
+        Find-Here $origin ('Destination PowerShell ' + [char]0x00b7 + ' Local')
+    }
+    Press-Key 13
+    $child = Wait-DetachedWindow $origin
+    $initialChild = Wait-Until 'the destination window has a local terminal' {
+        (Control @('list')).sessions | Where-Object label -eq 'Destination PowerShell'
+    }
+    $targetId = $initialChild.window_id
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before workspace restore'
+
+    $catalog = @((Control @('list-workspaces')).workspaces)
+    $mixed = $catalog | Where-Object name -ceq 'two-windows'
+    if ($catalog.Count -ne 3 -or $mixed.tab_count -ne 2 -or $mixed.pane_count -ne 3) {
+        throw "Unexpected workspace catalog: $($catalog | ConvertTo-Json -Compress)"
+    }
+    $failed = & $Cli --pid $app.Id open-workspace --window "$targetId" --name 'broken-copy' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*missing-window-profile*') {
+        throw 'Opening a workspace with a missing profile did not report the profile'
+    }
+    $target = (Control @('list-windows')).windows | Where-Object window_id -eq $targetId
+    if ($target.tab_count -ne 1 -or $target.pane_count -ne 1) {
+        throw 'The failed restore appended a partial layout'
+    }
+
+    $restored = Control @('open-workspace','--window',"$targetId",'--name','two-windows')
+    $remote = $restored.tabs[0].panes[0]
+    $local = $restored.tabs[0].panes[1]
+    if ($restored.name -cne 'two-windows' -or $restored.window_id -ne $targetId -or $restored.active -or
+        @($restored.tabs).Count -ne 2 -or @($restored.tabs[0].panes).Count -ne 2 -or
+        @($restored.tabs[1].panes).Count -ne 1 -or $restored.workspace_active_pane -ne $remote) {
+        throw "Unexpected workspace restore reply: $($restored | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    $null = Wait-Until 'the destination keeps its selection while restoring the workspace' {
+        $target = (Control @('list-windows')).windows | Where-Object window_id -eq $targetId
+        $target.active_tab_title -ceq 'Destination PowerShell' -and $target.tab_count -eq 3 -and $target.pane_count -eq 4
+    }
+    $panes = @((Control @('list')).sessions | Where-Object {
+        $_.window_id -eq $targetId -and $_.tab_id -eq $restored.tabs[0].tab_id
+    })
+    if ($panes.Count -ne 2 -or $remote -notin $panes.id -or $local -notin $panes.id) {
+        throw 'The returned split pane IDs do not belong to the restored tab in the destination'
+    }
+    Expect-Text $remote 'ready'
+    Expect-Text $local 'PS '
+    $null = Shell-State $local 'workspaceCliLocal' -Init
+    $null = Control @('send-text','--pane',"$remote",'--no-paste','targeted-workspace/')
+    Expect-Text $remote 'targeted-workspace/'
+
+    $selected = Control @('open-workspace','--window',"$targetId",'--name','Local Ops','--activate')
+    if (!$selected.active -or $selected.workspace_active_pane -ne $selected.tabs[0].panes[0]) {
+        throw 'Activation did not return the saved active pane'
+    }
+    $null = Wait-Until 'the restored local tab is selected in the background window' {
+        $target = (Control @('list-windows')).windows | Where-Object window_id -eq $targetId
+        $selectedPane = (Control @('list')).sessions | Where-Object id -eq $selected.workspace_active_pane
+        $target.active_tab_title -ceq 'Local Ops shell' -and !$target.active -and $selectedPane.visible
+    }
+    Expect-Focus $origin $ssh.id 'Restoring and activating a workspace leaves desktop focus alone'
+    Type-In $origin 'original-workspace/'
+    Expect-Text $ssh.id 'original-workspace/'
+    Close-FixtureWindow $child
+    Close-FixtureWindow $origin
+}
+
 function Test-RepairWorkspace {
     $window = $origin
     Run-WindowCommand $origin ('Workspaces' + [char]0x2026)
@@ -1189,8 +1259,12 @@ try {
         }
         return
     }
-    if ($FirstClose -eq 'CliWindows') {
-        Test-ExplicitControlWindow
+    if ($FirstClose -in @('CliWindows','CliWorkspace')) {
+        if ($FirstClose -eq 'CliWorkspace') {
+            Test-ControlWorkspace
+        } else {
+            Test-ExplicitControlWindow
+        }
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'The CLI window fixture did not shut down cleanly'
         }

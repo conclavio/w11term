@@ -332,6 +332,13 @@ pub enum SavedLayout {
 }
 
 impl SavedLayout {
+    pub fn pane_count(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Split { first, second, .. } => first.pane_count() + second.pane_count(),
+        }
+    }
+
     fn capture(
         layout: &Layout,
         depth: usize,

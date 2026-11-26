@@ -1,6 +1,6 @@
 use super::*;
 use w11term::workspace::{
-    SavedLayout, SavedPane, SavedSource, SshStartup, Workspace, WorkspaceStore,
+    SavedLayout, SavedPane, SavedSource, SshStartup, Workspace, WorkspaceLaunch, WorkspaceStore,
 };
 
 mod duplicate;
@@ -9,6 +9,53 @@ mod save;
 pub(super) use duplicate::{ClosedPane, ClosedTab, ClosedTabWindow, PreparedTabLayout};
 #[cfg(feature = "ui-smoke")]
 pub(super) use save::Action as SaveWorkspaceAction;
+
+impl TerminalApp {
+    pub(super) fn control_open_workspace(
+        &mut self,
+        name: &str,
+        activate: bool,
+        context: &ComponentContext<Self>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let launch = WorkspaceLaunch::load(&WorkspaceStore::open()?, name, self.store.path())?;
+        let preferences = self.appearance.read().unwrap().pane_preferences();
+        let previous = self.tabs.active_id();
+        let groups =
+            append_resolved_workspace(&mut self.tabs, &launch.layout, launch.sources, preferences);
+        let workspace_active_pane = self.tabs.active().and_then(AppTab::pane_id);
+        let tabs: Vec<_> = groups
+            .into_iter()
+            .map(|tab_id| {
+                let panes: Vec<_> = self
+                    .tabs
+                    .group_layout(tab_id)
+                    .expect("restored tab has a layout")
+                    .leaves()
+                    .into_iter()
+                    .filter_map(|id| self.tabs.get(id).and_then(AppTab::pane_id))
+                    .collect();
+                serde_json::json!({ "tab_id": tab_id, "panes": panes })
+            })
+            .collect();
+        let active = activate || previous.is_none();
+        if !activate && let Some(previous) = previous {
+            self.tabs.select(previous);
+        }
+        self.sync_selection(context);
+        if active {
+            self.activate(context);
+        } else {
+            self.publish_panes();
+        }
+        Ok(serde_json::json!({
+            "name": name,
+            "window_id": self.registry.window_id(),
+            "tabs": tabs,
+            "workspace_active_pane": workspace_active_pane,
+            "active": active,
+        }))
+    }
+}
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {
@@ -611,7 +658,7 @@ pub(super) fn append_resolved_workspace(
     workspace: &Workspace,
     mut sources: BTreeMap<u64, Source>,
     preferences: impl Into<PanePreferences> + Copy,
-) {
+) -> Vec<TabId> {
     restore_tabs(tabs, workspace, |pane| {
         let source = sources
             .remove(&pane.slot)
@@ -658,7 +705,7 @@ pub(super) fn append_resolved_workspace(
             live.pane_font_size.set(pane.font_size);
         }
         tab
-    });
+    })
 }
 
 fn first_leaf(mut layout: &SavedLayout) -> &SavedPane {
@@ -676,7 +723,7 @@ fn restore_tabs<T>(
     tabs: &mut Tabs<T>,
     workspace: &Workspace,
     mut create: impl FnMut(&SavedPane) -> T,
-) {
+) -> Vec<TabId> {
     fn restore_split<T>(
         tabs: &mut Tabs<T>,
         layout: &SavedLayout,
@@ -709,8 +756,10 @@ fn restore_tabs<T>(
         }
     }
     let mut active = None;
+    let mut groups = Vec::with_capacity(workspace.tabs.len());
     for (index, tab) in workspace.tabs.iter().enumerate() {
         let entry = tabs.insert(create(first_leaf(&tab.layout)));
+        groups.push(tabs.group_id(entry).expect("new tab has a group"));
         tabs.set_group_title(entry, tab.title.clone());
         tabs.set_group_color(entry, tab.tab_color);
         tabs.set_group_pinned(entry, tab.pinned);
@@ -723,6 +772,7 @@ fn restore_tabs<T>(
         }
     }
     tabs.select(active.expect("validated workspace has an active tab"));
+    groups
 }
 
 #[cfg(feature = "ui-smoke")]

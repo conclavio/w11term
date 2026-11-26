@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] open-workspace --window ID --name NAME [--activate]\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -77,6 +77,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "list-ssh-groups"
             | "list-saved-ssh-groups"
             | "open-ssh-group"
+            | "open-workspace"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
             | "get-ssh-group-retry-plan"
@@ -164,15 +165,15 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
     }
     let verb = verb.context(HELP)?;
     let request = match verb.as_str() {
-        "list" | "list-windows" => {
+        "list" | "list-windows" | "list-workspaces" => {
             ensure!(
                 pane.is_none() && payload.is_none() && path.is_none() && !no_paste,
                 "{verb} takes no pane/input options"
             );
-            if verb == "list-windows" {
-                Request::ListWindows
-            } else {
-                Request::List
+            match verb.as_str() {
+                "list-windows" => Request::ListWindows,
+                "list-workspaces" => Request::ListWorkspaces,
+                _ => Request::List,
             }
         }
         "get-text" => {
@@ -362,6 +363,44 @@ mod tests {
             "open --profile desk --window 0",
             "open --profile desk --window 1 --window 2",
             "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn lists_and_opens_saved_workspaces() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("list-workspaces --pid 7").unwrap(),
+            (Some(7), Request::ListWorkspaces)
+        ));
+        let (_, request) = parse(
+            [
+                "open-workspace",
+                "--window",
+                "12",
+                "--name",
+                "Fleet Ops",
+                "--activate",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb": "open-workspace", "window_id": 12, "name": "Fleet Ops", "activate": true,
+            })
+        );
+        for invalid in [
+            "list-workspaces --window 1",
+            "open-workspace --name fleet",
+            "open-workspace --window 1",
+            "open-workspace --window 0 --name fleet",
+            "open-workspace --window 1 --window 2 --name fleet",
+            "open-workspace --window 1 --name fleet --name another",
+            "open-workspace --window 1 --name fleet --pane 2",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

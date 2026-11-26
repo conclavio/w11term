@@ -157,12 +157,6 @@ pub(super) fn view(
 }
 
 fn layout_summary(label: &str, workspace: &Workspace) -> View {
-    fn pane_count(layout: &SavedLayout) -> usize {
-        match layout {
-            SavedLayout::Leaf(_) => 1,
-            SavedLayout::Split { first, second, .. } => pane_count(first) + pane_count(second),
-        }
-    }
     fn quantity(count: usize, unit: &str) -> String {
         format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
     }
@@ -172,7 +166,7 @@ fn layout_summary(label: &str, workspace: &Workspace) -> View {
         .iter()
         .enumerate()
         .map(|(index, tab)| {
-            let count = pane_count(&tab.layout);
+            let count = tab.layout.pane_count();
             panes += count;
             let title = tab
                 .title
