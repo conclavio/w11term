@@ -213,6 +213,17 @@ out of the retained history. After a gap or reconnect, take a new cursor with
 `list-commands`. Use a pane dedicated to the script if it needs to attribute
 the next completion to a particular input.
 
+Add `--output-file PATH` to either `get-command` or `wait-command` to save
+the captured text as UTF-8 without a BOM. The file preserves the capture's
+line endings and trailing whitespace. The CLI resolves relative paths from
+its current directory. The destination directory must already exist.
+
+The reply still includes the command metadata and exit code. It sets
+`output` to `null` and returns `output_file` with the absolute `path` and
+`bytes` saved. An empty capture produces a zero-byte file. A failed or
+unavailable capture leaves the destination untouched. Pass `--overwrite`
+to replace an existing file with the complete new capture.
+
 Direct pipe clients use these JSON requests.
 
 ```json
@@ -220,7 +231,11 @@ Direct pipe clients use these JSON requests.
 {"verb":"list-commands","pane":2,"status":"failed"}
 {"verb":"get-command","pane":2,"id":5,"connection_generation":1}
 {"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"timeout_seconds":60}
+{"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"output_file":{"path":"C:\\Logs\\capture.txt"}}
 ```
+
+For either command, direct pipe clients send an absolute `output_file.path`
+and may set `output_file.overwrite` to `true`.
 
 `get-command` returns `pane`, `connection_generation`, `id`, `command`,
 `exit_code`, `output`, and `output_error`. Output preserves Unicode text,

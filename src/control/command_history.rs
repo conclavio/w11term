@@ -1,6 +1,27 @@
 use super::*;
 use wezterm_term::CompletedCommand;
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandOutputFile {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overwrite: bool,
+}
+
+impl CommandOutputFile {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.path.is_absolute(),
+            "command output path must be absolute"
+        );
+        ensure!(
+            self.path.file_name().is_some(),
+            "Choose a command output file name"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommandStatus {
@@ -60,16 +81,23 @@ impl Registry {
         pane: u64,
         id: u64,
         connection_generation: u64,
+        output_file: Option<CommandOutputFile>,
     ) -> Result<Value> {
+        if let Some(destination) = &output_file {
+            destination.validate()?;
+        }
         // Resolve the connection and record against the same committed frame.
         let (frame, _) = Self::capture(&self.pane(pane)?).await?;
         check_generation(&frame, pane, connection_generation)?;
         let entry = frame
-            .command_history
-            .iter()
-            .find(|entry| entry.id == id)
-            .with_context(|| format!("command {id} is not retained in pane {pane}"))?;
-        Ok(command_detail(pane, connection_generation, entry))
+            .command_for_link(crate::events::CommandLink {
+                generation: connection_generation,
+                id,
+            })
+            .with_context(|| format!("command {id} is not retained in pane {pane}"))?
+            .clone();
+        drop(frame);
+        reply_command(pane, connection_generation, entry, output_file).await
     }
 
     pub(super) async fn wait_command(
@@ -78,11 +106,15 @@ impl Registry {
         after_id: u64,
         connection_generation: u64,
         timeout_seconds: u64,
+        output_file: Option<CommandOutputFile>,
     ) -> Result<Value> {
         ensure!(
             (1..=3600).contains(&timeout_seconds),
             "wait timeout must be 1..=3600 seconds"
         );
+        if let Some(destination) = &output_file {
+            destination.validate()?;
+        }
         let target = self.pane(pane)?;
         let events = if connection_generation == 0 {
             None
@@ -122,7 +154,7 @@ impl Registry {
             events.is_none_or(|events| events.terminal_connection_is(connection_generation)),
             STALE
         );
-        Ok(command_detail(pane, connection_generation, &entry))
+        reply_command(pane, connection_generation, entry, output_file).await
     }
 }
 
@@ -154,8 +186,18 @@ fn next_command(frame: &Snapshot, after_id: u64) -> Result<Option<&Arc<Completed
     Ok(next)
 }
 
-fn command_detail(pane: u64, connection_generation: u64, entry: &CompletedCommand) -> Value {
-    json!({
+async fn reply_command(
+    pane: u64,
+    connection_generation: u64,
+    entry: Arc<CompletedCommand>,
+    output_file: Option<CommandOutputFile>,
+) -> Result<Value> {
+    let output = if output_file.is_none() {
+        entry.output.as_ref().ok()
+    } else {
+        None
+    };
+    let mut result = json!({
         "pane": pane,
         "connection_generation": connection_generation,
         "id": entry.id,
@@ -165,9 +207,21 @@ fn command_detail(pane: u64, connection_generation: u64, entry: &CompletedComman
         "finished_unix_ms": entry.timing.finished_unix_ms,
         "duration_ms": entry.timing.duration_ms,
         "exit_code": entry.exit_code,
-        "output": entry.output.as_ref().ok(),
+        "output": output,
         "output_error": entry.output.as_ref().err(),
-    })
+    });
+    if let Some(CommandOutputFile { path, overwrite }) = output_file {
+        let published = tokio::task::spawn_blocking(move || {
+            let text = entry.output.as_deref().map_err(|error| {
+                anyhow::anyhow!("command {} output is unavailable: {error}", entry.id)
+            })?;
+            crate::transcript::save(&path, text, overwrite)?;
+            Ok::<_, anyhow::Error>(json!({"path": path, "bytes": text.len()}))
+        })
+        .await??;
+        result["output_file"] = published;
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -331,6 +385,60 @@ mod tests {
         assert!(before.same_presentation(&after));
         let pane = registry.pane(23).unwrap();
         assert!(pane.read_only && !pane.active && !pane.visible);
+    }
+
+    #[tokio::test]
+    async fn output_export_preserves_bytes_keeps_existing_files_and_reports_unavailable_output() {
+        let (registry, _session) = pane(concat!(
+            "\x1b]133;C\x07雪\r\n\r\nend\x1b]133;D;7\x07",
+            "\x1b]133;C\x07\x1b]133;D;0\x07",
+            "\x1b]133;D;1\x07",
+        ));
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("captured output.txt");
+        let get = |id, overwrite| {
+            json!({
+                "verb":"get-command","pane":23,"id":id,"connection_generation":0,
+                "output_file":{"path":path,"overwrite":overwrite}
+            })
+        };
+        let bytes = "雪\r\n\r\nend".as_bytes();
+        let saved = execute(&registry, get(1, false)).await.unwrap();
+        assert_eq!(saved["id"], 1);
+        assert_eq!(saved["exit_code"], 7);
+        assert!(saved["output"].is_null());
+        assert_eq!(
+            saved["output_file"],
+            json!({"path":path,"bytes":bytes.len()})
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        assert!(execute(&registry, get(2, false)).await.is_err());
+        assert!(
+            execute(&registry, get(3, true))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("output is unavailable")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let empty = execute(&registry, get(2, true)).await.unwrap();
+        assert_eq!(empty["output_file"]["bytes"], 0);
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);
+
+        let relative = json!({
+            "verb":"wait-command","pane":23,"after_id":3,"connection_generation":0,
+            "output_file":{"path":"relative.txt"}
+        });
+        assert!(
+            execute(&registry, relative)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("path must be absolute")
+        );
     }
 
     #[tokio::test]

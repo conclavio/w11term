@@ -227,6 +227,7 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
                 after_id: old.latest_command_id,
                 connection_generation: 0,
                 timeout_seconds: 1,
+                output_file: None,
             },
             screenshot.clone(),
         ));

@@ -31,9 +31,11 @@ function Get-Entry([int]$Id, [long]$Generation) {
     }
     return $entry
 }
-function Start-CommandWait([uint64]$After, [uint64]$Generation, [string]$Name) {
+function Start-CommandWait([uint64]$After, [uint64]$Generation, [string]$Name, [string]$OutputFile) {
     $path = Join-Path $State "$Name.json"
-    $process = Start-Process -FilePath $Cli -ArgumentList @('--pid',"$($app.Id)",'wait-command','--pane',"$remote",'--after-id',"$After",'--connection-generation',"$Generation",'--timeout','15') -WindowStyle Hidden -PassThru -RedirectStandardOutput $path
+    $arguments = @('--pid',"$($app.Id)",'wait-command','--pane',"$remote",'--after-id',"$After",'--connection-generation',"$Generation",'--timeout','15')
+    if ($OutputFile) { $arguments += @('--output-file', ('"' + $OutputFile + '"')) }
+    $process = Start-Process -FilePath $Cli -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $path
     try {
         $null = $process.Handle
         if ($process.WaitForExit(250)) { throw "Command wait returned before the peer acted: $([IO.File]::ReadAllText($path))" }
@@ -41,6 +43,14 @@ function Start-CommandWait([uint64]$After, [uint64]$Generation, [string]$Name) {
     } catch {
         $process.Dispose()
         throw
+    }
+}
+function Check-SavedOutput($Entry, [string]$ExpectedPath) {
+    $expected = [Text.Encoding]::UTF8.GetBytes($outputText)
+    if ($Entry.output_file.path -ne $ExpectedPath -or $Entry.output_file.bytes -ne $expected.Length -or
+        $null -ne $Entry.output -or $null -ne $Entry.output_error -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($ExpectedPath)) -cne [Convert]::ToBase64String($expected)) {
+        throw "Command output export changed the full bytes or the receipt: $($Entry | ConvertTo-Json -Compress)"
     }
 }
 function Complete-CommandWait($Wait, [int]$ExitCode) {
@@ -104,6 +114,9 @@ try {
     if ($first.command -cne $command -or $first.exit_code -ne 17 -or $first.output -cne $outputText -or $null -ne $first.output_error) {
         throw "Wrapped command or output changed: $($first | ConvertTo-Json -Compress)"
     }
+    $firstFile = Join-Path $State 'original capture.txt'
+    $firstSaved = Control @('get-command','--pane',"$remote",'--id',"$firstId",'--connection-generation',"$v1",'--output-file',$firstFile)
+    Check-SavedOutput $firstSaved $firstFile
     $empty = Get-Entry $rows[1].id $v1
     if ($null -ne $empty.command -or $null -ne $empty.exit_code -or $null -eq $empty.output -or $empty.output -cne '' -or $null -ne $empty.output_error) {
         throw "Empty output or unknown shell metadata changed: $($empty | ConvertTo-Json -Compress)"
@@ -118,22 +131,25 @@ try {
 
     $after = $listing.latest_id
     Expect-Failure @('wait-command','--pane',"$remote",'--after-id',"$after",'--connection-generation',"$v1",'--timeout','1') 'timed out'
-    $pending = Start-CommandWait $after $v1 'pending-command'
+    $waitFile = Join-Path $State 'new capture.txt'
+    $pending = Start-CommandWait $after $v1 'pending-command' $waitFile
     [IO.File]::Delete((Join-Path $peer 'hold-shell-output'))
     $repeated = (Complete-CommandWait $pending 0).result
     if ($repeated.pane -ne $remote -or $repeated.connection_generation -ne $v1 -or
         $repeated.id -ne ($after + 1) -or $repeated.command -cne $command -or
-        $repeated.exit_code -ne 6 -or $repeated.output -cne $outputText -or $null -ne $repeated.output_error) {
+        $repeated.exit_code -ne 6) {
         throw "Waiting for the repeated command returned the wrong record: $($repeated | ConvertTo-Json -Compress)"
     }
+    Check-SavedOutput $repeated $waitFile
     Check-FocusAndLock
 
     # Have the peer drop the original transport while this pane is still read-only.
-    $oldWait = Start-CommandWait $repeated.id $v1 'stale-command'
+    $staleFile = Join-Path $State 'must stay absent.txt'
+    $oldWait = Start-CommandWait $repeated.id $v1 'stale-command' $staleFile
     [IO.File]::Copy((Join-Path $State 'replacement.vt'), (Join-Path $peer 'copy-history.vt'), $true)
     [IO.File]::Delete((Join-Path $peer 'keep-first-connection'))
     $stale = Complete-CommandWait $oldWait 1
-    if ($stale.error -notmatch 'connection changed|connection generation changed') {
+    if ($stale.error -notmatch 'connection changed|connection generation changed' -or [IO.File]::Exists($staleFile)) {
         throw "A wait on the old transport returned an unexpected error: $($stale.error)"
     }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','25','history-two-ready')

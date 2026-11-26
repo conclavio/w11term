@@ -32,7 +32,7 @@ mod registry;
 pub(crate) mod security;
 mod sftp_transfers;
 mod ssh_groups;
-pub use command_history::CommandStatus;
+pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
 pub use sftp_transfers::{SftpCancelState, SftpTransferStatus};
@@ -301,11 +301,15 @@ pub enum Request {
         pane: u64,
         id: u64,
         connection_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<CommandOutputFile>,
     },
     WaitCommand {
         pane: u64,
         after_id: u64,
         connection_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<CommandOutputFile>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
@@ -1236,15 +1240,26 @@ impl Registry {
                 pane,
                 id,
                 connection_generation,
-            } => self.get_command(pane, id, connection_generation).await,
+                output_file,
+            } => {
+                self.get_command(pane, id, connection_generation, output_file)
+                    .await
+            }
             Request::WaitCommand {
                 pane,
                 after_id,
                 connection_generation,
+                output_file,
                 timeout_seconds,
             } => {
-                self.wait_command(pane, after_id, connection_generation, timeout_seconds)
-                    .await
+                self.wait_command(
+                    pane,
+                    after_id,
+                    connection_generation,
+                    timeout_seconds,
+                    output_file,
+                )
+                .await
             }
             Request::Playback { pane, action } => {
                 let (reply, response) = oneshot::channel();

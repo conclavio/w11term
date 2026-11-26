@@ -998,7 +998,8 @@ mod tests {
                 Request::GetCommand {
                     pane: 2,
                     id: 53,
-                    connection_generation: 0
+                    connection_generation: 0,
+                    output_file: None
                 }
             )
         ));
@@ -1032,7 +1033,8 @@ mod tests {
                     pane: 7,
                     after_id: 0,
                     connection_generation: 0,
-                    timeout_seconds: 2
+                    timeout_seconds: 2,
+                    output_file: None
                 }
             )
         ));
@@ -1046,6 +1048,40 @@ mod tests {
             "wait-command --pane 7 --after-id 0 --connection-generation 0 --timeout 0",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn command_capture_file_flags_keep_paths_and_require_an_explicit_destination() {
+        let destination = "test folder/output.txt";
+        for options in [
+            ["get-command", "--id", "9"],
+            ["wait-command", "--after-id", "8"],
+        ] {
+            let parse_options = |extra: &[&str]| {
+                parse(
+                    options
+                        .into_iter()
+                        .chain(["--pane", "7", "--connection-generation", "1"])
+                        .chain(extra.iter().copied())
+                        .map(str::to_owned),
+                )
+            };
+            let (_, request) =
+                parse_options(&["--overwrite", "--output-file", destination]).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["output_file"],
+                serde_json::json!({"path": std::path::absolute(destination).unwrap(), "overwrite": true})
+            );
+            for extra in [
+                vec!["--overwrite"],
+                vec!["--output-file"],
+                vec!["--output-file", "--overwrite"],
+                vec!["--output-file", ""],
+                vec!["--output-file", destination, "--output-file", "duplicate"],
+            ] {
+                assert!(parse_options(&extra).is_err(), "{options:?} {extra:?}");
+            }
         }
     }
 
