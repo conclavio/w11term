@@ -1104,7 +1104,7 @@ The integration tests start ephemeral **loopback-only** SSH servers with generat
 
 Pull requests run the Rust suite and native Windows tests, including GUI automation, record/replay, ConPTY beside SSH, and a relocated release-package launch. The Rust job reports line coverage for `src/` and uploads LCOV and per-file JSON reports. Native GUI scenarios run in a separate job. Linux jobs check durable PTY recovery and compare graphics against upstream kitty. The Actions run includes the tested Windows x64 ZIP and checksum for download. [CI workflow](.github/workflows/windows-ci.yml)
 
-A merge into `main` reruns these checks at the merged commit. After they pass, GitHub publishes that run's verified ZIP and checksum under a `build-<commit>` release tag. Re-running the workflow preserves an existing published release. [GitHub Releases](https://github.com/conclavio/w11term/releases)
+A merge into `main` reruns these checks at the merged commit. After they pass, GitHub publishes that run's verified ZIP and checksum under a `build-<commit>` release tag. **Latest** follows the newest verified commit on `main` even when older builds finish later. Re-running the workflow preserves an existing published release. [GitHub Releases](https://github.com/conclavio/w11term/releases)
 
 The optional `ui-smoke` feature exercises the real native control lifecycle using only local terminal labs: independent tab buffers, switching, reordering, closing a background tab, Settings, and profile-form validation. It does not save a profile or connect to a server:
 
