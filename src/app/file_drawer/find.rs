@@ -697,6 +697,14 @@ impl Panel {
                         ready && !marked.is_empty(),
                     ),
                 ));
+                actions.push(KeyedView::new(
+                    "delete-marked",
+                    button(
+                        "Delete marked entries…",
+                        Action::StartFolderBatch(serial, FolderBatchKind::Delete),
+                        ready && !marked.is_empty(),
+                    ),
+                ));
             }
             rows.push(KeyedView::new(
                 "marking",

@@ -3504,6 +3504,50 @@ async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews, confirms and stops native SFTP deletes in the listing and search"]
+async fn native_sftp_deletes_only_reviewed_marks_and_stops_on_failure_or_request() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let root = remote.path();
+    let folder = root.join("shell directory");
+    for directory in ["a-empty", "b-occupied", "nested"] {
+        fs::create_dir_all(folder.join(directory)).unwrap();
+    }
+    for (name, bytes) in [
+        ("b-occupied/keep.txt", "inhabitant"),
+        ("c-queued.txt", "should survive failure"),
+        ("search-batch.txt", "root copy"),
+        ("nested/search-batch.txt", "should survive stop"),
+    ] {
+        fs::write(folder.join(name), bytes).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("fixture-root"), root.to_str().unwrap()).unwrap();
+    fs::write(root.join("delete-trace.jsonl"), []).unwrap();
+
+    drive_mixed_gui("sftp-delete-marked-ui.ps1", &ssh, state.path());
+    assert!(!folder.join("a-empty").exists());
+    assert!(!folder.join("search-batch.txt").exists());
+    for (name, bytes) in [
+        ("b-occupied/keep.txt", "inhabitant"),
+        ("c-queued.txt", "should survive failure"),
+        ("nested/search-batch.txt", "should survive stop"),
+    ] {
+        assert_eq!(fs::read(folder.join(name)).unwrap(), bytes.as_bytes());
+    }
+    assert_eq!(
+        mutation_trace(root, "delete-trace.jsonl"),
+        [
+            ["RMDIR", "/shell directory/a-empty"],
+            ["RMDIR", "/shell directory/b-occupied"],
+            ["REMOVE", "/shell directory/search-batch.txt"],
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "previews, checks and stops marked renames in the native SFTP listing and search"]
 async fn native_sftp_renames_marked_entries_with_preflight_and_stop() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

@@ -450,7 +450,9 @@ impl EditAction {
     fn uses_folder_picker(&self) -> bool {
         matches!(
             self,
-            Self::Move(..) | Self::FolderBatch(..) | Self::Copy(_, CopyFileMode::ToFolder)
+            Self::Move(..)
+                | Self::FolderBatch(FolderBatchKind::Move | FolderBatchKind::Copy, ..)
+                | Self::Copy(_, CopyFileMode::ToFolder)
         )
     }
 
@@ -545,6 +547,7 @@ impl EntryDialog {
                 ensure!(self.name != target.name(), "Enter a different name");
                 entry_path(parent()?, &self.name)
             }
+            EditAction::FolderBatch(FolderBatchKind::Delete, ..) => Ok(String::new()),
             EditAction::Move(..)
             | EditAction::FolderBatch(..)
             | EditAction::Copy(_, CopyFileMode::ToFolder) => {
@@ -1679,6 +1682,56 @@ impl FileDrawer {
         if let EditAction::RenameMarked(review) = &dialog.action {
             return Some(review.dialog(dialog, pane, generation, ssh, context));
         }
+        if let EditAction::FolderBatch(FolderBatchKind::Delete, _, hits) = &dialog.action {
+            let paths = hits
+                .iter()
+                .map(|hit| {
+                    let kind = if hit.kind == Some(EntryKind::Directory) {
+                        "Folder"
+                    } else {
+                        "File"
+                    };
+                    format!("{kind} · {}/{}", hit.parent.trim_end_matches('/'), hit.name)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(
+                ContentDialog::new()
+                    .title("Delete marked remote entries?")
+                    .primary_button_text("Delete entries")
+                    .close_button_text("Cancel")
+                    .is_open(true)
+                    .on_closed(context.callback(move |result| {
+                        Message::Files(FileAction::FinishEdit(pane, generation, serial, result))
+                    }))
+                    .content(
+                        StackPanel::new().spacing(8.0).min_width(300.0).children((
+                            TextBlock::new()
+                                .text(format!(
+                                    "{} {} on {}@{}:{}",
+                                    hits.len(),
+                                    FolderBatchKind::Delete.subject(hits.len()),
+                                    ssh.user,
+                                    ssh.host,
+                                    ssh.port
+                                ))
+                                .text_wrapping(TextWrapping::Wrap),
+                            TextBlock::new()
+                                .text("Deletion is permanent. Only empty folders can be deleted.")
+                                .text_wrapping(TextWrapping::Wrap),
+                            ScrollViewer::new()
+                                .max_height(190.0)
+                                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                                .content(
+                                    TextBlock::new()
+                                        .automation_id("sftp-delete-review-paths")
+                                        .text(paths)
+                                        .text_wrapping(TextWrapping::Wrap),
+                                ),
+                        )),
+                    ),
+            );
+        }
         let valid = dialog.destination();
         if let EditAction::Delete(_, kind) = &dialog.action {
             let title = match kind {
@@ -1726,7 +1779,8 @@ impl FileDrawer {
             EditAction::FolderBatch(FolderBatchKind::Copy, ..) => {
                 ("Copy marked files", "Destination folder", "Copy")
             }
-            EditAction::RenameMarked(_) | EditAction::FolderBatch(FolderBatchKind::Rename, ..) => {
+            EditAction::RenameMarked(_)
+            | EditAction::FolderBatch(FolderBatchKind::Rename | FolderBatchKind::Delete, ..) => {
                 unreachable!()
             }
             EditAction::VerifyDownload(_) => (
@@ -2403,6 +2457,11 @@ impl FileDrawer {
                         "Rename marked entries…",
                         writable && generation != 0 && !marked.is_empty(),
                         StartFolderBatch(pane, generation, revision, FolderBatchKind::Rename),
+                    ),
+                    button(
+                        "Delete marked entries…",
+                        writable && generation != 0 && !marked.is_empty(),
+                        StartFolderBatch(pane, generation, revision, FolderBatchKind::Delete),
                     ),
                     button(
                         "Exit selection",
@@ -3907,7 +3966,11 @@ impl TerminalApp {
                     if let Some(dialog) = files.dialog.as_mut().filter(|e| {
                         e.serial == serial
                             && e.destination_picker.is_none()
-                            && !matches!(e.action, EditAction::Delete(..))
+                            && !matches!(
+                                e.action,
+                                EditAction::Delete(..)
+                                    | EditAction::FolderBatch(FolderBatchKind::Delete, ..)
+                            )
                     }) {
                         dialog.name = name;
                     }

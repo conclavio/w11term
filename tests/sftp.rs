@@ -566,6 +566,7 @@ impl Files {
         } else {
             fs::remove_file(path).map_err(io)?;
         }
+        self.hold_response("hold-delete-reply").await;
         if self.root.join("disconnect-after-delete").is_file() {
             let _ = self
                 .ssh

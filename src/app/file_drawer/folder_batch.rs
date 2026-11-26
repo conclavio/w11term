@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
-use w11term::sftp::{MOVE_OUTCOME_UNKNOWN, RENAME_OUTCOME_UNKNOWN, ReviewedRename};
+use w11term::sftp::{
+    DELETE_OUTCOME_UNKNOWN, MOVE_OUTCOME_UNKNOWN, RENAME_OUTCOME_UNKNOWN, ReviewedRename,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Origin {
@@ -13,6 +15,7 @@ pub enum Kind {
     Move,
     Copy,
     Rename,
+    Delete,
 }
 
 impl Kind {
@@ -21,13 +24,14 @@ impl Kind {
             Self::Move => "move",
             Self::Copy => "copy",
             Self::Rename => "rename",
+            Self::Delete => "delete",
         }
     }
 
     pub(super) fn subject(self, count: usize) -> &'static str {
         match (self, count) {
-            (Self::Move | Self::Rename, 1) => "entry",
-            (Self::Move | Self::Rename, _) => "entries",
+            (Self::Move | Self::Rename | Self::Delete, 1) => "entry",
+            (Self::Move | Self::Rename | Self::Delete, _) => "entries",
             (Self::Copy, 1) => "file",
             (Self::Copy, _) => "files",
         }
@@ -38,6 +42,7 @@ impl Kind {
             Self::Move => "moving",
             Self::Copy => "copying",
             Self::Rename => "renaming",
+            Self::Delete => "deleting",
         }
     }
 }
@@ -50,6 +55,7 @@ pub(super) struct ListingRefresh {
 enum Plan {
     Move(String),
     Copy(String),
+    Delete,
     Rename {
         names: HashMap<String, String>,
         preflight_cancel: TransferCancel,
@@ -61,6 +67,7 @@ impl Plan {
         match self {
             Self::Move(_) => Kind::Move,
             Self::Copy(_) => Kind::Copy,
+            Self::Delete => Kind::Delete,
             Self::Rename { .. } => Kind::Rename,
         }
     }
@@ -90,7 +97,11 @@ fn validate_sources(kind: Kind, hits: &[FilenameMatch]) -> Result<()> {
     let mut names = HashSet::new();
     let mut directories = HashSet::new();
     for hit in hits {
-        let path = entry_path(&hit.parent, &hit.name)?;
+        let path = if kind == Kind::Delete {
+            delete_path(&hit.parent, &hit.name)?
+        } else {
+            entry_path(&hit.parent, &hit.name)?
+        };
         match kind {
             Kind::Move | Kind::Rename => ensure!(
                 matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
@@ -100,12 +111,20 @@ fn validate_sources(kind: Kind, hits: &[FilenameMatch]) -> Result<()> {
                 hit.kind == Some(EntryKind::File),
                 "Mark regular files to copy"
             ),
+            Kind::Delete => ensure!(
+                matches!(hit.kind, Some(EntryKind::File | EntryKind::Directory)),
+                "Mark regular files or empty folders to delete"
+            ),
         }
-        ensure!(
-            names.insert(hit.name.as_str()),
-            "Marked entries share the name {}. They need separate destinations.",
-            hit.name
-        );
+        if kind == Kind::Delete {
+            ensure!(names.insert(path.clone()), "Duplicate marked path {path}");
+        } else {
+            ensure!(
+                names.insert(hit.name.clone()),
+                "Marked entries share the name {}. They need separate destinations.",
+                hit.name
+            );
+        }
         if hit.kind == Some(EntryKind::Directory) {
             directories.insert(path);
         }
@@ -115,7 +134,8 @@ fn validate_sources(kind: Kind, hits: &[FilenameMatch]) -> Result<()> {
         while !ancestor.is_empty() {
             ensure!(
                 !directories.contains(ancestor),
-                "Unmark entries inside {ancestor} before moving that folder"
+                "Unmark entries inside {ancestor} before {} that folder",
+                kind.ongoing()
             );
             ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
         }
@@ -135,6 +155,7 @@ impl Batch {
             Kind::Move => Plan::Move(destination),
             Kind::Copy => Plan::Copy(destination),
             Kind::Rename => bail!("Choose the new names before starting a rename"),
+            Kind::Delete => Plan::Delete,
         };
         Self::with_plan(id, origin, hits, plan)
     }
@@ -220,6 +241,12 @@ impl Batch {
                 self.total,
                 Kind::Rename.subject(self.total)
             ),
+            Plan::Delete => format!(
+                "Deleted {} of {} marked {}",
+                self.confirmed,
+                self.total,
+                Kind::Delete.subject(self.total)
+            ),
         }
     }
 
@@ -250,6 +277,7 @@ impl Batch {
                     Kind::Move => MOVE_OUTCOME_UNKNOWN,
                     Kind::Copy => "Copy outcome unknown; refresh the destination folder",
                     Kind::Rename => RENAME_OUTCOME_UNKNOWN,
+                    Kind::Delete => DELETE_OUTCOME_UNKNOWN,
                 };
                 format!(
                     "{}. SSH reconnected while {} {}. {advice}.",
@@ -306,6 +334,8 @@ impl FileDrawer {
                         (Kind::Copy, false) => "Stop after current copy",
                         (Kind::Rename, true) => "Stopping after current rename…",
                         (Kind::Rename, false) => "Stop after current rename",
+                        (Kind::Delete, true) => "Stopping after current delete…",
+                        (Kind::Delete, false) => "Stop after current delete",
                     }
                 }),
         )
@@ -413,11 +443,17 @@ impl FileDrawer {
                 )?,
                 search_kind: batch.current.kind,
             },
+            Plan::Delete => Operation::RemoveEntry {
+                path: delete_path(&batch.current.parent, &batch.current.name)?,
+                kind: batch.current.kind.context("Missing reviewed entry type")?,
+                check_parent: true,
+            },
         };
         let (activity, subject) = match batch.plan.kind() {
             Kind::Move => ("Moving", "entry"),
             Kind::Copy => ("Copying", "file"),
             Kind::Rename => ("Renaming", "entry"),
+            Kind::Delete => ("Deleting", "entry"),
         };
         self.status = format!(
             "{activity} marked {subject} {} of {}…",
@@ -482,9 +518,15 @@ impl FileDrawer {
                             },
                         )?;
                     }
-                    (Plan::Move(_) | Plan::Rename { .. }, Origin::Listing(revision)) => {
-                        self.discard_moved_row(revision, &batch.current)
-                    }
+                    (Plan::Delete, Origin::Search(serial)) => self.apply_search_change(
+                        serial,
+                        &batch.current,
+                        &EntryChange::Delete(batch.current.name.clone()),
+                    )?,
+                    (
+                        Plan::Move(_) | Plan::Rename { .. } | Plan::Delete,
+                        Origin::Listing(revision),
+                    ) => self.discard_batch_row(revision, &batch.current),
                     (Plan::Copy(_), Origin::Listing(_)) => {}
                 }
                 if let Some(next) = batch.remaining.pop_front() {
@@ -494,19 +536,23 @@ impl FileDrawer {
                 batch.completed()
             }
             Err(error) => {
-                if (batch.plan.kind() == Kind::Move && error.contains(MOVE_OUTCOME_UNKNOWN))
-                    || (batch.plan.kind() == Kind::Rename && error.contains(RENAME_OUTCOME_UNKNOWN))
-                {
+                let unknown = match batch.plan.kind() {
+                    Kind::Move => error.contains(MOVE_OUTCOME_UNKNOWN),
+                    Kind::Rename => error.contains(RENAME_OUTCOME_UNKNOWN),
+                    Kind::Delete => error.contains(DELETE_OUTCOME_UNKNOWN),
+                    Kind::Copy => false,
+                };
+                if unknown {
                     match batch.origin {
                         Origin::Search(serial) => {
                             self.invalidate_search_entry(serial, &batch.current)?;
-                            // The worker could have moved this entry before it lost the reply.
+                            // The worker may have changed the entry before losing the reply.
                             if let Some(directory) = self.directory.clone() {
                                 self.accept_listing(None, directory, Vec::new());
                             }
                         }
                         Origin::Listing(revision) => {
-                            self.discard_moved_row(revision, &batch.current)
+                            self.discard_batch_row(revision, &batch.current)
                         }
                     }
                 }
@@ -525,7 +571,7 @@ impl FileDrawer {
         Ok(())
     }
 
-    fn discard_moved_row(&mut self, revision: u64, hit: &FilenameMatch) {
+    fn discard_batch_row(&mut self, revision: u64, hit: &FilenameMatch) {
         if self.listing_revision == revision
             && self.directory.as_deref() == Some(hit.parent.as_str())
         {
@@ -565,7 +611,7 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) {
         let revision = match batch {
-            (Kind::Move | Kind::Rename, Origin::Listing(revision)) => revision,
+            (Kind::Move | Kind::Rename | Kind::Delete, Origin::Listing(revision)) => revision,
             (Kind::Copy, Origin::Listing(_)) => {
                 self.status = note;
                 return;
@@ -625,6 +671,67 @@ mod tests {
             mtime: None,
             size: None,
         }
+    }
+
+    #[test]
+    fn delete_review_distinguishes_equal_leaf_names_and_rejects_ambiguous_paths() {
+        let first = hit("/project/one", "old.log", EntryKind::File);
+        let second = hit("/project/two", "old.log", EntryKind::File);
+        assert!(validate_sources(Kind::Delete, &[first.clone(), second]).is_ok());
+        assert!(validate_sources(Kind::Delete, &[first.clone(), first.clone()]).is_err());
+        assert!(
+            validate_sources(
+                Kind::Delete,
+                &[hit("/project/../other", "old.log", EntryKind::File)],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_sources(
+                Kind::Delete,
+                &[hit("/project", "one", EntryKind::Directory), first],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delete_confirmation_requires_unchanged_marks() {
+        let mut drawer = FileDrawer {
+            open: true,
+            directory: Some("/work".into()),
+            listing_revision: 1,
+            entries: vec![
+                entry("first", EntryKind::File),
+                entry("second", EntryKind::File),
+            ],
+            marked_downloads: Some(BTreeSet::from(["first".into(), "second".into()])),
+            ..Default::default()
+        };
+        drawer
+            .begin_folder_batch(Kind::Delete, Origin::Listing(1))
+            .unwrap();
+        let serial = drawer.dialog.as_ref().unwrap().serial;
+        assert!(!drawer.dialog.as_ref().unwrap().action.uses_folder_picker());
+        drawer.marked_downloads.as_mut().unwrap().remove("second");
+        assert!(
+            drawer
+                .finish_edit(serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+
+        drawer
+            .begin_folder_batch(Kind::Delete, Origin::Listing(1))
+            .unwrap();
+        let serial = drawer.dialog.as_ref().unwrap().serial;
+        let (review, _) = drawer
+            .finish_edit(serial, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(review.action, EditAction::FolderBatch(Kind::Delete, _, hits)
+            if hits.len() == 1 && hits[0].name == "first")
+        );
     }
 
     #[test]
@@ -691,7 +798,7 @@ mod tests {
             ])),
             ..Default::default()
         };
-        drawer.discard_moved_row(7, &hit("/work", "moved", EntryKind::File));
+        drawer.discard_batch_row(7, &hit("/work", "moved", EntryKind::File));
         drawer.move_listing_refresh = Some(ListingRefresh {
             directory: "/work".into(),
             note: "Moved 1 of 3 marked entries to /archive".into(),
