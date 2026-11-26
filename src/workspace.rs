@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 const VERSION: u32 = 2;
 const MAX_DEPTH: usize = 32;
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+mod profile_repair;
 mod startup;
+pub use profile_repair::MissingProfile;
 pub use startup::SshStartup;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1179,6 +1181,137 @@ mod tests {
         let mut invalid = reference;
         invalid.generation.clear();
         assert!(profile.with_session(Some(invalid)).is_err());
+    }
+
+    #[test]
+    fn workspace_repair_updates_shared_names_without_moving_startup_or_durable_sessions() {
+        let plain = ssh("dev.example");
+        let durable = SshOptions {
+            durable: true,
+            ..plain.clone()
+        };
+        let pin = format!("SHA256:{}", "A".repeat(43));
+        let mut reference = DurableReference::new(&durable, &pin);
+        reference.backend = crate::durable::Backend::Herdr;
+        reference.name = "t7".into();
+        reference.generation = format!(
+            "{}/123/112/d4156dc9-a3ad-4d94-ad77-0303577e25cc/34",
+            "a".repeat(32)
+        );
+        let startup = SshStartup::new(&plain, "/work".into(), "make".into()).unwrap();
+        let original = |name: &str| SavedSource::SavedProfile(name.into());
+        let options = [
+            original("old"),
+            SavedSource::Startup {
+                connection: Box::new(original("old")),
+                launch: startup.clone(),
+            },
+            SavedSource::HerdrDiscovery("durable-old".into())
+                .with_session(Some(reference.clone()))
+                .unwrap(),
+            SavedSource::capture(
+                &Source::Local(crate::options::LocalOptions {
+                    executable: "powershell.exe".into(),
+                    args: vec![],
+                    cwd: None,
+                    powershell_integration: false,
+                    scrollback_lines: Default::default(),
+                    color_scheme: Default::default(),
+                    font_size: None,
+                    tab_color: Default::default(),
+                }),
+                Some("old"),
+            )
+            .unwrap(),
+        ];
+        let layouts: Vec<_> = (0..options.len() as u64).map(Layout::Leaf).collect();
+        let layout = Workspace::capture(
+            layouts.iter().enumerate().map(|(i, tree)| (tree, i as u64)),
+            1,
+            |i| Ok(options[i as usize].clone()),
+        )
+        .unwrap();
+        let profiles = BTreeMap::from([
+            ("wrong".into(), ssh("other.example")),
+            ("new".into(), plain),
+            ("durable-new".into(), durable),
+        ]);
+        let missing = layout.missing_profiles(&profiles).unwrap();
+        assert_eq!(missing[0].name, "durable-old");
+        assert_eq!(missing[0].panes, 1);
+        // A discovery source enables durability on an otherwise compatible profile.
+        assert_eq!(missing[0].replacements, ["durable-new", "new"]);
+        assert_eq!(missing[1].name, "old");
+        assert_eq!(missing[1].panes, 2);
+        assert_eq!(missing[1].replacements, ["new"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
+        store.save("desk", &layout).unwrap();
+        let saved = store.entry("desk").unwrap();
+        let rejected = BTreeMap::from([
+            ("old".into(), "wrong".into()),
+            ("durable-old".into(), "durable-new".into()),
+        ]);
+        assert!(
+            store
+                .repair_profiles("desk", &saved, &rejected, &profiles)
+                .is_err()
+        );
+        assert_eq!(store.entry("desk").unwrap(), saved);
+
+        let selected = BTreeMap::from([
+            ("old".into(), "new".into()),
+            ("durable-old".into(), "durable-new".into()),
+        ]);
+        let mut restored_profiles = profiles.clone();
+        restored_profiles.insert("old".into(), profiles["new"].clone());
+        assert!(
+            store
+                .repair_profiles("desk", &saved, &selected, &restored_profiles)
+                .is_err()
+        );
+        store
+            .repair_profiles("desk", &saved, &selected, &profiles)
+            .unwrap();
+        let repaired = store.entry("desk").unwrap();
+        assert_eq!(repaired.identity, saved.identity);
+        assert_eq!(repaired.layout.active_tab, saved.layout.active_tab);
+        assert!(
+            repaired
+                .layout
+                .missing_profiles(&profiles)
+                .unwrap()
+                .is_empty()
+        );
+        let sources: Vec<_> = repaired
+            .layout
+            .tabs
+            .iter()
+            .map(|tab| {
+                let SavedLayout::Leaf(pane) = &tab.layout else {
+                    unreachable!()
+                };
+                &pane.source
+            })
+            .collect();
+        assert_eq!(sources[0], &original("new"));
+        assert_eq!(
+            sources[1],
+            &SavedSource::Startup {
+                connection: Box::new(original("new")),
+                launch: startup,
+            }
+        );
+        assert!(sources[2].is_herdr_browser());
+        assert_eq!(sources[2].profile_name(), Some("durable-new"));
+        assert_eq!(sources[2].session(), Some(&reference));
+        assert_eq!(sources[3], &options[3]);
+        assert!(
+            store
+                .repair_profiles("desk", &saved, &selected, &profiles)
+                .is_err()
+        );
     }
 
     #[test]

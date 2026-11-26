@@ -118,6 +118,12 @@ async fn native_duplicate_saved_workspace_registers_independently_when_opened() 
     run("CopyWorkspace", b"copy-recipe/original-recipe/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "repairs a missing SSH profile before opening the saved SSH and PowerShell split"]
+async fn native_repair_saved_workspace_ssh_profile_in_place() {
+    run("RepairWorkspace", b"repaired-ssh/original-ssh/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -177,6 +183,11 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             {"focused":1,"layout":leaf(1,json!({"kind":"saved_profile","value":"missing-window-profile"}))}
         ]});
     }
+    if first_close == "RepairWorkspace" {
+        let mut broken = workspaces["two-windows"].clone();
+        broken["tabs"][0]["layout"]["first"]["source"]["value"] = json!("missing-window-profile");
+        workspaces["broken-copy"] = broken;
+    }
     if first_close == "CopyWorkspace" {
         workspaces["two-windows copy"] = json!({"active_tab":0,"tabs":[
             {"focused":1,"layout":leaf(1,json!({"kind":"demo"}))}
@@ -212,7 +223,11 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     );
     let expected_ssh = 1 + usize::from(matches!(
         first_close,
-        "ProfileWindow" | "DuplicateWindow" | "WorkspaceWindow" | "CopyWorkspace"
+        "ProfileWindow"
+            | "DuplicateWindow"
+            | "WorkspaceWindow"
+            | "CopyWorkspace"
+            | "RepairWorkspace"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

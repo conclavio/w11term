@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -587,6 +587,73 @@ function Invoke-WorkspaceButton([IntPtr]$Hwnd, [string]$Name) {
     })
 }
 
+function Test-RepairWorkspace {
+    $window = $origin
+    Run-WindowCommand $origin ('Workspaces' + [char]0x2026)
+    Invoke-WorkspaceButton $origin 'Open workspace broken-copy in new window'
+    $null = Wait-Until 'the saved layout is initially unable to resolve its profile' {
+        Find-Here $origin 'Unknown workspace profile missing-window-profile'
+    }
+    Invoke-WorkspaceButton $origin 'Manage workspace broken-copy'
+    Invoke-WorkspaceButton $origin ('Repair SSH profiles' + [char]0x2026)
+    $selector = Wait-Until 'replacement is shown for the missing profile' {
+        Find-Here $origin 'Replacement for missing-window-profile'
+    }
+    if ((Find-Here $origin 'Save replacements').Current.IsEnabled) {
+        throw 'The repair offers to save before a replacement is selected'
+    }
+    $selector.SetFocus()
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selector.GetCurrentPattern($expand).Expand()
+    $options = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.'window-ssh'
+    $option = 'window-ssh ' + [char]0x00b7 + " $($options.user)@$($options.host):$($options.port)"
+    $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $item = Wait-Until 'the saved SSH profile with its reviewed endpoint' {
+        Find-Element $option ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $item.GetCurrentPattern($select).Select()
+    $null = Wait-Until 'the repair is enabled after selection' {
+        (Find-Here $origin 'Save replacements').Current.IsEnabled
+    }
+    $popup = (Find-Here $origin 'Replacement for missing-window-profile').GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    Invoke-WorkspaceButton $origin 'Save replacements'
+    $null = Wait-Until 'the repaired layout is saved' { Find-Here $origin 'Saved repaired layout broken-copy' }
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $saved = (Get-Content -LiteralPath $catalog -Raw | ConvertFrom-Json).workspaces
+    $restored = $saved.'broken-copy'
+    $original = $saved.'two-windows'
+    if (!$restored -or ($restored | ConvertTo-Json -Depth 12 -Compress) -cne
+        ($original | ConvertTo-Json -Depth 12 -Compress) -or
+        @((Control @('list')).sessions).Count -ne 3 -or [TabFixtureWindows]::OwnedBy($app.Id).Count -ne 1) {
+        throw 'Repair changed the saved layout or opened sessions'
+    }
+
+    Invoke-WorkspaceButton $origin 'Open workspace broken-copy in new window'
+    $child = Wait-DetachedWindow $origin
+    $opened = @(Wait-Until 'the repaired layout opens both tabs and all three panes' {
+        $new = @((Control @('list')).sessions | Where-Object window_id -ne $ssh.window_id)
+        if ($new.Count -eq 3 -and @($new.tab_id | Sort-Object -Unique).Count -eq 2) { $new }
+    })
+    $repairedSsh = $opened | Where-Object label -eq 'window-ssh'
+    $repairedLocal = $opened | Where-Object label -eq 'Moved PowerShell'
+    if ($repairedSsh.tab_id -ne $repairedLocal.tab_id -or $repairedSsh.tab_title -cne 'Cockpit tools') {
+        throw 'The repaired SSH pane lost its split or tab title'
+    }
+    Expect-Focus $child $repairedSsh.id 'The repaired SSH pane receives the saved focus'
+    Expect-Text $repairedSsh.id 'ready'
+    Expect-Text $repairedLocal.id 'PS '
+    Type-In $child 'repaired-ssh/'
+    Expect-Text $repairedSsh.id 'repaired-ssh/'
+    Close-FixtureWindow $child
+    Use-Window $origin
+    (Find-Here $origin 'Cockpit tools').GetCurrentPattern($select).Select()
+    Expect-Focus $origin $ssh.id 'The original SSH pane is still usable'
+    Type-In $origin 'original-ssh/'
+    Expect-Text $ssh.id 'original-ssh/'
+    Close-FixtureWindow $origin
+}
+
 function Test-CopySavedWorkspace {
     $workspaceCommand = 'Workspaces' + [char]0x2026
     $value = [System.Windows.Automation.ValuePattern]::Pattern
@@ -1008,6 +1075,13 @@ try {
         Test-CopySavedWorkspace
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'The original and duplicated workspace windows did not close normally'
+        }
+        return
+    }
+    if ($FirstClose -eq 'RepairWorkspace') {
+        Test-RepairWorkspace
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'The workspace repair windows did not close normally'
         }
         return
     }
