@@ -554,20 +554,38 @@ impl TerminalApp {
                     measured.scale,
                 );
             }
-            if !matches!(window_mode, WindowGrid::Off)
-                && let Some(((cols, rows), first)) =
-                    initial_grid.correction((measured.cols, measured.rows))
-            {
-                let (width, height) = window_size.get();
-                geometry_sender.send(Message::Geometry(
-                    width + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width) as f64,
-                    height
-                        + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
-                            - ctx.height) as f64,
-                    initial_grid.epoch(),
-                    first,
-                ));
-                return Ok(());
+            if !matches!(window_mode, WindowGrid::Off) && initial_grid.get().is_some() {
+                use crate::window_state::GridCorrection;
+                let scale = measured.scale;
+                let pixels = (
+                    (ctx.width * scale).round() as u32,
+                    (ctx.height * scale).round() as u32,
+                    (96.0 * scale).round() as u32,
+                );
+                match initial_grid.correction((measured.cols, measured.rows), pixels) {
+                    GridCorrection::Publish => {}
+                    GridCorrection::Wait => return Ok(()),
+                    GridCorrection::Resize { cols, rows, first } => {
+                        let (width, height) = native_window.hwnd()
+                            .and_then(|hwnd| crate::window_state::client_extent(hwnd, scale))
+                            .unwrap_or_else(|| window_size.get());
+                        log::debug!(
+                            "Correcting pane grid {}x{} to {cols}x{rows} from viewport {}x{} and client {width}x{height}",
+                            measured.cols, measured.rows, ctx.width, ctx.height
+                        );
+                        // Aim inside each cell to tolerate native pixel rounding.
+                        geometry_sender.send(Message::Geometry {
+                            client: (width, height),
+                            delta: (
+                                f64::from((cols as f32 + 0.5) * measured.cell_width + PADDING * 2.0 - ctx.width),
+                                f64::from((rows as f32 + 0.5) * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT - ctx.height),
+                            ),
+                            epoch: initial_grid.epoch(),
+                            first,
+                        });
+                        return Ok(());
+                    }
+                }
             }
             let size = terminal_size(measured);
             if last_size.replace(Some(size)) != Some(size) {

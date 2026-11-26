@@ -12,6 +12,14 @@ function Same-Grid($First, $Second) {
     $First.cols -eq $Second.cols -and $First.rows -eq $Second.rows -and
         $First.pixel_width -eq $Second.pixel_width -and $First.pixel_height -eq $Second.pixel_height
 }
+function Resize-Grid([int]$Pane, [int]$Cols, [int]$Rows) {
+    $null = Control @('resize','--pane',"$Pane",'--cols',"$Cols",'--rows',"$Rows")
+    $measured = Measure-Grid $Pane
+    if ($measured.cols -ne $Cols -or $measured.rows -ne $Rows) {
+        throw "Resize to ${Cols}x${Rows} acknowledged live grid $($measured.cols)x$($measured.rows)"
+    }
+    return $measured
+}
 function Check-Png([int]$Pane, [string]$Stage, $Grid) {
     $path = Join-Path $State "$Stage.png"
     $png = Control @('screenshot','--pane',"$Pane",$path)
@@ -73,6 +81,7 @@ try {
     }
     Wait-Focus $remote
 
+    $null = Resize-Grid $remote ($original.ssh.cols - 2) $original.ssh.rows
     Run-Palette 'Increase pane text size'
     $beforeMove = Wait-Until 'larger SSH cells before moving the pane' {
         $grid = Measure-Grid $remote
@@ -89,6 +98,32 @@ try {
             $grid.pixel_height / $grid.rows -eq $beforeMove.pixel_height / $beforeMove.rows) { $grid }
     }
     Check-Png $remote 'moved-ssh' $moved
+    $resized = Resize-Grid $remote 72 20
+    if ($resized.pixel_height / $resized.rows -ne $moved.pixel_height / $moved.rows) {
+        throw 'Resizing the window changed the pane-specific font'
+    }
+    Check-Png $remote 'resized-ssh' $resized
+
+    Picker-Query 'Palette PowerShell'
+    Press-Key 13
+    Wait-Focus $local
+    $localVisible = Resize-Grid $local 80 22
+    Picker-Query 'palette-ssh'
+    Press-Key 13
+    Wait-Focus $remote
+    $null = Resize-Grid $local ($localVisible.cols - 3) $localVisible.rows
+    Wait-Focus $remote
+    Picker-Query 'Palette PowerShell'
+    Press-Key 13
+    Wait-Focus $local
+    try {
+        $null = Wait-Until 'reactivated PowerShell adopts its unchanged viewport after a background resize' {
+            Same-Grid (Measure-Grid $local) $localVisible
+        }
+    } catch {
+        $actual = Measure-Grid $local
+        throw "$_. Expected $($localVisible.cols)x$($localVisible.rows) cells, measured $($actual.cols)x$($actual.rows)"
+    }
     if (@((Control @('list')).sessions).Count -ne 2) { throw 'Adjusting text size replaced a live pane' }
 } catch {
     throw "$_ at $($_.ScriptStackTrace)"

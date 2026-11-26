@@ -51,6 +51,7 @@ mod bulk_tab_close;
 mod clipboard_paste;
 mod command_history;
 mod config_import;
+mod control_resize;
 mod file_drawer;
 mod file_picker;
 mod folder_revoke;
@@ -1218,12 +1219,7 @@ pub enum Message {
     WatchRejected,
     RetryWatchers,
     Control(w11term::control::UiRequest),
-    ControlResizeDone {
-        pane: u64,
-        cols: usize,
-        rows: usize,
-        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
-    },
+    ControlResizeDone(control_resize::Completion),
     PromptEdit(TabId, u64, usize, String),
     PromptReply(TabId, u64, ContentDialogResult),
     GenerateKey(TabId),
@@ -1304,7 +1300,12 @@ pub enum Message {
     DeleteProfile(TabId),
     ConfirmDeleteProfile(TabId, bool),
     WindowSize(WindowSize),
-    Geometry(f64, f64, u64, bool),
+    Geometry {
+        client: (f64, f64),
+        delta: (f64, f64),
+        epoch: u64,
+        first: bool,
+    },
     PaneMeasured(TabId),
     GridFallback(u64),
     FindEdit(TabId, String),
@@ -2975,6 +2976,13 @@ impl TerminalApp {
         {
             crate::input::clear_grid();
             self.initial_grid.set(None);
+        } else if self.initial_grid.get().is_some()
+            && self
+                .initial_grid
+                .pane()
+                .is_some_and(|pane| Some(pane) != self.tabs.active_id())
+        {
+            self.initial_grid.set(None);
         }
         for entry in self.tabs.entries() {
             if let Page::Terminal(tab) = &entry.value.page {
@@ -3062,7 +3070,12 @@ impl TerminalApp {
     }
 
     fn restore_window(&self) {
-        if self.incoming.is_some() || !self.native_bound || self.initial_grid.get().is_some() {
+        // A startup placement can arrive after a control resize has already settled.
+        if self.incoming.is_some()
+            || !self.native_bound
+            || self.initial_grid.get().is_some()
+            || self.initial_grid.pane().is_some()
+        {
             return;
         }
         if let Some(name) = &self.window_profile {
@@ -5959,109 +5972,8 @@ impl Component for TerminalApp {
                 cols,
                 rows,
                 reply,
-            }) => {
-                let Some(tab_id) = self.tab_for_pane(pane) else {
-                    let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
-                    return;
-                };
-                if matches!(self.tabs.get(tab_id).map(|tab| &tab.page),
-                    Some(Page::Terminal(tab)) if matches!(tab.source, Source::TimedReplay(_) | Source::PausedReplay(_)))
-                {
-                    let _ = reply.send(Err(
-                        "The recording controls this pane’s grid during timed replay".into(),
-                    ));
-                    return;
-                }
-                let split = self.tabs.visible(tab_id)
-                    && matches!(
-                        self.tabs.active_layout(),
-                        Some(w11term::pane_layout::Layout::Split { .. })
-                    );
-                if split && self.tabs.zoomed() {
-                    let _ =
-                        reply.send(Err("Unzoom the pane before resizing its split grid".into()));
-                    return;
-                }
-                if !split
-                    && self.tabs.active_id() == Some(tab_id)
-                    && self.windows.borrow().fullscreen()
-                {
-                    let _ = reply.send(Err(
-                        "Exit fullscreen before resizing the active window grid".into(),
-                    ));
-                    return;
-                }
-                if split {
-                    if let Err(error) = self.resize_split(tab_id, cols, rows) {
-                        let _ = reply.send(Err(error.to_string()));
-                        return;
-                    }
-                } else if let Some(AppTab {
-                    page: Page::Terminal(tab),
-                    ..
-                }) = self.tabs.get(tab_id)
-                {
-                    let metrics = self.metrics.get();
-                    let size = TerminalSize {
-                        cols,
-                        rows,
-                        pixel_width: (cols as f32 * metrics.cell_width * metrics.scale).round()
-                            as usize,
-                        pixel_height: (rows as f32 * metrics.cell_height * metrics.scale).round()
-                            as usize,
-                        dpi: (96.0 * metrics.scale).round() as u32,
-                    };
-                    let _ = tab.session.input.send(Command::Resize(size));
-                    if self.tabs.active_id() == Some(tab_id) {
-                        self.initial_grid.set(Some((cols, rows)));
-                        self.windows.borrow_mut().grid = Some((cols, rows));
-                        self.client_size.0 +=
-                            (cols as f64 - metrics.cols as f64) * metrics.cell_width as f64;
-                        self.client_size.1 +=
-                            (rows as f64 - metrics.rows as f64) * metrics.cell_height as f64;
-                        self.invalidator.invalidate();
-                    }
-                } else {
-                    let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
-                    return;
-                }
-                context.spawn_background(move |_| {
-                    std::thread::sleep(Duration::from_millis(300));
-                    Message::ControlResizeDone {
-                        pane,
-                        cols,
-                        rows,
-                        reply,
-                    }
-                });
-            }
-            Message::ControlResizeDone {
-                pane,
-                cols,
-                rows,
-                reply,
-            } => {
-                let result = if let Some(AppTab {
-                    page: Page::Terminal(tab),
-                    ..
-                }) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id))
-                {
-                    let frame = tab.session.frames.load();
-                    if frame.cols == cols && frame.rows.len() == rows {
-                        Ok(serde_json::json!({"pane":pane,"cols":cols,"rows":rows}))
-                    } else {
-                        self.initial_grid.set(None);
-                        Err(format!(
-                            "requested grid does not fit the current window/display; actual {}x{}",
-                            frame.cols,
-                            frame.rows.len()
-                        ))
-                    }
-                } else {
-                    Err("pane was closed".into())
-                };
-                let _ = reply.send(result);
-            }
+            }) => self.control_resize(pane, cols, rows, reply, context),
+            Message::ControlResizeDone(completion) => completion.observe(self, context),
             Message::PromptEdit(id, prompt, index, value) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -7106,13 +7018,27 @@ impl Component for TerminalApp {
                     self.refresh_open_commands();
                 }
             }
-            Message::Geometry(width, height, epoch, first) => {
-                if self.initial_grid.epoch() == epoch {
-                    self.client_size = (width, height);
+            Message::Geometry {
+                client,
+                delta,
+                epoch,
+                first,
+            } => {
+                if self.initial_grid.epoch() == epoch && self.initial_grid.get().is_some() {
+                    // WinUI can report a client extent different from the size
+                    // requested through ResizeClient with a custom title bar.
+                    // After the first resize, apply the remaining error to the
+                    // last request, or the same caption offset would recur.
+                    let estimate = (client.0 + delta.0, client.1 + delta.1);
+                    self.client_size = if first && estimate != self.client_size {
+                        estimate
+                    } else {
+                        (self.client_size.0 + delta.0, self.client_size.1 + delta.1)
+                    };
                     if first {
                         context.spawn_background_with_rejection(
                             move |_| {
-                                std::thread::sleep(Duration::from_millis(300));
+                                std::thread::sleep(Duration::from_millis(750));
                                 Message::GridFallback(epoch)
                             },
                             Message::GridFallback(epoch),
@@ -7121,8 +7047,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::GridFallback(epoch) => {
-                if self.initial_grid.epoch() == epoch && self.initial_grid.get().is_some() {
-                    self.initial_grid.set(None);
+                if self.initial_grid.expire(epoch) {
                     self.invalidator.invalidate();
                 }
             }

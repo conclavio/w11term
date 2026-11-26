@@ -605,7 +605,9 @@ background pane's PTY without selecting the pane or activating the window. Chang
 to the active grid require leaving fullscreen first. A grid that cannot fit the
 current display/window constraints fails clearly; geometry may
 already have changed. The next user tab activation uses the shared window's grid.
-Success acknowledges the client model/resize request, not a remote TUI redraw.
+For a visible pane, success means the measured viewport and terminal grid both
+match the request. For a background pane, success means its terminal model
+accepted the new grid. A remote TUI can redraw afterward.
 
 `open` creates an independent tab in the existing process from a saved profile.
 Without `--activate`, the current tab stays selected. `--activate` selects the new

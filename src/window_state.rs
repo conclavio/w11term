@@ -7,9 +7,39 @@ use windows::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*
 #[derive(Default)]
 pub struct RequestedGrid {
     target: std::cell::Cell<Option<(usize, usize)>>,
+    pane: std::cell::Cell<Option<w11term::tabs::TabId>>,
     attempts: std::cell::Cell<u8>,
+    last_measurement: std::cell::Cell<Option<GridMeasurement>>,
     epoch: std::cell::Cell<u64>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GridMeasurement {
+    cells: (usize, usize),
+    pixels: (u32, u32, u32),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GridCorrection {
+    Publish,
+    Wait,
+    Resize {
+        cols: usize,
+        rows: usize,
+        first: bool,
+    },
+}
+
+pub fn client_extent(hwnd: HWND, scale: f32) -> Option<(f64, f64)> {
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
+    let scale = f64::from(scale);
+    Some((
+        f64::from(rect.right - rect.left) / scale,
+        f64::from(rect.bottom - rect.top) / scale,
+    ))
+}
+
 impl RequestedGrid {
     pub fn new(target: Option<(usize, usize)>) -> Self {
         let value = Self::default();
@@ -21,21 +51,54 @@ impl RequestedGrid {
     }
     pub fn set(&self, target: Option<(usize, usize)>) {
         self.target.set(target);
+        self.pane.set(None);
         self.attempts.set(0);
+        self.last_measurement.set(None);
         self.epoch.set(self.epoch.get().wrapping_add(1));
     }
     pub fn epoch(&self) -> u64 {
         self.epoch.get()
     }
-    pub fn correction(&self, measured: (usize, usize)) -> Option<((usize, usize), bool)> {
-        let target = self.get()?;
-        if target == measured || self.attempts.get() >= 2 {
-            self.set(None);
-            return None;
+    pub fn set_for_pane(&self, pane: w11term::tabs::TabId, target: (usize, usize)) -> u64 {
+        self.set(Some(target));
+        self.pane.set(Some(pane));
+        self.epoch()
+    }
+    pub fn pane(&self) -> Option<w11term::tabs::TabId> {
+        self.pane.get()
+    }
+    pub fn expire(&self, epoch: u64) -> bool {
+        self.epoch() == epoch && self.target.take().is_some()
+    }
+    pub fn correction(&self, measured: (usize, usize), pixels: (u32, u32, u32)) -> GridCorrection {
+        let Some((cols, rows)) = self.get() else {
+            return GridCorrection::Publish;
+        };
+        if (cols, rows) == measured {
+            self.target.set(None);
+            return GridCorrection::Publish;
         }
-        let first = self.attempts.get() == 0;
-        self.attempts.set(self.attempts.get() + 1);
-        Some((target, first))
+        // A caret blink or an SSH frame can redraw the same surface before WinUI
+        // has applied the queued window size. Wait for a different measurement.
+        let measurement = GridMeasurement {
+            cells: measured,
+            pixels,
+        };
+        if self.last_measurement.get() == Some(measurement) {
+            return GridCorrection::Wait;
+        }
+        let attempts = self.attempts.get();
+        if attempts >= 2 {
+            self.target.set(None);
+            return GridCorrection::Publish;
+        }
+        self.last_measurement.set(Some(measurement));
+        self.attempts.set(attempts + 1);
+        GridCorrection::Resize {
+            cols,
+            rows,
+            first: attempts == 0,
+        }
     }
 }
 fn fit_axis(position: i32, size: i32, start: i32, end: i32, minimum: i32) -> (i32, i32) {
@@ -298,17 +361,83 @@ mod tests {
     #[test]
     fn geometry_converges_or_falls_back_and_new_requests_reset_budget() {
         let request = RequestedGrid::new(Some((170, 48)));
-        assert_eq!(request.correction((80, 24)), Some(((170, 48), true)));
-        assert_eq!(request.correction((100, 30)), Some(((170, 48), false)));
-        assert_eq!(request.correction((100, 30)), None);
+        let first_viewport = (800, 480, 96);
+        let next_viewport = (1000, 600, 96);
+        let initial_epoch = request.epoch();
+        assert_eq!(
+            request.correction((80, 24), first_viewport),
+            GridCorrection::Resize {
+                cols: 170,
+                rows: 48,
+                first: true
+            }
+        );
+        assert_eq!(
+            request.correction((100, 30), next_viewport),
+            GridCorrection::Resize {
+                cols: 170,
+                rows: 48,
+                first: false
+            }
+        );
+        assert_eq!(
+            request.correction((100, 30), next_viewport),
+            GridCorrection::Wait
+        );
+        assert_eq!(
+            request.correction((105, 30), (1050, 600, 96)),
+            GridCorrection::Publish
+        );
         assert_eq!(request.get(), None);
-        request.set(Some((80, 24)));
-        assert_eq!(request.correction((80, 24)), None);
+        assert_eq!(request.epoch(), initial_epoch);
+        let epoch = request.set_for_pane(8, (80, 24));
+        assert_eq!(request.pane(), Some(8));
+        assert!(!request.expire(initial_epoch));
+        assert_eq!(
+            request.correction((80, 24), first_viewport),
+            GridCorrection::Publish
+        );
         assert_eq!(request.get(), None);
+        assert_eq!(request.epoch(), epoch);
         request.set(Some((170, 48)));
-        assert_eq!(request.correction((80, 24)), Some(((170, 48), true)));
+        assert_eq!(request.pane(), None);
+        assert!(matches!(
+            request.correction((80, 24), first_viewport),
+            GridCorrection::Resize { first: true, .. }
+        ));
         request.set(None); // user resizing cancels the pending request
-        assert_eq!(request.correction((90, 25)), None);
+        assert_eq!(
+            request.correction((90, 25), (900, 500, 96)),
+            GridCorrection::Publish
+        );
+    }
+
+    #[test]
+    fn repeating_a_paint_before_the_window_resizes_keeps_the_target_pending() {
+        let request = RequestedGrid::default();
+        let epoch = request.set_for_pane(7, (64, 18));
+        let old_viewport = (656, 395, 96);
+        assert_eq!(
+            request.correction((64, 19), old_viewport),
+            GridCorrection::Resize {
+                cols: 64,
+                rows: 18,
+                first: true
+            }
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                request.correction((64, 19), old_viewport),
+                GridCorrection::Wait
+            );
+            assert_eq!(request.get(), Some((64, 18)));
+            assert_eq!(request.epoch(), epoch);
+        }
+        assert_eq!(
+            request.correction((64, 18), (660, 380, 96)),
+            GridCorrection::Publish
+        );
+        assert_eq!(request.get(), None);
     }
     #[test]
     fn placement_fits_tiny_negative_and_normal_work_areas() {
