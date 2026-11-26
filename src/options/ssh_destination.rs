@@ -40,6 +40,7 @@ impl SshOptions {
             terminal_type: Default::default(),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             authentication: Authentication::Agent,
             host_key: None,

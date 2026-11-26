@@ -10,6 +10,7 @@ pub(super) struct Draft {
     args: Vec<String>,
     cwd: String,
     color_scheme: ColorScheme,
+    font_size: String,
     tab_color: TabColor,
     scrollback_lines: String,
     powershell_integration: bool,
@@ -26,6 +27,7 @@ impl Default for Draft {
             args: Vec::new(),
             cwd: String::new(),
             color_scheme: ColorScheme::default(),
+            font_size: String::new(),
             tab_color: TabColor::default(),
             scrollback_lines: ScrollbackLines::default().to_string(),
             powershell_integration: false,
@@ -46,6 +48,10 @@ impl Draft {
                 .unwrap_or_default(),
             args: options.args.clone(),
             color_scheme: options.color_scheme,
+            font_size: options
+                .font_size
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
             tab_color: options.tab_color,
             scrollback_lines: options.scrollback_lines.to_string(),
             powershell_integration: options.powershell_integration,
@@ -59,6 +65,7 @@ impl Draft {
             args: self.args.clone(),
             cwd: (!self.cwd.trim().is_empty()).then(|| self.cwd.trim().into()),
             color_scheme: self.color_scheme,
+            font_size: profile_font_size(&self.font_size)?,
             tab_color: self.tab_color,
             scrollback_lines: self.scrollback_lines.parse()?,
             powershell_integration: self.powershell_integration && self.supports_integration(),
@@ -90,6 +97,7 @@ pub enum Field {
     Executable,
     Cwd,
     ScrollbackLines,
+    FontSize,
     Argument(usize),
 }
 pub enum Action {
@@ -160,6 +168,12 @@ impl TerminalApp {
                 Field::ScrollbackLines => {
                     if draft.scrollback_lines != value {
                         draft.scrollback_lines = value;
+                        draft.error.clear();
+                    }
+                }
+                Field::FontSize => {
+                    if draft.font_size != value {
+                        draft.font_size = value;
                         draft.error.clear();
                     }
                 }
@@ -341,6 +355,12 @@ impl TerminalApp {
                 }),
             ),
             color_scheme_editor(id, draft.color_scheme, context),
+            profile_font_size_editor(
+                &draft.font_size,
+                context.callback(move |value| {
+                    Message::LocalProfile(Action::Field(id, Field::FontSize, value))
+                }),
+            ),
             tab_color_editor(id, draft.tab_color, context),
             TextBlock::new().text("Arguments").into(),
         ];

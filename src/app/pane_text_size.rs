@@ -37,6 +37,17 @@ pub(super) fn capture(
 }
 
 impl LiveTab {
+    fn profile_font_size(&self) -> Option<f32> {
+        self.source.profile_font_size().map(ProfileTextSize::as_f32)
+    }
+
+    pub(super) fn font_size_override(&self) -> Option<f32> {
+        self.surface
+            .font_size
+            .get()
+            .or_else(|| self.profile_font_size())
+    }
+
     pub(super) fn remeasure_font(&self, renderer: &mut Renderer) {
         self.selection.borrow_mut().take();
         self.hover.borrow_mut().take();
@@ -54,7 +65,9 @@ impl TerminalApp {
         let Some(Page::Terminal(tab)) = self.tabs.active().map(|tab| &tab.page) else {
             return MenuItem::disabled("pane-text-size", "Pane text size");
         };
-        let base = self.appearance.read().unwrap().font_size;
+        let base = tab
+            .profile_font_size()
+            .unwrap_or_else(|| self.appearance.read().unwrap().font_size);
         let current = tab.surface.font_size.get();
         MenuItem::submenu(
             "pane-text-size",
@@ -76,14 +89,15 @@ impl TerminalApp {
         };
         let appearance = self.appearance.read().unwrap();
         let current = tab.surface.font_size.get();
-        let next = change.next(appearance.font_size, current);
+        let profile = tab.profile_font_size();
+        let next = change.next(profile.unwrap_or(appearance.font_size), current);
         if next == current {
             return;
         }
         let mut renderer = match Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size_for(next),
+            appearance.terminal_font_size_for(next.or(profile)),
         ) {
             Ok(renderer) => renderer,
             Err(error) => {

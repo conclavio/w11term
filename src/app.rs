@@ -19,8 +19,8 @@ use w11term::{
         word_range,
     },
     options::{
-        Authentication, ColorScheme, LocalOptions, Profiles, ScrollbackLines, Source, SshOptions,
-        TabColor, TerminalType,
+        Authentication, ColorScheme, LocalOptions, ProfileTextSize, Profiles, ScrollbackLines,
+        Source, SshOptions, TabColor, TerminalType,
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
@@ -503,6 +503,7 @@ struct ProfileDraft {
     user: String,
     port: String,
     color_scheme: ColorScheme,
+    font_size: String,
     tab_color: TabColor,
     scrollback_lines: String,
     terminal_preset: usize,
@@ -534,6 +535,7 @@ impl Default for ProfileDraft {
             user: String::new(),
             port: "22".into(),
             color_scheme: ColorScheme::default(),
+            font_size: String::new(),
             tab_color: TabColor::default(),
             scrollback_lines: ScrollbackLines::default().to_string(),
             terminal_preset: 0,
@@ -576,6 +578,7 @@ impl ProfileDraft {
             host: host.into(),
             terminal_type: self.terminal_type()?,
             color_scheme: self.color_scheme,
+            font_size: profile_font_size(&self.font_size)?,
             tab_color: self.tab_color,
             scrollback_lines: self.scrollback_lines.parse()?,
             user: user.into(),
@@ -624,6 +627,10 @@ impl ProfileDraft {
             user: options.user.clone(),
             port: options.port.to_string(),
             color_scheme: options.color_scheme,
+            font_size: options
+                .font_size
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
             tab_color: options.tab_color,
             scrollback_lines: options.scrollback_lines.to_string(),
             terminal_preset: match options.terminal_type.as_str() {
@@ -741,6 +748,44 @@ fn scrollback_editor(value: &str, on_change: Callback<String>) -> View {
         TextBox::new()
             .automation_name("Scrollback lines")
             .text(value)
+            .on_text_changed(on_change),
+        hint,
+    ))
+}
+
+fn profile_font_size(value: &str) -> anyhow::Result<Option<ProfileTextSize>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let size = value.parse::<u8>().with_context(|| {
+        format!(
+            "Enter a whole text size from {} to {}",
+            ProfileTextSize::MIN,
+            ProfileTextSize::MAX
+        )
+    })?;
+    size.try_into().map(Some)
+}
+
+fn profile_font_size_editor(value: &str, on_change: Callback<String>) -> View {
+    let hint = TextBlock::new().text_wrapping(TextWrapping::Wrap);
+    let hint = match profile_font_size(value) {
+        Ok(_) => hint.text(format!(
+            "Choose {} to {} for new panes. Leave blank to use the window's text size.",
+            ProfileTextSize::MIN,
+            ProfileTextSize::MAX
+        )),
+        Err(error) => hint
+            .text(error.to_string())
+            .foreground(Color::rgb(255, 160, 150)),
+    };
+    StackPanel::new().spacing(5.0).children((
+        TextBlock::new().text("Terminal text size"),
+        TextBox::new()
+            .automation_name("Terminal text size")
+            .text(value)
+            .placeholder_text("Use window text size")
             .on_text_changed(on_change),
         hint,
     ))
@@ -911,6 +956,7 @@ pub enum Field {
     User,
     Port,
     ScrollbackLines,
+    FontSize,
     CustomTerminal,
     Identity,
     Fingerprint,
@@ -2214,8 +2260,7 @@ impl TerminalApp {
                 Page::Terminal(tab) => Some(tab),
                 _ => None,
             });
-        let pane_size =
-            |tab: &LiveTab| appearance.terminal_font_size_for(tab.surface.font_size.get());
+        let pane_size = |tab: &LiveTab| appearance.terminal_font_size_for(tab.font_size_override());
         let sizes =
             std::iter::once(appearance.terminal_font_size()).chain(panes.clone().map(pane_size));
         let mut renderers = BTreeMap::new();
@@ -2671,9 +2716,7 @@ impl TerminalApp {
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
                     capture: tab
-                        .surface
-                        .font_size
-                        .get()
+                        .font_size_override()
                         .map(|size| pane_text_size::capture(self.appearance.clone(), Some(size))),
                 })
             }));
@@ -4532,6 +4575,10 @@ impl TerminalApp {
             context.callback(move |v| Message::Edit(id, Field::ScrollbackLines, v)),
         ));
         fields.push(color_scheme_editor(id, draft.color_scheme, context));
+        fields.push(profile_font_size_editor(
+            &draft.font_size,
+            context.callback(move |v| Message::Edit(id, Field::FontSize, v)),
+        ));
         fields.push(tab_color_editor(id, draft.tab_color, context));
         fields.push(
             StackPanel::new().spacing(5.0).children((
@@ -4904,7 +4951,12 @@ impl Component for TerminalApp {
         let renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size(),
+            appearance.terminal_font_size_for(
+                options
+                    .source
+                    .profile_font_size()
+                    .map(ProfileTextSize::as_f32),
+            ),
         )
         .expect("creating DirectWrite formats");
         keyboard.set_shortcuts(
@@ -7104,6 +7156,7 @@ impl Component for TerminalApp {
                         Field::User => &mut draft.user,
                         Field::Port => &mut draft.port,
                         Field::ScrollbackLines => &mut draft.scrollback_lines,
+                        Field::FontSize => &mut draft.font_size,
                         Field::CustomTerminal => &mut draft.custom_terminal,
                         Field::Identity => &mut draft.identity,
                         Field::Fingerprint => &mut draft.fingerprint,
@@ -8590,6 +8643,7 @@ mod profile_ui_tests {
                 host: "test.invalid".into(),
                 terminal_type: Default::default(),
                 color_scheme: ColorScheme::OneHalfLight,
+                font_size: Some(22.try_into().unwrap()),
                 tab_color: TabColor::Purple,
                 scrollback_lines: "0".parse().unwrap(),
                 user: "pilot+character".into(),
@@ -8612,6 +8666,7 @@ mod profile_ui_tests {
             assert_eq!(draft.port, "6792");
             assert_eq!(draft.scrollback_lines, "0");
             assert_eq!(draft.color_scheme, ColorScheme::OneHalfLight);
+            assert_eq!(draft.font_size, "22");
             assert_eq!(draft.fingerprint, "SHA256:test");
             assert_eq!(draft.host, "test.invalid");
             assert_eq!(draft.host_key_alias, "cockpit.example");

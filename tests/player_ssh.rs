@@ -271,6 +271,7 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
     SshOptions {
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         terminal_type: Default::default(),
         host: "127.0.0.1".into(),

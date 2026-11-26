@@ -763,6 +763,11 @@ impl ProfileStore {
                 );
             }
             fields.insert("args".into(), serde_json::to_value(&shell.args)?);
+            if let Some(size) = shell.font_size {
+                fields.insert("font_size".into(), serde_json::to_value(size)?);
+            } else {
+                fields.remove("font_size");
+            }
             if shell.color_scheme.is_default() {
                 fields.remove("color_scheme");
             } else {
@@ -955,6 +960,9 @@ impl ProfileStore {
             }
             if options.color_scheme.is_default() {
                 object.remove("color_scheme");
+            }
+            if options.font_size.is_none() {
+                object.remove("font_size");
             }
             if options.tab_color.is_default() {
                 object.remove("tab_color");
@@ -1329,6 +1337,7 @@ mod tests {
             host: "new.test".into(),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             terminal_type: Default::default(),
             user: "root".into(),
@@ -1884,7 +1893,7 @@ mod order_tests {
     }
 
     #[test]
-    fn schemes_and_tab_colors_survive_profile_copies_and_allow_resets() {
+    fn appearance_survives_profile_copies_and_allows_resets() {
         use crate::options::ColorScheme::{Default, OneHalfDark, OneHalfLight};
         use crate::options::TabColor;
         let (_dir, store) = fixture();
@@ -1893,10 +1902,13 @@ mod order_tests {
         assert_eq!(catalog.source("Lima").unwrap().color_scheme(), Default);
         assert_eq!(catalog.source("Alpha").unwrap().tab_color(), TabColor::None);
         assert_eq!(catalog.source("Lima").unwrap().tab_color(), TabColor::None);
+        assert_eq!(catalog.source("Alpha").unwrap().profile_font_size(), None);
+        assert_eq!(catalog.source("Lima").unwrap().profile_font_size(), None);
 
         let mut ssh = catalog.profiles["Alpha"].clone();
         ssh.color_scheme = OneHalfLight;
         ssh.tab_color = TabColor::Red;
+        ssh.font_size = Some(6.try_into().unwrap());
         store
             .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
             .unwrap();
@@ -1905,6 +1917,7 @@ mod order_tests {
         let mut shell = catalog.local["Lima"].clone();
         shell.color_scheme = OneHalfDark;
         shell.tab_color = TabColor::Blue;
+        shell.font_size = Some(72.try_into().unwrap());
         store
             .save_local(Some(&store.inspect_local("Lima").unwrap()), "Lima", &shell)
             .unwrap();
@@ -1930,23 +1943,37 @@ mod order_tests {
             catalog.source("Local copy").unwrap().tab_color(),
             TabColor::Blue
         );
+        assert_eq!(
+            catalog.source("SSH copy").unwrap().profile_font_size(),
+            ssh.font_size
+        );
+        assert_eq!(
+            catalog.source("Local copy").unwrap().profile_font_size(),
+            shell.font_size
+        );
         ssh.color_scheme = Default;
         ssh.tab_color = TabColor::None;
+        ssh.font_size = None;
         store
             .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
             .unwrap();
         shell.color_scheme = Default;
         shell.tab_color = TabColor::None;
+        shell.font_size = None;
         store.save_local(Some(&base), "Lima", &shell).unwrap();
         let entries = &disk(&store)["profiles"];
         assert!(entries["Alpha"].get("color_scheme").is_none());
         assert!(entries["Lima"].get("color_scheme").is_none());
         assert!(entries["Alpha"].get("tab_color").is_none());
         assert!(entries["Lima"].get("tab_color").is_none());
+        assert!(entries["Alpha"].get("font_size").is_none());
+        assert!(entries["Lima"].get("font_size").is_none());
         assert_eq!(entries["SSH copy"]["tab_color"], "red");
         assert_eq!(entries["Local copy"]["tab_color"], "blue");
         assert_eq!(entries["SSH copy"]["color_scheme"], "one-half-light");
         assert_eq!(entries["Local copy"]["color_scheme"], "one-half-dark");
+        assert_eq!(entries["SSH copy"]["font_size"], 6);
+        assert_eq!(entries["Local copy"]["font_size"], 72);
         assert_eq!(entries["SSH copy"]["extra"], 7);
         assert_eq!(entries["Local copy"]["extra"], "local");
     }

@@ -770,6 +770,21 @@ async fn native_pane_text_size_preserves_the_neighbor_and_screenshot_grid() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits both profile types and checks native grid, pane reset and PNG over SSH and PowerShell"]
+async fn native_profile_text_size_is_used_by_new_panes() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 3).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("profile-text-size-ui.ps1", &ssh, state.path());
+    assert!(fs::read(trace).unwrap().is_empty());
+    assert_eq!(opens.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens Files, Find, Commands, pane layout and Settings from native title-bar controls"]
 async fn native_title_tools_follow_the_active_ssh_and_powershell_panes() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

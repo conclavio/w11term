@@ -123,6 +123,7 @@ impl Fixture {
             cwd: Some(cwd.path().into()),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             powershell_integration: false,
         };
@@ -275,6 +276,7 @@ async fn missing_executable_returns_a_launch_error_and_releases_endpoints() -> R
         cwd: None,
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         powershell_integration: false,
     };
@@ -296,6 +298,7 @@ async fn failed_local_launch_offers_one_fresh_restart_per_termination() -> Resul
         cwd: None,
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         powershell_integration: false,
     };

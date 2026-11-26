@@ -284,7 +284,7 @@ impl TerminalApp {
         let font_size = self
             .tab_for_pane(pane)
             .and_then(|id| match &self.tabs.get(id)?.page {
-                Page::Terminal(tab) => tab.surface.font_size.get(),
+                Page::Terminal(tab) => tab.font_size_override(),
                 _ => None,
             });
         let mut appearance = self.appearance.read().unwrap().clone();

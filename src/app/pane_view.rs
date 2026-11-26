@@ -452,7 +452,7 @@ impl TerminalApp {
         let mut renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size_for(surface.font_size.get()),
+            appearance.terminal_font_size_for(tab.font_size_override()),
         )?;
         renderer.live_cursor = Some(surface.cursor_blink.clone());
         let renderer = RefCell::new(renderer);
@@ -539,7 +539,7 @@ impl TerminalApp {
             let window_mode = window_grid.get();
             if matches!(window_mode, WindowGrid::Terminal) {
                 if !remember_grid {
-                    // The next launch will use the window font again.
+                    // The next launch will use the profile or window text size again.
                     windows.borrow_mut().grid = None;
                 } else if initial_grid
                     .get()

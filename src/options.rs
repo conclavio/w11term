@@ -7,10 +7,12 @@ use std::{
 };
 mod group_prompt;
 mod local;
+mod profile_text_size;
 mod ssh_destination;
 mod tab_color;
 pub use group_prompt::GroupPromptPattern;
 pub use local::LocalOptions;
+pub use profile_text_size::ProfileTextSize;
 pub use tab_color::TabColor;
 
 /// Base colors for a new terminal pane. Applications can override them with OSC.
@@ -244,6 +246,8 @@ pub struct SshOptions {
     pub scrollback_lines: ScrollbackLines,
     #[serde(default, skip_serializing_if = "ColorScheme::is_default")]
     pub color_scheme: ColorScheme,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<ProfileTextSize>,
     #[serde(default, skip_serializing_if = "TabColor::is_default")]
     pub tab_color: TabColor,
     #[serde(flatten)]
@@ -295,6 +299,7 @@ impl From<JumpHost> for SshOptions {
             terminal_type: TerminalType::default(),
             scrollback_lines: ScrollbackLines::default(),
             color_scheme: ColorScheme::default(),
+            font_size: None,
             tab_color: Default::default(),
             authentication: hop.authentication,
             host_key: hop.host_key,
@@ -757,6 +762,14 @@ impl Source {
             Self::Local(shell) => shell.tab_color,
             Self::Ssh(ssh) => ssh.tab_color,
             _ => TabColor::None,
+        }
+    }
+
+    pub fn profile_font_size(&self) -> Option<ProfileTextSize> {
+        match self {
+            Self::Local(shell) => shell.font_size,
+            Self::Ssh(ssh) => ssh.font_size,
+            _ => None,
         }
     }
 
@@ -1512,6 +1525,7 @@ mod tests {
             host_key_alias: None,
             terminal_type: TerminalType::default(),
             color_scheme: Default::default(),
+            font_size: None,
             tab_color: Default::default(),
             scrollback_lines: ScrollbackLines::default(),
             player: PlayerOptions::default(),

@@ -234,6 +234,7 @@ async fn roundtrip(
             Source::Ssh(SshOptions {
                 scrollback_lines: Default::default(),
                 color_scheme: Default::default(),
+                font_size: None,
                 tab_color: Default::default(),
                 terminal_type: terminal_type
                     .map(|name| name.to_owned().try_into().unwrap())

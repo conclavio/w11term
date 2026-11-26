@@ -202,6 +202,7 @@ fn options() -> Result<SshOptions> {
         local_forwards: vec![],
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        font_size: None,
         tab_color: Default::default(),
         terminal_type: Default::default(),
         durable: false,

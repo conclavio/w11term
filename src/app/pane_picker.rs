@@ -1130,7 +1130,7 @@ impl TerminalApp {
                 pane,
                 live.session.frames.clone(),
                 &self.appearance.read().unwrap(),
-                live.surface.font_size.get(),
+                live.font_size_override(),
             ))
         });
         self.picker.as_mut().unwrap().preview = preview;
