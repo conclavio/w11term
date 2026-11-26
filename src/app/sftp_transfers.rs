@@ -5,7 +5,9 @@ use super::{
 use std::cmp::Reverse;
 use w11term::{
     control::SftpTransferStatus,
-    events::{RECENT_SFTP_TRANSFER_LIMIT, RecentSftpTransfer},
+    events::{
+        RECENT_SFTP_TRANSFER_LIMIT, RecentSftpTransfer, SftpTransferDetails, SftpTransferItem,
+    },
     options::SshOptions,
     sftp::{TransferOperation, TransferOutcome, TransferPhase},
 };
@@ -17,6 +19,7 @@ pub enum Action {
     Visit(TransferId),
     Cancel(TransferId),
     ShowDownload(TransferId),
+    ExpandDetails(TransferId, bool),
 }
 
 impl TerminalApp {
@@ -24,7 +27,7 @@ impl TerminalApp {
         if !matches!(action, Action::Open)
             && !matches!(
                 self.tabs.active().map(|tab| &tab.page),
-                Some(Page::SftpTransfers)
+                Some(Page::SftpTransfers(_))
             )
         {
             return;
@@ -35,7 +38,7 @@ impl TerminalApp {
                     .tabs
                     .entries()
                     .iter()
-                    .find(|entry| matches!(entry.value.page, Page::SftpTransfers))
+                    .find(|entry| matches!(entry.value.page, Page::SftpTransfers(_)))
                     .map(|entry| entry.id);
                 if let Some(id) = existing {
                     self.tabs.select(id);
@@ -45,7 +48,7 @@ impl TerminalApp {
                     self.insert_tab(
                         AppTab {
                             label: LABEL.into(),
-                            page: Page::SftpTransfers,
+                            page: Page::SftpTransfers(None),
                         },
                         ctx,
                     );
@@ -89,10 +92,26 @@ impl TerminalApp {
                     explorer::show_download(saved, ctx);
                 }
             }
+            Action::ExpandDetails(transfer, expanded) => {
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(Page::SftpTransfers(current)) =
+                        self.tabs.get_mut(id).map(|tab| &mut tab.page)
+                {
+                    if expanded {
+                        *current = Some(transfer);
+                    } else if *current == Some(transfer) {
+                        *current = None;
+                    }
+                }
+            }
         }
     }
 
-    pub(super) fn sftp_transfers_view(&self, ctx: &ViewContext<Self>) -> View {
+    pub(super) fn sftp_transfers_view(
+        &self,
+        expanded: Option<TransferId>,
+        ctx: &ViewContext<Self>,
+    ) -> View {
         let mut rows: Vec<_> = self
             .window_sftp_transfers()
             .map(|(_, label, ssh, transfer)| {
@@ -123,7 +142,13 @@ impl TerminalApp {
             ));
             rows.extend(recent.into_iter().take(RECENT_SFTP_TRANSFER_LIMIT).map(
                 |(label, ssh, result)| {
-                    result_row(transfer_source(label, ssh, result.id.pane), result, ctx)
+                    let show_details = expanded == Some(result.id);
+                    result_row(
+                        transfer_source(label, ssh, result.id.pane),
+                        result,
+                        show_details,
+                        ctx,
+                    )
                 },
             ));
         }
@@ -265,15 +290,11 @@ fn transfer_row(
 fn result_row(
     source: String,
     result: RecentSftpTransfer,
+    expanded: bool,
     ctx: &ViewContext<TerminalApp>,
 ) -> KeyedView {
     let id = result.id;
-    let outcome = match result.outcome {
-        TransferOutcome::Completed => "Completed",
-        TransferOutcome::Cancelled => "Cancelled",
-        TransferOutcome::Failed => "Failed",
-        TransferOutcome::Interrupted => "Interrupted",
-    };
+    let outcome = outcome_label(result.outcome);
     let mut details = vec![
         KeyedView::new(
             "source",
@@ -298,8 +319,112 @@ fn result_row(
                 .content(label),
         ));
     }
+    if let Some(items) = result.details {
+        let mut slots = vec![SlotView::new(
+            ExpanderSlot::Header,
+            TextBlock::new().text("Transfer item details"),
+        )];
+        if expanded {
+            slots.push(SlotView::new(ExpanderSlot::Content, item_details(&items)));
+        }
+        details.push(KeyedView::new(
+            "item-details",
+            Expander::new()
+                .automation_name(format!("Transfer item details for {id}"))
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .is_expanded(expanded)
+                .on_is_expanded_changed(
+                    ctx.callback(move |open| {
+                        Message::SftpTransfers(Action::ExpandDetails(id, open))
+                    }),
+                )
+                .slots(slots),
+        ));
+    }
     KeyedView::new(
         format!("recent-{id}"),
         StackPanel::new().spacing(6.0).keyed_children(details),
     )
+}
+
+fn outcome_label(outcome: TransferOutcome) -> &'static str {
+    match outcome {
+        TransferOutcome::Completed => "Completed",
+        TransferOutcome::Cancelled => "Cancelled",
+        TransferOutcome::Failed => "Failed",
+        TransferOutcome::Interrupted => "Interrupted",
+    }
+}
+
+fn item_details(details: &SftpTransferDetails) -> View {
+    let mut rows: Vec<_> = details
+        .completed
+        .iter()
+        .enumerate()
+        .map(|(index, item)| KeyedView::new(index.to_string(), item_row(item)))
+        .collect();
+    if details.omitted_completed != 0 {
+        rows.push(KeyedView::new(
+            "omitted",
+            TextBlock::new().text(format!(
+                "{} additional completed items",
+                details.omitted_completed
+            )),
+        ));
+    }
+    if let Some(item) = &details.stopped {
+        rows.push(KeyedView::new("stopped", item_row(item)));
+    }
+    if details.not_started != 0 {
+        let label = if details.not_started == 1 {
+            "item"
+        } else {
+            "items"
+        };
+        rows.push(KeyedView::new(
+            "not-started",
+            TextBlock::new().text(format!("{} {label} did not start", details.not_started)),
+        ));
+    }
+    StackPanel::new().spacing(10.0).keyed_children(rows)
+}
+
+fn item_row(item: &SftpTransferItem) -> View {
+    let operation = match item.operation {
+        TransferOperation::UploadFile => "File upload",
+        TransferOperation::UploadFolder => "Folder upload",
+        TransferOperation::DownloadFile => "File download",
+        TransferOperation::DownloadFolder => "Folder download",
+        TransferOperation::PrepareUpload => "Upload preparation",
+    };
+    let mut title = format!("{} · {operation}", outcome_label(item.outcome));
+    if let Some(bytes) = item.bytes_transferred {
+        use std::fmt::Write;
+        let _ = write!(title, " · {bytes} bytes");
+    }
+    StackPanel::new().spacing(2.0).children((
+        TextBlock::new()
+            .text(title)
+            .text_wrapping(TextWrapping::Wrap),
+        path_text("Remote", &item.remote),
+        path_text("Windows", &item.local.to_string_lossy()),
+    ))
+}
+
+fn path_text(label: &str, path: &str) -> TextBlock {
+    use std::fmt::Write;
+    let mut line = format!("{label} · ");
+    for ch in path.chars() {
+        if ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            let _ = write!(line, "{}", ch.escape_unicode());
+        } else {
+            line.push(ch);
+        }
+    }
+    TextBlock::new()
+        .text(line)
+        .text_wrapping(TextWrapping::Wrap)
+        .is_text_selection_enabled(true)
 }

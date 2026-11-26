@@ -254,6 +254,17 @@ try {
     Assert-Explorer "Open download folder for palette-ssh, notice $($events[0].sequence)" 'explore' (Join-Path $State 'picker/batch background')
     Run-Palette 'SFTP transfers'
     Assert-Explorer "Open download folder for transfer $($results[1].data.transfer_id)" 'explore' (Join-Path $State 'picker/batch background conflict')
+    Set-NativeExpansion "Transfer item details for $($results[1].data.transfer_id)" $true
+    $dot = ' ' + [char]0xb7 + ' '
+    $completed = Join-Path $State 'picker\batch background conflict\interrupted'
+    $failedDestination = Join-Path $State 'picker\batch background conflict\verified.bin'
+    $null = Wait-Until 'partially completed batch lists both attempted item paths' {
+        (Find-Element "Remote${dot}/shell directory/interrupted") -and
+            (Find-Element "Windows${dot}$completed") -and
+            (Find-Element "Failed${dot}File download") -and
+            (Find-Element "Remote${dot}/shell directory/verified.bin") -and
+            (Find-Element "Windows${dot}$failedDestination")
+    }
 } catch {
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
     throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"

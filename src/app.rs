@@ -408,7 +408,7 @@ enum Page {
     ForwardOverview(String),
     SharedFolders(folder_shares::Panel),
     Attention(attention::AttentionPage),
-    SftpTransfers,
+    SftpTransfers(Option<file_drawer::TransferId>),
     CommandHistory(command_history::HistoryPage),
     HostGroup(Box<host_groups::HostGroup>),
     Terminal(LiveTab),
@@ -7837,7 +7837,7 @@ impl Component for TerminalApp {
                     word_delimiters::view(editor, context)
                 }
                 Page::Attention(page) => self.attention_view(page, context),
-                Page::SftpTransfers => self.sftp_transfers_view(context),
+                Page::SftpTransfers(expanded) => self.sftp_transfers_view(*expanded, context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::HostGroup(page) => self.host_group_view(id, page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),

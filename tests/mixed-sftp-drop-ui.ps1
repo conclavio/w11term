@@ -87,6 +87,22 @@ try {
     Wait-Status 'dropped item changed.*1 of 3 items completed'
 
     Confirm-TransferShells $fixture 'mixed-drop-live'
+    $journal = (Control @('events','--pane',"$($fixture.Ssh.id)",'--since','0','--timeout','0')).journal
+    $completed = $journal.events | Where-Object {
+        $_.kind -eq 'sftp-transfer' -and $_.data.message -like 'Uploaded a-tail.bin*3 of 3 items completed*'
+    }
+    Run-Palette 'SFTP transfers'
+    Set-NativeExpansion "Transfer item details for $($completed.data.transfer_id)" $true
+    $dot = ' ' + [char]0xb7 + ' '
+    $localFile = Join-Path $source 'z-lead.bin'
+    $localFolder = Join-Path $source $release
+    $null = Wait-Until 'history keeps the original Windows sources and uploaded destinations' {
+        (Find-Element "Completed${dot}File upload${dot}3 bytes") -and
+            (Find-Element "Remote${dot}/shell directory/z-lead.bin") -and
+            (Find-Element "Windows${dot}$localFile") -and
+            (Find-Element "Remote${dot}/shell directory/$release") -and
+            (Find-Element "Windows${dot}$localFolder")
+    }
 } catch {
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
     throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"

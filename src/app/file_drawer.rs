@@ -3,11 +3,11 @@ use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::sync::{oneshot, watch};
 use w11term::control::SftpCancelState;
-use w11term::events::SavedDownload;
+use w11term::events::{SavedDownload, SftpTransferDetails};
 use w11term::folder_grants::Authority;
 use w11term::profiles::BookmarkPeer;
 pub use w11term::sftp::TransferId;
@@ -251,6 +251,7 @@ pub(super) struct FileDrawer {
     pending: Option<Pending>,
     queue: TransferQueue,
     last_download: Option<SavedDownload>,
+    finished_transfer_details: Option<Arc<SftpTransferDetails>>,
     preparing_drop: Option<DropPreparation>,
     transfer_serial: u64,
     status: String,
@@ -668,10 +669,12 @@ enum TransferFile {
     Upload {
         name: String,
         remote: String,
+        local: PathBuf,
         atomic: bool,
     },
     UploadFolder {
         remote: String,
+        local: PathBuf,
     },
     Download {
         remote: String,
@@ -699,6 +702,21 @@ fn download_folder_subject(remote: &str, selected: bool) -> String {
 }
 
 impl TransferFile {
+    fn paths(&self) -> (TransferOperation, &str, &Path) {
+        match self {
+            Self::Upload { remote, local, .. } => (TransferOperation::UploadFile, remote, local),
+            Self::UploadFolder { remote, local } => {
+                (TransferOperation::UploadFolder, remote, local)
+            }
+            Self::Download { remote, local, .. } => {
+                (TransferOperation::DownloadFile, remote, local)
+            }
+            Self::DownloadFolder { remote, local, .. } => {
+                (TransferOperation::DownloadFolder, remote, local)
+            }
+        }
+    }
+
     fn downloaded_item(&self) -> Option<SavedDownload> {
         match self {
             Self::Download { local, .. } => Some(SavedDownload::File(Arc::from(local.as_path()))),
@@ -751,7 +769,7 @@ impl TransferFile {
                 "Cancelled download of {} ({bytes} bytes written to the temporary folder).",
                 download_folder_subject(remote, *selected),
             ),
-            (Self::UploadFolder { remote }, true) => {
+            (Self::UploadFolder { remote, .. }, true) => {
                 let destination = reply["resolved_remote"].as_str().unwrap_or(remote);
                 let outcome = if reply["remote_may_be_partial"] == true {
                     "The remote folder may be incomplete."
@@ -764,7 +782,7 @@ impl TransferFile {
                     counted(bytes.as_u64().unwrap_or_default(), "byte"),
                 )
             }
-            (Self::UploadFolder { remote }, false) => format!(
+            (Self::UploadFolder { remote, .. }, false) => format!(
                 "Uploaded folder {} ({}, {}, {}, {} skipped).",
                 reply["resolved_remote"].as_str().unwrap_or(remote),
                 counted(reply["files"].as_u64().unwrap_or_default(), "file"),
@@ -816,7 +834,7 @@ impl TransferFile {
             Self::Upload { remote, .. } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote file may be incomplete."
             ),
-            Self::UploadFolder { remote } => format!(
+            Self::UploadFolder { remote, .. } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote folder may be incomplete."
             ),
             Self::Download {
@@ -850,22 +868,24 @@ impl TransferFile {
         reply: &mut oneshot::Receiver<Result<Value, String>>,
         bytes: u64,
         queue: &mut TransferQueue,
-    ) -> (String, Option<SavedDownload>, TransferOutcome) {
+    ) -> (String, transfer_queue::FinishedTransfer, TransferOutcome) {
         use TransferOutcome::*;
         let (mut status, outcome) = match reply.try_recv() {
             Ok(Ok(result)) => {
-                let outcome = if result["cancelled"] == true {
+                let item_outcome = if result["cancelled"] == true {
                     Cancelled
                 } else {
-                    queue.completed_one();
-                    queue.record_download(self);
-                    if queue.completed >= queue.total {
-                        Completed
-                    } else if queue.remaining.is_empty() {
-                        Cancelled
-                    } else {
-                        Interrupted
-                    }
+                    Completed
+                };
+                queue.settle_item(self, item_outcome, Some(&result));
+                let outcome = if item_outcome == Cancelled {
+                    Cancelled
+                } else if queue.completed >= queue.total {
+                    Completed
+                } else if queue.remaining.is_empty() {
+                    Cancelled
+                } else {
+                    Interrupted
                 };
                 (
                     format!(
@@ -875,17 +895,26 @@ impl TransferFile {
                     outcome,
                 )
             }
-            Ok(Err(error)) if let Self::UploadFolder { remote } = self => {
-                (format!("Could not upload folder {remote}: {error}"), Failed)
+            Ok(Err(error)) => {
+                queue.settle_item(self, Failed, None);
+                let message = match self {
+                    Self::UploadFolder { remote, .. } => {
+                        format!("Could not upload folder {remote}: {error}")
+                    }
+                    _ => error,
+                };
+                (message, Failed)
             }
-            Ok(Err(error)) => (error, Failed),
-            Err(_) => (
-                format!(
-                    "SSH reconnected. {} Refresh to browse.",
-                    self.interrupted(bytes)
-                ),
-                Interrupted,
-            ),
+            Err(_) => {
+                queue.settle_item(self, Interrupted, None);
+                (
+                    format!(
+                        "SSH reconnected. {} Refresh to browse.",
+                        self.interrupted(bytes)
+                    ),
+                    Interrupted,
+                )
+            }
         };
         let saved = queue.finish(&mut status);
         (status, saved, outcome)
@@ -1344,11 +1373,11 @@ impl FileDrawer {
         self.status = format!("Uploading folder {remote}…");
         Ok((
             Operation::PutDir {
-                local,
+                local: local.clone(),
                 remote: remote.clone(),
                 preserve_times: self.preserve_upload_times,
             },
-            TransferFile::UploadFolder { remote },
+            TransferFile::UploadFolder { remote, local },
         ))
     }
 
@@ -2051,14 +2080,7 @@ impl FileDrawer {
         }
         let file = self.transfer_file()?;
         let transfer = self.pending.as_ref()?.transfer.as_ref()?;
-        let (operation, remote) = match file {
-            TransferFile::Upload { remote, .. } => (TransferOperation::UploadFile, remote),
-            TransferFile::UploadFolder { remote } => (TransferOperation::UploadFolder, remote),
-            TransferFile::Download { remote, .. } => (TransferOperation::DownloadFile, remote),
-            TransferFile::DownloadFolder { remote, .. } => {
-                (TransferOperation::DownloadFolder, remote)
-            }
-        };
+        let (operation, remote, _) = file.paths();
         Some(TransferView {
             id: transfer.id,
             operation,
@@ -2110,27 +2132,37 @@ impl FileDrawer {
     }
 
     fn finish_transfer_queue(&mut self) {
-        if let Some(saved) = self.queue.finish(&mut self.status) {
+        let finished = self.queue.finish(&mut self.status);
+        if let Some(saved) = finished.saved {
             self.last_download = Some(saved);
+        }
+        if finished.details.is_some() {
+            self.finished_transfer_details = finished.details;
         }
     }
 
     fn publish_ended_transfer(
-        &self,
+        &mut self,
         session: &Session,
         previous: Option<(TransferId, bool)>,
         background: bool,
         outcome: TransferOutcome,
     ) {
+        let details = self.finished_transfer_details.take();
         if let Some((id, download)) = previous
             && self
                 .transfer_stamp()
                 .is_none_or(|(current, _)| current != id)
         {
             let saved = self.last_download.as_ref().filter(|_| download).cloned();
-            session
-                .events
-                .sftp_transfer_finished(id, outcome, &self.status, saved, background);
+            session.events.sftp_transfer_finished(
+                id,
+                outcome,
+                &self.status,
+                saved,
+                details,
+                background,
+            );
         }
     }
 
@@ -2140,6 +2172,7 @@ impl FileDrawer {
             return outcome;
         }
         let mut last_download = self.last_download.take();
+        let mut finished_transfer_details = None;
         let status = match self.pending.as_mut() {
             Some(Pending {
                 step: Step::Change { change, .. },
@@ -2170,12 +2203,13 @@ impl FileDrawer {
                 transfer: Some(transfer),
                 ..
             }) => {
-                let (status, saved, terminal) =
+                let (status, finished, terminal) =
                     file.reconnect_status(reply, transfer.progress.borrow().bytes, &mut self.queue);
                 outcome = terminal;
-                if saved.is_some() {
-                    last_download = saved;
+                if finished.saved.is_some() {
+                    last_download = finished.saved;
                 }
+                finished_transfer_details = finished.details;
                 status
             }
             _ if self.move_listing_refresh.is_some() => format!(
@@ -2204,6 +2238,7 @@ impl FileDrawer {
             dialog_serial: self.dialog_serial,
             editor,
             last_download,
+            finished_transfer_details,
             generation,
             status,
             ..Self::default()
@@ -2827,7 +2862,7 @@ impl FileDrawer {
             .context("No transfer selected")?;
         self.status = match &transfer {
             TransferFile::Upload { name, .. } => format!("Uploading {name}…"),
-            TransferFile::UploadFolder { remote } => format!("Uploading folder {remote}…"),
+            TransferFile::UploadFolder { remote, .. } => format!("Uploading folder {remote}…"),
             TransferFile::Download { remote, .. } | TransferFile::DownloadFolder { remote, .. } => {
                 format!(
                     "Downloading item {} of {}: {remote}…",
@@ -2877,6 +2912,8 @@ impl FileDrawer {
                 {
                     let error = file.interrupted(transfer.progress.borrow().bytes);
                     *outcome = TransferOutcome::Interrupted;
+                    self.queue
+                        .settle_item(file, TransferOutcome::Interrupted, None);
                     self.pending.take();
                     self.cached.borrow_mut().take();
                     bail!("{error}");
@@ -2944,6 +2981,9 @@ impl FileDrawer {
                 }
             }
             (step, Err(error)) => {
+                if let Step::Transfer(file) = &step {
+                    self.queue.settle_item(file, TransferOutcome::Failed, None);
+                }
                 if let Step::IdentifyDelete(entry) = &step {
                     bail!("Could not delete {}: {error}", entry.name);
                 }
@@ -2975,7 +3015,7 @@ impl FileDrawer {
                 {
                     bail!("Could not download {remote}: {error}");
                 }
-                if let Step::Transfer(TransferFile::UploadFolder { remote }) = &step {
+                if let Step::Transfer(TransferFile::UploadFolder { remote, .. }) = &step {
                     bail!("Could not upload folder {remote}: {error}");
                 }
                 bail!("{error}");
@@ -3032,17 +3072,19 @@ impl FileDrawer {
                 self.status = file.outcome(&reply);
                 if reply["cancelled"] == true {
                     *outcome = TransferOutcome::Cancelled;
+                    self.queue
+                        .settle_item(&file, TransferOutcome::Cancelled, Some(&reply));
                     self.finish_transfer_queue();
                     return Ok(());
                 }
                 let upload = !file.is_download();
-                self.queue.record_download(&file);
+                self.queue
+                    .settle_item(&file, TransferOutcome::Completed, Some(&reply));
                 if !upload && self.queue.batch_id.is_none() {
                     *outcome = TransferOutcome::Completed;
                     self.finish_transfer_queue();
                     return Ok(());
                 }
-                self.queue.completed_one();
                 if self.queue.remaining.is_empty() {
                     *outcome = if self.queue.completed < self.queue.total {
                         TransferOutcome::Cancelled
@@ -4456,7 +4498,9 @@ impl TerminalApp {
                     None => format!("{error:#}"),
                 },
             };
-            files.finish_transfer_queue();
+            if files.transfer_file().is_none() {
+                files.finish_transfer_queue();
+            }
             files.cached.borrow_mut().take();
         }
         files.publish_ended_transfer(session, previous_transfer, !visible || !files.open, outcome);
@@ -5743,6 +5787,7 @@ mod tests {
         let upload = TransferFile::Upload {
             name: "large.bin".into(),
             remote: "/srv/uploads/large.bin".into(),
+            local: r"C:\upload\large.bin".into(),
             atomic: false,
         };
         let download = TransferFile::Download {
@@ -5775,7 +5820,11 @@ mod tests {
         let (worker, mut reply) = oneshot::channel();
         let (interrupted, saved, outcome) =
             upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default());
-        assert!(saved.is_none());
+        assert!(saved.saved.is_none());
+        assert_eq!(
+            saved.details.unwrap().stopped.as_ref().unwrap().outcome,
+            TransferOutcome::Interrupted
+        );
         assert_eq!(outcome, TransferOutcome::Interrupted);
         assert!(interrupted.contains("/srv/uploads/large.bin"));
         assert!(interrupted.contains("at least 32 bytes acknowledged"));
@@ -5791,20 +5840,17 @@ mod tests {
         worker
             .send(Err("WRITE timed out; outcome is unknown".into()))
             .unwrap();
-        assert_eq!(
-            upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default()),
-            (
-                "WRITE timed out; outcome is unknown".into(),
-                None,
-                TransferOutcome::Failed
-            )
-        );
+        let (status, finished, outcome) =
+            upload.reconnect_status(&mut reply, 32, &mut TransferQueue::default());
+        assert_eq!(status, "WRITE timed out; outcome is unknown");
+        assert!(finished.saved.is_none());
+        assert_eq!(outcome, TransferOutcome::Failed);
         let (worker, mut reply) = oneshot::channel();
         worker.send(Ok(complete)).unwrap();
         let (status, saved, outcome) =
             download.reconnect_status(&mut reply, 64, &mut TransferQueue::default());
         assert!(status.starts_with("Downloaded /large.bin (128 bytes)"));
-        assert_eq!(saved, download.downloaded_item());
+        assert_eq!(saved.saved, download.downloaded_item());
         assert_eq!(outcome, TransferOutcome::Completed);
     }
 
@@ -5888,6 +5934,7 @@ mod tests {
     fn folder_upload_reports_its_destination_and_distinguishes_partial_remote_trees() {
         let folder = TransferFile::UploadFolder {
             remote: "/reports/run".into(),
+            local: r"C:\reports\run".into(),
         };
         let partial = json!({
             "cancelled": true,
@@ -5915,14 +5962,14 @@ mod tests {
         assert!(interrupted.contains("at least 42 bytes acknowledged"));
         assert!(interrupted.contains("remote folder may be incomplete"));
         worker.send(Err("Permission denied".into())).unwrap();
+        let (status, finished, outcome) =
+            folder.reconnect_status(&mut reply, 0, &mut TransferQueue::default());
         assert_eq!(
-            folder.reconnect_status(&mut reply, 0, &mut TransferQueue::default()),
-            (
-                "Could not upload folder /reports/run: Permission denied".into(),
-                None,
-                TransferOutcome::Failed,
-            )
+            status,
+            "Could not upload folder /reports/run: Permission denied"
         );
+        assert!(finished.saved.is_none());
+        assert_eq!(outcome, TransferOutcome::Failed);
     }
 
     #[test]

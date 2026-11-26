@@ -156,6 +156,16 @@ try {
     if (Find-Element "Open download folder for transfer $firstId" $button) {
         throw 'A cancelled batch without saved items offered an Explorer action in history'
     }
+    Set-NativeExpansion "Transfer item details for $firstId" $true
+    $alphaLocal = Join-Path $State 'picker\alpha\bulk-alpha'
+    $null = Wait-Until 'cancelled item paths and the skipped queue count' {
+        (Find-Element "Remote${dot}/shell directory/bulk-alpha" $text) -and
+            (Find-Element "Windows${dot}$alphaLocal" $text) -and
+            (Find-Element '1 item did not start' $text)
+    }
+    if (Find-Element "Remote${dot}/shell directory/queued-alpha" $text) {
+        throw 'A queued item was shown as attempted'
+    }
     if (!$waiting.WaitForExit(15000)) { throw 'The named-pipe waiter did not return' }
     $waitReply = [IO.File]::ReadAllText($waitPath) | ConvertFrom-Json
     if ($waiting.ExitCode -ne 0 -or !$waitReply.ok -or
@@ -188,6 +198,13 @@ try {
     }
     if (@((Control @('sftp','list-transfers')).transfers).Count -ne 0) {
         throw 'The control pipe still lists an ended transfer'
+    }
+    Set-NativeExpansion "Transfer item details for $secondId" $true
+    $betaLocal = Join-Path $State 'picker\beta\beta folder'
+    $null = Wait-Until 'completed folder details replace the expanded cancelled batch' {
+        (Find-Element "Remote${dot}/shell directory/beta folder" $text) -and
+            (Find-Element "Windows${dot}$betaLocal" $text) -and
+            !(Find-Element '1 item did not start' $text)
     }
 } catch {
     $alphaWire = if ($alphaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $alphaTrace)) }

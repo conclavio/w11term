@@ -743,7 +743,14 @@ mod tests {
                 panic!("expected the wait to obtain the pane journal");
             };
             if finished {
-                journal.sftp_transfer_finished(id, TransferOutcome::Completed, "done", None, false);
+                journal.sftp_transfer_finished(
+                    id,
+                    TransferOutcome::Completed,
+                    "done",
+                    None,
+                    None,
+                    false,
+                );
             }
             reply.send(journal).unwrap();
             drop(commands);

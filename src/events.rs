@@ -1,12 +1,12 @@
 //! Bounded per-pane event journal with monotonic cursors and loss detection.
 use crate::options::GroupPromptPattern;
-use crate::sftp::{TransferId, TransferOutcome};
+use crate::sftp::{TransferId, TransferOperation, TransferOutcome};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -65,6 +65,24 @@ pub struct RecentSftpTransfer {
     pub outcome: TransferOutcome,
     pub message: Arc<str>,
     pub saved_download: Option<SavedDownload>,
+    pub details: Option<Arc<SftpTransferDetails>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SftpTransferDetails {
+    pub completed: Vec<SftpTransferItem>,
+    pub stopped: Option<SftpTransferItem>,
+    pub omitted_completed: usize,
+    pub not_started: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SftpTransferItem {
+    pub operation: TransferOperation,
+    pub remote: String,
+    pub local: PathBuf,
+    pub outcome: TransferOutcome,
+    pub bytes_transferred: Option<u64>,
 }
 
 #[derive(Default)]
@@ -951,6 +969,7 @@ impl Events {
         outcome: TransferOutcome,
         message: &str,
         saved_download: Option<SavedDownload>,
+        details: Option<Arc<SftpTransferDetails>>,
         background: bool,
     ) {
         let message = inbox::sftp_transfer_text(message);
@@ -967,6 +986,7 @@ impl Events {
             outcome,
             message: Arc::from(message.as_str()),
             saved_download: saved_download.clone(),
+            details,
         });
         Self::append_locked(
             &mut state,
@@ -1188,6 +1208,7 @@ mod tests {
                 TransferOutcome::Completed,
                 "downloaded",
                 Some(saved.clone()),
+                None,
                 serial % 2 == 0,
             );
         }
@@ -1226,13 +1247,27 @@ mod tests {
                 .await
                 .is_err()
         );
-        events.sftp_transfer_finished(other, TransferOutcome::Completed, "other", None, false);
+        events.sftp_transfer_finished(
+            other,
+            TransferOutcome::Completed,
+            "other",
+            None,
+            None,
+            false,
+        );
         assert!(
             tokio::time::timeout(Duration::ZERO, waiting.as_mut())
                 .await
                 .is_err()
         );
-        events.sftp_transfer_finished(id, TransferOutcome::Cancelled, "cancelled", None, false);
+        events.sftp_transfer_finished(
+            id,
+            TransferOutcome::Cancelled,
+            "cancelled",
+            None,
+            None,
+            false,
+        );
         let result = waiting.await.unwrap();
         assert_eq!(result.data["outcome"], "cancelled");
         assert_eq!(
@@ -1283,7 +1318,14 @@ mod tests {
                 .to_string()
                 .contains("still active")
         );
-        events.sftp_transfer_finished(id, TransferOutcome::Completed, "verified", None, false);
+        events.sftp_transfer_finished(
+            id,
+            TransferOutcome::Completed,
+            "verified",
+            None,
+            None,
+            false,
+        );
         assert_eq!(
             events
                 .wait_sftp_transfer(id, Instant::now())
