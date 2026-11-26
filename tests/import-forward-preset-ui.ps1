@@ -9,7 +9,9 @@ $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 $fingerprint = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.host_key
 $aliasName = 'imported-loopback'
-$localPort = [int][IO.File]::ReadAllText((Join-Path $State 'local-port'))
+$importedPort = [int][IO.File]::ReadAllText((Join-Path $State 'local-port'))
+$manualPort = [int][IO.File]::ReadAllText((Join-Path $State 'manual-port'))
+$localPort = $importedPort
 $remotePort = [int][IO.File]::ReadAllText((Join-Path $State 'target-port'))
 $wildcard = [int][IO.File]::ReadAllText((Join-Path $State 'wildcard-port'))
 $token = [IO.File]::ReadAllText((Join-Path $State 'token'))
@@ -65,7 +67,7 @@ function Select-Keyless {
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
 }
 function Saved-Profile { ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.$aliasName }
-function Assert-OnlySupportedPair {
+function Assert-OnlyPair {
     $pairs = @( (Saved-Profile).local_forwards )
     if ($pairs.Count -ne 1 -or $pairs[0].local_port -ne $localPort -or $pairs[0].remote_port -ne $remotePort) {
         throw "Unexpected saved forwarding presets: $($pairs | ConvertTo-Json -Compress)"
@@ -116,7 +118,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
             if (Saved-Profile) { throw 'Preview saved a profile before confirmation' }
             Click 'Save profile'
             $null = Wait-Until 'saved imported profile' { Find-Element "Saved profile $aliasName" $text }
-            Assert-OnlySupportedPair
+            Assert-OnlyPair
             Expect-Refused $localPort
             Expect-Refused $wildcard
             # The imported config defaults to the Windows agent. Configure the
@@ -130,7 +132,45 @@ for ($launch = 1; $launch -le 2; $launch++) {
                 $saved = Saved-Profile
                 $saved.auth -ceq 'none' -and $saved.host_key -ceq $fingerprint
             }
-            Assert-OnlySupportedPair
+            Assert-OnlyPair
+
+            Set-NativeExpansion 'Saved local forwards' $true
+            $removeImported = "Remove $preset"
+            $null = Wait-Until 'imported pair has a Remove action' { Find-Element $removeImported $button }
+            $windowsPort = Field 'Saved forward Windows port'
+            (Field 'Saved forward remote port').SetValue("$remotePort")
+            $windowsPort.SetValue("$manualPort")
+            $null = Wait-Until 'manual pair can be added' {
+                (Find-Element 'Add saved forward' $button).Current.IsEnabled
+            }
+            $windowsPort.SetValue('0')
+            $null = Wait-Until 'zero cannot be saved as a port' {
+                $add = Find-Element 'Add saved forward' $button
+                $add -and !$add.Current.IsEnabled
+            }
+            $windowsPort.SetValue("$importedPort")
+            $null = Wait-Until 'the existing pair still cannot be added' {
+                $add = Find-Element 'Add saved forward' $button
+                $add -and !$add.Current.IsEnabled -and $windowsPort.Current.Value -ceq "$importedPort"
+            }
+            $windowsPort.SetValue("$manualPort")
+            Click 'Add saved forward'
+            $localPort = $manualPort
+            $preset = "Windows $localPort " + [char]0x2192 + " remote $remotePort"
+            $null = Wait-Until 'the manually entered pair is staged' { Find-Element "Remove $preset" $button }
+            $localPort = $importedPort
+            Assert-OnlyPair
+            Click $removeImported
+            $null = Wait-Until 'imported pair has been removed from the draft' {
+                !(Find-Element $removeImported $button)
+            }
+            Set-NativeExpansion 'Saved local forwards' $false
+            Click 'Save profile changes'
+            $null = Wait-Until 'edited pairs saved with the profile' { Find-Element 'Changes saved.' $text }
+            $localPort = $manualPort
+            Assert-OnlyPair
+            Expect-Refused $importedPort
+            Expect-Refused $localPort
             continue
         }
         $pane = ((Control @('list')).sessions | Where-Object label -eq $aliasName).id
@@ -144,6 +184,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
         $client = Open-Client $localPort
         Confirm-HttpEcho $client
         Expect-Refused $wildcard
+        Expect-Refused $importedPort
         [IO.File]::Delete([IO.File]::ReadAllText((Join-Path $State 'disconnect-gate')))
         Expect-Closed $client
         $null = Wait-Until 'same imported pane on a new SSH transport' {
@@ -156,7 +197,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
         Wait-Focus $pane
         Run-Palette $action
         Apply-Preset
-        Assert-OnlySupportedPair
+        Assert-OnlyPair
     } catch {
         $failure = "$_ on launch $launch at $($_.ScriptStackTrace)"
         if ($launch -eq 1 -and !$app.HasExited) {

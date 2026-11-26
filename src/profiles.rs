@@ -2,7 +2,7 @@
 use crate::options::{Profiles, SshOptions, SshRecipientSets, SshRosterDefaults, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::Write,
     path::PathBuf,
 };
@@ -211,6 +211,23 @@ fn replace_profile_member(members: &mut Vec<String>, old: &str, new: Option<&str
         }
         seen.insert(name.clone())
     });
+}
+
+fn preserve_forward_preset_fields(previous: &serde_json::Value, next: &mut serde_json::Value) {
+    let (Some(previous), Some(next)) = (previous.as_array(), next.as_array_mut()) else {
+        return;
+    };
+    let ports =
+        |entry: &serde_json::Value| (entry["local_port"].as_u64(), entry["remote_port"].as_u64());
+    let mut raw = BTreeMap::<_, VecDeque<_>>::new();
+    for entry in previous {
+        raw.entry(ports(entry)).or_default().push_back(entry);
+    }
+    for entry in next {
+        if let Some(saved) = raw.get_mut(&ports(entry)).and_then(VecDeque::pop_front) {
+            *entry = saved.clone();
+        }
+    }
 }
 
 fn validate_group_name(name: &str) -> Result<()> {
@@ -965,6 +982,11 @@ impl ProfileStore {
                     continue;
                 }
                 let mut value = value.clone();
+                if key == "local_forwards"
+                    && let Some(previous) = object.get(key)
+                {
+                    preserve_forward_preset_fields(previous, &mut value);
+                }
                 if key == "player"
                     && expected.is_some_and(|previous| {
                         previous.player.device_key == options.player.device_key
@@ -2281,6 +2303,14 @@ mod jump_tests {
         store.duplicate(&renamed, "copy", &edited).unwrap();
         let (_, copy) = store.inspect("copy").unwrap();
         assert_eq!(copy.raw["local_forwards"], forwards);
+        edited.local_forwards.push(
+            serde_json::from_value(serde_json::json!({"local_port":9090, "remote_port":9000}))
+                .unwrap(),
+        );
+        store.edit("copy", "copy", &edited, &copy.options).unwrap();
+        let (_, copy) = store.inspect("copy").unwrap();
+        assert_eq!(copy.raw["local_forwards"][0], forwards[0]);
+        assert_eq!(copy.raw["local_forwards"][1]["remote_port"], 9000);
         edited.local_forwards.clear();
         store.edit("copy", "copy", &edited, &copy.options).unwrap();
         let (_, copy) = store.inspect("copy").unwrap();

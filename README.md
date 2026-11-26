@@ -718,6 +718,8 @@ Both endpoints use IPv4 loopback. Each client connection uses the pane's authent
 
 The OpenSSH profile importer recognizes loopback port pairs such as `LocalForward 15432 127.0.0.1:5432`. The import preview lists the saved pairs and identifies rules it skips by alias and source line. In the profile's SSH pane, choose **Forward a local port… → Use saved forward… → Windows 15432 → remote 5432** to fill in both ports. Choose **Start forwarding** when you need the connection. After reconnecting, you can select and start the saved pair again. [OpenSSH LocalForward](https://man.openbsd.org/ssh_config#LocalForward)
 
+To manage these pairs directly, open **Settings → Profiles → Edit… → Saved local forwards**. Enter the Windows and remote loopback ports and choose **Add saved forward**, or remove an existing pair. Save the profile and open a new session to use the updated list. Saving the profile leaves listeners under manual control.
+
 ## Browse existing Herdr terminals
 
 Choose **More → Find remote sessions → Browse Herdr terminals on _profile_** for a saved Linux SSH profile with Herdr Core’s `hc` available to remote SSH commands. Select a terminal by its display name and numeric address (such as `t7`). w11term opens a full interactive viewer over that SSH login. The program receives input and resize events, and continues running after the viewer detaches. This explicit command runs `hc connect`, which can start the account’s Core daemon. Session discovery and attachment use existing terminal records. The adapter targets Core’s generation 1 framed protocol from v0.1.21. [Herdr viewer protocol](https://github.com/herdrdev/herdr-core/blob/v0.1.21/schema/README.md#attach-streams)

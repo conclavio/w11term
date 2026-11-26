@@ -190,7 +190,7 @@ async fn serve_forward_http(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "imports loopback SSH forward presets through WinUI and starts one only on explicit request"]
+#[ignore = "imports and edits loopback SSH forward presets and starts one only on explicit request"]
 async fn native_imported_forward_preset_remains_inactive_across_save_open_and_reconnect() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), root, sessions, server) =
@@ -201,23 +201,25 @@ async fn native_imported_forward_preset_remains_inactive_across_save_open_and_re
     let state = tempfile::tempdir().unwrap();
     let (remote, service) = serve_forward_http(state.path(), root.path(), 1).await;
     let reservation = || std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let (supported, rejected) = (reservation(), reservation());
-    let (local, wildcard) = (
+    let (supported, rejected, manual) = (reservation(), reservation(), reservation());
+    let (local, wildcard, manual_port) = (
         supported.local_addr().unwrap().port(),
         rejected.local_addr().unwrap().port(),
+        manual.local_addr().unwrap().port(),
     );
     fs::write(state.path().join("config"), format!(
         "Host imported-loopback\n  HostName 127.0.0.1\n  User test\n  Port {}\n  LocalForward 127.0.0.1:{local} localhost:{remote}\n  LocalForward *:{wildcard} localhost:{remote}\n", ssh.port
     )).unwrap();
     fs::write(state.path().join("local-port"), local.to_string()).unwrap();
     fs::write(state.path().join("wildcard-port"), wildcard.to_string()).unwrap();
+    fs::write(state.path().join("manual-port"), manual_port.to_string()).unwrap();
     let gate = root.path().join("keep-first-connection");
     fs::write(&gate, []).unwrap();
     fs::write(state.path().join("disconnect-gate"), gate.to_str().unwrap()).unwrap();
     for log in ["authenticated-users", "keyboard-input.bin", "forward-trace"] {
         fs::write(root.path().join(log), []).unwrap();
     }
-    drop((supported, rejected));
+    drop((supported, rejected, manual));
     drive_mixed_gui("import-forward-preset-ui.ps1", &ssh, state.path());
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), service)

@@ -1,4 +1,5 @@
 use super::*;
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 use w11term::options::LocalForwardPreset;
@@ -68,23 +69,26 @@ struct Draft {
     local: String,
 }
 
+pub(super) fn parse_port(value: &str) -> Option<NonZeroU16> {
+    let value = value.trim();
+    if !value.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 impl Draft {
     fn ports(&self) -> Result<(u16, u16), &'static str> {
-        fn port(value: &str) -> Option<u16> {
-            let value = value.trim();
-            if !value.bytes().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            value.parse::<u16>().ok().filter(|p| *p != 0)
-        }
-        let remote = port(&self.remote).ok_or("Enter a remote TCP port between 1 and 65535.")?;
+        let remote =
+            parse_port(&self.remote).ok_or("Enter a remote TCP port between 1 and 65535.")?;
         let local = if self.local.trim().is_empty() {
             0
         } else {
-            port(&self.local)
+            parse_port(&self.local)
                 .ok_or("Enter a Windows TCP port between 1 and 65535, or leave it blank.")?
+                .get()
         };
-        Ok((local, remote))
+        Ok((local, remote.get()))
     }
 }
 

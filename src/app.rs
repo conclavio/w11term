@@ -64,6 +64,7 @@ mod local_forwards;
 mod local_profile;
 mod pane_drop;
 mod pattern_settings;
+mod profile_forwards;
 mod saved_commands;
 mod shell_setup;
 mod word_delimiters;
@@ -485,6 +486,7 @@ struct ProfileDraft {
     confirm_delete: bool,
     proxy_jump: Vec<w11term::options::JumpHost>,
     local_forwards: Vec<w11term::options::LocalForwardPreset>,
+    forward_editor: profile_forwards::Editor,
     durable: bool,
     saved: bool,
     name: String,
@@ -515,6 +517,7 @@ impl Default for ProfileDraft {
             confirm_delete: false,
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
+            forward_editor: Default::default(),
             durable: false,
             saved: false,
             name: String::new(),
@@ -1069,6 +1072,7 @@ pub struct ExitedPane {
 
 pub enum Message {
     LocalForward(local_forwards::Action),
+    ProfileForward(TabId, profile_forwards::Edit),
     FolderAuthority,
     FolderShare(folder_shares::Action),
     FolderRevoke(TabId, u64, folder_revoke::Action),
@@ -4562,6 +4566,11 @@ impl TerminalApp {
             )),
         );
         fields.push(
+            draft
+                .forward_editor
+                .view(id, &draft.local_forwards, context),
+        );
+        fields.push(
             Button::new()
                 .is_enabled(!draft.generating)
                 .on_click(context.callback(move |_| Message::GenerateKey(id)))
@@ -7071,6 +7080,19 @@ impl Component for TerminalApp {
                         draft.saved = false;
                         draft.error = None;
                     }
+                }
+            }
+            Message::ProfileForward(id, action) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && draft
+                        .forward_editor
+                        .update(&mut draft.local_forwards, action)
+                {
+                    draft.saved = false;
+                    draft.error = None;
                 }
             }
             Message::Auth(id, Some(index)) => {
