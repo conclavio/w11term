@@ -1,4 +1,5 @@
 //! Embedded SSH transport, interactive authentication, and reconnect lifecycle.
+pub mod agent;
 mod durability;
 #[cfg(test)]
 mod folder_mount_fixture;

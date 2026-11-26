@@ -17,6 +17,7 @@ pub enum Field {
     Port,
     Identity,
     Certificate,
+    AgentFingerprint,
     Fingerprint,
     Alias,
     Timeout,
@@ -62,6 +63,7 @@ struct Draft {
     authentication: usize,
     identity: String,
     certificate: String,
+    agent_fingerprint: String,
     fingerprint: String,
     alias: String,
     timeout: String,
@@ -73,8 +75,8 @@ struct Draft {
 impl Draft {
     fn new(index: Option<usize>, existing: Option<&JumpHost>) -> Self {
         let keepalive = existing.map_or_else(SshKeepalive::default, |hop| hop.keepalive);
-        let (authentication, identity, certificate) = existing.map_or_else(
-            || (0, String::new(), String::new()),
+        let (authentication, identity, certificate, agent_fingerprint) = existing.map_or_else(
+            || (0, String::new(), String::new(), String::new()),
             |hop| ssh_auth_fields(&hop.authentication),
         );
         Self {
@@ -85,6 +87,7 @@ impl Draft {
             authentication,
             identity,
             certificate,
+            agent_fingerprint,
             fingerprint: existing
                 .and_then(|hop| hop.host_key.clone())
                 .unwrap_or_default(),
@@ -116,6 +119,7 @@ impl Draft {
                 self.authentication,
                 &self.identity,
                 &self.certificate,
+                &self.agent_fingerprint,
             )?,
             host_key: (!fingerprint.is_empty()).then(|| fingerprint.to_owned()),
             host_key_alias: (!alias.is_empty()).then(|| alias.to_ascii_lowercase()),
@@ -131,6 +135,7 @@ impl Draft {
             Field::Port => &mut self.port,
             Field::Identity => &mut self.identity,
             Field::Certificate => &mut self.certificate,
+            Field::AgentFingerprint => &mut self.agent_fingerprint,
             Field::Fingerprint => &mut self.fingerprint,
             Field::Alias => &mut self.alias,
             Field::Timeout => &mut self.timeout,
@@ -225,6 +230,14 @@ impl Draft {
                     context,
                 ),
             ]);
+        } else if self.authentication == SPECIFIC_AGENT_KEY_AUTH {
+            fields.push(agent_key_picker::field(
+                "Jump host agent key fingerprint",
+                &self.agent_fingerprint,
+                context.callback(move |value| {
+                    Message::ProfileJump(id, Edit::Text(Field::AgentFingerprint, value))
+                }),
+            ));
         }
         fields.extend([
             text_box(

@@ -48,6 +48,7 @@ fn tab_pin_command(label: &str) -> Option<bool> {
     }
 }
 
+mod agent_key_picker;
 mod attention;
 mod bulk_tab_close;
 mod clipboard_paste;
@@ -542,6 +543,7 @@ struct ProfileDraft {
     custom_terminal: String,
     identity: String,
     certificate: String,
+    agent_fingerprint: String,
     fingerprint: String,
     host_key_alias: String,
     group_prompt: String,
@@ -582,6 +584,7 @@ impl Default for ProfileDraft {
             custom_terminal: String::new(),
             identity: String::new(),
             certificate: String::new(),
+            agent_fingerprint: String::new(),
             fingerprint: String::new(),
             host_key_alias: String::new(),
             group_prompt: String::new(),
@@ -601,8 +604,12 @@ impl ProfileDraft {
             "Apply or cancel the pending edit under SSH jump hosts"
         );
         let (host, user, port) = parse_ssh_address(&self.host, &self.user, &self.port)?;
-        let authentication =
-            ssh_authentication(self.authentication, &self.identity, &self.certificate)?;
+        let authentication = ssh_authentication(
+            self.authentication,
+            &self.identity,
+            &self.certificate,
+            &self.agent_fingerprint,
+        )?;
         let mut player = self.player.clone();
         match self.reconnect_window.trim().parse() {
             Ok(seconds) => player.reconnect_window_seconds = seconds,
@@ -650,7 +657,8 @@ impl ProfileDraft {
     }
 
     fn from_options(name: String, options: &SshOptions) -> Self {
-        let (authentication, identity, certificate) = ssh_auth_fields(&options.authentication);
+        let (authentication, identity, certificate, agent_fingerprint) =
+            ssh_auth_fields(&options.authentication);
         Self {
             proxy_jump: options.proxy_jump.clone(),
             local_forwards: options.local_forwards.clone(),
@@ -681,6 +689,7 @@ impl ProfileDraft {
             custom_terminal: options.terminal_type.as_str().into(),
             identity,
             certificate,
+            agent_fingerprint,
             fingerprint: options.host_key.clone().unwrap_or_default(),
             host_key_alias: options.host_key_alias.clone().unwrap_or_default(),
             group_prompt: options
@@ -696,12 +705,14 @@ impl ProfileDraft {
 }
 
 const PRIVATE_KEY_AUTH: usize = 1;
-const SSH_AUTH_LABELS: [&str; 5] = [
+const SPECIFIC_AGENT_KEY_AUTH: usize = 5;
+const SSH_AUTH_LABELS: [&str; 6] = [
     "Windows SSH agent",
     "Private key file",
     "None (keyless server)",
     "Password",
     "Keyboard-interactive (password / MFA)",
+    "Specific SSH agent key",
 ];
 
 fn parse_ssh_address(host: &str, user: &str, port: &str) -> anyhow::Result<(String, String, u16)> {
@@ -746,10 +757,16 @@ fn parse_ssh_keepalive(interval: &str, max: &str) -> anyhow::Result<SshKeepalive
     })
 }
 
-fn ssh_auth_fields(authentication: &Authentication) -> (usize, String, String) {
-    let without_files = |index| (index, String::new(), String::new());
+fn ssh_auth_fields(authentication: &Authentication) -> (usize, String, String, String) {
+    let empty = |index| (index, String::new(), String::new(), String::new());
     match authentication {
-        Authentication::Agent => without_files(0),
+        Authentication::Agent => empty(0),
+        Authentication::AgentKey { agent_fingerprint } => (
+            SPECIFIC_AGENT_KEY_AUTH,
+            String::new(),
+            String::new(),
+            agent_fingerprint.as_str().into(),
+        ),
         Authentication::Identity {
             identity,
             certificate,
@@ -760,10 +777,11 @@ fn ssh_auth_fields(authentication: &Authentication) -> (usize, String, String) {
                 .as_deref()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            String::new(),
         ),
-        Authentication::None => without_files(2),
-        Authentication::Password => without_files(3),
-        Authentication::KeyboardInteractive => without_files(4),
+        Authentication::None => empty(2),
+        Authentication::Password => empty(3),
+        Authentication::KeyboardInteractive => empty(4),
     }
 }
 
@@ -771,6 +789,7 @@ fn ssh_authentication(
     index: usize,
     identity: &str,
     certificate: &str,
+    agent_fingerprint: &str,
 ) -> anyhow::Result<Authentication> {
     Ok(match index {
         PRIVATE_KEY_AUTH => {
@@ -785,6 +804,9 @@ fn ssh_authentication(
         2 => Authentication::None,
         3 => Authentication::Password,
         4 => Authentication::KeyboardInteractive,
+        SPECIFIC_AGENT_KEY_AUTH => Authentication::AgentKey {
+            agent_fingerprint: agent_fingerprint.parse()?,
+        },
         _ => Authentication::Agent,
     })
 }
@@ -1074,6 +1096,7 @@ pub enum Field {
     CustomTerminal,
     Identity,
     Certificate,
+    AgentFingerprint,
     Fingerprint,
     HostKeyAlias,
     GroupPrompt,
@@ -4939,6 +4962,12 @@ impl TerminalApp {
                     context,
                 ),
             ]);
+        } else if draft.authentication == SPECIFIC_AGENT_KEY_AUTH {
+            fields.push(agent_key_picker::field(
+                "SSH agent key fingerprint",
+                &draft.agent_fingerprint,
+                context.callback(move |value| Message::Edit(id, Field::AgentFingerprint, value)),
+            ));
         }
         fields.push(
             StackPanel::new().spacing(5.0).children((
@@ -7452,6 +7481,7 @@ impl Component for TerminalApp {
                         Field::CustomTerminal => &mut draft.custom_terminal,
                         Field::Identity => &mut draft.identity,
                         Field::Certificate => &mut draft.certificate,
+                        Field::AgentFingerprint => &mut draft.agent_fingerprint,
                         Field::Fingerprint => &mut draft.fingerprint,
                         Field::HostKeyAlias => &mut draft.host_key_alias,
                         Field::GroupPrompt => &mut draft.group_prompt,
@@ -8945,6 +8975,14 @@ mod profile_ui_tests {
             (2, Authentication::None),
             (3, Authentication::Password),
             (4, Authentication::KeyboardInteractive),
+            (
+                SPECIFIC_AGENT_KEY_AUTH,
+                Authentication::AgentKey {
+                    agent_fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                        .parse()
+                        .unwrap(),
+                },
+            ),
         ] {
             let options = SshOptions {
                 host: "test.invalid".into(),
@@ -8975,6 +9013,10 @@ mod profile_ui_tests {
             };
             let mut draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
+            assert_eq!(
+                draft.ssh_options().unwrap().authentication,
+                options.authentication
+            );
             assert_eq!(draft.port, "6792");
             assert_eq!(draft.connect_timeout, "20");
             assert_eq!(draft.keepalive_interval, "17");

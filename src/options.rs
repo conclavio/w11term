@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use russh::keys::{HashAlg, PublicKey, ssh_key::Fingerprint};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -136,6 +137,9 @@ impl std::str::FromStr for ScrollbackLines {
 #[serde(tag = "auth", rename_all = "kebab-case")]
 pub enum Authentication {
     Agent,
+    AgentKey {
+        agent_fingerprint: AgentFingerprint,
+    },
     None,
     Identity {
         identity: Box<PathBuf>,
@@ -144,6 +148,44 @@ pub enum Authentication {
     },
     Password,
     KeyboardInteractive,
+}
+
+/// An explicitly selected plain SSH agent key, identified by its OpenSSH SHA256 fingerprint.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+pub struct AgentFingerprint(Box<str>);
+
+impl AgentFingerprint {
+    pub(crate) fn for_key(key: &PublicKey) -> Self {
+        Self(
+            key.fingerprint(HashAlg::Sha256)
+                .to_string()
+                .into_boxed_str(),
+        )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for AgentFingerprint {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let Ok(fingerprint @ Fingerprint::Sha256(_)) = value.trim().parse() else {
+            bail!("Enter an OpenSSH SHA256 fingerprint for the SSH agent key");
+        };
+        Ok(Self(fingerprint.to_string().into_boxed_str()))
+    }
+}
+
+impl TryFrom<String> for AgentFingerprint {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
 }
 
 impl Authentication {
@@ -917,7 +959,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY [--certificate FILE] | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY [--certificate FILE] | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -956,9 +998,18 @@ impl Options {
                 "--identity" => {
                     ensure!(
                         authentication.is_none(),
-                        "choose only one of --identity and --auth"
+                        "choose only one of --identity, --agent-key, and --auth"
                     );
                     authentication = Some(Authentication::identity(value(&mut args, &arg)?, None));
+                }
+                "--agent-key" => {
+                    ensure!(
+                        authentication.is_none(),
+                        "choose only one of --identity, --agent-key, and --auth"
+                    );
+                    authentication = Some(Authentication::AgentKey {
+                        agent_fingerprint: value(&mut args, &arg)?.parse()?,
+                    });
                 }
                 "--certificate" => {
                     ensure!(certificate.is_none(), "specify --certificate only once");
@@ -967,7 +1018,7 @@ impl Options {
                 "--auth" => {
                     ensure!(
                         authentication.is_none(),
-                        "choose only one of --identity and --auth"
+                        "choose only one of --identity, --agent-key, and --auth"
                     );
                     authentication = Some(match value(&mut args, &arg)?.as_str() {
                         "none" => Authentication::None,
@@ -1021,6 +1072,7 @@ impl Options {
                         match ssh.authentication {
                             Authentication::None => "none",
                             Authentication::Agent => "agent",
+                            Authentication::AgentKey { .. } => "agent-key",
                             Authentication::Identity { .. } => "identity",
                             Authentication::Password => "password",
                             Authentication::KeyboardInteractive => "keyboard-interactive",
@@ -1215,6 +1267,79 @@ mod tests {
         dest["proxy_jump"] = serde_json::json!([]);
         dest["host_key_alias"] = "!host".into();
         assert!(parse(dest).is_err());
+    }
+
+    #[test]
+    fn explicit_agent_key_requires_and_round_trips_an_openssh_fingerprint() {
+        const KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let expected = Authentication::AgentKey {
+            agent_fingerprint: KEY.parse().unwrap(),
+        };
+        let mut profile = serde_json::json!({
+            "host": "destination", "user": "pilot", "auth": "agent-key", "agent_fingerprint": KEY,
+            "proxy_jump":[{"host": "jump", "user": "pilot", "auth": "agent-key", "agent_fingerprint": KEY}]
+        });
+        let decoded: SshOptions = serde_json::from_value(profile.clone()).unwrap();
+        assert_eq!(decoded.authentication, expected);
+        assert_eq!(decoded.proxy_jump[0].authentication, expected);
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["agent_fingerprint"], KEY);
+        assert_eq!(encoded["proxy_jump"][0]["agent_fingerprint"], KEY);
+
+        profile.as_object_mut().unwrap().remove("agent_fingerprint");
+        assert!(serde_json::from_value::<SshOptions>(profile.clone()).is_err());
+        profile["agent_fingerprint"] = KEY.into();
+        profile["proxy_jump"][0]["agent_fingerprint"] = "SHA256:short".into();
+        assert!(serde_json::from_value::<SshOptions>(profile).is_err());
+        assert!(
+            serde_json::from_value::<Authentication>(serde_json::json!({"auth":"agent"})).is_ok()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"profiles":{"pilot": {
+                "host":"localhost","user":"pilot","auth":"password"
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                args.iter()
+                    .map(|arg| arg.to_string())
+                    .chain(["--profiles".into(), path.to_string_lossy().into_owned()]),
+            )
+        };
+        for base in [["ssh", "pilot@localhost"], ["--profile", "pilot"]] {
+            let Source::Ssh(ssh) = parse(&[base[0], base[1], "--agent-key", KEY])
+                .unwrap()
+                .unwrap()
+                .source
+            else {
+                panic!("expected SSH");
+            };
+            assert_eq!(ssh.authentication, expected);
+        }
+        for extra in [
+            ["--auth", "agent"],
+            ["--identity", "id"],
+            ["--certificate", "id-cert.pub"],
+        ] {
+            assert!(
+                parse(&[
+                    "ssh",
+                    "pilot@localhost",
+                    "--agent-key",
+                    KEY,
+                    extra[0],
+                    extra[1]
+                ])
+                .is_err()
+            );
+        }
+        assert!(parse(&["--demo", "--agent-key", KEY]).is_err());
     }
 
     #[test]

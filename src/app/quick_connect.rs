@@ -8,6 +8,7 @@ pub(super) struct Draft {
     pub(super) authentication: usize,
     pub(super) identity: String,
     pub(super) certificate: String,
+    agent_fingerprint: String,
     pub(super) error: Option<String>,
     input: ElementRef<TextBox>,
 }
@@ -18,6 +19,7 @@ pub enum Action {
     Authentication(TabId, Option<usize>),
     Identity(TabId, String),
     Certificate(TabId, String),
+    AgentFingerprint(TabId, String),
     Connect(TabId),
 }
 
@@ -79,6 +81,7 @@ impl TerminalApp {
             | Action::Authentication(id, _)
             | Action::Identity(id, _)
             | Action::Certificate(id, _)
+            | Action::AgentFingerprint(id, _)
             | Action::Connect(id) => *id,
         };
         let active = self.tabs.active_id() == Some(id);
@@ -105,6 +108,10 @@ impl TerminalApp {
                 draft.certificate = value;
                 draft.error = None;
             }
+            Action::AgentFingerprint(_, value) if draft.agent_fingerprint != value => {
+                draft.agent_fingerprint = value;
+                draft.error = None;
+            }
             Action::Connect(_) if active => {
                 let result =
                     SshOptions::from_destination(&draft.destination).and_then(|mut options| {
@@ -112,6 +119,7 @@ impl TerminalApp {
                             draft.authentication,
                             &draft.identity,
                             &draft.certificate,
+                            &draft.agent_fingerprint,
                         )?;
                         options.prepare_profile_connection(self.store.path())?;
                         Ok(options)
@@ -200,6 +208,17 @@ pub(super) fn view(
                 ),
             ),
         ]);
+    } else if draft.authentication == SPECIFIC_AGENT_KEY_AUTH {
+        fields.push(KeyedView::new(
+            "agent-key",
+            agent_key_picker::field(
+                "SSH agent key fingerprint",
+                &draft.agent_fingerprint,
+                context.callback(move |value| {
+                    Message::QuickConnect(Action::AgentFingerprint(id, value))
+                }),
+            ),
+        ));
     }
     if let Some(error) = &draft.error {
         fields.push(KeyedView::new(

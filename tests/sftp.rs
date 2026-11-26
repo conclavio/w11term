@@ -66,6 +66,22 @@ impl server::Handler for Peer {
         Ok(server::Auth::Accept)
     }
     #[cfg(feature = "ui-smoke")]
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        key: &russh::keys::PublicKey,
+    ) -> anyhow::Result<server::Auth> {
+        let path = self.root.join("offered-key-trace");
+        if path.is_file() {
+            writeln!(
+                fs::OpenOptions::new().append(true).open(path)?,
+                "{}",
+                key.fingerprint(russh::keys::HashAlg::Sha256)
+            )?;
+        }
+        Ok(server::Auth::Accept)
+    }
+    #[cfg(feature = "ui-smoke")]
     async fn auth_publickey(
         &mut self,
         _user: &str,

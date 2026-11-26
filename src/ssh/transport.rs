@@ -704,18 +704,44 @@ pub(super) async fn authenticate(
                 });
             }
         }
-        Authentication::Agent => {
+        Authentication::Agent | Authentication::AgentKey { .. } => {
+            use russh::keys::agent::AgentIdentity;
+
             let hash = session.best_supported_rsa_hash().await?.flatten();
-            let pipe = std::env::var_os("SSH_AUTH_SOCK")
-                .unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into());
-            let mut agent = russh::keys::agent::client::AgentClient::connect_named_pipe(pipe)
-                .await
-                .map_err(|e| {
-                    stop(format!(
-                        "cannot connect to Windows SSH agent: {e}; choose a device key or password"
-                    ))
-                })?;
-            for identity in agent.request_identities().await? {
+            let mut agent = super::agent::connect().await.map_err(|e| {
+                stop(format!(
+                    "{e:#}. Choose a device key or password if the agent is unavailable."
+                ))
+            })?;
+            let identities = agent.request_identities().await?;
+            if let Authentication::AgentKey { agent_fingerprint } = &options.authentication {
+                let Some(key) = identities.into_iter().find_map(|identity| match identity {
+                    AgentIdentity::PublicKey { key, .. }
+                        if crate::options::AgentFingerprint::for_key(&key)
+                            == *agent_fingerprint =>
+                    {
+                        Some(key)
+                    }
+                    _ => None,
+                }) else {
+                    return Err(stop(format!(
+                        "Windows SSH agent does not hold the selected key {}",
+                        agent_fingerprint.as_str()
+                    )));
+                };
+                let result = session
+                    .authenticate_publickey_with(&options.user, key, hash, &mut agent)
+                    .await?;
+                return finish_public_key_authentication(
+                    session,
+                    options,
+                    prompts,
+                    result,
+                    "the server rejected the selected SSH agent key",
+                )
+                .await;
+            }
+            for identity in identities {
                 let result = session
                     .authenticate_publickey_with(
                         &options.user,

@@ -137,6 +137,9 @@ pub(super) fn endpoint(
     let auth = match auth {
         Authentication::None => "none".to_owned(),
         Authentication::Agent => "SSH agent".to_owned(),
+        Authentication::AgentKey { agent_fingerprint } => {
+            format!("SSH agent key {}", agent_fingerprint.as_str())
+        }
         Authentication::Identity {
             identity,
             certificate,
