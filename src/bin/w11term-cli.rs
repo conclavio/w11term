@@ -68,6 +68,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "close-pane"
             | "split-pane"
             | "move-pane"
+            | "move-tab"
             | "focus-pane"
             | "zoom-pane"
             | "get-tab-layout"
@@ -455,6 +456,35 @@ mod tests {
             "zoom-pane --pane 1 --pane 2 --on",
             "zoom-pane --pane 1 --on --off",
             "zoom-pane --pane 1 --off --off",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn moves_a_tab_with_an_explicit_window_choice() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (pid, request) =
+            parse_line("--pid 7 move-tab --pane 42 --window 9 --activate").unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"move-tab","pane":42,"window_id":9,"activate":true})
+        );
+        let (_, request) = parse_line("move-tab --pane 42 --new-window").unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"move-tab","pane":42,"new_window":true})
+        );
+        for invalid in [
+            "move-tab --pane 1",
+            "move-tab --new-window",
+            "move-tab --pane 0 --new-window",
+            "move-tab --pane 1 --window 0",
+            "move-tab --pane 1 --window 2 --new-window",
+            "move-tab --pane 1 --new-window --activate",
+            "move-tab --pane 1 --pane 2 --new-window",
+            "move-tab --pane 1 --target-pane 2 --new-window",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

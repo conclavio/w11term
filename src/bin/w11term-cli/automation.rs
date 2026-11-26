@@ -6,7 +6,7 @@ use w11term::control::{
 };
 use w11term::pane_layout::{Axis, Direction};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] get-running-output --pane ID --start-token TOKEN\nw11term-cli [--pid PID] interrupt-command --pane ID --start-token TOKEN\nw11term-cli [--pid PID] wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] [--connection-generation N] [--after-frame N] [--screenshot PATH] [--] TEXT\nw11term-cli [--pid PID] wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]\nw11term-cli [--pid PID] wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--kind KIND] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--window ID] [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] open --profile NAME --new-window [--cols N --rows N]\nw11term-cli [--pid PID] close-pane --pane ID\nw11term-cli [--pid PID] split-pane --pane ID --profile NAME --axis columns|rows [--activate]\nw11term-cli [--pid PID] move-pane --pane ID --target-pane ID --direction left|right|up|down [--activate]\nw11term-cli [--pid PID] focus-pane --pane ID\nw11term-cli [--pid PID] zoom-pane --pane ID (--on | --off)\nw11term-cli [--pid PID] get-tab-layout --pane ID\nw11term-cli [--pid PID] resize-split --pane ID --target-pane ID --percent N\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --after-id ID --connection-generation N [--timeout SECONDS] [--command TEXT] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --start-token TOKEN [--timeout SECONDS] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN\nw11term-cli [--pid PID] stop-ssh-attempt --pane ID --attempt-token TOKEN\nw11term-cli [--pid PID] retry-ssh-now --pane ID --retry-token TOKEN\nw11term-cli [--pid PID] disconnect-ssh-shell --pane ID --connection-generation N";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] get-running-output --pane ID --start-token TOKEN\nw11term-cli [--pid PID] interrupt-command --pane ID --start-token TOKEN\nw11term-cli [--pid PID] wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] [--connection-generation N] [--after-frame N] [--screenshot PATH] [--] TEXT\nw11term-cli [--pid PID] wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]\nw11term-cli [--pid PID] wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--kind KIND] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--window ID] [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] open --profile NAME --new-window [--cols N --rows N]\nw11term-cli [--pid PID] close-pane --pane ID\nw11term-cli [--pid PID] split-pane --pane ID --profile NAME --axis columns|rows [--activate]\nw11term-cli [--pid PID] move-pane --pane ID --target-pane ID --direction left|right|up|down [--activate]\nw11term-cli [--pid PID] move-tab --pane ID (--window ID [--activate] | --new-window)\nw11term-cli [--pid PID] focus-pane --pane ID\nw11term-cli [--pid PID] zoom-pane --pane ID (--on | --off)\nw11term-cli [--pid PID] get-tab-layout --pane ID\nw11term-cli [--pid PID] resize-split --pane ID --target-pane ID --percent N\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --after-id ID --connection-generation N [--timeout SECONDS] [--command TEXT] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --start-token TOKEN [--timeout SECONDS] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN\nw11term-cli [--pid PID] stop-ssh-attempt --pane ID --attempt-token TOKEN\nw11term-cli [--pid PID] retry-ssh-now --pane ID --retry-token TOKEN\nw11term-cli [--pid PID] disconnect-ssh-shell --pane ID --connection-generation N";
 pub(super) fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -93,6 +93,7 @@ pub(super) fn parse(
                         "close-pane"
                             | "split-pane"
                             | "move-pane"
+                            | "move-tab"
                             | "focus-pane"
                             | "zoom-pane"
                             | "get-tab-layout"
@@ -211,11 +212,14 @@ pub(super) fn parse(
                 name = Some(value(&mut args)?);
             }
             "--activate"
-                if matches!(verb, "open" | "open-workspace" | "split-pane" | "move-pane") =>
+                if matches!(
+                    verb,
+                    "open" | "open-workspace" | "split-pane" | "move-pane" | "move-tab"
+                ) =>
             {
                 activate = true
             }
-            "--new-window" if matches!(verb, "open" | "open-workspace") => {
+            "--new-window" if matches!(verb, "open" | "open-workspace" | "move-tab") => {
                 ensure!(!new_window, "specify --new-window only once");
                 new_window = true;
             }
@@ -407,6 +411,7 @@ pub(super) fn parse(
                         | "save-workspace"
                         | "open-ssh-group"
                         | "list-saved-ssh-groups"
+                        | "move-tab"
                 ) && arg == "--window")
                     || matches!(
                         verb,
@@ -569,6 +574,24 @@ pub(super) fn parse(
                 pane,
                 target_pane,
                 direction: direction.context("--direction left, right, up, or down is required")?,
+                activate,
+            }
+        }
+        "move-tab" => {
+            ensure!(
+                new_window != window_id.is_some(),
+                "provide exactly one of --window ID or --new-window"
+            );
+            ensure!(
+                !new_window || !activate,
+                "--new-window already selects the moved tab"
+            );
+            Request::MoveTab {
+                pane: pane
+                    .filter(|id| *id > 0)
+                    .context("provide a positive --pane ID")?,
+                window_id,
+                new_window,
                 activate,
             }
         }

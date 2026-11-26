@@ -203,6 +203,16 @@ impl WindowLaunch {
             child: None,
         }
     }
+
+    pub(super) fn preserves_desktop_focus(&self) -> bool {
+        self.child
+            .as_ref()
+            .is_some_and(|child| child.control.is_some())
+            || self
+                .transfer
+                .as_ref()
+                .is_some_and(|offer| offer.control.is_some())
+    }
 }
 
 impl PartialEq for WindowLaunch {
@@ -223,7 +233,7 @@ pub(super) struct Transfer {
     pub(super) new_window: Option<NewWindow>,
     panes: Vec<u64>,
     kind: TransferKind,
-    control: Option<Rc<ControlPaneMove>>,
+    control: Option<Rc<ControlMove>>,
     source: LocalSender<Message>,
     pub(super) target: RefCell<Option<LocalSender<Message>>>,
     payload: RefCell<Option<TransferPayload>>,
@@ -232,12 +242,12 @@ pub(super) struct Transfer {
     started: Instant,
 }
 
-struct ControlPaneMove {
+struct ControlMove {
     activate: bool,
     reply: RefCell<Option<WindowReply>>,
 }
 
-impl ControlPaneMove {
+impl ControlMove {
     fn finish(&self, result: Result<serde_json::Value, String>) {
         if let Some(reply) = self.reply.borrow_mut().take() {
             let _ = reply.send(result);
@@ -454,7 +464,7 @@ impl<T> OfferedTabs<T> {
         }
     }
 
-    fn receive(self, destination: &mut Tabs<T>) -> Vec<TabId> {
+    fn receive(self, destination: &mut Tabs<T>, select: bool) -> Vec<TabId> {
         let focused = self.selected.or_else(|| self.tabs.first()?.1.active_id());
         let mut leaves = Vec::new();
         let first_index = destination.headers().len();
@@ -462,7 +472,7 @@ impl<T> OfferedTabs<T> {
             leaves.extend(tab.entries().iter().map(|entry| entry.id));
             destination.restore_group(tab, first_index + offset, false);
         }
-        if let Some(id) = focused {
+        if select && let Some(id) = focused {
             destination.select(id);
         }
         leaves
@@ -517,19 +527,21 @@ impl Transfer {
     }
 
     fn reply_to_control_move(&self) {
-        if let Some(control) = &self.control
-            && let TransferKind::Pane {
+        let Some(control) = &self.control else { return };
+        let reply = match self.kind {
+            TransferKind::Tab(group) => serde_json::json!({
+                "window_id": self.destination,
+                "tab_id": group,
+                "panes": self.panes,
+                "active": control.activate,
+            }),
+            TransferKind::Pane {
                 placement: Some((target, side)),
                 ..
-            } = self.kind
-        {
-            control.finish(Ok(moved_pane_reply(
-                self.panes[0],
-                target,
-                side,
-                control.activate,
-            )));
-        }
+            } => moved_pane_reply(self.panes[0], target, side, control.activate),
+            _ => return,
+        };
+        control.finish(Ok(reply));
     }
 }
 
@@ -1117,7 +1129,7 @@ impl TerminalApp {
                 .map(|()| moved_pane_reply(pane, target, direction, activate));
             let _ = reply.send(result.map_err(|error| format!("{error:#}")));
         } else {
-            let control = Rc::new(ControlPaneMove {
+            let control = Rc::new(ControlMove {
                 activate,
                 reply: RefCell::new(Some(reply)),
             });
@@ -1134,6 +1146,62 @@ impl TerminalApp {
             ) {
                 control.finish(Err(format!("{error:#}")));
             }
+        }
+    }
+
+    pub(super) fn control_move_tab(
+        &mut self,
+        pane: u64,
+        destination: Option<u64>,
+        activate: bool,
+        reply: WindowReply,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let control = Rc::new(ControlMove {
+            activate: activate || destination.is_none(),
+            reply: RefCell::new(Some(reply)),
+        });
+        let result = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.incoming.is_none() && self.outgoing.is_none(),
+                "This window already has a transfer in progress"
+            );
+            anyhow::ensure!(
+                destination != Some(self.registry.window_id()),
+                "Choose a different destination window"
+            );
+            let entry = self
+                .tab_for_pane(pane)
+                .with_context(|| format!("unknown pane {pane}"))?;
+            let group = self
+                .tabs
+                .group_id(entry)
+                .context("The source pane has no tab")?;
+            let leaves = self
+                .group_leaves(&[group])
+                .context("The source tab is closed")?;
+            anyhow::ensure!(
+                self.tabs.entries().len() > leaves.len(),
+                "Moving the last tab would close its window"
+            );
+            if let Some(reason) = self.tab_move_blocker(&leaves) {
+                anyhow::bail!(reason);
+            }
+            let panes = leaves
+                .into_iter()
+                .map(|leaf| self.tabs.get(leaf)?.pane_id())
+                .collect::<Option<Vec<_>>>()
+                .context("The source tab has a missing pane")?;
+            self.start_window_transfer(
+                panes,
+                destination,
+                TransferKind::Tab(group),
+                Some(control.clone()),
+                ctx,
+            )
+        })();
+        if let Err(error) = result {
+            control.finish(Err(format!("{error:#}")));
         }
     }
 
@@ -1191,7 +1259,7 @@ impl TerminalApp {
         panes: Vec<u64>,
         destination: Option<u64>,
         kind: TransferKind,
-        control: Option<Rc<ControlPaneMove>>,
+        control: Option<Rc<ControlMove>>,
         ctx: &ComponentContext<Self>,
     ) -> anyhow::Result<()> {
         let (destination, new_window, target) = if let Some(destination) = destination {
@@ -1334,6 +1402,13 @@ impl TerminalApp {
             self.cancel_transfer(id, ctx);
             return;
         };
+        if offer.control.is_some()
+            && matches!(offer.kind, TransferKind::Tab(_))
+            && self.tabs.entries().len() == leaves.len()
+        {
+            self.cancel_transfer(id, ctx);
+            return;
+        }
         let panes: Vec<_> = leaves
             .iter()
             .filter_map(|leaf| self.tabs.get(*leaf)?.pane_id())
@@ -1443,7 +1518,7 @@ impl TerminalApp {
             .as_ref()
             .is_none_or(|control| control.activate);
         let leaves = match payload {
-            TransferPayload::Tabs(payload) => payload.receive(&mut self.tabs),
+            TransferPayload::Tabs(payload) => payload.receive(&mut self.tabs, select),
             TransferPayload::Pane(pane) => {
                 if let Some((target, side)) = target {
                     match self
@@ -1549,7 +1624,11 @@ impl TerminalApp {
         offer.pin.take();
         offer.cancel_target();
         if let Some(control) = &offer.control {
-            control.finish(Err("Could not move the pane to the target tab".into()));
+            let message = match offer.kind {
+                TransferKind::Tab(_) => "Could not move the tab to the target window",
+                _ => "Could not move the pane to the target tab",
+            };
+            control.finish(Err(message.into()));
         }
         self.window_error = Some(
             match offer.kind {
@@ -1693,6 +1772,29 @@ mod tests {
     }
 
     #[test]
+    fn receiving_a_background_tab_preserves_both_windows_selections() {
+        let mut source = Tabs::default();
+        let left = source.insert("SSH");
+        let right = source.split(left, "PowerShell", Axis::Columns).unwrap();
+        assert!(source.set_ratio(&[], 0.625));
+        assert_eq!(source.set_zoom(right, true), Some(true));
+        let group = source.group_id(left).unwrap();
+        let layout = source.group_layout(group).unwrap().clone();
+        let fallback = source.insert("source tab");
+        let mut destination = Tabs::default();
+        let selected = destination.insert("destination tab");
+
+        let offer = OfferedTabs::take(&mut source, &[group]).unwrap();
+        assert_eq!(offer.receive(&mut destination, false), [left, right]);
+        assert_eq!(source.active_id(), Some(fallback));
+        assert_eq!(destination.active_id(), Some(selected));
+        assert_eq!(destination.group_layout(group), Some(&layout));
+        assert_eq!(destination.group_focus(group), Some(right));
+        assert!(destination.group_zoomed(group));
+        assert!(!destination.visible(left) && !destination.visible(right));
+    }
+
+    #[test]
     fn batch_preserves_order_pins_and_split_focus_on_claim_or_rollback() {
         let mut source = Tabs::default();
         let first = source.insert("first");
@@ -1722,7 +1824,10 @@ mod tests {
         let old_tab = destination.insert("old tab");
         destination.set_group_pinned(old_pin, true);
         let offer = OfferedTabs::take(&mut source, &[first, last]).unwrap();
-        assert_eq!(offer.receive(&mut destination), [first, last, focused]);
+        assert_eq!(
+            offer.receive(&mut destination, true),
+            [first, last, focused]
+        );
         assert_eq!(header_ids(&destination), [old_pin, first, old_tab, last]);
         assert_eq!(destination.active_id(), Some(focused));
     }
