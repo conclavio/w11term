@@ -15,6 +15,17 @@ function Sample-Cell {
 function Read-Generation {
     (Control @('get-text','--pane',"$pane")).generation
 }
+function Read-Appearance {
+    # Settings are replaced atomically. Allow that replacement while reading the prior file.
+    try {
+        $stream = [IO.File]::Open($env:W11TERM_SETTINGS_PATH, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    } catch [IO.FileNotFoundException] {
+        return $null
+    }
+    $reader = [IO.StreamReader]::new($stream)
+    try { $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+}
 function Send-Sequence([string]$Suffix) {
     $before = Read-Generation
     $bytes = [Text.Encoding]::ASCII.GetBytes(([string][char]27) + $Suffix)
@@ -99,7 +110,7 @@ try {
     }
     $bar.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $null = Wait-Until 'cursor style persisted' {
-        (Get-Content -LiteralPath $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).default_cursor_style -ceq 'steady_bar'
+        (Read-Appearance).default_cursor_style -ceq 'steady_bar'
     }
     $field = Find-Element 'Default cursor style' $combo
     $popup = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
@@ -126,7 +137,7 @@ try {
     }
     $follow.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $null = Wait-Until 'cursor guide mode persisted' {
-        (Get-Content -LiteralPath $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).cursor_guide -ceq 'follow_applications'
+        (Read-Appearance).cursor_guide -ceq 'follow_applications'
     }
     $field = Find-Element 'Cursor guide' $combo
     $popup = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
