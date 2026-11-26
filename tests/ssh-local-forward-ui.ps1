@@ -33,9 +33,17 @@ function Window-Elements($Type) {
     $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $Type)
     $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
+function Wait-RoutePreview([string]$WindowsEndpoint) {
+    $route = "Windows $WindowsEndpoint " + [char]0x2192 + " remote 127.0.0.1:$destination"
+    $null = Wait-Until "reviewed route '$route'" {
+        $start = Find-Element 'Start forwarding' $button
+        $start -and $start.Current.IsEnabled -and (Find-Element $route $text)
+    }
+}
 function Start-Forward {
     Field 'Remote localhost port' "$destination"
     Field 'Windows local port' ''
+    Wait-RoutePreview '127.0.0.1 (automatic port)'
     Click 'Start forwarding'
     Wait-Until 'ephemeral listener and its remote loopback endpoint' {
         foreach ($entry in (Window-Elements $button)) {
@@ -75,12 +83,27 @@ try {
     $busy = [Net.Sockets.TcpListener]::new($loopback, 0)
     $busy.ExclusiveAddressUse = $true
     $busy.Start()
+    $busyPort = $busy.LocalEndpoint.Port
     try {
         Field 'Remote localhost port' "$destination"
-        Field 'Windows local port' "$($busy.LocalEndpoint.Port)"
+        Wait-RoutePreview '127.0.0.1 (automatic port)'
+        Field 'Windows local port' '0'
+        $null = Wait-Until 'an invalid Windows port cannot be started' {
+            $start = Find-Element 'Start forwarding' $button
+            $message = 'Enter a Windows TCP port between 1 and 65535, or leave it blank.'
+            $start -and !$start.Current.IsEnabled -and (Find-Element $message $text)
+        }
+        Field 'Windows local port' "$busyPort"
+        Wait-RoutePreview "127.0.0.1:$busyPort"
         Click 'Start forwarding'
         $null = Wait-Until 'bind failure displayed in manager' {
-            (Window-Elements $text) | Where-Object { $_.Current.Name.StartsWith('Could not start forwarding') }
+            (Window-Elements $text) | Where-Object {
+                $_.Current.Name.StartsWith('Could not start forwarding') -and
+                    $_.Current.Name.Contains("Could not listen on 127.0.0.1:$busyPort")
+            }
+        }
+        if ((Window-Elements $button) | Where-Object { $_.Current.Name -match '^Stop forwarding port \d+$' }) {
+            throw 'Starting the occupied port created an unexpected forwarding listener'
         }
     } finally { $busy.Stop() }
 

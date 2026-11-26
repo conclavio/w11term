@@ -74,8 +74,10 @@ function Assert-OnlySupportedPair {
 function Apply-Preset {
     Click $use
     Click $preset $menu
-    $null = Wait-Until 'preset fills both draft fields' {
-        (Field 'Remote localhost port').Current.Value -ceq "$remotePort" -and (Field 'Windows local port').Current.Value -ceq "$localPort"
+    $route = "Windows 127.0.0.1:$localPort " + [char]0x2192 + " remote 127.0.0.1:$remotePort"
+    $null = Wait-Until 'preset fills both draft fields and previews the route' {
+        (Field 'Remote localhost port').Current.Value -ceq "$remotePort" -and
+            (Field 'Windows local port').Current.Value -ceq "$localPort" -and (Find-Element $route $text)
     }
     if (Find-Element "Stop forwarding port $localPort" $button) { throw 'Selecting a preset created a listener' }
     Expect-Refused $localPort

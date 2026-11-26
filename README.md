@@ -704,7 +704,7 @@ and each jump. Profiles store it in the optional `host_key_alias` field.
 
 ## Forward a local port
 
-If a development server on the SSH host listens on `127.0.0.1:8000`, open the command palette in its SSH pane and choose **Forward a local port…**. Enter `8000` as the remote port. Leave the Windows port empty to have Windows assign one, or enter a specific port. Choose **Start forwarding**, then **Copy address** to use the Windows endpoint in your browser or TCP client. You can close the manager while the forward is running. For example, if Windows assigns port `54210`, visit `http://127.0.0.1:54210/` for an HTTP service.
+If a development server on the SSH host listens on `127.0.0.1:8000`, open the command palette in its SSH pane and choose **Forward a local port…**. Enter `8000` as the remote port. Leave the Windows port empty to have Windows assign one, or enter a specific port. Review the Windows and remote endpoints shown above **Start forwarding**. Once the forward starts, choose **Copy address** to use the Windows endpoint in your browser or TCP client. You can close the manager while the forward is running. For example, if Windows assigns port `54210`, visit `http://127.0.0.1:54210/` for an HTTP service.
 
 Both endpoints use IPv4 loopback. Each client connection uses the pane's authenticated SSH connection, and the SSH server must allow local TCP forwarding. Use **Stop** on a forward to close its listener and connected clients. Closing the owning pane or losing its SSH connection also stops its forwards, even when another pane shares that login. You can start a fresh forward after reconnecting. [OpenSSH local forwarding](https://man.openbsd.org/ssh#L)
 

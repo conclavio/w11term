@@ -173,7 +173,7 @@ pub enum Edit {
     Remote(String),
     Local(String),
     Preset(LocalForwardPreset),
-    Start,
+    Start { local: u16, remote: u16 },
     Stop(u64),
     Copy(u64),
     Refresh,
@@ -192,6 +192,15 @@ fn edit(id: TabId, origin: Origin, edit: Edit) -> Message {
 
 fn windows_address(port: u16) -> String {
     format!("127.0.0.1:{port}")
+}
+
+fn draft_route(local: u16, remote: u16) -> String {
+    let endpoint = if local == 0 {
+        "127.0.0.1 (automatic port)".into()
+    } else {
+        windows_address(local)
+    };
+    format!("Windows {endpoint} → remote 127.0.0.1:{remote}")
 }
 
 // A receiver can close immediately after publishing its final status. Report that
@@ -370,22 +379,26 @@ impl TerminalApp {
             }
             Edit::Remote(text) => {
                 panel.draft.remote = text;
+                panel.feedback.clear();
                 return;
             }
             Edit::Local(text) => {
                 panel.draft.local = text;
+                panel.feedback.clear();
+                return;
+            }
+            Edit::Start { local, remote } if panel.draft.ports() != Ok((local, remote)) => {
+                panel.feedback = "The ports changed. Check the route and start again.".into();
                 return;
             }
             _ => {}
         }
-        let ports = panel.draft.ports();
         let Page::Terminal(tab) = &mut self.tabs.get_mut(source).unwrap().page else {
             return;
         };
         let feedback =
             match action {
-                Edit::Start => {
-                    let Ok((local, remote)) = ports else { return };
+                Edit::Start { local, remote } => {
                     match tab
                         .session
                         .start_local_forward(origin.generation, local, remote)
@@ -482,20 +495,31 @@ impl TerminalApp {
                         .text(&draft.local)
                         .on_text_changed(ctx.callback(move |s| action(Edit::Local(s)))),
                 ),
-                KeyedView::new(
-                    "start",
-                    Button::new()
-                        .style(ButtonStyle::Accent)
-                        .is_enabled(validation.is_ok())
-                        .on_click(ctx.callback(move |_| action(Edit::Start)))
-                        .content("Start forwarding"),
-                ),
             ]);
-            if !draft.remote.is_empty()
-                && let Err(error) = validation
-            {
-                items.push(KeyedView::new("validation", TextBlock::new().text(error)));
+            match validation {
+                Ok((local, remote)) => items.push(KeyedView::new(
+                    "preview",
+                    TextBlock::new()
+                        .text(draft_route(local, remote))
+                        .text_wrapping(TextWrapping::Wrap),
+                )),
+                Err(error) if !draft.remote.is_empty() => {
+                    items.push(KeyedView::new("validation", TextBlock::new().text(error)));
+                }
+                Err(_) => {}
             }
+            items.push(KeyedView::new(
+                "start",
+                Button::new()
+                    .style(ButtonStyle::Accent)
+                    .is_enabled(validation.is_ok())
+                    .on_click(ctx.callback(move |_| {
+                        validation.map_or(Message::ControlIdle, |(local, remote)| {
+                            action(Edit::Start { local, remote })
+                        })
+                    }))
+                    .content("Start forwarding"),
+            ));
             if !tab.forwards.entries.is_empty() {
                 items.push(KeyedView::new(
                     "route-heading",
