@@ -4,7 +4,7 @@ use w11term::workspace::{
 };
 
 mod duplicate;
-pub(super) use duplicate::{ClosedPane, ClosedTab, PreparedTabLayout};
+pub(super) use duplicate::{ClosedPane, ClosedTab, ClosedTabWindow, PreparedTabLayout};
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {

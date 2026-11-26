@@ -349,6 +349,17 @@ pub(super) struct Picker {
 }
 
 impl Picker {
+    pub(super) fn selected_closed_tab(&self) -> Option<TabId> {
+        if self.mode != Mode::Commands(command_palette::Search::ClosedTabs) {
+            return None;
+        }
+        let entry = self.commands.get(self.selected)?;
+        match entry.id {
+            command_palette::CommandId::ReopenTabFromHistory(group) if entry.enabled => Some(group),
+            _ => None,
+        }
+    }
+
     pub(super) fn bookmark_results_expired(&self, frame: &Snapshot) -> bool {
         let Mode::Commands(command_palette::Search::Bookmarks(_, screen)) = self.mode else {
             return false;
@@ -1311,6 +1322,7 @@ impl TerminalApp {
         }
         self.sync_picker_preview(ctx);
         self.keyboard.set_picker(Some(match mode {
+            Mode::Commands(command_palette::Search::ClosedTabs) => PickerStage::ClosedTabs,
             Mode::Commands(command_palette::Search::CommandHistory) => PickerStage::CommandHistory,
             Mode::Commands(command_palette::Search::RunningCommands) => {
                 PickerStage::RunningCommands
@@ -1469,6 +1481,13 @@ impl TerminalApp {
             .map(|row| row.pane)
         {
             self.choose_picker_pane(pane, ctx);
+        }
+    }
+
+    pub(super) fn choose_closed_tab_window(&mut self, group: TabId, ctx: &ComponentContext<Self>) {
+        if self.picker.as_ref().and_then(Picker::selected_closed_tab) == Some(group) {
+            self.close_picker(ctx);
+            self.reopen_closed_tab_in_window(group, ctx);
         }
     }
 

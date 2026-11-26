@@ -375,6 +375,8 @@ If you close a terminal tab by accident, choose **More → Reopen last closed ta
 
 Choose **More → Recently closed tabs…** to reopen a specific layout from that history. Search by tab title, pane name, profile or SSH address. Results appear newest first and show the former tab position and pane count. Enter reopens the selected layout. Escape keeps your current tab. The picker is also available from the command palette and **Settings → Keyboard**.
 
+In **Recently closed tabs…**, choose **Reopen in new window** or press **Ctrl+Enter** to restore the selected layout in its own window. The layout stays in history until the new window opens successfully.
+
 Choose **More → Reopen last closed pane** to recover one ordinary SSH or local shell that you closed from a split. It starts a fresh shell with the pane name and input lock, then focuses it on the original side of the divider. The other panes keep running. If those panes moved or the original split position is gone, the shell opens in its own tab. Each window remembers one eligible split pane. The action is also available in the command palette and **Settings → Keyboard**.
 
 Duplication works with ordinary SSH and interactive local shell launches. The menu explains when a workspace startup command, durable viewer, RustMUSH player session or local command makes a tab ineligible. If a profile has been edited or removed, the duplicate still uses the original pane’s connection settings.

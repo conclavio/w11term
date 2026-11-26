@@ -37,6 +37,7 @@ enum LocalMode {
 pub enum PickerStage {
     Search,
     Commands,
+    ClosedTabs,
     CommandHistory,
     RunningCommands,
     Placement,
@@ -250,6 +251,7 @@ pub enum Shortcut {
     FindAllPanes,
     PickerMove(isize),
     PickerAccept,
+    PickerReopenTabInWindow,
     PickerCancel,
     PickerHistoryOption(HistoryPickerOption),
     PickerSaveHistory,
@@ -1657,8 +1659,12 @@ impl State {
                     (PickerStage::RunningCommands, 0x0d) if modifiers() == KeyModifiers::CTRL => {
                         Shortcut::PickerConfirmRunningInterrupt
                     }
+                    (PickerStage::ClosedTabs, 0x0d) if modifiers() == KeyModifiers::CTRL => {
+                        Shortcut::PickerReopenTabInWindow
+                    }
                     (
                         PickerStage::Commands
+                        | PickerStage::ClosedTabs
                         | PickerStage::CommandHistory
                         | PickerStage::RunningCommands,
                         0x09,
@@ -1670,6 +1676,7 @@ impl State {
                     (
                         PickerStage::Search
                         | PickerStage::Commands
+                        | PickerStage::ClosedTabs
                         | PickerStage::CommandHistory
                         | PickerStage::RunningCommands,
                         0x0d,
@@ -1677,6 +1684,7 @@ impl State {
                     (
                         PickerStage::Search
                         | PickerStage::Commands
+                        | PickerStage::ClosedTabs
                         | PickerStage::CommandHistory
                         | PickerStage::RunningCommands,
                         0x26,
@@ -1684,6 +1692,7 @@ impl State {
                     (
                         PickerStage::Search
                         | PickerStage::Commands
+                        | PickerStage::ClosedTabs
                         | PickerStage::CommandHistory
                         | PickerStage::RunningCommands,
                         0x28,
@@ -1891,10 +1900,10 @@ impl State {
                     ) {
                         self.picker = Some(match shortcut {
                             Shortcut::FindCommandHistory => PickerStage::CommandHistory,
-                            Shortcut::CommandPalette
-                            | Shortcut::FindTab
-                            | Shortcut::FindWindow
-                            | Shortcut::FindClosedTab => PickerStage::Commands,
+                            Shortcut::FindClosedTab => PickerStage::ClosedTabs,
+                            Shortcut::CommandPalette | Shortcut::FindTab | Shortcut::FindWindow => {
+                                PickerStage::Commands
+                            }
                             _ => PickerStage::Search,
                         });
                         self.local_held.insert(slot, false);
