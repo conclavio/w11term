@@ -14,13 +14,20 @@ function Wait-KeyPrompt([int]$Pane, [bool]$Retry) {
         $row = (Control @('list')).sessions | Where-Object id -eq $Pane
         $question = $row.prompt.question
         if ($question.kind -eq 'identity-passphrase' -and $question.retry -eq $Retry -and
-            $row.connection_generation -eq 0 -and $question.identity -like '*fixture-key.ed25519') {
+            $question.identity -like '*fixture-key.ed25519') {
             $row.prompt.id
         }
     }
 }
 
-function Submit-KeyPassphrase([string]$Value) {
+function Submit-KeyPassphrase([string]$Value, [switch]$Remember) {
+    $label = 'Keep this key unlocked for reconnects'
+    $checkbox = Wait-CheckBox $label Off
+    if ($Remember) {
+        $checkbox.Toggle()
+        $null = Wait-CheckBox $label On
+    }
+
     $field = Wait-Until 'masked key passphrase field' {
         $element = Find-Element 'Key passphrase' $edit
         if ($element -and $element.Current.IsPassword -and !$element.Current.IsOffscreen) { $element }
@@ -37,6 +44,10 @@ function Submit-KeyPassphrase([string]$Value) {
         }
     }
     Invoke-Button (Wait-Until 'Unlock button' { Find-Element 'Unlock' $button })
+}
+
+function Drop-Link([int]$Pane, [uint64]$Generation) {
+    $null = Control @('send-text','--pane',"$Pane",'--connection-generation',"$Generation",'--no-paste','--base64','BA==')
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','90','--rows','24') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -56,10 +67,33 @@ try {
 
     $second = (Control @('open','--profile','palette-ssh','--activate')).pane
     $null = Wait-KeyPrompt $second $false
-    Submit-KeyPassphrase 'ui-fixture-passphrase'
-    $null = Control @('wait-ssh-connected','--pane',"$second",'--timeout','15')
+    Submit-KeyPassphrase 'ui-fixture-passphrase' -Remember
+    $generation = (Control @('wait-ssh-connected','--pane',"$second",'--timeout','15')).connection_generation
     $result = Control @('wait-for-text','--pane',"$second",'--timeout','15','ready')
     if ($result.text -match 'fixture-passphrase') { throw 'The key passphrase reached the terminal' }
+
+    Drop-Link $second $generation
+    $reconnected = Control @('wait-ssh-connected','--pane',"$second",'--after-generation',"$generation",'--timeout','15')
+    if ($reconnected.pane -ne $second -or $reconnected.connection_generation -le $generation) {
+        throw 'The same pane did not automatically reconnect with its unlocked key'
+    }
+    $null = Control @('wait-for-text','--pane',"$second",'--connection-generation',"$($reconnected.connection_generation)",'--timeout','15','ready')
+
+    $independent = (Control @('open','--profile','palette-ssh')).pane
+    $null = Wait-KeyPrompt $independent $false
+    $null = Control @('close-pane','--pane',"$independent")
+    Wait-Focus $second
+
+    [IO.File]::Copy((Join-Path $State 'rotated-key.ed25519'), (Join-Path $State 'fixture-key.ed25519'), $true)
+    Drop-Link $second $reconnected.connection_generation
+    $rotationPrompt = Wait-KeyPrompt $second $false
+    Submit-KeyPassphrase 'ui-rotated-passphrase'
+    $latest = Control @('wait-ssh-connected','--pane',"$second",'--after-generation',"$($reconnected.connection_generation)",'--timeout','15')
+    $null = Control @('wait-for-text','--pane',"$second",'--connection-generation',"$($latest.connection_generation)",'--timeout','15','ready')
+    Drop-Link $second $latest.connection_generation
+    $uncached = Wait-KeyPrompt $second $false
+    if ($uncached -eq $rotationPrompt) { throw 'The unchecked login reused its previous prompt' }
+    Invoke-Button (Wait-Until 'Cancel unlock button' { Find-Element 'Cancel' $button })
 } finally {
     Close-FixtureApp $app
 }

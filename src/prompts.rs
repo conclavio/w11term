@@ -136,7 +136,10 @@ pub struct Prompt {
 pub enum Answer {
     Trust(bool),
     Authentication(Vec<Zeroizing<String>>),
-    IdentityPassphrase(Zeroizing<String>),
+    IdentityPassphrase {
+        passphrase: Zeroizing<String>,
+        remember: bool,
+    },
     Cancel,
 }
 impl std::fmt::Debug for Answer {

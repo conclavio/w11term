@@ -300,7 +300,10 @@ async fn roundtrip(
                 assert!(!serde_json::to_string(&question).unwrap().contains(passphrase));
                 session
                     .prompts
-                    .answer(question.id, Answer::IdentityPassphrase(value.to_owned().into()))
+                    .answer(question.id, Answer::IdentityPassphrase {
+                        passphrase: value.to_owned().into(),
+                        remember: false,
+                    })
                     .unwrap();
             }
         }

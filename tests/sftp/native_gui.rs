@@ -1295,11 +1295,11 @@ fn recording_burst(host: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "unlocks an encrypted OpenSSH key with the native masked prompt"]
+#[ignore = "unlocks a native OpenSSH key and verifies scoped opt-in reconnect reuse"]
 async fn native_encrypted_ssh_identity_can_retry_cancel_and_unlock() {
     use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 
-    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 6).await else {
         unreachable!()
     };
     let state = tempfile::tempdir().unwrap();
@@ -1309,20 +1309,27 @@ async fn native_encrypted_ssh_identity_can_retry_cancel_and_unlock() {
         key.public_key().to_openssh().unwrap(),
     )
     .unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
     let identity = state.path().join("fixture-key.ed25519");
-    let encrypted = key
-        .encrypt(&mut rand::rng(), "ui-fixture-passphrase")
+    for (path, passphrase) in [
+        (identity.clone(), "ui-fixture-passphrase"),
+        (
+            state.path().join("rotated-key.ed25519"),
+            "ui-rotated-passphrase",
+        ),
+    ] {
+        let encrypted = key.encrypt(&mut rand::rng(), passphrase).unwrap();
+        fs::write(
+            path,
+            encrypted.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+        )
         .unwrap();
-    fs::write(
-        &identity,
-        encrypted.to_openssh(LineEnding::LF).unwrap().as_bytes(),
-    )
-    .unwrap();
+    }
     ssh.authentication = Authentication::identity(identity, None);
-    ssh.player.reconnect = false;
+    ssh.player.reconnect = true;
 
     drive_mixed_gui("ssh-identity-passphrase-ui.ps1", &ssh, state.path());
-    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(opens.load(Ordering::Relaxed), 3);
     server.abort();
 }
 

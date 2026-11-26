@@ -18,7 +18,7 @@ use russh::{
     },
 };
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -93,7 +93,9 @@ mod tests {
             key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
         )
         .unwrap();
-        let error = identity_key(file.path(), None).await.unwrap_err();
+        let error = identity_key(file.path(), None, &mut None)
+            .await
+            .unwrap_err();
         assert!(error.is::<Permanent>());
         assert!(
             error
@@ -320,16 +322,41 @@ impl client::Handler for Handler {
         Ok(true)
     }
 }
-async fn identity_key(identity: &Path, prompts: Option<&Prompts>) -> Result<PrivateKey> {
-    let key = crate::keys::read_identity(identity).map_err(|error| {
+struct UnlockedIdentity {
+    path: PathBuf,
+    encrypted_digest: [u8; 32],
+    key: Arc<PrivateKey>,
+}
+
+#[derive(Default)]
+pub(super) struct EndpointCredentials {
+    password: Option<Zeroizing<String>>,
+    unlocked_identity: Option<UnlockedIdentity>,
+}
+
+async fn identity_key(
+    identity: &Path,
+    prompts: Option<&Prompts>,
+    cached: &mut Option<UnlockedIdentity>,
+) -> Result<(Arc<PrivateKey>, Option<[u8; 32]>)> {
+    let (key, encrypted_digest) = crate::keys::read_identity(identity).map_err(|error| {
+        *cached = None;
         stop(format!(
             "loading identity {}: {error:#}",
             identity.display()
         ))
     })?;
-    if !key.is_encrypted() {
-        return Ok(key);
+    let Some(encrypted_digest) = encrypted_digest else {
+        *cached = None;
+        return Ok((Arc::new(key), None));
+    };
+    if let Some(saved) = cached
+        .as_ref()
+        .filter(|saved| saved.path == identity && saved.encrypted_digest == encrypted_digest)
+    {
+        return Ok((saved.key.clone(), None));
     }
+    *cached = None;
     // Each pane owns its runtime and joins its worker on close. Keep local
     // decryption work bounded, including when a key file's KDF is malformed.
     ensure!(
@@ -354,7 +381,11 @@ async fn identity_key(identity: &Path, prompts: Option<&Prompts>) -> Result<Priv
             })
             .await
             .map_err(|error| stop(error.to_string()))?;
-        let Answer::IdentityPassphrase(passphrase) = answer else {
+        let Answer::IdentityPassphrase {
+            passphrase,
+            remember,
+        } = answer
+        else {
             return Err(stop("SSH identity unlock cancelled"));
         };
         let encrypted = key.clone();
@@ -363,7 +394,7 @@ async fn identity_key(identity: &Path, prompts: Option<&Prompts>) -> Result<Priv
                 .await
                 .map_err(|_| stop("SSH identity unlock worker failed"))?;
         if let Ok(key) = decrypted {
-            return Ok(key);
+            return Ok((Arc::new(key), remember.then_some(encrypted_digest)));
         }
     }
     Err(stop(
@@ -375,7 +406,7 @@ pub(super) async fn authenticate(
     session: &mut client::Handle<Handler>,
     options: &SshOptions,
     prompts: Option<&Prompts>,
-    password: &mut Option<Zeroizing<String>>,
+    credentials: &mut EndpointCredentials,
 ) -> Result<()> {
     match &options.authentication {
         Authentication::None => ensure!(
@@ -386,7 +417,8 @@ pub(super) async fn authenticate(
             identity,
             certificate,
         } => {
-            let key = Arc::new(identity_key(identity, prompts).await?);
+            let (key, remember) =
+                identity_key(identity, prompts, &mut credentials.unlocked_identity).await?;
             if let Some(path) = certificate {
                 let cert =
                     russh::keys::load_openssh_certificate(path.as_path()).map_err(|error| {
@@ -405,7 +437,7 @@ pub(super) async fn authenticate(
                 );
                 ensure!(
                     session
-                        .authenticate_openssh_cert(&options.user, key, cert)
+                        .authenticate_openssh_cert(&options.user, key.clone(), cert)
                         .await?
                         .success(),
                     Permanent("SSH user certificate authentication rejected".into())
@@ -416,12 +448,19 @@ pub(super) async fn authenticate(
                     session
                         .authenticate_publickey(
                             &options.user,
-                            PrivateKeyWithHashAlg::new(key, hash)
+                            PrivateKeyWithHashAlg::new(key.clone(), hash)
                         )
                         .await?
                         .success(),
                     Permanent("public-key authentication rejected".into())
                 );
+            }
+            if let Some(encrypted_digest) = remember {
+                credentials.unlocked_identity = Some(UnlockedIdentity {
+                    path: identity.as_path().to_owned(),
+                    encrypted_digest,
+                    key,
+                });
             }
         }
         Authentication::Agent => {
@@ -457,6 +496,7 @@ pub(super) async fn authenticate(
             );
         }
         Authentication::Password => {
+            let password = &mut credentials.password;
             let prompts =
                 prompts.ok_or_else(|| stop("password authentication requires the GUI"))?;
             let mut accepted = false;
@@ -593,7 +633,7 @@ pub(super) async fn authenticate(
 async fn connect(
     options: &SshOptions,
     prompts: Option<&Prompts>,
-    passwords: &mut [Option<Zeroizing<String>>],
+    credentials: &mut [EndpointCredentials],
     durable_peer: Option<&str>,
     output: Option<&mpsc::Sender<Event>>,
 ) -> Result<ConnectionShare> {
@@ -604,7 +644,7 @@ async fn connect(
         .map(SshOptions::from)
         .chain(std::iter::once(options.clone()));
     let mut upstream: Option<ConnectionShare> = None;
-    for (index, (endpoint, password)) in route.zip(passwords).enumerate() {
+    for (index, (endpoint, credentials)) in route.zip(credentials).enumerate() {
         let expected_peer = if index == options.proxy_jump.len() {
             durable_peer
         } else {
@@ -666,7 +706,7 @@ async fn connect(
         }
         .with_context(|| format!("SSH handshake for {address}"))?;
         report(ConnectionStep::Authenticating).await?;
-        authenticate(&mut handle, &endpoint, prompts, password)
+        authenticate(&mut handle, &endpoint, prompts, credentials)
             .await
             .with_context(|| format!("SSH authentication for {address}"))?;
         upstream = Some(ConnectionShare::new(
@@ -849,7 +889,7 @@ pub(super) async fn request_terminal(
 async fn connect_shell(
     options: SshOptions,
     prompts: Option<Prompts>,
-    passwords: &mut [Option<Zeroizing<String>>],
+    credentials: &mut [EndpointCredentials],
     source: Option<ConnectionShare>,
     published: ShareSlot,
     durable_peer: Option<String>,
@@ -884,7 +924,7 @@ async fn connect_shell(
         connect(
             &options,
             prompts.as_ref(),
-            passwords,
+            credentials,
             durable_peer.as_deref(),
             Some(output),
         )
@@ -909,7 +949,9 @@ pub(crate) async fn run_with_sharing(
     mut sharing: Sharing,
 ) -> Result<()> {
     options.validate_route()?;
-    let passwords = vec![None; options.proxy_jump.len() + 1];
+    let credentials = (0..=options.proxy_jump.len())
+        .map(|_| EndpointCredentials::default())
+        .collect();
     if let Some(startup) = &sharing.startup {
         startup.check_target(&options)?;
     }
@@ -923,7 +965,7 @@ pub(crate) async fn run_with_sharing(
         prompts,
         events,
         sharing,
-        passwords,
+        credentials,
         generation: 0,
         command_dispatched: false,
         game,
@@ -943,7 +985,7 @@ pub(super) struct Driver {
     prompts: Option<Prompts>,
     events: Events,
     sharing: Sharing,
-    passwords: Vec<Option<Zeroizing<String>>>,
+    credentials: Vec<EndpointCredentials>,
     generation: u64,
     command_dispatched: bool,
     game: Option<game_resume::Pane>,
@@ -969,7 +1011,7 @@ impl Driver {
                     connect(
                         &options,
                         self.prompts.as_ref(),
-                        &mut self.passwords,
+                        &mut self.credentials,
                         None,
                         None,
                     )
@@ -1065,7 +1107,7 @@ impl Driver {
                 let connect = connect_shell(
                     self.options.clone(),
                     self.prompts.clone(),
-                    &mut self.passwords,
+                    &mut self.credentials,
                     self.sharing.offered.take(),
                     self.sharing.published.clone(),
                     program.peer_fingerprint(),

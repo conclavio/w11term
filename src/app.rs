@@ -152,6 +152,7 @@ struct LiveTab {
     find: Find,
     prompt_id: Option<u64>,
     answers: Vec<zeroize::Zeroizing<String>>,
+    remember_ssh_key: bool,
     connection_generation: u64,
 }
 struct Find {
@@ -1353,6 +1354,7 @@ pub enum Message {
     Control(w11term::control::UiRequest),
     ControlResizeDone(control_resize::Completion),
     PromptEdit(TabId, u64, usize, String),
+    PromptRememberSshKey(TabId, u64, bool),
     PromptReply(TabId, u64, ContentDialogResult),
     GenerateKey(TabId),
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
@@ -1526,6 +1528,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             find: Find::default(),
             prompt_id: None,
             answers: Vec::new(),
+            remember_ssh_key: false,
             connection_generation: 0,
         }),
     }
@@ -1624,6 +1627,7 @@ impl TerminalApp {
                 _ => Vec::new(),
             };
             tab.prompt_id = prompt_id;
+            tab.remember_ssh_key = false;
         }
         if tab.connection_generation != frame.connection_generation {
             self.header.borrow_mut().take();
@@ -1756,6 +1760,13 @@ impl TerminalApp {
                         TextBlock::new().text(identity).text_wrapping(TextWrapping::Wrap).into(),
                         TextBlock::new().text(instructions).text_wrapping(TextWrapping::Wrap).into(),
                         field.into(),
+                        CheckBox::new()
+                            .automation_name("Keep this key unlocked for reconnects")
+                            .is_checked(tab.remember_ssh_key)
+                            .on_is_checked_changed(context.callback(move |remember| {
+                                Message::PromptRememberSshKey(id, prompt_id, remember)
+                            }))
+                            .content("Keep this key unlocked for reconnects"),
                     ],
                 )
             }
@@ -6322,6 +6333,16 @@ impl Component for TerminalApp {
                     *answer = zeroize::Zeroizing::new(value);
                 }
             }
+            Message::PromptRememberSshKey(id, prompt, remember) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && tab.prompt_id == Some(prompt)
+                {
+                    tab.remember_ssh_key = remember;
+                }
+            }
             Message::PromptReply(id, prompt, result) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -6338,7 +6359,10 @@ impl Component for TerminalApp {
                             Some(w11term::prompts::Question::IdentityPassphrase { .. }) => {
                                 tab.answers.pop().map_or(
                                     w11term::prompts::Answer::Cancel,
-                                    w11term::prompts::Answer::IdentityPassphrase,
+                                    |passphrase| w11term::prompts::Answer::IdentityPassphrase {
+                                        passphrase,
+                                        remember: tab.remember_ssh_key,
+                                    },
                                 )
                             }
                             Some(w11term::prompts::Question::Authentication { .. }) => {
@@ -6353,6 +6377,7 @@ impl Component for TerminalApp {
                     };
                     let _ = tab.session.prompts.answer(prompt, answer);
                     tab.answers.clear();
+                    tab.remember_ssh_key = false;
                 }
             }
             Message::GenerateKey(id) => {
