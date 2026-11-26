@@ -82,6 +82,35 @@ function Shell-Pid([string]$Tag) {
     return [int]([regex]::Match($reply.text,$pattern).Groups[1].Value)
 }
 
+function Write-SelectAllFixture([int]$Cols, [int]$Rows) {
+    $historyRows = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.scrollback_lines
+    $fillerRows = $Rows + $historyRows - 4
+    if ($Cols -lt 'FIRST-RETAINED-SSH'.Length -or $Rows -lt 2 -or $historyRows -lt 1 -or $fillerRows -lt 1) {
+        throw "Select All needs a grid and retained history for all fixture lines. Grid ${Cols}x$Rows, history $historyRows."
+    }
+    $newline = "`r`n"
+    $snow = [char]0x96ea
+    $globe = [char]::ConvertFromUtf32(0x1f30d)
+    $accent = [char]0x00e9
+    # The snow character ends the first physical row. The globe and suffix start the next.
+    $wrap = 'wrap/' + ('x' * ($Cols - 7)) + $snow + $globe + $accent + '/tail'
+    # The two markers and the wrapped line use four rows. Fill the remaining
+    # visible and retained rows so the evicted prelude sits just beyond the limit.
+    $primary = @('FIRST-RETAINED-SSH', $wrap) +
+        @(1..$fillerRows | ForEach-Object { 'row {0:D2}' -f $_ }) +
+        @('LAST-RETAINED-SSH')
+    $primary = $primary -join $newline
+    $alternate = (1..$Rows | ForEach-Object { 'alternate {0:D2} {1}' -f $_, $snow }) -join $newline
+    [IO.File]::WriteAllText((Join-Path $State 'expected-primary.txt'), $primary, $utf8)
+    [IO.File]::WriteAllText((Join-Path $State 'expected-alternate.txt'), $alternate, $utf8)
+    $esc = [char]27
+    [IO.File]::WriteAllText((Join-Path $State 'alternate.vt'), "$esc[?1049h$esc[H$alternate", $utf8)
+    $gate = [IO.File]::ReadAllText((Join-Path $State 'output-gate'))
+    $history = (("EVICTED-SSH" + $newline) * 48) + $primary
+    [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $gate) 'deferred-output.vt'), $history, $utf8)
+    [IO.File]::Delete($gate)
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','64','--rows','12') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -94,8 +123,13 @@ try {
     Press-Key 0x77 # F8 selects the SSH tab.
     Wait-Focus $remote
     if ($real) { Show-CursorWindow }
-    $null = Control @('resize','--pane',"$remote",'--cols','64','--rows','12')
-    [IO.File]::Delete([IO.File]::ReadAllText((Join-Path $State 'output-gate')))
+    # Drive the copy assertions on the viewport Windows provided after activating this tab.
+    $measured = Wait-Until 'a native SSH text grid' {
+        $grid = Control @('inspect','--pane',"$remote")
+        if ($grid.dpi -gt 0 -and $grid.pixel_width -gt $grid.cols -and $grid.pixel_height -gt $grid.rows) { $grid }
+    }
+    $grid = Control @('resize','--pane',"$remote",'--cols',"$($measured.cols)",'--rows',"$($measured.rows)")
+    Write-SelectAllFixture $grid.cols $grid.rows
     $end = Control @('wait-for-text','--pane',"$remote",'--timeout','15','LAST-RETAINED-SSH')
     $first = (Control @('find-text','--pane',"$remote",'FIRST-RETAINED-SSH')).panes[0]
     $old = (Control @('find-text','--pane',"$remote",'EVICTED-SSH')).panes[0]
@@ -125,9 +159,10 @@ try {
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','LAST-RETAINED-SSH!')
 
     Send-RemoteBytes ([IO.File]::ReadAllBytes((Join-Path $State 'alternate.vt')))
-    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','alternate 12')
+    $alternateMarker = 'alternate {0:D2}' -f [int]$grid.rows
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15',$alternateMarker)
     $sequence = Set-Sentinel
-    Start-Selection 'Alternate screen text selected' 'alternate 12' -Palette
+    Start-Selection 'Alternate screen text selected' $alternateMarker -Palette
     Assert-Uncopied $sequence
     Copy-Selection $sequence ([IO.File]::ReadAllText((Join-Path $State 'expected-alternate.txt')))
     Send-RemoteBytes ([Text.Encoding]::ASCII.GetBytes(([char]27 + '[?1049l')))

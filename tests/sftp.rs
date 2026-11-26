@@ -236,12 +236,24 @@ impl server::Handler for Peer {
         #[cfg(feature = "ui-smoke")]
         if self.root.join("hold-shell-output").is_file() {
             let gate = self.root.join("hold-shell-output");
-            let bytes = fs::read(self.root.join("deferred-output.vt"))?;
+            let output = self.root.join("deferred-output.vt");
+            // Reserve prewritten output for this shell. A fixture that needs
+            // the measured PTY can instead write the data before releasing it.
+            let prepared = match fs::read(&output) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
             let peer = s.handle();
             tokio::spawn(async move {
                 while gate.is_file() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                let bytes = match prepared {
+                    Some(bytes) => bytes,
+                    None => fs::read(output)
+                        .expect("write deferred fixture output before releasing its gate"),
+                };
                 let _ = peer.data(c, bytes).await;
             });
         }
