@@ -6813,6 +6813,24 @@ impl Component for TerminalApp {
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
+            Message::Control(w11term::control::UiRequest::CheckWorkspaceProfiles {
+                names,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = if names.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        self.store.load().map(|profiles| {
+                            names
+                                .into_iter()
+                                .filter(|name| !profiles.contains_key(name))
+                                .collect()
+                        })
+                    };
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::TabOrder { order, reply }) => {
                 if !reply.is_closed() {
                     let result = match order {

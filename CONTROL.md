@@ -51,6 +51,10 @@ Replies include `window_id`, `tab_id`, the explicit `name` (null after reset), a
 
 `list-workspaces` reads the saved workspace catalog and returns `workspaces` in name order. Each entry has `name`, `tab_count`, and `pane_count`.
 
+`get-workspace --name NAME [--window ID]` previews a saved workspace without opening it. The reply contains `name`, zero-based `active_tab`, ordered `tabs`, and sorted `required_ssh_profiles`. Each tab has its `title`, `pinned`, `color_override`, remembered `focused_slot`, and `layout`. The layout array follows the same split and child-index format as `get-tab-layout`, with saved `slot` values for pane leaves. Slots identify positions in a recipe and receive new live pane IDs on open.
+
+Pane leaves include `pane_name`, `font_size`, and a `source` with `kind`, the nullable `profile` name, and `startup` and `durable` flags. The preview omits connection settings, credential and recording paths, launch commands, and durable session identifiers. With `--window`, `profile_check` gives that `window_id` and its `missing_ssh_profiles`. This checks saved SSH profile names against the selected window's catalog. Without a window, `profile_check` is null. Direct pipe clients can send `{"verb":"get-workspace","name":"Fleet Ops","window_id":2}`.
+
 `save-workspace --window ID --name NAME` saves the terminal tabs in that window as a new workspace and registers the window under the saved name for the workspace switcher. It captures the same pane launch recipes, split proportions, titles, and remembered selection as **Save workspace** in the GUI. Utility tabs are skipped. Saving keeps the current sessions, selection, and desktop focus in place. Existing names are rejected, and the reply includes `name`, `window_id`, `tab_count`, and `pane_count`. Direct pipe clients can send `{"verb":"save-workspace","window_id":2,"name":"Fleet Ops"}`.
 
 `open-workspace --window ID --name NAME` appends a fresh copy of a saved layout to the specified window. The existing selection stays in place by default. Pass `--activate` to select the saved tab and pane within that window while preserving desktop focus. Missing SSH profiles cause the entire request to fail before any tabs are added.
@@ -63,6 +67,7 @@ The reply contains `name`, `window_id`, and `tabs` in saved order. Each tab cont
 & $ctl --pid 12345 list-profiles
 & $ctl --pid 12345 open --profile 'Fleet Ops' --new-window --cols 120 --rows 32
 & $ctl --pid 12345 list-workspaces
+& $ctl --pid 12345 get-workspace --name 'Fleet Ops' --window 2
 & $ctl --pid 12345 save-workspace --window 2 --name 'Fleet Ops'
 & $ctl --pid 12345 open-workspace --window 2 --name 'Fleet Ops' --activate
 & $ctl --pid 12345 open-workspace --new-window --name 'Fleet Ops'
