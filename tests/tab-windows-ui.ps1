@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -691,6 +691,86 @@ function Test-ExplicitControlWindow {
     Close-FixtureWindow $origin
 }
 
+function Test-ControlProfileWindows {
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground before profile discovery'
+    $saved = Control @('list-profiles')
+    $remoteEntry = $saved.profiles | Where-Object name -ceq 'window-ssh'
+    $localEntry = $saved.profiles | Where-Object name -ceq 'Destination PowerShell'
+    $wsl = $saved.profiles | Where-Object name -ceq 'Fixture WSL'
+    $target = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'window-ssh'
+    if ($saved.startup_profile -cne 'Destination PowerShell' -or
+        ($saved.profiles[0..2].name -join ',') -cne 'Destination PowerShell,Fixture WSL,window-ssh' -or
+        $remoteEntry.backend -cne 'ssh' -or !$remoteEntry.pinned -or
+        $remoteEntry.host -cne $target.host -or $remoteEntry.user -cne $target.user -or $remoteEntry.port -ne $target.port -or
+        $localEntry.backend -cne 'local' -or $null -ne $localEntry.wsl_distribution -or
+        $wsl.backend -cne 'local' -or $wsl.wsl_distribution -cne 'Fixture') {
+        throw "Unexpected saved profile listing: $($saved | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    if ((($remoteEntry.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'backend,host,name,pinned,port,user' -or
+        (($localEntry.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'backend,name,pinned,wsl_distribution') {
+        throw 'Profile discovery returned fields beyond its public launch metadata'
+    }
+    $failed = & $Cli --pid $app.Id open --profile 'missing profile' --new-window | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -cne 'unknown profile missing profile') {
+        throw 'Opening a missing profile did not report the profile name'
+    }
+    $invalidGrid = & $Cli --pid $app.Id open --profile 'window-ssh' --new-window --cols 0 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $invalidGrid.ok -or $invalidGrid.error -notlike '*columns*') {
+        throw 'A new profile window accepted an invalid grid'
+    }
+    if (@((Control @('list-windows')).windows).Count -ne 1) { throw 'An invalid launch opened a window' }
+
+    $local = Control @('open','--profile','Destination PowerShell','--new-window')
+    $localWindow = Wait-DetachedWindow $origin
+    $null = Wait-Until 'PowerShell restores its saved cell grid in a background window' {
+        $grid = Control @('inspect','--pane',"$($local.pane)")
+        $grid.cols -eq 96 -and $grid.rows -eq 28
+    }
+    Expect-Text $local.pane 'PS '
+    $freshLocal = Shell-State $local.pane 'cliFreshLocal' -Init
+    if (!$local.active -or $freshLocal -in $localIdentity,$anchorIdentity) {
+        throw 'The new window did not create and select an independent PowerShell process'
+    }
+    Expect-Focus $origin $ssh.id 'Restoring saved profile geometry leaves desktop focus alone'
+
+    $remote = Control @('open','--profile','window-ssh','--new-window','--cols','88','--rows','27')
+    $remoteWindow = Wait-Until 'a third same-process HWND for SSH' {
+        [TabFixtureWindows]::OwnedBy($app.Id) | Where-Object { $_ -notin @($origin,$localWindow) }
+    }
+    if ($remote.window_id -in @($ssh.window_id,$local.window_id) -or
+        !$remote.active -or $remote.cols -ne 88 -or $remote.rows -ne 27) {
+        throw "Unexpected SSH open reply: $($remote | ConvertTo-Json -Compress)"
+    }
+    $windowDetails = (Control @('list-windows')).windows | Where-Object window_id -eq $remote.window_id
+    if ($windowDetails.pane_count -ne 1 -or $windowDetails.active -or
+        $windowDetails.active_tab_title -cne 'window-ssh') {
+        throw 'The SSH window was not ready with the named profile when the CLI returned'
+    }
+    $null = Wait-Until 'the SSH canvas keeps the requested grid' {
+        $grid = Control @('inspect','--pane',"$($remote.pane)")
+        $grid.cols -eq 88 -and $grid.rows -eq 27
+    }
+    Expect-Text $remote.pane 'ready'
+    $null = Control @('send-text','--pane',"$($remote.pane)",'--no-paste','fresh-profile/')
+    Expect-Text $remote.pane 'fresh-profile/'
+    Expect-Focus $origin $ssh.id 'Creating both new profile windows preserves the original keyboard focus'
+    Type-In $origin 'source-profile/'
+    Expect-Text $ssh.id 'source-profile/'
+
+    Close-FixtureWindow $origin
+    $null = Wait-Until 'both new profile windows retain the same pipe after closing the source' {
+        $panes = @((Control @('list')).sessions)
+        $panes.Count -eq 2 -and $remote.pane -in $panes.id -and $local.pane -in $panes.id
+    }
+    Close-FixtureWindow $localWindow
+    $null = Wait-Until 'the remaining SSH window still owns the control pipe' {
+        $windows = @((Control @('list-windows')).windows)
+        $windows.Count -eq 1 -and $windows[0].window_id -eq $remote.window_id
+    }
+    Close-FixtureWindow $remoteWindow
+}
+
 function Test-ControlWorkspace {
     $window = $origin
     $field = Open-ProfileWindowPicker $origin -FromPalette
@@ -1340,18 +1420,22 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
             'CliWorkspaceWindow' { Test-ControlWorkspaceWindow }
+            'CliProfiles' { Test-ControlProfileWindows }
         }
-        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
-            throw 'The CLI window fixture did not shut down cleanly'
+        if (!$app.WaitForExit(10000)) {
+            throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"
         }
         [uint32]$code = 0
         if (![TabFixtureWindows]::GetExitCodeProcess($processHandle, [ref]$code) -or $code -ne 0) {
             throw "The CLI window fixture exited with code $code"
+        }
+        if (Test-Path -LiteralPath $manifest) {
+            throw 'The CLI window fixture left a stale control manifest'
         }
         return
     }

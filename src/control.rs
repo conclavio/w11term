@@ -144,6 +144,14 @@ pub enum Request {
     },
     List,
     ListWindows,
+    ListProfiles,
+    OpenProfileWindow {
+        profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cols: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<usize>,
+    },
     ListWorkspaces,
     OpenWorkspace {
         window_id: WindowId,
@@ -398,6 +406,14 @@ pub enum UiRequest {
     ListSavedSshGroups {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    ListProfiles {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    OpenProfileWindow {
+        profile: String,
+        grid: Option<(usize, usize)>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     OpenSshGroup {
         name: String,
         reply: oneshot::Sender<Result<Value, String>>,
@@ -492,6 +508,8 @@ impl UiRequest {
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
             | Self::ListSavedSshGroups { reply }
+            | Self::ListProfiles { reply }
+            | Self::OpenProfileWindow { reply, .. }
             | Self::OpenSshGroup { reply, .. }
             | Self::OpenWorkspace { reply, .. }
             | Self::OpenWorkspaceWindow { reply, .. }
@@ -1188,6 +1206,41 @@ impl Registry {
                 anyhow::bail!("follow-ssh-group-output requires a streaming reply")
             }
             Request::ListWindows => Ok(self.list_windows()),
+            Request::ListProfiles => {
+                let ui = self.active_ui()?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::ListProfiles { reply });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("list-profiles timed out")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::OpenProfileWindow {
+                profile,
+                cols,
+                rows,
+            } => {
+                let grid = if cols.is_some() || rows.is_some() {
+                    let grid = (cols.unwrap_or(120), rows.unwrap_or(32));
+                    validate_grid(grid.0, grid.1)?;
+                    Some(grid)
+                } else {
+                    None
+                };
+                let ui = self.active_ui()?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::OpenProfileWindow {
+                    profile,
+                    grid,
+                    reply,
+                });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("open timed out; the window may have been created")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::ListWorkspaces => {
                 let workspaces: Vec<_> = crate::workspace::WorkspaceStore::open()?
                     .load()?

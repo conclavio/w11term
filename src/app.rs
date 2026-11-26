@@ -1287,7 +1287,7 @@ pub struct TerminalApp {
     _control: Arc<Server>,
     window_launch: w11term::options::Options,
     opening: Option<Rc<crate::workspace_window::Opening>>,
-    workspace_open_reply: Option<(Rc<workspace_view::ControlWindowOpen>, serde_json::Value)>,
+    child_open_reply: Option<(Rc<tab_windows::WindowControlReply>, serde_json::Value)>,
     reopening_tab_window: Option<Rc<workspace_view::ClosedTabWindow>>,
     incoming: Option<Rc<tab_windows::Transfer>>,
     outgoing: Option<Rc<tab_windows::Transfer>>,
@@ -3702,6 +3702,65 @@ impl TerminalApp {
         }
     }
 
+    fn control_list_profiles(&self) -> anyhow::Result<serde_json::Value> {
+        let catalog = self.store.catalog()?;
+        let profiles: Vec<_> = catalog
+            .profile_order
+            .iter()
+            .filter_map(|name| {
+                let pinned = catalog.pinned_profiles.contains(name);
+                if let Some(ssh) = catalog.profiles.get(name) {
+                    Some(serde_json::json!({
+                        "name": name,
+                        "backend": "ssh",
+                        "host": ssh.host,
+                        "user": ssh.user,
+                        "port": ssh.port,
+                        "pinned": pinned,
+                    }))
+                } else {
+                    let local = catalog.local.get(name)?;
+                    Some(serde_json::json!({
+                        "name": name,
+                        "backend": "local",
+                        "wsl_distribution": local.wsl_distribution(),
+                        "pinned": pinned,
+                    }))
+                }
+            })
+            .collect();
+        Ok(serde_json::json!({ "profiles": profiles, "startup_profile": catalog.startup_profile }))
+    }
+
+    fn control_open_profile_window(
+        &self,
+        name: String,
+        grid: Option<(usize, usize)>,
+        reply: tab_windows::WindowReply,
+        context: &ComponentContext<Self>,
+    ) {
+        let source = match self.store.catalog().and_then(|catalog| {
+            catalog
+                .source(&name)
+                .with_context(|| format!("unknown profile {name}"))
+        }) {
+            Ok(source) => source,
+            Err(error) => {
+                let _ = reply.send(Err(format!("{error:#}")));
+                return;
+            }
+        };
+        self.open_control_child_window(
+            tab_windows::ChildLaunch::Profile {
+                name,
+                source: Box::new(source),
+                grid,
+            },
+            reply,
+            context,
+        );
+    }
+
     fn utility(&mut self, settings: bool, context: &ComponentContext<Self>) {
         let existing = self
             .tabs
@@ -5374,13 +5433,18 @@ impl Component for TerminalApp {
         let options = &input.options;
         let moving = input.transfer.is_some();
         let child = input.child.as_ref();
-        let opening = input
-            .opening
-            .clone()
-            .or_else(|| match child.map(|child| &child.launch) {
-                Some(tab_windows::ChildLaunch::Workspace { opening, .. }) => Some(opening.clone()),
-                _ => None,
-            });
+        let child_launch = child.map(|child| &child.launch);
+        let child_control = child.and_then(|child| child.control.as_ref());
+        let opening = input.opening.clone().or_else(|| match child_launch {
+            Some(tab_windows::ChildLaunch::Workspace { opening, .. }) => Some(opening.clone()),
+            _ => None,
+        });
+        let (grid_source, profile_grid) = match child_launch {
+            Some(tab_windows::ChildLaunch::Profile { source, grid, .. }) => {
+                (source.as_ref(), *grid)
+            }
+            _ => (&options.source, None),
+        };
         let child_window = moving || child.is_some();
         let sender = context.sender();
         let clipboard = clipboard_paste::State::default();
@@ -5433,13 +5497,7 @@ impl Component for TerminalApp {
             });
         })
         .expect("installing terminal input adapter");
-        if matches!(
-            child.map(|child| &child.launch),
-            Some(tab_windows::ChildLaunch::Workspace {
-                control: Some(_),
-                ..
-            })
-        ) {
+        if child_control.is_some() {
             // WinUI can close a window shown without activation through its window API.
             let sender = context.sender();
             keyboard.on_close_request(move || sender.send(Message::CloseWindow));
@@ -5495,10 +5553,7 @@ impl Component for TerminalApp {
             &appearance.font_family,
             appearance.ligatures,
             appearance.terminal_font_size_for(
-                options
-                    .source
-                    .profile_font_size()
-                    .map(ProfileTextSize::as_f32),
+                grid_source.profile_font_size().map(ProfileTextSize::as_f32),
             ),
         )
         .expect("creating DirectWrite formats");
@@ -5509,11 +5564,10 @@ impl Component for TerminalApp {
                 .expect("validated keyboard settings"),
         );
         let appearance = Arc::new(RwLock::new(appearance));
-        let grid = if !child_window && (options.cols.is_some() || options.rows.is_some()) {
-            Some((options.cols.unwrap_or(120), options.rows.unwrap_or(32)))
-        } else {
-            None
-        };
+        let grid = profile_grid.or_else(|| {
+            (!child_window && (options.cols.is_some() || options.rows.is_some()))
+                .then(|| (options.cols.unwrap_or(120), options.rows.unwrap_or(32)))
+        });
         let size = grid
             .map(|(cols, rows)| TerminalSize {
                 cols,
@@ -5570,10 +5624,11 @@ impl Component for TerminalApp {
         // The initial cell target sizes the whole window. A split layout derives
         // its individual PTY grids from the measured rectangle of each canvas.
         let grid = grid.filter(|_| {
-            matches!(
-                tabs.active_layout(),
-                Some(w11term::pane_layout::Layout::Leaf(_))
-            )
+            profile_grid.is_some()
+                || matches!(
+                    tabs.active_layout(),
+                    Some(w11term::pane_layout::Layout::Leaf(_))
+                )
         });
         let new_window = input
             .transfer
@@ -5640,7 +5695,7 @@ impl Component for TerminalApp {
             _control: control,
             window_launch: options.clone(),
             opening: opening.clone(),
-            workspace_open_reply: None,
+            child_open_reply: None,
             reopening_tab_window: None,
             incoming: input.transfer.clone(),
             outgoing: None,
@@ -5714,25 +5769,40 @@ impl Component for TerminalApp {
         }
         app.arm_window_tick(context);
         context.sender().send(Message::WindowTick);
-        match child.map(|child| &child.launch) {
+        match child_launch {
             Some(tab_windows::ChildLaunch::Group(group)) => app.start_group_window(group, context),
-            Some(tab_windows::ChildLaunch::Profile { name, source }) => {
-                app.window_restored = false;
-                app.open(
+            Some(tab_windows::ChildLaunch::Profile { name, source, .. }) => {
+                app.window_restored = profile_grid.is_some();
+                let tab = live_tab_sized(
                     name.clone(),
                     source.as_ref().clone(),
-                    Some(name.clone()),
-                    context,
-                );
+                    size,
+                    osc52,
+                    None,
+                    None,
+                )
+                .with_profile(Some(name.clone()));
+                if let Some(control) = child_control {
+                    let pane = tab.pane_id().expect("new terminal has a pane ID");
+                    let result = serde_json::json!({
+                        "pane": pane,
+                        "window_id": app.registry.window_id(),
+                        "cols": size.cols,
+                        "rows": size.rows,
+                        "active": true,
+                    });
+                    app.child_open_reply = Some((control.clone(), result));
+                }
+                app.insert_tab(tab, context);
             }
             Some(tab_windows::ChildLaunch::Tab { layout, reopening }) => {
                 app.reopening_tab_window = reopening.clone();
                 app.start_prepared_tab(layout, context);
             }
-            Some(tab_windows::ChildLaunch::Workspace { control, .. }) => {
-                if let Some(control) = control {
-                    let result = app.workspace_opened(&control.name, restored_groups, true);
-                    app.workspace_open_reply = Some((control.clone(), result));
+            Some(tab_windows::ChildLaunch::Workspace { name, .. }) => {
+                if let Some(control) = child_control {
+                    let result = app.workspace_opened(name, restored_groups, true);
+                    app.child_open_reply = Some((control.clone(), result));
                 }
                 app.activate(context);
             }
@@ -6608,6 +6678,21 @@ impl Component for TerminalApp {
                 if !reply.is_closed() {
                     let result = self.control_open_workspace(&name, activate, context);
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::ListProfiles { reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_list_profiles();
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::OpenProfileWindow {
+                profile,
+                grid,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    self.control_open_profile_window(profile, grid, reply, context);
                 }
             }
             Message::Control(w11term::control::UiRequest::OpenWorkspaceWindow { name, reply }) => {
@@ -8059,13 +8144,12 @@ impl Component for TerminalApp {
             WindowVisuals::new()
                 .client_size(self.client_size.0, self.client_size.1)
                 .theme(WindowTheme::Dark)
-                .preserve_focus_on_show(matches!(
-                    input.child.as_ref().map(|child| &child.launch),
-                    Some(tab_windows::ChildLaunch::Workspace {
-                        control: Some(_),
-                        ..
-                    })
-                ))
+                .preserve_focus_on_show(
+                    input
+                        .child
+                        .as_ref()
+                        .is_some_and(|child| child.control.is_some()),
+                )
                 .constraints(WindowConstraints {
                     min_width: Some(640.0_f64.min(self.client_size.0)),
                     min_height: Some(360.0_f64.min(self.client_size.1)),

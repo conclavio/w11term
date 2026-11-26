@@ -185,8 +185,8 @@ impl server::Handler for Peer {
         &mut self,
         c: ChannelId,
         _: &str,
-        _: u32,
-        _: u32,
+        cols: u32,
+        rows: u32,
         _: u32,
         _: u32,
         _: &[(russh::Pty, u32)],
@@ -199,6 +199,13 @@ impl server::Handler for Peer {
                     .append(true)
                     .open(self.root.join("pty-trace"))?,
                 "{c}"
+            )?;
+        }
+        let grid_trace = self.root.join("pty-grid-trace");
+        if cfg!(feature = "ui-smoke") && grid_trace.is_file() {
+            writeln!(
+                fs::OpenOptions::new().append(true).open(grid_trace)?,
+                "{cols}x{rows}"
             )?;
         }
         s.channel_success(c)?;

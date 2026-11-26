@@ -1095,6 +1095,7 @@ impl TerminalApp {
                                 tab_windows::ChildLaunch::Profile {
                                     name,
                                     source: Box::new(source),
+                                    grid: None,
                                 },
                                 ctx,
                             )

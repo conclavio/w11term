@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -165,7 +165,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
     }
     let verb = verb.context(HELP)?;
     let request = match verb.as_str() {
-        "list" | "list-windows" | "list-workspaces" => {
+        "list" | "list-windows" | "list-workspaces" | "list-profiles" => {
             ensure!(
                 pane.is_none() && payload.is_none() && path.is_none() && !no_paste,
                 "{verb} takes no pane/input options"
@@ -173,6 +173,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             match verb.as_str() {
                 "list-windows" => Request::ListWindows,
                 "list-workspaces" => Request::ListWorkspaces,
+                "list-profiles" => Request::ListProfiles,
                 _ => Request::List,
             }
         }
@@ -363,6 +364,43 @@ mod tests {
             "open --profile desk --window 0",
             "open --profile desk --window 1 --window 2",
             "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn lists_profiles_and_opens_one_in_a_new_window() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("list-profiles --pid 7").unwrap(),
+            (Some(7), Request::ListProfiles)
+        ));
+        let (_, request) = parse(
+            [
+                "open",
+                "--profile",
+                "Fleet Ops",
+                "--new-window",
+                "--cols",
+                "88",
+                "--rows",
+                "27",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"open-profile-window","profile":"Fleet Ops","cols":88,"rows":27})
+        );
+        for invalid in [
+            "list-profiles --pane 1",
+            "list-profiles --window 1",
+            "open --new-window",
+            "open --profile fleet --new-window --window 1",
+            "open --profile fleet --new-window --activate",
+            "open --profile fleet --new-window --new-window",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

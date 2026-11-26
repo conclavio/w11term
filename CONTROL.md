@@ -26,6 +26,10 @@ Omit `--pid` when exactly one process is running. Each process serves all its wi
 
 `open --profile NAME --window ID` opens in that window and returns its `window_id` alongside the pane ID and grid. Omitting `--window` uses the most recently active window. An unknown or closed ID fails. `--activate` selects the newly opened tab in the target window. Pipe requests preserve desktop focus.
 
+`list-profiles` reads the running instance's profile catalog in the same order as the profile picker. The reply includes `startup_profile` (nullable) and a `profiles` array with `name`, `backend` (`ssh` or `local`), and `pinned`. SSH entries give `host`, `user`, and `port`. Local entries give `wsl_distribution` for interactive WSL profiles, or null. The reply omits authentication settings, executable paths, arguments, and working directories.
+
+`open --profile NAME --new-window [--cols N --rows N]` opens a saved profile in a new window of the same process, preserving desktop focus. The reply has the new `window_id` and `pane`, the initial terminal `cols` and `rows`, and `active: true` for the selected pane within that window. The new window is registered on the same pipe when the reply arrives. With no grid options, the window can restore its saved geometry. Use `list` for the measured grid after window layout. For direct pipe clients, send `{"verb":"open-profile-window","profile":"Fleet Ops","cols":120,"rows":32}`.
+
 `list-workspaces` reads the saved workspace catalog and returns `workspaces` in name order. Each entry has `name`, `tab_count`, and `pane_count`.
 
 `open-workspace --window ID --name NAME` appends a fresh copy of a saved layout to the specified window. The existing selection stays in place by default. Pass `--activate` to select the saved tab and pane within that window while preserving desktop focus. Missing SSH profiles cause the entire request to fail before any tabs are added.
@@ -35,6 +39,8 @@ Omit `--pid` when exactly one process is running. Each process serves all its wi
 The reply contains `name`, `window_id`, and `tabs` in saved order. Each tab contains its new `tab_id` and `panes` (new pane IDs in layout order). `workspace_active_pane` identifies the saved active pane's new ID, and `active` reports whether the new workspace selection took effect in that window.
 
 ```powershell
+& $ctl --pid 12345 list-profiles
+& $ctl --pid 12345 open --profile 'Fleet Ops' --new-window --cols 120 --rows 32
 & $ctl --pid 12345 list-workspaces
 & $ctl --pid 12345 open-workspace --window 2 --name 'Fleet Ops' --activate
 & $ctl --pid 12345 open-workspace --new-window --name 'Fleet Ops'

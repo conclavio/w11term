@@ -39,7 +39,7 @@ impl TerminalApp {
     pub(super) fn control_open_workspace_window(
         &self,
         name: String,
-        reply: WorkspaceReply,
+        reply: tab_windows::WindowReply,
         context: &ComponentContext<Self>,
     ) {
         let opening = match crate::workspace_window::prepare_copy(&name, self.store.path()) {
@@ -49,20 +49,11 @@ impl TerminalApp {
                 return;
             }
         };
-        let control = Rc::new(ControlWindowOpen {
-            name,
-            reply: RefCell::new(Some(reply)),
-        });
-        let result = self.open_child_window(
-            tab_windows::ChildLaunch::Workspace {
-                opening,
-                control: Some(control.clone()),
-            },
+        self.open_control_child_window(
+            tab_windows::ChildLaunch::Workspace { opening, name },
+            reply,
             context,
         );
-        if let Err(error) = result {
-            control.finish(Err(format!("{error:#}")));
-        }
     }
 
     pub(super) fn workspace_opened(
@@ -93,29 +84,6 @@ impl TerminalApp {
             "workspace_active_pane": workspace_active_pane,
             "active": active,
         })
-    }
-}
-
-type WorkspaceReply = tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>;
-
-pub(super) struct ControlWindowOpen {
-    pub(super) name: String,
-    reply: RefCell<Option<WorkspaceReply>>,
-}
-
-impl ControlWindowOpen {
-    pub(super) fn finish(&self, result: Result<serde_json::Value, String>) {
-        if let Some(reply) = self.reply.borrow_mut().take() {
-            let _ = reply.send(result);
-        }
-    }
-}
-
-impl Drop for ControlWindowOpen {
-    fn drop(&mut self) {
-        self.finish(Err(
-            "Workspace window closed before it could be registered".into()
-        ));
     }
 }
 
@@ -395,10 +363,7 @@ impl TerminalApp {
                 let result = crate::workspace_window::prepare_copy(&name, self.store.path())
                     .and_then(|opening| {
                         self.open_child_window(
-                            tab_windows::ChildLaunch::Workspace {
-                                opening,
-                                control: None,
-                            },
+                            tab_windows::ChildLaunch::Workspace { opening, name },
                             context,
                         )
                     });
