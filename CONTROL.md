@@ -35,6 +35,10 @@ Omit `--pid` when exactly one process is running. Each process serves all its wi
 
 Direct pipe clients can send `{"verb":"list-tabs","window_id":2}` or `{"verb":"reorder-tabs","window_id":2,"tab_ids":[10,14,12]}`.
 
+`rename-tab --window ID --tab ID (--name NAME | --reset)` sets or clears the explicit title of a terminal tab. `rename-pane --pane ID (--name NAME | --reset)` sets or clears the name of one pane, including after it moves. The commands target hidden tabs and background panes without selecting them or changing desktop focus. Names can contain 1–128 characters, with no control characters or surrounding spaces.
+
+Replies include `window_id`, `tab_id`, the explicit `name` (null after reset), and `changed`. Pane replies also include `pane`. The names appear in later listings and workspace saves. Direct pipe clients must supply the `name` field. Send `{"verb":"rename-tab","window_id":2,"tab_id":10,"name":"Fleet Ops"}` or `{"verb":"rename-pane","pane":42,"name":null}` to reset a pane.
+
 `open --profile NAME --window ID` opens in that window and returns its `window_id` alongside the pane ID and grid. Omitting `--window` uses the most recently active window. An unknown or closed ID fails. `--activate` selects the newly opened tab in the target window. Pipe requests preserve desktop focus.
 
 `list-profiles` reads the running instance's profile catalog in the same order as the profile picker. The reply includes `startup_profile` (nullable) and a `profiles` array with `name`, `backend` (`ssh` or `local`), and `pinned`. SSH entries give `host`, `user`, and `port`. Local entries give `wsl_distribution` for interactive WSL profiles, or null. The reply omits authentication settings, executable paths, arguments, and working directories.

@@ -6911,6 +6911,22 @@ impl Component for TerminalApp {
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
+            Message::Control(w11term::control::UiRequest::RenameTab {
+                tab_id,
+                name,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = self.control_rename_tab(tab_id, name);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::RenamePane { pane, name, reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_rename_pane(pane, name);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::ResizeSplit {
                 pane,
                 target_pane,

@@ -2,6 +2,7 @@
 use crate::{
     pane_layout::{Axis, Direction},
     session::{Command, PaneDescription},
+    tabs::TabTitle,
     terminal::Snapshot,
 };
 use anyhow::{Context, Result, ensure};
@@ -157,6 +158,17 @@ pub enum Request {
     },
     GetTabLayout {
         pane: u64,
+    },
+    RenameTab {
+        window_id: WindowId,
+        tab_id: crate::tabs::TabId,
+        #[serde(deserialize_with = "Option::deserialize")]
+        name: Option<TabTitle>,
+    },
+    RenamePane {
+        pane: u64,
+        #[serde(deserialize_with = "Option::deserialize")]
+        name: Option<TabTitle>,
     },
     ResizeSplit {
         pane: u64,
@@ -579,6 +591,16 @@ pub enum UiRequest {
         pane: u64,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    RenameTab {
+        tab_id: crate::tabs::TabId,
+        name: Option<TabTitle>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    RenamePane {
+        pane: u64,
+        name: Option<TabTitle>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     ResizeSplit {
         pane: u64,
         target_pane: u64,
@@ -602,6 +624,8 @@ impl UiRequest {
             | Self::MoveTab { reply, .. }
             | Self::SelectPaneView { reply, .. }
             | Self::GetTabLayout { reply, .. }
+            | Self::RenameTab { reply, .. }
+            | Self::RenamePane { reply, .. }
             | Self::ResizeSplit { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
@@ -649,6 +673,7 @@ impl UiRequest {
             | Self::MoveTab { pane, .. }
             | Self::SelectPaneView { pane, .. }
             | Self::GetTabLayout { pane, .. }
+            | Self::RenamePane { pane, .. }
             | Self::ResizeSplit { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
@@ -664,6 +689,7 @@ impl UiRequest {
             | Self::MoveTab { reply, .. }
             | Self::SelectPaneView { reply, .. }
             | Self::GetTabLayout { reply, .. }
+            | Self::RenamePane { reply, .. }
             | Self::ResizeSplit { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             if reply.is_closed()
@@ -933,6 +959,33 @@ impl Registry {
                 tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("reading the tab layout timed out")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::RenameTab {
+                window_id,
+                tab_id,
+                name,
+            } => {
+                let ui = self.window_ui(window_id)?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::RenameTab {
+                    tab_id,
+                    name,
+                    reply,
+                });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("rename-tab timed out; use list-tabs to check the tab name")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::RenamePane { pane, name } => {
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(pane, UiRequest::RenamePane { pane, name, reply });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("rename-pane timed out; use list to check the pane name")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }

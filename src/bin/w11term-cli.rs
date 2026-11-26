@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -71,6 +71,8 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "move-tab"
             | "list-tabs"
             | "reorder-tabs"
+            | "rename-tab"
+            | "rename-pane"
             | "focus-pane"
             | "zoom-pane"
             | "get-tab-layout"
@@ -460,6 +462,58 @@ mod tests {
             "zoom-pane --pane 1 --off --off",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn names_terminal_tabs_and_panes_with_an_explicit_reset() {
+        let (_, request) = parse(
+            [
+                "rename-tab",
+                "--window",
+                "12",
+                "--tab",
+                "14",
+                "--name",
+                "Fleet Ops",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"rename-tab","window_id":12,"tab_id":14,"name":"Fleet Ops"})
+        );
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (_, request) = parse_line("rename-pane --pane 42 --reset").unwrap();
+        let reset = serde_json::json!({"verb":"rename-pane","pane":42,"name":null});
+        assert_eq!(serde_json::to_value(request).unwrap(), reset);
+        assert!(matches!(
+            serde_json::from_value::<Request>(reset).unwrap(),
+            Request::RenamePane {
+                pane: 42,
+                name: None
+            }
+        ));
+        for invalid in [
+            "rename-tab --tab 14 --reset",
+            "rename-tab --window 12 --reset",
+            "rename-tab --window 12 --tab 0 --reset",
+            "rename-pane --pane 42",
+            "rename-pane --pane 42 --name Fleet --reset",
+            "rename-pane --pane 42 --reset --reset",
+            "rename-pane --pane 42 --window 12 --name Fleet",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+        for invalid in [
+            serde_json::json!({"verb":"rename-pane","pane":42}),
+            serde_json::json!({"verb":"rename-tab","window_id":12,"tab_id":14}),
+            serde_json::json!({"verb":"rename-tab","window_id":12,"tab_id":14,"name":" Fleet "}),
+            serde_json::json!({"verb":"rename-pane","pane":42,"name":"invalid\nname"}),
+        ] {
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
         }
     }
 

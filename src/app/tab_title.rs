@@ -182,6 +182,60 @@ pub(super) fn switcher_leaf<T>(headers: &[&w11term::tabs::Tab<T>], group: TabId)
 }
 
 impl TerminalApp {
+    pub(super) fn control_rename_tab(
+        &mut self,
+        tab_id: TabId,
+        name: Option<TabTitle>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let window_id = self.registry.window_id();
+        let entry = self
+            .tabs
+            .group_focus(tab_id)
+            .with_context(|| format!("unknown tab {tab_id} in window {window_id}"))?;
+        anyhow::ensure!(
+            self.tabs.get(entry).and_then(AppTab::pane_id).is_some(),
+            "Only terminal tabs can be renamed"
+        );
+        let changed = self.tabs.title_for(entry) != name.as_ref();
+        if changed {
+            self.tabs.set_group_title(tab_id, name.clone());
+            self.terminal_titles_changed();
+        }
+        Ok(serde_json::json!({
+            "window_id": window_id, "tab_id": tab_id, "name": name, "changed": changed,
+        }))
+    }
+
+    pub(super) fn control_rename_pane(
+        &mut self,
+        pane: u64,
+        name: Option<TabTitle>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let entry = self
+            .tab_for_pane(pane)
+            .with_context(|| format!("unknown pane {pane}"))?;
+        let tab_id = self.tabs.group_id(entry).context("The pane has no tab")?;
+        let Some(Page::Terminal(live)) = self.tabs.get_mut(entry).map(|entry| &mut entry.page)
+        else {
+            anyhow::bail!("unknown pane {pane}");
+        };
+        let changed = live.pane_name != name;
+        if changed {
+            live.pane_name = name.clone();
+            self.terminal_titles_changed();
+        }
+        Ok(serde_json::json!({
+            "window_id": self.registry.window_id(), "tab_id": tab_id,
+            "pane": pane, "name": name, "changed": changed,
+        }))
+    }
+
+    fn terminal_titles_changed(&mut self) {
+        self.header.borrow_mut().take();
+        self.publish_panes();
+        self.refresh_open_commands();
+    }
+
     pub(super) fn tab_label(&self, entry: TabId, follow_application: bool) -> Cow<'_, str> {
         let Some(tab) = self.tabs.get(entry) else {
             return Cow::Borrowed("Terminal");
@@ -316,8 +370,7 @@ impl TerminalApp {
                         self.rename_window(title);
                     } else {
                         editor.target.apply(&mut self.tabs, title);
-                        self.header.borrow_mut().take();
-                        self.publish_panes();
+                        self.terminal_titles_changed();
                     }
                 }
                 self.keyboard.set_modal(false);
