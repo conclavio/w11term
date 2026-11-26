@@ -13,6 +13,7 @@ pub(super) struct HistoryPage {
     selected: Option<(u64, u64)>, // Connection generation and command id.
     search: HistorySearch,
     status: CommandStatus,
+    order: HistoryOrder,
     feedback: String,
     save: Option<SaveDraft>,
     showing: Option<Arc<()>>,
@@ -39,6 +40,7 @@ pub enum HistoryAction {
     Search(String),
     IncludeOutput(bool),
     Status(CommandStatus),
+    Order(HistoryOrder),
     Refresh,
     Select(u64, u64),
     Copy(u64, u64, CopyPart),
@@ -51,6 +53,13 @@ pub enum HistoryAction {
     Save((u64, u64)),
     CancelSave((u64, u64)),
     Return,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HistoryOrder {
+    #[default]
+    Newest,
+    Slowest,
 }
 
 enum DirectoryNavigation {
@@ -78,6 +87,11 @@ const STATUS_OPTIONS: [(CommandStatus, &str); 4] = [
     (CommandStatus::Failed, "Failed"),
     (CommandStatus::Succeeded, "Succeeded"),
     (CommandStatus::Unknown, "Status unknown"),
+];
+
+const ORDER_OPTIONS: [(HistoryOrder, &str); 2] = [
+    (HistoryOrder::Newest, "Newest first"),
+    (HistoryOrder::Slowest, "Slowest first"),
 ];
 
 #[derive(Default)]
@@ -160,6 +174,38 @@ fn command_status(entry: &CompletedCommand) -> String {
         .map_or_else(|| "status unknown".into(), |code| format!("exit {code}"))
 }
 
+fn elapsed_label(ms: u64) -> String {
+    match ms {
+        0 => "<1 ms".into(),
+        1..=999 => format!("{ms} ms"),
+        1000..=59_999 => format!("{}.{:03} s", ms / 1000, ms % 1000),
+        _ => {
+            let seconds = ms / 1000;
+            format!("{}m {:02}s", seconds / 60, seconds % 60)
+        }
+    }
+}
+
+fn timestamp_label(ms: u64) -> Option<String> {
+    let time = chrono::DateTime::from_timestamp_millis(i64::try_from(ms).ok()?)?;
+    Some(time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+}
+
+fn timing_label(entry: &CompletedCommand) -> String {
+    let timing = entry.timing;
+    let mut fields = Vec::new();
+    if let Some(start) = timing.started_unix_ms.and_then(timestamp_label) {
+        fields.push(format!("Started {start}"));
+    }
+    if let Some(finish) = timestamp_label(timing.finished_unix_ms) {
+        fields.push(format!("Finished {finish}"));
+    }
+    if let Some(elapsed) = timing.duration_ms {
+        fields.push(format!("Elapsed {}", elapsed_label(elapsed)));
+    }
+    fields.join(" · ")
+}
+
 fn command_directory(
     source: &Source,
     entry: &CompletedCommand,
@@ -199,13 +245,34 @@ fn saveable_command(frame: &Snapshot, target: (u64, u64)) -> Option<&str> {
         .filter(|text| valid_command_text(text))
 }
 
-fn newest(frame: &Snapshot, search: &HistorySearch, status: CommandStatus) -> Option<(u64, u64)> {
-    frame
+fn history_matches<'a>(
+    frame: &'a Snapshot,
+    search: &HistorySearch,
+    status: CommandStatus,
+    order: HistoryOrder,
+) -> Vec<&'a CompletedCommand> {
+    let mut matches: Vec<_> = frame
         .command_history
         .iter()
         .rev()
-        .find(|entry| search.includes(frame, entry, status))
-        .map(|c| (frame.connection_generation, c.id))
+        .map(AsRef::as_ref)
+        .filter(|entry| search.includes(frame, entry, status))
+        .collect();
+    if order == HistoryOrder::Slowest {
+        matches.sort_unstable_by_key(|entry| Reverse((entry.timing.duration_ms, entry.id)));
+    }
+    matches
+}
+
+fn first_matching(
+    frame: &Snapshot,
+    search: &HistorySearch,
+    status: CommandStatus,
+    order: HistoryOrder,
+) -> Option<(u64, u64)> {
+    history_matches(frame, search, status, order)
+        .first()
+        .map(|entry| (frame.connection_generation, entry.id))
 }
 
 impl HistoryPage {
@@ -213,7 +280,7 @@ impl HistoryPage {
         if !selected_command(frame, self.selected)
             .is_some_and(|entry| self.search.includes(frame, entry, self.status))
         {
-            self.selected = newest(frame, &self.search, self.status);
+            self.selected = first_matching(frame, &self.search, self.status, self.order);
         }
     }
 }
@@ -435,7 +502,7 @@ impl TerminalApp {
         let selected = match target {
             Some(link) if frame.has_command(link) => Some((link.generation, link.id)),
             Some(_) => return false,
-            None => newest(&frame, &search, CommandStatus::All),
+            None => first_matching(&frame, &search, CommandStatus::All, HistoryOrder::Newest),
         };
         let existing = self
             .tabs
@@ -448,6 +515,7 @@ impl TerminalApp {
             selected,
             search,
             status: CommandStatus::All,
+            order: HistoryOrder::Newest,
             feedback: String::new(),
             save: None,
             showing: None,
@@ -538,6 +606,7 @@ impl TerminalApp {
             return;
         };
         if matches!(&action, HistoryAction::Status(status) if *status == page.status)
+            || matches!(&action, HistoryAction::Order(order) if *order == page.order)
             || matches!(&action, HistoryAction::IncludeOutput(include) if *include == page.search.include_output)
             || matches!(&action, HistoryAction::Search(query) if *query == page.search.query)
         {
@@ -560,7 +629,13 @@ impl TerminalApp {
                 page.status = status;
                 page.keep_matching_selection(&frame);
             }
-            HistoryAction::Refresh => page.selected = newest(&frame, &page.search, page.status),
+            HistoryAction::Order(order) => {
+                page.order = order;
+                page.keep_matching_selection(&frame);
+            }
+            HistoryAction::Refresh => {
+                page.selected = first_matching(&frame, &page.search, page.status, page.order);
+            }
             HistoryAction::Select(generation, command) => {
                 let key = Some((generation, command));
                 if selected_command(&frame, key)
@@ -714,14 +789,9 @@ impl TerminalApp {
         let action = move |request| Message::History(Action::InPane(pane, request));
         let selected = selected_command(&frame, page.selected)
             .filter(|entry| page.search.includes(&frame, entry, page.status));
-        let mut matches = frame
-            .command_history
-            .iter()
-            .rev()
-            .filter(|c| page.search.includes(&frame, c, page.status))
-            .peekable();
-        let has_matches = matches.peek().is_some();
-        let rows = matches.map(|entry| {
+        let matches = history_matches(&frame, &page.search, page.status, page.order);
+        let has_matches = !matches.is_empty();
+        let rows = matches.into_iter().map(|entry| {
             let id = entry.id;
             let name = command_name(entry);
             let status = command_status(entry);
@@ -736,13 +806,29 @@ impl TerminalApp {
                         ButtonStyle::Subtle
                     })
                     .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .horizontal_content_alignment(HorizontalAlignment::Stretch)
                     .automation_name(if active {
                         format!("Selected, {label}")
                     } else {
                         label.clone()
                     })
                     .on_click(ctx.callback(move |_| action(HistoryAction::Select(generation, id))))
-                    .content(label),
+                    .content(
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .column_spacing(8.0)
+                            .children((
+                                TextBlock::new()
+                                    .text(label)
+                                    .text_trimming(TextTrimming::CharacterEllipsis),
+                                TextBlock::new().grid_column(1).text(
+                                    entry
+                                        .timing
+                                        .duration_ms
+                                        .map_or_else(String::new, elapsed_label),
+                                ),
+                            )),
+                    ),
             )
         });
         let preview_hit = selected.and_then(|entry| page.search.output_match(&frame, entry.id));
@@ -820,6 +906,13 @@ impl TerminalApp {
                         .content("Open command directory"),
                 ))
             });
+        let timing = selected.map_or_else(View::empty, |entry| {
+            TextBlock::new()
+                .automation_id("command-timing")
+                .text(timing_label(entry))
+                .text_wrapping(TextWrapping::Wrap)
+                .into()
+        });
         let save = match (&page.save, save_target) {
             (Some(draft), Some(target)) if draft.target == target => saved_commands::name_form(
                 &draft.name,
@@ -901,6 +994,22 @@ impl TerminalApp {
                                     action(HistoryAction::Status(status))
                                 })
                         })),
+                    ComboBox::new()
+                        .automation_name("Command order")
+                        .items_source(ORDER_OPTIONS.map(|(_, label)| label))
+                        .selected_index(
+                            ORDER_OPTIONS
+                                .iter()
+                                .position(|(order, _)| *order == page.order),
+                        )
+                        .horizontal_alignment(HorizontalAlignment::Stretch)
+                        .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                            index
+                                .and_then(|index| ORDER_OPTIONS.get(index))
+                                .map_or(Message::ControlIdle, |&(order, _)| {
+                                    action(HistoryAction::Order(order))
+                                })
+                        })),
                 )),
                 ScrollViewer::new()
                     .grid_row(3)
@@ -917,6 +1026,7 @@ impl TerminalApp {
                                     .font_size(18.0)
                                     .text(heading)
                                     .text_wrapping(TextWrapping::Wrap),
+                                timing,
                                 directory,
                                 Button::new()
                                     .is_enabled(insert_target.is_some())
@@ -958,6 +1068,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slowest_order_keeps_the_status_filter_and_places_unknown_durations_last() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let terminal = w11term::terminal::create(TerminalSize::default(), tx);
+        let mut frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        frame.command_history = Arc::new(VecDeque::from(
+            [
+                (1, Some(45), Some(1)),
+                (2, Some(0), Some(1)),
+                (3, Some(45), Some(1)),
+                (4, Some(900), Some(0)),
+                (5, None, Some(1)),
+            ]
+            .map(|(id, duration_ms, exit_code)| {
+                Arc::new(CompletedCommand {
+                    id,
+                    finished_at: std::time::Instant::now(),
+                    timing: wezterm_term::CommandTiming {
+                        duration_ms,
+                        ..Default::default()
+                    },
+                    command: Some("timed command".into()),
+                    reported_directory: None,
+                    exit_code,
+                    output: Ok(String::new()),
+                })
+            }),
+        ));
+        let search = HistorySearch::default();
+        let ordered = |order| {
+            history_matches(&frame, &search, CommandStatus::Failed, order)
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordered(HistoryOrder::Newest), [5, 3, 2, 1]);
+        assert_eq!(ordered(HistoryOrder::Slowest), [3, 1, 2, 5]);
+    }
+
+    #[test]
     fn output_search_uses_literal_unicode_text_and_keeps_the_status_filter() {
         let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let terminal = w11term::terminal::create(TerminalSize::default(), tx);
@@ -968,6 +1117,7 @@ mod tests {
             Arc::new(CompletedCommand {
                 id,
                 finished_at: std::time::Instant::now(),
+                timing: Default::default(),
                 command: Some(format!("run {id}")),
                 reported_directory: None,
                 output,
@@ -984,12 +1134,26 @@ mod tests {
             needle: "[ångström.*]".into(),
             ..Default::default()
         };
-        assert_eq!(newest(&frame, &search, CommandStatus::All), None);
+        assert_eq!(
+            first_matching(&frame, &search, CommandStatus::All, HistoryOrder::Newest),
+            None
+        );
 
         search.include_output = true;
         search.update_matcher();
-        assert_eq!(newest(&frame, &search, CommandStatus::Failed), Some((0, 1)));
-        assert_eq!(newest(&frame, &search, CommandStatus::Succeeded), None);
+        assert_eq!(
+            first_matching(&frame, &search, CommandStatus::Failed, HistoryOrder::Newest),
+            Some((0, 1))
+        );
+        assert_eq!(
+            first_matching(
+                &frame,
+                &search,
+                CommandStatus::Succeeded,
+                HistoryOrder::Newest
+            ),
+            None
+        );
         assert!(search.output_match(&frame, 3).is_none());
         let hit = search.output_match(&frame, 1).unwrap();
         assert_eq!(&long[hit.clone()], "[Ångström.*]");
@@ -1009,6 +1173,7 @@ mod tests {
         let mut entry = CompletedCommand {
             id: 9,
             finished_at: std::time::Instant::now(),
+            timing: Default::default(),
             command: Some(command.clone()),
             reported_directory: None,
             output: Ok("archived result\r\n".into()),

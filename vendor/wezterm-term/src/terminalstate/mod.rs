@@ -328,10 +328,48 @@ impl ScreenOrAlt {
 pub struct CompletedCommand {
     pub id: u64,
     pub finished_at: std::time::Instant,
+    pub timing: CommandTiming,
     pub command: Option<String>,
     pub reported_directory: Option<Arc<str>>,
     pub exit_code: Option<i32>,
     pub output: Result<String, &'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommandTiming {
+    pub started_unix_ms: Option<u64>,
+    pub finished_unix_ms: u64,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct CommandClock {
+    monotonic: std::time::Instant,
+    unix_ms: u64,
+}
+
+impl CommandClock {
+    fn now() -> Self {
+        Self {
+            monotonic: std::time::Instant::now(),
+            unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+
+    fn timing(self, start: Option<Self>) -> CommandTiming {
+        CommandTiming {
+            started_unix_ms: start.map(|started| started.unix_ms),
+            finished_unix_ms: self.unix_ms,
+            duration_ms: start.map(|started| {
+                self.monotonic
+                    .saturating_duration_since(started.monotonic)
+                    .as_millis() as u64
+            }),
+        }
+    }
 }
 
 impl CompletedCommand {
@@ -497,6 +535,7 @@ pub struct TerminalState {
     track_primary_prints: bool,
     last_primary_print: Option<PrimaryPrint>,
     command_label: Option<String>,
+    command_started: Option<CommandClock>,
     command_directory: Option<Arc<str>>,
     vscode_command: VscodeCommand,
 
@@ -785,6 +824,7 @@ impl TerminalState {
             track_primary_prints: false,
             last_primary_print: None,
             command_label: None,
+            command_started: None,
             command_directory: None,
             vscode_command: VscodeCommand::Idle,
             term_program: term_program.to_string(),
@@ -1062,6 +1102,7 @@ impl TerminalState {
     fn begin_command_input(&mut self) {
         if !self.is_alt_screen_active() {
             self.command_label = None;
+            self.command_started = None;
             self.command_directory = None;
             self.capturing_shell_input = true;
             self.mark_shell_position();
@@ -1070,6 +1111,7 @@ impl TerminalState {
 
     fn begin_command_output(&mut self, reported_command: Option<String>) {
         if !self.is_alt_screen_active() {
+            self.command_started = Some(CommandClock::now());
             self.command_directory = self
                 .current_dir
                 .as_ref()
@@ -1101,12 +1143,15 @@ impl TerminalState {
             self.capturing_shell_input = false;
             self.screen.command_start = None;
             self.command_label = None;
+            self.command_started = None;
             self.command_directory = None;
         }
     }
 
     fn finish_command_output(&mut self, exit_code: Option<i32>) {
         if !self.is_alt_screen_active() {
+            let finished = CommandClock::now();
+            let timing = finished.timing(self.command_started.take());
             if self.capturing_shell_input {
                 self.screen.command_start = None;
                 self.capturing_shell_input = false;
@@ -1120,7 +1165,8 @@ impl TerminalState {
                 .take_command_text(self.cursor.y, col, 1024 * 1024);
             let command = Arc::new(CompletedCommand {
                 id: self.next_command_id,
-                finished_at: std::time::Instant::now(),
+                finished_at: finished.monotonic,
+                timing,
                 command: self.command_label.take(),
                 reported_directory: self.command_directory.take(),
                 exit_code,

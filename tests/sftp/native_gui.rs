@@ -695,6 +695,33 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "sorts actual shell captures by duration and checks their native timing details"]
+async fn native_ssh_history_displays_timing_and_sorts_slowest_first() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    fs::write(remote.path().join("hold-shell-output"), []).unwrap();
+    fs::write(
+        remote.path().join("copy-history.vt"),
+        b"\x1b]133;D;9\x07\x1b]133;A\x07$ \x1b]133;B\x07timing slow\r\n\x1b]133;C\x07timing-started\r\n",
+    )
+    .unwrap();
+    fs::write(
+        remote.path().join("deferred-output.vt"),
+        b"\x1b]133;D;2\x07\x1b]133;A\x07$ \x1b]133;B\x07timing quick\r\n\x1b]133;C\x07done\r\n\x1b]133;D;0\x07timing-ready\r\n",
+    )
+    .unwrap();
+    drive_mixed_gui("command-history-timing-ui.ps1", &ssh, state.path());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "samples focused and inactive GPU cursor cells in two native SSH panes"]
 async fn native_focused_block_cursor_redraws_the_glyph_and_tracks_pane_focus() {
     let (Source::Ssh(ssh), _remote, shells, server) = fixture_server(false).await else {

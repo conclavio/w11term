@@ -282,6 +282,7 @@ mod tests {
             Some(&CompletedCommand {
                 id: 7,
                 finished_at: finished,
+                timing: Default::default(),
                 command: Some("report".into()),
                 reported_directory: None,
                 exit_code: Some(17),
@@ -306,6 +307,7 @@ mod tests {
         let mut command = CompletedCommand {
             id: 7,
             finished_at: std::time::Instant::now(),
+            timing: Default::default(),
             command: None,
             reported_directory: None,
             exit_code: None,

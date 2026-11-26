@@ -163,6 +163,12 @@ Both `list-commands` and `get-command` include `reported_directory`. This is the
 shell’s file URI from the start of that command, or JSON `null` if unavailable.
 The value is the original shell report, including its authority and escapes.
 
+Both commands also include `started_unix_ms`, `finished_unix_ms`, and
+`duration_ms`. The timestamps use the Windows client's clock. Duration uses
+monotonic time between the observed shell markers, through the next prompt
+when it closes a capture without an explicit finish marker. Start time and
+duration are JSON `null` when there is no command start marker.
+
 Use `--status failed` for nonzero exit codes, `--status succeeded` for zero, or
 `--status unknown` when the shell omitted the exit code. The default is `all`.
 Filtered listings keep the original IDs, generation, and newest-first order.

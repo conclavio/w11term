@@ -939,6 +939,8 @@ Choose **Show output in pane** to return to the source pane and scroll to where 
 
 When the shell reports a working directory, history shows the path captured at the command’s start. **Open command directory** opens an SSH path in the original pane’s file drawer while its connection is available, or opens a supported local path in File Explorer. A later directory change leaves the saved path intact.
 
+Command history shows the selected capture’s timestamps in UTC and the elapsed time observed between shell markers. Choose **Slowest first** under **Command order** to compare commands with measured durations. Captures without a start marker show their finish time and sort after timed commands.
+
 Choose **Insert command** to return to the source pane and paste the selected command for editing. Press Enter in the shell when you are ready to submit it. The action requires a live, writable shell on the same connection. Commands containing line breaks or tabs require bracketed paste.
 
 Scripts can read the same OSC 133 history with `w11term-cli list-commands` and retrieve one command’s output with `get-command`. [Command history in the control reference](CONTROL.md#completed-shell-commands)

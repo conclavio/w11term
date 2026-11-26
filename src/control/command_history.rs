@@ -38,6 +38,9 @@ impl Registry {
                     "id": entry.id,
                     "command": entry.command,
                     "reported_directory": entry.reported_directory.as_deref(),
+                    "started_unix_ms": entry.timing.started_unix_ms,
+                    "finished_unix_ms": entry.timing.finished_unix_ms,
+                    "duration_ms": entry.timing.duration_ms,
                     "exit_code": entry.exit_code,
                     "output_available": entry.output.is_ok(),
                 })
@@ -74,6 +77,9 @@ impl Registry {
             "id": entry.id,
             "command": entry.command,
             "reported_directory": entry.reported_directory.as_deref(),
+            "started_unix_ms": entry.timing.started_unix_ms,
+            "finished_unix_ms": entry.timing.finished_unix_ms,
+            "duration_ms": entry.timing.duration_ms,
             "exit_code": entry.exit_code,
             "output": entry.output.as_ref().ok(),
             "output_error": entry.output.as_ref().err(),
@@ -178,14 +184,28 @@ mod tests {
             .await
             .unwrap();
         let generation = before.connection_generation;
+        let first = before.command_history[0].timing;
+        let second = before.command_history[1].timing;
+        let third = before.command_history[2].timing;
+        for timing in [first, second] {
+            assert!(timing.started_unix_ms.is_some());
+            assert!(timing.duration_ms.is_some());
+            assert!(timing.finished_unix_ms > 0);
+        }
+        assert!(third.started_unix_ms.is_none());
+        assert!(third.duration_ms.is_none());
+        assert!(third.finished_unix_ms > 0);
         assert_eq!(
             list,
             json!({
                 "pane":23,"connection_generation":generation,
                 "commands":[
-                    {"id":3,"command":null,"reported_directory":null,"exit_code":1,"output_available":false},
-                    {"id":2,"command":null,"reported_directory":"file://loopback/new","exit_code":null,"output_available":true},
-                    {"id":1,"command":"echo 雪","reported_directory":"file://loopback/old%20folder","exit_code":7,"output_available":true}
+                    {"id":3,"command":null,"reported_directory":null,"exit_code":1,"output_available":false,
+                     "started_unix_ms":null,"finished_unix_ms":third.finished_unix_ms,"duration_ms":null},
+                    {"id":2,"command":null,"reported_directory":"file://loopback/new","exit_code":null,"output_available":true,
+                     "started_unix_ms":second.started_unix_ms,"finished_unix_ms":second.finished_unix_ms,"duration_ms":second.duration_ms},
+                    {"id":1,"command":"echo 雪","reported_directory":"file://loopback/old%20folder","exit_code":7,"output_available":true,
+                     "started_unix_ms":first.started_unix_ms,"finished_unix_ms":first.finished_unix_ms,"duration_ms":first.duration_ms}
                 ]
             })
         );
@@ -208,6 +228,7 @@ mod tests {
                 Some("No command output marker"),
             ),
         ] {
+            let timing = [first, second, third][id - 1];
             let result = execute(
                 &registry,
                 json!({"verb":"get-command","pane":23,"id":id,"connection_generation":generation}),
@@ -217,7 +238,8 @@ mod tests {
             assert_eq!(
                 result,
                 json!({"pane":23,"id":id,"connection_generation":generation,
-                "command":command,"reported_directory":directory,"exit_code":code,"output":output,"output_error":error})
+                "command":command,"reported_directory":directory,"exit_code":code,"output":output,"output_error":error,
+                "started_unix_ms":timing.started_unix_ms,"finished_unix_ms":timing.finished_unix_ms,"duration_ms":timing.duration_ms})
             );
         }
         let after = Registry::capture(&target).await.unwrap().0;

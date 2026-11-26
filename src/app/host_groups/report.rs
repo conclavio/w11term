@@ -388,6 +388,7 @@ mod tests {
                 Arc::new(CompletedCommand {
                     id: link.id,
                     finished_at: std::time::Instant::now(),
+                    timing: Default::default(),
                     command: Some("show".into()),
                     reported_directory: None,
                     exit_code: Some(17),
