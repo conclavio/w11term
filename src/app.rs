@@ -1421,6 +1421,9 @@ pub enum Message {
     CloseTabs(bulk_tab_close::Offer),
     WindowTick,
     WindowTargetsChanged,
+    WindowTabsChanged,
+    FocusWindowTab(u64, TabId),
+    WindowTabFocusFailed(&'static str),
     DismissWindowError,
     TransferRequest(u64, u64),
     TransferReady(u64),
@@ -4105,6 +4108,7 @@ impl TerminalApp {
     }
 
     fn header_view(&self, context: &ViewContext<Self>, application_titles: bool) -> View {
+        self.publish_tab_search_entries(application_titles);
         let mut progress = BTreeMap::new();
         let mut programs: BTreeMap<u64, (u64, Arc<wezterm_term::ProgramStatus>)> = BTreeMap::new();
         for entry in self.tabs.entries() {
@@ -5899,6 +5903,9 @@ impl Component for TerminalApp {
             Message::CloseTabs(offer) => self.close_tabs_from_offer(offer, context),
             Message::WindowTick => self.window_tick(context),
             Message::WindowTargetsChanged => self.refresh_open_commands(),
+            Message::WindowTabsChanged => self.refresh_tab_search(),
+            Message::FocusWindowTab(source, group) => self.focus_window_tab(source, group, context),
+            Message::WindowTabFocusFailed(error) => self.window_error = Some(error.into()),
             Message::TransferRequest(source, id) => self.accept_transfer(source, id, context),
             Message::TransferReady(id) => self.offer_group(id, context),
             Message::TransferClaim(id) => self.claim_group(id, context),

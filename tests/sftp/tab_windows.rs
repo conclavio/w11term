@@ -25,6 +25,12 @@ async fn native_move_background_tab_from_context_menu() {
     run("Context", b"ssh-probe/existing-window/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "finds and activates a background tab in a minimized sibling HWND"]
+async fn native_find_tab_across_windows() {
+    run("Search", b"ssh-probe/searched-window/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -50,7 +56,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     .unwrap();
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10"}}"#,
+        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12"}}"#,
     )
     .unwrap();
     let local = |name| {

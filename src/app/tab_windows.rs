@@ -8,7 +8,7 @@ use w11term::options::Options;
 use windows::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{
-        GetWindowTextW, IsIconic, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
+        GetWindowTextW, IsIconic, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
     },
 };
 
@@ -25,6 +25,8 @@ struct WindowEndpoint {
     hwnd: HWND,
     sender: LocalSender<Message>,
     outgoing: Weak<Transfer>,
+    tabs: Rc<[command_palette::SearchTab]>,
+    tab_search: std::sync::Weak<()>,
 }
 
 thread_local! {
@@ -256,6 +258,16 @@ impl TerminalApp {
                                 hwnd,
                                 sender: ctx.sender(),
                                 outgoing: Weak::new(),
+                                tabs: self
+                                    .tab_search_entries(
+                                        self.appearance
+                                            .read()
+                                            .unwrap()
+                                            .interaction
+                                            .application_tab_titles,
+                                    )
+                                    .into(),
+                                tab_search: self.active_tab_search(),
                             },
                         );
                     });
@@ -306,6 +318,106 @@ impl TerminalApp {
             ),
             self.existing_window_menu(),
         ]
+    }
+
+    pub(super) fn sibling_tab_search_entries(
+        &self,
+    ) -> Vec<(u64, Rc<[command_palette::SearchTab]>)> {
+        let source = self.registry.window_id();
+        WINDOWS.with_borrow(|windows| {
+            windows
+                .iter()
+                .filter(|(id, endpoint)| {
+                    **id != source && unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool()
+                })
+                .map(|(&id, endpoint)| (id, endpoint.tabs.clone()))
+                .collect()
+        })
+    }
+
+    pub(super) fn watch_tab_search(&self, launch: &Arc<()>) {
+        WINDOWS.with_borrow_mut(|windows| {
+            if let Some(endpoint) = windows.get_mut(&self.registry.window_id()) {
+                endpoint.tab_search = Arc::downgrade(launch);
+            }
+        });
+    }
+
+    pub(super) fn publish_tab_search_entries(&self, follow_titles: bool) {
+        let source = self.registry.window_id();
+        let entries = self.tab_search_entries(follow_titles);
+        let Some(subscribers) = WINDOWS.with_borrow_mut(|windows| {
+            let endpoint = windows.get_mut(&source)?;
+            if endpoint.tabs.as_ref() == entries {
+                return None;
+            }
+            endpoint.tabs = entries.into();
+            Some(
+                windows
+                    .iter()
+                    .filter(|(id, endpoint)| {
+                        **id != source && endpoint.tab_search.strong_count() > 0
+                    })
+                    .map(|(_, endpoint)| endpoint.sender.clone())
+                    .collect::<Vec<_>>(),
+            )
+        }) else {
+            return;
+        };
+        for sender in subscribers {
+            sender.send(Message::WindowTabsChanged);
+        }
+    }
+
+    pub(super) fn request_window_tab(
+        &mut self,
+        window: u64,
+        group: TabId,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let source = self.registry.window_id();
+        if window == source {
+            self.select_switched_group(group, ctx);
+            return;
+        }
+        let sender = WINDOWS.with_borrow(|windows| {
+            let endpoint = windows.get(&window)?;
+            unsafe { IsWindow(Some(endpoint.hwnd)) }
+                .as_bool()
+                .then(|| endpoint.sender.clone())
+        });
+        if !sender.is_some_and(|sender| sender.send(Message::FocusWindowTab(source, group))) {
+            self.window_error = Some("That tab’s window is no longer available.".into());
+        }
+    }
+
+    pub(super) fn focus_window_tab(
+        &mut self,
+        source: u64,
+        group: TabId,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let entry = tab_title::switcher_leaf(&self.tabs.headers(), group);
+        let error = match entry.zip(self.keyboard.hwnd()) {
+            Some((entry, hwnd)) if self.tabs.active_id() == Some(entry) => {
+                foreground(hwnd);
+                return;
+            }
+            Some((entry, hwnd))
+                if self.incoming.is_none() && !self.existing_destination_blocked() =>
+            {
+                self.tabs.select(entry);
+                self.activate(ctx);
+                foreground(hwnd);
+                return;
+            }
+            Some(_) => "The other window is busy. Try again after its current action finishes.",
+            None => "That tab has closed or moved to another window.",
+        };
+        let sender = WINDOWS.with_borrow(|windows| windows.get(&source).map(|e| e.sender.clone()));
+        if let Some(sender) = sender {
+            sender.send(Message::WindowTabFocusFailed(error));
+        }
     }
 
     fn existing_window_menu(&self) -> MenuItem {
@@ -617,12 +729,7 @@ impl TerminalApp {
         offer.source.send(Message::TransferDone(id));
         self.incoming = None;
         if existing && let Some(hwnd) = self.keyboard.hwnd() {
-            unsafe {
-                if IsIconic(hwnd).as_bool() {
-                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
-                }
-                let _ = SetForegroundWindow(hwnd);
-            }
+            foreground(hwnd);
         }
     }
 
@@ -664,6 +771,16 @@ impl TerminalApp {
         offer.cancel_target();
         self.window_error =
             Some("The tab could not move. It is still available in this window.".into());
+    }
+}
+
+fn foreground(hwnd: HWND) {
+    // Both terminal windows are owned by this UI thread. Restore before activating.
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 
