@@ -300,7 +300,7 @@ fn elapsed_label(ms: u64) -> String {
     }
 }
 
-fn timestamp_label(ms: u64) -> Option<String> {
+pub(super) fn timestamp_label(ms: u64) -> Option<String> {
     let time = chrono::DateTime::from_timestamp_millis(i64::try_from(ms).ok()?)?;
     Some(time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
 }

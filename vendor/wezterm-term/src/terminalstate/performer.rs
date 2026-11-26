@@ -1169,7 +1169,7 @@ impl Performer<'_> {
                         if status.is_some()
                             && !command.as_ref().is_some_and(|line| line.trim().is_empty()) =>
                     {
-                        self.command_label = command
+                        self.command_label = command.map(Into::into)
                     }
                     VscodeCommand::Pending(_) if self.capturing_shell_input => {
                         self.next_shell_prompt();
@@ -1188,7 +1188,7 @@ impl Performer<'_> {
                         self.screen.command_start = None;
                         self.vscode_command = VscodeCommand::Idle;
                     } else {
-                        self.command_label = Some(command);
+                        self.command_label = Some(command.into());
                     }
                     let state = &mut *self.state;
                     if let Some(handler) = state.alert_handler.as_mut() {

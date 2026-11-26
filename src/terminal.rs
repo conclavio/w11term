@@ -1881,6 +1881,34 @@ mod tests {
     }
 
     #[test]
+    fn running_command_handles_late_shell_metadata_prompt_and_terminal_reset() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]633;A\x07\x1b]633;B\x07");
+        assert!(term.running_command().is_none());
+        term.advance_bytes(b"\x1b]633;C\x07");
+        let started = term.running_command().unwrap();
+        assert!(started.command.is_none());
+
+        term.advance_bytes(b"\x1b]633;E;build all\x07");
+        let named = term.running_command().unwrap();
+        assert_eq!(named.command.as_deref(), Some("build all"));
+        assert_eq!(named.id, started.id);
+        assert_eq!(named.started_unix_ms, started.started_unix_ms);
+
+        term.advance_bytes(b"\x1b]633;A\x07");
+        assert!(term.running_command().is_none());
+        let finished = term.last_command().unwrap();
+        assert_eq!(finished.id, named.id);
+        assert_eq!(finished.timing.started_unix_ms, Some(named.started_unix_ms));
+        assert_eq!(finished.exit_code, None);
+
+        term.advance_bytes(b"\x1b]133;C\x07");
+        assert!(term.running_command().is_some());
+        term.advance_bytes(b"\x1bc");
+        assert!(term.running_command().is_none());
+    }
+
+    #[test]
     fn command_history_is_bounded_and_frozen_across_eviction_and_reset() {
         let (mut term, _) = engine();
         term.advance_bytes(b"\x1b]133;B\x07cancelled\x1b]133;A\x07");

@@ -277,6 +277,7 @@ pub struct PaneDescription {
 pub struct PaneInspection {
     pub connection_generation: u64,
     pub modes: terminal::TerminalModes,
+    pub running_command: Option<wezterm_term::RunningCommand>,
     pub ssh: Option<Arc<ssh::VerifiedSshRoute>>,
     pub ssh_transport: Option<Arc<ssh::SshTransport>>,
     pub ssh_connection: Option<crate::events::SshConnectionPhase>,
@@ -306,6 +307,11 @@ impl PaneInspection {
             Self {
                 connection_generation,
                 modes: terminal::TerminalModes::read(terminal),
+                running_command: if events.shell_generation() == Some(connection_generation) {
+                    terminal.running_command()
+                } else {
+                    None
+                },
                 ssh: route,
                 ssh_transport,
                 ssh_connection,

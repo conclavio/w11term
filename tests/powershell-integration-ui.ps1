@@ -11,6 +11,7 @@ $appearance.shortcuts | Add-Member NoteProperty 'find_command_history' 'F6'
 $profiles = Join-Path $State 'profiles.json'
 $startFolder = Join-Path $State ('history start % ' + [char]0x96ea)
 $env:W11TERM_HISTORY_LATER = Join-Path $State 'history later'
+$env:W11TERM_HISTORY_INSPECT_GATE = Join-Path $State 'finish-inspected-command'
 $env:W11TERM_TEST_EXPLORER_TRACE = Join-Path $State 'history-explorer.json'
 $null = [IO.Directory]::CreateDirectory($startFolder)
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_HISTORY_LATER)
@@ -214,6 +215,22 @@ try {
 
     $null = Control @('send-text','--pane',"$remote",'--no-paste','neighbor-ok')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','neighbor-ok')
+    $diagnostic = 'while (![IO.File]::Exists($env:W11TERM_HISTORY_INSPECT_GATE)) { Start-Sleep -Milliseconds 25 }; "local-command-finished"'
+    $wire = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($diagnostic + [char]13))
+    $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64',$wire)
+    $running = Wait-Until 'background PowerShell exposes its running command' {
+        $m = Control @('inspect','--pane',"$pane")
+        if ($m.running_command.command -ceq $diagnostic -and $m.running_command.id -gt 0) {
+            $m.running_command
+        }
+    }
+    Wait-Focus $remote
+    [IO.File]::WriteAllText($env:W11TERM_HISTORY_INSPECT_GATE, 'finish')
+    $null = Wait-Until 'PowerShell completes the inspected capture' {
+        $m = Control @('inspect','--pane',"$pane")
+        $h = Control @('list-commands','--pane',"$pane")
+        !$m.running_command -and $h.commands[0].id -eq $running.id -and $h.commands[0].command -ceq $diagnostic
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

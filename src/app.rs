@@ -1366,6 +1366,7 @@ pub enum Message {
     AttentionChanged,
     VisualBellTick,
     ToggleInspector,
+    InspectorTick,
     PaneTextSize(pane_text_size::Change),
     InspectSshRoute(u64, bool),
     PaletteChoose(command_palette::CommandId),
@@ -5703,6 +5704,7 @@ impl Component for TerminalApp {
                 | Message::CaptureLost(..)
                 | Message::FinalizeCapture(..)
                 | Message::VisualBellTick
+                | Message::InspectorTick
         ) {
             self.header.borrow_mut().take();
         }
@@ -5897,6 +5899,7 @@ impl Component for TerminalApp {
             Message::SftpTransfers(action) => self.handle_sftp_transfers(action, context),
             Message::AttentionChanged | Message::FolderAuthority => {}
             Message::VisualBellTick => self.expire_visual_bells(),
+            Message::InspectorTick => {}
             Message::ToggleInspector => {
                 self.show_inspector = !self.show_inspector;
                 self.sync_inspector();
@@ -6608,6 +6611,7 @@ impl Component for TerminalApp {
                             && inspector.pane == tab.session.pane_id
                         {
                             inspector.refresh(tab.session.frames.inspection());
+                            inspector.sync_running_timer(context);
                         }
                         let frame = tab.session.frames.load();
                         if frame.generation == tab.observed_frame {

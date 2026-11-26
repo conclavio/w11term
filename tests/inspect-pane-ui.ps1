@@ -9,6 +9,7 @@ $profiles = Join-Path $State 'profiles.json'
 $peer = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'
 $button = [System.Windows.Automation.ControlType]::Button
 $esc = [char]27
+$bell = [char]7
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -35,6 +36,10 @@ function Inspect {
 function Set-RemoteModes([string]$Bytes) {
     $data = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($Bytes))
     $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64',$data)
+}
+function Report-CommandStart([string]$Line) {
+    $encoded = [Uri]::EscapeDataString($Line)
+    Set-RemoteModes "$esc]133;C;cmdline_url=$encoded$bell"
 }
 function Type-Line([string]$Line) {
     foreach ($ch in $Line.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
@@ -118,6 +123,39 @@ try {
     }
     Set-RemoteModes "$esc[?2048l"
     $null = Wait-Until 'inspector observes resize reporting disabled' { Find-Element 'In-band resize   Off' }
+    if ((Inspect).running_command) { throw 'A shell without a command start reported a running command' }
+    $folder = 'file://127.0.0.1/build%20work'
+    Set-RemoteModes "$esc]7;$folder$bell"
+    Report-CommandStart 'compile fixture'
+    $running = Wait-Until 'native and CLI inspector show the started command and directory' {
+        $r = (Inspect).running_command
+        if ($r.id -gt 0 -and $r.command -ceq 'compile fixture' -and
+            $r.reported_directory -ceq $folder -and $r.started_unix_ms -gt 0 -and $r.elapsed_ms -ge 0 -and
+            (Find-Element 'Running command   compile fixture') -and (Find-Element "Starting directory   $folder")) { $r }
+    }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    $null = Wait-Until 'elapsed time advances without further shell output' {
+        $m = (Inspect).running_command
+        $m.elapsed_ms -ge 1000 -and $m.started_unix_ms -eq $running.started_unix_ms -and
+            ($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
+                Where-Object { $_.Current.Name -match '^Elapsed   [1-9][0-9]* s$' } | Select-Object -First 1)
+    }
+    Set-RemoteModes "$esc]7;file://127.0.0.1/after$bell$esc[?1049h"
+    $null = Wait-Until 'alternate screen keeps the outer command and its starting directory' {
+        $m = Inspect
+        $m.alternate_screen -and $m.running_command.id -eq $running.id -and
+            $m.running_command.reported_directory -ceq $folder -and (Find-Element 'Running command   compile fixture')
+    }
+    Set-RemoteModes "$esc[?1049l$esc]133;D;17$bell"
+    $null = Wait-Until 'finish clears the readout and retains the same command identity' {
+        $m = Inspect
+        $list = Control @('list-commands','--pane',"$remote")
+        !$m.running_command -and !(Find-Element 'Running command   compile fixture') -and
+            $list.commands[0].id -eq $running.id -and $list.commands[0].exit_code -eq 17 -and
+            $list.commands[0].started_unix_ms -eq $running.started_unix_ms
+    }
     Invoke-Button (Wait-Until 'close inspector' { Find-Element 'Close terminal inspector' $button })
     $null = Wait-Until 'GUI inspection closed before inspecting the hidden tab' { !(Find-Element 'Close terminal inspector') }
 
@@ -159,11 +197,16 @@ try {
     Wait-Focus $remote
     Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
     $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
+    Report-CommandStart 'interrupted fixture'
+    $null = Wait-Until 'the unfinished command is visible before disconnect' {
+        (Inspect).running_command.command -ceq 'interrupted fixture' -and (Find-Element 'Running command   interrupted fixture')
+    }
     Set-RemoteModes ([string][char]4)
     $null = Wait-Until 'a lost SSH transport retires the verified route and shows the failure' {
         $m = Inspect
         (Find-Element 'Close terminal inspector' $button) -and
-            !(Find-Element 'Verified SSH route') -and !$m.ssh -and !$m.ssh_transport -and !$m.ssh_progress -and
+            !(Find-Element 'Verified SSH route') -and !(Find-Element 'Running command   interrupted fixture') -and
+            !$m.ssh -and !$m.ssh_transport -and !$m.ssh_progress -and !$m.running_command -and
             $m.ssh_connection.phase -ceq 'failed' -and $m.ssh_connection.reason -and
             (Find-Element 'SSH connection   Failed') -and (Find-Element $m.ssh_connection.reason)
     }

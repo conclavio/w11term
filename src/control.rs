@@ -1293,6 +1293,15 @@ impl Registry {
                 let mut report = inspection.modes.as_json();
                 report["pane"] = pane.into();
                 report["connection_generation"] = inspection.connection_generation.into();
+                if let Some(command) = inspection.running_command {
+                    report["running_command"] = json!({
+                        "id": command.id,
+                        "command": command.command.as_deref(),
+                        "reported_directory": command.reported_directory.as_deref(),
+                        "started_unix_ms": command.started_unix_ms,
+                        "elapsed_ms": command.elapsed_ms(),
+                    });
+                }
                 if let Some(ssh) = inspection.ssh {
                     report["ssh"] = serde_json::to_value(ssh.as_ref())?;
                 }

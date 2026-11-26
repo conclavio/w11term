@@ -17,6 +17,7 @@ pub(super) struct Inspection {
     input: tokio::sync::mpsc::UnboundedSender<Command>,
     readout: View,
     pointer: PointerReadout,
+    running_timer: Option<crate::ui_timer::RetryTimer>,
 }
 
 #[derive(Default)]
@@ -326,7 +327,57 @@ fn ssh_transport_view(transport: &SshTransport, pane: u64) -> View {
     ))
 }
 
+fn running_command_view(command: &wezterm_term::RunningCommand) -> View {
+    let label = command
+        .command
+        .as_deref()
+        .map_or_else(|| "Command line unavailable".into(), target_label);
+    let started = command_history::timestamp_label(command.started_unix_ms).map_or_else(
+        View::empty,
+        |timestamp| {
+            TextBlock::new()
+                .text(format!("Started   {timestamp}"))
+                .into()
+        },
+    );
+    let directory = command
+        .reported_directory
+        .as_deref()
+        .map_or_else(View::empty, |name| {
+            TextBlock::new()
+                .text(format!("Starting directory   {}", target_label(name)))
+                .text_wrapping(TextWrapping::Wrap)
+                .into()
+        });
+    StackPanel::new().spacing(3.0).children((
+        TextBlock::new()
+            .text(format!("Running command   {label}"))
+            .text_wrapping(TextWrapping::Wrap),
+        started,
+        directory,
+        TextBlock::new().text(format!("Elapsed   {} s", command.elapsed_ms() / 1000)),
+    ))
+}
+
 impl Inspection {
+    pub(super) fn sync_running_timer(&mut self, context: &ComponentContext<TerminalApp>) {
+        if self
+            .current
+            .as_ref()
+            .and_then(|value| value.running_command.as_ref())
+            .is_none()
+        {
+            self.running_timer = None;
+        } else if self.running_timer.is_none() {
+            let sender = context.sender();
+            self.running_timer = crate::ui_timer::RetryTimer::with_next_delay(1000, move || {
+                sender.send(Message::InspectorTick);
+                1000
+            })
+            .ok();
+        }
+    }
+
     pub(super) fn set_ssh_expanded(&mut self, expanded: bool) {
         self.ssh_expanded = expanded
             && self
@@ -460,6 +511,10 @@ impl Inspection {
                                 self.current
                                     .as_ref()
                                     .map_or_else(View::empty, ssh_status_view),
+                                self.current
+                                    .as_ref()
+                                    .and_then(|value| value.running_command.as_ref())
+                                    .map_or_else(View::empty, running_command_view),
                                 transport,
                                 ssh,
                                 self.readout.clone(),
@@ -511,6 +566,7 @@ impl TerminalApp {
             input,
             readout: TextBlock::new().text(status).into(),
             pointer: Default::default(),
+            running_timer: None,
         });
     }
 }
@@ -546,6 +602,7 @@ mod tests {
             input,
             readout: TextBlock::new().into(),
             pointer: Default::default(),
+            running_timer: None,
         };
         let (writer, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut terminal = w11term::terminal::create(
@@ -618,6 +675,7 @@ mod tests {
             input,
             readout: TextBlock::new().text("Waiting").into(),
             pointer: Default::default(),
+            running_timer: None,
         };
         let modes = TerminalModes {
             cols: 80,
@@ -639,6 +697,7 @@ mod tests {
         let observation = PaneInspection {
             connection_generation: 0,
             modes,
+            running_command: None,
             ssh: None,
             ssh_transport: None,
             ssh_connection: None,

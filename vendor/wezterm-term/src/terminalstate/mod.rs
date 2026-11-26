@@ -335,6 +335,22 @@ pub struct CompletedCommand {
     pub output: Result<String, &'static str>,
 }
 
+/// Shell integration metadata observed at the start of the current command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningCommand {
+    pub id: u64,
+    pub command: Option<Arc<str>>,
+    pub reported_directory: Option<Arc<str>>,
+    pub started_unix_ms: u64,
+    started_at: std::time::Instant,
+}
+
+impl RunningCommand {
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CommandTiming {
     pub started_unix_ms: Option<u64>,
@@ -534,7 +550,7 @@ pub struct TerminalState {
     capturing_shell_input: bool,
     track_primary_prints: bool,
     last_primary_print: Option<PrimaryPrint>,
-    command_label: Option<String>,
+    command_label: Option<Arc<str>>,
     command_started: Option<CommandClock>,
     command_directory: Option<Arc<str>>,
     vscode_command: VscodeCommand,
@@ -1076,6 +1092,17 @@ impl TerminalState {
         self.next_command_id - 1
     }
 
+    pub fn running_command(&self) -> Option<RunningCommand> {
+        let start = self.command_started?;
+        Some(RunningCommand {
+            id: self.next_command_id,
+            command: self.command_label.clone(),
+            reported_directory: self.command_directory.clone(),
+            started_unix_ms: start.unix_ms,
+            started_at: start.monotonic,
+        })
+    }
+
     fn shell_column(&self) -> usize {
         if self.wrap_next {
             self.screen().physical_cols
@@ -1122,19 +1149,21 @@ impl TerminalState {
                 .as_ref()
                 .filter(|(url, raw)| url.scheme() == "file" && raw.len() <= 16 * 1024)
                 .map(|(_, raw)| raw.clone());
-            self.command_label = reported_command.or_else(|| {
-                if !self.capturing_shell_input {
-                    return None;
-                }
-                let col = self.shell_column();
-                self.screen
-                    .take_command_text(self.cursor.y, col, 4096)
-                    .ok()
-                    .and_then(|mut text| {
-                        text.truncate(text.trim_end_matches(['\r', '\n']).len());
-                        (!text.is_empty()).then_some(text)
-                    })
-            });
+            self.command_label = reported_command
+                .or_else(|| {
+                    if !self.capturing_shell_input {
+                        return None;
+                    }
+                    let col = self.shell_column();
+                    self.screen
+                        .take_command_text(self.cursor.y, col, 4096)
+                        .ok()
+                        .and_then(|mut text| {
+                            text.truncate(text.trim_end_matches(['\r', '\n']).len());
+                            (!text.is_empty()).then_some(text)
+                        })
+                })
+                .map(Arc::from);
             self.capturing_shell_input = false;
             self.mark_shell_position();
         }
@@ -1172,7 +1201,7 @@ impl TerminalState {
                 id: self.next_command_id,
                 finished_at: finished.monotonic,
                 timing,
-                command: self.command_label.take(),
+                command: self.command_label.take().map(|label| label.to_string()),
                 reported_directory: self.command_directory.take(),
                 exit_code,
                 output,
