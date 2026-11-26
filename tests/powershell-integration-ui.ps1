@@ -287,7 +287,7 @@ try {
     Picker-Query $label
     Press-Key 13
     Wait-Focus $pane
-    Run-Palette 'Command history'
+    Run-Palette 'Command history' -Enter
     $inputType = [System.Windows.Automation.ControlType]::Edit
     $query = Wait-Until 'local command history search' { Find-Element 'Search command history' $inputType }
     $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($line)
