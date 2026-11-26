@@ -14,12 +14,17 @@ use windows::Win32::{
 };
 
 const WINDOW_LABEL: &str = "Window ";
+const MOVE_ALL_PREFIX: &str = "Move all terminal tabs to ";
 pub(super) const NEW_WINDOW_LABEL: &str = "Move tab to new window";
 static NEXT_WINDOW: AtomicU64 = AtomicU64::new(2);
 
 pub(super) fn menu_window(label: &str) -> Option<u64> {
     let (id, _) = label.strip_prefix(WINDOW_LABEL)?.split_once(" · ")?;
     id.parse().ok().filter(|id| *id != 0)
+}
+
+pub(super) fn menu_all_tabs_window(label: &str) -> Option<u64> {
+    menu_window(label.strip_prefix(MOVE_ALL_PREFIX)?)
 }
 
 pub(super) fn window_label(window: u64, name: Option<&TabTitle>) -> String {
@@ -200,7 +205,6 @@ pub(super) struct Transfer {
     ticket: u64,
     destination: u64,
     pub(super) new_window: Option<NewWindow>,
-    pub(super) group: TabId,
     panes: Vec<u64>,
     kind: TransferKind,
     source: LocalSender<Message>,
@@ -211,17 +215,28 @@ pub(super) struct Transfer {
     started: Instant,
 }
 
-#[derive(Clone, Copy)]
 enum TransferKind {
-    Tab,
+    Tab(TabId),
+    AllTabs(Vec<TabId>),
     Pane {
+        group: TabId,
         source: TabId,
         placement: Option<(PaneDestination, Direction)>,
     },
 }
 
+impl TransferKind {
+    fn tab_groups(&self) -> &[TabId] {
+        match self {
+            Self::Tab(group) => std::slice::from_ref(group),
+            Self::AllTabs(groups) => groups,
+            Self::Pane { .. } => &[],
+        }
+    }
+}
+
 enum TransferPayload {
-    Tab(OfferedTab<AppTab>),
+    Tabs(OfferedTabs<AppTab>),
     Pane(Box<DetachedPane<AppTab>>),
 }
 
@@ -309,21 +324,36 @@ impl TerminalApp {
     }
 }
 
-struct OfferedTab<T> {
-    tab: Tabs<T>,
-    index: usize,
-    was_selected: bool,
+struct OfferedTabs<T> {
+    tabs: Vec<(usize, Tabs<T>)>,
+    selected: Option<TabId>,
     fallback_group: Option<TabId>,
 }
 
-impl<T> OfferedTab<T> {
-    fn take(source: &mut Tabs<T>, group: TabId, index: usize) -> Option<Self> {
-        let was_selected = source.active_group_id() == Some(group);
-        let tab = source.take_group(group)?;
+impl<T> OfferedTabs<T> {
+    fn take(source: &mut Tabs<T>, groups: &[TabId]) -> Option<Self> {
+        let positions: Vec<_> = source
+            .headers()
+            .into_iter()
+            .map(|tab| tab.group_id())
+            .enumerate()
+            .filter(|(_, id)| groups.contains(id))
+            .collect();
+        if positions.is_empty() || positions.len() != groups.len() {
+            return None;
+        }
+        let selected = source.active_id().filter(|_| {
+            source
+                .active_group_id()
+                .is_some_and(|id| groups.contains(&id))
+        });
+        let tabs = positions
+            .into_iter()
+            .map(|(index, group)| (index, source.take_group(group).expect("all groups checked")))
+            .collect();
         Some(Self {
-            tab,
-            index,
-            was_selected,
+            tabs,
+            selected,
             fallback_group: source.active_group_id(),
         })
     }
@@ -331,8 +361,27 @@ impl<T> OfferedTab<T> {
     fn return_to(self, source: &mut Tabs<T>) {
         // The automatic fallback may still be active with a different focused split.
         // A different surviving tab reflects a newer choice in the source window.
-        let select = self.was_selected && source.active_group_id() == self.fallback_group;
-        source.restore_group(self.tab, self.index, select);
+        let restore_selection = source.active_group_id() == self.fallback_group;
+        for (index, tab) in self.tabs {
+            source.restore_group(tab, index, false);
+        }
+        if restore_selection && let Some(id) = self.selected {
+            source.select(id);
+        }
+    }
+
+    fn receive(self, destination: &mut Tabs<T>) -> Vec<TabId> {
+        let focused = self.selected.or_else(|| self.tabs.first()?.1.active_id());
+        let mut leaves = Vec::new();
+        let first_index = destination.headers().len();
+        for (offset, (_, tab)) in self.tabs.into_iter().enumerate() {
+            leaves.extend(tab.entries().iter().map(|entry| entry.id));
+            destination.restore_group(tab, first_index + offset, false);
+        }
+        if let Some(id) = focused {
+            destination.select(id);
+        }
+        leaves
     }
 }
 
@@ -359,6 +408,13 @@ impl TransferPhase {
 impl Transfer {
     fn id(&self) -> u64 {
         self.ticket
+    }
+
+    pub(super) fn includes_group(&self, group: TabId) -> bool {
+        match &self.kind {
+            TransferKind::Tab(id) | TransferKind::Pane { group: id, .. } => *id == group,
+            TransferKind::AllTabs(groups) => groups.contains(&group),
+        }
     }
 
     fn send_target(&self, message: Message) -> bool {
@@ -482,7 +538,7 @@ impl TerminalApp {
                 NEW_WINDOW_LABEL,
                 self.outgoing.is_none() && self.incoming.is_none(),
             ),
-            self.existing_window_menu(),
+            self.existing_window_menu(false),
         ]
     }
 
@@ -705,8 +761,20 @@ impl TerminalApp {
         }
     }
 
-    fn existing_window_menu(&self) -> MenuItem {
-        let windows = if self.incoming.is_some() || self.outgoing.is_some() {
+    pub(super) fn existing_window_menu(&self, all_tabs: bool) -> MenuItem {
+        let (key, label, prefix) = if all_tabs {
+            (
+                "move-all-tabs-existing",
+                "Move all terminal tabs to another window",
+                MOVE_ALL_PREFIX,
+            )
+        } else {
+            ("move-tab-existing", "Move tab to existing window", "")
+        };
+        let windows = if self.incoming.is_some()
+            || self.outgoing.is_some()
+            || (all_tabs && self.terminal_groups().is_empty())
+        {
             Vec::new()
         } else {
             WINDOWS.with_borrow(|windows| {
@@ -725,20 +793,27 @@ impl TerminalApp {
                             .filter(|s| !s.is_empty())
                             .unwrap_or("Terminal");
                         Some(MenuItem::item(
-                            format!("move-tab-existing-{id}"),
-                            format!("{WINDOW_LABEL}{id} · {title}"),
+                            format!("{key}-{id}"),
+                            format!("{prefix}{WINDOW_LABEL}{id} · {title}"),
                         ))
                     })
                     .collect()
             })
         };
-        let key = "move-tab-existing";
-        let label = "Move tab to existing window";
         if windows.is_empty() {
             MenuItem::disabled(key, label)
         } else {
             MenuItem::submenu(key, label, windows)
         }
+    }
+
+    fn terminal_groups(&self) -> Vec<TabId> {
+        self.tabs
+            .headers()
+            .into_iter()
+            .filter(|tab| tab.value.pane_id().is_some())
+            .map(|tab| tab.group_id())
+            .collect()
     }
 
     fn tab_move_blocker(&self, leaves: &[TabId]) -> Option<&'static str> {
@@ -776,13 +851,39 @@ impl TerminalApp {
         destination: Option<u64>,
         ctx: &ComponentContext<Self>,
     ) {
-        if self.outgoing.is_some() || self.incoming.is_some() {
+        self.start_tab_transfer(destination, TransferKind::Tab(group), ctx);
+    }
+
+    pub(super) fn move_all_terminal_tabs(
+        &mut self,
+        destination: u64,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let groups = self.terminal_groups();
+        self.start_tab_transfer(Some(destination), TransferKind::AllTabs(groups), ctx);
+    }
+
+    fn group_leaves(&self, groups: &[TabId]) -> Option<Vec<TabId>> {
+        let mut leaves = Vec::new();
+        for group in groups {
+            leaves.extend(self.tabs.group_layout(*group)?.leaves());
+        }
+        Some(leaves)
+    }
+
+    fn start_tab_transfer(
+        &mut self,
+        destination: Option<u64>,
+        kind: TransferKind,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let groups = kind.tab_groups();
+        if self.outgoing.is_some() || self.incoming.is_some() || groups.is_empty() {
             return;
         }
-        let Some(layout) = self.tabs.group_layout(group) else {
+        let Some(leaves) = self.group_leaves(groups) else {
             return;
         };
-        let leaves = layout.leaves();
         if let Some(reason) = self.tab_move_blocker(&leaves) {
             self.window_error = Some(reason.into());
             return;
@@ -794,7 +895,7 @@ impl TerminalApp {
         else {
             return;
         };
-        self.start_window_transfer(group, panes, destination, TransferKind::Tab, ctx);
+        self.start_window_transfer(panes, destination, kind, ctx);
     }
 
     pub(super) fn move_pane_to_window(
@@ -821,10 +922,13 @@ impl TerminalApp {
             return;
         };
         self.start_window_transfer(
-            group,
             vec![pane],
             placement.map(|(target, _)| target.window),
-            TransferKind::Pane { source, placement },
+            TransferKind::Pane {
+                group,
+                source,
+                placement,
+            },
             ctx,
         );
     }
@@ -847,7 +951,6 @@ impl TerminalApp {
 
     fn start_window_transfer(
         &mut self,
-        group: TabId,
         panes: Vec<u64>,
         destination: Option<u64>,
         kind: TransferKind,
@@ -882,7 +985,6 @@ impl TerminalApp {
             ticket: NEXT_TRANSFER.fetch_add(1, Ordering::Relaxed),
             destination,
             new_window,
-            group,
             panes,
             kind,
             source: ctx.sender(),
@@ -967,27 +1069,25 @@ impl TerminalApp {
         if offer.phase.get() != TransferPhase::Ready {
             return;
         }
-        let headers = self.tabs.headers();
-        let Some(index) = headers
-            .iter()
-            .position(|t| self.tabs.group_id(t.id) == Some(offer.group))
-        else {
+        let groups = offer.kind.tab_groups();
+        let leaves = match &offer.kind {
+            TransferKind::AllTabs(groups) if *groups != self.terminal_groups() => None,
+            TransferKind::Tab(_) | TransferKind::AllTabs(_) => self.group_leaves(groups),
+            TransferKind::Pane {
+                group,
+                source,
+                placement,
+            } if self.tabs.group_id(*source) == Some(*group)
+                && self.move_source() == Some(*source)
+                && (placement.is_some() || self.active_tab_has_split()) =>
+            {
+                Some(vec![*source])
+            }
+            TransferKind::Pane { .. } => None,
+        };
+        let Some(leaves) = leaves else {
             self.cancel_transfer(id, ctx);
             return;
-        };
-        let leaves = match offer.kind {
-            TransferKind::Tab => self.tabs.layout_for(headers[index].id).unwrap().leaves(),
-            TransferKind::Pane { source, placement }
-                if self.tabs.group_id(source) == Some(offer.group)
-                    && self.move_source() == Some(source)
-                    && (placement.is_some() || self.active_tab_has_split()) =>
-            {
-                vec![source]
-            }
-            TransferKind::Pane { .. } => {
-                self.cancel_transfer(id, ctx);
-                return;
-            }
         };
         let panes: Vec<_> = leaves
             .iter()
@@ -1017,12 +1117,12 @@ impl TerminalApp {
             }
         }
         let before = self.tabs.active_id();
-        let payload = match offer.kind {
-            TransferKind::Tab => {
-                OfferedTab::take(&mut self.tabs, offer.group, index).map(TransferPayload::Tab)
+        let payload = match &offer.kind {
+            TransferKind::Tab(_) | TransferKind::AllTabs(_) => {
+                OfferedTabs::take(&mut self.tabs, groups).map(TransferPayload::Tabs)
             }
             TransferKind::Pane { source, .. } => {
-                self.tabs.detach_pane(source).map(TransferPayload::Pane)
+                self.tabs.detach_pane(*source).map(TransferPayload::Pane)
             }
         };
         let Some(payload) = payload else {
@@ -1035,9 +1135,8 @@ impl TerminalApp {
         }
         offer.payload.replace(Some(payload));
         offer.phase.set(TransferPhase::Offered);
-        if self.tabs.group_layout(offer.group).is_none() {
-            self.mru_groups.retain(|g| *g != offer.group);
-        }
+        self.mru_groups
+            .retain(|g| self.tabs.group_layout(*g).is_some());
         self.refresh_source_after_transfer(source_selection_changed, ctx);
         if !offer.send_target(Message::TransferClaim(id)) {
             self.cancel_transfer(id, ctx);
@@ -1069,7 +1168,7 @@ impl TerminalApp {
         let existing = offer.new_window.is_none();
         let placement = match offer.kind {
             TransferKind::Pane { placement, .. } => placement,
-            TransferKind::Tab => None,
+            TransferKind::Tab(_) | TransferKind::AllTabs(_) => None,
         };
         let target = placement
             .and_then(|(target, side)| self.pane_transfer_target(target).map(|id| (id, side)));
@@ -1083,12 +1182,7 @@ impl TerminalApp {
             return;
         };
         let leaves = match payload {
-            TransferPayload::Tab(payload) => {
-                let leaves: Vec<_> = payload.tab.entries().iter().map(|t| t.id).collect();
-                self.tabs
-                    .restore_group(payload.tab, self.tabs.headers().len(), true);
-                leaves
-            }
+            TransferPayload::Tabs(payload) => payload.receive(&mut self.tabs),
             TransferPayload::Pane(pane) => {
                 if let Some((target, side)) = target {
                     match self.tabs.insert_detached_pane(pane, target, side) {
@@ -1175,7 +1269,7 @@ impl TerminalApp {
         if let Some(payload) = offer.payload.take() {
             let before = self.tabs.active_id();
             match payload {
-                TransferPayload::Tab(tab) => tab.return_to(&mut self.tabs),
+                TransferPayload::Tabs(tabs) => tabs.return_to(&mut self.tabs),
                 TransferPayload::Pane(pane) => self.tabs.return_detached_pane(*pane),
             }
             self.refresh_source_after_transfer(self.tabs.active_id() != before, ctx);
@@ -1184,8 +1278,11 @@ impl TerminalApp {
         offer.cancel_target();
         self.window_error = Some(
             match offer.kind {
-                TransferKind::Tab => {
+                TransferKind::Tab(_) => {
                     "The tab could not move. It is still available in this window."
+                }
+                TransferKind::AllTabs(_) => {
+                    "The tabs could not move. They are still available in this window."
                 }
                 TransferKind::Pane { .. } => {
                     "The pane could not move. It is still available in this window."
@@ -1281,6 +1378,13 @@ mod tests {
             bind_tab_action(tab_menu_message(label.into()), Some(42)),
             Message::MoveTabToExistingWindow(Some(42), 27)
         ));
+        assert!(matches!(
+            bind_tab_action(
+                tab_menu_message(format!("Move all terminal tabs to {label}")),
+                None,
+            ),
+            Message::MoveAllTerminalTabs(27)
+        ));
     }
 
     #[test]
@@ -1293,7 +1397,7 @@ mod tests {
         let group = source.group_id(moving).unwrap();
         source.select(moving);
 
-        let offer = OfferedTab::take(&mut source, group, 1).unwrap();
+        let offer = OfferedTabs::take(&mut source, &[group]).unwrap();
         assert_eq!(source.active_id(), Some(sibling));
         source.select(first);
         offer.return_to(&mut source);
@@ -1301,16 +1405,51 @@ mod tests {
         assert_eq!(source.headers()[1].id, moving);
 
         source.select(moving);
-        let offer = OfferedTab::take(&mut source, group, 1).unwrap();
+        let offer = OfferedTabs::take(&mut source, &[group]).unwrap();
         source.select(fallback);
         offer.return_to(&mut source);
         assert_eq!(source.active_id(), Some(moving));
         assert_eq!(source.headers()[1].id, moving);
 
         source.select(first);
-        let background = OfferedTab::take(&mut source, group, 1).unwrap();
+        let background = OfferedTabs::take(&mut source, &[group]).unwrap();
         background.return_to(&mut source);
         assert_eq!(source.active_id(), Some(first));
+    }
+
+    #[test]
+    fn batch_preserves_order_pins_and_split_focus_on_claim_or_rollback() {
+        let mut source = Tabs::default();
+        let first = source.insert("first");
+        let utility = source.insert("utility");
+        let last = source.insert("last");
+        let focused = source.split(last, "split", Axis::Rows).unwrap();
+        source.set_group_pinned(first, true);
+        let header_ids = |tabs: &Tabs<&str>| {
+            tabs.headers()
+                .iter()
+                .map(|tab| tab.group_id())
+                .collect::<Vec<_>>()
+        };
+        assert!(OfferedTabs::take(&mut source, &[first, last, u64::MAX]).is_none());
+        assert_eq!(header_ids(&source), [first, utility, last]);
+        assert_eq!(source.active_id(), Some(focused));
+
+        let offer = OfferedTabs::take(&mut source, &[first, last]).unwrap();
+        assert_eq!(header_ids(&source), [utility]);
+        offer.return_to(&mut source);
+        assert_eq!(header_ids(&source), [first, utility, last]);
+        assert!(source.group_is_pinned(first));
+        assert_eq!(source.active_id(), Some(focused));
+
+        let mut destination = Tabs::default();
+        let old_pin = destination.insert("old pin");
+        let old_tab = destination.insert("old tab");
+        destination.set_group_pinned(old_pin, true);
+        let offer = OfferedTabs::take(&mut source, &[first, last]).unwrap();
+        assert_eq!(offer.receive(&mut destination), [first, last, focused]);
+        assert_eq!(header_ids(&destination), [old_pin, first, old_tab, last]);
+        assert_eq!(destination.active_id(), Some(focused));
     }
 
     #[test]

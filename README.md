@@ -383,6 +383,8 @@ Duplication works with ordinary SSH and interactive local shell launches. The me
 
 Choose **More → Panes → Move tab to new window** to move the whole terminal tab, including every split, to another native window. The tab keeps its title, focused pane, split proportions and zoom. Each SSH channel and local shell keeps running with its scrollback. The last tab leaving a window closes that window after the destination takes ownership. Both windows share a process and control pipe. Use the pane’s `window_id` in `w11term-cli list` to find its current window.
 
+Choose **More → Move all terminal tabs to another window** and select a window in the same instance. The command palette also lists each destination. The existing sessions, split layouts, and tab order within the pinned and unpinned sections move together. The source window keeps utility tabs such as Settings and closes if the move empties it.
+
 Use **More → Panes → Move tab to existing window** to move the live tab back into another window in the same process. Choose a destination by its window ID and active tab title. The moved tab joins the end of the destination’s tab strip and becomes selected. The command palette also lists the available destinations.
 
 Both move commands are also on the tab header’s right-click menu. Moving a background tab keeps the source window’s current tab selected.

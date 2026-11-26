@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -85,7 +85,7 @@ function Run-WindowCommand([IntPtr]$Hwnd, [string]$Action) {
     Use-Window $Hwnd
     $window = $Hwnd
     Press-Key 0x76 # F7, fixture command palette
-    $field = Wait-Until 'focused command palette in the requested HWND' {
+    $field = Wait-Until "focused command palette for '$Action' in the requested HWND" {
         $element = Find-Here $Hwnd 'Search commands'
         if ($element -and $element.Current.HasKeyboardFocus) { $element }
     }
@@ -95,6 +95,10 @@ function Run-WindowCommand([IntPtr]$Hwnd, [string]$Action) {
         if ($item -and $item.Current.IsEnabled) { $item }
     }
     Press-Key 13
+    $null = Wait-Until "command palette closes after '$Action'" {
+        [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $Hwnd -or
+            !(Find-Here $Hwnd 'Search commands')
+    }
 }
 
 function Open-TabSearch([IntPtr]$Hwnd, [string]$Query, [string]$Result) {
@@ -486,6 +490,91 @@ function Test-WorkspaceInNewWindow {
     Expect-Text $ssh.id 'original-workspace/'
 }
 
+function Test-MoveAllTerminalTabs {
+    Use-Window $origin
+    $window = $origin
+    Expect-Focus $origin $ssh.id 'The SSH pane is focused before moving tabs'
+    Type-In $origin 'before-bulk/'
+    Expect-Text $ssh.id 'before-bulk/'
+    Run-WindowCommand $origin 'Pin tab'
+    Run-WindowCommand $origin 'Settings'
+    $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $sourceTab = Wait-Until 'the original pinned split tab' { Find-Here $origin 'Pinned: Cockpit tools' }
+    $sourceTab.GetCurrentPattern($select).Select()
+    Expect-Focus $origin $ssh.id 'The terminal tab is selected again'
+
+    $field = Open-ProfileWindowPicker $origin -FromPalette
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Destination PowerShell')
+    $null = Wait-Until 'the PowerShell destination profile' {
+        Find-Here $origin ('Destination PowerShell ' + [char]0x00b7 + ' Local')
+    }
+    Press-Key 13
+    $destination = Wait-DetachedWindow $origin
+    $local = Wait-Until 'the existing destination shell' {
+        (Control @('list')).sessions | Where-Object label -eq 'Destination PowerShell'
+    }
+    Expect-Focus $destination $local.id 'The new destination window owns its shell'
+    Expect-Text $local.id 'PS '
+    $destinationIdentity = Shell-State $local.id 'dest1' -Init
+    # Rename the destination to prove the palette keeps targeting its numeric window ID.
+    Set-FixtureWindowName $destination 'Consolidated tools'
+    $separator = " $([char]0x00b7) "
+    $destinationTitle = "Consolidated tools${separator}Destination PowerShell"
+    $null = Wait-Until 'the named destination is published' {
+        [TabFixtureWindows]::Title($destination) -ceq "w11term${separator}$destinationTitle"
+    }
+
+    Run-WindowCommand $origin "Move all terminal tabs to Window $($local.window_id)${separator}$destinationTitle"
+    Expect-Focus $destination $ssh.id 'The moved split keeps its focused SSH pane'
+    $null = Expect-Group 4 $ssh.window_id
+    $null = Wait-Until 'all original pane IDs are in the destination with their original tabs' {
+        $panes = @((Control @('list')).sessions)
+        $currentAnchor = $panes | Where-Object id -eq $anchor.id
+        $currentLocal = $panes | Where-Object id -eq $local.id
+        $panes.Count -eq 4 -and @($panes | Where-Object window_id -ne $local.window_id).Count -eq 0 -and
+            $currentAnchor.tab_id -eq $anchor.tab_id -and $currentLocal.tab_id -eq $local.tab_id
+    }
+    $null = Wait-Until 'Settings remains open in the original window' {
+        (Find-Here $origin 'Settings') -and !(Find-Here $origin 'Pinned: Cockpit tools') -and
+            !(Find-Here $origin 'Source PowerShell')
+    }
+    Expect-Text $ssh.id 'before-bulk/'
+    Type-In $destination 'after-bulk/'
+    Expect-Text $ssh.id 'after-bulk/'
+    if ((Shell-State $moved.id 'moved2') -ne $localIdentity -or
+        (Shell-State $anchor.id 'anchor2') -ne $anchorIdentity -or
+        (Shell-State $local.id 'dest2') -ne $destinationIdentity) {
+        throw 'Moving tabs restarted a PowerShell process'
+    }
+    $split = Find-Here $destination 'Pinned: Cockpit tools'
+    $preexisting = Find-Here $destination 'Destination PowerShell'
+    $single = Find-Here $destination 'Source PowerShell'
+    if (!($split.Current.BoundingRectangle.Left -lt $preexisting.Current.BoundingRectangle.Left -and
+          $preexisting.Current.BoundingRectangle.Left -lt $single.Current.BoundingRectangle.Left)) {
+        throw 'The pinned split or existing tab order changed incorrectly'
+    }
+
+    $prefix = "w11term$separator"
+    $title = Wait-Until 'the original window title' {
+        $native = [TabFixtureWindows]::Title($origin)
+        if ($native.StartsWith($prefix)) { $native.Substring($prefix.Length) }
+    }
+    $window = $destination
+    $action = "Move all terminal tabs to Window $($ssh.window_id)${separator}$title"
+    Invoke-Button (Get-NativeMenuAction 'Tab menu' $action -Submenu 'Move all terminal tabs to another window')
+    Expect-Focus $origin $ssh.id 'Moving back preserves the focused split'
+    $null = Wait-Until 'an emptied window closes after all four panes are reclaimed' {
+        $panes = @((Control @('list')).sessions)
+        $panes.Count -eq 4 -and @($panes | Where-Object window_id -ne $ssh.window_id).Count -eq 0 -and
+            [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $destination
+    }
+    Type-In $origin 'after-return/'
+    Expect-Text $ssh.id 'after-return/'
+    if ((Shell-State $local.id 'dest3') -ne $destinationIdentity) {
+        throw 'The destination shell did not survive its old window closing'
+    }
+}
+
 function Test-DuplicateInNewWindow {
     Use-Window $origin
     $window = $origin
@@ -618,6 +707,14 @@ try {
         Close-FixtureWindow $origin
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'Closing the last workspace window did not release the process and control pipe'
+        }
+        return
+    }
+    if ($FirstClose -eq 'AllTabs') {
+        Test-MoveAllTerminalTabs
+        Close-FixtureWindow $origin
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'The last window did not release the process and control pipe'
         }
         return
     }

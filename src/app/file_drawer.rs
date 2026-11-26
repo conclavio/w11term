@@ -3341,10 +3341,11 @@ impl TerminalApp {
     pub(super) fn drawer_shell_eligible(&self, tab: &LiveTab, generation: u64) -> bool {
         tab.session.is_direct_ssh_shell()
             && tab.session.frames.load().connection_generation == generation
-            && !self
-                .outgoing
-                .as_ref()
-                .is_some_and(|transfer| self.tabs.active_group_id() == Some(transfer.group))
+            && !self.outgoing.as_ref().is_some_and(|transfer| {
+                self.tabs
+                    .active_group_id()
+                    .is_some_and(|group| transfer.includes_group(group))
+            })
     }
 
     pub(super) fn with_file_drawer(&self, content: View, context: &mut ViewContext<Self>) -> View {
@@ -3481,10 +3482,11 @@ impl TerminalApp {
             return;
         };
         let visible = self.tabs.active_id() == Some(id);
-        let transferring = self
-            .outgoing
-            .as_ref()
-            .is_some_and(|transfer| self.tabs.group_id(id) == Some(transfer.group));
+        let transferring = self.outgoing.as_ref().is_some_and(|transfer| {
+            self.tabs
+                .group_id(id)
+                .is_some_and(|group| transfer.includes_group(group))
+        });
         let Some(AppTab {
             page: super::Page::Terminal(tab),
             ..

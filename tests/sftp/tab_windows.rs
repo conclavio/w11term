@@ -20,6 +20,12 @@ async fn native_move_live_split_to_existing_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "consolidates live SSH and PowerShell tabs without moving utility tabs"]
+async fn native_move_all_terminal_tabs_between_windows() {
+    run("AllTabs", b"before-bulk/after-bulk/after-return/").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "moves a background split from its tab header and preserves the other window's active session"]
 async fn native_move_background_tab_from_context_menu() {
     run("Context", b"ssh-probe/existing-window/").await;
