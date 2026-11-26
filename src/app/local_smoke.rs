@@ -108,11 +108,17 @@ impl TerminalApp {
             }
             3 => {
                 let local = self.tabs.active_id().unwrap();
-                use super::workspace_view::WorkspaceAction;
+                use super::workspace_view::{SaveWorkspaceAction, WorkspaceAction};
                 self.workspace_action(WorkspaceAction::Show, context);
                 let manager = self.tabs.active_id().unwrap();
                 self.workspace_action(WorkspaceAction::Name(manager, "Mixed test".into()), context);
-                self.workspace_action(WorkspaceAction::Save(manager), context);
+                self.workspace_action(
+                    WorkspaceAction::Save(
+                        manager,
+                        SaveWorkspaceAction::Create("Mixed test".into()),
+                    ),
+                    context,
+                );
                 self.tabs.select(local);
                 self.activate(context);
                 self.update(Message::ClosePane, context);

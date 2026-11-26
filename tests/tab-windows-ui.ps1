@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -580,6 +580,106 @@ function Test-ManageWorkspace {
     Close-FixtureWindow $origin
 }
 
+function Invoke-WorkspaceButton([IntPtr]$Hwnd, [string]$Name) {
+    Invoke-Button (Wait-Until "enabled workspace action '$Name'" {
+        $button = Find-Here $Hwnd $Name
+        if ($button -and $button.Current.IsEnabled) { $button }
+    })
+}
+
+function Test-WorkspaceReplacement {
+    $window = $origin
+    $workspaceCommand = 'Workspaces' + [char]0x2026
+    $name = 'Shared desk'
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $separator = " $([char]0x00b7) "
+    $field = Open-ProfileWindowPicker $origin -FromPalette
+    $field.GetCurrentPattern($value).SetValue('Destination PowerShell')
+    $null = Wait-Until 'the second window profile' {
+        Find-Here $origin "Destination PowerShell${separator}Local"
+    }
+    Press-Key 13
+    $other = Wait-DetachedWindow $origin
+
+    Run-WindowCommand $origin $workspaceCommand
+    (Wait-Until 'source workspace name field' { Find-Here $origin 'Workspace name' }).
+        GetCurrentPattern($value).SetValue($name)
+    Run-WindowCommand $other $workspaceCommand
+    (Wait-Until 'second window workspace name field' { Find-Here $other 'Workspace name' }).
+        GetCurrentPattern($value).SetValue($name)
+    Invoke-WorkspaceButton $other 'Save workspace'
+    $null = Wait-Until 'the other window saves the name first' { Find-Here $other "Saved $name" }
+    $saved = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces.$name |
+        ConvertTo-Json -Depth 12 -Compress
+
+    Invoke-WorkspaceButton $origin 'Save workspace'
+    $null = Wait-Until 'stale Save is refused' {
+        Find-Here $origin "Workspace $name already exists. Review it before replacing it."
+    }
+    Invoke-WorkspaceButton $origin 'Update saved workspace'
+    $null = Wait-Until 'existing and proposed layouts are presented separately' {
+        (Find-Here $origin "Saved layout${separator}1 tab, 1 pane") -and
+            (Find-Here $origin "Replacement layout${separator}2 tabs, 3 panes")
+    }
+    Invoke-WorkspaceButton $origin 'Cancel'
+    $null = Wait-Until 'cancel returns to the workspace list' {
+        (Find-Here $origin 'Update saved workspace') -and !(Find-Here $origin 'Replace saved workspace')
+    }
+    $afterCancel = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces.$name |
+        ConvertTo-Json -Depth 12 -Compress
+    if ($afterCancel -cne $saved) { throw 'Creating an occupied name or canceling review changed the saved layout' }
+
+    Invoke-WorkspaceButton $origin 'Update saved workspace'
+    $null = Wait-Until 'the original window starts a second review' {
+        Find-Here $origin 'Replace saved workspace'
+    }
+    Run-WindowCommand $other "New tab with Destination PowerShell${separator}Local"
+    Run-WindowCommand $other $workspaceCommand
+    Invoke-WorkspaceButton $other 'Update saved workspace'
+    $null = Wait-Until 'the other window reviews a different layout' {
+        Find-Here $other "Replacement layout${separator}2 tabs, 2 panes"
+    }
+    Invoke-WorkspaceButton $other 'Replace saved workspace'
+    $null = Wait-Until 'the other window updates the catalog' { Find-Here $other "Updated $name" }
+
+    Invoke-WorkspaceButton $origin 'Replace saved workspace'
+    $null = Wait-Until 'stale confirmation is refused' {
+        Find-Here $origin "Workspace $name changed in another window. Review it again."
+    }
+    Invoke-WorkspaceButton $origin 'Update saved workspace'
+    $null = Wait-Until 'the current saved layout is shown before replacing it' {
+        (Find-Here $origin "Saved layout${separator}2 tabs, 2 panes") -and
+            (Find-Here $origin "Replacement layout${separator}2 tabs, 3 panes")
+    }
+    Run-WindowCommand $origin "New tab with Destination PowerShell${separator}Local"
+    $null = Wait-Until 'an unreviewed shell opens in the source window' {
+        (Control @('list')).sessions |
+            Where-Object { $_.window_id -eq $ssh.window_id -and $_.label -eq 'Destination PowerShell' }
+    }
+    $workspaceTab = Find-Here $origin 'Workspaces'
+    $workspaceTab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Invoke-WorkspaceButton $origin 'Replace saved workspace'
+    $null = Wait-Until 'a reviewed replacement is saved' { Find-Here $origin "Updated $name" }
+    $result = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces.$name
+    if ($result.tabs.Count -ne 2 -or $result.tabs[0].title -cne 'Cockpit tools' -or
+        $result.tabs[0].layout.type -cne 'split' -or $result.tabs[1].layout.type -cne 'leaf') {
+        throw 'The reviewed replacement did not preserve the expected split'
+    }
+
+    Use-Window $origin
+    $sourceTab = Find-Here $origin 'Cockpit tools'
+    $sourceTab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Expect-Focus $origin $ssh.id 'The replacement leaves the original SSH session running'
+    Type-In $origin 'after-review/'
+    Expect-Text $ssh.id 'after-review/'
+    if ((Shell-State $moved.id 'review') -ne $localIdentity) {
+        throw 'Updating the workspace restarted the PowerShell session'
+    }
+    Close-FixtureWindow $other
+    Close-FixtureWindow $origin
+}
+
 function Test-MoveAllTerminalTabs {
     Use-Window $origin
     $window = $origin
@@ -804,6 +904,13 @@ try {
         Test-ManageWorkspace
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'Workspace management did not leave the windows able to close normally'
+        }
+        return
+    }
+    if ($FirstClose -eq 'ReplaceWorkspace') {
+        Test-WorkspaceReplacement
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'The workspace review windows did not close normally'
         }
         return
     }

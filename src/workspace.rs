@@ -578,7 +578,7 @@ impl Catalog {
         ensure!(
             self.workspaces.get(name) == Some(&expected.layout)
                 && self.identity(name) == expected.identity,
-            "Workspace {name} changed in another window. Reopen its management page and try again."
+            "Workspace {name} changed in another window. Review it again."
         );
         Ok(())
     }
@@ -586,6 +586,12 @@ impl Catalog {
 
 pub struct WorkspaceStore {
     path: PathBuf,
+}
+
+enum SaveCondition<'a> {
+    Any,
+    Absent,
+    Matches(&'a WorkspaceEntry),
 }
 
 impl WorkspaceStore {
@@ -667,19 +673,40 @@ impl WorkspaceStore {
     }
 
     pub fn save(&self, name: &str, workspace: &Workspace) -> Result<()> {
-        self.save_with(name, workspace, |_| Ok(()))
+        self.save_layout(name, workspace, SaveCondition::Any, |_| Ok(()))
     }
 
-    /// Prepare the window's registration for the exact identity being written.
-    pub fn save_with<T>(
+    /// With no expected entry, create a new workspace. Otherwise replace the
+    /// reviewed entry only if its identity and layout still match.
+    pub fn save_checked<T>(
         &self,
         name: &str,
         workspace: &Workspace,
+        expected: Option<&WorkspaceEntry>,
+        prepare: impl FnOnce(&WorkspaceIdentity) -> Result<T>,
+    ) -> Result<T> {
+        let condition = expected.map_or(SaveCondition::Absent, SaveCondition::Matches);
+        self.save_layout(name, workspace, condition, prepare)
+    }
+
+    fn save_layout<T>(
+        &self,
+        name: &str,
+        workspace: &Workspace,
+        condition: SaveCondition<'_>,
         prepare: impl FnOnce(&WorkspaceIdentity) -> Result<T>,
     ) -> Result<T> {
         validate_name(name)?;
         workspace.validate()?;
         self.edit(|catalog| {
+            match condition {
+                SaveCondition::Any => {}
+                SaveCondition::Absent => ensure!(
+                    !catalog.workspaces.contains_key(name),
+                    "Workspace {name} already exists. Review it before replacing it."
+                ),
+                SaveCondition::Matches(expected) => catalog.check_entry(name, expected)?,
+            }
             let identity = if catalog.workspaces.contains_key(name) {
                 catalog.identity(name)
             } else {
@@ -1317,6 +1344,57 @@ mod tests {
         assert_eq!(updated.identity, original.identity);
         assert_eq!(updated.layout, changed);
         assert!(store.rename("desk", "renamed", &updated).is_ok());
+    }
+
+    #[test]
+    fn checked_save_rejects_stale_creation_and_replacement_before_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new(directory.path().join("workspaces.json"));
+        let original = demo();
+        store
+            .save_checked("desk", &original, None, |_| Ok(()))
+            .unwrap();
+        let reviewed = store.entry("desk").unwrap();
+        let mut newer = original.clone();
+        newer.tabs[0].title = Some("New layout".to_owned().try_into().unwrap());
+        assert!(
+            store
+                .save_checked::<()>("desk", &newer, None, |_| {
+                    panic!("stale creation reached window registration")
+                })
+                .is_err()
+        );
+        assert_eq!(store.entry("desk").unwrap(), reviewed);
+
+        store
+            .save_checked("desk", &newer, Some(&reviewed), |identity| {
+                assert_eq!(identity, &reviewed.identity);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .save_checked::<()>("desk", &original, Some(&reviewed), |_| {
+                    panic!("stale replacement reached window registration")
+                })
+                .is_err()
+        );
+        let updated = store.entry("desk").unwrap();
+        assert_eq!(updated.identity, reviewed.identity);
+        assert_eq!(updated.layout, newer);
+
+        store.remove("desk", &updated).unwrap();
+        store.save("desk", &newer).unwrap();
+        assert!(
+            store
+                .save_checked::<()>("desk", &original, Some(&updated), |_| {
+                    panic!("replacement of a reused name reached window registration")
+                })
+                .is_err()
+        );
+        let recreated = store.entry("desk").unwrap();
+        assert_ne!(recreated.identity, updated.identity);
+        assert_eq!(recreated.layout, newer);
     }
 
     #[test]

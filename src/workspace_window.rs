@@ -13,7 +13,7 @@ use std::{
 use w11term::{
     control,
     options::Options,
-    workspace::{Workspace, WorkspaceIdentity, WorkspaceLaunch, WorkspaceStore},
+    workspace::{Workspace, WorkspaceEntry, WorkspaceIdentity, WorkspaceLaunch, WorkspaceStore},
 };
 use windows::{
     Win32::{
@@ -211,11 +211,12 @@ pub fn save(
     name: &str,
     profiles: &Path,
     layout: &Workspace,
+    expected: Option<&WorkspaceEntry>,
     server: &control::Server,
     window_id: control::WindowId,
 ) -> Result<()> {
     let store = WorkspaceStore::open()?;
-    let (key, _lock) = store.save_with(name, layout, |identity| {
+    let (key, _lock) = store.save_checked(name, layout, expected, |identity| {
         let key = workspace_key(store.path(), profiles, identity)?;
         let lock = registration_lock(&key)?;
         lock.try_lock()
