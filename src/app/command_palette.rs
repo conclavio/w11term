@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 use w11term::terminal::BookmarkScreen;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
+pub(super) const FIND_CLOSED_TAB_LABEL: &str = "Recently closed tabs…";
 pub(super) const FIND_COMMAND_HISTORY_LABEL: &str = "Find command history…";
 pub(super) const FIND_RUNNING_COMMANDS_LABEL: &str = "Find running commands…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
@@ -21,6 +22,7 @@ pub enum ProfileDestination {
 pub(super) enum Search {
     Window,
     Tabs,
+    ClosedTabs,
     CommandHistory,
     RunningCommands,
     Profiles(ProfileDestination),
@@ -40,6 +42,7 @@ impl Search {
         match self {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
+            Self::ClosedTabs => "Search closed tabs",
             Self::CommandHistory => "Search commands across panes",
             Self::RunningCommands => "Search running commands",
             Self::Profiles(ProfileDestination::Tab) => "Search profiles",
@@ -76,6 +79,8 @@ impl Search {
             }
             Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
+            Self::ClosedTabs if query.trim().is_empty() => "No recently closed tab layouts",
+            Self::ClosedTabs => "No matching closed tabs",
             Self::CommandHistory if query.trim().is_empty() => {
                 "No retained commands in this window"
             }
@@ -150,6 +155,7 @@ pub enum CommandId {
     SetTabColor(TabId, Option<TabColor>),
     CloseTabs(Option<bulk_tab_close::Offer>),
     ReopenClosedTab(Option<TabId>),
+    ReopenTabFromHistory(TabId),
     ReopenClosedPane(Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
@@ -366,6 +372,21 @@ fn search_tabs(
 }
 
 impl TerminalApp {
+    pub(super) fn closed_tab_rows(&self, query: &str) -> Vec<Row> {
+        let query = query.to_lowercase();
+        self.closed_tabs
+            .iter()
+            .rev()
+            .filter(|tab| tab.matches(&query))
+            .map(|tab| Row {
+                id: CommandId::ReopenTabFromHistory(tab.group),
+                label: tab.title.clone(),
+                chord: tab.detail(),
+                enabled: true,
+            })
+            .collect()
+    }
+
     pub(super) fn tab_search_entries(&self, follow_titles: bool) -> Vec<SearchTab> {
         self.tabs
             .headers()
@@ -888,6 +909,7 @@ impl TerminalApp {
             CommandId::RenamePane(target) => tab_title::show_pane(target),
             CommandId::SaveLiveProfile(origin) => live_profile::open(origin),
             CommandId::ReopenClosedTab(group) => Message::ReopenClosedTab(group),
+            CommandId::ReopenTabFromHistory(group) => return self.reopen_closed_tab(group, ctx),
             CommandId::ReopenClosedPane(id) => Message::ReopenClosedPane(id),
             CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
@@ -1079,6 +1101,7 @@ pub(super) fn view(
     let trimming = if matches!(
         mode,
         Search::Tabs
+            | Search::ClosedTabs
             | Search::CommandHistory
             | Search::RunningCommands
             | Search::Profiles(_)

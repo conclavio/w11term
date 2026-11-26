@@ -147,6 +147,26 @@ pub struct TabLayoutRecipe<P> {
     index: usize,
     group: Group,
     panes: Vec<P>,
+    strip: Vec<TabId>,
+}
+
+impl<P> TabLayoutRecipe<P> {
+    pub fn panes(&self) -> &[P] {
+        &self.panes
+    }
+
+    pub fn original_index(&self) -> usize {
+        self.index
+    }
+
+    /// Reopened tabs have new IDs. Update their slots in other closed layouts.
+    pub fn replace_neighbor(&mut self, closed: TabId, reopened: TabId) {
+        for id in &mut self.strip {
+            if *id == closed {
+                *id = reopened;
+            }
+        }
+    }
 }
 
 pub struct Tabs<T> {
@@ -480,6 +500,7 @@ impl<T> Tabs<T> {
             index,
             group: group.clone(),
             panes,
+            strip: self.groups.iter().map(|group| group.id).collect(),
         }))
     }
 
@@ -496,7 +517,26 @@ impl<T> Tabs<T> {
             .iter()
             .map(prepare)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(self.insert_fresh_group(recipe.index, recipe.group.clone(), panes, launch))
+        let indices: HashMap<_, _> = self
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| (group.id, index))
+            .collect();
+        let left = recipe.strip[..recipe.index]
+            .iter()
+            .rev()
+            .find_map(|id| indices.get(id).copied());
+        let right = recipe.strip[recipe.index + 1..]
+            .iter()
+            .find_map(|id| indices.get(id).copied());
+        let index = match (left, right) {
+            (Some(left), Some(right)) if left >= right => recipe.index,
+            (_, Some(right)) => right,
+            (Some(left), None) => left + 1,
+            (None, None) => recipe.index,
+        };
+        Ok(self.insert_fresh_group(index, recipe.group.clone(), panes, launch))
     }
 
     pub fn duplicate_active_group<P, E>(
@@ -1331,6 +1371,39 @@ mod tests {
             [first, restored]
         );
         assert_eq!(tabs.active(), Some(&3));
+    }
+
+    #[test]
+    fn reopening_a_batch_out_of_order_recovers_the_original_neighbors() {
+        let mut tabs = Tabs::default();
+        let [first, middle_left, middle_right, last] =
+            ["first", "left", "right", "last"].map(|label| tabs.insert(label));
+        let mut left = tabs
+            .capture_group(middle_left, |&label| Ok::<_, ()>(label))
+            .unwrap()
+            .unwrap();
+        let right = tabs
+            .capture_group(middle_right, |&label| Ok::<_, ()>(label))
+            .unwrap()
+            .unwrap();
+        assert!(tabs.remove_group(middle_left));
+        assert!(tabs.remove_group(middle_right));
+        let right_restored = tabs
+            .reopen_group(&right, |&label| Ok::<_, ()>(label), |label| label)
+            .unwrap();
+        assert_eq!(
+            tabs.headers().iter().map(|t| t.id).collect::<Vec<_>>(),
+            [first, right_restored, last]
+        );
+
+        left.replace_neighbor(middle_right, right_restored);
+        let left_restored = tabs
+            .reopen_group(&left, |&label| Ok::<_, ()>(label), |label| label)
+            .unwrap();
+        assert_eq!(
+            tabs.headers().iter().map(|t| t.id).collect::<Vec<_>>(),
+            [first, left_restored, right_restored, last]
+        );
     }
 
     #[test]
