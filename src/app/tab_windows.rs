@@ -483,13 +483,7 @@ impl TerminalApp {
 
     pub(super) fn request_window_result(&mut self, window: u64, target: SearchTarget) {
         let source = self.registry.window_id();
-        let sender = WINDOWS.with_borrow(|windows| {
-            let endpoint = windows.get(&window)?;
-            unsafe { IsWindow(Some(endpoint.hwnd)) }
-                .as_bool()
-                .then(|| endpoint.sender.clone())
-        });
-        if !sender.is_some_and(|sender| sender.send(Message::FocusWindowResult(source, target))) {
+        if !send_to_window(window, Message::FocusWindowResult(source, target)) {
             self.window_error = Some("That window is no longer available.".into());
         }
     }
@@ -683,7 +677,7 @@ impl TerminalApp {
         }
     }
 
-    fn existing_destination_blocked(&self) -> bool {
+    pub(super) fn existing_destination_blocked(&self) -> bool {
         self.tabs.entries().is_empty()
             || self.outgoing.is_some()
             || self.title_editor.is_some()
@@ -884,7 +878,17 @@ impl TerminalApp {
     }
 }
 
-fn foreground(hwnd: HWND) {
+pub(super) fn send_to_window(window: u64, message: Message) -> bool {
+    let sender = WINDOWS.with_borrow(|windows| {
+        let endpoint = windows.get(&window)?;
+        unsafe { IsWindow(Some(endpoint.hwnd)) }
+            .as_bool()
+            .then(|| endpoint.sender.clone())
+    });
+    sender.is_some_and(|sender| sender.send(message))
+}
+
+pub(super) fn foreground(hwnd: HWND) {
     // Both terminal windows are owned by this UI thread. Restore before activating.
     unsafe {
         if IsIconic(hwnd).as_bool() {

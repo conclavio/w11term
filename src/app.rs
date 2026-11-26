@@ -1317,6 +1317,7 @@ pub struct TerminalApp {
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
     running_interrupt_pending: Option<pane_picker::PendingRunningInterrupt>,
+    remote_text_reveal: Option<u64>,
     title_editor: Option<tab_title::Editor>,
     disconnect_review: Option<Arc<disconnect_ssh::Review>>,
     name_edit_serial: u64,
@@ -1381,6 +1382,11 @@ pub enum Message {
     WatchRunningCommand(Arc<()>, u64, w11term::events::RunningCommandTarget, bool),
     WindowHistory(pane_picker::WindowHistoryAction),
     PaneText(pane_picker::TextAction),
+    StartRemoteText(Arc<pane_picker::RemoteReveal>),
+    FinishRemoteText(
+        Arc<pane_picker::RemoteReveal>,
+        Option<w11term::copy_mode::ScreenId>,
+    ),
     PickerHover(u64),
     PickerFrame(u64, u64),
     BookmarksRead(Arc<()>, Option<Vec<w11term::terminal::BookmarkEntry>>),
@@ -5603,6 +5609,7 @@ impl Component for TerminalApp {
             switcher: None,
             picker: None,
             running_interrupt_pending: None,
+            remote_text_reveal: None,
             title_editor: None,
             disconnect_review: None,
             name_edit_serial: 0,
@@ -5973,6 +5980,10 @@ impl Component for TerminalApp {
             }
             Message::WindowHistory(action) => self.window_history_action(action, context),
             Message::PaneText(action) => self.pane_text_action(action, context),
+            Message::StartRemoteText(request) => self.start_remote_text(request, context),
+            Message::FinishRemoteText(request, screen) => {
+                self.finish_remote_text(request, screen, context)
+            }
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::BookmarksRead(launch, entries) => self.bookmarks_received(&launch, entries),
