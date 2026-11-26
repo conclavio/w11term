@@ -3766,7 +3766,7 @@ impl TerminalApp {
                 ),
                 SlotView::new(
                     TitleBarSlot::RightHeader,
-                    self.title_tools(&layout, menu_callback, context),
+                    self.title_tools(&layout, &arrangement, menu_callback, context),
                 ),
             ])
     }
@@ -4051,6 +4051,44 @@ impl TerminalApp {
         ]
     }
 
+    fn split_arrangement_items(&self, arrangement: &PaneArrangement) -> [MenuItem; 2] {
+        [
+            (KeyAction::RotateSplit, arrangement.rotation.is_some()),
+            (KeyAction::BalancePanes, arrangement.balance.is_some()),
+        ]
+        .map(|(action, enabled)| {
+            let binding = action.binding();
+            self.binding_menu_enabled(binding.id, binding.label, action, enabled)
+        })
+    }
+
+    fn active_layout_is_split(&self) -> bool {
+        matches!(
+            self.tabs.active_layout(),
+            Some(w11term::pane_layout::Layout::Split { .. })
+        )
+    }
+
+    fn pane_zoom_item(&self) -> MenuItem {
+        self.binding_menu(
+            "zoom-pane",
+            if self.tabs.zoomed() {
+                "Restore panes"
+            } else {
+                "Zoom pane"
+            },
+            KeyAction::ZoomPane,
+        )
+    }
+
+    fn rename_pane_item(&self) -> MenuItem {
+        command_menu_item(
+            "rename-pane",
+            tab_title::RENAME_PANE,
+            self.move_source().is_some(),
+        )
+    }
+
     fn pane_menu(
         &self,
         can_restart: bool,
@@ -4156,11 +4194,7 @@ impl TerminalApp {
             {
                 items.extend(shell_setup::Setup::menu_items());
             }
-            items.push(command_menu_item(
-                "rename-pane",
-                tab_title::RENAME_PANE,
-                self.move_source().is_some(),
-            ));
+            items.push(self.rename_pane_item());
             if pane_colors::available(live) {
                 items.push(pane_colors::menu(live.color_scheme));
             }
@@ -4256,19 +4290,9 @@ impl TerminalApp {
                 MenuItem::disabled(binding.id, binding.label)
             });
         }
-        for (action, enabled) in [
-            (KeyAction::RotateSplit, arrangement.rotation.is_some()),
-            (KeyAction::BalancePanes, arrangement.balance.is_some()),
-        ] {
-            let binding = action.binding();
-            items.push(self.binding_menu_enabled(binding.id, binding.label, action, enabled));
-        }
+        items.extend(self.split_arrangement_items(arrangement));
         items.push(previous_item);
-        if self
-            .tabs
-            .active_layout()
-            .is_some_and(|layout| matches!(layout, w11term::pane_layout::Layout::Split { .. }))
-        {
+        if self.active_layout_is_split() {
             items.push(MenuItem::separator("pane-actions"));
             for (key, action) in [
                 ("left", KeyAction::FocusLeft),
@@ -4297,15 +4321,7 @@ impl TerminalApp {
                     }
                 }
             }
-            items.push(self.binding_menu(
-                "zoom-pane",
-                if self.tabs.zoomed() {
-                    "Restore panes"
-                } else {
-                    "Zoom pane"
-                },
-                KeyAction::ZoomPane,
-            ));
+            items.push(self.pane_zoom_item());
             items.push(self.binding_menu_enabled(
                 "close-pane",
                 "Close pane",

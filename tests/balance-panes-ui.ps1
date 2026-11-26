@@ -79,7 +79,7 @@ try {
         $p.Count -eq 3 -and $p[0].cols -eq $before[0].cols -and $p[1].cols -eq $before[1].cols -and $p[2].cols -eq $before[2].cols
     }
 
-    Run-Palette $balance
+    Invoke-NativeMenuAction 'Pane layout' $balance
     $null = Wait-Until 'three live terminal grids balanced within one column' {
         $p = @(Three-Panes)
         if ($p.Count -ne 3) { return $false }

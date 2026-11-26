@@ -2133,7 +2133,7 @@ async fn native_pane_names_identify_one_ssh_split_and_survive_workspace_restore(
 
     assert_eq!(
         fs::read(trace).unwrap(),
-        b"named-input/\x1b]2;changed-by-shell\x07restored-input/"
+        b"named-input/\x1b]2;changed-by-shell\x07rename-cancel-return/restored-input/"
     );
     assert_eq!(
         shells.load(Ordering::Relaxed),

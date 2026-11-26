@@ -27,7 +27,10 @@ function Menu-Route([string[]]$Path) {
     Click 'Tab menu'
     $menu = [System.Windows.Automation.ControlType]::MenuItem
     foreach ($name in $Path) {
-        $item = Wait-Until "menu item '$name'" { Find-Element $name $menu }
+        $item = Wait-Until "visible and enabled menu item '$name'" {
+            $entry = Find-Element $name $menu -Visible
+            if ($entry -and $entry.Current.IsEnabled) { $entry }
+        }
         if ($name -ceq $Path[-1]) { Invoke-Button $item }
         else { $item.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand() }
     }
@@ -152,6 +155,9 @@ try {
     $field.SetValue('Discarded')
     Finish-Editor 'Cancel' 'Pane name' $right
     Wait-Names $right $left $alias 'changed-by-shell'
+    # Prove the window has handed typing back to the terminal before opening
+    # another native flyout. The dialog can disappear before that happens.
+    Marker $right $left 'rename-cancel-return/'
     $field = Open-Editor $paneRename 'Pane name'
     if ($field.Current.Value -cne $alias) { throw 'Cancelling persisted the pending name' }
     Finish-Editor 'Use default' 'Pane name' $right

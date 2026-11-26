@@ -66,9 +66,21 @@ pub(super) fn below(text: impl Into<String>) -> Tooltip {
 }
 
 impl TerminalApp {
+    fn pane_layout_items(&self, arrangement: &PaneArrangement) -> Vec<MenuItem> {
+        let mut items = Vec::from(self.split_items());
+        if self.active_layout_is_split() {
+            items.push(MenuItem::separator("layout-adjustments"));
+            items.push(self.pane_zoom_item());
+            items.extend(self.split_arrangement_items(arrangement));
+        }
+        items.extend([MenuItem::separator("pane-name"), self.rename_pane_item()]);
+        items
+    }
+
     pub(super) fn title_tools(
         &self,
         layout: &Layout,
+        arrangement: &PaneArrangement,
         menu_action: Callback<String>,
         context: &ViewContext<Self>,
     ) -> View {
@@ -115,7 +127,7 @@ impl TerminalApp {
                     .glyph("\u{e7c4}")
                     .tooltip_with(below("Pane layout")),
             )
-            .menu(Menu::new(self.split_items(), menu_action));
+            .menu(Menu::new(self.pane_layout_items(arrangement), menu_action));
         let find_binding = KeyAction::Find.binding();
         let palette_binding = KeyAction::CommandPalette.binding();
         let shortcut_hint = |binding| {

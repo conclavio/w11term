@@ -137,6 +137,39 @@ try {
     }
     Wait-Focus $split
     $null = Control @('wait-for-text','--pane',"$split",'--timeout','15','PS ')
+
+    $zoom = 'Zoom pane    Ctrl+Alt+Shift+Z'
+    Invoke-NativeMenuAction 'Pane layout' $zoom
+    $null = Wait-Until 'the toolbar zooms the focused local pane' {
+        $visible = @((Control @('list')).sessions | Where-Object visible)
+        $visible.Count -eq 1 -and $visible[0].id -eq $split -and $visible[0].active
+    }
+    Invoke-NativeMenuAction 'Pane layout' 'Restore panes    Ctrl+Alt+Shift+Z'
+    $null = Wait-Until 'the toolbar restores both original local panes' {
+        $visible = @((Control @('list')).sessions | Where-Object visible)
+        $visible.Count -eq 2 -and $local -in $visible.id -and $split -in $visible.id
+    }
+
+    $rename = 'Rename focused pane' + [char]0x2026
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    Invoke-NativeMenuAction 'Pane layout' $rename
+    $name = Wait-Until 'pane name editor from the toolbar' { Find-Element 'Pane name' $edit -Visible }
+    $name.GetCurrentPattern($value).SetValue('Discard this name')
+    Click 'Cancel'
+    $null = Wait-Until 'canceled pane name editor closes' { !(Find-Element 'Pane name' $edit -Visible) }
+
+    Invoke-NativeMenuAction 'Pane layout' $rename
+    $name = Wait-Until 'pane name editor reopens after cancel' { Find-Element 'Pane name' $edit -Visible }
+    $field = $name.GetCurrentPattern($value)
+    if ($field.Current.Value) { throw 'The discarded pane name appeared in the reopened editor' }
+    $field.SetValue('Build output')
+    Click 'Save'
+    $null = Wait-Until 'only the focused PowerShell pane is named by the toolbar' {
+        $sessions = (Control @('list')).sessions
+        $named = @($sessions | Where-Object pane_name -ceq 'Build output')
+        $named.Count -eq 1 -and $named[0].id -eq $split -and $named[0].active -and
+            @($sessions).Count -eq 3
+    }
     Click 'Tab menu'
     Click 'Settings' $menu
     $null = Wait-Until 'Settings opened from More' {
