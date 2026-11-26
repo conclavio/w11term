@@ -298,6 +298,29 @@ impl FileDrawer {
                 ),
             ),
             MenuItem::separator("write-end"),
+            MenuItem::submenu(
+                "download-folder-default",
+                "Default download folder",
+                [
+                    item(
+                        "choose",
+                        "Choose default download folder…",
+                        writable && profile.is_some(),
+                        Pick(
+                            pane,
+                            generation,
+                            revision,
+                            TransferPicker::DefaultDownloadFolder,
+                        ),
+                    ),
+                    item(
+                        "reset",
+                        "Use Windows default folder",
+                        writable && profile.is_some(),
+                        ResetDownloadFolder(pane, generation),
+                    ),
+                ],
+            ),
             item(
                 "space",
                 "Filesystem space…",

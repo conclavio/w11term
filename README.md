@@ -427,6 +427,8 @@ Scripts can list, cancel, and wait for drawer transfers with `w11term-cli sftp l
 
 After a file or folder is saved, choose **Show download in File Explorer** in the drawer or beside its inbox result to select it. Use **Open download folder** for a batch that saved at least one item. Each inbox result keeps its own destination so you can find earlier downloads.
 
+For a saved SSH profile, open **More folder actions → Default download folder → Choose default download folder…** and select a folder on a local Windows drive. File, directory, and marked-item download dialogs for that profile open in the chosen folder, including downloads from search results. You still choose the destination for every transfer. Select **Use Windows default folder** to clear the preference. Windows also uses its usual starting folder if the saved folder is unavailable.
+
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
 Choose **Compare with local file…** from a text preview to see changed lines with their original remote and local line numbers. The comparison includes line endings, final newlines and UTF-8 byte order marks. It compares a local UTF-8 file up to 256 KiB with the remote snapshot already displayed. Choose **Return to preview** to go back to the remote file.

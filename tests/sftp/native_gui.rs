@@ -3074,6 +3074,29 @@ async fn native_sftp_compares_two_remote_text_files_across_folders_and_search() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "sets the per-profile SFTP starting folder and verifies both native download dialogs"]
+async fn native_sftp_download_dialogs_start_in_the_saved_profile_folder() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let preferred = picker.join("preferred downloads");
+    fs::create_dir_all(picker.join("usual marker")).unwrap();
+    fs::create_dir_all(preferred.join("preferred marker")).unwrap();
+    let parent = remote.path().join("shell directory");
+    fs::create_dir_all(parent.join("snapshot")).unwrap();
+    let bytes = b"downloaded to the saved folder\x00\xff";
+    fs::write(parent.join("payload.bin"), bytes).unwrap();
+
+    drive_mixed_gui("sftp-default-download-folder-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(preferred.join("payload.bin")).unwrap(), bytes);
+    assert!(!preferred.join("snapshot").exists());
+    assert!(!picker.join("payload.bin").exists());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
 async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

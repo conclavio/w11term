@@ -29,6 +29,7 @@ pub(super) enum Purpose {
         certificate: bool,
     },
     Folder,
+    DefaultDownloadFolder,
     DownloadFolder,
     Save(String),
     SaveSearchResults,
@@ -49,7 +50,7 @@ pub(super) enum Purpose {
     OpenRecording,
 }
 
-fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
+fn is_local_folder(folder: &Path) -> bool {
     use std::path::{Component, Prefix};
     if !folder.is_absolute() {
         return false;
@@ -61,11 +62,15 @@ fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
         return false;
     };
     let drive = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
+    // A typed UNC path or disconnected mapped drive is not a starting folder.
+    (unsafe { matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) }) && folder.is_dir()
+}
+
+fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
+    if !is_local_folder(folder) {
+        return false;
+    }
     unsafe {
-        // A typed UNC path or disconnected mapped drive is not a starting folder.
-        if !matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) || !folder.is_dir() {
-            return false;
-        }
         let wide: Vec<_> = folder.as_os_str().encode_wide().chain(Some(0)).collect();
         // The proposed parent (such as ~/.ssh) may not exist yet. In that case
         // leave the file dialog's normal starting directory available.
@@ -144,29 +149,41 @@ impl IFileDialogEvents_Impl for Overwrite_Impl {
 }
 
 pub(super) fn pick(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
-    let mut selected = pick_items(owner, purpose)?;
+    let mut selected = pick_items(owner, purpose, None)?;
     anyhow::ensure!(selected.len() <= 1, "Expected a single selection");
     Ok(selected.pop())
 }
 
 pub(super) fn pick_paths(owner: usize, purpose: Purpose) -> Result<Vec<PathBuf>> {
-    Ok(pick_items(owner, purpose)?
+    pick_paths_from_folder(owner, purpose, None)
+}
+
+pub(super) fn pick_paths_from_folder(
+    owner: usize,
+    purpose: Purpose,
+    initial_folder: Option<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    Ok(pick_items(owner, purpose, initial_folder)?
         .into_iter()
         .map(|item| item.path)
         .collect())
 }
 
-fn pick_items(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
+fn pick_items(
+    owner: usize,
+    purpose: Purpose,
+    initial_folder: Option<PathBuf>,
+) -> Result<Vec<Selection>> {
     // The modal dialog needs its own STA independently of the Reactor UI and worker threads.
     std::thread::Builder::new()
         .name("w11term file picker".into())
-        .spawn(move || show(owner, purpose))
+        .spawn(move || show(owner, purpose, initial_folder))
         .context("Starting file picker")?
         .join()
         .map_err(|_| anyhow!("File picker stopped"))?
 }
 
-fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
+fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Result<Vec<Selection>> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         struct Apartment;
@@ -188,6 +205,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 | Purpose::OpenSshGroupDefinition
                 | Purpose::SshIdentity { .. }
                 | Purpose::Folder
+                | Purpose::DefaultDownloadFolder
                 | Purpose::DownloadFolder
         ) {
             FileOpenDialog
@@ -198,6 +216,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let mut options = dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR;
         let confirmed = Rc::new(RefCell::new(None));
         let multiple = matches!(purpose, Purpose::UploadFiles);
+        let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
             Purpose::StartRecording | Purpose::OpenRecording => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
@@ -289,10 +308,12 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 None
             }
             Purpose::Folder
+            | Purpose::DefaultDownloadFolder
             | Purpose::DownloadFolder
             | Purpose::UploadFolder
             | Purpose::CompareLocalFolder => {
                 dialog.SetTitle(match purpose {
+                    Purpose::DefaultDownloadFolder => w!("Choose the default SFTP download folder"),
                     Purpose::DownloadFolder => w!("Choose a download destination folder"),
                     Purpose::UploadFolder => w!("Choose a folder to upload"),
                     Purpose::CompareLocalFolder => w!("Choose a Windows folder for comparison"),
@@ -421,6 +442,9 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             }
         };
         dialog.SetOptions(options)?;
+        if let Some(folder) = initial_folder {
+            local_folder(&dialog, &folder);
+        }
         let shown = dialog.Show(Some(HWND(owner as *mut _)));
         if let Some(cookie) = cookie {
             dialog.Unadvise(cookie)?;
@@ -443,6 +467,12 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 .collect();
         }
         let path = shell_path(&dialog.GetResult()?)?;
+        if setting_download_folder {
+            anyhow::ensure!(
+                is_local_folder(&path),
+                "Choose a folder on a local Windows drive"
+            );
+        }
         let overwrite = confirmed.borrow().as_ref() == Some(&path);
         Ok(vec![Selection { path, overwrite }])
     }

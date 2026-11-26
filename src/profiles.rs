@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 mod bookmarks;
@@ -43,6 +43,7 @@ const SHARE_TOKEN: &str = "folder_share_id";
 const SHARE_EPOCH: &str = "folder_share_epoch";
 const PINNED_PROFILES: &str = "pinned_profiles";
 const STARTUP_PROFILE: &str = "startup_profile";
+const SFTP_DOWNLOAD_FOLDER: &str = "sftp_download_folder";
 const SSH_HOST_GROUPS: &str = "ssh_host_groups";
 const SSH_RECIPIENT_SETS: &str = "ssh_recipient_sets";
 const SSH_HOST_GROUP_DEFAULTS: &str = "ssh_host_group_defaults";
@@ -816,6 +817,45 @@ impl ProfileStore {
     pub fn inspect(&self, name: &str) -> Result<(BTreeMap<String, SshOptions>, ProfileSnapshot)> {
         let (catalog, snapshot) = self.inspect_catalog(name)?;
         Ok((catalog.profiles, snapshot))
+    }
+
+    pub fn sftp_download_folder(&self, name: &str, peer: &BookmarkPeer) -> Result<Option<PathBuf>> {
+        let (_, snapshot) = self.inspect(name)?;
+        peer.check_profile(&snapshot.options)?;
+        Ok(snapshot
+            .raw
+            .get(SFTP_DOWNLOAD_FOLDER)
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from))
+    }
+
+    pub fn set_sftp_download_folder(
+        &self,
+        name: &str,
+        peer: &BookmarkPeer,
+        folder: Option<&Path>,
+    ) -> Result<()> {
+        if let Some(folder) = folder {
+            ensure!(folder.is_absolute(), "Choose an absolute Windows folder");
+        }
+        self.modify(|profiles, catalog| {
+            let options = catalog
+                .profiles
+                .get(name)
+                .context("The saved SSH profile is no longer available")?;
+            peer.check_profile(options)?;
+            let fields = profiles
+                .get_mut(name)
+                .and_then(serde_json::Value::as_object_mut)
+                .context("The SSH profile must be an object")?;
+            if let Some(folder) = folder {
+                fields.insert(SFTP_DOWNLOAD_FOLDER.into(), serde_json::to_value(folder)?);
+            } else {
+                fields.remove(SFTP_DOWNLOAD_FOLDER);
+            }
+            Ok(CatalogEdit::default())
+        })?;
+        Ok(())
     }
 
     pub fn inspect_catalog(

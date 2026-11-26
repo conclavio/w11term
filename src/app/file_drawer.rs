@@ -9,6 +9,7 @@ use tokio::sync::{oneshot, watch};
 use w11term::control::SftpCancelState;
 use w11term::events::SavedDownload;
 use w11term::folder_grants::Authority;
+use w11term::profiles::BookmarkPeer;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
     CopyDestination, DEFAULT_TIMEOUT, EntryKind, FilenameMatch, FolderInventory, Job, JobProgress,
@@ -108,6 +109,7 @@ pub enum FileAction {
     ShowTransfer(u64),
     ShowSavedDownload(u64, SavedDownload),
     Bookmarks(u64, u64, bookmarks::Action),
+    ResetDownloadFolder(u64, u64),
     Search(u64, u64, find::Action),
     FocusSearch(u64, u64, u64, u8),
     Follow(u64, u64, bool),
@@ -343,6 +345,7 @@ pub enum TransferPicker {
     Download(FileTarget, Option<DownloadVerification>),
     DownloadMarked,
     DownloadSearch(u64),
+    DefaultDownloadFolder,
     ComparePreview(u64),
     LocalFolderReference(u64),
 }
@@ -354,6 +357,16 @@ pub struct DownloadVerification {
 }
 
 impl TransferPicker {
+    fn uses_default_download_folder(&self) -> bool {
+        matches!(
+            self,
+            Self::Download(..)
+                | Self::DownloadMarked
+                | Self::DownloadSearch(_)
+                | Self::DefaultDownloadFolder
+        )
+    }
+
     fn purpose(&self, files: &FileDrawer) -> Result<file_picker::Purpose> {
         use file_picker::Purpose;
         match self {
@@ -379,6 +392,7 @@ impl TransferPicker {
                 files.search_download_selection(*serial)?;
                 Ok(Purpose::SaveSearchResults)
             }
+            Self::DefaultDownloadFolder => Ok(Purpose::DefaultDownloadFolder),
             Self::ComparePreview(_) => Ok(Purpose::CompareLocalFile),
             Self::LocalFolderReference(revision) => {
                 ensure!(
@@ -3290,6 +3304,7 @@ impl TerminalApp {
             | ShowSavedDownload(id, _)
             | Close(id)
             | Bookmarks(id, ..)
+            | ResetDownloadFolder(id, ..)
             | Search(id, ..)
             | FocusSearch(id, ..)
             | Follow(id, ..)
@@ -3377,6 +3392,11 @@ impl TerminalApp {
         };
         let session = &tab.session;
         let files = &mut tab.files;
+        let download_profile = |generation| {
+            let name = tab.profile_name.as_deref()?;
+            let connection = session.ssh_connection_at(generation)?;
+            Some((name, BookmarkPeer::from_connection(&connection)))
+        };
         let frame = session.frames.load();
         let may_open_dialog = visible
             && !transferring
@@ -3507,6 +3527,19 @@ impl TerminalApp {
                     )?;
                 }
                 Bookmarks(..) => {}
+                ResetDownloadFolder(_, generation)
+                    if files.open
+                        && may_open_dialog
+                        && !files.busy()
+                        && generation == files.generation =>
+                {
+                    let (name, peer) = download_profile(generation)
+                        .context("Choose a connected, saved SSH profile")?;
+                    self.store.set_sftp_download_folder(name, &peer, None)?;
+                    files.status =
+                        "Downloads will use the Windows dialog's usual starting folder.".into();
+                }
+                ResetDownloadFolder(..) => {}
                 Toggle => {
                     if files.open {
                         files.close();
@@ -3844,6 +3877,17 @@ impl TerminalApp {
                                 }),
                                 context,
                             )?;
+                        }
+                        TransferPicker::DefaultDownloadFolder => {
+                            let [folder] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one default download folder"))?;
+                            let (name, peer) = download_profile(files.generation)
+                                .context("Choose a connected, saved SSH profile")?;
+                            self.store
+                                .set_sftp_download_folder(name, &peer, Some(&folder))?;
+                            files.status =
+                                format!("Default download folder for {name}: {}", folder.display());
                         }
                         TransferPicker::ComparePreview(preview) => {
                             let [local] = paths
@@ -4284,6 +4328,7 @@ impl TerminalApp {
                             picker,
                             TransferPicker::DownloadMarked
                                 | TransferPicker::DownloadSearch(_)
+                                | TransferPicker::DefaultDownloadFolder
                                 | TransferPicker::Download(FileTarget::Search(..), _)
                         ) && files.busy())
                         || revision != files.listing_revision
@@ -4292,6 +4337,18 @@ impl TerminalApp {
                         return Ok(());
                     }
                     let purpose = picker.purpose(files)?;
+                    let mut initial_folder = None;
+                    if picker.uses_default_download_folder() {
+                        let profile = download_profile(files.generation);
+                        if matches!(picker, TransferPicker::DefaultDownloadFolder) {
+                            let (name, peer) =
+                                profile.context("Choose a connected, saved SSH profile")?;
+                            initial_folder = self.store.sftp_download_folder(name, &peer)?;
+                        } else if let Some((name, peer)) = profile {
+                            initial_folder =
+                                self.store.sftp_download_folder(name, &peer).ok().flatten();
+                        }
+                    }
                     let owner = crate::input::window().context("Window is not ready")?.0 as usize;
                     files.end_filter_edit();
                     let serial = files.start_picker();
@@ -4308,8 +4365,9 @@ impl TerminalApp {
                     ));
                     context.spawn_background_with_rejection(
                         move |_| {
-                            let result = file_picker::pick_paths(owner, purpose)
-                                .map_err(|error| format!("{error:#}"));
+                            let result =
+                                file_picker::pick_paths_from_folder(owner, purpose, initial_folder)
+                                    .map_err(|error| format!("{error:#}"));
                             Message::Files(Picked(pane, generation, serial, picker, result))
                         },
                         reject,
