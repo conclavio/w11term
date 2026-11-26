@@ -182,6 +182,7 @@ impl TerminalApp {
         }) {
             self.refresh_open_commands();
             self.refresh_running_command_output(true);
+            self.poll_interrupt_completion();
         }
     }
 

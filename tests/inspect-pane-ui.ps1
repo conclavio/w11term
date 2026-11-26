@@ -384,8 +384,31 @@ try {
             (Count-PeerInterrupts) -eq ($beforeInterrupt + 2)
     }
     Wait-Focus $localPane
-    Press-Key 13
+    $null = Wait-Until 'the picker waits for the interrupted command to finish' {
+        Find-Element ("Waiting for completion in pane " + $remote + [char]0x2026)
+    }
+    Set-RemoteModes "gui-interrupt-capture$esc]133;D;130$bell"
+    Set-RemoteModes "`r`n$esc]133;C;cmdline_url=later%20result${bell}other-output$esc]133;D;0$bell"
+    $null = Wait-Until 'the picker shows the exit code of the interrupted capture' {
+        Find-Element "Command in pane $remote finished with exit code 130."
+    }
+    Wait-Focus $localPane
+    Invoke-Button (Wait-Until 'the exact interrupted command output can be opened' {
+        $item = Find-Element 'View interrupted command output' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    })
+    $null = Wait-Until 'the earlier interrupted capture is selected instead of the later command' {
+        (Find-Element ("Selected, interrupted fixture " + [char]0xb7 + " exit 130")) -and
+            (Find-Element 'gui-interrupt-capture') -and
+            (Find-Element ("later result " + [char]0xb7 + " exit 0"))
+    }
+    Invoke-Button (Wait-Until 'return from the interrupted capture to its pane' { Find-Element 'Return to pane' $button })
     Wait-Focus $remote
+    Report-CommandStart 'interrupted fixture'
+    $replacement = Wait-Until 'the pane has a fresh running capture for the input lock checks' {
+        $r = (Inspect).running_command
+        if ($r.command -ceq 'interrupted fixture' -and $r.start_token -gt 0) { $r }
+    }
     Run-Palette 'Enable read-only pane input'
     $null = Wait-Until 'SSH pane input is read-only' {
         ((Control @('list')).sessions | Where-Object id -eq $remote).read_only
@@ -398,7 +421,8 @@ try {
     if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 2)) {
         throw 'An invalid target wrote Ctrl+C to the peer'
     }
-    Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
+    # The retained history tab can push the title-bar menu offscreen at 150% DPI.
+    Run-Palette 'Terminal inspector: Off'
     $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
     $null = Wait-Until 'the unfinished command is visible before disconnect' {
         (Inspect).running_command.command -ceq 'interrupted fixture' -and (Find-Element 'Running command   interrupted fixture')
