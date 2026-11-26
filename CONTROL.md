@@ -148,8 +148,10 @@ When xterm modified-key reporting or its alternate format is enabled, `keyboard.
 
 ## Completed shell commands
 
-`list-commands --pane ID` reads the pane’s OSC 133 command history. It returns
-`pane`, `connection_generation`, and a `commands` array, newest first. Each entry
+`list-commands --pane ID` reads the pane’s OSC 133 or OSC 633 command history. It
+returns `pane`, `connection_generation`, `latest_id`, and a `commands` array,
+newest first. Use `latest_id` as the wait cursor even if a filter or terminal
+reset leaves the listing empty. It starts at zero. Each entry
 contains `id`, `command`, `reported_directory`, `exit_code`, and `output_available`. The array is empty
 until the shell marks a completed command. A missing command line or exit status
 is JSON `null`. Listing transfers only this metadata and preserves keyboard focus
@@ -171,7 +173,7 @@ duration are JSON `null` when there is no command start marker.
 
 Use `--status failed` for nonzero exit codes, `--status succeeded` for zero, or
 `--status unknown` when the shell omitted the exit code. The default is `all`.
-Filtered listings keep the original IDs, generation, and newest-first order.
+Filtered listings keep the original IDs, generation, latest ID, and newest-first order.
 
 To get the latest command’s output, pass its ID and the generation from the same
 listing. A generation of zero is valid.
@@ -189,12 +191,35 @@ if ($history.commands.Count -gt 0) {
 }
 ```
 
+To wait for a new completion, read the cursor before triggering the command.
+`wait-command` returns the first completed capture after that cursor in the
+same generation, with the same fields as `get-command`. A command that has
+already finished since the cursor was read is returned immediately. The shell
+exit code is in `result.exit_code`, and a successfully retrieved capture
+returns CLI exit code zero even when the shell command failed.
+
+```powershell
+$cursor = & $ctl --pid 12345 list-commands --pane $pane | ConvertFrom-Json
+if (!$cursor.ok) { throw $cursor.error }
+# Trigger the shell command here.
+$completion = & $ctl --pid 12345 wait-command --pane $pane --after-id $cursor.result.latest_id --connection-generation $cursor.result.connection_generation --timeout 60 | ConvertFrom-Json
+if (!$completion.ok) { throw $completion.error }
+$completion.result.exit_code
+```
+
+The wait defaults to 30 seconds and accepts 1 to 3600 seconds. It fails if the
+pane closes, its SSH connection ends, or the next capture has already fallen
+out of the retained history. After a gap or reconnect, take a new cursor with
+`list-commands`. Use a pane dedicated to the script if it needs to attribute
+the next completion to a particular input.
+
 Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-commands","pane":2}
 {"verb":"list-commands","pane":2,"status":"failed"}
 {"verb":"get-command","pane":2,"id":5,"connection_generation":1}
+{"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"timeout_seconds":60}
 ```
 
 `get-command` returns `pane`, `connection_generation`, `id`, `command`,

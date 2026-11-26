@@ -62,6 +62,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "close-pane"
             | "list-commands"
             | "get-command"
+            | "wait-command"
             | "inspect"
             | "playback"
             | "list-ssh-groups"
@@ -1014,6 +1015,35 @@ mod tests {
             "get-command --id 53 --connection-generation 1",
             "get-command --pane 2 --id 53 --connection-generation -1",
             "get-command --pane 2 --id foo --connection-generation 1",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn wait_command_requires_a_pane_and_explicit_cursor() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("wait-command --pane 7 --after-id 0 --connection-generation 0 --timeout 2")
+                .unwrap(),
+            (
+                None,
+                Request::WaitCommand {
+                    pane: 7,
+                    after_id: 0,
+                    connection_generation: 0,
+                    timeout_seconds: 2
+                }
+            )
+        ));
+        for line in [
+            "wait-command --pane 7 --connection-generation 0",
+            "wait-command --pane 7 --after-id 0",
+            "wait-command --after-id 0 --connection-generation 0",
+            "wait-command --pane 7 --after-id -1 --connection-generation 0",
+            "wait-command --pane 7 --after-id 0 --after-id 1 --connection-generation 0",
+            "wait-command --pane 7 --after-id 0 --connection-generation 0 --connection-generation 1",
+            "wait-command --pane 7 --after-id 0 --connection-generation 0 --timeout 0",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
         }

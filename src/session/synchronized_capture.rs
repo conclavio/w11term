@@ -6,7 +6,7 @@ use std::{future::poll_fn, pin::Pin, task::Poll};
 async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
     assert!(
         poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await,
-        "wait-for-text completed before the synchronized update was committed"
+        "control wait completed before the synchronized update was committed"
     );
 }
 
@@ -148,7 +148,13 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
         }]);
 
         let old = feed(&input, "old HUD").await;
-        for piece in ["\x1b[?20", "26h", "\rnew HUD", "\x1b[2;1Hnew picture"] {
+        for piece in [
+            "\x1b[?20",
+            "26h",
+            "\rnew HUD",
+            "\x1b[2;1Hnew picture",
+            "\x1b]133;C\x07\x1b]133;D;4\x07",
+        ] {
             let partial = feed(&input, piece).await;
             assert_eq!(partial.generation, old.generation);
             assert_eq!(text(&partial), text(&old));
@@ -215,12 +221,26 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
         assert!(relative_path.to_string().contains("path must be absolute"));
         let mut waiting = wait("new picture", old.generation, Some(matched_path.clone()));
         let mut recurring = wait("HUD", old.generation, None);
+        let mut completion = Box::pin(registry.execute(
+            Request::WaitCommand {
+                pane: 1,
+                after_id: old.latest_command_id,
+                connection_generation: 0,
+                timeout_seconds: 1,
+            },
+            screenshot.clone(),
+        ));
         assert_pending(waiting.as_mut()).await; // queues Command::Frames
         assert_pending(recurring.as_mut()).await;
+        assert_pending(completion.as_mut()).await;
         capture(&input).await; // FIFO barrier: the worker has replied to Frames
         assert_pending(waiting.as_mut()).await; // matcher has checked the held frame
         assert_pending(recurring.as_mut()).await; // HUD already appears in the held frame
+        assert_pending(completion.as_mut()).await;
         let done = feed(&input, "\x1b[?2026l").await;
+        let completed = completion.await.unwrap();
+        assert_eq!(completed["id"], old.latest_command_id + 1);
+        assert_eq!(completed["exit_code"], 4);
         // Let the wait choose the committed match. The renderer then runs
         // off-thread, while the terminal remains free to publish another frame.
         let next = recurring.await.unwrap();

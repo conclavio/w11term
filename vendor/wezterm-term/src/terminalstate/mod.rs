@@ -1071,6 +1071,11 @@ impl TerminalState {
         &self.command_history
     }
 
+    /// The newest assigned capture ID, even when no capture remains in history.
+    pub fn latest_command_id(&self) -> u64 {
+        self.next_command_id - 1
+    }
+
     fn shell_column(&self) -> usize {
         if self.wrap_next {
             self.screen().physical_cols

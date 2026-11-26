@@ -1,4 +1,5 @@
 use super::*;
+use wezterm_term::CompletedCommand;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,6 +50,7 @@ impl Registry {
         Ok(json!({
             "pane": pane,
             "connection_generation": frame.connection_generation,
+            "latest_id": frame.latest_command_id,
             "commands": commands,
         }))
     }
@@ -61,30 +63,111 @@ impl Registry {
     ) -> Result<Value> {
         // Resolve the connection and record against the same committed frame.
         let (frame, _) = Self::capture(&self.pane(pane)?).await?;
-        ensure!(
-            frame.connection_generation == connection_generation,
-            "pane {pane} connection generation changed (requested {connection_generation}, current {})",
-            frame.connection_generation
-        );
+        check_generation(&frame, pane, connection_generation)?;
         let entry = frame
             .command_history
             .iter()
             .find(|entry| entry.id == id)
             .with_context(|| format!("command {id} is not retained in pane {pane}"))?;
-        Ok(json!({
-            "pane": pane,
-            "connection_generation": connection_generation,
-            "id": entry.id,
-            "command": entry.command,
-            "reported_directory": entry.reported_directory.as_deref(),
-            "started_unix_ms": entry.timing.started_unix_ms,
-            "finished_unix_ms": entry.timing.finished_unix_ms,
-            "duration_ms": entry.timing.duration_ms,
-            "exit_code": entry.exit_code,
-            "output": entry.output.as_ref().ok(),
-            "output_error": entry.output.as_ref().err(),
-        }))
+        Ok(command_detail(pane, connection_generation, entry))
     }
+
+    pub(super) async fn wait_command(
+        &self,
+        pane: u64,
+        after_id: u64,
+        connection_generation: u64,
+        timeout_seconds: u64,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=3600).contains(&timeout_seconds),
+            "wait timeout must be 1..=3600 seconds"
+        );
+        let target = self.pane(pane)?;
+        let events = if connection_generation == 0 {
+            None
+        } else {
+            Some(Self::pane_events(&target).await?)
+        };
+        let frames = Self::live_frames(&target).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+        let wait = async {
+            loop {
+                let frame = frames.load();
+                check_generation(&frame, pane, connection_generation)?;
+                if let Some(entry) = next_command(&frame, after_id)? {
+                    return Ok::<_, anyhow::Error>(Arc::clone(entry));
+                }
+                ensure!(
+                    tokio::time::Instant::now() < deadline
+                        && frames.changed(frame.generation, deadline).await,
+                    "wait-command timed out without a new completed command"
+                );
+            }
+        };
+        const STALE: &str =
+            "The pane connection changed or is no longer active; no command was accepted";
+        let entry = tokio::select! {
+            biased;
+            _ = async {
+                match &events {
+                    Some(events) => events.terminal_connection_changed(connection_generation).await,
+                    None => std::future::pending().await,
+                }
+            } => anyhow::bail!(STALE),
+            _ = target.input.closed() => anyhow::bail!("pane is closed"),
+            result = wait => result?,
+        };
+        ensure!(
+            events.is_none_or(|events| events.terminal_connection_is(connection_generation)),
+            STALE
+        );
+        Ok(command_detail(pane, connection_generation, &entry))
+    }
+}
+
+fn check_generation(frame: &Snapshot, pane: u64, expected: u64) -> Result<()> {
+    ensure!(
+        frame.connection_generation == expected,
+        "pane {pane} connection generation changed (requested {expected}, current {})",
+        frame.connection_generation
+    );
+    Ok(())
+}
+
+fn next_command(frame: &Snapshot, after_id: u64) -> Result<Option<&Arc<CompletedCommand>>> {
+    ensure!(
+        after_id <= frame.latest_command_id,
+        "command ID is ahead of this pane; check the instance and pane ID"
+    );
+    if after_id == frame.latest_command_id {
+        return Ok(None);
+    }
+    let next = frame
+        .command_history
+        .iter()
+        .find(|entry| entry.id > after_id);
+    ensure!(
+        next.is_some_and(|entry| entry.id == after_id + 1),
+        "command history is no longer retained immediately after ID {after_id}; get a new cursor with list-commands"
+    );
+    Ok(next)
+}
+
+fn command_detail(pane: u64, connection_generation: u64, entry: &CompletedCommand) -> Value {
+    json!({
+        "pane": pane,
+        "connection_generation": connection_generation,
+        "id": entry.id,
+        "command": entry.command,
+        "reported_directory": entry.reported_directory.as_deref(),
+        "started_unix_ms": entry.timing.started_unix_ms,
+        "finished_unix_ms": entry.timing.finished_unix_ms,
+        "duration_ms": entry.timing.duration_ms,
+        "exit_code": entry.exit_code,
+        "output": entry.output.as_ref().ok(),
+        "output_error": entry.output.as_ref().err(),
+    })
 }
 
 #[cfg(test)]
@@ -154,6 +237,7 @@ mod tests {
             .unwrap();
             assert_eq!(list["pane"], all["pane"]);
             assert_eq!(list["connection_generation"], all["connection_generation"]);
+            assert_eq!(list["latest_id"], 4);
             let entries = all["commands"].as_array().unwrap();
             let expected: Vec<_> = ids.into_iter().map(|id: usize| &entries[4 - id]).collect();
             assert_eq!(list["commands"], json!(expected));
@@ -198,7 +282,7 @@ mod tests {
         assert_eq!(
             list,
             json!({
-                "pane":23,"connection_generation":generation,
+                "pane":23,"connection_generation":generation,"latest_id":3,
                 "commands":[
                     {"id":3,"command":null,"reported_directory":null,"exit_code":1,"output_available":false,
                      "started_unix_ms":null,"finished_unix_ms":third.finished_unix_ms,"duration_ms":null},
@@ -247,6 +331,65 @@ mod tests {
         assert!(before.same_presentation(&after));
         let pane = registry.pane(23).unwrap();
         assert!(pane.read_only && !pane.active && !pane.visible);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_the_first_new_record_and_detects_an_evicted_cursor_gap() {
+        let (registry, _session) = pane(&"\x1b]133;C\x07\x1b]133;D;9\x07".repeat(65));
+        let request = |after_id| {
+            json!({
+                "verb":"wait-command","pane":23,"connection_generation":0,
+                "after_id":after_id,"timeout_seconds":1
+            })
+        };
+        let first = execute(&registry, request(1)).await.unwrap();
+        assert_eq!(first["id"], 2);
+        assert_eq!(first["exit_code"], 9);
+        assert_eq!(
+            execute(&registry, request(0))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "command history is no longer retained immediately after ID 0; get a new cursor with list-commands"
+        );
+        assert!(
+            execute(&registry, request(66))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ahead of this pane")
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_keeps_the_latest_id_for_new_waiters() {
+        let (registry, session) = pane("\x1b]133;D;0\x07\x1bc");
+        let list = execute(&registry, json!({"verb":"list-commands","pane":23}))
+            .await
+            .unwrap();
+        assert_eq!(list["commands"], json!([]));
+        assert_eq!(list["latest_id"], 1);
+        let request = |after_id| {
+            json!({
+                "verb":"wait-command","pane":23,"connection_generation":0,
+                "after_id":after_id,"timeout_seconds":1
+            })
+        };
+        assert!(
+            execute(&registry, request(0))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no longer retained")
+        );
+        session.input.send(Command::SetReadOnly(false)).unwrap();
+        session
+            .input
+            .send(Command::Paste("\x1b]633;C\x07\x1b]633;D;7\x07".into()))
+            .unwrap();
+        let entry = execute(&registry, request(1)).await.unwrap();
+        assert_eq!(entry["id"], 2);
+        assert_eq!(entry["exit_code"], 7);
     }
 
     #[tokio::test]

@@ -693,6 +693,7 @@ pub struct Snapshot {
     pub title: String,
     application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
+    pub latest_command_id: u64,
     pub failed_command_rows: Arc<[isize]>,
     pub scrollback_bookmarks: Arc<[isize]>,
     pub command_context: Option<CommandContext>,
@@ -959,6 +960,7 @@ impl Snapshot {
                     })
             }),
             command_history: terminal.command_history().clone(),
+            latest_command_id: terminal.latest_command_id(),
             failed_command_rows: scrollback_view::failed_command_rows(terminal, previous),
             scrollback_bookmarks: scrollback_view::bookmark_rows(screen, previous),
             command_context: scrollback_view::command_context(
@@ -1063,6 +1065,7 @@ impl Snapshot {
             && self.visual_bell_color == old.visual_bell_color
             && self.title == old.title
             && self.application_title() == old.application_title()
+            && self.latest_command_id == old.latest_command_id
             && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.failed_command_rows == old.failed_command_rows
             && self.scrollback_bookmarks == old.scrollback_bookmarks

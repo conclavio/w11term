@@ -302,6 +302,13 @@ pub enum Request {
         id: u64,
         connection_generation: u64,
     },
+    WaitCommand {
+        pane: u64,
+        after_id: u64,
+        connection_generation: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     FindText {
         pattern: String,
         pane: Option<u64>,
@@ -536,6 +543,17 @@ impl Registry {
         tokio::time::timeout(TIMEOUT, response)
             .await
             .context("pane did not respond")?
+            .context("pane is closed")
+    }
+
+    async fn live_frames(pane: &Pane) -> Result<crate::terminal::FrameStore> {
+        let (reply, response) = oneshot::channel();
+        pane.input
+            .send(Command::Frames(reply))
+            .context("pane is closed")?;
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("pane frame request timed out")?
             .context("pane is closed")
     }
 
@@ -798,12 +816,7 @@ impl Registry {
                 } else {
                     None
                 };
-                let (reply, response) = oneshot::channel();
-                target
-                    .input
-                    .send(Command::Frames(reply))
-                    .context("pane is closed")?;
-                let frames = tokio::time::timeout(TIMEOUT, response).await??;
+                let frames = Self::live_frames(&target).await?;
                 ensure!(
                     after_frame.is_none_or(|baseline| baseline <= frames.load().generation),
                     "frame generation is ahead of this pane; check the instance and pane ID"
@@ -1224,6 +1237,15 @@ impl Registry {
                 id,
                 connection_generation,
             } => self.get_command(pane, id, connection_generation).await,
+            Request::WaitCommand {
+                pane,
+                after_id,
+                connection_generation,
+                timeout_seconds,
+            } => {
+                self.wait_command(pane, after_id, connection_generation, timeout_seconds)
+                    .await
+            }
             Request::Playback { pane, action } => {
                 let (reply, response) = oneshot::channel();
                 self.pane(pane)?
@@ -1509,6 +1531,7 @@ async fn serve(
                 let is_wait = matches!(
                     r,
                     Request::WaitForText { .. }
+                        | Request::WaitCommand { .. }
                         | Request::WaitSshConnected { .. }
                         | Request::WaitPaneExit { .. }
                         | Request::WaitSftpTransfer { .. }
@@ -1878,6 +1901,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,
             Request::WaitForText {
+                timeout_seconds, ..
+            }
+            | Request::WaitCommand {
                 timeout_seconds, ..
             }
             | Request::WaitSshConnected {

@@ -603,7 +603,7 @@ async fn native_word_delimiters_update_reader_and_pointer_selection_in_running_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reads OSC 133 captures from a read-only, inactive SSH pane across a live reconnect"]
+#[ignore = "reads and waits for OSC 133 captures in a read-only, inactive SSH pane across a live reconnect"]
 async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(mut ssh), remote, channels, server) =
@@ -625,6 +625,14 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
     stream.push_str(&"older row\r\n".repeat(150));
     stream.push_str("\x1b[3J\x1b]133;D;3\x07\r\nhistory-one-ready\r\n");
     fs::write(remote.path().join("copy-history.vt"), stream).unwrap();
+    fs::write(
+        remote.path().join("deferred-output.vt"),
+        format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\x1b]133;D;6\x07\r\n"
+        ),
+    )
+    .unwrap();
+    fs::write(remote.path().join("hold-shell-output"), []).unwrap();
     fs::write(remote.path().join("keyboard-input.bin"), []).unwrap();
     fs::write(remote.path().join("keep-first-connection"), []).unwrap();
     fs::write(

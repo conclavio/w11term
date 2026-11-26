@@ -31,6 +31,32 @@ function Get-Entry([int]$Id, [long]$Generation) {
     }
     return $entry
 }
+function Start-CommandWait([uint64]$After, [uint64]$Generation, [string]$Name) {
+    $path = Join-Path $State "$Name.json"
+    $process = Start-Process -FilePath $Cli -ArgumentList @('--pid',"$($app.Id)",'wait-command','--pane',"$remote",'--after-id',"$After",'--connection-generation',"$Generation",'--timeout','15') -WindowStyle Hidden -PassThru -RedirectStandardOutput $path
+    try {
+        $null = $process.Handle
+        if ($process.WaitForExit(250)) { throw "Command wait returned before the peer acted: $([IO.File]::ReadAllText($path))" }
+        return @{ Process = $process; Path = $path }
+    } catch {
+        $process.Dispose()
+        throw
+    }
+}
+function Complete-CommandWait($Wait, [int]$ExitCode) {
+    $process = $Wait.Process
+    try {
+        if (!$process.WaitForExit(18000)) { throw "Command wait did not finish: $($Wait.Path)" }
+        $reply = [IO.File]::ReadAllText($Wait.Path) | ConvertFrom-Json
+        if ($process.ExitCode -ne $ExitCode -or $reply.ok -ne ($ExitCode -eq 0)) {
+            throw "Command wait returned exit $($process.ExitCode): $($reply | ConvertTo-Json -Compress)"
+        }
+        return $reply
+    } finally {
+        if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() }
+        $process.Dispose()
+    }
+}
 function Check-FocusAndLock {
     $panes = @((Control @('list')).sessions)
     $source = $panes | Where-Object id -eq $remote
@@ -60,7 +86,7 @@ try {
     $listing = Control @('list-commands','--pane',"$remote")
     $v1 = $listing.connection_generation
     $rows = @($listing.commands)
-    if ($listing.pane -ne $remote -or $v1 -lt 1 -or $rows.Count -ne 3) { throw "Wrong listing: $($listing | ConvertTo-Json -Depth 5)" }
+    if ($listing.pane -ne $remote -or $v1 -lt 1 -or $rows.Count -ne 3 -or $listing.latest_id -ne $rows[0].id) { throw "Wrong listing: $($listing | ConvertTo-Json -Depth 5)" }
     foreach ($row in $rows) {
         foreach ($key in 'id','command','exit_code','output_available') {
             if ($row.PSObject.Properties.Name -cnotcontains $key) { throw "Missing list-commands field '$key'" }
@@ -90,15 +116,32 @@ try {
     Expect-Failure @('get-command','--pane',"$remote",'--id','999999','--connection-generation',"$v1") 'not retained'
     Check-FocusAndLock
 
+    $after = $listing.latest_id
+    Expect-Failure @('wait-command','--pane',"$remote",'--after-id',"$after",'--connection-generation',"$v1",'--timeout','1') 'timed out'
+    $pending = Start-CommandWait $after $v1 'pending-command'
+    [IO.File]::Delete((Join-Path $peer 'hold-shell-output'))
+    $repeated = (Complete-CommandWait $pending 0).result
+    if ($repeated.pane -ne $remote -or $repeated.connection_generation -ne $v1 -or
+        $repeated.id -ne ($after + 1) -or $repeated.command -cne $command -or
+        $repeated.exit_code -ne 6 -or $repeated.output -cne $outputText -or $null -ne $repeated.output_error) {
+        throw "Waiting for the repeated command returned the wrong record: $($repeated | ConvertTo-Json -Compress)"
+    }
+    Check-FocusAndLock
+
     # Have the peer drop the original transport while this pane is still read-only.
+    $oldWait = Start-CommandWait $repeated.id $v1 'stale-command'
     [IO.File]::Copy((Join-Path $State 'replacement.vt'), (Join-Path $peer 'copy-history.vt'), $true)
     [IO.File]::Delete((Join-Path $peer 'keep-first-connection'))
+    $stale = Complete-CommandWait $oldWait 1
+    if ($stale.error -notmatch 'connection changed|connection generation changed') {
+        throw "A wait on the old transport returned an unexpected error: $($stale.error)"
+    }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','25','history-two-ready')
     $next = Control @('list-commands','--pane',"$remote")
     if ($next.pane -ne $remote -or $next.connection_generation -le $v1 -or @($next.commands).Count -ne 1 -or
         $next.commands[0].command -cne 'replacement') { throw 'Reconnected pane retained the wrong history' }
     $freshId = $next.commands[0].id
-    if ($freshId -le $rows[0].id) { throw "Expected monotonically assigned command IDs, got $freshId after $($rows[0].id)" }
+    if ($freshId -le $repeated.id) { throw "Expected monotonically assigned command IDs, got $freshId after $($repeated.id)" }
     Expect-Failure @('get-command','--pane',"$remote",'--id',"$firstId",'--connection-generation',"$v1") 'connection generation changed'
     Expect-Failure @('get-command','--pane',"$remote",'--id',"$freshId",'--connection-generation',"$v1") 'connection generation changed'
     Expect-Failure @('get-command','--pane',"$remote",'--id',"$firstId",'--connection-generation',"$($next.connection_generation)") 'not retained'
