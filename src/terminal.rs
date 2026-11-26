@@ -1935,6 +1935,45 @@ mod tests {
     }
 
     #[test]
+    fn exact_completion_wait_follows_only_its_start_marker() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(8));
+        term.advance_bytes(b"\x1b]133;C\x07original");
+        let original = term.running_command().unwrap();
+        let watch = |running: &wezterm_term::RunningCommand| {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            events.watch_command_completion(
+                crate::events::RunningCommandTarget::new(8, running),
+                reply,
+            );
+            response
+        };
+        let mut stale = watch(&original);
+        term.advance_bytes(b"\x1b]133;C\x07replacement");
+        let running = term.running_command().unwrap();
+        assert_eq!(running.id, original.id);
+        assert_ne!(running.start_token, original.start_token);
+        let mut active = watch(&running);
+        term.advance_bytes(b"\x1b]133;D;7\x07\r\n\x1b]133;C\x07later\x1b]133;D;0\x07");
+        let captured = active.try_recv().unwrap().unwrap();
+        assert_eq!(captured.connection_generation, 8);
+        assert_eq!(captured.command.id, running.id);
+        assert_eq!(captured.command.start_token, Some(running.start_token));
+        assert_eq!(captured.command.exit_code, Some(7));
+        assert_eq!(captured.command.output.as_deref().unwrap(), "replacement");
+        events.retain_running_capture(None);
+        assert!(stale.try_recv().unwrap().is_err());
+
+        term.advance_bytes(b"\x1b]133;C\x07pending");
+        let mut disconnected = watch(&term.running_command().unwrap());
+        events.command_stream(None);
+        assert_eq!(
+            disconnected.try_recv().unwrap().unwrap_err(),
+            "shell connection changed before command completion"
+        );
+    }
+
+    #[test]
     fn running_output_waits_match_retained_live_and_final_lines() {
         let (mut term, events) = watched_terminal();
         events.command_stream(Some(6));
@@ -1977,7 +2016,7 @@ mod tests {
             missing.try_recv().unwrap().unwrap_err(),
             "command finished without a matching output line"
         );
-        assert!(!events.prune_running_output_waits());
+        assert!(!events.prune_command_waits());
     }
 
     #[test]

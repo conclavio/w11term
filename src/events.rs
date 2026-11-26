@@ -118,6 +118,20 @@ impl RunningCommandTarget {
     }
 }
 
+#[derive(Debug)]
+pub struct CommandCompletionCapture {
+    pub connection_generation: u64,
+    pub command: Arc<wezterm_term::CompletedCommand>,
+}
+
+pub type CommandCompletionResult = Result<CommandCompletionCapture, &'static str>;
+
+#[derive(Debug)]
+struct CompletionWait {
+    target: RunningCommandTarget,
+    reply: tokio::sync::oneshot::Sender<CommandCompletionResult>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SshConnectionPhase {
     Queued,
@@ -182,6 +196,7 @@ struct State {
     kitty_notifications: kitty_notification::Notifications,
     command_watch: Option<CommandWatch>,
     running_output: Vec<running_output::Waiter>,
+    command_completion: Vec<CompletionWait>,
     group_run: Option<GroupRun>,
     group_prompt_pattern: Option<GroupPromptPattern>,
     group_serial: u64,
@@ -763,9 +778,28 @@ impl Events {
         }
     }
 
-    pub(crate) fn prune_running_output_waits(&self) -> bool {
+    pub(crate) fn watch_command_completion(
+        &self,
+        target: RunningCommandTarget,
+        reply: tokio::sync::oneshot::Sender<CommandCompletionResult>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state
+            .command_completion
+            .retain(|wait| !wait.reply.is_closed());
+        if !reply.is_closed() {
+            state
+                .command_completion
+                .push(CompletionWait { target, reply });
+        }
+    }
+
+    pub(crate) fn prune_command_waits(&self) -> bool {
         let mut state = self.state.lock().unwrap();
         state.running_output.retain(|wait| !wait.reply.is_closed());
+        state
+            .command_completion
+            .retain(|wait| !wait.reply.is_closed());
         !state.running_output.is_empty()
     }
 
@@ -833,6 +867,13 @@ impl Events {
                 .reply
                 .send(Err("command capture ended before an output match"));
         }
+        for wait in state.command_completion.extract_if(.., |wait| {
+            wait.reply.is_closed() || Some(wait.target) != running
+        }) {
+            let _ = wait
+                .reply
+                .send(Err("command capture ended before completion was reported"));
+        }
     }
 
     pub(crate) fn command_stream(&self, generation: Option<u64>) {
@@ -845,6 +886,11 @@ impl Events {
             let _ = wait
                 .reply
                 .send(Err("shell connection changed before an output match"));
+        }
+        for wait in state.command_completion.drain(..) {
+            let _ = wait
+                .reply
+                .send(Err("shell connection changed before command completion"));
         }
         state.command_watch = generation.map(CommandWatch::new);
         state.refresh_watch(previous);
@@ -860,6 +906,11 @@ impl Events {
             let _ = wait
                 .reply
                 .send(Err("terminal reset before an output match"));
+        }
+        for wait in state.command_completion.drain(..) {
+            let _ = wait
+                .reply
+                .send(Err("terminal reset before command completion"));
         }
         if let Some(watch) = &mut state.command_watch {
             watch.reset();
@@ -893,11 +944,23 @@ impl Events {
             && !run.marker(
                 marker,
                 started,
-                completed.as_ref().map(|ended| ended.command),
+                completed.as_ref().map(|ended| ended.command.as_ref()),
                 now,
             )
         {
             state.group_run = None;
+        }
+        if let Some(ended) = completed.as_ref().filter(|ended| ended.had_output_start)
+            && let Some(token) = ended.command.start_token
+        {
+            for wait in state.command_completion.extract_if(.., |wait| {
+                wait.target.start_token == token && wait.target.id == ended.command.id
+            }) {
+                let _ = wait.reply.send(Ok(CommandCompletionCapture {
+                    connection_generation: wait.target.generation,
+                    command: ended.command.clone(),
+                }));
+            }
         }
         self.process_semantic_prompt(
             state,

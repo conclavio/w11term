@@ -327,6 +327,7 @@ impl ScreenOrAlt {
 #[derive(Debug)]
 pub struct CompletedCommand {
     pub id: u64,
+    pub start_token: Option<u64>,
     pub finished_at: std::time::Instant,
     pub timing: CommandTiming,
     pub command: Option<String>,
@@ -1221,7 +1222,8 @@ impl TerminalState {
     fn finish_command_output(&mut self, exit_code: Option<i32>) {
         if !self.is_alt_screen_active() {
             let finished = CommandClock::now();
-            let timing = finished.timing(self.command_started.map(|start| start.clock));
+            let start = self.command_started;
+            let timing = finished.timing(start.map(|start| start.clock));
             if self.capturing_shell_input {
                 self.screen.command_start = None;
                 self.capturing_shell_input = false;
@@ -1236,6 +1238,7 @@ impl TerminalState {
                 .take_command_text(self.cursor.y, col, 1024 * 1024);
             let command = Arc::new(CompletedCommand {
                 id: self.next_command_id,
+                start_token: start.map(|start| start.token),
                 finished_at: finished.monotonic,
                 timing,
                 command: self.command_label.take().map(|label| label.to_string()),

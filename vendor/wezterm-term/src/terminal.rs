@@ -87,7 +87,7 @@ pub enum Alert {
 }
 
 pub struct ShellCommandCompletion<'a> {
-    pub command: &'a crate::CompletedCommand,
+    pub command: &'a Arc<crate::CompletedCommand>,
     pub had_output_start: bool,
 }
 

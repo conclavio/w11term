@@ -47,7 +47,7 @@ async fn timed_out_running_output_wait_closes_its_reader_and_prunes_the_worker()
         assert!(!reply.is_closed());
         assert!(matches!(
             worker.recv().await,
-            Some(Command::PruneRunningOutputWaits)
+            Some(Command::PruneCommandWaits)
         ));
         assert!(reply.is_closed());
     };

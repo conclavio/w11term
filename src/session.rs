@@ -85,7 +85,11 @@ pub enum Command {
         pattern: regex::Regex,
         reply: tokio::sync::oneshot::Sender<crate::events::RunningOutputResult>,
     },
-    PruneRunningOutputWaits,
+    WaitCommandCapture {
+        start_token: u64,
+        reply: tokio::sync::oneshot::Sender<crate::events::CommandCompletionResult>,
+    },
+    PruneCommandWaits,
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<PaneInspection>),
     Replay {
@@ -1495,15 +1499,19 @@ async fn run(
                                         pattern, reply,
                                     );
                                     terminal.notify_running_shell_output();
-                                    waiting_for_output = events.prune_running_output_waits();
+                                    waiting_for_output = events.prune_command_waits();
                                 }
                                 Err(reason) => { let _ = reply.send(Err(reason)); }
                             }
                         }
                         Ok(())
                     }
-                    Some(Command::PruneRunningOutputWaits) => {
-                        waiting_for_output = events.prune_running_output_waits();
+                    Some(Command::WaitCommandCapture { start_token, reply }) => {
+                        wait_for_capture(&terminal, &events, connection_generation, live_commands, start_token, reply);
+                        Ok(())
+                    }
+                    Some(Command::PruneCommandWaits) => {
+                        waiting_for_output = events.prune_command_waits();
                         Ok(())
                     }
                     Some(Command::ReadModes(reply)) => {
@@ -1894,7 +1902,7 @@ async fn run(
                             if group_shell || waiting_for_output {
                                 terminal.notify_running_shell_output();
                                 if waiting_for_output {
-                                    waiting_for_output = events.prune_running_output_waits();
+                                    waiting_for_output = events.prune_command_waits();
                                 }
                             }
                             if let Some(matcher) = &mut prompt_matcher
@@ -1959,6 +1967,39 @@ async fn run(
     }
     if let Some(recorder) = recorder {
         let _ = finish_recording(recorder, &events);
+    }
+}
+
+fn wait_for_capture(
+    terminal: &wezterm_term::TerminalState,
+    events: &crate::events::Events,
+    generation: u64,
+    live_commands: bool,
+    start_token: u64,
+    reply: tokio::sync::oneshot::Sender<crate::events::CommandCompletionResult>,
+) {
+    if reply.is_closed() {
+        return;
+    }
+    if !live_commands {
+        let _ = reply.send(Err("command start tokens require a live shell"));
+        return;
+    }
+    if let Some(command) = terminal
+        .command_history()
+        .iter()
+        .find(|command| command.start_token == Some(start_token))
+    {
+        let _ = reply.send(Ok(crate::events::CommandCompletionCapture {
+            connection_generation: generation,
+            command: command.clone(),
+        }));
+    } else if let Ok(command) = find_running_command(terminal, events, generation, start_token) {
+        events.watch_command_completion(RunningCommandTarget::new(generation, &command), reply);
+    } else {
+        let _ = reply.send(Err(
+            "that command capture is no longer running or retained in this pane",
+        ));
     }
 }
 
@@ -2236,6 +2277,27 @@ mod failure_tests {
         ssh.durable = false;
         ssh.player.rustmush = true;
         assert!(!direct_ssh_shell(&Source::Ssh(ssh), false, None));
+    }
+
+    #[test]
+    fn exact_completion_can_read_retained_results_after_the_shell_exits() {
+        let (writer, _) = mpsc::unbounded_channel();
+        let mut terminal = terminal::create(TerminalSize::default(), writer);
+        let events = crate::events::Events::default();
+        terminal.advance_bytes(b"\x1b]133;C\x07saved");
+        let original = terminal.running_command().unwrap();
+        terminal.advance_bytes(b"\x1b]133;D;6\x07");
+        let fetch = |live, token| {
+            let (reply, mut response) = tokio::sync::oneshot::channel();
+            wait_for_capture(&terminal, &events, 4, live, token, reply);
+            response.try_recv().unwrap()
+        };
+        let found = fetch(true, original.start_token).unwrap();
+        assert_eq!(found.connection_generation, 4);
+        assert_eq!(found.command.exit_code, Some(6));
+        assert_eq!(found.command.output.as_deref().unwrap(), "saved");
+        assert!(fetch(true, original.start_token + 1).is_err());
+        assert!(fetch(false, original.start_token).is_err());
     }
 
     #[test]

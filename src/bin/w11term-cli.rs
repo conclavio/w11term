@@ -963,6 +963,34 @@ mod tests {
     }
 
     #[test]
+    fn wait_command_start_token_is_exclusive_and_preserves_success_checks() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let invocation = parse_invocation(
+            "--pid 9 wait-command --pane 8 --start-token 27 --timeout 7 --require-success"
+                .split_ascii_whitespace()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(invocation.pid, Some(9));
+        assert_eq!(invocation.success_check, Some(SuccessCheck::Command));
+        assert_eq!(
+            serde_json::to_value(invocation.request).unwrap(),
+            serde_json::json!({"verb":"wait-command-capture","pane":8,"start_token":27,"timeout_seconds":7})
+        );
+        for line in [
+            "wait-command --pane 8 --start-token 0",
+            "wait-command --pane 0 --start-token 27",
+            "wait-command --pane 8 --start-token 27 --after-id 4",
+            "wait-command --pane 8 --start-token 27 --connection-generation 1",
+            "wait-command --pane 8 --start-token 27 --command build",
+            "wait-command --pane 8 --start-token 27 --start-token 28",
+            "wait-command --pane 8 --start-token 27 --timeout 0",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
     fn single_pane_ssh_wait_accepts_a_generation_floor_and_valid_timeout() {
         let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
         assert!(matches!(

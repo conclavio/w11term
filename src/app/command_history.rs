@@ -1280,6 +1280,7 @@ mod tests {
             .map(|(id, duration_ms, exit_code)| {
                 Arc::new(CompletedCommand {
                     id,
+                    start_token: None,
                     finished_at: std::time::Instant::now(),
                     timing: wezterm_term::CommandTiming {
                         duration_ms,
@@ -1313,6 +1314,7 @@ mod tests {
         let entry = |id, output, exit_code| {
             Arc::new(CompletedCommand {
                 id,
+                start_token: None,
                 finished_at: std::time::Instant::now(),
                 timing: Default::default(),
                 command: Some(format!("run {id}")),
@@ -1369,6 +1371,7 @@ mod tests {
         let command = format!("{} [Ångström]\r\n  --final", "x".repeat(130));
         let mut entry = CompletedCommand {
             id: 9,
+            start_token: None,
             finished_at: std::time::Instant::now(),
             timing: Default::default(),
             command: Some(command.clone()),

@@ -281,6 +281,7 @@ mod tests {
             None,
             Some(&CompletedCommand {
                 id: 7,
+                start_token: None,
                 finished_at: finished,
                 timing: Default::default(),
                 command: Some("report".into()),
@@ -306,6 +307,7 @@ mod tests {
     fn group_preview_bounds_lines_and_preserves_utf8() {
         let mut command = CompletedCommand {
             id: 7,
+            start_token: None,
             finished_at: std::time::Instant::now(),
             timing: Default::default(),
             command: None,

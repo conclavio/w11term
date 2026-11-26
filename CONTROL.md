@@ -275,13 +275,28 @@ breaks. Captures whose shell integration supplied no command line are skipped.
 The cursor still advances past inspected captures, and a gap in uninspected
 history remains an error.
 
+To wait for a specific command, use the `start_token` from `inspect` or the
+pane's `command-started` event.
+
+```powershell
+& $ctl --pid 12345 wait-command --pane $pane --start-token $token --timeout 60
+```
+
+This form returns the exact capture when the parser receives its completion
+marker. If it already completed, the reply comes from retained history and
+is available even after the shell exits. The result includes `start_token`
+along with the usual command fields. Replacement, reset, disconnection before
+completion, and expired history produce errors. Use `--start-token` on its own
+as the command selector. It is exclusive with `--after-id`,
+`--connection-generation`, and `--command`.
+
 Use `--require-success` to make the CLI exit 0 for shell exit code zero,
 2 for a nonzero or unknown shell exit status, and 1 if the wait or file save
 fails. The JSON reply and any requested output file are available for exit 2.
 This flag affects the CLI process and is independent of the pipe request.
 
-The wait defaults to 30 seconds and accepts 1 to 3600 seconds. It fails if the
-pane closes, its SSH connection ends, or the next capture has already fallen
+Both forms default to 30 seconds and accept 1 to 3600 seconds. The cursor-based
+wait fails if the pane closes, its SSH connection ends, or the next capture has already fallen
 out of the retained history. After a gap or reconnect, take a new cursor with
 `list-commands`. Use a pane dedicated to the script if it needs to attribute
 the next completion to a particular input.
@@ -306,6 +321,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"timeout_seconds":60}
 {"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"command":"make test"}
 {"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"output_file":{"path":"C:\\Logs\\capture.txt"}}
+{"verb":"wait-command-capture","pane":2,"start_token":27,"timeout_seconds":60}
 ```
 
 For either command, direct pipe clients send an absolute `output_file.path`

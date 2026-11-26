@@ -218,6 +218,37 @@ try {
         $record.exit_code -ne 3 -or (Inspect).running_command) {
         throw "The quick command's start event did not match its completed capture"
     }
+    $exact = & $Cli --pid $app.Id wait-command --pane "$remote" --start-token "$($started.start_token)" --require-success --timeout 5 |
+        ConvertFrom-Json
+    if ($LASTEXITCODE -ne 2 -or !$exact.ok -or $exact.result.id -ne $record.id -or
+        $exact.result.start_token -ne $started.start_token -or $exact.result.exit_code -ne 3) {
+        throw "The exact wait lost the completed failure or its exit status"
+    }
+    Report-CommandStart 'exact pending'
+    $pending = Wait-Until 'inspect returns the live token for exact completion' {
+        $r = (Inspect).running_command
+        if ($r.command -ceq 'exact pending') { $r }
+    }
+    $exactLog = Join-Path $State 'exact-completion.json'
+    $capturePath = Join-Path $State 'exact command output.txt'
+    $argsForWait = @('--pid',"$($app.Id)",'wait-command','--pane',"$remote",
+        '--start-token',"$($pending.start_token)",'--timeout','7','--require-success',
+        '--output-file',('"' + $capturePath + '"'))
+    $waiter = Start-Process -FilePath $Cli -ArgumentList $argsForWait -WindowStyle Hidden -PassThru -RedirectStandardOutput $exactLog
+    try {
+        if ($waiter.HasExited) { throw 'The exact command wait exited before the shell completed' }
+        Set-RemoteModes "saved-exact-output$esc]133;D;0$bell"
+        if (!$waiter.WaitForExit(9000)) { throw 'The exact command wait did not settle' }
+        $reply = [IO.File]::ReadAllText($exactLog) | ConvertFrom-Json
+        if (!$reply.ok -or $reply.result.id -ne $pending.id -or $reply.result.start_token -ne $pending.start_token -or
+            $reply.result.exit_code -ne 0 -or $reply.result.output -ne $null -or $reply.result.output_file.path -ne $capturePath -or
+            [IO.File]::ReadAllText($capturePath) -cne 'saved-exact-output') {
+            throw "The exact wait did not save its command output: $($reply | ConvertTo-Json -Depth 4 -Compress)"
+        }
+    } finally {
+        if (!$waiter.HasExited) { $waiter.Kill(); $waiter.WaitForExit() }
+        $waiter.Dispose()
+    }
     Wait-Focus $localPane
     Type-Line 'if ($inspectPid -eq $PID) { "local-inspect-" + "still-live" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-still-live')
@@ -265,6 +296,10 @@ try {
     $staleWait = & $Cli --pid $app.Id wait-running-output --pane "$remote" --start-token "$($first.start_token)" --timeout 5 'replacement-preview' | ConvertFrom-Json
     if ($LASTEXITCODE -eq 0 -or $staleWait.ok -or $staleWait.error -notmatch 'no longer running') {
         throw 'An output wait accepted a replaced command token'
+    }
+    $staleCompletion = & $Cli --pid $app.Id wait-command --pane "$remote" --start-token "$($first.start_token)" --timeout 5 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $staleCompletion.ok -or $staleCompletion.error -notmatch 'no longer running or retained') {
+        throw 'A completion wait accepted a replaced command token'
     }
     $null = Wait-Until 'the replacement token reads only its own output' {
         $sample = Read-RunningOutput $replacement.start_token

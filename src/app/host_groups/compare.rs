@@ -997,6 +997,7 @@ mod tests {
             );
             Some(Arc::new(CompletedCommand {
                 id: link.id,
+                start_token: None,
                 finished_at: std::time::Instant::now(),
                 timing: Default::default(),
                 command: None,

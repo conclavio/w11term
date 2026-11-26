@@ -158,6 +158,47 @@ impl Registry {
         );
         reply_command(pane, connection_generation, entry, output_file).await
     }
+
+    pub(super) async fn wait_command_capture(
+        &self,
+        pane: u64,
+        start_token: u64,
+        timeout_seconds: u64,
+        output_file: Option<CommandOutputFile>,
+    ) -> Result<Value> {
+        ensure!(
+            (1..=3600).contains(&timeout_seconds),
+            "wait timeout must be 1..=3600 seconds"
+        );
+        if let Some(destination) = &output_file {
+            destination.validate()?;
+        }
+        let (reply, response) = oneshot::channel();
+        let mut pending = PendingCommandWait {
+            input: self.pane(pane)?.input,
+            response,
+        };
+        pending
+            .input
+            .send(Command::WaitCommandCapture { start_token, reply })
+            .context("pane is closed")?;
+        let capture =
+            tokio::time::timeout(Duration::from_secs(timeout_seconds), &mut pending.response)
+                .await
+                .context("wait-command timed out before the selected capture completed")?
+                .context("pane closed before command completion")?
+                .map_err(anyhow::Error::msg)?;
+        drop(pending);
+        let mut result = reply_command(
+            pane,
+            capture.connection_generation,
+            capture.command,
+            output_file,
+        )
+        .await?;
+        result["start_token"] = start_token.into();
+        Ok(result)
+    }
 }
 
 fn check_generation(frame: &Snapshot, pane: u64, expected: u64) -> Result<()> {

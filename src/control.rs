@@ -330,6 +330,14 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    WaitCommandCapture {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<CommandOutputFile>,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     FindText {
         pattern: String,
         pane: Option<u64>,
@@ -1282,7 +1290,7 @@ impl Registry {
                 );
                 let pattern = ssh_groups::output_pattern(&pattern, regex, match_case)?;
                 let (reply, response) = oneshot::channel();
-                let mut pending = PendingRunningOutput {
+                let mut pending = PendingCommandWait {
                     input: self.pane(pane)?.input,
                     response,
                 };
@@ -1332,6 +1340,15 @@ impl Registry {
                     output_file,
                 )
                 .await
+            }
+            Request::WaitCommandCapture {
+                pane,
+                start_token,
+                output_file,
+                timeout_seconds,
+            } => {
+                self.wait_command_capture(pane, start_token.get(), timeout_seconds, output_file)
+                    .await
             }
             Request::Playback { pane, action } => {
                 let (reply, response) = oneshot::channel();
@@ -1629,6 +1646,7 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitCommand { .. }
+                        | Request::WaitCommandCapture { .. }
                         | Request::WaitRunningOutput { .. }
                         | Request::WaitSshConnected { .. }
                         | Request::WaitPaneExit { .. }
@@ -1704,15 +1722,15 @@ async fn while_client_waits<T>(
     }
 }
 
-struct PendingRunningOutput {
+struct PendingCommandWait<T> {
     input: mpsc::UnboundedSender<Command>,
-    response: oneshot::Receiver<crate::events::RunningOutputResult>,
+    response: oneshot::Receiver<Result<T, &'static str>>,
 }
 
-impl Drop for PendingRunningOutput {
+impl<T> Drop for PendingCommandWait<T> {
     fn drop(&mut self) {
         self.response.close();
-        let _ = self.input.send(Command::PruneRunningOutputWaits);
+        let _ = self.input.send(Command::PruneCommandWaits);
     }
 }
 
@@ -2014,6 +2032,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitCommand {
+                timeout_seconds, ..
+            }
+            | Request::WaitCommandCapture {
                 timeout_seconds, ..
             }
             | Request::WaitRunningOutput {
