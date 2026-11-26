@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -84,7 +84,15 @@ function Use-Window([IntPtr]$Hwnd) {
 function Run-WindowCommand([IntPtr]$Hwnd, [string]$Action) {
     Use-Window $Hwnd
     $window = $Hwnd
-    Press-Key 0x76 # F7, fixture command palette
+    # These tests exercise commands in the chosen window. Activate its native
+    # palette control so opening the picker does not depend on keyboard routing.
+    $launcher = Find-Here $Hwnd 'Command palette'
+    if ($launcher -and $launcher.Current.IsEnabled -and !$launcher.Current.IsOffscreen) {
+        Invoke-Button $launcher
+    } else {
+        $menuLabel = 'Command palette' + [char]0x2026 + '    F7'
+        Invoke-Button (Get-NativeMenuAction 'Tab menu' $menuLabel)
+    }
     $field = Wait-Until "focused command palette for '$Action' in the requested HWND" {
         $element = Find-Here $Hwnd 'Search commands'
         if ($element -and $element.Current.HasKeyboardFocus) { $element }
@@ -490,6 +498,96 @@ function Test-WorkspaceInNewWindow {
     Expect-Text $ssh.id 'original-workspace/'
 }
 
+function Test-ManageWorkspace {
+    $window = $origin
+    $workspaceCommand = 'Workspaces' + [char]0x2026
+    $managedName = 'Cockpit desk'
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $originalClaim = Wait-Until 'the legacy workspace registers its original window' {
+        (Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows |
+            Where-Object { $_.window_id -eq $ssh.window_id -and $_.workspace }
+    }
+
+    $field = Open-ProfileWindowPicker $origin -FromPalette
+    $field.GetCurrentPattern($value).SetValue('Destination PowerShell')
+    $null = Wait-Until 'the management window profile' {
+        Find-Here $origin ('Destination PowerShell ' + [char]0x00b7 + ' Local')
+    }
+    Press-Key 13
+    $manager = Wait-DetachedWindow $origin
+    Run-WindowCommand $manager $workspaceCommand
+    Invoke-Button (Wait-Until 'manage the existing saved layout' {
+        Find-Here $manager 'Manage workspace two-windows'
+    })
+
+    $field = Wait-Until 'the rename input' { Find-Here $manager 'New workspace name' }
+    $field.GetCurrentPattern($value).SetValue('broken-copy')
+    Invoke-Button (Wait-Until 'rename is enabled' {
+        $button = Find-Here $manager 'Rename workspace'
+        if ($button -and $button.Current.IsEnabled) { $button }
+    })
+    $null = Wait-Until 'the existing name is refused' {
+        Find-Here $manager 'Workspace broken-copy already exists'
+    }
+    $field = Find-Here $manager 'New workspace name'
+    $field.GetCurrentPattern($value).SetValue($managedName)
+    $null = Wait-Until 'the updated rename value reaches the editor' {
+        (Find-Here $manager 'New workspace name').GetCurrentPattern($value).Current.Value -ceq $managedName
+    }
+    Invoke-Button (Find-Here $manager 'Rename workspace')
+    $null = Wait-Until 'the list reflects the new name' {
+        (Find-Here $manager "Switch to workspace $managedName") -and
+            !(Find-Here $manager 'Switch to workspace two-windows')
+    }
+    $saved = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces
+    if (!$saved.$managedName -or !$saved.'broken-copy' -or $saved.'two-windows') {
+        throw 'Renaming did not preserve both saved layouts correctly'
+    }
+    $claim = (Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows |
+        Where-Object window_id -eq $ssh.window_id
+    if (!$claim -or $claim.workspace -cne $originalClaim.workspace) {
+        throw 'Renaming changed the identity of the live workspace'
+    }
+    Invoke-Button (Find-Here $manager "Switch to workspace $managedName")
+    Expect-Focus $origin $ssh.id 'Switching by the new name returns to the original SSH pane'
+    if ([TabFixtureWindows]::OwnedBy($app.Id).Count -ne 2 -or @((Control @('list')).sessions).Count -ne 4) {
+        throw 'Switching after rename reopened panes'
+    }
+
+    Run-WindowCommand $origin $workspaceCommand
+    Invoke-Button (Wait-Until 'open management under the renamed workspace' {
+        Find-Here $origin "Manage workspace $managedName"
+    })
+    $review = 'Remove saved workspace' + [char]0x2026
+    Invoke-Button (Wait-Until 'review removal' { Find-Here $origin $review })
+    $null = Wait-Until 'separate workspace removal confirmation' {
+        Find-Here $origin "Remove saved workspace ${managedName}?"
+    }
+    Invoke-Button (Find-Here $origin 'Cancel')
+    Invoke-Button (Wait-Until 'the editor is restored after canceling' { Find-Here $origin $review })
+    $saved = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces
+    if (!$saved.$managedName) { throw 'Canceling confirmation removed the workspace' }
+    Invoke-Button (Wait-Until 'confirm removal of the saved layout' { Find-Here $origin 'Remove workspace' })
+    $null = Wait-Until 'the removed name is absent from the list' {
+        (Find-Here $origin "Removed saved workspace $managedName") -and
+            !(Find-Here $origin "Switch to workspace $managedName") -and
+            (Find-Here $origin 'Switch to workspace broken-copy')
+    }
+    $saved = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces
+    if ($saved.$managedName -or !$saved.'broken-copy') { throw 'Removing the saved layout changed the wrong entries' }
+    $split = Find-Here $origin 'Cockpit tools'
+    $split.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Expect-Focus $origin $ssh.id 'Removing the layout leaves the original terminal usable'
+    Type-In $origin 'after-management/'
+    Expect-Text $ssh.id 'after-management/'
+    if ((Shell-State $moved.id 'mgmt') -ne $localIdentity) {
+        throw 'Workspace management restarted the original PowerShell process'
+    }
+    Close-FixtureWindow $manager
+    Close-FixtureWindow $origin
+}
+
 function Test-MoveAllTerminalTabs {
     Use-Window $origin
     $window = $origin
@@ -707,6 +805,13 @@ try {
         Close-FixtureWindow $origin
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'Closing the last workspace window did not release the process and control pipe'
+        }
+        return
+    }
+    if ($FirstClose -eq 'ManageWorkspace') {
+        Test-ManageWorkspace
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'Workspace management did not leave the windows able to close normally'
         }
         return
     }

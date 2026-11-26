@@ -1030,6 +1030,7 @@ pub struct Options {
     pub source: Source,
     pub workspace: Option<String>,
     pub switch_workspace: bool,
+    pub expected_workspace_key: Option<String>,
     pub benchmark: bool,
     pub smoke_seconds: Option<u64>,
     pub profiles_path: PathBuf,
@@ -1050,6 +1051,7 @@ impl Options {
         let mut profile = None;
         let mut workspace_name = None;
         let mut switch_workspace = false;
+        let mut expected_workspace_key = None;
         let mut explicit_source = false;
         let mut profiles_path: Option<PathBuf> = None;
         let mut list_profiles = false;
@@ -1094,6 +1096,9 @@ impl Options {
                     ensure!(workspace_name.is_none(), "Choose one workspace");
                     workspace_name = Some(value(&mut args, &arg)?);
                     switch_workspace = arg == "--switch-workspace";
+                }
+                "--expected-workspace-key" => {
+                    expected_workspace_key = Some(value(&mut args, &arg)?);
                 }
                 "--tab" => extra_profiles.push(value(&mut args, &arg)?),
                 "--cols" => cols = Some(value(&mut args, &arg)?.parse::<usize>()?),
@@ -1311,10 +1316,15 @@ impl Options {
             rows.is_none_or(|n| (1..=500).contains(&n)),
             "--rows must be 1..500"
         );
+        ensure!(
+            expected_workspace_key.is_none() || switch_workspace,
+            "--expected-workspace-key requires --switch-workspace"
+        );
         Ok(Some(Self {
             source,
             workspace: workspace_name,
             switch_workspace,
+            expected_workspace_key,
             benchmark,
             smoke_seconds,
             profiles_path,
@@ -1806,6 +1816,16 @@ mod tests {
     #[test]
     fn a_workspace_is_the_only_launch_source_and_overridden_profiles_are_ad_hoc() {
         let parse = |args: &[&str]| Options::parse_from(args.iter().map(|s| s.to_string()));
+        assert!(parse(&["--workspace", "desk", "--expected-workspace-key", "key"]).is_err());
+        let guarded = parse(&[
+            "--switch-workspace",
+            "desk",
+            "--expected-workspace-key",
+            "key",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(guarded.expected_workspace_key.as_deref(), Some("key"));
         for source in [
             vec!["--demo"],
             vec!["--profile", "root"],

@@ -100,6 +100,12 @@ async fn native_saved_workspace_opens_in_a_new_window() {
     run("WorkspaceWindow", b"workspace-copy/original-workspace/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "renames and removes a saved workspace while its original SSH and PowerShell panes stay live"]
+async fn native_manage_saved_workspace_keeps_its_open_sessions() {
+    run("ManageWorkspace", b"after-management/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -154,7 +160,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         {"focused":3,"layout":leaf(3,local("Source PowerShell"))}
     ]});
     let mut workspaces = json!({"two-windows":workspace});
-    if first_close == "WorkspaceWindow" {
+    if matches!(first_close, "WorkspaceWindow" | "ManageWorkspace") {
         workspaces["broken-copy"] = json!({"active_tab":0,"tabs":[
             {"focused":1,"layout":leaf(1,json!({"kind":"saved_profile","value":"missing-window-profile"}))}
         ]});
