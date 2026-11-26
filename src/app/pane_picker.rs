@@ -751,6 +751,10 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
+    pub(super) fn open_closed_tab_search(&mut self, ctx: &ComponentContext<Self>) {
+        self.start_picker(Mode::Commands(command_palette::Search::ClosedTabs), ctx);
+    }
+
     pub(super) fn active_window_search(&self) -> Option<(SearchScope, std::sync::Weak<()>)> {
         let picker = self.picker.as_ref()?;
         Some((picker.mode.window_search()?, Arc::downgrade(&picker.launch)))
@@ -982,6 +986,7 @@ impl TerminalApp {
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
+            Mode::Commands(command_palette::Search::ClosedTabs) => self.closed_tab_rows(query),
             Mode::Commands(command_palette::Search::RunningCommands) => {
                 self.running_command_rows(query)
             }

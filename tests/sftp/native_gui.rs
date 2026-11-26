@@ -2631,6 +2631,17 @@ async fn native_reopen_closed_tab_layout_restores_position_focus_and_input_lock(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "finds and reopens an older mixed split after closing several tabs"]
+async fn native_recently_closed_tabs_reopens_the_selected_layout() {
+    check_mixed_tab_layout(
+        "recently-closed-tabs-ui.ps1",
+        b"before-close/after-reopen/",
+        2,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "restores a single PowerShell pane beside a live SSH shell after closing the split"]
 async fn native_reopen_closed_pane_keeps_the_neighboring_ssh_session() {
     check_mixed_tab_layout(

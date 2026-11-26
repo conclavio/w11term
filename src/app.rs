@@ -1106,6 +1106,7 @@ fn tab_menu_message(label: String) -> Message {
         title_tools::FIND_SCROLLBACK => Message::Shortcut(Shortcut::Find),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         command_palette::FIND_TAB_LABEL => Message::Shortcut(Shortcut::FindTab),
+        command_palette::FIND_CLOSED_TAB_LABEL => Message::Shortcut(Shortcut::FindClosedTab),
         command_palette::FIND_COMMAND_HISTORY_LABEL => {
             Message::Shortcut(Shortcut::FindCommandHistory)
         }
@@ -4061,6 +4062,7 @@ impl TerminalApp {
                 Message::Shortcut(
                     shortcut @ (Shortcut::PanePicker
                     | Shortcut::FindTab
+                    | Shortcut::FindClosedTab
                     | Shortcut::FindCommandHistory
                     | Shortcut::FindAllPanes
                     | Shortcut::CommandPalette
@@ -4399,6 +4401,12 @@ impl TerminalApp {
                 "reopen_closed_tab",
                 KeyAction::ReopenClosedTab.binding().label,
                 KeyAction::ReopenClosedTab,
+                !self.closed_tabs.is_empty(),
+            ),
+            self.binding_menu_enabled(
+                "find-closed-tab",
+                command_palette::FIND_CLOSED_TAB_LABEL,
+                KeyAction::FindClosedTab,
                 !self.closed_tabs.is_empty(),
             ),
             self.binding_menu_enabled(
@@ -5876,10 +5884,13 @@ impl Component for TerminalApp {
                 }
             }
             Message::ReopenClosedTab(Some(group)) => {
-                self.window_error = self
-                    .reopen_closed_tab(group, context)
-                    .err()
-                    .map(|error| format!("Couldn’t reopen tab layout. {error:#}"));
+                if self
+                    .closed_tabs
+                    .back()
+                    .is_some_and(|closed| closed.group == group)
+                {
+                    self.reopen_closed_tab(group, context);
+                }
             }
             Message::ReopenClosedTab(None) => {}
             Message::ReopenClosedPane(Some(id)) => {
@@ -6977,6 +6988,7 @@ impl Component for TerminalApp {
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
                 Shortcut::FindTab => self.open_tab_search(context),
+                Shortcut::FindClosedTab => self.open_closed_tab_search(context),
                 Shortcut::FindCommandHistory => self.open_window_command_history(context),
                 Shortcut::FindAllPanes => self.open_text_picker(context),
                 Shortcut::MovePaneToExistingTab => self.open_move_picker(context),

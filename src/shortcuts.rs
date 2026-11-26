@@ -38,6 +38,7 @@ pub enum Action {
     CommandPalette,
     PanePicker,
     FindTab,
+    FindClosedTab,
     FindCommandHistory,
     Find,
     FindNext,
@@ -185,6 +186,13 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
     Binding::new(FindTab, "find_tab", "Find tab", 0, Mods::NONE),
+    Binding::new(
+        FindClosedTab,
+        "find_closed_tab",
+        "Recently closed tabs",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(
         FindCommandHistory,
         "find_command_history",
@@ -650,6 +658,7 @@ mod tests {
         for (action, expected) in [
             (FocusPreviousPane, r#"{"focus_previous_pane":"F8"}"#),
             (ReopenClosedTab, r#"{"reopen_closed_tab":"F8"}"#),
+            (FindClosedTab, r#"{"find_closed_tab":"F8"}"#),
             (ReopenClosedPane, r#"{"reopen_closed_pane":"F8"}"#),
         ] {
             let mut shortcuts = Shortcuts::default();

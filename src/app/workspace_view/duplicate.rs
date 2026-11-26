@@ -69,7 +69,23 @@ fn eligible_pane(tab: &AppTab) -> Result<&LiveTab> {
 
 pub(in crate::app) struct ClosedTab {
     pub(in crate::app) group: TabId,
+    pub(in crate::app) title: String,
+    search_text: String,
     layout: w11term::tabs::TabLayoutRecipe<NewShell>,
+}
+
+impl ClosedTab {
+    pub(in crate::app) fn matches(&self, query: &str) -> bool {
+        query
+            .split_whitespace()
+            .all(|word| self.search_text.contains(word))
+    }
+
+    pub(in crate::app) fn detail(&self) -> String {
+        let count = self.layout.panes().len();
+        let unit = if count == 1 { "pane" } else { "panes" };
+        format!("{count} {unit} · Tab {}", self.layout.original_index() + 1)
+    }
 }
 
 pub(in crate::app) struct ClosedPane {
@@ -201,34 +217,80 @@ impl TerminalApp {
     }
 
     pub(in crate::app) fn remember_closed_tab(&mut self, group: TabId) {
-        if let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture) {
-            if self.closed_tabs.len() == CLOSED_TAB_LIMIT {
-                self.closed_tabs.pop_front();
+        let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture) else {
+            return;
+        };
+        let Some(focused) = tab_title::switcher_leaf(&self.tabs.headers(), group) else {
+            return;
+        };
+        let follow_titles = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .application_tab_titles;
+        let title = self.tab_label(focused, follow_titles).into_owned();
+        let mut search_text = title.to_lowercase();
+        for shell in layout.panes() {
+            let destination = source_label(&shell.source);
+            for field in [
+                Some(shell.label.as_str()),
+                shell.pane_name.as_ref().map(TabTitle::as_str),
+                shell.profile.as_deref(),
+                Some(destination.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                search_text.push(' ');
+                search_text.push_str(&field.to_lowercase());
             }
-            self.closed_tabs.push_back(ClosedTab { group, layout });
         }
+        if self.closed_tabs.len() == CLOSED_TAB_LIMIT {
+            self.closed_tabs.pop_front();
+        }
+        self.closed_tabs.push_back(ClosedTab {
+            group,
+            title,
+            search_text,
+            layout,
+        });
     }
 
     pub(in crate::app) fn reopen_closed_tab(
         &mut self,
         group: TabId,
         context: &ComponentContext<Self>,
+    ) {
+        self.window_error = self
+            .try_reopen_closed_tab(group, context)
+            .err()
+            .map(|error| format!("Couldn’t reopen tab layout. {error:#}"));
+    }
+
+    fn try_reopen_closed_tab(
+        &mut self,
+        group: TabId,
+        context: &ComponentContext<Self>,
     ) -> Result<()> {
-        let Some(closed) = self
+        let Some(index) = self
             .closed_tabs
-            .back()
-            .filter(|closed| closed.group == group)
+            .iter()
+            .position(|closed| closed.group == group)
         else {
             return Ok(());
         };
         let catalog = self.store.catalog().ok();
         let preferences = self.appearance.read().unwrap().pane_preferences();
-        self.tabs.reopen_group(
-            &closed.layout,
+        let reopened = self.tabs.reopen_group(
+            &self.closed_tabs[index].layout,
             |recipe| recipe.clone().prepare(catalog.as_ref()),
             |shell| shell.launch(preferences),
         )?;
-        self.closed_tabs.pop_back();
+        self.closed_tabs.remove(index);
+        for closed in &mut self.closed_tabs {
+            closed.layout.replace_neighbor(group, reopened);
+        }
         self.sync_selection(context);
         self.activate(context);
         Ok(())
