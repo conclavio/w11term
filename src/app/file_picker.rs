@@ -36,6 +36,7 @@ pub(super) enum Purpose {
     Scrollback,
     PaneImage,
     CommandOutput(String),
+    CommandOutputDiff(String),
     GroupReport(String),
     SshLoginReport(String),
     GroupJsonReport(String),
@@ -368,6 +369,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             Purpose::Scrollback
             | Purpose::PaneImage
             | Purpose::CommandOutput(_)
+            | Purpose::CommandOutputDiff(_)
             | Purpose::GroupReport(_)
             | Purpose::SshLoginReport(_)
             | Purpose::GroupJsonReport(_)
@@ -386,6 +388,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     Purpose::PaneImage => (w!("Save pane image"), "terminal.png", w!("png")),
                     Purpose::CommandOutput(suggestion) => (
                         w!("Save command output as text"),
+                        suggestion.as_str(),
+                        w!("txt"),
+                    ),
+                    Purpose::CommandOutputDiff(suggestion) => (
+                        w!("Save command output differences"),
                         suggestion.as_str(),
                         w!("txt"),
                     ),

@@ -31,6 +31,12 @@ pub enum Subject {
         pane: u64,
         command: u64,
     },
+    CommandOutputDiff {
+        reference_pane: u64,
+        reference: u64,
+        selected_pane: u64,
+        selected: u64,
+    },
     HostGroupResults {
         submission: u64,
         format: GroupReportFormat,
@@ -65,6 +71,7 @@ impl Subject {
             Self::PaneImage(pane) => format!("image of pane {pane}"),
             Self::PaneText(pane) => format!("visible text from pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
+            Self::CommandOutputDiff { .. } => "command output differences".into(),
             Self::HostGroupResults { format, shown, .. } => {
                 let scope = if shown { "shown " } else { "" };
                 let format = if format == GroupReportFormat::Json {
@@ -94,6 +101,14 @@ impl Subject {
             Self::CommandOutput { pane, command } => {
                 file_picker::Purpose::CommandOutput(format!("pane-{pane}-command-{command}.txt"))
             }
+            Self::CommandOutputDiff {
+                reference_pane,
+                reference,
+                selected_pane,
+                selected,
+            } => file_picker::Purpose::CommandOutputDiff(format!(
+                "command-diff-{reference_pane}-{reference}-to-{selected_pane}-{selected}.txt"
+            )),
             Self::HostGroupResults {
                 submission,
                 format,

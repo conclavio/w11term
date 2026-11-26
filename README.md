@@ -935,6 +935,8 @@ When you scroll into the middle of a command’s retained output, its command li
 
 Choose **Save output as text…** to write the selected command’s captured output to a UTF-8 file. It uses the same plain text as **Copy output**, including blank lines, and remains available for a read-only source pane.
 
+To compare two captures in the same window, select the first and choose **Use output as reference**. Select a second capture in any pane’s history and choose **Compare with reference**. The view shows both exit statuses and the changed lines with their original line numbers. Choose **Save full differences…** to export all changed lines while both captures are retained.
+
 Choose **Show output in pane** to return to the source pane and scroll to where the selected command’s output began. The location follows the text when the pane is resized. If its start has left scrollback, history stays open and you can still copy or save the captured output.
 
 When the shell reports a working directory, history shows the path captured at the command’s start. **Open command directory** opens an SSH path in the original pane’s file drawer while its connection is available, or opens a supported local path in File Explorer. A later directory change leaves the saved path intact.

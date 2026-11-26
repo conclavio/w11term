@@ -1,7 +1,7 @@
 use super::*;
 use std::io::{self, Write};
 
-pub(super) use crate::app::text_diff::{Difference, write_changes};
+pub(super) use crate::app::text_diff::{Difference, output_view as result_view, write_changes};
 
 pub(super) struct Panel {
     reference: Side,
@@ -196,43 +196,5 @@ impl TerminalApp {
             },
             ready(Err("Could not start the output comparison.")),
         );
-    }
-}
-
-pub(super) fn result_view(
-    result: Option<&Result<Difference, &'static str>>,
-    identical: &str,
-) -> View {
-    let text = |value: &str| {
-        TextBlock::new()
-            .text(value)
-            .text_wrapping(TextWrapping::Wrap)
-    };
-    match result {
-        None => text("Comparing output lines…").into(),
-        Some(Err(message)) => text(message).into(),
-        Some(Ok(diff)) if diff.changes.is_empty() => text(identical).into(),
-        Some(Ok(diff)) => StackPanel::new().spacing(5.0).children((
-            if diff.unaligned {
-                text("The changed sections are too large to align. Lines are shown by source.")
-                    .into()
-            } else {
-                View::empty()
-            },
-            if diff.limited {
-                text("More changed lines are available in the full output.").into()
-            } else {
-                View::empty()
-            },
-            StackPanel::new()
-                .spacing(4.0)
-                .keyed_children(diff.changes.iter().enumerate().map(|(index, change)| {
-                    let verb = change.edit.verb();
-                    KeyedView::new(
-                        index,
-                        text(&format!("{verb} line {} · {}", change.line, change.text)),
-                    )
-                })),
-        )),
     }
 }

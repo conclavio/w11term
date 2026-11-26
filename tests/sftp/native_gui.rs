@@ -722,6 +722,46 @@ async fn native_ssh_history_displays_timing_and_sorts_slowest_first() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "compares retained outputs across native SSH panes and exports the full changes"]
+async fn native_history_compares_and_exports_two_shell_captures() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for (label, output, exit) in [
+        ("History before", "old result", 5),
+        ("History after", "new result", 0),
+    ] {
+        let (Source::Ssh(ssh), root, _, task) = fixture_server(false).await else {
+            unreachable!()
+        };
+        fs::write(
+            root.path().join("copy-history.vt"),
+            format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07check result\r\n\x1b]133;C\x07unchanged\r\n{output}\r\n\x1b]133;D;{exit}\x07capture-ready\r\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.path().join("keyboard-input.bin"), []).unwrap();
+        profiles.insert(label.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((root, task));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":profiles})).unwrap(),
+    )
+    .unwrap();
+    drive_gui("command-history-compare-ui.ps1", state.path());
+    for (root, task) in peers {
+        assert!(
+            fs::read(root.path().join("keyboard-input.bin"))
+                .unwrap()
+                .is_empty()
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "samples focused and inactive GPU cursor cells in two native SSH panes"]
 async fn native_focused_block_cursor_redraws_the_glyph_and_tracks_pane_focus() {
     let (Source::Ssh(ssh), _remote, shells, server) = fixture_server(false).await else {

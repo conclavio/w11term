@@ -8,6 +8,15 @@ use w11term::session::history_text_allowed;
 use w11term::terminal::Snapshot;
 use wezterm_term::CompletedCommand;
 
+mod compare;
+pub use compare::Request as CompareRequest;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputCapture {
+    pane: u64,
+    link: CommandLink,
+}
+
 pub(super) struct HistoryPage {
     pane: u64,
     selected: Option<(u64, u64)>, // Connection generation and command id.
@@ -17,6 +26,7 @@ pub(super) struct HistoryPage {
     feedback: String,
     save: Option<SaveDraft>,
     showing: Option<Arc<()>>,
+    comparison: Option<compare::Panel>,
 }
 
 struct SaveDraft {
@@ -34,6 +44,11 @@ pub enum Action {
         request: Arc<()>,
         result: Result<(), &'static str>,
     },
+    ComparisonReady {
+        page: TabId,
+        request: Arc<()>,
+        result: Result<text_diff::Difference, &'static str>,
+    },
 }
 
 pub enum HistoryAction {
@@ -47,6 +62,7 @@ pub enum HistoryAction {
     ExportOutput((u64, u64)),
     ShowOutput((u64, u64)),
     OpenDirectory((u64, u64)),
+    Compare(CompareRequest),
     Insert((u64, u64)),
     BeginSave((u64, u64)),
     SaveName((u64, u64), String),
@@ -519,6 +535,7 @@ impl TerminalApp {
             feedback: String::new(),
             save: None,
             showing: None,
+            comparison: None,
         });
         if let Some(id) = existing {
             self.tabs.get_mut(id).unwrap().page = page;
@@ -532,6 +549,15 @@ impl TerminalApp {
     }
 
     pub(super) fn handle_history(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if let Action::ComparisonReady {
+            page,
+            request,
+            result,
+        } = action
+        {
+            self.finish_history_comparison(page, &request, result);
+            return;
+        }
         if let Action::OutputShown {
             page,
             pane,
@@ -599,6 +625,10 @@ impl TerminalApp {
         if source != pane {
             return;
         }
+        if let HistoryAction::Compare(request) = action {
+            self.history_compare(id, pane, request, ctx);
+            return;
+        }
         let Some(frame) = self.history_frame(pane) else {
             return;
         };
@@ -614,6 +644,7 @@ impl TerminalApp {
         }
         page.feedback.clear();
         match action {
+            HistoryAction::Compare(_) => unreachable!(),
             HistoryAction::Search(query) => {
                 page.search.needle = query.to_lowercase();
                 page.search.query = query;
@@ -778,6 +809,9 @@ impl TerminalApp {
     }
 
     pub(super) fn history_view(&self, page: &HistoryPage, ctx: &ViewContext<Self>) -> View {
+        if let Some(comparison) = &page.comparison {
+            return self.history_comparison_view(page.pane, comparison, ctx);
+        }
         let Some(frame) = self.history_frame(page.pane) else {
             return TextBlock::new()
                 .margin(16.0)
@@ -913,6 +947,7 @@ impl TerminalApp {
                 .text_wrapping(TextWrapping::Wrap)
                 .into()
         });
+        let comparison = self.history_reference_view(pane, generation, selected, ctx);
         let save = match (&page.save, save_target) {
             (Some(draft), Some(target)) if draft.target == target => saved_commands::name_form(
                 &draft.name,
@@ -1028,6 +1063,7 @@ impl TerminalApp {
                                     .text_wrapping(TextWrapping::Wrap),
                                 timing,
                                 directory,
+                                comparison,
                                 Button::new()
                                     .is_enabled(insert_target.is_some())
                                     .on_click(ctx.callback(move |_| {
