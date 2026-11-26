@@ -164,13 +164,24 @@ try {
     if ((Control @('get-text','--pane',"$left")).generation -ne $before) {
         throw 'Visual bell changed committed terminal contents'
     }
+    # The parser and UI consume output and bell events independently. Publish
+    # the new color in a committed frame before asking the UI to flash it.
+    Send-Sequence $left ($esc + ']21;visual_bell=#00e850' + $esc + '\' + "$esc[HGreenBellProof")
+    $null = Control @('wait-for-text','--pane',"$left",'--timeout','15','GreenBellProof')
     $null = Wait-Until 'the per-pane bell cooldown has elapsed' { $timer.ElapsedMilliseconds -ge 1050 }
+    Show-CursorWindow
+    $null = Wait-Until 'both pane edges to be visible before the custom bell' { Read-Outlines -Green }
     $since = Bell-Cursor $left
-    Send-Sequence $left ($esc + ']21;visual_bell=#00e850' + $esc + '\' + $bell)
-    $null = Wait-Until 'application-set green outline on the left pane only' {
-        $outlines = Read-Outlines -Green
-        if ($outlines.Right) { throw 'Custom bell drew on the focused neighbor' }
-        $outlines.Left
+    Send-Sequence $left $bell
+    try {
+        $null = Wait-Until 'application-set green outline on the left pane only' {
+            $outlines = Read-Outlines -Green
+            if ($outlines.Right) { throw 'Custom bell drew on the focused neighbor' }
+            $outlines.Left
+        }
+    } catch {
+        $observed = (Control @('events','--pane',"$left",'--since',"$since",'--kind','bell','--timeout','0')).journal.events.Count
+        throw "$_ New BEL events: $observed. Foreground HWND: $([FixtureMessages]::GetForegroundWindow()), fixture HWND: $window."
     }
     $null = Wait-Until 'custom outline expires with idle output' {
         $outlines = Read-Outlines -Green
