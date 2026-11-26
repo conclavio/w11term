@@ -1001,13 +1001,16 @@ impl Registry {
                     .input
                     .send(Command::ReadModes(reply))
                     .context("pane is closed")?;
-                let (connection_generation, modes) = tokio::time::timeout(TIMEOUT, response)
+                let inspection = tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("pane inspection timed out")?
                     .context("pane closed before inspection")?;
-                let mut report = modes.as_json();
+                let mut report = inspection.modes.as_json();
                 report["pane"] = pane.into();
-                report["connection_generation"] = connection_generation.into();
+                report["connection_generation"] = inspection.connection_generation.into();
+                if let Some(ssh) = inspection.ssh {
+                    report["ssh"] = serde_json::to_value(ssh.as_ref())?;
+                }
                 Ok(report)
             }
             Request::GetText { pane } => {

@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
+$peer = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'
 $button = [System.Windows.Automation.ControlType]::Button
 $esc = [char]27
 Add-Type @'
@@ -72,6 +73,17 @@ try {
     }
     Invoke-Button (Wait-Until 'menu' { Find-Element 'Tab menu' $button })
     Invoke-Button (Wait-Until 'open inspector' { Find-Element 'Terminal inspector: Off' })
+    Set-NativeExpansion 'Verified SSH route' $true
+    $null = Wait-Until 'the verified SSH key and destination match the control reply' {
+        $route = (Inspect).ssh
+        $destination = $route.destination
+        $destination.host -ceq $peer.host -and $destination.user -ceq $peer.user -and
+            $destination.port -eq $peer.port -and $destination.key_fingerprint -ceq $peer.host_key -and
+            @($route.jump_hosts).Count -eq 0 -and
+            (Find-Element "Destination   $($peer.user)@$($peer.host):$($peer.port)") -and
+            (Find-Element "Host key   $($peer.host_key)")
+    }
+    Set-NativeExpansion 'Verified SSH route' $false
     $null = Wait-Until 'inspector geometry and resize mode match the CLI' {
         $m = Inspect
         $area = "Text area   $($m.pixel_width) $([char]0xd7) $($m.pixel_height) px at $($m.dpi) DPI"
@@ -91,6 +103,7 @@ try {
     $localPane = (Control @('open','--profile','Palette PowerShell','--activate')).pane
     Wait-Focus $localPane
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','20','PS ')
+    if ((Control @('inspect','--pane',"$localPane")).ssh) { throw 'PowerShell reported an SSH route' }
     Type-Line '$inspectPid = $PID; "local-inspect-" + "ready"'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-ready')
     $before = (Control @('get-text','--pane',"$remote")).text
@@ -117,6 +130,16 @@ try {
     Type-Line 'if ($inspectPid -eq $PID) { "local-inspect-" + "still-live" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-still-live')
     if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains('local-inspect')) { throw 'PowerShell input landed in SSH' }
+    Picker-Query 'palette-ssh'
+    Press-Key 13
+    Wait-Focus $remote
+    Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
+    $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
+    Set-RemoteModes ([string][char]4)
+    $null = Wait-Until 'disconnected SSH retires the verified route in the inspector and CLI' {
+        (Find-Element 'Close terminal inspector' $button) -and
+            !(Find-Element 'Verified SSH route') -and !(Inspect).ssh
+    }
 } catch {
     $failure = $_.Exception.Message
     try {
@@ -132,9 +155,5 @@ try {
     throw "$failure. Last pane observations: $($observed | ConvertTo-Json -Compress -Depth 5)"
 } finally {
     $wire.Dispose()
-    if (!$app.HasExited) {
-        $null = $app.CloseMainWindow()
-        if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
-    }
-    $app.Dispose()
+    Close-FixtureApp $app
 }

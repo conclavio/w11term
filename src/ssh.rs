@@ -17,7 +17,7 @@ pub use folder_share::{
     FolderMount, FolderMountStatus, FolderRoot, MountedFolder, valid_mount_name,
 };
 pub use local_forward::{LocalForward, LocalForwardStatus};
-pub use sharing::ConnectionShare;
+pub use sharing::{ConnectionShare, VerifiedSshPeer, VerifiedSshRoute};
 pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing};
 pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};

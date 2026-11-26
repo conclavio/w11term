@@ -76,7 +76,7 @@ pub enum Command {
     DescribePane(tokio::sync::oneshot::Sender<PaneDescription>),
     Inspect(bool),
     /// One read of the live model and its connection generation, even between paints.
-    ReadModes(tokio::sync::oneshot::Sender<(u64, terminal::TerminalModes)>),
+    ReadModes(tokio::sync::oneshot::Sender<PaneInspection>),
     Replay {
         action: ReplayAction,
         reply: tokio::sync::oneshot::Sender<Result<ReplayStatus, String>>,
@@ -266,6 +266,27 @@ pub struct PaneDescription {
     pub(crate) frame: Arc<Snapshot>,
     pub(crate) restart_token: Option<u64>,
     pub(crate) ssh_phase: Option<SshConnectionPhase>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneInspection {
+    pub connection_generation: u64,
+    pub modes: terminal::TerminalModes,
+    pub ssh: Option<Arc<ssh::VerifiedSshRoute>>,
+}
+
+impl PaneInspection {
+    fn read(
+        terminal: &wezterm_term::Terminal,
+        connection_generation: u64,
+        ssh: &ssh::ShareSlot,
+    ) -> Self {
+        Self {
+            connection_generation,
+            modes: terminal::TerminalModes::read(terminal),
+            ssh: ssh.verified_route_at(connection_generation),
+        }
+    }
 }
 
 pub struct Session {
@@ -791,6 +812,7 @@ async fn run(
         .map(group_prompt::Matcher::new);
     terminal.set_track_primary_prints(prompt_matcher.is_some());
     let restartable = can_restart(live_commands, sharing.startup.as_ref());
+    let published_ssh = sharing.published.clone();
     let mut launch =
         launch::Launcher::new(source.clone(), sharing, prompts.clone(), events.clone());
     let mut launch_id = 1u64;
@@ -968,7 +990,11 @@ async fn run(
             }
         }
         if inspecting {
-            frames.set_inspection(Some(terminal::TerminalModes::read(&terminal)));
+            frames.set_inspection(Some(PaneInspection::read(
+                &terminal,
+                connection_generation,
+                &published_ssh,
+            )));
         }
         let notification_expiry = events.next_notification_expiry();
         let animation_deadline = presentation.animation_deadline(&terminal);
@@ -1329,7 +1355,7 @@ async fn run(
                     },
                     Some(Command::ReadModes(reply)) => {
                         if !reply.is_closed() {
-                            let _ = reply.send((connection_generation, terminal::TerminalModes::read(&terminal)));
+                            let _ = reply.send(PaneInspection::read(&terminal, connection_generation, &published_ssh));
                         }
                         Ok(())
                     }

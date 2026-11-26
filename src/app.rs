@@ -1094,6 +1094,7 @@ pub enum Message {
     AttentionChanged,
     VisualBellTick,
     ToggleInspector,
+    InspectSshRoute(u64, bool),
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
     PaneText(pane_picker::TextAction),
@@ -2768,7 +2769,7 @@ impl TerminalApp {
                 .inspection
                 .as_ref()
                 .filter(|inspector| inspector.pane == tab.session.pane_id)
-                .map(|inspector| inspector.modes);
+                .map(|inspector| inspector.current.clone());
             let epoch = self.watch_epoch;
             self.frame_tasks.insert(
                 id,
@@ -5366,6 +5367,15 @@ impl Component for TerminalApp {
                 self.cancel_frame_tasks();
                 self.watch_frames(context);
             }
+            Message::InspectSshRoute(pane, open) => {
+                if let Some(inspector) = self
+                    .inspection
+                    .as_mut()
+                    .filter(|current| current.pane == pane)
+                {
+                    inspector.set_ssh_expanded(open);
+                }
+            }
             Message::CopyLastCommand => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -7436,7 +7446,7 @@ impl Component for TerminalApp {
         {
             views.push(KeyedView::new(
                 "terminal-inspector",
-                inspection.view(context),
+                inspection.view(self.window_height, context),
             ));
         }
         if let Some(id) = self.tabs.active_id()

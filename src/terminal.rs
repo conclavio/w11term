@@ -1113,7 +1113,7 @@ pub struct FrameStore(Arc<(Mutex<ViewState>, Condvar, tokio::sync::Notify)>);
 #[derive(Debug)]
 struct ViewState {
     frame: Arc<Snapshot>,
-    inspection: Option<TerminalModes>,
+    inspection: Option<crate::session::PaneInspection>,
     inbox: Option<WindowInbox>,
 }
 
@@ -1182,13 +1182,13 @@ impl FrameStore {
         }
         tokio::time::timeout_at(deadline, changed).await.is_ok()
     }
-    pub fn inspection(&self) -> Option<TerminalModes> {
-        self.0.0.lock().unwrap().inspection
+    pub fn inspection(&self) -> Option<crate::session::PaneInspection> {
+        self.0.0.lock().unwrap().inspection.clone()
     }
-    pub(crate) fn set_inspection(&self, modes: Option<TerminalModes>) {
+    pub(crate) fn set_inspection(&self, inspection: Option<crate::session::PaneInspection>) {
         let mut state = self.0.0.lock().unwrap();
-        if state.inspection != modes {
-            state.inspection = modes;
+        if state.inspection != inspection {
+            state.inspection = inspection;
             // Wake the native watcher only. Control consumers await committed frames.
             self.0.1.notify_all();
         }
@@ -1201,12 +1201,14 @@ impl FrameStore {
     pub fn wait_for_view(
         &self,
         generation: u64,
-        inspected: Option<Option<TerminalModes>>,
+        inspected: Option<Option<crate::session::PaneInspection>>,
         cancelled: impl Fn() -> bool,
     ) {
         let mut state = self.0.0.lock().unwrap();
         while state.frame.generation == generation
-            && inspected.is_none_or(|previous| previous == state.inspection)
+            && inspected
+                .as_ref()
+                .is_none_or(|previous| previous == &state.inspection)
             && !cancelled()
         {
             state = self

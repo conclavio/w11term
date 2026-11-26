@@ -1,12 +1,15 @@
 use super::*;
 use termwiz::input::KeyboardEncoding;
+use w11term::session::PaneInspection;
+use w11term::ssh::{VerifiedSshPeer, VerifiedSshRoute};
 use w11term::terminal::TerminalModes;
 use wezterm_input_types::KittyKeyboardFlags as Flags;
 use wezterm_term::MouseEncoding;
 
 pub(super) struct Inspection {
     pub(super) pane: u64,
-    pub(super) modes: Option<TerminalModes>,
+    pub(super) current: Option<PaneInspection>,
+    ssh_expanded: bool,
     input: tokio::sync::mpsc::UnboundedSender<Command>,
     readout: View,
     pointer: PointerReadout,
@@ -107,7 +110,66 @@ fn text_area_label(width: usize, height: usize, dpi: u32) -> String {
     }
 }
 
+fn ssh_route_view(
+    route: &VerifiedSshRoute,
+    pane: u64,
+    expanded: bool,
+    context: &ViewContext<TerminalApp>,
+) -> View {
+    const LABEL: &str = "Verified SSH route";
+    let peer = |role: &str, peer: &VerifiedSshPeer| {
+        let address = host_groups::ssh_address(&peer.user, &peer.host, peer.port);
+        StackPanel::new().spacing(3.0).children((
+            TextBlock::new()
+                .text(format!("{role}   {address}"))
+                .text_wrapping(TextWrapping::Wrap),
+            TextBlock::new()
+                .text(format!("Host key   {}", peer.key_fingerprint))
+                .text_wrapping(TextWrapping::Wrap),
+            peer.host_key_alias
+                .as_ref()
+                .map_or_else(View::empty, |alias| {
+                    TextBlock::new()
+                        .text(format!("Host key alias   {alias}"))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .into()
+                }),
+        ))
+    };
+    let hosts = std::iter::once(KeyedView::new(
+        "destination",
+        peer("Destination", &route.destination),
+    ))
+    .chain(
+        route
+            .jump_hosts
+            .iter()
+            .enumerate()
+            .map(|(i, hop)| KeyedView::new(i, peer(&format!("Jump {}", i + 1), hop))),
+    );
+    Expander::new()
+        .automation_name(LABEL)
+        .horizontal_alignment(HorizontalAlignment::Stretch)
+        .is_expanded(expanded)
+        .on_is_expanded_changed(context.callback(move |open| Message::InspectSshRoute(pane, open)))
+        .slots([
+            SlotView::new(ExpanderSlot::Header, TextBlock::new().text(LABEL)),
+            SlotView::new(
+                ExpanderSlot::Content,
+                StackPanel::new().spacing(8.0).keyed_children(hosts),
+            ),
+        ])
+}
+
 impl Inspection {
+    pub(super) fn set_ssh_expanded(&mut self, expanded: bool) {
+        self.ssh_expanded = expanded
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|value| value.ssh.is_some());
+    }
+
     pub(super) fn clear_pointer(&mut self) {
         self.pointer = Default::default();
     }
@@ -146,12 +208,15 @@ impl Inspection {
         }
     }
 
-    pub(super) fn refresh(&mut self, current: Option<TerminalModes>) {
-        if self.modes == current {
+    pub(super) fn refresh(&mut self, current: Option<PaneInspection>) {
+        let previous_modes = self.current.as_ref().map(|previous| previous.modes);
+        let modes = current.as_ref().map(|inspection| inspection.modes);
+        self.current = current;
+        self.set_ssh_expanded(self.ssh_expanded);
+        if previous_modes == modes {
             return;
         }
-        self.modes = current;
-        match current {
+        match modes {
             None => self.readout = TextBlock::new().text("Reading terminal modes…").into(),
             Some(modes) => {
                 let on_off = |enabled| if enabled { "On" } else { "Off" };
@@ -182,8 +247,15 @@ impl Inspection {
         }
     }
 
-    pub(super) fn view(&self, context: &ViewContext<TerminalApp>) -> View {
+    pub(super) fn view(&self, window_height: f64, context: &ViewContext<TerminalApp>) -> View {
         let title = format!("Terminal inspector · Pane {}", self.pane);
+        let ssh = self
+            .current
+            .as_ref()
+            .and_then(|value| value.ssh.as_deref())
+            .map_or_else(View::empty, |route| {
+                ssh_route_view(route, self.pane, self.ssh_expanded, context)
+            });
         Border::new()
             .grid_row(1)
             .horizontal_alignment(HorizontalAlignment::Right)
@@ -208,17 +280,25 @@ impl Inspection {
                                 .on_click(context.callback(|_| Message::ToggleInspector))
                                 .content("×"),
                         )),
-                    self.readout.clone(),
-                    TextBlock::new().text(self.pointer.cell.map_or_else(
-                        || "Pointer cell   Outside grid".into(),
-                        |(col, row)| format!("Pointer cell   {col}, {row}"),
-                    )),
-                    TextBlock::new()
-                        .text(format!(
-                            "Hyperlink   {}",
-                            self.pointer.target.as_deref().unwrap_or("None")
-                        ))
-                        .text_wrapping(TextWrapping::Wrap),
+                    ScrollViewer::new()
+                        .max_height((window_height - 130.0).max(80.0))
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .content(
+                            StackPanel::new().spacing(6.0).children((
+                                ssh,
+                                self.readout.clone(),
+                                TextBlock::new().text(self.pointer.cell.map_or_else(
+                                    || "Pointer cell   Outside grid".into(),
+                                    |(col, row)| format!("Pointer cell   {col}, {row}"),
+                                )),
+                                TextBlock::new()
+                                    .text(format!(
+                                        "Hyperlink   {}",
+                                        self.pointer.target.as_deref().unwrap_or("None")
+                                    ))
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )),
+                        ),
                 )),
             )
     }
@@ -250,7 +330,8 @@ impl TerminalApp {
         };
         self.inspection = Some(Inspection {
             pane,
-            modes: None,
+            current: None,
+            ssh_expanded: false,
             input,
             readout: TextBlock::new().text(status).into(),
             pointer: Default::default(),
@@ -284,7 +365,8 @@ mod tests {
         let (input, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut inspector = Inspection {
             pane: 1,
-            modes: None,
+            current: None,
+            ssh_expanded: false,
             input,
             readout: TextBlock::new().into(),
             pointer: Default::default(),
@@ -355,7 +437,8 @@ mod tests {
         let (input, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut inspector = Inspection {
             pane: 1,
-            modes: None,
+            current: None,
+            ssh_expanded: false,
             input,
             readout: TextBlock::new().text("Waiting").into(),
             pointer: Default::default(),
@@ -377,11 +460,16 @@ mod tests {
             synchronized: false,
             in_band_resize: false,
         };
-        inspector.refresh(Some(modes));
-        assert_eq!(inspector.modes, Some(modes));
+        let observation = PaneInspection {
+            connection_generation: 0,
+            modes,
+            ssh: None,
+        };
+        inspector.refresh(Some(observation.clone()));
+        assert_eq!(inspector.current, Some(observation.clone()));
         inspector.refresh(None);
-        assert!(inspector.modes.is_none());
-        inspector.refresh(Some(modes));
-        assert_eq!(inspector.modes, Some(modes));
+        assert!(inspector.current.is_none());
+        inspector.refresh(Some(observation.clone()));
+        assert_eq!(inspector.current, Some(observation));
     }
 }

@@ -2286,11 +2286,13 @@ async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "inspects live SSH modes and geometry from the CLI while PowerShell keeps input focus"]
 async fn native_inspect_reads_background_ssh_without_disturbing_powershell() {
-    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_server(false).await else {
         unreachable!()
     };
     let wire = remote.path().join("keyboard-input.bin");
     fs::write(&wire, []).unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    ssh.player.reconnect = false;
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join("ssh-wire"), wire.to_str().unwrap()).unwrap();
     drive_mixed_gui("inspect-pane-ui.ps1", &ssh, state.path());

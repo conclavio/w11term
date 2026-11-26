@@ -5,7 +5,7 @@ use crate::{events::SshConnectionPhase, options::SshOptions, prompts::Prompts};
 use anyhow::{Context, Result};
 use russh::{Channel, client};
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use tokio::{
     runtime,
     sync::{Semaphore, oneshot, watch},
@@ -24,9 +24,10 @@ pub(crate) static NETWORK: LazyLock<runtime::Runtime> = LazyLock::new(|| {
 
 struct Link {
     // A forwarded connection owns its authenticated upstream transport.
-    _upstream: Option<ConnectionShare>,
+    upstream: Option<ConnectionShare>,
     handle: Arc<client::Handle<Handler>>,
     fingerprint: String,
+    verified_route: OnceLock<Arc<VerifiedSshRoute>>,
     options: SshOptions,
     known_hosts: Option<PathBuf>,
     runtime: runtime::Handle,
@@ -47,6 +48,22 @@ impl Drop for Link {
 #[derive(Clone)]
 pub struct ConnectionShare(Arc<Link>);
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct VerifiedSshPeer {
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub key_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_key_alias: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct VerifiedSshRoute {
+    pub destination: VerifiedSshPeer,
+    pub jump_hosts: Vec<VerifiedSshPeer>,
+}
+
 impl ConnectionShare {
     pub(super) fn new(
         handle: client::Handle<Handler>,
@@ -58,7 +75,8 @@ impl ConnectionShare {
         Self(Arc::new(Link {
             handle: Arc::new(handle),
             fingerprint,
-            _upstream: upstream,
+            verified_route: OnceLock::new(),
+            upstream,
             options,
             known_hosts: prompts.and_then(Prompts::known_hosts).map(PathBuf::from),
             runtime: runtime::Handle::current(),
@@ -99,6 +117,34 @@ impl ConnectionShare {
             options.port,
             &self.0.fingerprint,
         )
+    }
+    fn verified_route(&self) -> Arc<VerifiedSshRoute> {
+        self.0
+            .verified_route
+            .get_or_init(|| {
+                let mut jump_hosts: Vec<_> =
+                    std::iter::successors(self.0.upstream.as_ref(), |link| {
+                        link.0.upstream.as_ref()
+                    })
+                    .map(Self::verified_peer)
+                    .collect();
+                jump_hosts.reverse();
+                Arc::new(VerifiedSshRoute {
+                    destination: self.verified_peer(),
+                    jump_hosts,
+                })
+            })
+            .clone()
+    }
+    fn verified_peer(&self) -> VerifiedSshPeer {
+        let (host, user, port, key_fingerprint) = self.verified_endpoint();
+        VerifiedSshPeer {
+            host: host.into(),
+            user: user.into(),
+            port,
+            key_fingerprint: key_fingerprint.into(),
+            host_key_alias: self.0.options.host_key_alias.clone(),
+        }
     }
     pub(super) async fn open_shell(&self) -> Result<ShellChannel> {
         // russh doesn't close a bare Channel on drop. An opener cancelled
@@ -237,6 +283,10 @@ impl ShareSlot {
             .upgrade()
             .filter(|share| !share.0.handle.is_closed())
             .map(|share| (state.generation, (*share).clone()))
+    }
+    pub(crate) fn verified_route_at(&self, generation: u64) -> Option<Arc<VerifiedSshRoute>> {
+        let (current, link) = self.generation()?;
+        (current == generation).then(|| link.verified_route())
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
         self.changed.subscribe()

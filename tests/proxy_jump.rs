@@ -22,9 +22,10 @@ use tokio::{
 };
 use w11term::{
     events::Events,
-    options::{Authentication, JumpHost, SshOptions},
+    options::{Authentication, JumpHost, Source, SshOptions},
     profiles::ProfileStore,
     prompts::Prompts,
+    session::{Command, Session},
     ssh::{self, Event},
     terminal::TransportInput,
 };
@@ -346,6 +347,54 @@ async fn imported_config_fragments_connect_through_both_trusted_jumps_and_close_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_hop_trust_aliases_validate_certificates_without_changing_forwarding_addresses() {
     assert_imported_route(Some(["public-jump.keys", "inner-jump.keys", "shell.keys"])).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspection_reports_each_verified_peer_in_connection_order() {
+    let fixture = Fixture::start_with_aliases(Some([
+        "outer-inspect.invalid",
+        "inner-inspect.invalid",
+        "destination-inspect.invalid",
+    ]))
+    .await
+    .unwrap();
+    let session = Session::start(Source::Ssh(fixture.options.clone()));
+    let route = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            session.input.send(Command::ReadModes(reply)).unwrap();
+            let inspection = receive.await.unwrap();
+            if let Some(ssh) = inspection.ssh {
+                assert_eq!(inspection.connection_generation, 1);
+                break ssh;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("verified SSH route was never published");
+
+    let expected = fixture
+        .options
+        .proxy_jump
+        .iter()
+        .cloned()
+        .map(SshOptions::from)
+        .chain(std::iter::once(fixture.options.clone()));
+    assert_eq!(route.jump_hosts.len(), 2);
+    for (peer, expected) in route
+        .jump_hosts
+        .iter()
+        .chain([&route.destination])
+        .zip(expected)
+    {
+        assert_eq!(
+            (&peer.host, &peer.user, peer.port),
+            (&expected.host, &expected.user, expected.port)
+        );
+        assert_eq!(Some(&peer.key_fingerprint), expected.host_key.as_ref());
+        assert_eq!(peer.host_key_alias, expected.host_key_alias);
+    }
 }
 
 async fn assert_imported_route(aliases: Option<[&str; 3]>) {

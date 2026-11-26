@@ -359,7 +359,9 @@ async fn a_pause_in_output_runs_the_synchronized_presentation_watchdog() {
             wait_for(&input, |f| f.rows[0].as_str().trim_end() == "A").await;
             let (reply, result) = oneshot::channel();
             input.send(Command::ReadModes(reply)).unwrap();
-            assert!(result.await.unwrap().1.synchronized);
+            let inspection = result.await.unwrap();
+            assert!(inspection.modes.synchronized);
+            assert!(inspection.ssh.is_none());
             advance(Duration::from_millis(149)).await;
             assert_eq!(capture(&input).await.rows[0].as_str().trim_end(), "A");
             advance(Duration::from_millis(1)).await;
