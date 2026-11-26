@@ -136,11 +136,29 @@ function Finish-ObsoletePrompt($OldButton) {
     }
     Wait-NoPrompt
 }
+function Get-MultilinePasteChoice {
+    Find-Element 'Multiline paste warning' ([System.Windows.Automation.ControlType]::ComboBox)
+}
+function Get-SelectedMultilinePasteChoice {
+    $field = Get-MultilinePasteChoice
+    if ($field) {
+        $selection = @($field.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection())
+        if ($selection.Count -eq 1) { $selection[0].Current.Name }
+    }
+}
 function Choose-Setting([string]$Name) {
-    $choice = Wait-Until "multiline paste preference '$Name'" {
-        Find-Element $Name ([System.Windows.Automation.ControlType]::RadioButton)
+    $field = Wait-Until 'multiline paste warning dropdown' { Get-MultilinePasteChoice }
+    $field.SetFocus()
+    $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $choice = Wait-Until "visible multiline paste option '$Name'" {
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem) -Visible
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until "multiline paste option '$Name' selected" {
+        (Get-SelectedMultilinePasteChoice) -ceq $Name
+    }
+    $dropdown = (Get-MultilinePasteChoice).GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($dropdown.Current.ExpandCollapseState -eq 'Expanded') { $dropdown.Collapse() }
 }
 function Read-InteractionSettings {
     $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
@@ -207,6 +225,9 @@ try {
     Terminal-Marker 'after-large/'
 
     Run-Palette 'Settings'
+    $null = Wait-Until 'Automatic multiline paste option selected by default' {
+        (Get-SelectedMultilinePasteChoice) -ceq 'Automatic'
+    }
     Choose-Setting 'Always'
     $null = Wait-Until 'saved Always multiline preference' {
         (Read-InteractionSettings).multiLinePasteWarning -ceq 'always'
@@ -243,6 +264,9 @@ try {
     if ((Control @('get-text','--pane',"$local")).text.Contains('discard-focus')) { throw 'Pending SSH text reached PowerShell' }
     Back-ToSsh
     Run-Palette 'Settings'
+    $null = Wait-Until 'saved Always multiline paste option restored in Settings' {
+        (Get-SelectedMultilinePasteChoice) -ceq 'Always'
+    }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $byName = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Warn about large pastes')
     $canToggle = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::IsTogglePatternAvailableProperty,$true)

@@ -382,6 +382,13 @@ pub enum InteractionField {
     Osc52,
     Osc52ForegroundOnly,
 }
+
+const MULTILINE_PASTE_CHOICES: [(MultiLinePasteWarning, &str); 3] = [
+    (MultiLinePasteWarning::Automatic, "Automatic"),
+    (MultiLinePasteWarning::Always, "Always"),
+    (MultiLinePasteWarning::Never, "Never"),
+];
+
 enum SettingsEditor {
     Keyboard(keyboard_settings::KeyboardPage),
     Patterns(pattern_settings::PatternPage),
@@ -1212,7 +1219,7 @@ pub enum Message {
     FollowWindowsTextSize(bool),
     WindowsTextSizeChanged,
     Interaction(InteractionField, bool),
-    MultilinePasteWarning(MultiLinePasteWarning, bool),
+    MultilinePasteWarning(Option<usize>),
     TabMode(Option<usize>),
     PickTab(TabId),
     CaptureLost(TabId),
@@ -2575,23 +2582,18 @@ impl TerminalApp {
             );
         }
         children.push(TextBlock::new().text("Multiline paste warning").into());
-        for (mode, label) in [
-            (MultiLinePasteWarning::Automatic, "Automatic"),
-            (MultiLinePasteWarning::Always, "Always"),
-            (MultiLinePasteWarning::Never, "Never"),
-        ] {
-            children.push(
-                RadioButton::new()
-                    .group_name("Multiline paste warning")
-                    .automation_name(label)
-                    .is_checked(appearance.interaction.multi_line_paste_warning == mode)
-                    .on_checked(
-                        context
-                            .callback(move |checked| Message::MultilinePasteWarning(mode, checked)),
-                    )
-                    .content(label),
-            );
-        }
+        children.push(
+            ComboBox::new()
+                .automation_name("Multiline paste warning")
+                .items_source(MULTILINE_PASTE_CHOICES.map(|(_, label)| label))
+                .selected_index(
+                    MULTILINE_PASTE_CHOICES.iter().position(|(mode, _)| {
+                        *mode == appearance.interaction.multi_line_paste_warning
+                    }),
+                )
+                .on_selection_changed(context.callback(Message::MultilinePasteWarning))
+                .into(),
+        );
         children.push(TextBlock::new().text("Automatic warns when the application will receive multiple lines without bracketed paste. Raw paste always sends text without brackets.").text_wrapping(TextWrapping::Wrap).into());
         children.push(TextBlock::new().text("Clipboard copies contain plain text only. Alt+drag selects a block. Hold Shift to select or paste over a mouse-reporting TUI.").text_wrapping(TextWrapping::Wrap).into());
         children.push(TextBlock::new().text("Tab switcher").into());
@@ -6815,8 +6817,9 @@ impl Component for TerminalApp {
             }
             Message::Clipboard(action) => self.clipboard_action(action, context),
             Message::PaneDrop(action) => self.pane_drop_action(action, context),
-            Message::MultilinePasteWarning(mode, checked) => {
-                if checked {
+            Message::MultilinePasteWarning(index) => {
+                if let Some(&(mode, _)) = index.and_then(|index| MULTILINE_PASTE_CHOICES.get(index))
+                {
                     let mut appearance = self.appearance.read().unwrap().clone();
                     if appearance.interaction.multi_line_paste_warning != mode {
                         appearance.interaction.multi_line_paste_warning = mode;
