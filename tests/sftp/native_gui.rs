@@ -628,7 +628,11 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
     fs::write(
         remote.path().join("deferred-output.vt"),
         format!(
-            "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\x1b]133;D;6\x07\r\n"
+            concat!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07background check\r\n\x1b]133;C\x07\x1b]133;D;0\x07\r\n",
+                "\x1b]133;A\x07$ \x1b]133;B\x07{}\r\n\x1b]133;C\x07{}\x1b]133;D;6\x07\r\n"
+            ),
+            command, output,
         ),
     )
     .unwrap();

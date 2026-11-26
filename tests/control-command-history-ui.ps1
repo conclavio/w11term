@@ -31,10 +31,11 @@ function Get-Entry([int]$Id, [long]$Generation) {
     }
     return $entry
 }
-function Start-CommandWait([uint64]$After, [uint64]$Generation, [string]$Name, [string]$OutputFile) {
+function Start-CommandWait([uint64]$After, [uint64]$Generation, [string]$Name, [string]$OutputFile, [string]$Command) {
     $path = Join-Path $State "$Name.json"
     $arguments = @('--pid',"$($app.Id)",'wait-command','--pane',"$remote",'--after-id',"$After",'--connection-generation',"$Generation",'--timeout','15')
     if ($OutputFile) { $arguments += @('--output-file', ('"' + $OutputFile + '"')) }
+    if ($Command) { $arguments += @('--command', ('"' + $Command + '"'), '--require-success') }
     $process = Start-Process -FilePath $Cli -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $path
     try {
         $null = $process.Handle
@@ -58,7 +59,7 @@ function Complete-CommandWait($Wait, [int]$ExitCode) {
     try {
         if (!$process.WaitForExit(18000)) { throw "Command wait did not finish: $($Wait.Path)" }
         $reply = [IO.File]::ReadAllText($Wait.Path) | ConvertFrom-Json
-        if ($process.ExitCode -ne $ExitCode -or $reply.ok -ne ($ExitCode -eq 0)) {
+        if ($process.ExitCode -ne $ExitCode -or $reply.ok -ne ($ExitCode -ne 1)) {
             throw "Command wait returned exit $($process.ExitCode): $($reply | ConvertTo-Json -Compress)"
         }
         return $reply
@@ -132,15 +133,20 @@ try {
     $after = $listing.latest_id
     Expect-Failure @('wait-command','--pane',"$remote",'--after-id',"$after",'--connection-generation',"$v1",'--timeout','1') 'timed out'
     $waitFile = Join-Path $State 'new capture.txt'
-    $pending = Start-CommandWait $after $v1 'pending-command' $waitFile
+    $pending = Start-CommandWait $after $v1 'pending-command' $waitFile $command
     [IO.File]::Delete((Join-Path $peer 'hold-shell-output'))
-    $repeated = (Complete-CommandWait $pending 0).result
+    $repeated = (Complete-CommandWait $pending 2).result
     if ($repeated.pane -ne $remote -or $repeated.connection_generation -ne $v1 -or
-        $repeated.id -ne ($after + 1) -or $repeated.command -cne $command -or
+        $repeated.id -ne ($after + 2) -or $repeated.command -cne $command -or
         $repeated.exit_code -ne 6) {
         throw "Waiting for the repeated command returned the wrong record: $($repeated | ConvertTo-Json -Compress)"
     }
     Check-SavedOutput $repeated $waitFile
+    $unfiltered = Control @('wait-command','--pane',"$remote",'--after-id',"$after",'--connection-generation',"$v1")
+    if ($unfiltered.id -ne ($after + 1) -or $unfiltered.command -cne 'background check') {
+        throw "The unfiltered wait should return the first new capture: $($unfiltered | ConvertTo-Json -Compress)"
+    }
+    Expect-Failure @('wait-command','--pane',"$remote",'--after-id',"$after",'--connection-generation',"$v1",'--command','unreported','--timeout','1') 'timed out without a matching completed command'
     Check-FocusAndLock
 
     # Have the peer drop the original transport while this pane is still read-only.

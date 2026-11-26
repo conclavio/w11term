@@ -106,6 +106,7 @@ impl Registry {
         after_id: u64,
         connection_generation: u64,
         timeout_seconds: u64,
+        command: Option<&str>,
         output_file: Option<CommandOutputFile>,
     ) -> Result<Value> {
         ensure!(
@@ -124,16 +125,17 @@ impl Registry {
         let frames = Self::live_frames(&target).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
         let wait = async {
+            let mut cursor = after_id;
             loop {
                 let frame = frames.load();
                 check_generation(&frame, pane, connection_generation)?;
-                if let Some(entry) = next_command(&frame, after_id)? {
+                if let Some(entry) = matching_command(&frame, &mut cursor, command)? {
                     return Ok::<_, anyhow::Error>(Arc::clone(entry));
                 }
                 ensure!(
                     tokio::time::Instant::now() < deadline
                         && frames.changed(frame.generation, deadline).await,
-                    "wait-command timed out without a new completed command"
+                    "wait-command timed out without a matching completed command"
                 );
             }
         };
@@ -167,7 +169,12 @@ fn check_generation(frame: &Snapshot, pane: u64, expected: u64) -> Result<()> {
     Ok(())
 }
 
-fn next_command(frame: &Snapshot, after_id: u64) -> Result<Option<&Arc<CompletedCommand>>> {
+fn matching_command<'a>(
+    frame: &'a Snapshot,
+    cursor: &mut u64,
+    command: Option<&str>,
+) -> Result<Option<&'a Arc<CompletedCommand>>> {
+    let after_id = *cursor;
     ensure!(
         after_id <= frame.latest_command_id,
         "command ID is ahead of this pane; check the instance and pane ID"
@@ -175,15 +182,22 @@ fn next_command(frame: &Snapshot, after_id: u64) -> Result<Option<&Arc<Completed
     if after_id == frame.latest_command_id {
         return Ok(None);
     }
-    let next = frame
+    let mut newer = frame
         .command_history
         .iter()
-        .find(|entry| entry.id > after_id);
+        .skip_while(|entry| entry.id <= after_id)
+        .peekable();
     ensure!(
-        next.is_some_and(|entry| entry.id == after_id + 1),
+        newer.peek().is_some_and(|entry| entry.id == after_id + 1),
         "command history is no longer retained immediately after ID {after_id}; get a new cursor with list-commands"
     );
-    Ok(next)
+    let matched =
+        newer.find(|entry| command.is_none_or(|text| entry.command.as_deref() == Some(text)));
+    if matched.is_none() {
+        // These entries were seen and rejected. Their later eviction is safe.
+        *cursor = frame.latest_command_id;
+    }
+    Ok(matched)
 }
 
 async fn reply_command(
@@ -467,6 +481,40 @@ mod tests {
                 .to_string()
                 .contains("ahead of this pane")
         );
+    }
+
+    #[tokio::test]
+    async fn matching_advances_past_seen_nonmatches_but_rejects_an_unseen_gap() {
+        let (registry, session) = pane(concat!(
+            "\x1b]133;B\x07build  Ω\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+            "\x1b]133;B\x07Build Ω\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+            "\x1b]133;C\x07\x1b]133;D;0\x07",
+        ));
+        let target = registry.pane(23).unwrap();
+        let (frame, _) = Registry::capture(&target).await.unwrap();
+        let mut cursor = 0;
+        let text = Some("Build  Ω");
+        assert!(
+            matching_command(&frame, &mut cursor, text)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cursor, 3);
+        session.input.send(Command::SetReadOnly(false)).unwrap();
+        let mut more = "\x1b]133;C\x07\x1b]133;D;0\x07".repeat(63);
+        more.push_str("\x1b]133;B\x07Build  Ω\r\n\x1b]133;C\x07\x1b]133;D;7\x07");
+        session.input.send(Command::Paste(more)).unwrap();
+        let (frame, _) = Registry::capture(&target).await.unwrap();
+        assert_eq!(frame.command_history.front().unwrap().id, cursor + 1);
+        let matched = matching_command(&frame, &mut cursor, text)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.id, 67);
+        assert_eq!(matched.exit_code, Some(7));
+
+        let mut stale_cursor = 2;
+        let error = matching_command(&frame, &mut stale_cursor, text).unwrap_err();
+        assert!(error.to_string().contains("no longer retained"));
     }
 
     #[tokio::test]

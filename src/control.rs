@@ -309,6 +309,8 @@ pub enum Request {
         after_id: u64,
         connection_generation: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         output_file: Option<CommandOutputFile>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
@@ -1249,6 +1251,7 @@ impl Registry {
                 pane,
                 after_id,
                 connection_generation,
+                command,
                 output_file,
                 timeout_seconds,
             } => {
@@ -1257,6 +1260,7 @@ impl Registry {
                     after_id,
                     connection_generation,
                     timeout_seconds,
+                    command.as_deref(),
                     output_file,
                 )
                 .await

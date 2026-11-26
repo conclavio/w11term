@@ -207,6 +207,17 @@ if (!$completion.ok) { throw $completion.error }
 $completion.result.exit_code
 ```
 
+Add `--command TEXT` to wait for the first capture with that exact recorded
+command line. Matching is case-sensitive and preserves spacing and line
+breaks. Captures whose shell integration supplied no command line are skipped.
+The cursor still advances past inspected captures, and a gap in uninspected
+history remains an error.
+
+Use `--require-success` to make the CLI exit 0 for shell exit code zero,
+2 for a nonzero or unknown shell exit status, and 1 if the wait or file save
+fails. The JSON reply and any requested output file are available for exit 2.
+This flag affects the CLI process and is independent of the pipe request.
+
 The wait defaults to 30 seconds and accepts 1 to 3600 seconds. It fails if the
 pane closes, its SSH connection ends, or the next capture has already fallen
 out of the retained history. After a gap or reconnect, take a new cursor with
@@ -231,6 +242,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"list-commands","pane":2,"status":"failed"}
 {"verb":"get-command","pane":2,"id":5,"connection_generation":1}
 {"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"timeout_seconds":60}
+{"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"command":"make test"}
 {"verb":"wait-command","pane":2,"after_id":5,"connection_generation":1,"output_file":{"path":"C:\\Logs\\capture.txt"}}
 ```
 

@@ -226,6 +226,7 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
                 pane: 1,
                 after_id: old.latest_command_id,
                 connection_generation: 0,
+                command: None,
                 timeout_seconds: 1,
                 output_file: None,
             },

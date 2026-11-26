@@ -18,7 +18,13 @@ const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-t
 struct Invocation {
     pid: Option<u32>,
     request: Request,
-    require_success: bool,
+    success_check: Option<SuccessCheck>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SuccessCheck {
+    Command,
+    SshGroup,
 }
 
 impl Invocation {
@@ -26,7 +32,7 @@ impl Invocation {
         Self {
             pid,
             request,
-            require_success: false,
+            success_check: None,
         }
     }
 }
@@ -211,7 +217,7 @@ async fn main() -> ExitCode {
         println!("{HELP}\n\n{}\n\n{}", sftp_args::HELP, automation::HELP);
         return ExitCode::SUCCESS;
     }
-    let mut require_success = false;
+    let mut success_check = None;
     let result = if args == ["instances"] {
         control::discover().await.map(|instances| {
             Reply::from_result(serde_json::to_value(instances).map_err(Into::into))
@@ -246,7 +252,7 @@ async fn main() -> ExitCode {
                 }
             }
             Ok(invocation) => {
-                require_success = invocation.require_success;
+                success_check = invocation.success_check;
                 control::call(invocation.pid, &invocation.request).await
             }
             Err(e) => Err(e),
@@ -254,17 +260,27 @@ async fn main() -> ExitCode {
     };
     let reply = result.unwrap_or_else(|e| Reply::from_result(Err(e)));
     println!("{}", serde_json::to_string(&reply).unwrap());
-    cli_exit_code(&reply, require_success)
+    cli_exit_code(&reply, success_check)
 }
 
-fn cli_exit_code(reply: &Reply, require_success: bool) -> ExitCode {
+fn cli_exit_code(reply: &Reply, success_check: Option<SuccessCheck>) -> ExitCode {
     if !reply.ok {
         return ExitCode::FAILURE;
     }
-    if !require_success {
+    let Some(success_check) = success_check else {
         return ExitCode::SUCCESS;
+    };
+    let Some(result) = reply.result.as_ref() else {
+        return ExitCode::FAILURE;
+    };
+    if success_check == SuccessCheck::Command {
+        return if result["exit_code"].as_i64() == Some(0) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        };
     }
-    let Some(run) = reply.result.as_ref().and_then(|result| result.get("run")) else {
+    let Some(run) = result.get("run") else {
         return ExitCode::FAILURE;
     };
     let Some(recipients) = run.get("recipients").and_then(serde_json::Value::as_array) else {
@@ -302,7 +318,7 @@ mod tests {
                 .map(str::to_owned),
         )
         .unwrap();
-        assert!(invocation.require_success);
+        assert_eq!(invocation.success_check, Some(SuccessCheck::SshGroup));
         assert_eq!(
             serde_json::to_value(invocation.request).unwrap(),
             serde_json::json!({
@@ -334,7 +350,7 @@ mod tests {
             })))
         };
         assert_eq!(
-            cli_exit_code(&outcome(success.clone()), true),
+            cli_exit_code(&outcome(success.clone()), Some(SuccessCheck::SshGroup)),
             ExitCode::SUCCESS
         );
         for (field, bad) in [
@@ -348,11 +364,17 @@ mod tests {
             recipient[field] = bad;
             let reply = outcome(recipient);
             assert!(reply.ok);
-            assert_eq!(cli_exit_code(&reply, true), ExitCode::from(2));
-            assert_eq!(cli_exit_code(&reply, false), ExitCode::SUCCESS);
+            assert_eq!(
+                cli_exit_code(&reply, Some(SuccessCheck::SshGroup)),
+                ExitCode::from(2)
+            );
+            assert_eq!(cli_exit_code(&reply, None), ExitCode::SUCCESS);
         }
         assert_eq!(
-            cli_exit_code(&Reply::from_result(Err(anyhow::anyhow!("timeout"))), true),
+            cli_exit_code(
+                &Reply::from_result(Err(anyhow::anyhow!("timeout"))),
+                Some(SuccessCheck::SshGroup)
+            ),
             ExitCode::FAILURE
         );
     }
@@ -1034,6 +1056,7 @@ mod tests {
                     after_id: 0,
                     connection_generation: 0,
                     timeout_seconds: 2,
+                    command: None,
                     output_file: None
                 }
             )
@@ -1049,6 +1072,47 @@ mod tests {
         ] {
             assert!(parse_line(line).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn exact_command_wait_preserves_text_and_can_check_shell_success() {
+        let command = "Build  Ω";
+        let invocation = parse_invocation(
+            [
+                "wait-command",
+                "--pane",
+                "7",
+                "--after-id",
+                "5",
+                "--connection-generation",
+                "1",
+                "--command",
+                command,
+                "--require-success",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(invocation.success_check, Some(SuccessCheck::Command));
+        let request = serde_json::to_value(invocation.request).unwrap();
+        assert_eq!(request["command"], command);
+        assert!(request.get("require_success").is_none());
+
+        for (code, expected) in [
+            (Some(0), ExitCode::SUCCESS),
+            (Some(17), ExitCode::from(2)),
+            (None, ExitCode::from(2)),
+        ] {
+            let reply = Reply::from_result(Ok(serde_json::json!({"exit_code":code})));
+            assert_eq!(cli_exit_code(&reply, Some(SuccessCheck::Command)), expected);
+            assert_eq!(cli_exit_code(&reply, None), ExitCode::SUCCESS);
+        }
+        let timeout = Reply::from_result(Err(anyhow::anyhow!("timeout")));
+        assert_eq!(
+            cli_exit_code(&timeout, Some(SuccessCheck::Command)),
+            ExitCode::FAILURE
+        );
     }
 
     #[test]
