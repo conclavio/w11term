@@ -116,15 +116,15 @@ try {
         throw 'The previous SSH generation could still send input'
     }
     $current = $connected.result.connection_generation
-    $baseline = Control @('get-text','--pane',"$remote")
-    if ($baseline.connection_generation -ne $current) { throw 'Screen baseline came from another SSH generation' }
+    $screenBaseline = Control @('get-text','--pane',"$remote")
+    if ($screenBaseline.connection_generation -ne $current) { throw 'Screen baseline came from another SSH generation' }
     $written = Control @('send-text','--pane',"$remote",'--no-paste','--connection-generation',"$current",$marker)
     if ($written.pane -ne $remote -or $written.connection_generation -ne $current -or $written.bytes_written -ne $marker.Length) {
         throw 'Scoped SSH write did not acknowledge the replacement generation'
     }
-    $match = Control @('wait-for-text','--pane',"$remote",'--connection-generation',"$current",'--after-frame',"$($baseline.generation)",'--timeout','15',$marker)
+    $match = Control @('wait-for-text','--pane',"$remote",'--connection-generation',"$current",'--after-frame',"$($screenBaseline.generation)",'--timeout','15',$marker)
     if ($match.pane -ne $remote -or $match.connection_generation -ne $current -or !$match.matched -or
-        $match.generation -le $baseline.generation) {
+        $match.generation -le $screenBaseline.generation) {
         throw 'The screen match did not report a newer frame from the replacement SSH generation'
     }
     Reject-Retry $palette.ssh_retry_token
