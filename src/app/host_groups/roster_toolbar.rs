@@ -1,5 +1,7 @@
 use super::*;
 
+mod scope;
+
 const UPLOAD: &str = "Upload files…";
 const DOWNLOAD: &str = "Download files…";
 const EXPORT_VARIABLES: &str = "Export group variables…";
@@ -66,7 +68,7 @@ pub(super) fn view(
                 .grid_column(1)
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
-                .children((display, actions)),
+                .children((scope::button(id, page, ctx), display, actions)),
         ))
 }
 

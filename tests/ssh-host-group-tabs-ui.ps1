@@ -18,6 +18,18 @@ $edit = [System.Windows.Automation.ControlType]::Edit
 $comboBox = [System.Windows.Automation.ControlType]::ComboBox
 $listItem = [System.Windows.Automation.ControlType]::ListItem
 $selectionItem = [System.Windows.Automation.SelectionItemPattern]::Pattern
+$groupScope = 'Group panes'
+$windowScope = 'All window panes'
+
+function Find-RosterScope {
+    foreach ($scope in $groupScope, $windowScope) {
+        if (Find-Element $scope $button -Visible) { return $scope }
+    }
+}
+function Invoke-RosterScopeAction([string]$Name) {
+    $scope = Wait-Until 'named roster scope button' { Find-RosterScope }
+    Invoke-NativeMenuAction $scope $Name
+}
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -435,7 +447,7 @@ try {
         !(Find-Element 'Find SSH host in group' $edit) -and (Find-Element 'Host filter' $edit)
     }
     Wait-Tab $westTab
-    (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
+    Invoke-NativeMenuAction $groupScope 'Show all window SSH panes'
     $null = Wait-Until 'the window-wide roster includes the running East pane' {
         Find-Element "Pane $east${dot}Connected${dot}Waiting for a fresh prompt"
     }
@@ -468,7 +480,7 @@ try {
     Wait-Tab $westTab
     Expect-Choice 'Filter host state' 'Ready'
     Choose-Option 'Filter host state' 'All host states'
-    (Wait-CheckBox 'Show all window SSH panes' On).Toggle()
+    Invoke-NativeMenuAction $windowScope 'Show group panes only'
 
     Click "Focus result pane $west"
     Wait-Focus $west
@@ -477,15 +489,15 @@ try {
     $null = Wait-Until 'the run picker is also available from a terminal tab' { Find-Element $westRun $button }
     Press-Key 13
     Wait-Tab $westTab
-    (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
+    Invoke-NativeMenuAction $groupScope 'Show all window SSH panes'
     (Wait-CheckBox $eastName Off).Toggle()
     $null = Wait-CheckBox $eastName On
-    (Wait-CheckBox 'Show all window SSH panes' On).Toggle()
+    Invoke-NativeMenuAction $windowScope 'Show group panes only'
     $null = Wait-Until 'the East pane leaves the West scope' { !(Find-Element "Focus pane $east" $button) }
-    (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
+    Invoke-NativeMenuAction $groupScope 'Show all window SSH panes'
     $null = Wait-CheckBox $eastName Off
     $null = Wait-CheckBox $westName On
-    (Wait-CheckBox 'Show all window SSH panes' On).Toggle()
+    Invoke-NativeMenuAction $windowScope 'Show group panes only'
 
     Select-Tab $eastTab
     Expect-Field 'Group command' 'east-only draft'
@@ -513,7 +525,7 @@ try {
     Select-Tab $eastTab
     (Field 'Host filter').SetValue('')
     $manage = 'Manage live panes' + [char]0x2026
-    Click $manage
+    Invoke-RosterScopeAction $manage
     $null = Wait-CheckBox "Include $eastName" On
     $null = Wait-CheckBox "Include $westName" Off
     (Field 'Find SSH panes').SetValue("WEST $($config.West.port)")
@@ -524,9 +536,9 @@ try {
     $null = Wait-CheckBox "Include $westName" On
     Click 'Cancel'
     $null = Wait-Until 'cancel leaves the committed East roster intact' {
-        (Find-Element $manage $button) -and !(Find-Element "Focus pane $west" $button)
+        (Find-Element $groupScope $button -Visible) -and !(Find-Element "Focus pane $west" $button)
     }
-    Click $manage
+    Invoke-RosterScopeAction $manage
     (Wait-CheckBox "Include $westName" Off).Toggle()
     $null = Wait-CheckBox "Include $westName" On
     Click 'Apply membership'
@@ -557,14 +569,14 @@ try {
     Wait-Tab $eastTab
     $null = Wait-Until 'West receives the intentionally selected command' { Find-Element "$westName${dot}Exit 0" }
 
-    Click $manage
+    Invoke-RosterScopeAction $manage
     (Wait-CheckBox "Include $westName" On).Toggle()
     $null = Wait-CheckBox "Include $westName" Off
     Click 'Apply membership'
     $null = Wait-Until 'removal hides West on the named East roster' {
-        (Find-Element $manage $button) -and !(Find-Element "Focus pane $west" $button)
+        (Find-Element $groupScope $button -Visible) -and !(Find-Element "Focus pane $west" $button)
     }
-    (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
+    Invoke-NativeMenuAction $groupScope 'Show all window SSH panes'
     $null = Wait-CheckBox $westName Off
     Select-Tab $westTab
     $null = Wait-CheckBox $westName On
@@ -672,7 +684,7 @@ try {
 
     Select-Tab $eastTab
     Choose-SavedGroup 'Fleet Mixed'
-    Click $manage
+    Invoke-RosterScopeAction $manage
     (Wait-CheckBox "Include $westName" Off).Toggle()
     $null = Wait-CheckBox "Include $westName" On
     Click 'Apply membership'
@@ -682,16 +694,16 @@ try {
     Expect-Field 'Host filter' 'east'
     $update = 'Update saved group' + [char]0x2026
     $original = [IO.File]::ReadAllBytes($profiles)
-    Click $update
+    Invoke-RosterScopeAction $update
     $null = Wait-Until 'the roster review targets its source group and includes unchecked, hidden West' {
         (Find-Element "Update saved SSH group${dot}Fleet East") -and (Find-Element 'Add profile West')
     }
     Click 'Cancel'
-    $null = Wait-Until 'cancelling the roster review returns to the tab' { Find-Element $update $button }
+    $null = Wait-Until 'cancelling the roster review returns to the tab' { Find-RosterScope }
     if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($profiles)) -cne
             [Convert]::ToBase64String($original)) { throw 'Cancelling the roster review edited the catalog' }
 
-    Click $update
+    Invoke-RosterScopeAction $update
     $null = Wait-Until 'West is available at the start of the review' { Find-Element 'Add profile West' }
     $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
     $changed.profiles.PSObject.Properties.Remove('West')
@@ -704,9 +716,9 @@ try {
     }
     [IO.File]::WriteAllBytes($profiles, $original)
     Click 'Cancel'
-    $null = Wait-Until 'the updated preview closes' { Find-Element $update $button }
+    $null = Wait-Until 'the updated preview closes' { Find-RosterScope }
 
-    Click $update
+    Invoke-RosterScopeAction $update
     $null = Wait-Until 'the roster review proposes West' { Find-Element 'Add profile West' }
     $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
     $changed.ssh_host_groups.'Fleet East' = @('East', 'North')
@@ -752,7 +764,7 @@ try {
     }
     Click 'Back to SSH group'
 
-    $null = Wait-CheckBox 'Show all window SSH panes' On
+    $null = Wait-Until 'the scope button reports all window panes' { Find-Element $windowScope $button -Visible }
     Select-Tab $westTab
     Open-GroupCommandSearch 'apply recipient canaries'
     $null = Wait-Until 'the West group does not offer the East group canaries' {
@@ -779,7 +791,7 @@ try {
     [IO.File]::WriteAllBytes($profiles, $beforePresetEdit)
     Open-GroupCommandSearch 'apply CANARIES recipient'
     Accept-GroupCommandWithEnter $applyCanaries
-    $null = Wait-CheckBox 'Show all window SSH panes' Off
+    $null = Wait-Until 'applying a recipient set restores group scope' { Find-Element $groupScope $button -Visible }
     Expect-Field 'Host filter' ''
     Expect-Field 'Group command' 'retained roster draft'
     $null = Wait-CheckBox $eastName On
@@ -819,8 +831,13 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-Until 'only the canary is in the new roster' {
         (Find-Element "Reused 1${dot}Opened 0 for Fleet East${dot}Skipped 1") -and
-            !(Find-Element "Focus pane $west" $button) -and !(Find-Element $update $button)
+            !(Find-Element "Focus pane $west" $button)
     }
+    $null = Get-NativeMenuAction $groupScope 'Show all window SSH panes'
+    if (Find-Element $update ([System.Windows.Automation.ControlType]::MenuItem) -Visible) {
+        throw 'The partial tab offered to replace saved group membership'
+    }
+    Close-NativeMenu 'Show all window SSH panes'
     if (@((Control @('list')).sessions).Count -ne 4 -or
         [Convert]::ToBase64String([IO.File]::ReadAllBytes($profiles)) -cne
             [Convert]::ToBase64String($beforePresetLaunch)) {
@@ -893,7 +910,7 @@ try {
     Press-Key 0x79
     Select-TabSearchResult $eastTab $eastTab
     Expect-Field 'Group command' 'retained roster draft'
-    Click $manage
+    Invoke-RosterScopeAction $manage
     (Wait-CheckBox "Include $westName" On).Toggle()
     $null = Wait-CheckBox "Include $westName" Off
     Click 'Apply membership'
@@ -904,7 +921,7 @@ try {
     }
     Click 'Back to SSH group'
     $null = Wait-CheckBox $eastName On
-    Click $update
+    Invoke-RosterScopeAction $update
     $null = Wait-Until 'a second review uses the just-saved roster' { Find-Element 'Remove profile West' }
     Click 'Save roster changes'
     $null = Wait-Until 'the second update is saved' { Find-Element 'Saved live membership for Fleet East' }

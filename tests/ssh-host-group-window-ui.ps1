@@ -120,12 +120,12 @@ try {
     }
     $window = $subsetHwnd
     $null = Wait-CheckBox "East${dot}test@127.0.0.1:$($portByName.East.port)${dot}Pane $($subset.id)" On
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($subsetHwnd)
-    $update = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty, ('Update saved group' + [char]0x2026))
-    if ($root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $update)) {
+    $null = Get-NativeMenuAction 'Group panes' 'Show all window SSH panes'
+    $update = 'Update saved group' + [char]0x2026
+    if (Find-Element $update ([System.Windows.Automation.ControlType]::MenuItem) -Visible) {
         throw 'The partial roster offered to replace saved group membership'
     }
+    Close-NativeMenu 'Show all window SSH panes'
     Close-TestWindow $subsetHwnd
     $window = $originHwnd
     $null = Wait-Until 'closing the reviewed window restores the unchanged source roster' {

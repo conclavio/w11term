@@ -7,7 +7,6 @@ mod duplicate;
 mod roster_update;
 mod toolbar;
 pub use roster_update::Action as RosterUpdateAction;
-pub(super) use roster_update::update_button;
 
 #[derive(Default)]
 pub(super) struct SavedUi {
@@ -158,6 +157,10 @@ impl SavedUi {
         self.roster_update.can_update()
     }
 
+    pub(super) fn has_unsaved_roster_defaults(&self, current: SshRosterDefaults) -> bool {
+        self.roster_defaults != current
+    }
+
     pub(super) fn origin(&self) -> Option<(&str, &[String])> {
         self.roster_update.origin()
     }
@@ -215,30 +218,6 @@ pub enum Action {
         group: String,
         defaults: SshRosterDefaults,
     },
-}
-
-pub(super) fn roster_defaults_button(
-    id: TabId,
-    page: &HostGroup,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    let Some((name, _)) = page.saved.origin() else {
-        return View::empty();
-    };
-    let group = name.to_owned();
-    let defaults = page.roster_preferences;
-    Button::new()
-        .is_enabled(defaults != page.saved.roster_defaults)
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(HostAction::Saved(
-                id,
-                Action::SaveRosterDefaults {
-                    group: group.clone(),
-                    defaults,
-                },
-            ))
-        }))
-        .content("Save roster defaults")
 }
 
 pub enum DraftAction {

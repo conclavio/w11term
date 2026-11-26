@@ -2261,31 +2261,6 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             }),
-            page.roster.as_ref().map_or_else(View::empty, |roster| {
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        CheckBox::new()
-                            .automation_name("Show all window SSH panes")
-                            .is_checked(roster.show_window)
-                            .on_is_checked_changed(ctx.callback(move |show| {
-                                Message::HostGroup(Action::ShowWindowRoster(id, show))
-                            }))
-                            .content("Show all window SSH panes"),
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::Membership(id, membership::Action::Open))
-                            }))
-                            .content(membership::LABEL),
-                        if page.saved.can_update_roster() {
-                            saved::update_button(id, ctx)
-                        } else {
-                            View::empty()
-                        },
-                        saved::roster_defaults_button(id, page, ctx),
-                    ))
-            }),
             filter_error.map_or_else(View::empty, |error| {
                 TextBlock::new()
                     .text(error)

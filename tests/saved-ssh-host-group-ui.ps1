@@ -243,6 +243,26 @@ try {
     $saveDefaults = 'Save roster defaults'
     $hideOutput = 'Hide last command output'
     $allReady = 'Require all recipients ready'
+    $scope = 'Group panes'
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $originalBounds = $root.Current.BoundingRectangle
+    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
+    $resize.Resize([Math]::Round(640 * $scale), $originalBounds.Height)
+    $null = Wait-Until 'named roster scope fits on the compact roster toolbar' {
+        $scopeButton = Find-Element $scope $button -Visible
+        $selectButton = Find-Element 'Deselect shown' $button -Visible
+        $displayButton = Find-Element 'Roster display' $button -Visible
+        if (!$scopeButton -or !$selectButton -or !$displayButton) { return }
+        $bounds = $root.Current.BoundingRectangle
+        $current = $scopeButton.Current.BoundingRectangle
+        $select = $selectButton.Current.BoundingRectangle
+        $display = $displayButton.Current.BoundingRectangle
+        $bounds.Width -lt $originalBounds.Width -and
+            $current.Top -lt $select.Bottom -and $current.Bottom -gt $select.Top -and
+            $select.Right -le $current.Left -and $current.Right -le $display.Left
+    }
+    $resize.Resize($originalBounds.Width, $originalBounds.Height)
     Roster-Choice 'Tab order'
     Roster-Choice 'Host label' -Choose
     Set-NativeExpansion 'Dispatch settings' $true
@@ -258,7 +278,7 @@ try {
     $null = Wait-CheckBox $allReady On
     Set-NativeExpansion 'Dispatch settings' $false
     Invoke-NativeMenuAction 'Roster display' 'Show last command output'
-    Click $saveDefaults
+    Invoke-NativeMenuAction $scope $saveDefaults
     $null = Wait-Until 'the defaults are saved for Fleet' {
         if (!(Find-Element 'Saved roster defaults')) { return }
         $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
@@ -288,10 +308,11 @@ try {
     Set-NativeExpansion 'Dispatch settings' $false
     $null = Get-NativeMenuAction 'Roster display' $hideOutput
     Close-NativeMenu $hideOutput
-    $null = Wait-Until 'the loaded preferences match the saved defaults' {
-        $save = Find-Element $saveDefaults $button
-        $save -and !$save.Current.IsEnabled
+    $save = Get-NativeMenuAction $scope $saveDefaults -AllowDisabled
+    if ($save.Current.IsEnabled) {
+        throw 'The loaded preferences did not match the saved defaults'
     }
+    Close-NativeMenu $saveDefaults
     $sessions = Wait-Until 'the restarted window has the group panes' {
         $current = @((Control @('list')).sessions)
         if ($current.Count -eq 3) { ,$current }
