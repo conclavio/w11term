@@ -373,6 +373,8 @@ Choose **More → Panes → Move tab to new window** to move the whole terminal 
 
 Use **More → Panes → Move tab to existing window** to move the live tab back into another window in the same process. Choose a destination by its window ID and active tab title. The moved tab joins the end of the destination’s tab strip and becomes selected. The command palette also lists the available destinations.
 
+Both move commands are also on the tab header’s right-click menu. Moving a background tab keeps the source window’s current tab selected.
+
 To monitor an SSH or local shell, choose **More → Panes → Enable read-only pane input** or search for **read-only** in the command palette. The pane’s status line and picker entry show **Read-only**, and `w11term-cli list` reports `read_only: true`. Typing, IME commits, paste, and application mouse input are blocked. A control-pipe write gets a read-only error. Output, terminal query replies, resizing, selection, copying, and scrollback search continue. Use **Disable read-only pane input** to resume typing. The lock follows the live pane when it moves. Newly opened panes start unlocked. Closing panes and SFTP file operations are still available.
 
 To trade places with a neighboring pane in the same tab, choose **More → Panes → Swap pane left**, **right**, **up**, or **down**. Focus follows your shell. Both panes keep their sessions and IDs, and the dividers stay in place. When two panes share an edge with yours, the action uses the same neighbor as directional focus. Unzoom to swap panes. All four actions are searchable in the command palette and can be assigned shortcuts under **Settings → Keyboard**.

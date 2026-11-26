@@ -19,6 +19,12 @@ async fn native_move_live_split_to_existing_window() {
     run("Existing", b"ssh-probe/existing-window/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "moves a background split from its tab header and preserves the other window's active session"]
+async fn native_move_background_tab_from_context_menu() {
+    run("Context", b"ssh-probe/existing-window/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -33,12 +39,18 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     fs::write(&trace, []).unwrap();
     fs::write(
         state.path().join("profiles.json"),
-        serde_json::to_vec(&json!({"profiles":{"window-ssh": ssh}})).unwrap(),
+        serde_json::to_vec(&json!({"profiles":{
+            "window-ssh": ssh,
+            "Destination PowerShell":{
+                "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]
+            }
+        }}))
+        .unwrap(),
     )
     .unwrap();
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9"}}"#,
+        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10"}}"#,
     )
     .unwrap();
     let local = |name| {
@@ -46,7 +58,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         "shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}})
     };
     let leaf = |slot, source: Value| json!({"type":"leaf","slot":slot,"source":source});
-    let workspace = json!({"active_tab":0,"tabs":[
+    let workspace = json!({"active_tab": usize::from(first_close == "Context"),"tabs":[
         {"title":"Cockpit tools","focused":1,"layout":{"type":"split","axis":"columns","ratio":0.375,
             "first":leaf(1,json!({"kind":"saved_profile","value":"window-ssh"})),
             "second":leaf(2,local("Moved PowerShell"))}},

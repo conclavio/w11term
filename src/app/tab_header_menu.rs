@@ -68,7 +68,12 @@ impl Binding {
 }
 
 impl TerminalApp {
-    pub(super) fn tab_header_menu(&self, group: TabId, page: &Page) -> Menu {
+    pub(super) fn tab_header_menu(
+        &self,
+        group: TabId,
+        page: &Page,
+        window_items: &[MenuItem; 2],
+    ) -> Menu {
         let pinned = self.tabs.group_is_pinned(group);
         let mut items = Vec::new();
         if matches!(page, Page::Terminal(_)) {
@@ -77,8 +82,9 @@ impl TerminalApp {
                 self.duplicate_tab_item_for(Some(group)),
                 tab_colors::menu(true, self.tabs.group_color(group)),
                 MenuItem::item("pin", if pinned { UNPIN } else { PIN }),
-                MenuItem::separator("close-separator"),
             ]);
+            items.extend(window_items.iter().cloned());
+            items.push(MenuItem::separator("close-separator"));
         }
         items.push(command_menu_item("close", CLOSE, !pinned));
         let bindings = self.tab_header_bindings.borrow();
@@ -113,10 +119,15 @@ impl TerminalApp {
         ) {
             return;
         }
+        if let Some(window) = tab_windows::menu_window(label) {
+            self.move_tab_group_to_window(group, Some(window), context);
+            return;
+        }
         match label.split("    ").next().unwrap_or(label) {
             RENAME => self.edit_tab_title(tab_title::Action::ShowGroup(group), context),
             PIN => self.set_tab_pinned(group, true, context),
             UNPIN => self.set_tab_pinned(group, false, context),
+            tab_windows::NEW_WINDOW_LABEL => self.move_tab_group_to_window(group, None, context),
             label if label == KeyAction::DuplicateTabLayout.binding().label => {
                 self.duplicate_tab_from_menu(group, context);
             }

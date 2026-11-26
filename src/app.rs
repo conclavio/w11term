@@ -1087,7 +1087,7 @@ fn tab_menu_message(label: String) -> Message {
         "Enable read-only pane input" => Message::SetPaneReadOnly(true),
         "Disable read-only pane input" => Message::SetPaneReadOnly(false),
         "Move pane to new tab" => Message::MovePaneToTab,
-        "Move tab to new window" => Message::MoveTabToWindow,
+        tab_windows::NEW_WINDOW_LABEL => Message::MoveTabToWindow,
         "Move pane to existing tab…" => Message::Shortcut(Shortcut::MovePaneToExistingTab),
         "Paste" => Message::Paste,
         "Paste raw (no bracketed paste)" => Message::PasteRaw,
@@ -4133,6 +4133,7 @@ impl TerminalApp {
             self.taskbar.borrow_mut().show(hwnd, state);
         }
         let headers = self.tabs.headers();
+        let window_items = self.tab_window_items();
         let layout = title_tools::Layout::new(self.width, headers.len());
         self.tab_header_bindings
             .borrow_mut()
@@ -4204,7 +4205,7 @@ impl TerminalApp {
                                     .text_wrapping(TextWrapping::Wrap)
                                     .text(tooltip),
                             ))
-                            .menu(self.tab_header_menu(group, &tab.value.page)),
+                            .menu(self.tab_header_menu(group, &tab.value.page, &window_items)),
                     )
                 }),
             );
@@ -4646,6 +4647,7 @@ impl TerminalApp {
             };
         }
         let action = KeyAction::MovePaneToExistingTab;
+        let [new_window, existing_window] = self.tab_window_items();
         let binding = action.binding();
         let move_item = if self.move_source().is_some_and(|source| {
             self.tabs
@@ -4687,12 +4689,8 @@ impl TerminalApp {
             ),
             command_menu_item("restart-exited", RESTART_EXITED_PANE, can_restart),
             move_item,
-            if self.outgoing.is_none() && self.incoming.is_none() {
-                MenuItem::item("move-tab-window", "Move tab to new window")
-            } else {
-                MenuItem::disabled("move-tab-window", "Move tab to new window")
-            },
-            self.existing_window_menu(),
+            new_window,
+            existing_window,
             self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
             self.broadcast_menu(),
