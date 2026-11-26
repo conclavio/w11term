@@ -260,10 +260,10 @@ try {
     $failedDestination = Join-Path $State 'picker\batch background conflict\verified.bin'
     $null = Wait-Until 'partially completed batch lists both attempted item paths' {
         (Find-Element "Remote${dot}/shell directory/interrupted") -and
-            (Find-Element "Windows${dot}$completed") -and
+            (Test-TransferDestination $completed) -and
             (Find-Element "Failed${dot}File download") -and
             (Find-Element "Remote${dot}/shell directory/verified.bin") -and
-            (Find-Element "Windows${dot}$failedDestination")
+            (Test-TransferDestination $failedDestination)
     }
     $batchId = $results[1].data.transfer_id
     Assert-Explorer "Show in File Explorer for item 1 of transfer $batchId" 'select' $completed
@@ -271,8 +271,12 @@ try {
         throw 'A failed download offered to reveal the existing file'
     }
 } catch {
+    $failure = $_
+    $details = if ($window) {
+        try { (Get-TransferDetailLabels | Where-Object { $_ -match '^(Remote|Windows|Failed) ' }) -join ' | ' } catch { }
+    }
     $wire = if ($reader) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $reader)) }
-    throw "$_ at $($_.ScriptStackTrace). Server packets: $wire"
+    throw "$failure at $($failure.ScriptStackTrace). Transfer details: [$details]. Server packets: $wire"
 } finally {
     [IO.File]::Delete($readGate)
     if ($reader) { $reader.Dispose() }

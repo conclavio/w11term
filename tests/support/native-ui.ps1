@@ -309,6 +309,23 @@ function Set-NativeExpansion([string]$Name, [bool]$Expanded) {
         if ($Expanded) { $options.Expand() } else { $options.Collapse() }
     }
 }
+function Get-TransferDetailLabels {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $kind = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $kind)) {
+        $item.Current.Name
+    }
+}
+function Test-TransferDestination([string]$Path) {
+    $prefix = 'Windows ' + [char]0xb7 + ' '
+    foreach ($name in Get-TransferDetailLabels) {
+        if ($name.StartsWith($prefix, [StringComparison]::Ordinal) -and
+            [FixtureDialog]::SameDestination($Path, $name.Substring($prefix.Length))) {
+            return $true
+        }
+    }
+}
 function Get-SftpOptionsExpander {
     Get-NativeExpander 'File options'
 }

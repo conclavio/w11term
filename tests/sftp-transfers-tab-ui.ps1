@@ -161,7 +161,7 @@ try {
     $alphaLocal = Join-Path $State 'picker\alpha\bulk-alpha'
     $null = Wait-Until 'cancelled item paths and the skipped queue count' {
         (Find-Element "Remote${dot}/shell directory/bulk-alpha" $text) -and
-            (Find-Element "Windows${dot}$alphaLocal" $text) -and
+            (Test-TransferDestination $alphaLocal) -and
             (Find-Element '1 item did not start' $text)
     }
     if (Find-Element "Remote${dot}/shell directory/queued-alpha" $text) {
@@ -207,7 +207,7 @@ try {
     $betaLocal = Join-Path $State 'picker\beta\beta folder'
     $null = Wait-Until 'completed folder details replace the expanded cancelled batch' {
         (Find-Element "Remote${dot}/shell directory/beta folder" $text) -and
-            (Find-Element "Windows${dot}$betaLocal" $text) -and
+            (Test-TransferDestination $betaLocal) -and
             !(Find-Element '1 item did not start' $text)
     }
     $remoteAction = "Show remote entry for item 1 of transfer $secondId"
@@ -258,7 +258,7 @@ try {
         $saved.pane.label -cne 'second-ssh' -or $saved.ssh.host -cne $profile.host -or
         $saved.ssh.user -cne $profile.user -or $saved.ssh.port -ne $profile.port -or
         $saved.finished_unix_ms -ne $finished.timestamp_ms -or $saved.outcome -cne 'completed' -or
-        $saved.saved_download.kind -cne 'folder' -or $saved.saved_download.path -ine $betaLocal -or
+        $saved.saved_download.kind -cne 'folder' -or ![FixtureDialog]::SameDestination($betaLocal, $saved.saved_download.path) -or
         $saved.details.completed.Count -ne 1 -or
         $saved.details.completed[0].remote -cne '/shell directory/beta folder' -or
         $saved.details.completed[0].bytes_transferred -le 0) {
@@ -267,14 +267,18 @@ try {
     $stopped = $report.transfers[1]
     if ($stopped.transfer_id -cne $firstId -or $stopped.outcome -cne 'cancelled' -or !$stopped.background -or
         $stopped.finished_unix_ms -ne $cancelled[0].timestamp_ms -or $stopped.saved_download -or
-        $stopped.details.stopped.local -ine $alphaLocal -or
+        ![FixtureDialog]::SameDestination($alphaLocal, $stopped.details.stopped.local) -or
         $stopped.details.stopped.outcome -cne 'cancelled' -or $stopped.details.not_started -ne 1) {
         throw "Unexpected stopped transfer report: $($stopped | ConvertTo-Json -Depth 8 -Compress)"
     }
 } catch {
+    $failure = $_
+    $details = if ($window) {
+        try { (Get-TransferDetailLabels | Where-Object { $_ -match '^(Remote|Windows|Cancelled) | did not start$' }) -join ' | ' } catch { }
+    }
     $alphaWire = if ($alphaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $alphaTrace)) }
     $betaWire = if ($betaTrace) { [Text.Encoding]::UTF8.GetString((Read-PeerTrace $betaTrace)) }
-    throw "$_ at $($_.ScriptStackTrace). First peer: $alphaWire Second peer: $betaWire"
+    throw "$failure at $($failure.ScriptStackTrace). Transfer details: [$details]. First peer: $alphaWire Second peer: $betaWire"
 } finally {
     if ($waiting) {
         if (!$waiting.HasExited) { $waiting.Kill(); $waiting.WaitForExit() }
