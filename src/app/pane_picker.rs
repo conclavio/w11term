@@ -1,4 +1,5 @@
 use super::*;
+use tab_windows::{SearchScope, SearchTarget};
 use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
 mod running_commands;
 mod running_interrupt;
@@ -13,7 +14,7 @@ pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
 
 struct Preview {
     pane: u64,
-    frames: FrameStore,
+    source: PreviewSource,
     frame: Rc<RefCell<Arc<Snapshot>>>,
     summary: String,
     invalidator: Invalidator,
@@ -22,15 +23,15 @@ struct Preview {
 }
 
 impl Preview {
-    fn new(pane: u64, frames: FrameStore, appearance: &Appearance, font_size: Option<f32>) -> Self {
-        let snapshot = frames.load();
+    fn new(pane: u64, source: PreviewSource, appearance: &Appearance) -> Self {
+        let snapshot = source.frames.load();
         let summary = preview_summary(&snapshot);
         let frame = Rc::new(RefCell::new(snapshot));
         let invalidator = Invalidator::default();
         let canvas = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size_for(font_size),
+            appearance.terminal_font_size_for(source.font_size),
         )
         .map(|renderer| {
             let renderer = RefCell::new(renderer);
@@ -51,7 +52,7 @@ impl Preview {
         .ok();
         Self {
             pane,
-            frames,
+            source,
             frame,
             summary,
             invalidator,
@@ -68,7 +69,7 @@ impl Preview {
         {
             let pane = self.pane;
             let generation = self.frame.borrow().generation;
-            let frames = self.frames.clone();
+            let frames = self.source.frames.clone();
             self.watch = Some(ctx.spawn_background_with_rejection(
                 move |cancel| {
                     frames.wait_for_change(generation, || cancel.is_cancelled());
@@ -86,7 +87,7 @@ impl Preview {
         if self.pane != pane || self.frame.borrow().generation != generation {
             return;
         }
-        let latest = self.frames.load();
+        let latest = self.source.frames.load();
         if latest.generation != generation {
             self.summary = preview_summary(&latest);
             self.frame.replace(latest);
@@ -164,6 +165,7 @@ fn preview_summary(frame: &Snapshot) -> String {
         .join(" / ")
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct Choice {
     read_only: bool,
     pane: u64,
@@ -175,6 +177,7 @@ struct Choice {
     destination: String,
     tab_number: usize,
     pane_number: usize,
+    window: Option<u64>,
 }
 
 impl Choice {
@@ -220,12 +223,56 @@ impl Choice {
                 fields.push(text);
             }
         }
-        format!(
-            "{}  ·  Tab {} / pane {}",
-            fields.join("  ·  "),
-            self.tab_number,
-            self.pane_number
-        )
+        let pane = format!("Tab {} / pane {}", self.tab_number, self.pane_number);
+        let title = fields.join("  ·  ");
+        match self.window {
+            Some(window) => format!("{title}  ·  Window {window}  ·  {pane}"),
+            None => format!("{title}  ·  {pane}"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct PreviewSource {
+    frames: FrameStore,
+    font_size: Option<f32>,
+}
+
+impl PreviewSource {
+    fn from_live(live: &LiveTab) -> Self {
+        Self {
+            frames: live.session.frames.clone(),
+            font_size: live.font_size_override(),
+        }
+    }
+}
+
+pub(super) struct SearchPane {
+    choice: Choice,
+    source: PreviewSource,
+}
+
+impl PartialEq for SearchPane {
+    fn eq(&self, other: &Self) -> bool {
+        // A pane ID identifies one frame store for the lifetime of that pane.
+        self.choice == other.choice && self.source.font_size == other.source.font_size
+    }
+}
+
+impl SearchPane {
+    pub(super) fn pane(&self) -> u64 {
+        self.choice.pane
+    }
+
+    pub(super) fn preview(&self) -> PreviewSource {
+        self.source.clone()
+    }
+
+    fn row(&self, window: Option<u64>) -> Choice {
+        let mut row = self.choice.clone();
+        row.window = window;
+        row.title = self.source.frames.load().title.clone();
+        row
     }
 }
 
@@ -242,6 +289,14 @@ enum Mode {
 impl Mode {
     fn has_commands(self) -> bool {
         matches!(self, Self::Commands(_))
+    }
+
+    fn window_search(self) -> Option<SearchScope> {
+        match self {
+            Self::Commands(command_palette::Search::Tabs) => Some(SearchScope::Tabs),
+            Self::Focus => Some(SearchScope::Panes),
+            _ => None,
+        }
     }
 }
 
@@ -307,6 +362,15 @@ impl Picker {
             .collect();
         matches.sort_by_key(|(rank, _)| *rank);
         matches.into_iter().map(|(_, choice)| choice).collect()
+    }
+
+    fn replace_matches(&mut self, matches: Vec<Choice>) {
+        self.selected = self
+            .matches
+            .get(self.selected)
+            .and_then(|previous| matches.iter().position(|row| row.pane == previous.pane))
+            .unwrap_or_else(|| self.selected.min(matches.len().saturating_sub(1)));
+        self.matches = matches;
     }
 
     pub(super) fn move_by(&mut self, amount: isize) {
@@ -559,7 +623,7 @@ impl Picker {
 }
 
 impl TerminalApp {
-    fn picker_choices(&self, mode: Mode) -> Vec<Choice> {
+    fn local_pane_search_entries(&self, mode: Mode) -> Vec<SearchPane> {
         let excluded = match mode {
             Mode::Destination { source } => self.tabs.group_id(source),
             _ => None,
@@ -595,26 +659,64 @@ impl TerminalApp {
                         } else {
                             source_label(&live.source)
                         };
-                        choices.push(Choice {
-                            read_only: live.read_only.get(),
-                            pane_name: live.pane_name.as_ref().map(|n| n.as_str().to_owned()),
-                            tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
-                            pane: pane_id,
-                            label: label.clone(),
-                            title: live.session.frames.load().title.clone(),
-                            destination,
-                            profile: live.profile_name.clone(),
-                            tab_number: tab + 1,
-                            pane_number: pane + 1,
+                        choices.push(SearchPane {
+                            choice: Choice {
+                                read_only: live.read_only.get(),
+                                pane_name: live.pane_name.as_ref().map(|n| n.as_str().to_owned()),
+                                tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
+                                pane: pane_id,
+                                label: label.clone(),
+                                title: String::new(),
+                                destination,
+                                profile: live.profile_name.clone(),
+                                tab_number: tab + 1,
+                                pane_number: pane + 1,
+                                window: None,
+                            },
+                            source: PreviewSource::from_live(live),
                         });
                     }
                 }
             }
         }
         if let Some(roster) = roster {
-            choices.sort_by_key(|choice| roster[&choice.pane].0);
+            choices.sort_by_key(|entry| roster[&entry.pane()].0);
         }
         choices
+    }
+
+    pub(super) fn pane_search_entries(&self) -> Vec<SearchPane> {
+        self.local_pane_search_entries(Mode::Focus)
+    }
+
+    fn picker_choices(&self, mode: Mode, query: &str) -> Vec<Choice> {
+        if mode != Mode::Focus {
+            let choices = self
+                .local_pane_search_entries(mode)
+                .iter()
+                .map(|entry| entry.row(None))
+                .collect();
+            return Picker::filter(choices, query);
+        }
+        let Some((window_filter, stripped)) = tab_windows::window_query(query) else {
+            return Vec::new();
+        };
+        let local = self.registry.window_id();
+        let allowed = |window| window_filter.is_none_or(|filter| filter == window);
+        let mut choices = Vec::new();
+        if allowed(local) {
+            choices.extend(
+                self.pane_search_entries()
+                    .iter()
+                    .map(|entry| entry.row(None)),
+            );
+        }
+        for (window, entries) in self.sibling_pane_search_entries() {
+            if allowed(window) {
+                choices.extend(entries.iter().map(|entry| entry.row(Some(window))));
+            }
+        }
+        Picker::filter(choices, window_filter.map_or(query, |_| stripped.as_str()))
     }
 
     pub(super) fn open_command_palette(&mut self, ctx: &ComponentContext<Self>) {
@@ -643,19 +745,34 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
-    pub(super) fn active_tab_search(&self) -> std::sync::Weak<()> {
-        self.picker
-            .as_ref()
-            .filter(|picker| picker.mode == Mode::Commands(command_palette::Search::Tabs))
-            .map_or_else(std::sync::Weak::new, |picker| {
-                Arc::downgrade(&picker.launch)
-            })
+    pub(super) fn active_window_search(&self) -> Option<(SearchScope, std::sync::Weak<()>)> {
+        let picker = self.picker.as_ref()?;
+        Some((picker.mode.window_search()?, Arc::downgrade(&picker.launch)))
     }
 
-    pub(super) fn refresh_tab_search(&mut self) {
-        if self.active_tab_search().strong_count() > 0 {
-            self.refresh_open_commands();
+    pub(super) fn refresh_window_search(&mut self, ctx: &ComponentContext<Self>) {
+        match self
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.mode.window_search())
+        {
+            Some(SearchScope::Tabs) => self.refresh_open_commands(),
+            Some(SearchScope::Panes) => self.refresh_window_pane_search(ctx),
+            None => {}
         }
+    }
+
+    pub(super) fn refresh_window_pane_search(&mut self, ctx: &ComponentContext<Self>) {
+        let Some(picker) = self
+            .picker
+            .as_ref()
+            .filter(|picker| picker.mode == Mode::Focus)
+        else {
+            return;
+        };
+        let matches = self.picker_choices(picker.mode, &picker.query);
+        self.picker.as_mut().unwrap().replace_matches(matches);
+        self.sync_picker_preview(ctx);
     }
 
     pub(super) fn open_window_command_history(&mut self, ctx: &ComponentContext<Self>) {
@@ -968,15 +1085,8 @@ impl TerminalApp {
         else {
             return;
         };
-        let matches = Picker::filter(self.picker_choices(picker.mode), &picker.query);
-        let selected = picker
-            .matches
-            .get(picker.selected)
-            .and_then(|previous| matches.iter().position(|row| row.pane == previous.pane))
-            .unwrap_or_else(|| picker.selected.min(matches.len().saturating_sub(1)));
-        let picker = self.picker.as_mut().unwrap();
-        picker.matches = matches;
-        picker.selected = selected;
+        let matches = self.picker_choices(picker.mode, &picker.query);
+        self.picker.as_mut().unwrap().replace_matches(matches);
         self.sync_picker_preview(ctx);
     }
 
@@ -1083,7 +1193,7 @@ impl TerminalApp {
         } else if mode == Mode::Text {
             (vec![], vec![])
         } else {
-            (self.picker_choices(mode), vec![])
+            (self.picker_choices(mode, ""), vec![])
         };
         let active = self.tabs.active().and_then(AppTab::pane_id);
         let selected_tab = (mode == Mode::Commands(command_palette::Search::Tabs))
@@ -1098,8 +1208,8 @@ impl TerminalApp {
             .or_else(|| matches.iter().position(|row| Some(row.pane) == active))
             .unwrap_or(0);
         let launch = Arc::new(());
-        if mode == Mode::Commands(command_palette::Search::Tabs) {
-            self.watch_tab_search(&launch);
+        if let Some(scope) = mode.window_search() {
+            self.watch_window_search(scope, &launch);
         }
         let running_timer = if mode == Mode::Commands(command_palette::Search::RunningCommands) {
             let sender = ctx.sender();
@@ -1189,7 +1299,7 @@ impl TerminalApp {
             self.refresh_running_command_output(false);
             return;
         }
-        let matches = Picker::filter(self.picker_choices(picker.mode), &query);
+        let matches = self.picker_choices(picker.mode, &query);
         if let Some(picker) = &mut self.picker {
             picker.query = query;
             picker.matches = matches;
@@ -1221,21 +1331,30 @@ impl TerminalApp {
         if picker.placement().is_some() {
             return;
         }
-        let selected = picker.matches.get(picker.selected).map(|row| row.pane);
-        if selected == picker.preview.as_ref().map(|preview| preview.pane) {
+        let selected = picker.matches.get(picker.selected).and_then(|row| {
+            let source = if let Some(window) = row.window {
+                self.sibling_pane_preview(window, row.pane)?
+            } else {
+                let Page::Terminal(live) = &self.tabs.get(self.tab_for_pane(row.pane)?)?.page
+                else {
+                    return None;
+                };
+                PreviewSource::from_live(live)
+            };
+            Some((row.pane, source))
+        });
+        if selected
+            .as_ref()
+            .map(|(pane, source)| (*pane, source.font_size))
+            == picker
+                .preview
+                .as_ref()
+                .map(|preview| (preview.pane, preview.source.font_size))
+        {
             return;
         }
-        let preview = selected.and_then(|pane| {
-            let Page::Terminal(live) = &self.tabs.get(self.tab_for_pane(pane)?)?.page else {
-                return None;
-            };
-            Some(Preview::new(
-                pane,
-                live.session.frames.clone(),
-                &self.appearance.read().unwrap(),
-                live.font_size_override(),
-            ))
-        });
+        let preview = selected
+            .map(|(pane, source)| Preview::new(pane, source, &self.appearance.read().unwrap()));
         self.picker.as_mut().unwrap().preview = preview;
         self.watch_picker_preview(ctx);
     }
@@ -1307,6 +1426,11 @@ impl TerminalApp {
             return;
         };
         if picker.placement().is_some() {
+            return;
+        }
+        if let Some(window) = picker.matches[index].window {
+            self.close_picker(ctx);
+            self.request_window_result(window, SearchTarget::Pane(pane));
             return;
         }
         let Some(id) = id else {
@@ -1412,6 +1536,7 @@ mod tests {
             destination: destination.into(),
             tab_number: 1,
             pane_number: 1,
+            window: None,
         }
     }
     #[test]

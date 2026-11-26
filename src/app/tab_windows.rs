@@ -26,7 +26,42 @@ struct WindowEndpoint {
     sender: LocalSender<Message>,
     outgoing: Weak<Transfer>,
     tabs: Rc<[command_palette::SearchTab]>,
-    tab_search: std::sync::Weak<()>,
+    panes: Rc<[pane_picker::SearchPane]>,
+    search: Option<(SearchScope, std::sync::Weak<()>)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SearchScope {
+    Tabs,
+    Panes,
+}
+
+pub enum SearchTarget {
+    Tab(TabId),
+    Pane(u64),
+}
+
+pub(super) fn window_query(query: &str) -> Option<(Option<u64>, String)> {
+    let query = query.to_lowercase();
+    let mut input = query.split_whitespace().peekable();
+    let mut words = Vec::new();
+    let mut window_filter = None;
+    while let Some(word) = input.next() {
+        if word == "window"
+            && let Some(window) = input.peek().and_then(|id| id.parse::<u64>().ok())
+        {
+            input.next();
+            if window_filter
+                .replace(window)
+                .is_some_and(|old| old != window)
+            {
+                return None;
+            }
+        } else {
+            words.push(word);
+        }
+    }
+    Some((window_filter, words.join(" ")))
 }
 
 thread_local! {
@@ -43,6 +78,24 @@ fn windows_changed() {
     for sender in senders {
         sender.send(Message::WindowTargetsChanged);
     }
+}
+
+fn search_subscribers(
+    windows: &BTreeMap<u64, WindowEndpoint>,
+    source: u64,
+    scope: SearchScope,
+) -> Vec<LocalSender<Message>> {
+    windows
+        .iter()
+        .filter(|(id, endpoint)| {
+            **id != source
+                && endpoint
+                    .search
+                    .as_ref()
+                    .is_some_and(|(kind, launch)| *kind == scope && launch.strong_count() > 0)
+        })
+        .map(|(_, endpoint)| endpoint.sender.clone())
+        .collect()
 }
 
 #[derive(Clone)]
@@ -267,7 +320,8 @@ impl TerminalApp {
                                             .application_tab_titles,
                                     )
                                     .into(),
-                                tab_search: self.active_tab_search(),
+                                panes: self.pane_search_entries().into(),
+                                search: self.active_window_search(),
                             },
                         );
                     });
@@ -335,10 +389,10 @@ impl TerminalApp {
         })
     }
 
-    pub(super) fn watch_tab_search(&self, launch: &Arc<()>) {
+    pub(super) fn watch_window_search(&self, scope: SearchScope, launch: &Arc<()>) {
         WINDOWS.with_borrow_mut(|windows| {
             if let Some(endpoint) = windows.get_mut(&self.registry.window_id()) {
-                endpoint.tab_search = Arc::downgrade(launch);
+                endpoint.search = Some((scope, Arc::downgrade(launch)));
             }
         });
     }
@@ -352,20 +406,64 @@ impl TerminalApp {
                 return None;
             }
             endpoint.tabs = entries.into();
-            Some(
-                windows
-                    .iter()
-                    .filter(|(id, endpoint)| {
-                        **id != source && endpoint.tab_search.strong_count() > 0
-                    })
-                    .map(|(_, endpoint)| endpoint.sender.clone())
-                    .collect::<Vec<_>>(),
-            )
+            Some(search_subscribers(windows, source, SearchScope::Tabs))
         }) else {
             return;
         };
         for sender in subscribers {
-            sender.send(Message::WindowTabsChanged);
+            sender.send(Message::WindowSearchChanged);
+        }
+    }
+
+    pub(super) fn sibling_pane_search_entries(&self) -> Vec<(u64, Rc<[pane_picker::SearchPane]>)> {
+        let source = self.registry.window_id();
+        WINDOWS.with_borrow(|windows| {
+            windows
+                .iter()
+                .filter(|(id, endpoint)| {
+                    **id != source && unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool()
+                })
+                .map(|(&id, endpoint)| (id, endpoint.panes.clone()))
+                .collect()
+        })
+    }
+
+    pub(super) fn sibling_pane_preview(
+        &self,
+        window: u64,
+        pane: u64,
+    ) -> Option<pane_picker::PreviewSource> {
+        WINDOWS.with_borrow(|windows| {
+            let endpoint = windows.get(&window)?;
+            if !unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool() {
+                return None;
+            }
+            endpoint
+                .panes
+                .iter()
+                .find(|entry| entry.pane() == pane)
+                .map(|entry| entry.preview())
+        })
+    }
+
+    pub(super) fn publish_pane_search_entries(&self) {
+        if !self.native_bound {
+            return;
+        }
+        let source = self.registry.window_id();
+        let entries = self.pane_search_entries();
+        let Some(subscribers) = WINDOWS.with_borrow_mut(|windows| {
+            let endpoint = windows.get_mut(&source)?;
+            if endpoint.panes.as_ref() == entries {
+                return None;
+            }
+            endpoint.panes = entries.into();
+            Some(search_subscribers(windows, source, SearchScope::Panes))
+        }) else {
+            return;
+        };
+        for sender in subscribers {
+            sender.send(Message::WindowSearchChanged);
         }
     }
 
@@ -380,24 +478,32 @@ impl TerminalApp {
             self.select_switched_group(group, ctx);
             return;
         }
+        self.request_window_result(window, SearchTarget::Tab(group));
+    }
+
+    pub(super) fn request_window_result(&mut self, window: u64, target: SearchTarget) {
+        let source = self.registry.window_id();
         let sender = WINDOWS.with_borrow(|windows| {
             let endpoint = windows.get(&window)?;
             unsafe { IsWindow(Some(endpoint.hwnd)) }
                 .as_bool()
                 .then(|| endpoint.sender.clone())
         });
-        if !sender.is_some_and(|sender| sender.send(Message::FocusWindowTab(source, group))) {
-            self.window_error = Some("That tab’s window is no longer available.".into());
+        if !sender.is_some_and(|sender| sender.send(Message::FocusWindowResult(source, target))) {
+            self.window_error = Some("That window is no longer available.".into());
         }
     }
 
-    pub(super) fn focus_window_tab(
+    pub(super) fn focus_window_result(
         &mut self,
         source: u64,
-        group: TabId,
+        target: SearchTarget,
         ctx: &ComponentContext<Self>,
     ) {
-        let entry = tab_title::switcher_leaf(&self.tabs.headers(), group);
+        let entry = match target {
+            SearchTarget::Tab(group) => tab_title::switcher_leaf(&self.tabs.headers(), group),
+            SearchTarget::Pane(pane) => self.tab_for_pane(pane),
+        };
         let error = match entry.zip(self.keyboard.hwnd()) {
             Some((entry, hwnd)) if self.tabs.active_id() == Some(entry) => {
                 foreground(hwnd);
@@ -407,16 +513,20 @@ impl TerminalApp {
                 if self.incoming.is_none() && !self.existing_destination_blocked() =>
             {
                 self.tabs.select(entry);
+                self.sync_selection(ctx);
                 self.activate(ctx);
                 foreground(hwnd);
                 return;
             }
             Some(_) => "The other window is busy. Try again after its current action finishes.",
-            None => "That tab has closed or moved to another window.",
+            None => match target {
+                SearchTarget::Tab(_) => "That tab has closed or moved to another window.",
+                SearchTarget::Pane(_) => "That pane has closed or moved to another window.",
+            },
         };
         let sender = WINDOWS.with_borrow(|windows| windows.get(&source).map(|e| e.sender.clone()));
         if let Some(sender) = sender {
-            sender.send(Message::WindowTabFocusFailed(error));
+            sender.send(Message::WindowFocusFailed(error));
         }
     }
 

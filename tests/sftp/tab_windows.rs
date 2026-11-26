@@ -31,6 +31,16 @@ async fn native_find_tab_across_windows() {
     run("Search", b"ssh-probe/searched-window/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "previews and focuses live panes in a sibling native HWND"]
+async fn native_find_pane_across_windows() {
+    run(
+        "PaneSearch",
+        b"ssh-probe/preview-before-live/\r\nfocused-remote/",
+    )
+    .await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -56,7 +66,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     .unwrap();
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12"}}"#,
+        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12","pane_picker":"F6"}}"#,
     )
     .unwrap();
     let local = |name| {
@@ -92,10 +102,11 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         .unwrap();
     assert!(
         result.status.success(),
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\nSSH input: {:?}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr),
-        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
+        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default(),
+        fs::read_to_string(&trace).unwrap_or_default()
     );
     assert_eq!(
         transports.load(Ordering::Relaxed),

@@ -1421,9 +1421,9 @@ pub enum Message {
     CloseTabs(bulk_tab_close::Offer),
     WindowTick,
     WindowTargetsChanged,
-    WindowTabsChanged,
-    FocusWindowTab(u64, TabId),
-    WindowTabFocusFailed(&'static str),
+    WindowSearchChanged,
+    FocusWindowResult(u64, tab_windows::SearchTarget),
+    WindowFocusFailed(&'static str),
     DismissWindowError,
     TransferRequest(u64, u64),
     TransferReady(u64),
@@ -2947,6 +2947,7 @@ impl TerminalApp {
         )
     }
     fn publish_panes(&self) {
+        self.publish_pane_search_entries();
         let titles = tab_title::followed_headers(
             &self.tabs,
             self.appearance
@@ -3022,6 +3023,7 @@ impl TerminalApp {
         Ok(true)
     }
     fn sync_selection(&mut self, context: &ComponentContext<Self>) {
+        self.publish_pane_search_entries();
         // Native collection resets select the first item after Reactor's property pass.
         // Reapply our selected index after mounting, and ignore intermediate reset events.
         self.selection_pending = true;
@@ -5708,6 +5710,7 @@ impl Component for TerminalApp {
                 | Message::HostGroup(host_groups::Action::Tick | host_groups::Action::Edit(..))
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
+                | Message::WindowSearchChanged
                 | Message::BookmarksRead(..)
                 | Message::PickerFocus(..)
                 | Message::PickerFocusAfterMenu(..)
@@ -5902,10 +5905,15 @@ impl Component for TerminalApp {
             }
             Message::CloseTabs(offer) => self.close_tabs_from_offer(offer, context),
             Message::WindowTick => self.window_tick(context),
-            Message::WindowTargetsChanged => self.refresh_open_commands(),
-            Message::WindowTabsChanged => self.refresh_tab_search(),
-            Message::FocusWindowTab(source, group) => self.focus_window_tab(source, group, context),
-            Message::WindowTabFocusFailed(error) => self.window_error = Some(error.into()),
+            Message::WindowTargetsChanged => {
+                self.refresh_open_commands();
+                self.refresh_window_pane_search(context);
+            }
+            Message::WindowSearchChanged => self.refresh_window_search(context),
+            Message::FocusWindowResult(source, target) => {
+                self.focus_window_result(source, target, context);
+            }
+            Message::WindowFocusFailed(error) => self.window_error = Some(error.into()),
             Message::TransferRequest(source, id) => self.accept_transfer(source, id, context),
             Message::TransferReady(id) => self.offer_group(id, context),
             Message::TransferClaim(id) => self.claim_group(id, context),
