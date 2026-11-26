@@ -44,8 +44,10 @@ impl Layout {
         } else {
             (Tools::Hidden, 0.0)
         };
-        let content_width = width - tool_width;
-        let tabs_available = (content_width - TAB_ACTIONS_WIDTH - DRAG_RESERVE).max(0.0);
+        // New tab and More share the native RightHeader with the optional tools.
+        // WinUI can clip Content independently of this tab-width estimate.
+        let content_width = width - tool_width - TAB_ACTIONS_WIDTH;
+        let tabs_available = (content_width - DRAG_RESERVE).max(0.0);
         Self {
             content_width,
             tab_width: tab_width.min(tabs_available),
@@ -262,13 +264,25 @@ mod tests {
         let single = Layout::new(1120.0, 1);
         assert_eq!(single.tools, Tools::Full);
         assert_eq!(single.tab_width, 126.0);
+        assert_eq!(
+            single.content_width,
+            1120.0 - CAPTION_RESERVE - FULL_TOOLS_WIDTH - TAB_ACTIONS_WIDTH
+        );
 
         let crowded = Layout::new(1120.0, 8);
         assert_eq!(crowded.tools, Tools::Compact);
         assert!(crowded.tab_width >= 730.0);
+        assert_eq!(
+            crowded.content_width,
+            1120.0 - CAPTION_RESERVE - COMPACT_TOOLS_WIDTH - TAB_ACTIONS_WIDTH
+        );
 
         let narrow = Layout::new(440.0, 8);
         assert_eq!(narrow.tools, Tools::Hidden);
         assert!(narrow.tab_width >= MIN_TAB_STRIP_WIDTH);
+        assert_eq!(
+            narrow.content_width,
+            440.0 - CAPTION_RESERVE - TAB_ACTIONS_WIDTH
+        );
     }
 }

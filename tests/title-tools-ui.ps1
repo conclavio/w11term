@@ -94,7 +94,9 @@ function Wait-FilesToggle([string]$Expected) {
 
 function Wait-CompactTitle([string]$Description) {
     $null = Wait-Until $Description {
-        (Find-Element 'Terminal tools' $button -Visible) -and
+        (Find-Element 'New tab' $button -Visible) -and
+            (Find-Element 'Tab menu' $button -Visible) -and
+            (Find-Element 'Terminal tools' $button -Visible) -and
             (Find-Element 'Attention inbox, 0 unread' $button -Visible) -and
             !(Find-Element 'Pane layout' $button -Visible)
     }

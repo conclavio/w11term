@@ -4231,6 +4231,11 @@ impl TerminalApp {
                 ),
                 menu_callback.clone(),
             ));
+        let tools = self.title_tools(&layout, &arrangement, menu_callback, context);
+        let right_header = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .vertical_alignment(VerticalAlignment::Center)
+            .children((plus, more, tools));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
             .slots([
@@ -4239,17 +4244,10 @@ impl TerminalApp {
                     Grid::new()
                         // Keep the tabs left aligned within the space beside the native RightHeader.
                         .width(layout.content_width)
-                        .columns([
-                            GridLength::Auto,
-                            GridLength::Auto,
-                            GridLength::Auto,
-                            GridLength::STAR,
-                        ])
+                        .columns([GridLength::Auto, GridLength::STAR])
                         .children((
                             tab_strip,
-                            Border::new().grid_column(1).content(plus),
-                            Border::new().grid_column(2).content(more),
-                            Border::new().grid_column(3).content(
+                            Border::new().grid_column(1).content(
                                 self.recording_indicator().map_or_else(
                                     || Border::new().into(),
                                     |message| -> View {
@@ -4264,10 +4262,7 @@ impl TerminalApp {
                             ),
                         )),
                 ),
-                SlotView::new(
-                    TitleBarSlot::RightHeader,
-                    self.title_tools(&layout, &arrangement, menu_callback, context),
-                ),
+                SlotView::new(TitleBarSlot::RightHeader, right_header),
             ])
     }
 

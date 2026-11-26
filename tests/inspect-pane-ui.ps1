@@ -421,8 +421,20 @@ try {
     if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 2)) {
         throw 'An invalid target wrote Ctrl+C to the peer'
     }
-    # The retained history tab can push the title-bar menu offscreen at 150% DPI.
-    Run-Palette 'Terminal inspector: Off'
+    $dpiScale = [InspectDpi]::WindowDpi($window) / 96.0
+    $null = Wait-Until 'New tab and More keep their full width with the History tab open' {
+        $newTab = Find-Element 'New tab' $button -Visible
+        $more = Find-Element 'Tab menu' $button -Visible
+        $caption = Find-Element 'Minimize' $button -Visible
+        if ($newTab -and $more -and $caption) {
+            $newBounds = $newTab.Current.BoundingRectangle
+            $moreBounds = $more.Current.BoundingRectangle
+            $newBounds.Width -ge (35.0 * $dpiScale) -and $moreBounds.Width -ge (35.0 * $dpiScale) -and
+                $newBounds.Right -le ($moreBounds.Left + 1) -and
+                $moreBounds.Right -le ($caption.Current.BoundingRectangle.Left + 1)
+        }
+    }
+    Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
     $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
     $null = Wait-Until 'the unfinished command is visible before disconnect' {
         (Inspect).running_command.command -ceq 'interrupted fixture' -and (Find-Element 'Running command   interrupted fixture')
@@ -452,6 +464,12 @@ try {
                 $_ -like '*Ctrl+C*' -or $_ -like '*interrupt*'
             })
         $observed.peer_interrupts = Count-PeerInterrupts
+        $observed.title_controls = @(
+            foreach ($name in 'New tab','Tab menu','Terminal tools','Command palette','Pane layout','Attention inbox, 0 unread','Minimize','Maximize','Close') {
+                $item = Find-Element $name
+                if ($item) { "$name = $($item.Current.BoundingRectangle) (offscreen=$($item.Current.IsOffscreen))" }
+            }
+        )
     } catch { $observed.uia_error = $_.Exception.Message }
     throw "$failure. Last pane observations: $($observed | ConvertTo-Json -Compress -Depth 5)"
 } finally {
