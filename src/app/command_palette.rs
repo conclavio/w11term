@@ -104,6 +104,7 @@ pub enum CommandId {
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     StopSshAttempt(PendingPaneAttempt),
+    DisconnectSsh(disconnect_ssh::Target),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     LongCommands(Option<clipboard_paste::Origin>, bool),
     SavedCommand(
@@ -186,6 +187,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                             || key == "copy-selection".into()
                             || key == "restart-exited".into()
                             || key == "stop-ssh-attempt".into()
+                            || key == "disconnect-ssh-shell".into()
                             || key == "shared-folders".into()
                             || key == "local-forward".into()))
                 {
@@ -495,6 +497,14 @@ impl TerminalApp {
             rows.push(Row {
                 id: CommandId::StopSshAttempt(attempt),
                 label: STOP_SSH_ATTEMPT.into(),
+                chord: String::new(),
+                enabled: true,
+            });
+        }
+        if let Some(target) = self.disconnect_target() {
+            rows.push(Row {
+                id: CommandId::DisconnectSsh(target),
+                label: disconnect_ssh::LABEL.into(),
                 chord: String::new(),
                 enabled: true,
             });
@@ -880,6 +890,9 @@ impl TerminalApp {
             CommandId::RestartExited(Some(exit)) => Message::RestartExited(exit),
             CommandId::RestartExited(None) => return,
             CommandId::StopSshAttempt(attempt) => Message::StopSshAttempt(attempt),
+            CommandId::DisconnectSsh(target) => {
+                Message::DisconnectSsh(disconnect_ssh::Action::Review(target))
+            }
             CommandId::SaveScrollback(pane) => {
                 Message::Export(text_export::Action::StartScrollback(pane))
             }

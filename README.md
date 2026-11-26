@@ -919,6 +919,8 @@ When a direct SSH shell or local program has exited, choose **Panes → Restart 
 
 While a direct SSH pane is connecting or retrying, choose **Panes → Stop SSH attempt** or find the same action in the command palette. The pane and its scrollback stay available for **Restart exited pane**. For a background pane, scripts can read its attempt token from `w11term-cli list` and pass it to `stop-ssh-attempt`.
 
+For a connected direct SSH pane, choose **Panes → Disconnect SSH shell…** or find it in the command palette. Confirm to end that shell and any file transfers in the pane. The pane and scrollback stay open, and **Restart exited pane** opens a fresh shell when you want to reconnect. Scripts can disconnect an exact connection generation with `w11term-cli disconnect-ssh-shell`.
+
 Choose **Panes → Notify when command finishes** before starting a build or while it is running, then switch panes or use another application. Its exit status appears once in the **Attention inbox**. Selecting the entry takes you back to the originating pane. Choose **View command** beside the alert to open that command’s captured output and exit status while it is still in the pane’s history. If another window has focus, the owning window’s taskbar button flashes. Choose **Cancel command notification** to disarm it.
 
 Turn on **Panes → Notify for long commands** to receive an alert whenever a command runs for at least 10 seconds in that pane. It starts off in each new pane and follows that pane through reconnects. An explicitly watched command can still alert sooner. A command that qualifies for both alerts creates one inbox entry.

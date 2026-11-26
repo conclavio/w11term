@@ -1231,6 +1231,9 @@ async fn run_channel(
                             let _ = reply.send(Err("The SSH shell changed before disconnect.".into()));
                         } else {
                             // The channel guard closes this shell. A sibling may still own the link.
+                            events.push("ssh-disconnect-requested", serde_json::json!({
+                                "connection_generation": generation
+                            }));
                             let _ = reply.send(Ok(()));
                             return Ok(());
                         }

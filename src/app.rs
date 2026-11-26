@@ -77,6 +77,7 @@ use file_drawer::{FileAction, FileDrawer};
 mod accessibility_smoke;
 mod command_palette;
 mod directory_split;
+mod disconnect_ssh;
 mod durable_view;
 mod explorer;
 #[cfg(feature = "ui-smoke")]
@@ -1043,6 +1044,7 @@ struct CaretMenuBinding {
     closed_pane: Option<TabId>,
     exited: Option<ExitedPane>,
     pending_ssh: Option<PendingPaneAttempt>,
+    disconnect_ssh: Option<disconnect_ssh::Target>,
     on_click: Callback<String>,
 }
 
@@ -1173,6 +1175,7 @@ pub struct TerminalApp {
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
     title_editor: Option<tab_title::Editor>,
+    disconnect_review: Option<Arc<disconnect_ssh::Review>>,
     name_edit_serial: u64,
     identity_picker: Option<identity_picker::Pending>,
     clipboard: clipboard_paste::State,
@@ -1202,6 +1205,7 @@ pub enum Message {
     FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
     StopSshAttempt(PendingPaneAttempt),
+    DisconnectSsh(disconnect_ssh::Action),
     Export(text_export::Action),
     Recording(recordings::Action),
     ClearScrollback(u64),
@@ -1567,6 +1571,7 @@ impl TerminalApp {
         }
         if prompt_id.is_some() {
             self.title_editor = None;
+            self.disconnect_review = None;
             tab.files.cancel_entry_dialog();
             tab.files.end_filter_edit();
         }
@@ -1581,6 +1586,7 @@ impl TerminalApp {
         self.keyboard.set_modal(
             prompt_id.is_some()
                 || self.title_editor.is_some()
+                || self.disconnect_review.is_some()
                 || editing_files
                 || self.clipboard.is_open(),
         );
@@ -2972,6 +2978,7 @@ impl TerminalApp {
         self.activate_folder_panel(context);
         self.watch_forward_panel(context);
         self.title_editor = None;
+        self.disconnect_review = None;
         self.cancel_inactive_entry_dialog();
         self.close_copy_mode();
         self.close_hints();
@@ -3667,6 +3674,7 @@ impl TerminalApp {
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let pending_ssh = self.tabs.active().and_then(AppTab::pending_pane_attempt);
+        let disconnect_ssh = self.disconnect_target();
         let paste = self.paste_origin();
         let group = self.tabs.active_group_id();
         let mut cached = self.caret_menu_binding.borrow_mut();
@@ -3692,6 +3700,7 @@ impl TerminalApp {
             && binding.directory_split == directory_split
             && binding.exited == exited
             && binding.pending_ssh == pending_ssh
+            && binding.disconnect_ssh == disconnect_ssh
         {
             return binding.on_click.clone();
         }
@@ -3749,6 +3758,9 @@ impl TerminalApp {
             value if recordings::is_command(value) => recordings::invoke(recordings.target(value)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
             STOP_SSH_ATTEMPT => pending_ssh.map_or(Message::ControlIdle, Message::StopSshAttempt),
+            disconnect_ssh::LABEL => disconnect_ssh.map_or(Message::ControlIdle, |target| {
+                Message::DisconnectSsh(disconnect_ssh::Action::Review(target))
+            }),
             "Paste" => Message::Clipboard(clipboard_paste::Action::Start(paste, false)),
             "Paste raw (no bracketed paste)" => {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
@@ -3806,6 +3818,7 @@ impl TerminalApp {
             arrangement,
             exited,
             pending_ssh,
+            disconnect_ssh,
             on_click: on_click.clone(),
         });
         on_click
@@ -4419,6 +4432,12 @@ impl TerminalApp {
             .is_some()
         {
             items.push(MenuItem::item("stop-ssh-attempt", STOP_SSH_ATTEMPT));
+        }
+        if self.disconnect_target().is_some() {
+            items.push(MenuItem::item(
+                "disconnect-ssh-shell",
+                disconnect_ssh::LABEL,
+            ));
         }
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
@@ -5268,6 +5287,7 @@ impl Component for TerminalApp {
             switcher: None,
             picker: None,
             title_editor: None,
+            disconnect_review: None,
             name_edit_serial: 0,
             identity_picker: None,
             clipboard,
@@ -5440,6 +5460,7 @@ impl Component for TerminalApp {
                 }
                 self.refresh_open_commands();
             }
+            Message::DisconnectSsh(action) => self.handle_ssh_disconnect(action, context),
             Message::Export(action) => {
                 self.handle_text_export(action, context);
                 self.refresh_open_commands();
@@ -7396,6 +7417,7 @@ impl Component for TerminalApp {
             && self.picker.is_none()
             && self.hints.borrow().is_none()
             && self.title_editor.is_none()
+            && self.disconnect_review.is_none()
             && !self.clipboard.is_open()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
@@ -7631,6 +7653,9 @@ impl Component for TerminalApp {
         if let Some(editor) = &self.title_editor {
             views.push(KeyedView::new(editor.key(), editor.view(context)));
         }
+        if let Some(dialog) = self.disconnect_dialog(context) {
+            views.push(KeyedView::new("disconnect-ssh-shell", dialog));
+        }
         if let Some(dialog) = self.paste_dialog(context) {
             views.push(dialog);
         }
@@ -7639,6 +7664,7 @@ impl Component for TerminalApp {
             ..
         }) = self.tabs.active()
             && self.title_editor.is_none()
+            && self.disconnect_review.is_none()
             && tab.session.frames.load().prompt.is_none()
             && let Source::Ssh(ssh) = &tab.source
             && let Some(dialog) =

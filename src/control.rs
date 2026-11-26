@@ -61,6 +61,10 @@ pub enum Request {
         pane: u64,
         attempt_token: crate::events::PendingSshAttempt,
     },
+    DisconnectSshShell {
+        pane: u64,
+        connection_generation: std::num::NonZeroU64,
+    },
     WaitForText {
         pane: u64,
         pattern: String,
@@ -590,6 +594,27 @@ impl Registry {
                     "SSH attempt is no longer pending in this pane"
                 );
                 Ok(json!({"pane":pane,"attempt_token":attempt_token,"accepted":true}))
+            }
+            Request::DisconnectSshShell {
+                pane,
+                connection_generation,
+            } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::DisconnectSshShell {
+                        connection: connection_generation.get(),
+                        reply,
+                    })
+                    .context("pane is closed")?;
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("disconnect acknowledgement timed out")?
+                    .context("pane is closed")?
+                    .map_err(anyhow::Error::msg)?;
+                Ok(
+                    json!({"pane":pane,"connection_generation":connection_generation,"accepted":true}),
+                )
             }
             Request::Events {
                 pane,

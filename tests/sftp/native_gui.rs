@@ -2640,6 +2640,26 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "disconnects a reviewed SSH shell in a mixed split and checks scoped CLI disconnects"]
+async fn native_disconnect_ssh_shell_leaves_its_pane_and_powershell_neighbor() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 4, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("disconnect-ssh-shell-ui.ps1", &ssh, state.path());
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    assert_eq!(fs::read(trace).unwrap(), b"saved-history/after-cancel/");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stops initial and retrying SSH attempts from pane actions and the CLI"]
 async fn native_stop_ssh_attempt_preserves_the_pane_and_rejects_stale_tokens() {
     let accepted = Arc::new(AtomicUsize::new(0));

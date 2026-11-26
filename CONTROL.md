@@ -653,6 +653,20 @@ An accepted stop returns `pane`, `attempt_token`, and `accepted: true`. Wait
 for the pane's `stopped` phase or a `restart_token` before restarting it. A
 retired token returns an error. The pane, its history, and desktop focus stay in place.
 
+To end a connected direct SSH shell, use the `connection_generation` from
+`list` for the same process and pane.
+
+```powershell
+& $ctl --pid 12345 disconnect-ssh-shell --pane 2 --connection-generation 4
+```
+
+The reply includes `pane`, `connection_generation`, and `accepted: true`.
+The pane journals `ssh-disconnect-requested` with that generation. Wait for
+its `restart_token` before starting a fresh shell. A stale generation is
+rejected. Deliberate disconnect leaves the pane, scrollback, and focus in
+place and skips automatic reconnect. Other shells on the same authenticated
+transport can continue.
+
 A command completion watch armed in the GUI adds one `command-finished` event to
 the originating pane. Its data is `{"exit_code":17}` for a reported status or
 `{"exit_code":null}` when the shell supplied none. Command lines and output stay
