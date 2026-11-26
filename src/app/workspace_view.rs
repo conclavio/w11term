@@ -11,6 +11,21 @@ pub(super) use duplicate::{ClosedPane, ClosedTab, ClosedTabWindow, PreparedTabLa
 pub(super) use save::Action as SaveWorkspaceAction;
 
 impl TerminalApp {
+    pub(super) fn control_repair_workspace(
+        &self,
+        name: &str,
+        replacements: &BTreeMap<String, String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let store = WorkspaceStore::open()?;
+        let expected = store.entry(name)?;
+        let profiles = self.store.load()?;
+        let updated_panes = store.repair_profiles(name, &expected, replacements, &profiles)?;
+        Ok(serde_json::json!({
+            "name": name, "window_id": self.registry.window_id(), "replacements": replacements,
+            "updated_panes": updated_panes,
+        }))
+    }
+
     pub(super) fn control_save_workspace(
         &mut self,
         name: &str,

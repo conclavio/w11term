@@ -2,7 +2,8 @@ use super::{Invocation, SuccessCheck};
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{
     CommandOutputFile, CommandStatus, Request, SshGroupExpectedOutput, SshGroupQueueAction,
-    SshGroupReportFormat, validate_group_panes, validate_group_submission, validate_split_percent,
+    SshGroupReportFormat, WorkspaceProfileReplacement, validate_group_panes,
+    validate_group_submission, validate_split_percent, workspace_profile_replacements,
 };
 use w11term::options::TabColor;
 use w11term::pane_layout::{Axis, Direction};
@@ -74,6 +75,7 @@ pub(super) fn parse(
     let mut ordered_tabs = Vec::new();
     let mut reset = false;
     let mut color = None;
+    let mut workspace_replacements = Vec::new();
     let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
@@ -220,12 +222,23 @@ pub(super) fn parse(
                         | "open-workspace"
                         | "save-workspace"
                         | "get-workspace"
+                        | "repair-workspace"
                         | "rename-tab"
                         | "rename-pane"
                 ) =>
             {
                 ensure!(name.is_none(), "specify --name only once");
                 name = Some(value(&mut args)?);
+            }
+            "--replace" if verb == "repair-workspace" => {
+                let missing = value(&mut args)?;
+                let replacement = args
+                    .next()
+                    .context("--replace requires a replacement profile name")?;
+                workspace_replacements.push(WorkspaceProfileReplacement {
+                    missing,
+                    replacement,
+                });
             }
             "--reset" if matches!(verb, "rename-tab" | "rename-pane" | "set-tab-color") => {
                 ensure!(!reset, "specify --reset only once");
@@ -442,6 +455,7 @@ pub(super) fn parse(
                         | "open-workspace"
                         | "save-workspace"
                         | "get-workspace"
+                        | "repair-workspace"
                         | "open-ssh-group"
                         | "list-saved-ssh-groups"
                         | "move-tab"
@@ -585,6 +599,16 @@ pub(super) fn parse(
                 .context("provide a saved workspace name with --name")?,
             window_id,
         },
+        "repair-workspace" => {
+            workspace_profile_replacements(&workspace_replacements)?;
+            Request::RepairWorkspace {
+                window_id: window_id.context("--window is required (from list-windows)")?,
+                name: name
+                    .filter(|name| !name.trim().is_empty())
+                    .context("provide a saved workspace name with --name")?,
+                replacements: workspace_replacements,
+            }
+        }
         "save-workspace" => Request::SaveWorkspace {
             window_id: window_id.context("--window is required (from list-windows)")?,
             name: name

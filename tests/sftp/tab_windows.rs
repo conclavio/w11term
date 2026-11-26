@@ -212,6 +212,12 @@ async fn native_cli_sets_live_tab_pins_and_colors() {
     run("CliTabAppearance", b"after-style/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "repairs a missing SSH profile atomically, previews the saved result, and restores into a background window"]
+async fn native_cli_repairs_and_opens_a_saved_workspace() {
+    run("CliRepairWorkspace", b"cli-repaired/repair-source/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -290,7 +296,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             {"focused":1,"layout":leaf(1,json!({"kind":"saved_profile","value":"missing-window-profile"}))}
         ]});
     }
-    if first_close == "RepairWorkspace" {
+    if matches!(first_close, "RepairWorkspace" | "CliRepairWorkspace") {
         let mut broken = workspaces["two-windows"].clone();
         broken["tabs"][0]["layout"]["first"]["source"]["value"] = json!("missing-window-profile");
         workspaces["broken-copy"] = broken;
@@ -350,6 +356,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "WorkspaceWindow"
             | "CopyWorkspace"
             | "RepairWorkspace"
+            | "CliRepairWorkspace"
             | "CliWindows"
             | "CliWorkspace"
             | "CliWorkspaceWindow"

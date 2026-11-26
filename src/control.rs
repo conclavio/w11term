@@ -229,6 +229,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_id: Option<WindowId>,
     },
+    RepairWorkspace {
+        window_id: WindowId,
+        name: String,
+        replacements: Vec<WorkspaceProfileReplacement>,
+    },
     SaveWorkspace {
         window_id: WindowId,
         name: String,
@@ -506,6 +511,11 @@ pub enum UiRequest {
         names: Vec<String>,
         reply: oneshot::Sender<Result<Vec<String>, String>>,
     },
+    RepairWorkspace {
+        name: String,
+        replacements: BTreeMap<String, String>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     TabOrder {
         order: Option<Vec<crate::tabs::TabId>>,
         reply: oneshot::Sender<Result<Value, String>>,
@@ -662,6 +672,7 @@ impl UiRequest {
             | Self::OpenProfileWindow { reply, .. }
             | Self::OpenSshGroup { reply, .. }
             | Self::SaveWorkspace { reply, .. }
+            | Self::RepairWorkspace { reply, .. }
             | Self::TabOrder { reply, .. }
             | Self::TabAppearance { reply, .. }
             | Self::OpenWorkspace { reply, .. }
@@ -733,6 +744,41 @@ impl UiRequest {
 pub enum TabAppearanceChange {
     Pin(bool),
     Color(Option<TabColor>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceProfileReplacement {
+    pub missing: String,
+    pub replacement: String,
+}
+
+pub fn workspace_profile_replacements(
+    pairs: &[WorkspaceProfileReplacement],
+) -> Result<BTreeMap<String, String>> {
+    ensure!(
+        !pairs.is_empty(),
+        "provide at least one SSH profile replacement"
+    );
+    let mut replacements = BTreeMap::new();
+    for pair in pairs {
+        ensure!(
+            !pair.missing.trim().is_empty() && !pair.replacement.trim().is_empty(),
+            "provide both SSH profile names"
+        );
+        ensure!(
+            pair.missing != pair.replacement,
+            "choose a different replacement SSH profile"
+        );
+        ensure!(
+            replacements
+                .insert(pair.missing.clone(), pair.replacement.clone())
+                .is_none(),
+            "provide only one replacement for SSH profile {}",
+            pair.missing
+        );
+    }
+    Ok(replacements)
 }
 
 pub use ssh_groups::{
@@ -1640,6 +1686,27 @@ impl Registry {
                 Ok(json!({ "workspaces": workspaces }))
             }
             Request::GetWorkspace { name, window_id } => self.get_workspace(&name, window_id).await,
+            Request::RepairWorkspace {
+                window_id,
+                name,
+                replacements,
+            } => {
+                let replacements = workspace_profile_replacements(&replacements)?;
+                let ui = self.window_ui(window_id)?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::RepairWorkspace {
+                    name,
+                    replacements,
+                    reply,
+                });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context(
+                        "repair-workspace timed out; use get-workspace to check the saved layout",
+                    )?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::SaveWorkspace { window_id, name } => {
                 let ui = self.window_ui(window_id)?;
                 let (reply, response) = oneshot::channel();
