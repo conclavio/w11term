@@ -77,14 +77,8 @@ impl State {
         None
     }
 
-    pub(super) fn button(&self, tab: TabId, draft: &str, ctx: &ViewContext<TerminalApp>) -> View {
-        let text: Arc<str> = draft.into();
-        Button::new()
-            .is_enabled(self.form.is_none() && valid_command_text(draft))
-            .on_click(ctx.callback(move |_| {
-                Message::HostGroup(HostAction::SaveCommand(tab, Action::Begin(text.clone())))
-            }))
-            .content("Save as command…")
+    pub(super) fn draft_to_save(&self, draft: &str) -> Option<Arc<str>> {
+        (self.form.is_none() && valid_command_text(draft)).then(|| draft.into())
     }
 
     pub(super) fn view(&self, tab: TabId, ctx: &ViewContext<TerminalApp>) -> View {

@@ -93,7 +93,7 @@ Use **Host filter** to find SSH panes by profile, pane name, or address. **Selec
 
 Turn on **Use wildcards** for a list such as `web-[01][0-9], db-??, !*-canary`. Patterns match whole hostnames, SSH addresses with or without ports, pane names, or profile names. Separate patterns with commas. Use `*` for any number of characters, `?` for one character, brackets for sets or ranges, and `!` before a pattern to exclude matching hosts. Use `*, !*-canary` to include every host except canaries. A backslash escapes a special character. Matching ignores case. An incomplete pattern keeps the target list empty until you fix it.
 
-The command editor shows how many selected, visible hosts are ready. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
+The command bar above the host filter shows how many selected, visible hosts are ready. The Send button shows the recipient count, and its adjacent **Send options** menu offers recording and alerts. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
 
 Turn on **Require all recipients ready** to wait for every visible, checked host to have a verified prompt before **Send** or **Send and record** becomes available. Choose when to send once they are ready. The app checks every prompt again before dispatch, and each pane reports its own delivery outcome.
 
@@ -175,7 +175,7 @@ Choose **View matching output** in the Attention inbox for the matched line and 
 
 From the command palette, choose **Find armed SSH output alerts…** to review alerts across group tabs in the current window. Search by saved query, host scope, tab title, command, or run number such as `#4`. Enter opens the run, preserving its Live output view if it is already open for that run. Alerts leave the picker when they fire, are cancelled, or the run settles.
 
-Choose **Send with alert…** to catch a match from the start of a command. Review the command and recipients, set the search rule, then choose **Send with alert**. w11term rechecks the command and prompts and arms the alert before dispatch, including for queued and canary runs.
+Choose **Send options → Send with alert…** to catch a match from the start of a command. Review the command and recipients, set the search rule, then choose **Send with alert**. w11term rechecks the command and prompts and arms the alert before dispatch, including for queued and canary runs.
 
 Turn on **Record full output** in the same review to choose a new text file before sending. The alert uses your search rule, and the recording captures all marked output and final outcomes until the run settles. Cancelling the file picker leaves the command unsent. Scripts can use `submit-ssh-group-command --record-output PATH` and wait for the writer with `wait-ssh-group-run`.
 
@@ -195,7 +195,7 @@ At the end of a recording, **Host outcomes** lists each checked host's delivery 
 
 After saving, choose **Show in File Explorer** to select the file or **Copy recording path** to copy its full path. If you save several recordings of the same submission, use the **Saved recordings** selector to revisit an earlier file from the results or the live output view.
 
-Choose **Send and record…** beside the group command to attach a recorder before dispatch. Pick a new text file and w11term will recheck the command, checked hosts, and their prompts before sending. Cancelling the picker or choosing an existing file leaves the command unsent. If the checked scope changes while the file is being prepared, it records that no command was sent. The recorder saves automatically once every host finishes, rejects the send, or loses its connection, even while another tab is active. To finish sooner, choose **Stop recording** in the live output view.
+Choose **Send options → Send and record…** beside the group command to attach a recorder before dispatch. Pick a new text file and w11term will recheck the command, checked hosts, and their prompts before sending. Cancelling the picker or choosing an existing file leaves the command unsent. If the checked scope changes while the file is being prepared, it records that no command was sent. The recorder saves automatically once every host finishes, rejects the send, or loses its connection, even while another tab is active. To finish sooner, choose **Stop recording** in the live output view.
 
 The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status.
 
@@ -207,13 +207,13 @@ Use **Sort submission results** to show the longest or shortest shell times firs
 
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.
 
-Press **Ctrl+R** in an SSH host group, choose **Recent commands…**, or find **Recent group commands…** in the command palette to search the last 50 distinct commands submitted from this tab, newest first. Search matches the full command without regard to case. Press Enter to load the selected command as a draft or Esc to return to your current draft. The host filter and checked hosts stay as they are. Recent commands are kept in memory for the life of the group tab.
+Press **Ctrl+R** in an SSH host group, choose **Command library → Recent commands…**, or find **Recent group commands…** in the command palette to search the last 50 distinct commands submitted from this tab, newest first. Search matches the full command without regard to case. Press Enter to load the selected command as a draft or Esc to return to your current draft. The host filter and checked hosts stay as they are. Recent commands are kept in memory for the life of the group tab.
 
 Choose **Prepare retry** to load the exact command and select original recipients with a confirmed nonzero exit or withheld delivery. The roster and result filters scope the selection to the hosts you can see. Review the command and checked hosts, then choose **Send** when the targets have fresh prompts. **Restore draft** also restores the previous host selection and roster filter. Unconfirmed delivery and exit outcomes remain available in **Needs attention** for inspection.
 
-Choose **Saved commands…** in the group editor to browse the same command library managed in **Settings → Saved commands**. You can also search by name in the command palette while the group is active. Choosing a command fills the draft for review. **Restore draft** is available here too.
+Choose **Command library → Saved commands…** in the group editor to browse the same command library managed in **Settings → Saved commands**. You can also search by name in the command palette while the group is active. Choosing a command fills the draft for review. **Restore draft** is available here too.
 
-Choose **Save as command…** to add the draft to the shared library. Enter a name and choose **Save to commands**. The form shows the exact text it will save, and sending remains a separate action.
+Choose **Command library → Save as command…** to add the draft to the shared library. Enter a name and choose **Save to commands**. The form shows the exact text it will save, and sending remains a separate action.
 
 Choose **Copy results** to copy the viewed submission as plain text, including every recipient’s delivery, execution and interrupt status. The report uses full output retained in each pane and labels any preview that stands in for expired output. Large reports shorten output to fit the clipboard while retaining every host’s status.
 

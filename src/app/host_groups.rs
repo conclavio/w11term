@@ -16,6 +16,7 @@ mod alerted_send;
 mod close_ended;
 mod command_order;
 mod command_queue;
+mod command_toolbar;
 mod compare;
 mod completion;
 mod connection_notice;
@@ -165,7 +166,7 @@ impl Drop for Submission {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
@@ -218,7 +219,7 @@ impl HostGroup {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Target {
     pane: u64,
     name: String,
@@ -243,7 +244,7 @@ impl Target {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum TargetState {
     Offline,
     Failed(Option<ExitedPane>),
@@ -2255,7 +2256,7 @@ impl TerminalApp {
                             })
                     })),
             ));
-        let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
+        let filter = StackPanel::new().grid_row(3).spacing(6.0).children((
             filter_input,
             roster_state_summary(&matching, shown.len()).map_or_else(View::empty, |summary| {
                 TextBlock::new()
@@ -2391,12 +2392,6 @@ impl TerminalApp {
                 format!("{ready} of {count} selected {hosts} ready")
             }
         };
-        let entry = TextBox::new()
-            .element_ref(&page.command_editor)
-            .automation_name("Group command")
-            .placeholder_text("Enter one shell command")
-            .text(&page.draft)
-            .on_text_changed(ctx.callback(move |text| Message::HostGroup(Action::Edit(id, text))));
         let offer = page.command_offer(
             text,
             command_order::recipients(page, shown.iter().copied())
@@ -2422,36 +2417,6 @@ impl TerminalApp {
             !offer.targets.is_empty(),
             ctx,
         );
-        let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
-        let send_alerted = alerted_send::button(id, offer.clone(), enabled, ctx);
-        let send = Button::new()
-            .style(ButtonStyle::Accent)
-            .is_enabled(enabled)
-            .on_click(ctx.callback(move |_| Message::HostGroup(Action::Send(id, offer.clone()))))
-            .content(send_label);
-        let saved_commands = Button::new()
-            .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenSavedCommands(id))))
-            .content("Saved commands…");
-        let recall = ctx.sender();
-        let recent_commands = Button::new()
-            .automation_name("Recent commands…")
-            .key_accelerators(KeyAccelerators::new([KeyAccelerator::new(
-                AcceleratorKey::R,
-                AcceleratorModifiers::Control,
-                move || {
-                    recall.send(Message::HostGroup(Action::OpenRecentCommands(id)));
-                },
-            )]))
-            .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenRecentCommands(id))))
-            .content("Recent commands…  Ctrl+R");
-        let save_command = page.command_save.button(id, &page.draft, ctx);
-        let restore = if page.previous_draft.is_some() {
-            Button::new()
-                .on_click(ctx.callback(move |_| Message::HostGroup(Action::RestoreDraft(id))))
-                .content("Restore draft")
-        } else {
-            View::empty()
-        };
         let hidden_selection = if hidden_count == 0 {
             View::empty()
         } else {
@@ -2479,9 +2444,27 @@ impl TerminalApp {
             .children((
                 TextBlock::new().font_size(24.0).text(LABEL),
                 self.saved_host_group_toolbar(id, page, ctx),
-                filter,
-                StackPanel::new().grid_row(3).spacing(7.0).children((
-                    entry,
+                StackPanel::new().grid_row(2).spacing(7.0).children((
+                    command_toolbar::composer(id, page, offer, send_label, enabled, ctx),
+                    Grid::new()
+                        .column_spacing(12.0)
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .children((
+                            TextBlock::new()
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text(instructions)
+                                .text_wrapping(TextWrapping::Wrap),
+                            CheckBox::new()
+                                .grid_column(1)
+                                .automation_name(REQUIRE_READY)
+                                .is_checked(page.roster_preferences.require_all_ready)
+                                .is_enabled(!page.recorded_send.pending())
+                                .on_is_checked_changed(ctx.callback(move |require| {
+                                    Message::HostGroup(Action::RequireAllReady(id, require))
+                                }))
+                                .content(REQUIRE_READY),
+                        )),
+                    hidden_selection,
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(12.0)
@@ -2511,42 +2494,12 @@ impl TerminalApp {
                             command_queue::expiry_picker(id, page, ctx),
                         )),
                     command_queue::canary_picker(id, page, &selected, ctx),
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(8.0)
-                        .children((
-                            send,
-                            send_recorded,
-                            send_alerted,
-                            recent_commands,
-                            saved_commands,
-                            save_command,
-                            restore,
-                        )),
                     page.command_save.view(id, ctx),
                     page.recorded_send.feedback(),
                     page.alerted_send.feedback(),
                     retry::feedback(page),
-                    hidden_selection,
-                    Grid::new()
-                        .column_spacing(12.0)
-                        .columns([GridLength::Auto, GridLength::STAR])
-                        .children((
-                            CheckBox::new()
-                                .automation_name(REQUIRE_READY)
-                                .is_checked(page.roster_preferences.require_all_ready)
-                                .is_enabled(!page.recorded_send.pending())
-                                .on_is_checked_changed(ctx.callback(move |require| {
-                                    Message::HostGroup(Action::RequireAllReady(id, require))
-                                }))
-                                .content(REQUIRE_READY),
-                            TextBlock::new()
-                                .grid_column(1)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text(instructions)
-                                .text_wrapping(TextWrapping::Wrap),
-                        )),
                 )),
+                filter,
                 Grid::new()
                     .grid_row(4)
                     .keyed_children([KeyedView::new(body_key, ScrollViewer::new().content(body))]),

@@ -166,15 +166,15 @@ function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Typ
 function Invoke-Button($Element) {
     $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }
-function Get-SftpMenuAction([string]$TriggerName, [string]$Name, [switch]$Comparison, [switch]$AllowDisabled) {
+function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Submenu, [switch]$AllowDisabled) {
     $button = [System.Windows.Automation.ControlType]::Button
     $menu = [System.Windows.Automation.ControlType]::MenuItem
     Invoke-Button (Wait-Until "'$TriggerName' button" {
         $trigger = Find-Element $TriggerName $button -Visible
         if ($trigger -and $trigger.Current.IsEnabled) { $trigger }
     })
-    if ($Comparison) {
-        $category = Wait-Until 'Compare folders submenu' { Find-Element 'Compare folders' $menu }
+    if ($Submenu) {
+        $category = Wait-Until "'$Submenu' submenu" { Find-Element $Submenu $menu }
         $category.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     }
     try { Wait-Until "'$Name' in '$TriggerName'" {
@@ -182,22 +182,32 @@ function Get-SftpMenuAction([string]$TriggerName, [string]$Name, [switch]$Compar
         if ($item -and ($AllowDisabled -or $item.Current.IsEnabled)) { $item }
     } } catch {
         $item = Find-Element $Name $menu
-        $category = Find-Element 'Compare folders' $menu
+        $category = if ($Submenu) { Find-Element $Submenu $menu }
         $trigger = Find-Element $TriggerName $button
-        throw "$_ Item=$($item.Current.Name) Enabled=$($item.Current.IsEnabled) Comparison=$($category.Current.Name) Menu trigger enabled=$($trigger.Current.IsEnabled)"
+        throw "$_ Item=$($item.Current.Name) Enabled=$($item.Current.IsEnabled) Submenu=$($category.Current.Name) Menu trigger enabled=$($trigger.Current.IsEnabled)"
     }
 }
 function Get-SftpFolderAction([string]$Name, [switch]$Comparison, [switch]$AllowDisabled) {
-    Get-SftpMenuAction 'More folder actions' $Name -Comparison:$Comparison -AllowDisabled:$AllowDisabled
+    $submenu = if ($Comparison) { 'Compare folders' }
+    Get-NativeMenuAction 'More folder actions' $Name -Submenu $submenu -AllowDisabled:$AllowDisabled
 }
 function Invoke-SftpFolderAction([string]$Name, [switch]$Comparison) {
     Invoke-Button (Get-SftpFolderAction $Name -Comparison:$Comparison)
 }
 function Get-SftpEntryAction([string]$Name, [switch]$AllowDisabled) {
-    Get-SftpMenuAction 'Selected entry actions' $Name -AllowDisabled:$AllowDisabled
+    Get-NativeMenuAction 'Selected entry actions' $Name -AllowDisabled:$AllowDisabled
 }
 function Invoke-SftpEntryAction([string]$Name) {
     Invoke-Button (Get-SftpEntryAction $Name)
+}
+function Invoke-NativeMenuAction([string]$Trigger, [string]$Name) {
+    Invoke-Button (Get-NativeMenuAction $Trigger $Name)
+}
+function Close-NativeMenu([string]$ItemName) {
+    $null = Press-FocusedKey 27
+    $null = Wait-Until 'menu closes after Escape' {
+        !(Find-Element $ItemName ([System.Windows.Automation.ControlType]::MenuItem) -Visible)
+    }
 }
 function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$State) {
     Wait-Until "enabled checkbox '$Name' in state $State" {

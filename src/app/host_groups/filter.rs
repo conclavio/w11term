@@ -27,7 +27,7 @@ struct Wildcards {
     excluded: RegexSet,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub(super) struct Names {
     pub(super) label: String,
     pub(super) host: String,

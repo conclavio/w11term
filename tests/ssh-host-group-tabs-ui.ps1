@@ -415,7 +415,7 @@ try {
     Click 'Back to results'
     Select-Tab $westTab
 
-    Click ('Recent commands' + [char]0x2026)
+    Invoke-NativeMenuAction 'Command library' ('Recent commands' + [char]0x2026)
     $null = Wait-Until 'West recent commands excludes the East submission' {
         (Find-Element 'west-probe' $button) -and !(Find-Element 'east-probe' $button)
     }

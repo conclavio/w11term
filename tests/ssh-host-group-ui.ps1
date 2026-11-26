@@ -62,6 +62,13 @@ function Wait-CommandDraft([string]$Text) {
     }
 }
 function Submit([string]$Text, [string]$ButtonName) {
+    # Observe the invalid draft first so an enabled control belongs to the new
+    # command after the queued UI Automation text edit reaches the app.
+    (Command-Editor).SetValue('')
+    $null = Wait-Until "disabled $ButtonName for an empty draft" {
+        $entry = Find-Element $ButtonName $button
+        $entry -and !$entry.Current.IsEnabled
+    }
     (Command-Editor).SetValue($Text)
     Invoke-Button (Wait-Until "enabled $ButtonName" {
         $entry = Find-Element $ButtonName $button
@@ -211,6 +218,21 @@ try {
     $groupTab = ($owner.groups | Where-Object label -ceq 'SSH host group').tab_id
     if (!$groupWindow -or !$groupTab) { throw 'The CLI did not list the active SSH group' }
     $readyArgs = @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab")
+    $null = Wait-Until 'send and its menus share the command row above the host filter' {
+        $command = Find-Element 'Group command' $edit -Visible
+        $filter = Find-Element 'Host filter' $edit -Visible
+        $libraryMenu = Find-Element 'Command library' $button -Visible
+        $send = Find-Element 'Send to 0 hosts' $button -Visible
+        $sendOptions = Find-Element 'Send options' $button -Visible
+        if (!$command -or !$filter -or !$libraryMenu -or !$send -or !$sendOptions) { return }
+        $entryBounds = $command.Current.BoundingRectangle
+        $libraryBounds = $libraryMenu.Current.BoundingRectangle
+        $sendBounds = $send.Current.BoundingRectangle
+        $optionsBounds = $sendOptions.Current.BoundingRectangle
+        $entryBounds.Right -le $libraryBounds.Left -and $libraryBounds.Right -le $sendBounds.Left -and
+            $sendBounds.Right -le $optionsBounds.Left -and $entryBounds.Top -lt $optionsBounds.Bottom -and
+            $optionsBounds.Top -lt $entryBounds.Bottom -and $optionsBounds.Bottom -lt $filter.Current.BoundingRectangle.Top
+    }
     $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Connecting'
     $null = Wait-Until 'the connecting filter isolates West during its shell request' {
@@ -268,7 +290,7 @@ try {
     (Command-Editor).SetValue('one')
     $alertedSend = 'Send with alert' + [char]0x2026
     $alertSearch = 'Search for the output alert'
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     $null = Wait-Until 'an empty alert rule cannot send the command' {
         $confirm = Find-Element 'Send with alert' $button
         $confirm -and !$confirm.Current.IsEnabled
@@ -284,7 +306,7 @@ try {
     $null = Wait-Until 'cancelling the alert review preserves the unsent draft' {
         (Find-Element 'Send to 1 host' $button) -and !(Find-Element "Submitted${dot}one")
     }
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     $savedAlertRules = 'Saved alert rules' + [char]0x2026
     $ruleName = 'Fast success'
     $ruleQuery = '^east-accepted one$'
@@ -310,9 +332,9 @@ try {
     $null = Wait-Until 'cancel the recorded alert' { [FixtureDialog]::ClickButton($dialog, 2) }
     $null = Wait-Until 'cancelling the file picker keeps the command unsent' {
         !(Find-OwnedDialog 'Record SSH group output') -and
-            (Find-Element $alertedSend $button) -and !(Find-Element "Submitted${dot}one")
+            (Find-Element 'Send options' $button) -and !(Find-Element "Submitted${dot}one")
     }
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     Click $savedAlertRules
     Click "Use alert rule $ruleName"
     $null = Wait-Until 'loading the saved rule restores the exact review query' {
@@ -1316,12 +1338,13 @@ try {
     $sendRecordedOption = 'Send and record' + [char]0x2026
     (Wait-CheckBox $requireReady Off).Toggle()
     (Command-Editor).SetValue('after-reconnect')
-    $null = Wait-Until 'both send actions wait for the unverified checked host' {
+    $null = Wait-Until 'send waits for the unverified checked host' {
         $send = Find-Element 'Send to 2 hosts' $button
-        $record = Find-Element $sendRecordedOption $button
-        $send -and !$send.Current.IsEnabled -and $record -and !$record.Current.IsEnabled -and
-            (Find-Element "1 of 2 selected hosts ready${dot}waiting for all")
+        $send -and !$send.Current.IsEnabled -and (Find-Element "1 of 2 selected hosts ready$($dot)waiting for all")
     }
+    $record = Get-NativeMenuAction 'Send options' $sendRecordedOption -AllowDisabled
+    if ($record.Current.IsEnabled) { throw 'Recording bypassed the readiness requirement' }
+    Close-NativeMenu $sendRecordedOption
     Set-HostFilter 'east'
     $null = Wait-Until 'strict readiness respects the visible recipient scope' {
         $send = Find-Element 'Send to 1 host' $button
@@ -1334,11 +1357,12 @@ try {
     }
     Send-Raw $west 'prompt'
     Pane-Status $west "Connected${dot}Ready"
-    $null = Wait-Until 'both send actions become available when both prompts are fresh' {
+    $null = Wait-Until 'send becomes available when both prompts are fresh' {
         $send = Find-Element 'Send to 2 hosts' $button
-        $record = Find-Element $sendRecordedOption $button
-        $send -and $send.Current.IsEnabled -and $record -and $record.Current.IsEnabled
+        $send -and $send.Current.IsEnabled
     }
+    $null = Get-NativeMenuAction 'Send options' $sendRecordedOption
+    Close-NativeMenu $sendRecordedOption
     if (Find-Element "Submitted${dot}after-reconnect") { throw 'The ready check sent the draft automatically' }
     Submit 'after-reconnect' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
@@ -1442,7 +1466,7 @@ try {
     (Command-Editor).SetValue('draft before library')
     $libraryButton = 'Saved commands' + [char]0x2026
     $saved = "Load group command${dot}Fleet health"
-    Click $libraryButton
+    Invoke-NativeMenuAction 'Command library' $libraryButton
     $librarySearch = Wait-Until 'the group library opens with its saved command results' {
         $entry = Find-Element 'Search saved commands' $edit
         $provider = $null
@@ -1460,7 +1484,7 @@ try {
     Click $saved
     Click ("This saved command changed. Open the palette again.  " + [char]0xb7 + '  Dismiss')
     if ((Command-Editor).Current.Value -cne 'draft before library') { throw 'A stale saved command replaced the draft' }
-    Click $libraryButton
+    Invoke-NativeMenuAction 'Command library' $libraryButton
     Click $saved
     Wait-CommandDraft 'show  fleet-health'
     Click 'Restore draft'
@@ -1472,7 +1496,7 @@ try {
     Outcome $westName 'Exit 17'
     $saveButton = 'Save as command' + [char]0x2026
     (Command-Editor).SetValue('snapshot  status')
-    Click $saveButton
+    Invoke-NativeMenuAction 'Command library' $saveButton
     (Command-Editor 'Saved command name').SetValue('Discarded name')
     Click 'Cancel saving command'
     $null = Wait-Until 'canceled naming form is gone' { !(Find-Element 'Saved command name' $edit) }
@@ -1481,7 +1505,7 @@ try {
         (Command-Editor).Current.Value -cne 'snapshot  status') {
         throw 'Canceling save changed the draft or command library'
     }
-    Click $saveButton
+    Invoke-NativeMenuAction 'Command library' $saveButton
     $null = Wait-Until 'save form shows the exact captured draft' { Find-Element 'snapshot  status' }
     (Command-Editor).SetValue('new unsent notes')
     (Command-Editor 'Saved command name').SetValue('Fleet health')
@@ -1497,7 +1521,7 @@ try {
         (Command-Editor).Current.Value -cne 'new unsent notes') {
         throw 'Saving did not preserve the captured command, existing entry, and current draft'
     }
-    Click $libraryButton
+    Invoke-NativeMenuAction 'Command library' $libraryButton
     Click "Load group command${dot}Fleet snapshot"
     Wait-CommandDraft 'snapshot  status'
     Click 'Send to 1 host'
@@ -1616,7 +1640,7 @@ try {
     $recent = 'Search recent group commands'
     (Command-Editor).SetValue('unsent recent witness')
     Set-HostFilter 'west'
-    Click ('Recent commands' + [char]0x2026)
+    Invoke-NativeMenuAction 'Command library' ('Recent commands' + [char]0x2026)
     (Command-Editor $recent).SetValue('never-submitted-witness')
     $null = Wait-Until 'recent search reports no matches' { Find-Element 'No matching recent commands' }
     Press-Key 27
@@ -1650,13 +1674,13 @@ try {
     Set-HostFilter ''
     $sendRecorded = 'Send and record' + [char]0x2026
     (Command-Editor).SetValue('record-fast')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'record-before-send file picker' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'cancel recording before dispatch' { [FixtureDialog]::ClickButton($dialog, 2) }
     $null = Wait-Until 'file picker closes without a recorded submission' { !(Find-OwnedDialog 'Record SSH group output') }
     if (Find-Element "Submitted$($dot)record-fast") { throw 'Cancelling the picker sent the command' }
     $previousLogs = @(Get-ChildItem -LiteralPath $env:W11TERM_EXPORT_SMOKE_DIR -Filter 'ssh-group-output-*.txt')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'second record-before-send file picker' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'accept recording before dispatch' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'submission is attached to its recording' { Find-Element "Submitted$($dot)record-fast" }
@@ -1880,7 +1904,7 @@ try {
 
     $beforeCollision = [IO.File]::ReadAllText($burstPath)
     (Command-Editor).SetValue('never-send-on-collision')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'recording file picker for collision' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'choose the existing capture' { [FixtureDialog]::SetFilename($dialog, $burstPath, $nextName) }
     $null = Wait-Until 'confirm the existing name in the picker' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -1897,7 +1921,7 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     (Command-Editor).SetValue('never-send-with-stale-prompt')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'file picker before a host changes prompt state' { Find-OwnedDialog 'Record SSH group output' }
     Send-Raw $west 'alt'
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','alternate-proof')
@@ -1912,7 +1936,7 @@ try {
     (Wait-CheckBox $requireReady On).Toggle()
     Pane-Status $west "Connected$($dot)Alternate screen"
     (Command-Editor).SetValue('record-one')
-    Click $sendRecorded
+    Invoke-NativeMenuAction 'Send options' $sendRecorded
     $dialog = Wait-Until 'file picker for a group with an unavailable host' { Find-OwnedDialog 'Record SSH group output' }
     $withheldPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'withheld.txt'
     $null = Wait-Until 'enter the filename for the partially delivered submission' {
@@ -1933,7 +1957,7 @@ try {
         Find-Element 'Send to 1 host' $button
     }
     (Command-Editor).SetValue('check-expected')
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     (Command-Editor $alertSearch).SetValue('ready marker')
     (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()
     $null = Wait-CheckBox 'Alert if expected output is missing' On
@@ -1954,7 +1978,7 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     (Command-Editor).SetValue('check-each-host')
-    Click $alertedSend
+    Invoke-NativeMenuAction 'Send options' $alertedSend
     $expectedLine = 'east-accepted check-each-host'
     (Command-Editor $alertSearch).SetValue($expectedLine)
     (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()

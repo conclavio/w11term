@@ -41,25 +41,6 @@ impl State {
     }
 }
 
-pub(super) fn button(
-    id: TabId,
-    offer: CommandOffer,
-    enabled: bool,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    let label = if offer.canary.is_some() {
-        "Run canary and record…"
-    } else {
-        "Send and record…"
-    };
-    Button::new()
-        .is_enabled(enabled)
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(super::Action::RecordedSend(id, Action::Pick(offer.clone())))
-        }))
-        .content(label)
-}
-
 impl TerminalApp {
     fn recorded_send_state(&mut self, id: TabId) -> Option<&mut State> {
         let Page::HostGroup(page) = &mut self.tabs.get_mut(id)?.page else {

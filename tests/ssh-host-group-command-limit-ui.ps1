@@ -227,7 +227,7 @@ try {
     (Wait-CheckBox $labels.North On).Toggle()
     $null = Wait-CheckBox $labels.North Off
     Set-Command 'keep-first'
-    Click ('Send and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Send and record' + [char]0x2026)
     $dialog = Wait-Until 'output recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the bounded recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started keep-first')
@@ -329,7 +329,7 @@ try {
         (Find-Element "Canary first${dot}$($labels.East)") -and (Find-Element "Ready${dot}$($labels.West)") -and
             (Find-Element 'After approval, send to all remaining ready hosts.')
     }
-    Click ('Run canary and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Run canary and record' + [char]0x2026)
     $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-ok')
@@ -505,7 +505,7 @@ try {
     Select-GroupOption 'Parallel SSH commands' '1 at a time'
     $null = Wait-CheckBox 'Stop queue on failure' On
     Set-Command 'skip-middle'
-    Click ('Send and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Send and record' + [char]0x2026)
     $dialog = Wait-Until 'skip run recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the skip run' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started skip-middle')
@@ -565,7 +565,7 @@ try {
     Set-Command 'deadline'
     Click 'Preview send order'
     $null = Wait-Until 'the queue deadline is visible in preview' { Find-Element 'Unsent commands expire after 5s' }
-    Click ('Send and record' + [char]0x2026)
+    Invoke-NativeMenuAction 'Send options' ('Send and record' + [char]0x2026)
     $dialog = Wait-Until 'deadline recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the deadline run' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started deadline')
