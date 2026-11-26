@@ -359,7 +359,7 @@ Choose **More → Pin tab** or use the command palette to keep a terminal tab on
 
 Right-click a tab header to rename it, set its color, pin or unpin it, duplicate its layout, or close it. Rename, color, pin and close can operate on a background tab while your current pane stays selected. Duplicating opens and selects the new tab.
 
-Choose **Close other tabs** or **Close tabs to the right** from the More menu or command palette. Both preserve the selected tab and all pinned tabs. Closed terminal layouts enter the usual reopen history, with the rightmost eligible tab reopening first.
+Choose **Close other tabs** or **Close tabs to the right** from the More menu or command palette to close tabs around your selection. From a tab's right-click menu, both commands use the clicked tab. All pinned tabs stay open. Focus stays on the selected tab if it survives and moves to the clicked tab if the selection closes. Closed terminal layouts enter the usual reopen history, with the rightmost eligible tab reopening first.
 
 Choose **More → Duplicate tab layout** to open a fresh copy near the current tab. It keeps the tab name, pane arrangement, divider positions, focused pane, zoom and read-only input locks. Each SSH pane makes an independent login, and each local shell starts a new process. The original tab keeps its jobs and scrollback. A configured local or SSH starting directory carries over. Copies start unpinned. You can assign **Duplicate tab layout** a shortcut in Settings.
 

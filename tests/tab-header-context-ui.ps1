@@ -10,6 +10,11 @@ $menu = [System.Windows.Automation.ControlType]::MenuItem
 $edit = [System.Windows.Automation.ControlType]::Edit
 $button = [System.Windows.Automation.ControlType]::Button
 $value = [System.Windows.Automation.ValuePattern]::Pattern
+$config = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+foreach ($label in 'Left shell','Keep shell','Right shell','Pinned shell') {
+    $config.profiles | Add-Member -NotePropertyName $label -NotePropertyValue $config.profiles.'Palette PowerShell'
+}
+[IO.File]::WriteAllText($profiles, ($config | ConvertTo-Json -Depth 8))
 
 Add-Type @'
 using System;
@@ -24,7 +29,12 @@ public static class TabContextPointer {
     [DllImport("user32.dll")] public static extern bool GetPhysicalCursorPos(out Point point);
     [DllImport("user32.dll")] public static extern bool SetPhysicalCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
-    public static IntPtr TargetRoot(Point point) { return GetAncestor(WindowFromPhysicalPoint(point), 2); }
+    static bool IsClientTarget(IntPtr root, Point point) {
+        var target = WindowFromPhysicalPoint(point);
+        if (GetAncestor(target, 2) != root) return false;
+        var name = new StringBuilder(256);
+        return GetClassName(target, name, name.Capacity) > 0 && name.ToString() != "InputNonClientPointerSource";
+    }
     public static string DescribeHit(Point point) {
         var hit = WindowFromPhysicalPoint(point);
         var root = GetAncestor(hit, 2);
@@ -36,9 +46,9 @@ public static class TabContextPointer {
     }
     public static bool RightClick(IntPtr root, Point point) {
         Point current;
-        if (TargetRoot(point) != root || !SetPhysicalCursorPos(point.X, point.Y) ||
+        if (!IsClientTarget(root, point) || !SetPhysicalCursorPos(point.X, point.Y) ||
             !GetPhysicalCursorPos(out current) || current.X != point.X || current.Y != point.Y ||
-            TargetRoot(current) != root)
+            !IsClientTarget(root, current))
             return false;
         mouse_event(8, 0, 0, 0, UIntPtr.Zero);
         mouse_event(16, 0, 0, 0, UIntPtr.Zero);
@@ -57,7 +67,14 @@ function Open-Context([string]$Title, [string]$Action) {
     $savedCursor = [TabContextPointer]::GetPhysicalCursorPos([ref]$previous)
     $priorHit = [TabContextPointer]::DescribeHit($point)
     try {
-        $null = Wait-Until "right-click on '$Title' is inside the fixture window" { [TabContextPointer]::RightClick($window, $point) }
+        $null = Wait-Until "right-click on '$Title' reaches the fixture client area" {
+            $currentHeader = Find-Element $Title $tab -Visible
+            if (!$currentHeader) { return }
+            $currentBounds = $currentHeader.Current.BoundingRectangle
+            $point.X = [int]($currentBounds.Left + $currentBounds.Width * 0.35)
+            $point.Y = [int]($currentBounds.Top + $currentBounds.Height / 2)
+            [TabContextPointer]::RightClick($window, $point)
+        }
         Wait-Until "tab context menu item '$Action'" { Find-Element $Action $menu -Visible }
     } catch {
         $failure = $_
@@ -135,6 +152,32 @@ try {
         $sessions = @((Control @('list')).sessions)
         $sessions.Count -eq 1 -and $sessions[0].id -eq $ssh -and $sessions[0].active
     }
+
+    $left = (Control @('open','--profile','Left shell')).pane
+    $anchor = (Control @('open','--profile','Keep shell')).pane
+    $right = (Control @('open','--profile','Right shell')).pane
+    $saved = (Control @('open','--profile','Pinned shell')).pane
+    Invoke-Button (Open-Context 'Pinned shell' 'Pin tab')
+    $null = Wait-Until 'the protected shell is pinned' { Find-Element 'Pinned: Pinned shell' $tab -Visible }
+    Invoke-Button (Open-Context 'Keep shell' 'Close tabs to the right')
+    $null = Wait-Until 'only the tab to the right of the clicked tab closes' {
+        $sessions = @((Control @('list')).sessions)
+        $sessions.Count -eq 4 -and $ssh -in $sessions.id -and $left -in $sessions.id -and
+            $anchor -in $sessions.id -and $saved -in $sessions.id -and $right -notin $sessions.id
+    }
+    Wait-Focus $ssh
+    foreach ($ch in '-after-close-right'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
+    $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','12','still-in-ssh-after-close-right')
+
+    $right = (Control @('open','--profile','Right shell','--activate')).pane
+    Wait-Focus $right
+    Invoke-Button (Open-Context 'Keep shell' 'Close other tabs')
+    $null = Wait-Until 'Close other tabs preserves the clicked anchor and the separate pin' {
+        $sessions = @((Control @('list')).sessions)
+        $sessions.Count -eq 2 -and $anchor -in $sessions.id -and $saved -in $sessions.id
+    }
+    Wait-Focus $anchor
+    $null = Control @('wait-for-text','--pane',"$anchor",'--timeout','15','PS ')
 } finally {
     Close-FixtureApp $app
 }

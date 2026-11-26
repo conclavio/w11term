@@ -1,17 +1,74 @@
 use super::*;
+use bulk_tab_close::{Offer, Scope};
 
 const RENAME: &str = "Rename tab…";
 const PIN: &str = "Pin tab";
 const UNPIN: &str = "Unpin tab";
 const CLOSE: &str = "Close tab";
 
+#[derive(Default)]
+pub(super) struct Bindings {
+    strip: Vec<(TabId, bool)>,
+    by_tab: BTreeMap<TabId, Binding>,
+}
+
+impl Bindings {
+    pub(super) fn refresh(
+        &mut self,
+        strip: Vec<(TabId, bool)>,
+        context: &ViewContext<TerminalApp>,
+    ) {
+        if self.strip == strip {
+            return;
+        }
+        self.by_tab
+            .retain(|&id, _| strip.iter().any(|&(group, _)| id == group));
+        for &(group, _) in &strip {
+            let offers = Scope::ALL.map(|scope| Offer::from_header(&strip, group, scope));
+            if self
+                .by_tab
+                .get(&group)
+                .is_none_or(|binding| *binding.offers != offers)
+            {
+                self.by_tab
+                    .insert(group, Binding::new(group, offers, context));
+            }
+        }
+        self.strip = strip;
+    }
+}
+
+struct Binding {
+    // WinUI can deliver a click after the strip has changed.
+    // Keep the targets that went with the displayed menu.
+    offers: Rc<[Option<Offer>; 2]>,
+    callback: Callback<String>,
+}
+
+impl Binding {
+    fn new(group: TabId, offers: [Option<Offer>; 2], context: &ViewContext<TerminalApp>) -> Self {
+        let offers = Rc::new(offers);
+        let actions = Rc::clone(&offers);
+        let callback = context.callback(move |label: String| {
+            Scope::ALL
+                .into_iter()
+                .zip(actions.iter())
+                .find(|(scope, _)| scope.label() == label)
+                .map_or_else(
+                    || Message::TabHeaderMenu(group, label),
+                    |(_, offer)| {
+                        offer
+                            .clone()
+                            .map_or(Message::ControlIdle, Message::CloseTabs)
+                    },
+                )
+        });
+        Self { offers, callback }
+    }
+}
+
 impl TerminalApp {
-    pub(super) fn tab_header_menu(
-        &self,
-        group: TabId,
-        page: &Page,
-        context: &ViewContext<Self>,
-    ) -> Menu {
+    pub(super) fn tab_header_menu(&self, group: TabId, page: &Page) -> Menu {
         let pinned = self.tabs.group_is_pinned(group);
         let mut items = Vec::new();
         if matches!(page, Page::Terminal(_)) {
@@ -24,13 +81,17 @@ impl TerminalApp {
             ]);
         }
         items.push(command_menu_item("close", CLOSE, !pinned));
-        let callback = self
-            .tab_header_callbacks
-            .borrow_mut()
-            .entry(group)
-            .or_insert_with(|| context.callback(move |label| Message::TabHeaderMenu(group, label)))
-            .clone();
-        Menu::new(items, callback)
+        let bindings = self.tab_header_bindings.borrow();
+        let binding = &bindings.by_tab[&group];
+        items.extend(
+            Scope::ALL
+                .into_iter()
+                .zip(binding.offers.iter())
+                .map(|(scope, offer)| {
+                    command_menu_item(scope.label(), scope.label(), offer.is_some())
+                }),
+        );
+        Menu::new(items, binding.callback.clone())
     }
 
     pub(super) fn tab_header_action(

@@ -1003,7 +1003,7 @@ async fn native_tab_search_reveals_the_selected_header_in_an_overflowing_strip()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "uses the native context menu to manage a background tab without retargeting SSH input"]
+#[ignore = "uses the native context menu to manage and bulk-close tabs around a background anchor"]
 async fn native_tab_header_menu_targets_the_clicked_background_tab() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
         unreachable!()
@@ -1012,7 +1012,7 @@ async fn native_tab_header_menu_targets_the_clicked_background_tab() {
     fs::write(&trace, []).unwrap();
     let state = tempfile::tempdir().unwrap();
     drive_mixed_gui("tab-header-context-ui.ps1", &ssh, state.path());
-    assert_eq!(fs::read(trace).unwrap(), b"still-in-ssh");
+    assert_eq!(fs::read(trace).unwrap(), b"still-in-ssh-after-close-right");
     assert_eq!(channels.load(Ordering::Relaxed), 1);
     server.abort();
 }

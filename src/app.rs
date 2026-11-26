@@ -1284,7 +1284,7 @@ pub struct TerminalApp {
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
-    tab_header_callbacks: RefCell<BTreeMap<TabId, Callback<String>>>,
+    tab_header_bindings: RefCell<tab_header_menu::Bindings>,
     caret_menu_binding: Rc<RefCell<Option<CaretMenuBinding>>>,
     frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
@@ -4134,9 +4134,9 @@ impl TerminalApp {
         }
         let headers = self.tabs.headers();
         let layout = title_tools::Layout::new(self.width, headers.len());
-        self.tab_header_callbacks
+        self.tab_header_bindings
             .borrow_mut()
-            .retain(|group, _| self.tabs.group_layout(*group).is_some());
+            .refresh(bulk_tab_close::strip_order(&self.tabs, &headers), context);
         let tab_strip = TabView::new()
             .height(44.0)
             .width(layout.tab_width)
@@ -4204,7 +4204,7 @@ impl TerminalApp {
                                     .text_wrapping(TextWrapping::Wrap)
                                     .text(tooltip),
                             ))
-                            .menu(self.tab_header_menu(group, &tab.value.page, context)),
+                            .menu(self.tab_header_menu(group, &tab.value.page)),
                     )
                 }),
             );
@@ -5564,7 +5564,7 @@ impl Component for TerminalApp {
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
-            tab_header_callbacks: RefCell::default(),
+            tab_header_bindings: RefCell::default(),
             caret_menu_binding,
             folder_panel_timer: None,
             forward_watch: None,
