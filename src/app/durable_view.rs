@@ -70,7 +70,7 @@ pub(super) fn pane_menu(live: &LiveTab) -> Option<MenuItem> {
 impl TerminalApp {
     #[cfg(feature = "ui-smoke")]
     pub(super) fn durable_smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
-        use super::workspace_view::WorkspaceAction;
+        use super::workspace_view::{SaveWorkspaceAction, WorkspaceAction};
         let id = self.tabs.active_id().unwrap();
         let Page::Terminal(live) = &self.tabs.get(id).unwrap().page else {
             panic!("Expected active durable terminal")
@@ -89,7 +89,10 @@ impl TerminalApp {
                 let manager = self.tabs.active_id().unwrap();
                 let name = "durable fixture".to_owned();
                 self.workspace_action(WorkspaceAction::Name(manager, name.clone()), context);
-                self.workspace_action(WorkspaceAction::Save(manager), context);
+                self.workspace_action(
+                    WorkspaceAction::Save(manager, SaveWorkspaceAction::Create(name.clone())),
+                    context,
+                );
                 self.close_tab(id, context);
                 self.workspace_action(WorkspaceAction::Open(manager, name), context);
                 assert_ne!(id, self.tabs.active_id().unwrap());

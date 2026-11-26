@@ -5,7 +5,10 @@ use w11term::workspace::{
 
 mod duplicate;
 mod manage;
+mod save;
 pub(super) use duplicate::{ClosedPane, ClosedTab, ClosedTabWindow, PreparedTabLayout};
+#[cfg(feature = "ui-smoke")]
+pub(super) use save::Action as SaveWorkspaceAction;
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {
@@ -16,6 +19,7 @@ pub(super) struct WorkspacePage {
     status: String,
     startup: Option<StartupEditor>,
     editor: Option<manage::Editor>,
+    replacement: Option<save::Replacement>,
 }
 
 impl WorkspacePage {
@@ -83,7 +87,7 @@ pub enum WorkspaceAction {
     Search(TabId, String),
     Switch(TabId, String),
     Switched(TabId, Result<(), String>),
-    Save(TabId),
+    Save(TabId, save::Action),
     Open(TabId, String),
     OpenInWindow(TabId, String),
     Manage(TabId, manage::Action),
@@ -200,6 +204,7 @@ impl TerminalApp {
                 if let Some(page) = self.workspace_page_mut(id) {
                     page.startup = None;
                     page.editor = None;
+                    page.replacement = None;
                     page.reload_names();
                 }
                 self.activate(context);
@@ -243,32 +248,7 @@ impl TerminalApp {
                     Err(error) => self.workspace_page_mut(id).unwrap().status = error,
                 }
             }
-            WorkspaceAction::Save(id) => {
-                let Some(page) = self.workspace_page_mut(id) else {
-                    return;
-                };
-                let name = page.name.trim().to_owned();
-                let result = self.capture_workspace().and_then(|workspace| {
-                    crate::workspace_window::save(
-                        &name,
-                        self.store.path(),
-                        &workspace,
-                        &self._control,
-                        self.registry.window_id(),
-                    )
-                });
-                if let Some(page) = self.workspace_page_mut(id) {
-                    page.status = match result {
-                        Ok(()) => {
-                            if let Err(index) = page.names.binary_search(&name) {
-                                page.names.insert(index, name.clone());
-                            }
-                            format!("Saved {name}")
-                        }
-                        Err(error) => format!("{error:#}"),
-                    };
-                }
-            }
+            WorkspaceAction::Save(id, action) => self.save_workspace(id, action),
             WorkspaceAction::Open(id, name) => {
                 if self.workspace_page_mut(id).is_none() {
                     return;
@@ -405,6 +385,9 @@ impl TerminalApp {
         page: &WorkspacePage,
         context: &ViewContext<Self>,
     ) -> View {
+        if let Some(replacement) = &page.replacement {
+            return save::view(id, replacement, context);
+        }
         if let Some(editor) = &page.editor {
             return manage::view(id, page, editor, context);
         }
@@ -460,48 +443,55 @@ impl TerminalApp {
             return ScrollViewer::new().content(panel);
         }
         let name = page.name.trim();
-        let save_label = if page.names.iter().any(|entry| entry == name) {
+        let existing = page.names.iter().any(|entry| entry == name);
+        let save_label = if existing {
             "Update saved workspace"
         } else {
             "Save workspace"
         };
-        let mut children = vec![
-            KeyedView::new("title", TextBlock::new().text("Workspaces").font_size(26.0)),
-            KeyedView::new(
-                "name",
-                TextBox::new()
-                    .automation_name("Workspace name")
-                    .placeholder_text("Workspace name")
-                    .text(&page.name)
-                    .on_text_changed(
-                        context.callback(move |name| {
+        let save_name = name.to_owned();
+        let save_click = context.callback(move |_| {
+            let action = if existing {
+                save::Action::Review(save_name.clone())
+            } else {
+                save::Action::Create(save_name.clone())
+            };
+            Message::Workspace(WorkspaceAction::Save(id, action))
+        });
+        let can_save = !page.switching
+            && !name.is_empty()
+            && self
+                .tabs
+                .entries()
+                .iter()
+                .any(|tab| matches!(tab.value.page, Page::Terminal(_)));
+        let mut children =
+            vec![
+                KeyedView::new("title", TextBlock::new().text("Workspaces").font_size(26.0)),
+                KeyedView::new(
+                    "name",
+                    TextBox::new()
+                        .automation_name("Workspace name")
+                        .placeholder_text("Workspace name")
+                        .text(&page.name)
+                        .on_text_changed(context.callback(move |name| {
                             Message::Workspace(WorkspaceAction::Name(id, name))
-                        }),
-                    ),
-            ),
-            KeyedView::new(
-                "save",
-                Button::new()
-                    .is_enabled(
-                        !name.is_empty()
-                            && self
-                                .tabs
-                                .entries()
-                                .iter()
-                                .any(|tab| matches!(tab.value.page, Page::Terminal(_))),
-                    )
-                    .on_click(
-                        context.callback(move |_| Message::Workspace(WorkspaceAction::Save(id))),
-                    )
-                    .content(save_label),
-            ),
-            KeyedView::new(
-                "status",
-                TextBlock::new()
-                    .text(&page.status)
-                    .text_wrapping(TextWrapping::Wrap),
-            ),
-        ];
+                        })),
+                ),
+                KeyedView::new(
+                    "save",
+                    Button::new()
+                        .is_enabled(can_save)
+                        .on_click(save_click)
+                        .content(save_label),
+                ),
+                KeyedView::new(
+                    "status",
+                    TextBlock::new()
+                        .text(&page.status)
+                        .text_wrapping(TextWrapping::Wrap),
+                ),
+            ];
         if !page.names.is_empty() {
             children.push(KeyedView::new(
                 "list",
@@ -770,7 +760,13 @@ impl TerminalApp {
                     Message::Workspace(WorkspaceAction::Name(id, NAME.into())),
                     context,
                 );
-                self.update(Message::Workspace(WorkspaceAction::Save(id)), context);
+                self.update(
+                    Message::Workspace(WorkspaceAction::Save(
+                        id,
+                        save::Action::Create(NAME.into()),
+                    )),
+                    context,
+                );
                 let page = self.workspace_page_mut(id).expect("workspace page");
                 assert_eq!(page.status, format!("Saved {NAME}"));
                 assert!(page.names.iter().any(|name| name == NAME));

@@ -106,6 +106,12 @@ async fn native_manage_saved_workspace_keeps_its_open_sessions() {
     run("ManageWorkspace", b"after-management/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews a saved layout and refuses to overwrite concurrent workspace changes"]
+async fn native_workspace_replacement_requires_a_current_review() {
+    run("ReplaceWorkspace", b"after-review/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =

@@ -657,6 +657,8 @@ Check **Follow shell directory** under **File options** to track later directory
 
 Use **More → Workspaces…** to name and save your current terminal tabs. A workspace remembers tab order, split directions and proportions, the focused pane in each tab and which tab you were using. Under **Switch workspace**, type part of a name and select the workspace to bring its live window forward. If the window has closed, w11term opens its saved layout. Saving a workspace associates the current window with that name.
 
+For an existing name, **Update saved workspace** opens a review of the saved and proposed tab lists and pane counts. Choose **Replace saved workspace** to save the reviewed layout. If another window changes that workspace while the review is open, review the current layout before replacing it.
+
 Use `w11term --switch-workspace "Admin console"` for the same behavior from a launcher. Workspaces match within the same Windows user, session, elevation level, workspace catalog and profile file. **Append in this window** adds a fresh copy of the layout to the current window. `w11term --workspace "Admin console"` always opens a new window. When multiple windows have the same workspace open, switching from one of those windows keeps its sessions selected. Switching from elsewhere lists the matching process IDs so you can choose the window yourself.
 
 Choose **Open in new window** beside a saved workspace to restore its layout in a separate window within the same running instance. The source window stays open, and the new copy is registered for **Switch workspace** and **Find window…**.
