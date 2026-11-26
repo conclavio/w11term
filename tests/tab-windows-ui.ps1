@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -130,6 +130,19 @@ function Wait-RemotePreview([IntPtr]$Hwnd, [string]$Marker, [long]$WindowId) {
                 return $true
             }
         }
+    }
+}
+
+function Open-WindowTextSearch([IntPtr]$Hwnd, [int]$LocalPane, [int]$RemotePane, [long]$RemoteWindow) {
+    Use-Window $Hwnd
+    $window = $Hwnd
+    Press-Key 0x73 # F4, fixture Find in all panes shortcut
+    $field = Wait-PickerEditor 'Find in all panes' 'the fixture text search shortcut'
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('fleet needle')
+    $null = Wait-Until 'local PowerShell text and hidden sibling SSH history in order' {
+        $rows = @(Get-PickerRows)
+        $rows.Count -eq 2 -and $rows[0] -like "Pane $LocalPane *1 match*local fleet needle*" -and
+            $rows[1] -like "Pane $RemotePane *Window $RemoteWindow*1 match*old fleet needle*"
     }
 }
 
@@ -276,7 +289,7 @@ try {
     Press-Key 0x78 # F9 focuses the left SSH pane
     Expect-Focus $destination $ssh.id 'F9 selects the destination SSH pane'
 
-    if ($FirstClose -in 'Search','PaneSearch') {
+    if ($FirstClose -in 'Search','PaneSearch','TextSearch') {
         Run-WindowCommand $destination ('New tab with Destination PowerShell ' + [char]0x00b7 + ' Local')
         $helper = Wait-Until 'the detached split to become a background tab' {
             (Control @('list')).sessions | Where-Object {
@@ -287,7 +300,64 @@ try {
         $null = [TabFixtureWindows]::ShowWindowAsync($destination, 7) # SW_SHOWMINNOACTIVE
         $null = Wait-Until 'the detached window to minimize' { [TabFixtureWindows]::IsIconic($destination) }
     }
-    if ($FirstClose -eq 'PaneSearch') {
+    if ($FirstClose -eq 'TextSearch') {
+        $lineBreak = [string][char]13 + [char]10
+        $lines = @('', 'old fleet needle') + @(1..70 | ForEach-Object { "scrollback row $_" }) + @('ssh latest', '')
+        $wire = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($lines -join $lineBreak))
+        $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','--base64',$wire)
+        Expect-Text $ssh.id 'ssh latest'
+        Send-Line $anchor.id 'Write-Output ("local fleet" + " needle")'
+        Expect-Text $anchor.id 'local fleet needle'
+        $before = (Control @('get-text','--pane',"$($ssh.id)")).text
+        if ($before.Contains('old fleet needle')) { throw 'SSH match must start outside the viewport' }
+
+        Open-WindowTextSearch $origin $anchor.id $ssh.id $newOwner
+        Expect-Focus $origin $anchor.id 'Previewing a remote match leaves the source pane focused'
+        $window = $origin
+        Press-Key 27
+        $null = Wait-Until 'Escape closes the cross-window text search' { !(Find-Here $origin 'Find in all panes') }
+        Expect-Focus $origin $anchor.id 'Escape keeps the original pane'
+        if ((Control @('get-text','--pane',"$($ssh.id)")).text -cne $before -or
+            ![TabFixtureWindows]::IsIconic($destination)) { throw 'Preview changed the sibling view' }
+
+        Open-WindowTextSearch $origin $anchor.id $ssh.id $newOwner
+        Press-Key 40
+        Press-Key 13
+        Expect-Focus $destination $ssh.id 'Reveal restores the other window and selects the SSH pane'
+        $window = $destination
+        $find = Wait-PickerEditor 'Find in scrollback' 'revealing the remote historical match'
+        if ($find.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'fleet needle') {
+            throw 'The destination Find bar lost the query'
+        }
+        $status = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'find-status')
+        $null = Wait-Until 'the destination Find bar shows the selected occurrence' {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($destination)
+            $node = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $status)
+            $node -and $node.Current.Name -eq '1 / 1'
+        }
+        Press-Key 27
+        $null = Wait-Until 'the destination reveals the historical line in the viewport' {
+            $document = Find-Here $destination ("Terminal $([char]0x00b7) window-ssh")
+            if ($document) {
+                $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).
+                    DocumentRange.GetText(-1).Contains('old fleet needle')
+            }
+        }
+
+        Open-WindowTextSearch $origin $anchor.id $ssh.id $newOwner
+        Close-FixtureWindow $destination
+        $null = Wait-Until 'the matched sibling window closes' { [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $destination }
+        $window = $origin
+        Press-Key 40
+        Press-Key 13
+        $null = Wait-Until 'the stale match reports that it is unavailable' {
+            Find-Here $origin 'The match changed or the pane is unavailable. Refresh to search again.'
+        }
+        Expect-Focus $origin $anchor.id 'A stale sibling match keeps the source focus'
+        Press-Key 27
+        $last = $origin
+    } elseif ($FirstClose -eq 'PaneSearch') {
         $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','preview-before')
         Expect-Text $ssh.id 'preview-before'
         $grid = Control @('get-text','--pane',"$($ssh.id)")

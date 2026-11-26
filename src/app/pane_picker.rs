@@ -8,6 +8,7 @@ pub(in crate::app) use running_interrupt::Pending as PendingRunningInterrupt;
 mod text_search;
 mod window_history;
 pub use text_search::Action as TextAction;
+pub use text_search::RemoteReveal;
 pub use window_history::Action as WindowHistoryAction;
 pub(super) use window_history::WindowHistoryReturn;
 pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
@@ -690,7 +691,7 @@ impl TerminalApp {
     }
 
     fn picker_choices(&self, mode: Mode, query: &str) -> Vec<Choice> {
-        if mode != Mode::Focus {
+        if !matches!(mode, Mode::Focus | Mode::Text) {
             let choices = self
                 .local_pane_search_entries(mode)
                 .iter()
@@ -698,8 +699,13 @@ impl TerminalApp {
                 .collect();
             return Picker::filter(choices, query);
         }
-        let Some((window_filter, stripped)) = tab_windows::window_query(query) else {
-            return Vec::new();
+        let (window_filter, stripped) = if mode == Mode::Focus {
+            let Some(parsed) = tab_windows::window_query(query) else {
+                return Vec::new();
+            };
+            parsed
+        } else {
+            (None, String::new())
         };
         let local = self.registry.window_id();
         let allowed = |window| window_filter.is_none_or(|filter| filter == window);
