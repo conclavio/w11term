@@ -158,9 +158,5 @@ try {
     [IO.File]::Delete($writeGate)
     [IO.File]::Delete($readGate)
     if ($reader) { $reader.Dispose() }
-    if (!$app.HasExited) {
-        $null = $app.CloseMainWindow()
-        if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
-    }
-    $app.Dispose()
+    Close-FixtureApp $app
 }
