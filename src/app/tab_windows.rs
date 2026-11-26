@@ -467,6 +467,15 @@ impl TerminalApp {
                 Ok(()) => {
                     self.native_bound = true;
                     self.refresh_remote_clipboard_focus();
+                    let tabs = self.tab_search_entries(
+                        self.appearance
+                            .read()
+                            .unwrap()
+                            .interaction
+                            .application_tab_titles,
+                    );
+                    let active_group = self.tabs.active_group_id();
+                    self.publish_control_window(&tabs, active_group);
                     WINDOWS.with_borrow_mut(|windows| {
                         windows.insert(
                             self.registry.window_id(),
@@ -475,16 +484,8 @@ impl TerminalApp {
                                 sender: ctx.sender(),
                                 outgoing: Weak::new(),
                                 name: self.window_name.clone(),
-                                active_group: self.tabs.active_group_id(),
-                                tabs: self
-                                    .tab_search_entries(
-                                        self.appearance
-                                            .read()
-                                            .unwrap()
-                                            .interaction
-                                            .application_tab_titles,
-                                    )
-                                    .into(),
+                                active_group,
+                                tabs: tabs.into(),
                                 panes: self.pane_search_entries().into(),
                                 search: self.active_window_search(),
                             },
@@ -595,6 +596,7 @@ impl TerminalApp {
             if endpoint.tabs.as_ref() == entries && endpoint.active_group == active_group {
                 return None;
             }
+            self.publish_control_window(&entries, active_group);
             endpoint.tabs = entries.into();
             endpoint.active_group = active_group;
             Some(search_subscribers(windows, source, SearchScope::Tabs))
@@ -604,6 +606,19 @@ impl TerminalApp {
         for sender in subscribers {
             sender.send(Message::WindowSearchChanged);
         }
+    }
+
+    fn publish_control_window(
+        &self,
+        tabs: &[command_palette::SearchTab],
+        active_group: Option<TabId>,
+    ) {
+        let selected = tabs.iter().find(|tab| Some(tab.group) == active_group);
+        self.registry.set_window_details(
+            self.window_name.as_ref().map(TabTitle::as_str),
+            selected.map(|tab| tab.title.as_str()),
+            tabs.len(),
+        );
     }
 
     pub(super) fn sibling_pane_search_entries(
@@ -633,6 +648,7 @@ impl TerminalApp {
         WINDOWS.with_borrow_mut(|windows| {
             if let Some(endpoint) = windows.get_mut(&self.registry.window_id()) {
                 endpoint.name = name;
+                self.publish_control_window(&endpoint.tabs, endpoint.active_group);
             }
         });
         windows_changed();

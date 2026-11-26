@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -45,10 +45,15 @@ $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 
-function Find-Here([IntPtr]$Hwnd, [string]$Name) {
+function Find-Here([IntPtr]$Hwnd, [string]$Name, [System.Windows.Automation.ControlType]$Type) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($Hwnd)
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+    if ($Type) {
+        $byType = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $Type)
+        $condition = [System.Windows.Automation.AndCondition]::new($condition, $byType)
+    }
     return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
 
@@ -98,11 +103,22 @@ function Run-WindowCommand([IntPtr]$Hwnd, [string]$Action) {
         if ($element -and $element.Current.HasKeyboardFocus) { $element }
     }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Action)
-    $null = Wait-Until "enabled $Action action" {
-        $item = Find-Here $Hwnd $Action
-        if ($item -and $item.Current.IsEnabled) { $item }
+    $null = Wait-Until "invoke palette command '$Action' in the requested HWND" {
+        try {
+            $item = Find-Here $Hwnd $Action ([System.Windows.Automation.ControlType]::Button)
+            $invoke = $null
+            if ($item -and $item.Current.IsEnabled -and
+                $item.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+                $invoke.Invoke()
+                return $true
+            }
+        } catch {
+            $cause = $_.Exception.GetBaseException()
+            $retired = $cause -is [System.Windows.Automation.ElementNotAvailableException] -or
+                       ($cause -is [Runtime.InteropServices.COMException] -and $cause.HResult -eq -2147467259)
+            if (!$retired) { throw }
+        }
     }
-    Press-Key 13
     $null = Wait-Until "command palette closes after '$Action'" {
         [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $Hwnd -or
             !(Find-Here $Hwnd 'Search commands')
@@ -593,6 +609,86 @@ function Invoke-WorkspaceButton([IntPtr]$Hwnd, [string]$Name) {
         $button = Find-Here $Hwnd $Name
         if ($button -and $button.Current.IsEnabled) { $button }
     })
+}
+
+function Test-ExplicitControlWindow {
+    $window = $origin
+    $field = Open-ProfileWindowPicker $origin -FromPalette
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Destination PowerShell')
+    $null = Wait-Until 'local profile for the window target' {
+        Find-Here $origin ('Destination PowerShell ' + [char]0x00b7 + ' Local')
+    }
+    Press-Key 13
+    $child = Wait-DetachedWindow $origin
+    $initialChild = Wait-Until 'the new window has a local terminal' {
+        (Control @('list')).sessions | Where-Object label -eq 'Destination PowerShell'
+    }
+    $targetId = $initialChild.window_id
+    Set-FixtureWindowName $child 'Automation helper'
+    $null = Wait-Until 'the named child is published before opening Settings' {
+        (Control @('list-windows')).windows |
+            Where-Object { $_.window_id -eq $targetId -and $_.name -ceq 'Automation helper' }
+    }
+    Run-WindowCommand $child 'Settings'
+    $null = Control @('close-pane','--pane',"$($initialChild.id)")
+    try {
+        $null = Wait-Until 'window discovery includes the named utility-only window' {
+            $windows = @((Control @('list-windows')).windows)
+            $target = $windows | Where-Object window_id -eq $targetId
+            $windows.Count -eq 2 -and $target.name -ceq 'Automation helper' -and
+                $target.active_tab_title -ceq 'Settings' -and $target.tab_count -eq 1 -and $target.pane_count -eq 0
+        }
+    } catch {
+        throw "$_ Windows: $(Control @('list-windows') | ConvertTo-Json -Depth 4 -Compress)"
+    }
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'The source SSH pane is foreground for CLI tests'
+
+    $local = Control @('open','--window',"$targetId",'--profile','Destination PowerShell')
+    if ($local.window_id -ne $targetId -or $local.active) {
+        throw 'The background open did not target the utility window without selecting the tab'
+    }
+    $null = Wait-Until 'the background open keeps Settings selected' {
+        $windows = (Control @('list-windows')).windows
+        $target = $windows | Where-Object window_id -eq $targetId
+        $source = $windows | Where-Object window_id -eq $ssh.window_id
+        $target.active_tab_title -ceq 'Settings' -and $target.tab_count -eq 2 -and
+            $target.pane_count -eq 1 -and !$target.active -and $source.active
+    }
+    Expect-Text $local.pane 'PS '
+    $null = Shell-State $local.pane 'explicitLocal' -Init
+    Expect-Focus $origin $ssh.id 'The background open preserves foreground and SSH focus'
+
+    $remote = Control @('open','--window',"$targetId",'--profile','window-ssh','--activate')
+    if ($remote.window_id -ne $targetId -or !$remote.active) {
+        throw 'Activate did not select the new SSH tab in its target window'
+    }
+    $null = Wait-Until 'the specified background window selects its new terminal' {
+        $windows = (Control @('list-windows')).windows
+        $target = $windows | Where-Object window_id -eq $targetId
+        $pane = (Control @('list')).sessions | Where-Object id -eq $remote.pane
+        $target.active_tab_title -ceq 'window-ssh' -and $target.tab_count -eq 3 -and
+            $target.pane_count -eq 2 -and !$target.active -and
+            $pane.window_id -eq $targetId -and $pane.visible -and !$pane.active
+    }
+    Expect-Text $remote.pane 'ready'
+    $null = Control @('send-text','--pane',"$($remote.pane)",'--no-paste','targeted-ssh/')
+    Expect-Text $remote.pane 'targeted-ssh/'
+    Expect-Focus $origin $ssh.id 'Target-local activation preserves desktop focus'
+    Type-In $origin 'original-ssh/'
+    Expect-Text $ssh.id 'original-ssh/'
+
+    Close-FixtureWindow $child
+    $null = Wait-Until 'the closed target disappears from window discovery' {
+        $windows = @((Control @('list-windows')).windows)
+        $windows.Count -eq 1 -and $windows[0].window_id -eq $ssh.window_id
+    }
+    $failed = & $Cli --pid $app.Id open --window "$targetId" --profile 'Destination PowerShell' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -cne "unknown window $targetId") {
+        throw 'An explicit open against a closed window did not return the expected error'
+    }
+    if (@((Control @('list')).sessions).Count -ne 3) { throw 'A closed-window request fell back to the original window' }
+    Close-FixtureWindow $origin
 }
 
 function Test-RepairWorkspace {
@@ -1090,6 +1186,13 @@ try {
         Test-RepairWorkspace
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'The workspace repair windows did not close normally'
+        }
+        return
+    }
+    if ($FirstClose -eq 'CliWindows') {
+        Test-ExplicitControlWindow
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'The CLI window fixture did not shut down cleanly'
         }
         return
     }

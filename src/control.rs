@@ -114,6 +114,8 @@ pub enum Request {
     },
     Open {
         profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_id: Option<WindowId>,
         cols: Option<usize>,
         rows: Option<usize>,
         #[serde(default)]
@@ -141,6 +143,7 @@ pub enum Request {
         timeout_seconds: u64,
     },
     List,
+    ListWindows,
     ListSshGroups,
     ListSavedSshGroups {
         window_id: WindowId,
@@ -634,13 +637,18 @@ impl Registry {
             }
             Request::Open {
                 profile,
+                window_id,
                 cols,
                 rows,
                 activate,
             } => {
                 validate_grid(cols.unwrap_or(120), rows.unwrap_or(32))?;
+                let ui = match window_id {
+                    Some(id) => self.window_ui(id)?,
+                    None => self.active_ui()?,
+                };
                 let (reply, response) = oneshot::channel();
-                self.active_ui()?(UiRequest::Open {
+                ui(UiRequest::Open {
                     profile,
                     cols,
                     rows,
@@ -1158,6 +1166,7 @@ impl Registry {
             Request::FollowSshGroupOutput { .. } => {
                 anyhow::bail!("follow-ssh-group-output requires a streaming reply")
             }
+            Request::ListWindows => Ok(self.list_windows()),
             Request::List => {
                 let mut sessions = Vec::new();
                 for (window_id, pane) in self.listing() {

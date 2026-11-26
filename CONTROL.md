@@ -22,7 +22,11 @@ $pane = $listing.result.sessions[0].id
 
 Omit `--pid` when exactly one process is running. Each process serves all its windows on one pipe. Zero processes fail immediately and multiple processes require an explicit PID. Each session in `list` includes its process-local `window_id`, `tab_id` and pane `id`. Moving a live tab between windows changes its window ID and preserves its tab and pane IDs. Visible panes in all windows report `visible: true`. At most one pane reports `active: true`, in the most recently active window. Settings and New Profile pages are excluded.
 
-`open` uses the most recently active window. `resize` routes to the window that owns the pane, including after a live tab transfer. Closing one window leaves the process pipe and the remaining windows’ sessions accessible. Pipe requests preserve desktop focus.
+`list-windows` returns the registered windows ordered by `window_id`, including windows with only utility tabs. Each entry has `name` and `active_tab_title` (nullable), `tab_count` including utility tabs, terminal `pane_count`, and `active` for the most recently active window in the process.
+
+`open --profile NAME --window ID` opens in that window and returns its `window_id` alongside the pane ID and grid. Omitting `--window` uses the most recently active window. An unknown or closed ID fails. `--activate` selects the newly opened tab in the target window. Pipe requests preserve desktop focus.
+
+`resize` routes to the window that owns the pane, including after a live tab transfer. Closing one window leaves the process pipe and the remaining windows’ sessions accessible.
 
 ```powershell
 # Literal UTF-8, including a carriage return supplied by PowerShell.

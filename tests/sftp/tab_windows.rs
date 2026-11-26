@@ -124,6 +124,12 @@ async fn native_repair_saved_workspace_ssh_profile_in_place() {
     run("RepairWorkspace", b"repaired-ssh/original-ssh/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "discovers a utility-only window and opens SSH and PowerShell there without taking focus"]
+async fn native_cli_opens_profiles_in_an_explicit_window() {
+    run("CliWindows", b"targeted-ssh/original-ssh/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -228,6 +234,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "WorkspaceWindow"
             | "CopyWorkspace"
             | "RepairWorkspace"
+            | "CliWindows"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

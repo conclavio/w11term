@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -164,12 +164,16 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
     }
     let verb = verb.context(HELP)?;
     let request = match verb.as_str() {
-        "list" => {
+        "list" | "list-windows" => {
             ensure!(
                 pane.is_none() && payload.is_none() && path.is_none() && !no_paste,
-                "list takes no pane/input options"
+                "{verb} takes no pane/input options"
             );
-            Request::List
+            if verb == "list-windows" {
+                Request::ListWindows
+            } else {
+                Request::List
+            }
         }
         "get-text" => {
             ensure!(
@@ -311,6 +315,56 @@ mod tests {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request)> {
         let invocation = parse_invocation(args)?;
         Ok((invocation.pid, invocation.request))
+    }
+
+    #[test]
+    fn lists_windows_and_targets_a_specific_gui_window() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (pid, request) = parse_line("--pid 7 list-windows").unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"list-windows"})
+        );
+        let (_, request) = parse_line("open --profile desk --window 12 --activate").unwrap();
+        assert!(matches!(
+            request,
+            Request::Open {
+                window_id: Some(12),
+                activate: true,
+                ..
+            }
+        ));
+        let (_, request) = parse_line("open --profile desk").unwrap();
+        assert!(matches!(
+            request,
+            Request::Open {
+                window_id: None,
+                ..
+            }
+        ));
+        let legacy: Request = serde_json::from_value(serde_json::json!({
+            "verb": "open",
+            "profile": "desk",
+            "rows": 30
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Request::Open {
+                window_id: None,
+                rows: Some(30),
+                ..
+            }
+        ));
+        for invalid in [
+            "list-windows --pane 1",
+            "open --profile desk --window 0",
+            "open --profile desk --window 1 --window 2",
+            "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

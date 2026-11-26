@@ -6515,6 +6515,10 @@ impl Component for TerminalApp {
                 activate,
                 reply,
             }) => {
+                if reply.is_closed() {
+                    return;
+                }
+                self.refresh_profiles();
                 let result = (|| -> anyhow::Result<serde_json::Value> {
                     let source = self
                         .catalog
@@ -6562,9 +6566,13 @@ impl Component for TerminalApp {
                     } else {
                         self.publish_panes();
                     }
-                    Ok(
-                        serde_json::json!({"pane":pane,"cols":cols,"rows":rows,"active":activate||previous.is_none()}),
-                    )
+                    Ok(serde_json::json!({
+                        "pane": pane,
+                        "window_id": self.registry.window_id(),
+                        "cols": cols,
+                        "rows": rows,
+                        "active": activate || previous.is_none(),
+                    }))
                 })();
                 let _ = reply.send(result.map_err(|e| format!("{e:#}")));
             }
