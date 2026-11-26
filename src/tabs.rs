@@ -725,6 +725,12 @@ impl<T> Tabs<T> {
         Ok(id)
     }
 
+    pub fn open_detached_pane_as_tab(&mut self, moved: DetachedPane<T>) -> TabId {
+        let id = moved.entry.id;
+        self.insert_group(next_id(), id, moved.entry.value, moved.entry.visit);
+        id
+    }
+
     pub fn return_detached_pane(&mut self, moved: DetachedPane<T>) {
         let select = moved.was_selected && self.active_id() == moved.fallback;
         let original = moved.original;
@@ -1589,6 +1595,29 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_detached_pane_as_a_tab_keeps_its_entry_and_leaves_the_source_group() {
+        let mut source = Tabs::default();
+        let original = source.insert("SSH");
+        let moved = source.split(original, "PowerShell", Axis::Columns).unwrap();
+        source.set_group_title(original, Some("Operations".to_owned().try_into().unwrap()));
+        let pane = source.detach_pane(moved).unwrap();
+
+        let mut child = Tabs::default();
+        assert_eq!(child.open_detached_pane_as_tab(*pane), moved);
+        assert_eq!(child.active_id(), Some(moved));
+        assert_eq!(child.active(), Some(&"PowerShell"));
+        assert_eq!(child.active_layout(), Some(&Layout::Leaf(moved)));
+        assert_ne!(child.active_group_id(), Some(original));
+        assert_eq!(child.title_for(moved), None);
+        assert_eq!(source.active_group_id(), Some(original));
+        assert_eq!(source.active(), Some(&"SSH"));
+        assert_eq!(
+            source.title_for(original).map(TabTitle::as_str),
+            Some("Operations")
+        );
+    }
+
+    #[test]
     fn returning_an_unclaimed_group_restores_header_order_and_preserves_later_focus() {
         let mut tabs = Tabs::default();
         let first = tabs.insert("first");
@@ -1724,11 +1753,12 @@ mod tests {
         let sibling = tabs.split(source, "sibling", Axis::Rows).unwrap();
         assert!(tabs.toggle_zoom());
         let original = tabs.active_layout().unwrap().clone();
+        let missing = next_id();
         for (from, to) in [
             (source, source),
             (source, sibling),
-            (99, target),
-            (source, 99),
+            (missing, target),
+            (source, missing),
         ] {
             assert!(!tabs.move_to_existing_tab(from, to, Direction::Right));
             assert_eq!(tabs.active_layout(), Some(&original));

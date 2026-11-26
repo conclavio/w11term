@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -232,6 +232,70 @@ function Expect-Group([int]$Count, [long]$OldWindow) {
     }
 }
 
+function Wait-DetachedWindow([IntPtr]$Source) {
+    Wait-Until 'a second native window in the same process' {
+        $handles = [TabFixtureWindows]::OwnedBy($app.Id)
+        if ($handles.Count -eq 2 -and $handles -contains $Source) {
+            $handles | Where-Object { $_ -ne $Source }
+        }
+    }
+}
+
+function Test-PaneInNewWindow {
+    Use-Window $origin
+    $window = $origin
+    Press-Key 0x77 # F8 focuses the PowerShell half of the split.
+    Expect-Focus $origin $moved.id 'Right PowerShell pane before detaching'
+    Run-WindowCommand $origin 'Move pane to new window    F2'
+    $child = Wait-DetachedWindow $origin
+    Expect-Focus $child $moved.id 'The detached PowerShell pane receives focus'
+    $null = Wait-Until 'only the chosen pane is in the new window' {
+        $all = @((Control @('list')).sessions)
+        $local = $all | Where-Object id -eq $moved.id
+        $remote = $all | Where-Object id -eq $ssh.id
+        $all.Count -eq 3 -and $local.window_id -ne $ssh.window_id -and $local.tab_id -ne $ssh.tab_id -and
+            $remote.window_id -eq $ssh.window_id -and $remote.tab_id -eq $ssh.tab_id -and
+            $remote.tab_title -ceq 'Cockpit tools' -and $remote.connection_generation -eq $ssh.connection_generation
+    }
+    if ((Shell-State $moved.id 'NW' $child) -ne $localIdentity) { throw 'Detaching restarted the PowerShell process' }
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'The SSH sibling stays in its original tab'
+    Type-In $origin 'ssh-stays/'
+    Expect-Text $ssh.id 'ssh-stays/'
+
+    Choose-WindowPanePlacement $child $ssh.window_id 'window-ssh'
+    $window = $child
+    Press-Key 39
+    $null = Wait-Until 'the empty child closes after joining the original split' {
+        [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $child
+    }
+    Expect-Focus $origin $moved.id 'PowerShell returns to the original tab'
+    $window = $origin
+    Press-Key 0x78 # F9 focuses the SSH pane again.
+    Expect-Focus $origin $ssh.id 'Left SSH pane before detaching'
+    Press-Key 0x71 # F2 runs the action directly.
+    $child = Wait-DetachedWindow $origin
+    Expect-Focus $child $ssh.id 'The remapped action detaches the active SSH pane'
+    $null = Wait-Until 'the SSH pane keeps its original channel while the two shells stay behind' {
+        $all = @((Control @('list')).sessions)
+        $remote = $all | Where-Object id -eq $ssh.id
+        $all.Count -eq 3 -and $remote.window_id -ne $ssh.window_id -and
+            $remote.connection_generation -eq $ssh.connection_generation -and
+            @($all | Where-Object { $_.id -in $moved.id,$anchor.id -and $_.window_id -eq $ssh.window_id }).Count -eq 2
+    }
+    Expect-Text $ssh.id 'ssh-stays/'
+    Type-In $child 'ssh-moved/'
+    Expect-Text $ssh.id 'ssh-moved/'
+    Close-FixtureWindow $child
+    $null = Wait-Until 'closing the SSH window leaves both original PowerShell sessions' {
+        $all = @((Control @('list')).sessions)
+        $all.Count -eq 2 -and $moved.id -in $all.id -and $anchor.id -in $all.id
+    }
+    if ((Shell-State $moved.id 'RJ') -ne $localIdentity -or (Shell-State $anchor.id 'AN') -ne $anchorIdentity) {
+        throw 'The original local shell identities changed'
+    }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--workspace', 'two-windows') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     # Retain the process handle before any native close so Windows PowerShell can read its exit code.
@@ -262,6 +326,10 @@ try {
     $localIdentity = Shell-State $moved.id 'movedBefore' -Init
     $anchorIdentity = Shell-State $anchor.id 'anchorBefore' -Init
     if ($localIdentity -eq $anchorIdentity) { throw 'Expected independent PowerShell children' }
+    if ($FirstClose -eq 'PaneWindow') {
+        Test-PaneInNewWindow
+        return
+    }
     Write-Output "Moving split from source $origin"
     if ($FirstClose -eq 'Context') {
         Use-Window $origin
@@ -273,12 +341,7 @@ try {
     } else {
         Run-WindowCommand $origin 'Move tab to new window'
     }
-    $destination = Wait-Until 'two distinct native HWNDs owned by the same process' {
-        $handles = [TabFixtureWindows]::OwnedBy($app.Id)
-        if ($handles.Count -eq 2 -and $handles -contains $origin) {
-            $handles | Where-Object { $_ -ne $origin }
-        }
-    }
+    $destination = Wait-DetachedWindow $origin
     Write-Output "Source $origin and destination $destination are both live"
     $newOwner = Expect-Group 3 $ssh.window_id
     $sourceAfter = (Control @('list')).sessions | Where-Object id -eq $anchor.id

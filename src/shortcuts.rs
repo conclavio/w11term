@@ -34,6 +34,7 @@ pub enum Action {
     BalancePanes,
     ClosePane,
     MovePane,
+    MovePaneToNewWindow,
     MovePaneToExistingTab,
     CommandPalette,
     PanePicker,
@@ -170,6 +171,13 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(ClosePane, "close_pane", "Close pane", 0x57, PANE),
     Binding::new(MovePane, "move_pane", "Move pane to new tab", 0, Mods::NONE),
+    Binding::new(
+        MovePaneToNewWindow,
+        "move_pane_to_new_window",
+        "Move pane to new window",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(
         MovePaneToExistingTab,
         "move_pane_to_existing_tab",
@@ -328,6 +336,7 @@ impl Action {
                 | BalancePanes
                 | ClosePane
                 | MovePane
+                | MovePaneToNewWindow
                 | MovePaneToExistingTab
                 | Find
                 | FindNext
@@ -754,22 +763,33 @@ mod tests {
         );
     }
     #[test]
-    fn move_to_existing_tab_binds_only_in_a_terminal() {
-        let mut shortcuts = Shortcuts::default();
-        assert_eq!(shortcuts.get(MovePaneToExistingTab.binding()), None);
+    fn pane_move_shortcuts_bind_only_in_a_terminal() {
         let chord: Chord = "Ctrl+Shift+M".parse().unwrap();
-        shortcuts.set(MovePaneToExistingTab, Some(chord)).unwrap();
-        let json = serde_json::to_string(&shortcuts).unwrap();
-        assert_eq!(json, r#"{"move_pane_to_existing_tab":"Ctrl+Shift+M"}"#);
-        let keymap = serde_json::from_str::<Shortcuts>(&json)
-            .unwrap()
-            .keymap()
-            .unwrap();
-        assert_eq!(
-            keymap.resolve(chord.key, chord.mods, true, false),
-            Some(MovePaneToExistingTab)
-        );
-        assert_eq!(keymap.resolve(chord.key, chord.mods, false, false), None);
+        for (action, expected) in [
+            (
+                MovePaneToExistingTab,
+                r#"{"move_pane_to_existing_tab":"Ctrl+Shift+M"}"#,
+            ),
+            (
+                MovePaneToNewWindow,
+                r#"{"move_pane_to_new_window":"Ctrl+Shift+M"}"#,
+            ),
+        ] {
+            let mut shortcuts = Shortcuts::default();
+            assert_eq!(shortcuts.get(action.binding()), None);
+            shortcuts.set(action, Some(chord)).unwrap();
+            let json = serde_json::to_string(&shortcuts).unwrap();
+            assert_eq!(json, expected);
+            let keymap = serde_json::from_str::<Shortcuts>(&json)
+                .unwrap()
+                .keymap()
+                .unwrap();
+            assert_eq!(
+                keymap.resolve(chord.key, chord.mods, true, false),
+                Some(action)
+            );
+            assert_eq!(keymap.resolve(chord.key, chord.mods, false, false), None);
+        }
     }
 
     #[test]

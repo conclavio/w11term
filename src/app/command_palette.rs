@@ -101,6 +101,7 @@ impl Search {
 pub enum CommandId {
     Menu(String),
     MoveTabToExistingWindow(Option<TabId>, u64),
+    MovePaneToNewWindow(Option<u64>),
     BroadcastTyping(pane_broadcast::Action),
     RenamePane(Option<(u64, TabId)>),
     SaveLiveProfile(Option<clipboard_paste::Origin>),
@@ -687,6 +688,10 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                Shortcut::MovePaneToNewWindow => {
+                    row.id = CommandId::MovePaneToNewWindow(pane);
+                    row.enabled = self.can_detach_pane_to_window();
+                }
                 Shortcut::ReopenClosedTab => {
                     let closed = self.closed_tabs.back().map(|tab| tab.group);
                     row.enabled = closed.is_some();
@@ -1058,6 +1063,7 @@ impl TerminalApp {
             CommandId::MoveTabToExistingWindow(group, window) => {
                 Message::MoveTabToExistingWindow(group, window)
             }
+            CommandId::MovePaneToNewWindow(pane) => Message::MovePaneToNewWindow(pane),
             CommandId::BroadcastTyping(action) => Message::BroadcastTyping(action),
             CommandId::Recording(choice) => recordings::invoke(choice),
             CommandId::Shortcut(shortcut) => Message::Shortcut(shortcut),
