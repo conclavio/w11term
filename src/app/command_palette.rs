@@ -747,7 +747,10 @@ impl TerminalApp {
                 Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => {
                     row.id = CommandId::PaneFind(origin, shortcut);
                 }
-                Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
+                Shortcut::DuplicateTabLayout
+                | Shortcut::DuplicateTabLayoutInNewWindow
+                | Shortcut::MoveTabLeft
+                | Shortcut::MoveTabRight => {
                     // A click queued on this row must keep its original tab even
                     // when a control client switches tabs before we receive it.
                     row.id = CommandId::TabAction(shortcut, self.tabs.active_group_id());

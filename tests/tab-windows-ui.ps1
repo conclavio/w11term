@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -410,6 +410,84 @@ function Test-ProfileInNewWindow {
     Close-FixtureWindow $remoteWindow
 }
 
+function Test-DuplicateInNewWindow {
+    Use-Window $origin
+    $window = $origin
+    Expect-Focus $origin $ssh.id 'The source SSH pane starts selected'
+    Type-In $origin 'source-layout/'
+    Expect-Text $ssh.id 'source-layout/'
+    Press-Key 0x77 # F8 focuses the right split before capturing the layout.
+    Expect-Focus $origin $moved.id 'PowerShell is the source layout focus'
+    Run-WindowCommand $origin 'Set tab color to Blue'
+    Run-WindowCommand $origin 'Pin tab'
+    Run-WindowCommand $origin 'Enable read-only pane input'
+    Press-Key 0x73 # F4 zooms the source PowerShell pane.
+    $null = Wait-Until 'the source pane has the requested input lock and zoom' {
+        $rows = (Control @('list')).sessions
+        $local = $rows | Where-Object id -eq $moved.id
+        $remote = $rows | Where-Object id -eq $ssh.id
+        $local.active -and $local.read_only -and !$remote.visible
+    }
+    $anchorTab = Wait-Until 'the other tab in the source window' { Find-Here $origin 'Source PowerShell' }
+    $anchorTab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Expect-Focus $origin $anchor.id 'The duplicate action targets a background tab'
+    Invoke-Button (Open-Context 'Pinned: Cockpit tools (Blue tab)' 'Duplicate tab layout in new window')
+
+    $child = Wait-DetachedWindow $origin
+    $copied = Wait-Until 'the new window has two fresh panes in its only tab' {
+        $all = @((Control @('list')).sessions)
+        $new = @($all | Where-Object window_id -ne $ssh.window_id)
+        if ($all.Count -eq 5 -and $new.Count -eq 2 -and
+            @($new.window_id | Sort-Object -Unique).Count -eq 1 -and
+            @($new.tab_id | Sort-Object -Unique).Count -eq 1 -and
+            @($new | Where-Object { $_.tab_title -cne 'Cockpit tools' -or $_.tab_id -eq $ssh.tab_id }).Count -eq 0) { $new }
+    }
+    $copySsh = $copied | Where-Object label -eq 'window-ssh'
+    $copyShell = $copied | Where-Object id -ne $copySsh.id
+    if (!$copyShell -or !$copySsh -or !$copyShell.read_only -or $copySsh.visible) {
+        throw 'The copy lost its SSH and PowerShell layouts, input lock, or zoom'
+    }
+    Expect-Focus $child $copyShell.id 'The copy selects the remembered PowerShell pane'
+    $null = Wait-Until 'the duplicate keeps its color and starts unpinned' {
+        Find-Here $child 'Cockpit tools (Blue tab)'
+    }
+    Expect-Text $copySsh.id 'ready'
+    Expect-Text $copyShell.id 'PS '
+    if ((Control @('get-text','--pane',"$($copySsh.id)")).text.Contains('source-layout/')) {
+        throw 'The duplicate inherited source scrollback'
+    }
+
+    Run-WindowCommand $child 'Disable read-only pane input'
+    if ((Shell-State $copyShell.id 'duplicateLocal' -Init) -eq $localIdentity) {
+        throw 'The copy reused the source PowerShell process'
+    }
+    $window = $child
+    Press-Key 0x73 # Restore the copied split and confirm its asymmetric divider.
+    $null = Wait-Until 'the copied split keeps its proportions' {
+        $rows = (Control @('list')).sessions
+        $local = $rows | Where-Object id -eq $copyShell.id
+        $remote = $rows | Where-Object id -eq $copySsh.id
+        $local.visible -and $remote.visible -and $local.cols -gt $remote.cols -and
+            [Math]::Abs($remote.cols / ($local.cols + $remote.cols) - 0.375) -lt 0.04
+    }
+    Press-Key 0x78
+    Expect-Focus $child $copySsh.id 'The left copy pane is its own SSH session'
+    Type-In $child 'copy-window/'
+    Expect-Text $copySsh.id 'copy-window/'
+    Close-FixtureWindow $child
+    $null = Wait-Until 'closing the copy leaves the three original panes' {
+        @((Control @('list')).sessions).Count -eq 3
+    }
+    Use-Window $origin
+    Expect-Focus $origin $anchor.id 'The source window keeps its original selection'
+    $original = (Control @('list')).sessions | Where-Object id -eq $ssh.id
+    if ($original.window_id -ne $ssh.window_id -or $original.tab_id -ne $ssh.tab_id -or
+        $original.connection_generation -ne $ssh.connection_generation) {
+        throw 'The source SSH connection changed after duplication'
+    }
+    Expect-Text $ssh.id 'source-layout/'
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--workspace', 'two-windows') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     # Retain the process handle before any native close so Windows PowerShell can read its exit code.
@@ -448,6 +526,14 @@ try {
         Test-ProfileInNewWindow
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'Closing the last profile window did not release the process and its control pipe'
+        }
+        return
+    }
+    if ($FirstClose -eq 'DuplicateWindow') {
+        Test-DuplicateInNewWindow
+        Close-FixtureWindow $origin
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'Closing the source did not release the process and its control pipe'
         }
         return
     }

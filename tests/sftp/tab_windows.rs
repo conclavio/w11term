@@ -82,6 +82,12 @@ async fn native_open_profiles_in_new_windows_preserves_the_original_sessions() {
     run("ProfileWindow", b"fresh-window/source-window/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "duplicates a pinned SSH and PowerShell layout from its background tab into a new window"]
+async fn native_duplicate_tab_layout_in_a_new_window_starts_fresh_sessions() {
+    run("DuplicateWindow", b"source-layout/copy-window/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -112,9 +118,16 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         .unwrap(),
     )
     .unwrap();
+    let mut shortcuts = json!({"command_palette":"F7","focus_right":"F8","focus_left":"F9",
+        "copy_mode":"F10","find_tab":"F12","find_window":"F1","pane_picker":"F6","find_all_panes":"F4",
+        "move_pane_to_existing_tab":"F3","move_pane_to_new_window":"F2"});
+    if first_close == "DuplicateWindow" {
+        shortcuts["find_all_panes"] = Value::Null;
+        shortcuts["zoom_pane"] = json!("F4");
+    }
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12","find_window":"F1","pane_picker":"F6","find_all_panes":"F4","move_pane_to_existing_tab":"F3","move_pane_to_new_window":"F2"}}"#,
+        serde_json::to_vec(&json!({"shortcuts":shortcuts})).unwrap(),
     )
     .unwrap();
     let local = |name| {
@@ -156,7 +169,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         fs::read_to_string(state.path().join("gui.log")).unwrap_or_default(),
         fs::read_to_string(&trace).unwrap_or_default()
     );
-    let expected_ssh = 1 + usize::from(first_close == "ProfileWindow");
+    let expected_ssh = 1 + usize::from(matches!(first_close, "ProfileWindow" | "DuplicateWindow"));
     assert_eq!(
         transports.load(Ordering::Relaxed),
         expected_ssh,
