@@ -402,6 +402,248 @@ async fn identity_key(
     ))
 }
 
+fn authentication_title(options: &SshOptions, additional: bool) -> String {
+    let action = if additional {
+        "Verify sign-in as"
+    } else {
+        "Sign in as"
+    };
+    format!(
+        "{action} {}@{}:{}",
+        options.user, options.host, options.port
+    )
+}
+
+async fn password_authentication(
+    session: &mut client::Handle<Handler>,
+    options: &SshOptions,
+    prompts: &Prompts,
+    mut saved: Option<&mut Option<Zeroizing<String>>>,
+) -> Result<client::AuthResult> {
+    let additional = saved.is_none();
+    let mut attempt = 1;
+    loop {
+        let candidate = if let Some(value) = saved.as_deref_mut().and_then(Option::take) {
+            value
+        } else {
+            let instructions = match (attempt, additional) {
+                (1, true) => {
+                    "The server accepted your SSH key and requires a password to finish signing in."
+                }
+                (1, false) => {
+                    "Password is kept in memory for reconnection, never saved to the profile."
+                }
+                _ => "Password rejected. Try again.",
+            };
+            let answer = prompts
+                .ask(Question::Authentication {
+                    name: authentication_title(options, additional),
+                    instructions: instructions.into(),
+                    challenges: vec![Challenge {
+                        label: "Password".into(),
+                        echo: false,
+                    }],
+                })
+                .await
+                .map_err(|e| stop(e.to_string()))?;
+            let Answer::Authentication(mut values) = answer else {
+                return Err(stop("authentication cancelled"));
+            };
+            ensure!(
+                values.len() == 1,
+                Permanent("invalid password answer".into())
+            );
+            values.remove(0)
+        };
+
+        let reply = session
+            .authenticate_password(&options.user, candidate.as_str())
+            .await;
+        let closed = session.is_closed();
+        if let Some(saved) = saved.as_deref_mut()
+            && (closed || reply.as_ref().map_or(true, client::AuthResult::success))
+        {
+            *saved = Some(candidate);
+        }
+
+        let result = reply?;
+        if let client::AuthResult::Failure {
+            remaining_methods,
+            partial_success: false,
+        } = &result
+        {
+            ensure!(
+                !closed,
+                "SSH transport closed during password authentication"
+            );
+            if attempt < 3
+                && (!additional || remaining_methods.contains(&russh::MethodKind::Password))
+            {
+                attempt += 1;
+                continue;
+            }
+        }
+        return Ok(result);
+    }
+}
+
+async fn keyboard_interactive_authentication(
+    session: &mut client::Handle<Handler>,
+    options: &SshOptions,
+    prompts: &Prompts,
+    additional: bool,
+) -> Result<client::AuthResult> {
+    use client::KeyboardInteractiveAuthResponse as Response;
+    let mut result = session
+        .authenticate_keyboard_interactive_start(&options.user, None)
+        .await?;
+    let mut rounds = 0;
+    loop {
+        match result {
+            Response::Success => return Ok(client::AuthResult::Success),
+            Response::Failure {
+                remaining_methods,
+                partial_success,
+            } => {
+                ensure!(
+                    !session.is_closed(),
+                    "SSH transport closed during keyboard-interactive authentication"
+                );
+                return Ok(client::AuthResult::Failure {
+                    remaining_methods,
+                    partial_success,
+                });
+            }
+            Response::InfoRequest {
+                name,
+                instructions,
+                prompts: questions,
+            } => {
+                rounds += 1;
+                ensure!(
+                    rounds <= 16 && questions.len() <= 16,
+                    Permanent("too many keyboard-interactive challenges".into())
+                );
+                let count = questions.len();
+                let answer = if count == 0 {
+                    Answer::Authentication(Vec::new())
+                } else {
+                    ensure!(
+                        name.len() <= 1024
+                            && instructions.len() <= 8192
+                            && questions.iter().all(|p| p.prompt.len() <= 4096),
+                        Permanent("authentication challenge exceeds display limits".into())
+                    );
+                    let remote_name = crate::prompts::sanitize_single_line(&name, 256);
+                    let remote_instructions =
+                        crate::prompts::sanitize_multiline(&instructions, 2048, 24);
+                    let attributed_instructions =
+                        match (remote_name.is_empty(), remote_instructions.is_empty()) {
+                            (false, false) => {
+                                format!("Remote server ({remote_name}):\n{remote_instructions}")
+                            }
+                            (false, true) => format!("Remote server: {remote_name}"),
+                            (true, false) => {
+                                format!("Remote server message:\n{remote_instructions}")
+                            }
+                            (true, true) => "Remote server requested authentication.".into(),
+                        };
+                    prompts
+                        .ask(Question::Authentication {
+                            // Keep the dialog title strictly local so remote server
+                            // text cannot spoof or reorder the verified endpoint.
+                            name: authentication_title(options, additional),
+                            instructions: attributed_instructions,
+                            challenges: questions
+                                .into_iter()
+                                .map(|p| Challenge {
+                                    label: crate::prompts::sanitize_single_line(&p.prompt, 256),
+                                    echo: p.echo,
+                                })
+                                .collect(),
+                        })
+                        .await
+                        .map_err(|e| stop(e.to_string()))?
+                };
+                let Answer::Authentication(values) = answer else {
+                    return Err(stop("authentication cancelled"));
+                };
+                ensure!(
+                    values.len() == count,
+                    Permanent("incorrect challenge answer count".into())
+                );
+                result = session
+                    .authenticate_keyboard_interactive_respond(
+                        values.iter().map(|v| v.to_string()).collect(),
+                    )
+                    .await?;
+            }
+        }
+    }
+}
+
+async fn finish_public_key_authentication(
+    session: &mut client::Handle<Handler>,
+    options: &SshOptions,
+    prompts: Option<&Prompts>,
+    result: client::AuthResult,
+    rejection: &'static str,
+) -> Result<()> {
+    use client::AuthResult;
+    use russh::MethodKind::{KeyboardInteractive, Password};
+
+    let mut available = match result {
+        AuthResult::Success => return Ok(()),
+        AuthResult::Failure {
+            remaining_methods,
+            partial_success: true,
+        } => remaining_methods,
+        AuthResult::Failure { .. } => {
+            ensure!(
+                !session.is_closed(),
+                "SSH transport closed during key authentication"
+            );
+            return Err(stop(rejection));
+        }
+    };
+
+    let mut attempted = russh::MethodSet::empty();
+    let mut rejection = None;
+    loop {
+        let method = [KeyboardInteractive, Password]
+            .into_iter()
+            .find(|method| available.contains(method) && !attempted.contains(method))
+            .ok_or_else(|| stop(rejection.unwrap_or(
+                "SSH key accepted, but the server requires an unsupported additional authentication method",
+            )))?;
+        let prompts = prompts.ok_or_else(|| {
+            stop("SSH key accepted, but additional authentication requires the GUI")
+        })?;
+        attempted.push(method);
+        let (result, method_rejection) = if method == KeyboardInteractive {
+            (
+                keyboard_interactive_authentication(session, options, prompts, true).await?,
+                "additional keyboard-interactive authentication rejected",
+            )
+        } else {
+            (
+                password_authentication(session, options, prompts, None).await?,
+                "additional password authentication rejected",
+            )
+        };
+        match result {
+            AuthResult::Success => return Ok(()),
+            AuthResult::Failure {
+                remaining_methods,
+                partial_success,
+            } => {
+                available = remaining_methods;
+                rejection = (!partial_success).then_some(method_rejection);
+            }
+        }
+    }
+}
+
 pub(super) async fn authenticate(
     session: &mut client::Handle<Handler>,
     options: &SshOptions,
@@ -419,7 +661,7 @@ pub(super) async fn authenticate(
         } => {
             let (key, remember) =
                 identity_key(identity, prompts, &mut credentials.unlocked_identity).await?;
-            if let Some(path) = certificate {
+            let (result, rejection) = if let Some(path) = certificate {
                 let cert =
                     russh::keys::load_openssh_certificate(path.as_path()).map_err(|error| {
                         stop(format!(
@@ -435,26 +677,25 @@ pub(super) async fn authenticate(
                     cert.public_key() == key.public_key().key_data(),
                     Permanent("the SSH user certificate does not match the private key".into())
                 );
-                ensure!(
+                (
                     session
                         .authenticate_openssh_cert(&options.user, key.clone(), cert)
-                        .await?
-                        .success(),
-                    Permanent("SSH user certificate authentication rejected".into())
-                );
+                        .await?,
+                    "SSH user certificate authentication rejected",
+                )
             } else {
                 let hash = session.best_supported_rsa_hash().await?.flatten();
-                ensure!(
+                (
                     session
                         .authenticate_publickey(
                             &options.user,
-                            PrivateKeyWithHashAlg::new(key.clone(), hash)
+                            PrivateKeyWithHashAlg::new(key.clone(), hash),
                         )
-                        .await?
-                        .success(),
-                    Permanent("public-key authentication rejected".into())
-                );
-            }
+                        .await?,
+                    "public-key authentication rejected",
+                )
+            };
+            finish_public_key_authentication(session, options, prompts, result, rejection).await?;
             if let Some(encrypted_digest) = remember {
                 credentials.unlocked_identity = Some(UnlockedIdentity {
                     path: identity.as_path().to_owned(),
@@ -474,158 +715,55 @@ pub(super) async fn authenticate(
                         "cannot connect to Windows SSH agent: {e}; choose a device key or password"
                     ))
                 })?;
-            let mut accepted = false;
             for identity in agent.request_identities().await? {
-                if session
+                let result = session
                     .authenticate_publickey_with(
                         &options.user,
                         identity.public_key().into_owned(),
                         hash,
                         &mut agent,
                     )
-                    .await?
-                    .success()
+                    .await?;
+                if session.is_closed()
+                    || !matches!(
+                        result,
+                        client::AuthResult::Failure {
+                            partial_success: false,
+                            ..
+                        }
+                    )
                 {
-                    accepted = true;
-                    break;
+                    return finish_public_key_authentication(
+                        session,
+                        options,
+                        prompts,
+                        result,
+                        "SSH agent supplied no accepted identity",
+                    )
+                    .await;
                 }
             }
-            ensure!(
-                accepted,
-                Permanent("SSH agent supplied no accepted identity".into())
-            );
+            return Err(stop("SSH agent supplied no accepted identity"));
         }
         Authentication::Password => {
-            let password = &mut credentials.password;
             let prompts =
                 prompts.ok_or_else(|| stop("password authentication requires the GUI"))?;
-            let mut accepted = false;
-            for attempt in 0..3 {
-                let candidate = if let Some(value) = password.take() {
-                    value
-                } else {
-                    let answer=prompts.ask(Question::Authentication{name:format!("Sign in as {}@{}:{}",options.user,options.host,options.port),instructions:if attempt==0{"Password is kept in memory for reconnection, never saved to the profile."}else{"Password rejected. Try again."}.into(),challenges:vec![Challenge{label:"Password".into(),echo:false}]}).await.map_err(|e|stop(e.to_string()))?;
-                    let Answer::Authentication(mut values) = answer else {
-                        return Err(stop("authentication cancelled"));
-                    };
-                    ensure!(
-                        values.len() == 1,
-                        Permanent("invalid password answer".into())
-                    );
-                    values.remove(0)
-                };
-                match session
-                    .authenticate_password(&options.user, candidate.as_str())
-                    .await
-                {
-                    Ok(result) if result.success() => {
-                        *password = Some(candidate);
-                        accepted = true;
-                        break;
-                    }
-                    Ok(_) if session.is_closed() => {
-                        *password = Some(candidate);
-                        anyhow::bail!("SSH transport closed during password authentication");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        *password = Some(candidate);
-                        return Err(error.into());
-                    }
-                }
-            }
             ensure!(
-                accepted,
+                password_authentication(session, options, prompts, Some(&mut credentials.password))
+                    .await?
+                    .success(),
                 Permanent("password authentication rejected".into())
             );
         }
         Authentication::KeyboardInteractive => {
-            use client::KeyboardInteractiveAuthResponse as Response;
             let prompts = prompts
                 .ok_or_else(|| stop("keyboard-interactive authentication requires the GUI"))?;
-            let mut result = session
-                .authenticate_keyboard_interactive_start(&options.user, None)
-                .await?;
-            let mut rounds = 0;
-            loop {
-                match result {
-                    Response::Success => break,
-                    Response::Failure { .. } => {
-                        return Err(stop("keyboard-interactive authentication rejected"));
-                    }
-                    Response::InfoRequest {
-                        name,
-                        instructions,
-                        prompts: questions,
-                    } => {
-                        rounds += 1;
-                        ensure!(
-                            rounds <= 16 && questions.len() <= 16,
-                            Permanent("too many keyboard-interactive challenges".into())
-                        );
-                        let count = questions.len();
-                        let answer = if count == 0 {
-                            Answer::Authentication(Vec::new())
-                        } else {
-                            ensure!(
-                                name.len() <= 1024
-                                    && instructions.len() <= 8192
-                                    && questions.iter().all(|p| p.prompt.len() <= 4096),
-                                Permanent("authentication challenge exceeds display limits".into())
-                            );
-                            let remote_name = crate::prompts::sanitize_single_line(&name, 256);
-                            let remote_instructions =
-                                crate::prompts::sanitize_multiline(&instructions, 2048, 24);
-                            let attributed_instructions =
-                                match (remote_name.is_empty(), remote_instructions.is_empty()) {
-                                    (false, false) => format!(
-                                        "Remote server ({remote_name}):\n{remote_instructions}"
-                                    ),
-                                    (false, true) => format!("Remote server: {remote_name}"),
-                                    (true, false) => {
-                                        format!("Remote server message:\n{remote_instructions}")
-                                    }
-                                    (true, true) => {
-                                        "Remote server requested authentication.".into()
-                                    }
-                                };
-                            prompts
-                                .ask(Question::Authentication {
-                                    // Keep the dialog title strictly local so remote server
-                                    // text cannot spoof or reorder the verified endpoint.
-                                    name: format!(
-                                        "Sign in as {}@{}:{}",
-                                        options.user, options.host, options.port
-                                    ),
-                                    instructions: attributed_instructions,
-                                    challenges: questions
-                                        .into_iter()
-                                        .map(|p| Challenge {
-                                            label: crate::prompts::sanitize_single_line(
-                                                &p.prompt, 256,
-                                            ),
-                                            echo: p.echo,
-                                        })
-                                        .collect(),
-                                })
-                                .await
-                                .map_err(|e| stop(e.to_string()))?
-                        };
-                        let Answer::Authentication(values) = answer else {
-                            return Err(stop("authentication cancelled"));
-                        };
-                        ensure!(
-                            values.len() == count,
-                            Permanent("incorrect challenge answer count".into())
-                        );
-                        result = session
-                            .authenticate_keyboard_interactive_respond(
-                                values.iter().map(|v| v.to_string()).collect(),
-                            )
-                            .await?;
-                    }
-                }
-            }
+            ensure!(
+                keyboard_interactive_authentication(session, options, prompts, false)
+                    .await?
+                    .success(),
+                Permanent("keyboard-interactive authentication rejected".into())
+            );
         }
     }
     Ok(())

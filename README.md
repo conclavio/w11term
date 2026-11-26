@@ -695,6 +695,8 @@ Choose **Private key file** in Quick Connect or an SSH profile, then use **Brows
 
 If your SSH server trusts a user CA, choose **User certificate file (optional)** beside the private key. Each destination or jump host can have its own matching OpenSSH user certificate. From the command line, use `w11term ssh user@host --identity KEY --certificate KEY-cert.pub`. In a profile, the fields are `"auth": "identity"`, `"identity"`, and `"certificate"`. w11term uses the selected certificate for that endpoint and reports a rejected or mismatched certificate as a login error. [OpenSSH user certificate configuration](https://man.openbsd.org/ssh_config#CertificateFile)
 
+When a server accepts a key or certificate and requests a password or keyboard-interactive challenge to finish authentication, w11term opens a **Verify sign-in** dialog. This also works with agent keys and on jump hosts. If the server offers both methods, w11term tries keyboard-interactive first. It requests fresh answers for each connection, including reconnects. [OpenSSH authentication methods](https://man.openbsd.org/sshd_config#AuthenticationMethods)
+
 The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`. Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog.
 
 To trust a fleet’s SSH host CA, add its public key to `%USERPROFILE%\.ssh\known_hosts`.

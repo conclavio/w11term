@@ -1,4 +1,7 @@
 //! Real isolated SSH peers exercise trust, private prompts, env, and reconnection.
+#[path = "player_ssh/key_second_factor.rs"]
+mod key_second_factor;
+
 use anyhow::Result;
 use russh::{
     Channel, ChannelId,
