@@ -53,6 +53,11 @@ try {
 
     # Let the short initial waits run normally. The retry controls need time for cross-process UI automation.
     $background = Wait-Retry 3
+    $inspection = Control @('inspect','--pane',"$remote")
+    if ($inspection.ssh_connection.phase -cne 'reconnecting' -or
+        $inspection.ssh_connection.attempt -ne 3 -or $inspection.ssh_progress -or $inspection.ssh) {
+        throw 'The inspector retained SSH handshake or route details during the retry wait'
+    }
     $events = Control @('events','--pane',"$remote")
     if ($events.ssh_retry_token -ne $background.ssh_retry_token) { throw 'list and events disagree about the retry token' }
     $reply = Control @('retry-ssh-now','--pane',"$remote",'--retry-token',"$($background.ssh_retry_token)")

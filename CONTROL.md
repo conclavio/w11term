@@ -115,6 +115,8 @@ if ($modes.in_band_resize) { 'This pane has subscribed to resize reports.' }
 
 The reply includes `pane`, `connection_generation`, `cols`, `rows`, `pixel_width`, `pixel_height` and `dpi`. Pixel dimensions describe the drawable text area. An unavailable measurement is zero. The booleans `alternate_screen`, `bracketed_paste`, `synchronized_output` and `in_band_resize` reflect the modes at the time of the read.
 
+SSH panes also include `ssh_connection`, with the same phase and optional reason or retry attempt as `list`. While a shell is opening, `ssh_progress` reports the current `step`, `host`, `port` and `user`. A one-based `jump` identifies a ProxyJump hop. Its absence identifies the destination. A connection that ends in failure during an endpoint operation retains that step. Steps are `opening-tcp`, `opening-jump-channel`, `key-exchange`, `authenticating`, `opening-session-channel`, `requesting-terminal` and `preparing-remote-program`. Each observed step also appears in the pane's event journal as `ssh-step`. Local and replay panes omit these SSH fields.
+
 A connected SSH pane also reports `ssh.destination` and `ssh.jump_hosts`, ordered from the first jump toward the destination. Each peer contains `host`, `user`, `port`, the verified SHA256 `key_fingerprint`, and `host_key_alias` when configured. The `ssh` object is available only while that pane has an authenticated connection.
 
 `mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.

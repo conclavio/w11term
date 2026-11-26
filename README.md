@@ -671,7 +671,7 @@ The More menu displays **On**/**Off** for fullscreen, mute, game mode, alternate
 
 Choose **More → Terminal inspector** to see the focused pane’s cell grid, text area in physical pixels, DPI, in-band resize subscription, primary or alternate screen, mouse and keyboard modes, bracketed paste and synchronized output. The panel follows focus across splits and tabs. It reads the local parser, so it can show a pending synchronized update while the terminal still displays the last committed frame. Close it with **×** or the More menu. To inspect a background pane, run `w11term-cli inspect --pane ID`. [Control protocol and example](CONTROL.md#live-pane-inspection)
 
-For a connected SSH pane, expand **Verified SSH route** to see the destination and each jump host with its verified SHA256 host-key fingerprint and any configured host-key alias. The route reflects the current authenticated connection and disappears when it ends.
+For an SSH pane, the inspector shows the connection state and the current step and endpoint during login or reconnection. If the connection ends during a failed step, the inspector keeps the step and error visible. Once connected, expand **Verified SSH route** to see the destination and each jump host with its verified SHA256 host-key fingerprint and any configured host-key alias. The route disappears when the authenticated connection ends.
 
 Move the pointer over the focused pane to read its column and row, counted from 1 at the top-left of the visible grid, including while viewing scrollback. **Hyperlink** shows the allowed OSC 8 target or a detected URL under that cell. Moving into the padding or another pane clears the readout. Hovering leaves keyboard focus and the link destination alone.
 

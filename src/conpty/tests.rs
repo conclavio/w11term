@@ -149,6 +149,7 @@ impl Fixture {
                     Some(Event::Connected(_) | Event::Disconnected) => {}
                     Some(Event::HerdrViewer) => panic!("ConPTY supplied an SSH viewer stream"),
                     Some(Event::Reconnecting(_)) => panic!("ConPTY supplied an SSH retry"),
+                    Some(Event::ConnectionProgress(_)) => panic!("ConPTY supplied an SSH step"),
                     Some(Event::ConnectionFailed(_) | Event::ConnectionStopped) => {
                         panic!("ConPTY supplied an SSH exit")
                     }

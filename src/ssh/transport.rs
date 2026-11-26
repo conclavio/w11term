@@ -1,7 +1,7 @@
-use super::SESSION_SETUP_TIMEOUT;
 use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
+use super::{ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT};
 use crate::{
     events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
     options::{Authentication, SshOptions},
@@ -35,6 +35,7 @@ pub enum Event {
     Status(String),
     SessionListUpdated(String),
     Connected(u64),
+    ConnectionProgress(Arc<ConnectionProgress>),
     /// A retry has been scheduled and supersedes the previous transport.
     Reconnecting(u32),
     /// Final SSH failure from the transport launcher.
@@ -268,7 +269,7 @@ impl client::Handler for Handler {
         Ok(true)
     }
 }
-async fn authenticate(
+pub(super) async fn authenticate(
     session: &mut client::Handle<Handler>,
     options: &SshOptions,
     prompts: Option<&Prompts>,
@@ -465,6 +466,7 @@ async fn connect(
     prompts: Option<&Prompts>,
     passwords: &mut [Option<Zeroizing<String>>],
     durable_peer: Option<&str>,
+    output: Option<&mpsc::Sender<Event>>,
 ) -> Result<ConnectionShare> {
     let route = options
         .proxy_jump
@@ -480,12 +482,15 @@ async fn connect(
             None
         };
         let address = format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port);
+        let jump = (index < options.proxy_jump.len()).then_some(index + 1);
+        let report = |step| report_connection_step(output, &endpoint, jump, step);
         let now = Instant::now();
         let deadline = endpoint
             .connect_timeout_seconds
             .map(|seconds| now + Duration::from_secs(seconds.get().into()));
         let open_deadline = deadline.unwrap_or_else(|| now + Duration::from_secs(15));
-        let (handle, fingerprint) = if let Some(hop) = &upstream {
+        let (mut handle, fingerprint) = if let Some(hop) = &upstream {
+            report(ConnectionStep::OpeningJumpChannel).await?;
             let handle = hop.handle();
             let channel = tokio::time::timeout_at(
                 open_deadline,
@@ -508,16 +513,17 @@ async fn connect(
                     _ => anyhow::Error::from(error).context(message),
                 }
             })?;
-            handshake(
+            report(ConnectionStep::KeyExchange).await?;
+            key_exchange(
                 &endpoint,
                 prompts,
-                password,
                 expected_peer,
                 channel.into_stream(),
                 deadline,
             )
             .await
         } else {
+            report(ConnectionStep::OpeningTcp).await?;
             let stream = tokio::time::timeout_at(
                 open_deadline,
                 tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
@@ -526,17 +532,14 @@ async fn connect(
             .with_context(|| format!("SSH TCP connection to {address} timed out"))?
             .with_context(|| format!("connecting to {address}"))?;
             stream.set_nodelay(true)?;
-            handshake(
-                &endpoint,
-                prompts,
-                password,
-                expected_peer,
-                stream,
-                deadline,
-            )
-            .await
+            report(ConnectionStep::KeyExchange).await?;
+            key_exchange(&endpoint, prompts, expected_peer, stream, deadline).await
         }
-        .with_context(|| format!("SSH handshake or authentication for {address}"))?;
+        .with_context(|| format!("SSH handshake for {address}"))?;
+        report(ConnectionStep::Authenticating).await?;
+        authenticate(&mut handle, &endpoint, prompts, password)
+            .await
+            .with_context(|| format!("SSH authentication for {address}"))?;
         upstream = Some(ConnectionShare::new(
             handle,
             endpoint,
@@ -548,10 +551,29 @@ async fn connect(
     upstream.context("missing SSH destination")
 }
 
-pub(super) async fn handshake(
+async fn report_connection_step(
+    output: Option<&mpsc::Sender<Event>>,
+    endpoint: &SshOptions,
+    jump: Option<usize>,
+    step: ConnectionStep,
+) -> Result<()> {
+    if let Some(output) = output {
+        output
+            .send(Event::ConnectionProgress(Arc::new(ConnectionProgress {
+                step,
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                user: endpoint.user.clone(),
+                jump,
+            })))
+            .await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn key_exchange(
     options: &SshOptions,
     prompts: Option<&Prompts>,
-    password: &mut Option<Zeroizing<String>>,
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     deadline: Option<Instant>,
@@ -605,13 +627,12 @@ pub(super) async fn handshake(
             pause_trust_deadline: deadline.is_some(),
         },
     );
-    let mut session = tokio::select! {
+    let session = tokio::select! {
         biased;
         result = connecting => result?,
         () = handshake_deadline::expired(&mut clock) => anyhow::bail!("SSH handshake timed out"),
     };
     let _ = complete.send(());
-    authenticate(&mut session, options, prompts, password).await?;
     Ok((
         session,
         fingerprint
@@ -700,8 +721,18 @@ async fn connect_shell(
     source: Option<ConnectionShare>,
     published: ShareSlot,
     durable_peer: Option<String>,
+    output: &mpsc::Sender<Event>,
 ) -> Result<OpenShell> {
+    let opening_session = || {
+        report_connection_step(
+            Some(output),
+            &options,
+            None,
+            ConnectionStep::OpeningSessionChannel,
+        )
+    };
     if let Some(link) = source.filter(|link| link.matches(&options, prompts.as_ref())) {
+        opening_session().await?;
         match link.open_shell().await {
             Ok(channel) => {
                 return Ok(OpenShell {
@@ -723,9 +754,11 @@ async fn connect_shell(
             prompts.as_ref(),
             passwords,
             durable_peer.as_deref(),
+            Some(output),
         )
         .await?,
     );
+    opening_session().await?;
     let channel = link.open_shell().await?;
     Ok(OpenShell {
         link,
@@ -800,7 +833,16 @@ impl Driver {
         let scan = async {
             let link = match offered {
                 Some(link) => link,
-                None => connect(&options, self.prompts.as_ref(), &mut self.passwords, None).await?,
+                None => {
+                    connect(
+                        &options,
+                        self.prompts.as_ref(),
+                        &mut self.passwords,
+                        None,
+                        None,
+                    )
+                    .await?
+                }
             };
             let entries = if herdr {
                 tokio::time::timeout(
@@ -895,6 +937,7 @@ impl Driver {
                     self.sharing.offered.take(),
                     self.sharing.published.clone(),
                     program.peer_fingerprint(),
+                    &self.output,
                 );
                 let future = async {
                     // The slot covers login and opening the SSH channel. Active
@@ -1052,6 +1095,13 @@ async fn run_channel(
     ready: &OnceLock<Instant>,
 ) -> Result<()> {
     let _published = shell.published.shell_lifetime(&shell.link);
+    let managed = !matches!(program, Program::Shell(_));
+    let step = if managed {
+        ConnectionStep::PreparingRemoteProgram
+    } else {
+        ConnectionStep::RequestingTerminal
+    };
+    report_connection_step(Some(&driver.output), &driver.options, None, step).await?;
     if let Some(reference) = program.herdr_reference() {
         return run_herdr_channel(shell, driver, program, &reference).await;
     }
@@ -1069,7 +1119,6 @@ async fn run_channel(
     } = driver;
     let generation = *generation;
     let original_size = *size;
-    let managed = !matches!(program, Program::Shell(_));
     let probe = game
         .as_mut()
         .filter(|_| !managed)

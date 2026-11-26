@@ -378,6 +378,11 @@ async fn inspection_reports_each_verified_peer_in_connection_order() {
             let inspection = receive.await.unwrap();
             if let Some(ssh) = inspection.ssh {
                 assert_eq!(inspection.connection_generation, 1);
+                assert_eq!(
+                    inspection.ssh_connection,
+                    Some(w11term::events::SshConnectionPhase::Connected)
+                );
+                assert!(inspection.ssh_progress.is_none());
                 break ssh;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -385,6 +390,42 @@ async fn inspection_reports_each_verified_peer_in_connection_order() {
     })
     .await
     .expect("verified SSH route was never published");
+    let stages: Vec<_> = session
+        .events
+        .since(0)
+        .events
+        .into_iter()
+        .filter(|event| event.kind == "ssh-step")
+        .map(|event| event.data)
+        .collect();
+    let mut expected_stages = Vec::new();
+    for (index, (host, user)) in HOSTS.into_iter().zip(USERS).enumerate() {
+        let opening = if index == 0 {
+            "opening-tcp"
+        } else {
+            "opening-jump-channel"
+        };
+        let (port, jump) = if let Some(hop) = fixture.options.proxy_jump.get(index) {
+            (hop.port, Some(index + 1))
+        } else {
+            (fixture.options.port, None)
+        };
+        for step in [opening, "key-exchange", "authenticating"] {
+            let mut stage = serde_json::json!({
+                "step": step, "host": host, "user": user, "port": port
+            });
+            if let Some(jump) = jump {
+                stage["jump"] = jump.into();
+            }
+            expected_stages.push(stage);
+        }
+    }
+    for step in ["opening-session-channel", "requesting-terminal"] {
+        expected_stages.push(serde_json::json!({
+            "step": step, "host": HOSTS[2], "user": USERS[2], "port": fixture.options.port
+        }));
+    }
+    assert_eq!(stages, expected_stages);
 
     let expected = fixture
         .options

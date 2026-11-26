@@ -1,7 +1,8 @@
 use super::*;
 use termwiz::input::KeyboardEncoding;
+use w11term::events::SshConnectionPhase;
 use w11term::session::PaneInspection;
-use w11term::ssh::{VerifiedSshPeer, VerifiedSshRoute};
+use w11term::ssh::{ConnectionStep, VerifiedSshPeer, VerifiedSshRoute};
 use w11term::terminal::TerminalModes;
 use wezterm_input_types::KittyKeyboardFlags as Flags;
 use wezterm_term::MouseEncoding;
@@ -22,7 +23,7 @@ struct PointerReadout {
     target: Option<String>,
 }
 
-// Remote hyperlink labels are display-only. Limit them to one short line.
+// Keep remote labels to one short line of plain text.
 fn target_label(uri: &str) -> String {
     let mut chars = uri.chars().map(|c| match c {
         '\u{061c}'
@@ -108,6 +109,74 @@ fn text_area_label(width: usize, height: usize, dpi: u32) -> String {
         (_, _, 0) => format!("Text area   {width} × {height} px"),
         _ => format!("Text area   {width} × {height} px at {dpi} DPI"),
     }
+}
+
+fn ssh_status_view(value: &PaneInspection) -> View {
+    use SshConnectionPhase::*;
+    let Some(phase) = &value.ssh_connection else {
+        return View::empty();
+    };
+    let phase_label = match phase {
+        Queued => "Queued".into(),
+        Connecting => "Connecting".into(),
+        Reconnecting {
+            attempt: Some(attempt),
+        } => format!("Reconnecting · attempt {attempt}"),
+        Reconnecting { attempt: None } => "Reconnecting".into(),
+        Connected => "Connected".into(),
+        Disconnected => "Disconnected".into(),
+        Stopped => "Stopped".into(),
+        Failed(_) => "Failed".into(),
+    };
+    let step = value
+        .ssh_progress
+        .as_ref()
+        .map_or_else(View::empty, |progress| {
+            let action = match progress.step {
+                ConnectionStep::OpeningTcp => "Opening TCP connection",
+                ConnectionStep::OpeningJumpChannel => "Opening tunnel through the previous jump",
+                ConnectionStep::KeyExchange => "Exchanging SSH keys",
+                ConnectionStep::Authenticating => "Authenticating SSH user",
+                ConnectionStep::OpeningSessionChannel => "Opening SSH session channel",
+                ConnectionStep::RequestingTerminal => "Requesting PTY and shell",
+                ConnectionStep::PreparingRemoteProgram => "Preparing remote session",
+            };
+            let description = if matches!(phase, Failed(_)) {
+                format!("Last step   {action}")
+            } else {
+                action.to_owned()
+            };
+            let role = progress
+                .jump
+                .map_or_else(|| "Destination".into(), |i| format!("Jump {i}"));
+            let address = host_groups::ssh_address(
+                &target_label(&progress.user),
+                &target_label(&progress.host),
+                progress.port,
+            );
+            StackPanel::new().spacing(3.0).children((
+                TextBlock::new()
+                    .text(description)
+                    .text_wrapping(TextWrapping::Wrap),
+                TextBlock::new()
+                    .text(format!("{role}   {address}"))
+                    .text_wrapping(TextWrapping::Wrap),
+            ))
+        });
+    StackPanel::new().spacing(3.0).children((
+        TextBlock::new()
+            .text(format!("SSH connection   {phase_label}"))
+            .text_wrapping(TextWrapping::Wrap),
+        step,
+        if let Failed(reason) = phase {
+            TextBlock::new()
+                .text(reason.as_ref())
+                .text_wrapping(TextWrapping::Wrap)
+                .into()
+        } else {
+            View::empty()
+        },
+    ))
 }
 
 fn ssh_route_view(
@@ -285,6 +354,9 @@ impl Inspection {
                         .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                         .content(
                             StackPanel::new().spacing(6.0).children((
+                                self.current
+                                    .as_ref()
+                                    .map_or_else(View::empty, ssh_status_view),
                                 ssh,
                                 self.readout.clone(),
                                 TextBlock::new().text(self.pointer.cell.map_or_else(
@@ -464,6 +536,8 @@ mod tests {
             connection_generation: 0,
             modes,
             ssh: None,
+            ssh_connection: None,
+            ssh_progress: None,
         };
         inspector.refresh(Some(observation.clone()));
         assert_eq!(inspector.current, Some(observation.clone()));

@@ -1884,7 +1884,7 @@ async fn queued_group_connection_can_be_stopped_before_using_a_launch_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "ui-smoke")]
 async fn ssh_shell_setup_times_out_and_releases_the_group_login_slot() {
-    use w11term::events::SshConnectionPhase;
+    use w11term::{events::SshConnectionPhase, ssh::ConnectionStep};
 
     async fn failure(pane: &Session) -> Arc<str> {
         loop {
@@ -1956,6 +1956,20 @@ async fn ssh_shell_setup_times_out_and_releases_the_group_login_slot() {
         setup_error.contains("SSH PTY or shell setup timed out"),
         "{setup_error}"
     );
+    for (pane, step) in [
+        (&opening, ConnectionStep::OpeningSessionChannel),
+        (&setting_up, ConnectionStep::RequestingTerminal),
+    ] {
+        let (reply, inspection) = tokio::sync::oneshot::channel();
+        pane.input.send(Command::ReadModes(reply)).unwrap();
+        let inspection = inspection.await.unwrap();
+        assert!(matches!(
+            inspection.ssh_connection,
+            Some(SshConnectionPhase::Failed(_))
+        ));
+        assert!(inspection.ssh.is_none());
+        assert_eq!(inspection.ssh_progress.unwrap().step, step);
+    }
     assert_eq!(healthy_opens.load(Ordering::Relaxed), 1);
     assert_eq!(gate.available_permits(), 1);
     open_server.abort();

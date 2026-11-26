@@ -1072,6 +1072,12 @@ impl Registry {
                 if let Some(ssh) = inspection.ssh {
                     report["ssh"] = serde_json::to_value(ssh.as_ref())?;
                 }
+                if let Some(connection) = inspection.ssh_connection {
+                    report["ssh_connection"] = connection.as_json();
+                }
+                if let Some(progress) = inspection.ssh_progress {
+                    report["ssh_progress"] = serde_json::to_value(progress.as_ref())?;
+                }
                 Ok(report)
             }
             Request::GetText { pane } => {

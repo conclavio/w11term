@@ -2311,11 +2311,18 @@ async fn native_inspect_reads_background_ssh_without_disturbing_powershell() {
         unreachable!()
     };
     let wire = remote.path().join("keyboard-input.bin");
+    let hold = remote.path().join("hold-shell-request");
     fs::write(&wire, []).unwrap();
+    fs::write(&hold, []).unwrap();
     fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
     ssh.player.reconnect = false;
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join("ssh-wire"), wire.to_str().unwrap()).unwrap();
+    fs::write(
+        state.path().join("hold-shell-request"),
+        hold.to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("inspect-pane-ui.ps1", &ssh, state.path());
     assert_eq!(
         opens.load(Ordering::Relaxed),

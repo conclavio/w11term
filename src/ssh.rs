@@ -23,3 +23,26 @@ pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};
 
 const SESSION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectionStep {
+    OpeningTcp,
+    OpeningJumpChannel,
+    KeyExchange,
+    Authenticating,
+    OpeningSessionChannel,
+    RequestingTerminal,
+    PreparingRemoteProgram,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ConnectionProgress {
+    pub step: ConnectionStep,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// One-based ProxyJump index. A missing index identifies the destination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump: Option<usize>,
+}

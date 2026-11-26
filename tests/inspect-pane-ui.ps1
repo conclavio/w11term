@@ -59,7 +59,16 @@ try {
         $null = [InspectDpi]::ShowWindowAsync($window, 4) # SW_SHOWNOACTIVATE
     }
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
-    $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
+    $remote = Wait-Until 'the SSH pane to appear' { ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id }
+    Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
+    $null = Wait-Until 'inspector and CLI show the SSH step while the server withholds the shell' {
+        $m = Inspect
+        $m.ssh_connection.phase -ceq 'connecting' -and $m.ssh_progress.step -ceq 'requesting-terminal' -and
+            $m.ssh_progress.host -ceq $peer.host -and $m.ssh_progress.port -eq $peer.port -and
+            !$m.ssh -and (Find-Element 'SSH connection   Connecting') -and (Find-Element 'Requesting PTY and shell')
+    }
+    $hold = [IO.File]::ReadAllText((Join-Path $State 'hold-shell-request'))
+    [IO.File]::Delete($hold)
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
     $null = Wait-Until 'default SSH parser modes' { Is-Default (Inspect) }
     $initial = Wait-Until 'measured geometry matching the live pane list and window DPI' {
@@ -71,8 +80,10 @@ try {
             $m.cols -eq $observed.list.cols -and $m.rows -eq $observed.list.rows -and $m.cols -gt 0 -and $m.rows -gt 0 -and
             $m.pixel_width -gt $m.cols -and $m.pixel_height -gt $m.rows -and $m.dpi -gt 0 -and $m.dpi -eq $observed.window_dpi) { $m }
     }
-    Invoke-Button (Wait-Until 'menu' { Find-Element 'Tab menu' $button })
-    Invoke-Button (Wait-Until 'open inspector' { Find-Element 'Terminal inspector: Off' })
+    $null = Wait-Until 'the connected inspector replaces progress with the verified state' {
+        $m = Inspect
+        $m.ssh_connection.phase -ceq 'connected' -and !$m.ssh_progress -and (Find-Element 'SSH connection   Connected')
+    }
     Set-NativeExpansion 'Verified SSH route' $true
     $null = Wait-Until 'the verified SSH key and destination match the control reply' {
         $route = (Inspect).ssh
@@ -103,7 +114,10 @@ try {
     $localPane = (Control @('open','--profile','Palette PowerShell','--activate')).pane
     Wait-Focus $localPane
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','20','PS ')
-    if ((Control @('inspect','--pane',"$localPane")).ssh) { throw 'PowerShell reported an SSH route' }
+    $localInspect = Control @('inspect','--pane',"$localPane")
+    if ($localInspect.ssh -or $localInspect.ssh_progress -or $localInspect.ssh_connection) {
+        throw 'PowerShell reported SSH diagnostics'
+    }
     Type-Line '$inspectPid = $PID; "local-inspect-" + "ready"'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-ready')
     $before = (Control @('get-text','--pane',"$remote")).text
@@ -136,9 +150,12 @@ try {
     Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
     $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
     Set-RemoteModes ([string][char]4)
-    $null = Wait-Until 'disconnected SSH retires the verified route in the inspector and CLI' {
+    $null = Wait-Until 'a lost SSH transport retires the verified route and shows the failure' {
+        $m = Inspect
         (Find-Element 'Close terminal inspector' $button) -and
-            !(Find-Element 'Verified SSH route') -and !(Inspect).ssh
+            !(Find-Element 'Verified SSH route') -and !$m.ssh -and !$m.ssh_progress -and
+            $m.ssh_connection.phase -ceq 'failed' -and $m.ssh_connection.reason -and
+            (Find-Element 'SSH connection   Failed') -and (Find-Element $m.ssh_connection.reason)
     }
 } catch {
     $failure = $_.Exception.Message
@@ -150,7 +167,7 @@ try {
         $text = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
         $observed.inspector_rows = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$text) |
-            ForEach-Object { $_.Current.Name } | Where-Object { $_ -like 'Text area *' -or $_ -like 'In-band resize *' })
+            ForEach-Object { $_.Current.Name } | Where-Object { $_ -like 'Text area *' -or $_ -like 'In-band resize *' -or $_ -like '*SSH*' })
     } catch { $observed.uia_error = $_.Exception.Message }
     throw "$failure. Last pane observations: $($observed | ConvertTo-Json -Compress -Depth 5)"
 } finally {

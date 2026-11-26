@@ -272,6 +272,8 @@ pub struct PaneInspection {
     pub connection_generation: u64,
     pub modes: terminal::TerminalModes,
     pub ssh: Option<Arc<ssh::VerifiedSshRoute>>,
+    pub ssh_connection: Option<crate::events::SshConnectionPhase>,
+    pub ssh_progress: Option<Arc<ssh::ConnectionProgress>>,
 }
 
 impl PaneInspection {
@@ -279,11 +281,21 @@ impl PaneInspection {
         terminal: &wezterm_term::Terminal,
         connection_generation: u64,
         ssh: &ssh::ShareSlot,
+        events: &crate::events::Events,
+        progress: Option<&Arc<ssh::ConnectionProgress>>,
     ) -> Self {
+        use crate::events::SshConnectionPhase::*;
+        let ssh_connection = events.ssh_connection_phase();
+        let ssh_progress = match ssh_connection {
+            Some(Connecting | Reconnecting { .. } | Failed(_)) => progress.cloned(),
+            _ => None,
+        };
         Self {
             connection_generation,
             modes: terminal::TerminalModes::read(terminal),
             ssh: ssh.verified_route_at(connection_generation),
+            ssh_connection,
+            ssh_progress,
         }
     }
 }
@@ -817,6 +829,7 @@ async fn run(
     let mut launch_id = 1u64;
     let mut phase = Phase::Running;
     let mut ssh_exit = None;
+    let mut ssh_progress = None;
     let mut queued_before_connection = 0usize;
     let mut show_progress = interactive;
     let endpoint = match &source {
@@ -993,6 +1006,8 @@ async fn run(
                 &terminal,
                 connection_generation,
                 &published_ssh,
+                &events,
+                ssh_progress.as_ref(),
             )));
         }
         let notification_expiry = events.next_notification_expiry();
@@ -1275,6 +1290,7 @@ async fn run(
                     Some(Command::RestartExited(ClaimedRestart { token, login_permits })) => {
                         if phase == Phase::Exited && restartable && token == launch_id {
                             launch_id += 1;
+                            ssh_progress = None;
                             phase = Phase::Restarting { reset: true };
                             search_origin = Arc::new(());
                             terminal.reset_connection();
@@ -1352,7 +1368,9 @@ async fn run(
                     },
                     Some(Command::ReadModes(reply)) => {
                         if !reply.is_closed() {
-                            let _ = reply.send(PaneInspection::read(&terminal, connection_generation, &published_ssh));
+                            let _ = reply.send(PaneInspection::read(
+                                &terminal, connection_generation, &published_ssh, &events, ssh_progress.as_ref(),
+                            ));
                         }
                         Ok(())
                     }
@@ -1687,6 +1705,7 @@ async fn run(
                             show_progress = interactive;
                         }
                         ssh::Event::Reconnecting(attempt) => {
+                            ssh_progress = None;
                             events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Reconnecting {
                                 attempt: Some(attempt),
                             });
@@ -1699,8 +1718,15 @@ async fn run(
                             log::info!("{status}");
                         }
                         ssh::Event::ConnectionStopped => {
+                            ssh_progress = None;
                             ssh_exit = Some(crate::events::SshConnectionPhase::Stopped);
                             status = "SSH connection attempt stopped".into();
+                        }
+                        ssh::Event::ConnectionProgress(progress) => {
+                            if ssh_progress.as_ref() != Some(&progress) {
+                                events.push("ssh-step", serde_json::json!(progress.as_ref()));
+                                ssh_progress = Some(progress);
+                            }
                         }
                         ssh::Event::Data(bytes) => {
                             if observed.receiver_count() > 0 {
@@ -1741,6 +1767,7 @@ async fn run(
                             presentation.refresh_view = true;
                         }
                         ssh::Event::Connected(generation) => {
+                            ssh_progress = None;
                             if let Some(matcher) = &mut prompt_matcher { matcher.reset(); }
                             search_origin = Arc::new(());
                             if matches!(phase, Phase::Restarting { .. }) {
