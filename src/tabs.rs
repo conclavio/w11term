@@ -663,6 +663,20 @@ impl<T> Tabs<T> {
 
     /// Move the existing entry beside a leaf in another group, then focus it.
     pub fn move_to_existing_tab(&mut self, source: TabId, target: TabId, side: Direction) -> bool {
+        self.move_to_tab(source, target, side, true)
+    }
+
+    /// Move an existing pane while retaining the destination's selection and zoom.
+    pub fn move_to_tab_in_background(
+        &mut self,
+        source: TabId,
+        target: TabId,
+        side: Direction,
+    ) -> bool {
+        self.move_to_tab(source, target, side, false)
+    }
+
+    fn move_to_tab(&mut self, source: TabId, target: TabId, side: Direction, select: bool) -> bool {
         let Some(target_group) = self.group_id(target) else {
             return false;
         };
@@ -682,9 +696,11 @@ impl<T> Tabs<T> {
             return false;
         }
         entry.group = target_group;
-        destination.focused = source;
-        destination.zoomed = false;
-        self.active_group = Some(target_group);
+        if select {
+            destination.focused = source;
+            destination.zoomed = false;
+            self.active_group = Some(target_group);
+        }
         self.remove_from_layout(source_group, source);
         true
     }
@@ -710,9 +726,19 @@ impl<T> Tabs<T> {
 
     pub fn insert_detached_pane(
         &mut self,
+        moved: Box<DetachedPane<T>>,
+        target: TabId,
+        side: Direction,
+    ) -> Result<TabId, Box<DetachedPane<T>>> {
+        self.insert_detached_pane_with_focus(moved, target, side, true)
+    }
+
+    pub fn insert_detached_pane_with_focus(
+        &mut self,
         mut moved: Box<DetachedPane<T>>,
         target: TabId,
         side: Direction,
+        select: bool,
     ) -> Result<TabId, Box<DetachedPane<T>>> {
         if self.get(moved.entry.id).is_some() {
             return Err(moved);
@@ -730,10 +756,12 @@ impl<T> Tabs<T> {
             return Err(moved);
         }
         moved.entry.group = group;
-        destination.focused = id;
-        destination.zoomed = false;
+        if select {
+            destination.focused = id;
+            destination.zoomed = false;
+            self.active_group = Some(group);
+        }
         self.entries.push(moved.entry);
-        self.active_group = Some(group);
         Ok(id)
     }
 
@@ -1948,6 +1976,32 @@ mod tests {
         let reopened = tabs.reopen_pane(&location, "fresh local");
         assert_eq!(tabs.active_layout(), Some(&Layout::Leaf(reopened)));
         assert_eq!(tabs.layout_for(other), Some(&existing));
+    }
+
+    #[test]
+    fn moving_in_background_preserves_destination_focus_and_zoom() {
+        let mut tabs = Tabs::default();
+        let moved = tabs.insert("moved");
+        let left = tabs.insert("left");
+        let right = tabs.split(left, "right", Axis::Columns).unwrap();
+        assert!(tabs.toggle_zoom());
+        assert!(tabs.move_to_tab_in_background(moved, left, Direction::Up));
+        assert_eq!(tabs.active_id(), Some(right));
+        assert!(tabs.zoomed());
+        assert_eq!(tabs.active_layout().unwrap().leaves(), [moved, left, right]);
+        assert!(!tabs.visible(moved));
+
+        let mut source = Tabs::default();
+        let detached = source.insert("detached");
+        let pane = source.detach_pane(detached).unwrap();
+        let result = tabs.insert_detached_pane_with_focus(pane, left, Direction::Down, false);
+        assert!(matches!(result, Ok(id) if id == detached));
+        assert_eq!(tabs.active_id(), Some(right));
+        assert!(tabs.zoomed() && !tabs.visible(detached));
+        assert_eq!(
+            tabs.active_layout().unwrap().leaves(),
+            [moved, left, detached, right]
+        );
     }
 
     #[test]

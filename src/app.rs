@@ -6766,6 +6766,17 @@ impl Component for TerminalApp {
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
+            Message::Control(w11term::control::UiRequest::MovePane {
+                pane,
+                target_pane,
+                direction,
+                activate,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    self.control_move_pane(pane, target_pane, direction, activate, reply, context);
+                }
+            }
             Message::Control(w11term::control::UiRequest::Resize {
                 pane,
                 cols,
