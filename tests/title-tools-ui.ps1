@@ -92,6 +92,14 @@ function Wait-FilesToggle([string]$Expected) {
     }
 }
 
+function Wait-CompactTitle([string]$Description) {
+    $null = Wait-Until $Description {
+        (Find-Element 'Terminal tools' $button -Visible) -and
+            (Find-Element 'Attention inbox, 0 unread' $button -Visible) -and
+            !(Find-Element 'Pane layout' $button -Visible)
+    }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'palette-ssh', '--cols', '110', '--rows', '28') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -122,10 +130,25 @@ try {
     Press-Key 0x1b
     $null = Wait-Until 'command palette closed' { !(Find-Element 'Search commands' $edit) }
 
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $bounds = $root.Current.BoundingRectangle
+    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
+    $compactWidth = [Math]::Round(680 * $scale)
+    $wideSsh = Control @('inspect','--pane',"$remote")
+    $resize.Resize($compactWidth, $bounds.Height)
+    # Tab activation remembers the last measured SSH grid. Set it while SSH is
+    # still active so its later restoration is itself the transition to compact.
+    $compactSsh = Wait-Until 'the compact SSH grid has been measured' {
+        $measured = Control @('inspect','--pane',"$remote")
+        if ($measured.pixel_width -gt 0 -and $measured.cols -lt $wideSsh.cols) { $measured }
+    }
+
     Click 'New tab'
     Click ('Palette PowerShell ' + [char]0xb7 + ' Local') $menu
     $local = Wait-Until 'PowerShell tab' { ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id }
     Wait-Focus $local
+    $resize.Resize($bounds.Width, $bounds.Height)
     $null = Wait-Until 'SFTP toggle disabled for PowerShell' {
         $item = Title-Files
         $item -and !$item.Current.IsEnabled -and $item.GetCurrentPattern($toggle).Current.ToggleState -eq 'Off'
@@ -171,17 +194,8 @@ try {
             @($sessions).Count -eq 3
     }
 
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-    $bounds = $root.Current.BoundingRectangle
-    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
-    $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
-    $compactWidth = [Math]::Round(680 * $scale)
     $resize.Resize($compactWidth, $bounds.Height)
-    $null = Wait-Until 'Terminal tools and Attention remain visible in the compact title bar' {
-        (Find-Element 'Terminal tools' $button -Visible) -and
-            (Find-Element 'Attention inbox, 0 unread' $button -Visible) -and
-            !(Find-Element 'Pane layout' $button -Visible)
-    }
+    Wait-CompactTitle 'Terminal tools and Attention remain visible in the compact title bar'
     $localFiles = Get-NativeMenuAction 'Terminal tools' 'Show SFTP files' -AllowDisabled
     if ($localFiles.Current.IsEnabled) { throw 'The compact menu offered SFTP for PowerShell' }
     Click 'Find in scrollback    Ctrl+Shift+F' $menu
@@ -202,20 +216,21 @@ try {
     Press-Key 0x1b
     $null = Wait-Until 'compact command palette closes' { !(Find-Element 'Search commands' $edit) }
 
+    $resize.Resize($bounds.Width, $bounds.Height)
+    $null = Wait-Until 'PowerShell shows the full toolbar before switching to SSH' {
+        (Find-Element 'Pane layout' $button -Visible) -and !(Find-Element 'Terminal tools' $button -Visible)
+    }
     $remoteTab = Wait-Until 'the original SSH tab remains visible' { Find-Element 'palette-ssh' $tab -Visible }
     $remoteTab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     Wait-Focus $remote
-    # The single-pane SSH profile can restore its own size after activation.
-    # Reapply the compact size if that restoration happens during the handoff.
-    $keepCompact = {
-        if ($root.Current.BoundingRectangle.Width -gt $compactWidth + 8 * $scale) {
-            $resize.Resize($compactWidth, $bounds.Height)
-        }
+    Wait-CompactTitle 'selecting the SSH profile restores its compact toolbar'
+    $null = Wait-Until 'the SSH profile restores the compact cell grid' {
+        $restored = Control @('inspect','--pane',"$remote")
+        $restored.cols -eq $compactSsh.cols -and $restored.rows -eq $compactSsh.rows
     }
-    & $keepCompact
-    Invoke-Button (Get-NativeMenuAction 'Terminal tools' 'Show SFTP files' -Reveal $keepCompact)
+    Invoke-NativeMenuAction 'Terminal tools' 'Show SFTP files'
     $null = Wait-Until 'compact SSH files open the original drawer' { Find-Element 'title-tools.txt' }
-    Invoke-Button (Get-NativeMenuAction 'Terminal tools' 'Hide SFTP files' -Reveal $keepCompact)
+    Invoke-NativeMenuAction 'Terminal tools' 'Hide SFTP files'
     $null = Wait-Until 'compact SSH files close the same drawer' { !(Find-Element 'title-tools.txt') }
     Invoke-NativeMenuAction 'Tab menu' 'Find in scrollback    Ctrl+Shift+F'
     $null = Wait-PickerEditor 'Find in scrollback' 'Find from More'
