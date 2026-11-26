@@ -1314,6 +1314,7 @@ pub struct TerminalApp {
     mru_groups: Vec<TabId>,
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
+    running_interrupt_pending: Option<pane_picker::PendingRunningInterrupt>,
     title_editor: Option<tab_title::Editor>,
     disconnect_review: Option<Arc<disconnect_ssh::Review>>,
     name_edit_serial: u64,
@@ -1374,6 +1375,7 @@ pub enum Message {
     PickerQuery(String),
     OpenRunningCommands,
     RunningCommandsTick(Arc<()>),
+    RunningInterrupt(pane_picker::RunningInterruptAction),
     WatchRunningCommand(Arc<()>, u64, w11term::events::RunningCommandTarget, bool),
     WindowHistory(pane_picker::WindowHistoryAction),
     PaneText(pane_picker::TextAction),
@@ -5595,6 +5597,7 @@ impl Component for TerminalApp {
             mru_groups: Vec::new(),
             switcher: None,
             picker: None,
+            running_interrupt_pending: None,
             title_editor: None,
             disconnect_review: None,
             name_edit_serial: 0,
@@ -5692,6 +5695,7 @@ impl Component for TerminalApp {
                 )
                 | Message::PickerQuery(..)
                 | Message::RunningCommandsTick(..)
+                | Message::RunningInterrupt(..)
                 | Message::WatchRunningCommand(..)
                 | Message::WindowHistory(..)
                 | Message::Discovery(
@@ -5949,6 +5953,10 @@ impl Component for TerminalApp {
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::OpenRunningCommands => self.open_running_commands(context),
             Message::RunningCommandsTick(launch) => self.refresh_running_commands(&launch),
+            Message::RunningInterrupt(action) => {
+                self.running_interrupt(action, context);
+                self.focus_picker_input(0, context);
+            }
             Message::WatchRunningCommand(launch, pane, target, armed) => {
                 self.watch_selected_running_command(&launch, pane, target, armed);
             }
@@ -6967,11 +6975,23 @@ impl Component for TerminalApp {
                 Shortcut::KeyboardHints => self.open_hints(),
                 Shortcut::HintKey(key) => self.hint_key(key, context),
                 Shortcut::PickerAccept => self.accept_picker(context),
-                Shortcut::PickerCancel => self.close_picker(context),
+                Shortcut::PickerCancel => {
+                    if self.cancel_running_interrupt_review() {
+                        self.focus_picker_input(0, context);
+                    } else {
+                        self.close_picker(context);
+                    }
+                }
                 Shortcut::PickerHistoryOption(option) => self.cycle_window_history(option, context),
                 Shortcut::PickerSaveHistory => self.save_window_history(context),
                 Shortcut::PickerWatchRunningCommand => self.toggle_selected_running_command_watch(),
                 Shortcut::PickerRunningOutput => self.toggle_running_command_output(),
+                Shortcut::PickerReviewRunningInterrupt => {
+                    self.review_selected_running_interrupt(context)
+                }
+                Shortcut::PickerConfirmRunningInterrupt => {
+                    self.confirm_selected_running_interrupt(context)
+                }
                 Shortcut::PickerMove(delta) => {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);

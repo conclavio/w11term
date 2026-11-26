@@ -1027,11 +1027,7 @@ pub(super) fn view(
     let search_height = if mode == Search::CommandHistory {
         if narrow_history { 264.0 } else { 232.0 }
     } else if mode == Search::RunningCommands {
-        if running.is_some_and(pane_picker::Picker::running_output_open) {
-            352.0
-        } else {
-            244.0
-        }
+        running.map_or(296.0, pane_picker::Picker::running_controls_height)
     } else {
         156.0
     };
@@ -1072,6 +1068,12 @@ pub(super) fn view(
                 .automation_name(match mode {
                     Search::Tabs => "Close tab search",
                     Search::CommandHistory => "Close command history search",
+                    Search::RunningCommands
+                        if running
+                            .is_some_and(pane_picker::Picker::reviewing_running_interrupt) =>
+                    {
+                        "Cancel command interrupt"
+                    }
                     Search::RunningCommands => "Close running command search",
                     Search::Profiles(_) => "Close profile search",
                     Search::Bookmarks(..) => "Close bookmark search",
@@ -1177,19 +1179,16 @@ pub(super) fn view(
     });
     let history_export =
         history.map_or_else(View::empty, |picker| picker.history_export_button(app, ctx));
-    let running_command_watch = running.map_or_else(View::empty, |picker| {
-        picker.running_command_watch_button(app, ctx)
+    let running_controls = running.map_or_else(View::empty, |picker| {
+        picker.running_command_controls(app, ctx)
     });
-    let running_output =
-        running.map_or_else(View::empty, |picker| picker.running_output_view(app, ctx));
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
             history_controls,
             StackPanel::new().spacing(4.0).keyed_children(results),
             history_export,
-            running_command_watch,
-            running_output,
+            running_controls,
         )),
         (app.width - 32.0).clamp(1.0, 660.0),
     )

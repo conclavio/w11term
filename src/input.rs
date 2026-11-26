@@ -252,6 +252,8 @@ pub enum Shortcut {
     PickerSaveHistory,
     PickerWatchRunningCommand,
     PickerRunningOutput,
+    PickerReviewRunningInterrupt,
+    PickerConfirmRunningInterrupt,
     PickerPlace(Direction),
     KeyboardHints,
     HintKey(u32),
@@ -1648,6 +1650,9 @@ impl State {
                 let repeat = message.lParam.0 & (1 << 30) != 0;
                 let action = match (stage, vk) {
                     (_, 0x1b) => Shortcut::PickerCancel,
+                    (PickerStage::RunningCommands, 0x0d) if modifiers() == KeyModifiers::CTRL => {
+                        Shortcut::PickerConfirmRunningInterrupt
+                    }
                     (
                         PickerStage::Commands
                         | PickerStage::CommandHistory
@@ -1696,6 +1701,9 @@ impl State {
                     }
                     (PickerStage::RunningCommands, 0x78) if modifiers().is_empty() => {
                         Shortcut::PickerRunningOutput
+                    }
+                    (PickerStage::RunningCommands, 0x79) if modifiers().is_empty() => {
+                        Shortcut::PickerReviewRunningInterrupt
                     }
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),

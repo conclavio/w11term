@@ -343,6 +343,47 @@ try {
             Where-Object { $_.Current.Name.StartsWith('interrupted fixture') -and $_.Current.Name.Contains('palette-ssh') } |
             Select-Object -First 1
     }
+    Press-Key 0x79 # F10 reviews the current capture
+    $null = Wait-Until 'a separate review names the source pane' { Find-Element "Send Ctrl+C to pane ${remote}?" }
+    Press-Key 0x1b
+    $null = Wait-Until 'Escape cancels only the review' {
+        !(Find-Element 'Send Ctrl+C' $button) -and (Find-Element 'Search running commands')
+    }
+    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 1)) { throw 'Cancelled review sent Ctrl+C' }
+
+    $interrupt = Wait-Until 'the interrupt action is enabled' {
+        $item = Find-Element 'Interrupt selected command' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    Invoke-Button $interrupt
+    $null = Wait-Until 'the old command can be reviewed' { Find-Element 'Send Ctrl+C' $button }
+    Report-CommandStart 'interrupted fixture'
+    $reviewed = $replacement
+    $replacement = Wait-Until 'the reviewed command is replaced with the same history ID' {
+        $r = (Inspect).running_command
+        if ($r.id -eq $reviewed.id -and $r.start_token -gt 0 -and $r.start_token -ne $reviewed.start_token) { $r }
+    }
+    $null = Wait-Until 'the replaced capture cannot be confirmed' {
+        $item = Find-Element 'Send Ctrl+C' $button
+        $item -and !$item.Current.IsEnabled
+    }
+    Invoke-Button (Wait-Until 'cancel stale review' { Find-Element 'Cancel interrupt' $button })
+    $null = Wait-Until 'the new command can be reviewed' {
+        $item = Find-Element 'Interrupt selected command' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 1)) { throw 'Stale review sent Ctrl+C' }
+
+    Press-Key 0x79
+    Invoke-Button (Wait-Until 'confirm the new capture' {
+        $item = Find-Element 'Send Ctrl+C' $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    })
+    $null = Wait-Until 'the GUI acknowledges one additional background write' {
+        (Find-Element "Ctrl+C sent to pane $remote.") -and
+            (Count-PeerInterrupts) -eq ($beforeInterrupt + 2)
+    }
+    Wait-Focus $localPane
     Press-Key 13
     Wait-Focus $remote
     Run-Palette 'Enable read-only pane input'
@@ -354,7 +395,7 @@ try {
     $null = Wait-Until 'SSH pane input is unlocked' {
         !((Control @('list')).sessions | Where-Object id -eq $remote).read_only
     }
-    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 1)) {
+    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 2)) {
         throw 'An invalid target wrote Ctrl+C to the peer'
     }
     Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
@@ -382,7 +423,11 @@ try {
         $text = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
         $observed.inspector_rows = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$text) |
-            ForEach-Object { $_.Current.Name } | Where-Object { $_ -like 'Text area *' -or $_ -like 'In-band resize *' -or $_ -like '*SSH*' })
+            ForEach-Object { $_.Current.Name } | Where-Object {
+                $_ -like 'Text area *' -or $_ -like 'In-band resize *' -or $_ -like '*SSH*' -or
+                $_ -like '*Ctrl+C*' -or $_ -like '*interrupt*'
+            })
+        $observed.peer_interrupts = Count-PeerInterrupts
     } catch { $observed.uia_error = $_.Exception.Message }
     throw "$failure. Last pane observations: $($observed | ConvertTo-Json -Compress -Depth 5)"
 } finally {

@@ -95,7 +95,7 @@ impl OutputPreview {
 }
 
 impl Picker {
-    fn selected_running_command(&self) -> Option<(u64, RunningCommandTarget)> {
+    pub(super) fn selected_running_command(&self) -> Option<(u64, RunningCommandTarget)> {
         if self.mode != Mode::Commands(Search::RunningCommands) {
             return None;
         }
@@ -285,7 +285,7 @@ impl TerminalApp {
         rows.into_iter().map(|(_, row)| row).collect()
     }
 
-    fn running_command_session(
+    pub(super) fn running_command_session(
         &self,
         pane: u64,
         target: RunningCommandTarget,

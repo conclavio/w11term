@@ -1,6 +1,9 @@
 use super::*;
 use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
 mod running_commands;
+mod running_interrupt;
+pub(in crate::app) use running_interrupt::Action as RunningInterruptAction;
+pub(in crate::app) use running_interrupt::Pending as PendingRunningInterrupt;
 mod text_search;
 mod window_history;
 pub use text_search::Action as TextAction;
@@ -256,6 +259,7 @@ pub(super) struct Picker {
     selected: usize,
     preview: Option<Preview>,
     running_output: Option<running_commands::OutputPreview>,
+    running_interrupt: running_interrupt::State,
     _running_timer: Option<crate::ui_timer::RetryTimer>,
 }
 
@@ -1104,6 +1108,7 @@ impl TerminalApp {
             selected,
             preview: None,
             running_output: None,
+            running_interrupt: Default::default(),
             _running_timer: running_timer,
         });
         if let Some(previous) = previous {
