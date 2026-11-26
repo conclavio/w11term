@@ -195,6 +195,16 @@ try {
         }
     }
     Invoke-Button (Wait-Until 'Close properties' { Find-Element 'Close properties' $button })
+    Invoke-Button (Wait-Until 'Find files in the short drawer' {
+        $find = Find-Element ('Find files' + [char]0x2026) $button -Visible
+        if ($find -and $find.Current.IsEnabled) { $find }
+    })
+    $query = Wait-SftpSearchFocus 'focused search in the shortest window'
+    $actions = Find-Element 'SFTP search actions'
+    $null = Wait-Until 'the focused search field is inside the short viewport' {
+        Control-Point $query $actions
+    }
+    Invoke-Button (Wait-Until 'back to the short listing' { Find-Element 'Back to files' $button })
     $resize.Resize($tallWidth,$tallWindowHeight)
     $null = Wait-Until 'the tall window restores its entry viewport' {
         $root.Current.BoundingRectangle.Height -ge $tallOuterHeight-2 -and

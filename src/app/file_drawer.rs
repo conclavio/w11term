@@ -109,6 +109,7 @@ pub enum FileAction {
     ShowSavedDownload(u64, SavedDownload),
     Bookmarks(u64, u64, bookmarks::Action),
     Search(u64, u64, find::Action),
+    FocusSearch(u64, u64, u64, u8),
     Follow(u64, u64, bool),
     Reveal(u64, u64, String, Option<String>),
     Close(u64),
@@ -213,6 +214,7 @@ pub(super) struct FileDrawer {
     history: FolderHistory,
     bookmarks: Option<bookmarks::List>,
     search: Option<find::Panel>,
+    search_focus: Option<u64>,
     saved_search: Option<find::Panel>,
     /// Describes an explicit navigation request if either REALPATH or listing fails.
     opening_target: Option<String>,
@@ -3226,7 +3228,7 @@ impl TerminalApp {
                 .is_some_and(|transfer| self.tabs.active_group_id() == Some(transfer.group))
     }
 
-    pub(super) fn with_file_drawer(&self, content: View, context: &ViewContext<Self>) -> View {
+    pub(super) fn with_file_drawer(&self, content: View, context: &mut ViewContext<Self>) -> View {
         let Some(AppTab {
             page: Page::Terminal(tab),
             ..
@@ -3251,6 +3253,7 @@ impl TerminalApp {
         let shell_ready =
             connection.is_some() && self.drawer_shell_eligible(tab, tab.files.generation);
         let layout = DrawerLayout::for_window(self.width, self.window_height);
+        tab.files.publish_search_focus(tab.session.pane_id, context);
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(layout.width)])
             .keyed_children([
@@ -3288,6 +3291,7 @@ impl TerminalApp {
             | Close(id)
             | Bookmarks(id, ..)
             | Search(id, ..)
+            | FocusSearch(id, ..)
             | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
@@ -3458,6 +3462,7 @@ impl TerminalApp {
                 Filter(..)
                     | ClearFilter(..)
                     | FocusFilter(..)
+                    | FocusSearch(..)
                     | Sort(..)
                     | OptionsExpanded(..)
                     | ShowTransfer(..)
@@ -3465,11 +3470,7 @@ impl TerminalApp {
         if !editor_typing
             && !matches!(
                 action,
-                Tick(_)
-                    | PollTail(..)
-                    | EditName(..)
-                    | FocusFilter(..)
-                    | Search(_, _, find::Action::FocusQuery(..))
+                Tick(_) | PollTail(..) | EditName(..) | FocusFilter(..) | FocusSearch(..)
             )
         {
             files.cached.borrow_mut().take();
@@ -3489,6 +3490,10 @@ impl TerminalApp {
                     )?;
                 }
                 Search(..) => {}
+                FocusSearch(_, generation, serial, attempt) if generation == files.generation => {
+                    files.focus_search_query(pane, serial, attempt, may_open_dialog, context);
+                }
+                FocusSearch(..) => {}
                 Bookmarks(_, generation, action)
                     if files.open && generation == files.generation =>
                 {

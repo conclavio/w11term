@@ -65,10 +65,7 @@ try {
     }
 
     Click ('Find files' + [char]0x2026)
-    $query = Wait-Until 'recursive filename query' {
-        $field = Find-Element 'Filename contains' $edit
-        if ($field -and $field.Current.HasKeyboardFocus) { $field }
-    }
+    $query = Wait-SftpSearchFocus 'recursive filename query'
     $query.GetCurrentPattern($value).SetValue('copy-nested.bin')
     Click 'Search'
     Click "Copy to folder $parent/sub/copy-nested.bin"
@@ -117,10 +114,7 @@ try {
     Click 'Exit selection'
 
     Click ('Find files' + [char]0x2026)
-    $query = Wait-Until 'batch filename query' {
-        $field = Find-Element 'Filename contains' $edit
-        if ($field -and $field.Current.HasKeyboardFocus) { $field }
-    }
+    $query = Wait-SftpSearchFocus 'batch filename query'
     $query.GetCurrentPattern($value).SetValue('scan-copy-')
     Click 'Search'
     $null = Wait-Until 'both search rows are ready' {

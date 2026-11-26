@@ -256,6 +256,27 @@ function Press-Key([uint32]$Key) {
     Post-Key 0x100 $Key
     Post-Key 0x101 $Key
 }
+function Wait-SftpSearchFocus([string]$Description = 'focused recursive filename field') {
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    try {
+        Wait-Until $Description {
+            $field = Find-Element 'Filename contains' $edit
+            if ($field -and $field.Current.HasKeyboardFocus) { $field }
+        }
+    } catch {
+        $failure = $_
+        $field = Find-Element 'Filename contains' $edit
+        $state = if ($field) {
+            "enabled=$($field.Current.IsEnabled), offscreen=$($field.Current.IsOffscreen), bounds=$($field.Current.BoundingRectangle)"
+        } else { 'field not found' }
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        $focus = if ($focused -and $focused.Current.ProcessId -eq $app.Id) {
+            "$($focused.Current.ClassName) '$($focused.Current.Name)'"
+        } else { 'outside the fixture window' }
+        $search = $null -ne (Find-Element 'SFTP search actions')
+        throw "$($failure.Exception.Message). Search visible to UIA=$search. Field: $state. Focus: $focus"
+    }
+}
 function Press-FocusedKey([uint32]$Key) {
     # WinUI routes ordinary typing through the focused child HWND. Inspect the
     # fixture's own thread and keep both messages addressed to that process.

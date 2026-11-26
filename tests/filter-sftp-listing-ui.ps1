@@ -43,16 +43,10 @@ function Click([string]$Name) {
 function Filter-Edit {
     Find-Element 'Filter filenames' ([System.Windows.Automation.ControlType]::Edit)
 }
-function Wait-FilenameSearchFocus {
-    Wait-Until 'focused recursive filename field' {
-        $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
-        if ($query -and $query.Current.HasKeyboardFocus) { $query }
-    }
-}
 function Focus-FilenameSearch {
     $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
     $query.SetFocus()
-    $null = Wait-FilenameSearchFocus
+    $null = Wait-SftpSearchFocus
 }
 function Get-AdvancedSearchSummary {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -246,7 +240,7 @@ try {
     Click 'Back'
     $null = Wait-Until 'parent directory restored' { Find-Element $parent }
     Click ('Find files' + [char]0x2026)
-    $field = Wait-FilenameSearchFocus
+    $field = Wait-SftpSearchFocus
     Set-SearchChoice 'Search result type' 'Folders'
     $null = Wait-Until 'type-only search enabled' {
         $run = Button 'Search'
@@ -489,7 +483,7 @@ try {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt')
     }
     Click ('Find files' + [char]0x2026)
-    $null = Wait-FilenameSearchFocus
+    $null = Wait-SftpSearchFocus
     Click $savedSearchesButton
     Click 'Run saved search'
     $null = Wait-Until 'saved search uses its original root, criteria, and sort' {
@@ -630,7 +624,7 @@ try {
         (Find-Element "$parent/nested") -and (Button 'nested-content.txt') -and (Button $download).Current.IsEnabled
     }
     Click 'Back to search results'
-    $null = Wait-FilenameSearchFocus
+    $null = Wait-SftpSearchFocus
     $field = Wait-Until 'original search restored with both matches' {
         $edit = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
         if ($edit -and (Button "Reveal $parent/nested") -and (Button "Reveal $parent/nested/nested-content.txt")) {
@@ -811,7 +805,7 @@ try {
     $null = Wait-Until 'the destination listing contains the moved entry on a later page' { Button 'nested-content.txt' }
     Click 'Clear filter'
     Click ('Find files' + [char]0x2026)
-    $field = Wait-FilenameSearchFocus
+    $field = Wait-SftpSearchFocus
     $field.GetCurrentPattern($value).SetValue('nested-content.txt')
     Click 'Search'
     Click "Move to folder $parent/nested-content.txt"
@@ -860,7 +854,7 @@ try {
     [IO.File]::WriteAllText($sourceSecond, 'second marked entry')
     [IO.File]::WriteAllText($sourceLast, 'last marked entry')
     Focus-FilenameSearch
-    $field = Wait-FilenameSearchFocus
+    $field = Wait-SftpSearchFocus
     $field.GetCurrentPattern($value).SetValue('build-')
     Click 'Search'
     $null = Wait-Until 'the marked move starts with paginated results' {

@@ -60,15 +60,18 @@ try {
     Select-Row 'note.txt' $false 'canvas-typed'
 
     Invoke-Button (Wait-Until 'Find files button' { Find-Element ('Find files' + [char]0x2026) $button })
-    $null = Wait-Until 'focused file search query' {
+    $null = Wait-SftpSearchFocus 'focused file search query'
+    $null = Press-FocusedKey 0x51
+    $null = Wait-Until 'the first key goes to the new search field' {
         $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
-        $query -and $query.Current.HasKeyboardFocus
+        if ([IO.File]::ReadAllText($trace) -cne 'canvas-typed') { throw 'The search keystroke reached SSH' }
+        $query -and $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq 'q'
     }
     Focus-TerminalCanvas
     foreach ($ch in 'search-canvas-typed'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','search-canvas-typed')
     $query = Find-Element 'Filename contains' ([System.Windows.Automation.ControlType]::Edit)
-    if (!$query -or $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne '') {
+    if (!$query -or $query.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -cne 'q') {
         throw 'Returning to the terminal changed or closed the search'
     }
 } finally {
