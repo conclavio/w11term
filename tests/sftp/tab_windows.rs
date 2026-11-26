@@ -154,6 +154,16 @@ async fn native_cli_splits_live_and_background_panes() {
     run("CliSplit", b"source-split/split-remote/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "moves live SSH and PowerShell panes by ID within and between windows without taking desktop focus"]
+async fn native_cli_moves_live_panes_without_focus_or_reconnect() {
+    run(
+        "CliMove",
+        b"before-cli-move/after-cli-move/returned-cli-move/",
+    )
+    .await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =

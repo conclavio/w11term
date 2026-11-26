@@ -1,6 +1,6 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
 use crate::{
-    pane_layout::Axis,
+    pane_layout::{Axis, Direction},
     session::{Command, PaneDescription},
     terminal::Snapshot,
 };
@@ -129,6 +129,13 @@ pub enum Request {
         pane: u64,
         profile: String,
         axis: Axis,
+        #[serde(default)]
+        activate: bool,
+    },
+    MovePane {
+        pane: u64,
+        target_pane: u64,
+        direction: Direction,
         #[serde(default)]
         activate: bool,
     },
@@ -507,6 +514,13 @@ pub enum UiRequest {
         activate: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    MovePane {
+        pane: u64,
+        target_pane: u64,
+        direction: Direction,
+        activate: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Resize {
         pane: u64,
         cols: usize,
@@ -520,6 +534,7 @@ impl UiRequest {
             Self::Open { reply, .. }
             | Self::ClosePane { reply, .. }
             | Self::SplitPane { reply, .. }
+            | Self::MovePane { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
@@ -559,7 +574,8 @@ impl UiRequest {
         match self {
             Self::Resize { pane, .. }
             | Self::ClosePane { pane, .. }
-            | Self::SplitPane { pane, .. } => Some(*pane),
+            | Self::SplitPane { pane, .. }
+            | Self::MovePane { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
         }
@@ -570,6 +586,7 @@ impl UiRequest {
             Self::Resize { reply, .. }
             | Self::ClosePane { reply, .. }
             | Self::SplitPane { reply, .. }
+            | Self::MovePane { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             if reply.is_closed()
         )
@@ -748,6 +765,30 @@ impl Registry {
                 tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("split-pane timed out; the split may have been created")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::MovePane {
+                pane,
+                target_pane,
+                direction,
+                activate,
+            } => {
+                ensure!(pane != target_pane, "choose a different target pane");
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(
+                    pane,
+                    UiRequest::MovePane {
+                        pane,
+                        target_pane,
+                        direction,
+                        activate,
+                        reply,
+                    },
+                );
+                tokio::time::timeout(TIMEOUT + Duration::from_secs(2), response)
+                    .await
+                    .context("move-pane timed out; use list to check the pane's location")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }

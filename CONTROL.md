@@ -58,6 +58,16 @@ By default the current selection and zoom stay in place. With `--activate`, the 
 
 Direct pipe clients can send `{"verb":"split-pane","pane":42,"profile":"Windows PowerShell","axis":"columns"}`.
 
+`move-pane --pane ID --target-pane ID --direction left|right|up|down [--activate]` moves an existing session beside a pane in another tab of the same process. The tab can be in either window. The response includes `pane`, `target_pane`, the destination `window_id` and `tab_id`, `direction`, and `active`. Pane IDs, connections, and scrollback survive the move.
+
+The destination keeps its selection and zoom by default. Use `--activate` to select the moved pane in the destination window. The source selects a surviving pane if its selected pane moves. Desktop focus stays where it is. A move that would empty and close the source window is rejected.
+
+```powershell
+& $ctl --pid 12345 move-pane --pane $pane --target-pane 57 --direction right
+```
+
+Direct pipe clients can send `{"verb":"move-pane","pane":42,"target_pane":57,"direction":"right"}`.
+
 ```powershell
 # Literal UTF-8, including a carriage return supplied by PowerShell.
 & $ctl --pid 12345 send-text --pane $pane --no-paste "BOARD`r"

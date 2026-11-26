@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -688,6 +688,78 @@ function Test-ExplicitControlWindow {
         throw 'An explicit open against a closed window did not return the expected error'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'A closed-window request fell back to the original window' }
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlMove {
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'SSH is foreground before moving any pane'
+    Type-In $origin 'before-cli-move/'
+    Expect-Text $ssh.id 'before-cli-move/'
+    $initialSsh = (Control @('list')).sessions | Where-Object id -eq $ssh.id
+    $local = Control @('open','--profile','Destination PowerShell','--new-window')
+    $child = Wait-DetachedWindow $origin
+    Expect-Text $local.pane 'PS '
+    $same = & $Cli --pid $app.Id move-pane --pane "$($moved.id)" --target-pane "$($ssh.id)" --direction left | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $same.ok -or $same.error -notlike '*another tab*') {
+        throw 'The command accepted a destination in the same tab'
+    }
+    $missing = & $Cli --pid $app.Id move-pane --pane "$($moved.id)" --target-pane 2147483647 --direction left | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $missing.ok -or $missing.error -cne 'unknown pane 2147483647') {
+        throw 'The command redirected a missing destination'
+    }
+    $last = & $Cli --pid $app.Id move-pane --pane "$($local.pane)" --target-pane "$($ssh.id)" --direction left | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $last.ok -or $last.error -notlike '*last pane*') {
+        throw 'The command let the last pane close its source window'
+    }
+
+    $inWindow = Control @('move-pane','--pane',"$($anchor.id)",'--target-pane',"$($moved.id)",'--direction','down')
+    if ($inWindow.active -or $inWindow.pane -ne $anchor.id -or $inWindow.target_pane -ne $moved.id -or
+        $inWindow.window_id -ne $ssh.window_id -or $inWindow.tab_id -ne $ssh.tab_id -or $inWindow.direction -cne 'down') {
+        throw "Unexpected same-window move reply: $($inWindow | ConvertTo-Json -Compress)"
+    }
+    $null = Wait-Until 'the two PowerShell sessions share the right side of the SSH tab' {
+        $panes = (Control @('list')).sessions
+        $upper = $panes | Where-Object id -eq $moved.id
+        $lower = $panes | Where-Object id -eq $anchor.id
+        $lower.tab_id -eq $inWindow.tab_id -and $upper.visible -and $lower.visible -and
+            $upper.cols -eq $lower.cols -and $upper.rows -lt $initialSsh.rows -and $lower.rows -lt $initialSsh.rows
+    }
+    if ((Shell-State $moved.id 'upperMove') -ne $localIdentity -or
+        (Shell-State $anchor.id 'lowerMove') -ne $anchorIdentity) { throw 'The same-window move restarted PowerShell' }
+    Expect-Focus $origin $ssh.id 'The same-window move keeps the active SSH pane'
+
+    $across = Control @('move-pane','--pane',"$($ssh.id)",'--target-pane',"$($local.pane)",'--direction','right','--activate')
+    $panes = (Control @('list')).sessions
+    $result = $panes | Where-Object id -eq $ssh.id
+    $target = $panes | Where-Object id -eq $local.pane
+    if (!$across.active -or $across.pane -ne $ssh.id -or $across.window_id -ne $local.window_id -or
+        $result.window_id -ne $local.window_id -or $result.tab_id -ne $target.tab_id -or
+        $result.connection_generation -ne $initialSsh.connection_generation -or
+        $result.ssh_transport_id -ne $initialSsh.ssh_transport_id) {
+        throw 'The move reply did not preserve the live SSH connection in its target tab'
+    }
+    $null = Wait-Until 'the sibling selects the moved pane while the source window keeps desktop focus' {
+        $windows = (Control @('list-windows')).windows
+        $dest = $windows | Where-Object window_id -eq $local.window_id
+        $source = $windows | Where-Object window_id -eq $ssh.window_id
+        $dest.active_tab_title -ceq 'window-ssh' -and !$dest.active -and $source.active -and
+            [TabFixtureWindows]::GetForegroundWindow() -eq $origin
+    }
+    Expect-Text $ssh.id 'before-cli-move/'
+    $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','after-cli-move/')
+    Expect-Text $ssh.id 'after-cli-move/'
+
+    $back = Control @('move-pane','--pane',"$($ssh.id)",'--target-pane',"$($moved.id)",'--direction','left')
+    $result = (Control @('list')).sessions | Where-Object id -eq $ssh.id
+    if ($back.active -or $back.window_id -ne $ssh.window_id -or $back.tab_id -ne $ssh.tab_id -or
+        $result.active -or $result.id -ne $ssh.id -or $result.connection_generation -ne $initialSsh.connection_generation) {
+        throw 'The returned pane did not keep its original session and owner'
+    }
+    Expect-Text $ssh.id 'after-cli-move/'
+    $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','returned-cli-move/')
+    Expect-Text $ssh.id 'returned-cli-move/'
+    Close-FixtureWindow $child
     Close-FixtureWindow $origin
 }
 
@@ -1491,13 +1563,14 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
             'CliWorkspaceWindow' { Test-ControlWorkspaceWindow }
             'CliProfiles' { Test-ControlProfileWindows }
             'CliSplit' { Test-ControlSplit }
+            'CliMove' { Test-ControlMove }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

@@ -437,6 +437,16 @@ impl Registry {
             .with_context(|| format!("unknown pane {id}"))
     }
 
+    pub fn pane_location(&self, id: u64) -> Result<(WindowId, u64)> {
+        let state = self.state.lock().unwrap();
+        ensure!(!state.moving.contains_key(&id), "pane {id} is moving");
+        let (window, pane) = state
+            .panes
+            .get(&id)
+            .with_context(|| format!("unknown pane {id}"))?;
+        Ok((*window, pane.tab_id))
+    }
+
     pub(super) fn listing(&self) -> Vec<(WindowId, Pane)> {
         let state = self.state.lock().unwrap();
         let active = state.recent.last();

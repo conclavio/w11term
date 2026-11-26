@@ -67,6 +67,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "wait-pane-exit"
             | "close-pane"
             | "split-pane"
+            | "move-pane"
             | "list-commands"
             | "get-command"
             | "get-running-output"
@@ -365,6 +366,34 @@ mod tests {
             "open --profile desk --window 0",
             "open --profile desk --window 1 --window 2",
             "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn moves_an_exact_pane_beside_another_pane() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (_, request) =
+            parse_line("move-pane --pane 42 --target-pane 9 --direction down --activate").unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb": "move-pane", "pane": 42, "target_pane": 9, "direction": "down", "activate": true,
+            })
+        );
+        for invalid in [
+            "move-pane --pane 42 --target-pane 9",
+            "move-pane --pane 42 --direction left",
+            "move-pane --target-pane 9 --direction left",
+            "move-pane --pane 0 --target-pane 9 --direction left",
+            "move-pane --pane 42 --target-pane 0 --direction left",
+            "move-pane --pane 42 --target-pane 42 --direction left",
+            "move-pane --pane 42 --pane 43 --target-pane 9 --direction left",
+            "move-pane --pane 42 --target-pane 9 --target-pane 10 --direction left",
+            "move-pane --pane 42 --target-pane 9 --direction left --direction right",
+            "move-pane --pane 42 --target-pane 9 --direction diagonal",
+            "move-pane --pane 42 --target-pane 9 --direction left --window 1",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }
