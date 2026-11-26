@@ -56,6 +56,7 @@ pub enum Action {
     MoveTabRight,
     NewTab,
     DuplicateTabLayout,
+    DuplicateTabLayoutInNewWindow,
     ReopenClosedTab,
     ReopenClosedPane,
     CloseTab,
@@ -279,6 +280,13 @@ pub const BINDINGS: &[Binding] = &[
         0,
         Mods::NONE,
     ),
+    Binding::new(
+        DuplicateTabLayoutInNewWindow,
+        "duplicate_tab_layout_in_new_window",
+        "Duplicate tab layout in new window",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(CloseTab, "close_tab", "Close tab", 0x57, CTRL_SHIFT),
     Binding::new(
         ReopenClosedTab,
@@ -344,6 +352,7 @@ impl Action {
                 | FindNext
                 | FindPrevious
                 | DuplicateTabLayout
+                | DuplicateTabLayoutInNewWindow
                 | KeyboardHints
                 | CopyMode
                 | SelectAll

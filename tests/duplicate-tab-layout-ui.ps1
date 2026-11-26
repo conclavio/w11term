@@ -114,10 +114,11 @@ try {
     $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($action)
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,$button)
-    $null = Wait-Until 'duplicate disabled with the staged SSH startup reason' {
-        foreach ($entry in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)) {
-            if ($entry.Current.Name -like 'Duplicate tab layout:*workspace startup*' -and !$entry.Current.IsEnabled) { return $true }
-        }
+    $null = Wait-Until 'both duplicate actions disabled with the staged SSH startup reason' {
+        $disabled = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition) |
+            Where-Object { !$_.Current.IsEnabled } | ForEach-Object { $_.Current.Name })
+        ($disabled -like 'Duplicate tab layout:*workspace startup*') -and
+            ($disabled -like 'Duplicate tab layout in new window:*workspace startup*')
     }
     Press-Key 27
     Wait-Focus $sourceSsh.id

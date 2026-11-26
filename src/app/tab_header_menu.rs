@@ -79,7 +79,8 @@ impl TerminalApp {
         if matches!(page, Page::Terminal(_)) {
             items.extend([
                 MenuItem::item("rename", RENAME),
-                self.duplicate_tab_item_for(Some(group)),
+                self.duplicate_tab_item_for(Some(group), DuplicateTabDestination::Tab),
+                self.duplicate_tab_item_for(Some(group), DuplicateTabDestination::Window),
                 tab_colors::menu(true, self.tabs.group_color(group)),
                 MenuItem::item("pin", if pinned { UNPIN } else { PIN }),
             ]);
@@ -129,7 +130,10 @@ impl TerminalApp {
             UNPIN => self.set_tab_pinned(group, false, context),
             tab_windows::NEW_WINDOW_LABEL => self.move_tab_group_to_window(group, None, context),
             label if label == KeyAction::DuplicateTabLayout.binding().label => {
-                self.duplicate_tab_from_menu(group, context);
+                self.duplicate_tab_from_menu(group, DuplicateTabDestination::Tab, context);
+            }
+            label if label == KeyAction::DuplicateTabLayoutInNewWindow.binding().label => {
+                self.duplicate_tab_from_menu(group, DuplicateTabDestination::Window, context);
             }
             label => {
                 if let Some(color) = tab_colors::from_menu(label)
@@ -156,10 +160,11 @@ impl TerminalApp {
     pub(super) fn duplicate_tab_from_menu(
         &mut self,
         group: TabId,
+        destination: DuplicateTabDestination,
         context: &ComponentContext<Self>,
     ) {
         self.window_error = self
-            .duplicate_tab_layout(group, context)
+            .duplicate_tab_layout(group, destination, context)
             .err()
             .map(|error| format!("Couldn’t duplicate tab layout. {error:#}"));
     }

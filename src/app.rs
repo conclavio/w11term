@@ -1036,6 +1036,9 @@ fn tab_menu_message(label: String) -> Message {
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
         tab_title::RENAME_WINDOW => Message::TabTitle(tab_title::Action::ShowWindow),
         "Duplicate tab layout" => Message::Shortcut(Shortcut::DuplicateTabLayout),
+        "Duplicate tab layout in new window" => {
+            Message::Shortcut(Shortcut::DuplicateTabLayoutInNewWindow)
+        }
         "Reopen last closed tab layout" => Message::Shortcut(Shortcut::ReopenClosedTab),
         "Reopen last closed pane" => Message::Shortcut(Shortcut::ReopenClosedPane),
         "Move tab left" => Message::Shortcut(Shortcut::MoveTabLeft),
@@ -1129,9 +1132,14 @@ fn bind_tab_action(message: Message, group: Option<TabId>) -> Message {
             .map_or(Message::ControlIdle, |id| {
                 Message::MoveTabToExistingWindow(Some(id), window)
             }),
-        Message::Shortcut(Shortcut::DuplicateTabLayout) => {
-            group.map_or(Message::ControlIdle, Message::DuplicateTabLayout)
-        }
+        Message::Shortcut(Shortcut::DuplicateTabLayout) => group
+            .map_or(Message::ControlIdle, |group| {
+                Message::DuplicateTabLayout(group, DuplicateTabDestination::Tab)
+            }),
+        Message::Shortcut(Shortcut::DuplicateTabLayoutInNewWindow) => group
+            .map_or(Message::ControlIdle, |group| {
+                Message::DuplicateTabLayout(group, DuplicateTabDestination::Window)
+            }),
         Message::Shortcut(Shortcut::MoveTabLeft) => group.map_or(Message::ControlIdle, |id| {
             Message::MoveTab(id, Direction::Left)
         }),
@@ -1140,6 +1148,12 @@ fn bind_tab_action(message: Message, group: Option<TabId>) -> Message {
         }),
         message => message,
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum DuplicateTabDestination {
+    Tab,
+    Window,
 }
 
 #[derive(Clone, Copy)]
@@ -1423,7 +1437,7 @@ pub enum Message {
     MovePaneToNewWindow(Option<u64>),
     MoveTabToWindow,
     MoveTabToExistingWindow(Option<TabId>, u64),
-    DuplicateTabLayout(TabId),
+    DuplicateTabLayout(TabId, DuplicateTabDestination),
     ReopenClosedTab(Option<TabId>),
     ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
@@ -4395,7 +4409,11 @@ impl TerminalApp {
                 },
                 self.active_terminal_group().is_some(),
             ),
-            self.duplicate_tab_item(),
+            self.duplicate_tab_item_for(self.tabs.active_group_id(), DuplicateTabDestination::Tab),
+            self.duplicate_tab_item_for(
+                self.tabs.active_group_id(),
+                DuplicateTabDestination::Window,
+            ),
             command_menu_item(
                 "close-other-tabs",
                 bulk_tab_close::Scope::Other.label(),
@@ -4559,12 +4577,15 @@ impl TerminalApp {
             .map_or_else(|| label.to_owned(), |chord| format!("{label}    {chord}"));
         command_menu_item(key, description, enabled)
     }
-    fn duplicate_tab_item(&self) -> MenuItem {
-        self.duplicate_tab_item_for(self.tabs.active_group_id())
-    }
-
-    fn duplicate_tab_item_for(&self, group: Option<TabId>) -> MenuItem {
-        let action = KeyAction::DuplicateTabLayout;
+    fn duplicate_tab_item_for(
+        &self,
+        group: Option<TabId>,
+        destination: DuplicateTabDestination,
+    ) -> MenuItem {
+        let action = match destination {
+            DuplicateTabDestination::Tab => KeyAction::DuplicateTabLayout,
+            DuplicateTabDestination::Window => KeyAction::DuplicateTabLayoutInNewWindow,
+        };
         let binding = action.binding();
         match group
             .context("Select a terminal tab")
@@ -5672,6 +5693,7 @@ impl Component for TerminalApp {
                     context,
                 );
             }
+            Some(tab_windows::ChildLaunch::Tab(layout)) => app.start_prepared_tab(layout, context),
             None => app.activate(context),
         }
         app.watch_control(context);
@@ -5920,9 +5942,9 @@ impl Component for TerminalApp {
                     self.move_tab_window(Some(window), context);
                 }
             }
-            Message::DuplicateTabLayout(group) => {
+            Message::DuplicateTabLayout(group, destination) => {
                 if self.tabs.active_group_id() == Some(group) {
-                    self.duplicate_tab_from_menu(group, context);
+                    self.duplicate_tab_from_menu(group, destination, context);
                 }
             }
             Message::ReopenClosedTab(Some(group)) => {
@@ -7168,7 +7190,10 @@ impl Component for TerminalApp {
                     self.default_profile.clone(),
                     context,
                 ),
-                Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
+                Shortcut::DuplicateTabLayout
+                | Shortcut::DuplicateTabLayoutInNewWindow
+                | Shortcut::MoveTabLeft
+                | Shortcut::MoveTabRight => {
                     self.update(
                         bind_tab_action(Message::Shortcut(shortcut), self.tabs.active_group_id()),
                         context,
@@ -9109,12 +9134,19 @@ mod profile_ui_tests {
         ] {
             assert!(matches!(
                 bind_tab_action(action, Some(42)),
-                Message::DuplicateTabLayout(42)
+                Message::DuplicateTabLayout(42, DuplicateTabDestination::Tab)
             ));
         }
         assert!(matches!(
             bind_tab_action(tab_menu_message("Duplicate tab layout".into()), None),
             Message::ControlIdle
+        ));
+        assert!(matches!(
+            bind_tab_action(
+                tab_menu_message("Duplicate tab layout in new window    F8".into()),
+                Some(42)
+            ),
+            Message::DuplicateTabLayout(42, DuplicateTabDestination::Window)
         ));
     }
 

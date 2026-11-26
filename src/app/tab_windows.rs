@@ -233,6 +233,7 @@ pub(super) struct NewWindow {
 pub(super) enum ChildLaunch {
     Profile { name: String, source: Box<Source> },
     Group(host_groups::WindowGroup),
+    Tab(Box<workspace_view::PreparedTabLayout>),
 }
 
 pub(super) struct ChildWindow {

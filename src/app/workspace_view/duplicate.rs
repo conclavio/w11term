@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::{Result, bail, ensure};
-use w11term::tabs::TabTitle;
+use w11term::tabs::{TabLayoutRecipe, TabTitle};
 
 const CLOSED_TAB_LIMIT: usize = 10;
 
@@ -93,6 +93,8 @@ pub(in crate::app) struct ClosedPane {
     location: w11term::tabs::ClosedPaneLocation,
     shell: NewShell,
 }
+
+pub(in crate::app) struct PreparedTabLayout(TabLayoutRecipe<NewShell>);
 
 #[derive(Clone)]
 struct NewShell {
@@ -316,21 +318,52 @@ impl TerminalApp {
     pub(in crate::app) fn duplicate_tab_layout(
         &mut self,
         group: TabId,
+        destination: DuplicateTabDestination,
         context: &ComponentContext<Self>,
     ) -> Result<()> {
         self.can_duplicate_tab_layout(group)?;
         // Only keep a profile association if the on-disk catalog still agrees.
         // A moved/deleted catalog cannot change a live pane's launch recipe.
         let catalog = self.store.catalog().ok();
+        let prepare = |tab: &AppTab| NewShell::capture(tab)?.prepare(catalog.as_ref());
+        match destination {
+            DuplicateTabDestination::Tab => {
+                let preferences = self.appearance.read().unwrap().pane_preferences();
+                self.tabs
+                    .duplicate_group(group, prepare, |recipe| recipe.launch(preferences))?;
+                self.sync_selection(context);
+                self.activate(context);
+            }
+            DuplicateTabDestination::Window => {
+                let layout = self
+                    .tabs
+                    .capture_group(group, prepare)?
+                    .context("The original tab was closed")?;
+                self.open_child_window(
+                    tab_windows::ChildLaunch::Tab(Box::new(PreparedTabLayout(layout))),
+                    context,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::app) fn start_prepared_tab(
+        &mut self,
+        layout: &PreparedTabLayout,
+        context: &ComponentContext<Self>,
+    ) {
+        // All launch paths were checked in the source before allocating the new window.
         let preferences = self.appearance.read().unwrap().pane_preferences();
-        self.tabs.duplicate_group(
-            group,
-            |tab| NewShell::capture(tab)?.prepare(catalog.as_ref()),
-            |recipe| recipe.launch(preferences),
-        )?;
+        self.tabs
+            .reopen_group(
+                &layout.0,
+                |recipe| Ok::<_, std::convert::Infallible>(recipe.clone()),
+                |recipe| recipe.launch(preferences),
+            )
+            .unwrap_or_else(|never| match never {});
         self.sync_selection(context);
         self.activate(context);
-        Ok(())
     }
 }
 
