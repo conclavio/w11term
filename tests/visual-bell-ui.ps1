@@ -40,10 +40,18 @@ function Measure-TopEdge([int]$Pane, [string]$Marker) {
     # bell's gold stroke is 1–3 DIPs from the top edge, inside that padding.
     @{ X = $cell.X + [int][Math]::Round(10 * $scale)
        Y = $cell.Y - [int][Math]::Round(11 * $scale)
-       Height = [int][Math]::Ceiling(4 * $scale) }
+       Height = [int][Math]::Ceiling(4 * $scale)
+       Step = [int][Math]::Ceiling(16 * $scale) }
 }
-function Has-Outline($Edge, [switch]$Green) {
-    $pixels = [CursorCellProbe]::ReadPixels($window,$window,$Edge.X,$Edge.Y,8,$Edge.Height)
+function Read-Outline($Edge, [switch]$Green) {
+    # Either pane's top stroke is continuous. Try several nearby spots when
+    # a transient desktop window or a flyout covers the first one.
+    $pixels = $null
+    foreach ($offset in 0,1,2,3) {
+        $pixels = [CursorCellProbe]::TryReadPixels($window, ($Edge.X + $offset * $Edge.Step), $Edge.Y, 8, $Edge.Height)
+        if ($null -ne $pixels) { break }
+    }
+    if ($null -eq $pixels) { return $null }
     foreach ($pixel in $pixels) {
         $r = ($pixel -shr 16) -band 255
         $g = ($pixel -shr 8) -band 255
@@ -53,6 +61,13 @@ function Has-Outline($Edge, [switch]$Green) {
         } elseif ($r -gt 185 -and $g -gt 105 -and $g -lt 220 -and $b -lt 100) { return $true }
     }
     return $false
+}
+function Read-Outlines([switch]$Green) {
+    $rightOutline = Read-Outline $rightEdge -Green:$Green
+    $leftOutline = Read-Outline $leftEdge -Green:$Green
+    if ($null -ne $rightOutline -and $null -ne $leftOutline) {
+        @{ Left = $leftOutline; Right = $rightOutline }
+    }
 }
 function Get-BellSetting {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -98,10 +113,13 @@ try {
         throw 'The filtered bell wait returned a title event or failed to advance its cursor'
     }
     $since = $withoutBell.next
+    $null = Wait-Until 'both pane edges to be visible before the disabled bell' { Read-Outlines }
     Send-Sequence $left $bell
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.ElapsedMilliseconds -lt 650) {
-        if ((Has-Outline $leftEdge) -or (Has-Outline $rightEdge)) { throw 'Visual bell drew with its setting disabled' }
+        $outlines = Read-Outlines
+        if (!$outlines) { throw 'Could not observe both pane edges while the visual bell was disabled' }
+        if ($outlines.Left -or $outlines.Right) { throw 'Visual bell drew with its setting disabled' }
         Start-Sleep -Milliseconds 20
     }
     Wait-BellEvent $left $since
@@ -124,28 +142,42 @@ try {
     $tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     Wait-Focus $right
     Show-CursorWindow
+    $null = Wait-Until 'both pane edges to be visible after leaving Settings' { Read-Outlines }
     $before = (Control @('get-text','--pane',"$left")).generation
     $since = Bell-Cursor $left
-    $timer.Restart()
     Send-Sequence $left $bell
     $null = Wait-Until 'gold outline on the left pane only' {
-        if (Has-Outline $rightEdge) { throw 'Bell drew on the focused neighbor' }
-        Has-Outline $leftEdge
+        $outlines = Read-Outlines
+        if ($outlines.Right) { throw 'Bell drew on the focused neighbor' }
+        $outlines.Left
     }
-    $null = Wait-Until 'outline expires while the SSH pane is idle' { !(Has-Outline $leftEdge) }
-    if (Has-Outline $rightEdge) { throw 'Outline appeared on the neighboring pane' }
+    # The renderer starts the cooldown when it receives the bell, after the
+    # CLI has sent it. Anchor this interval to the observed stroke.
+    $timer.Restart()
+    $null = Wait-Until 'outline expires while the SSH pane is idle' {
+        $outlines = Read-Outlines
+        if ($outlines.Right) { throw 'Outline appeared on the neighboring pane' }
+        $outlines -and !$outlines.Left
+    }
     Wait-BellEvent $left $since
     Wait-Focus $right
     if ((Control @('get-text','--pane',"$left")).generation -ne $before) {
         throw 'Visual bell changed committed terminal contents'
     }
     $null = Wait-Until 'the per-pane bell cooldown has elapsed' { $timer.ElapsedMilliseconds -ge 1050 }
+    $since = Bell-Cursor $left
     Send-Sequence $left ($esc + ']21;visual_bell=#00e850' + $esc + '\' + $bell)
     $null = Wait-Until 'application-set green outline on the left pane only' {
-        if (Has-Outline $rightEdge -Green) { throw 'Custom bell drew on the focused neighbor' }
-        Has-Outline $leftEdge -Green
+        $outlines = Read-Outlines -Green
+        if ($outlines.Right) { throw 'Custom bell drew on the focused neighbor' }
+        $outlines.Left
     }
-    $null = Wait-Until 'custom outline expires with idle output' { !(Has-Outline $leftEdge -Green) }
+    $null = Wait-Until 'custom outline expires with idle output' {
+        $outlines = Read-Outlines -Green
+        if ($outlines.Right) { throw 'Custom outline appeared on the neighboring pane' }
+        $outlines -and !$outlines.Left
+    }
+    Wait-BellEvent $left $since
     Wait-Focus $right
 } finally {
     if (!$app.HasExited) {
