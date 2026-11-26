@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -688,6 +688,74 @@ function Test-ExplicitControlWindow {
         throw 'An explicit open against a closed window did not return the expected error'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'A closed-window request fell back to the original window' }
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlPaneView {
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'SSH starts as the foreground pane'
+    $invalid = & $Cli --pid $app.Id zoom-pane --pane "$($anchor.id)" --on | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $invalid.ok -or $invalid.error -cne 'Only split tabs can be zoomed') {
+        throw 'Zooming a single-pane tab did not fail cleanly'
+    }
+    Expect-Focus $origin $ssh.id 'A failed zoom leaves the foreground selection in place'
+
+    $focus = Control @('focus-pane','--pane',"$($moved.id)")
+    if (!$focus.active -or $focus.zoomed -or $focus.tab_id -ne $ssh.tab_id -or $focus.window_id -ne $ssh.window_id) {
+        throw 'Focus did not select the exact PowerShell pane'
+    }
+    Expect-Focus $origin $moved.id 'Keyboard input is routed to the focused PowerShell pane'
+    if ((Shell-State $moved.id 'cliFocusedShell' $origin) -ne $localIdentity) { throw 'Pane focus restarted PowerShell' }
+
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $zoomed = Control @('zoom-pane','--pane',"$($ssh.id)",'--on')
+        $visible = @((Control @('list')).sessions | Where-Object { $_.window_id -eq $ssh.window_id -and $_.visible })
+        if (!$zoomed.active -or !$zoomed.zoomed -or $visible.Count -ne 1 -or $visible[0].id -ne $ssh.id) {
+            throw 'Applying zoom on repeatedly failed to keep the requested SSH pane enlarged'
+        }
+    }
+    Type-In $origin 'origin-zoom/'
+    Expect-Text $ssh.id 'origin-zoom/'
+
+    $focus = Control @('focus-pane','--pane',"$($moved.id)")
+    $visible = @((Control @('list')).sessions | Where-Object { $_.window_id -eq $ssh.window_id -and $_.visible })
+    if (!$focus.active -or !$focus.zoomed -or $visible.Count -ne 1 -or $visible[0].id -ne $moved.id) {
+        throw 'Focusing a hidden sibling did not move the zoom to it'
+    }
+    $null = Control @('focus-pane','--pane',"$($anchor.id)")
+    Expect-Focus $origin $anchor.id 'A hidden tab can be selected by its pane ID'
+    $restored = Control @('zoom-pane','--pane',"$($ssh.id)",'--off')
+    if ($restored.active -or $restored.zoomed) { throw 'Unzoom selected a hidden tab or left it zoomed' }
+    Expect-Focus $origin $anchor.id 'Restoring a hidden split keeps the current tab selected'
+    $focus = Control @('focus-pane','--pane',"$($ssh.id)")
+    $visible = @((Control @('list')).sessions | Where-Object { $_.window_id -eq $ssh.window_id -and $_.visible })
+    if (!$focus.active -or $focus.zoomed -or $visible.Count -ne 2 -or $moved.id -notin $visible.id) {
+        throw 'Returning to the restored tab did not reveal both panes'
+    }
+
+    $child = Control @('open','--profile','Destination PowerShell','--new-window')
+    $hwnd = Wait-DetachedWindow $origin
+    $remote = Control @('split-pane','--pane',"$($child.pane)",'--profile','window-ssh','--axis','rows')
+    $zoomed = Control @('zoom-pane','--pane',"$($remote.pane)",'--on')
+    $visible = @((Control @('list')).sessions | Where-Object { $_.window_id -eq $child.window_id -and $_.visible })
+    if (!$zoomed.active -or !$zoomed.zoomed -or $zoomed.window_id -ne $child.window_id -or
+        $visible.Count -ne 1 -or $visible[0].id -ne $remote.pane -or $visible[0].active) {
+        throw 'The sibling window did not zoom locally in the background'
+    }
+    Expect-Text $remote.pane 'ready'
+    $null = Control @('send-text','--pane',"$($remote.pane)",'--no-paste','child-zoom/')
+    Expect-Text $remote.pane 'child-zoom/'
+    $focus = Control @('focus-pane','--pane',"$($child.pane)")
+    if (!$focus.active -or !$focus.zoomed -or $focus.window_id -ne $child.window_id) {
+        throw 'Window-local focus did not select the sibling PowerShell pane'
+    }
+    $restored = Control @('zoom-pane','--pane',"$($remote.pane)",'--off')
+    $visible = @((Control @('list')).sessions | Where-Object { $_.window_id -eq $child.window_id -and $_.visible })
+    if ($restored.active -or $restored.zoomed -or $visible.Count -ne 2) {
+        throw 'Restoring the sibling layout did not keep PowerShell selected and reveal SSH'
+    }
+    Expect-Focus $origin $ssh.id 'Selection and zoom in the sibling window preserve desktop focus'
+    Close-FixtureWindow $hwnd
     Close-FixtureWindow $origin
 }
 
@@ -1569,7 +1637,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -1577,6 +1645,7 @@ try {
             'CliProfiles' { Test-ControlProfileWindows }
             'CliSplit' { Test-ControlSplit }
             'CliMove' { Test-ControlMove }
+            'CliPaneView' { Test-ControlPaneView }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

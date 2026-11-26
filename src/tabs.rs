@@ -361,8 +361,12 @@ impl<T> Tabs<T> {
             .map(|g| &g.layout)
     }
     pub fn zoomed(&self) -> bool {
-        self.active_index()
-            .is_some_and(|index| self.groups[index].zoomed)
+        self.active_group.is_some_and(|id| self.group_zoomed(id))
+    }
+    pub fn group_zoomed(&self, id: TabId) -> bool {
+        self.groups
+            .iter()
+            .any(|group| group.id == id && group.zoomed)
     }
     pub fn visible(&self, entry: TabId) -> bool {
         self.active_group.is_some()
@@ -466,15 +470,19 @@ impl<T> Tabs<T> {
         true
     }
     pub fn toggle_zoom(&mut self) -> bool {
-        let Some(index) = self.active_index() else {
-            return false;
-        };
-        let group = &mut self.groups[index];
-        if matches!(group.layout, Layout::Leaf(_)) {
-            return false;
+        self.active_id()
+            .and_then(|entry| self.set_zoom(entry, !self.zoomed()))
+            .unwrap_or(false)
+    }
+
+    /// Set a pane's tab zoom without changing selection. Return whether the state changed.
+    pub fn set_zoom(&mut self, entry: TabId, zoomed: bool) -> Option<bool> {
+        let id = self.group_id(entry)?;
+        let group = self.groups.iter_mut().find(|group| group.id == id)?;
+        if zoomed && matches!(group.layout, Layout::Leaf(_)) {
+            return None;
         }
-        group.zoomed = !group.zoomed;
-        true
+        Some(std::mem::replace(&mut group.zoomed, zoomed) != zoomed)
     }
     pub fn set_ratio(&mut self, path: &[bool], ratio: f64) -> bool {
         let Some(index) = self.active_index() else {
@@ -1976,6 +1984,29 @@ mod tests {
         let reopened = tabs.reopen_pane(&location, "fresh local");
         assert_eq!(tabs.active_layout(), Some(&Layout::Leaf(reopened)));
         assert_eq!(tabs.layout_for(other), Some(&existing));
+    }
+
+    #[test]
+    fn setting_zoom_is_idempotent_and_does_not_select_the_target_tab() {
+        let mut tabs = Tabs::default();
+        let left = tabs.insert(1);
+        let right = tabs.split(left, 2, Axis::Columns).unwrap();
+        let group = tabs.group_id(right).unwrap();
+        let other = tabs.insert(3);
+        assert_eq!(tabs.set_zoom(left, true), Some(true));
+        assert_eq!(tabs.set_zoom(right, true), Some(false));
+        assert_eq!(tabs.active_id(), Some(other));
+        assert!(tabs.group_zoomed(group));
+        assert!(!tabs.zoomed());
+        assert!(tabs.select_index(0));
+        assert_eq!(tabs.active_id(), Some(right));
+        assert!(tabs.zoomed());
+        assert_eq!(tabs.set_zoom(left, false), Some(true));
+        assert_eq!(tabs.set_zoom(right, false), Some(false));
+        assert_eq!(tabs.active_id(), Some(right));
+        assert!(tabs.visible(left) && tabs.visible(right));
+        assert_eq!(tabs.set_zoom(other, true), None);
+        assert_eq!(tabs.set_zoom(other, false), Some(false));
     }
 
     #[test]
