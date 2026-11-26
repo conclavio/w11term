@@ -159,8 +159,7 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
             assert_eq!(text(frame), expected);
             Ok((400, 160))
         });
-        let screen = registry
-            .execute(Request::GetText { pane: 1 }, screenshot.clone())
+        let screen = Box::pin(registry.execute(Request::GetText { pane: 1 }, screenshot.clone()))
             .await
             .unwrap();
         assert!(screen["text"].as_str().unwrap().contains("old HUD"));
@@ -168,19 +167,33 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
         assert_eq!(screen["connection_generation"], 0);
         // The callback inspects the snapshot without writing a PNG. No
         // temporary directory or filesystem access is needed for this capture.
-        let image = registry
-            .execute(
-                Request::Screenshot {
-                    pane: 1,
-                    path: std::env::temp_dir().join("unused.png"),
-                },
-                screenshot.clone(),
-            )
-            .await
-            .unwrap();
+        let image = Box::pin(registry.execute(
+            Request::Screenshot {
+                pane: 1,
+                path: std::env::temp_dir().join("unused.png"),
+            },
+            screenshot.clone(),
+        ))
+        .await
+        .unwrap();
         assert_eq!(image["generation"], old.generation);
         // Keep the concurrent request dispatcher futures off the Windows test stack.
-        let wait = |pattern: &str, after_frame| {
+        let matched_path = std::env::temp_dir().join("matched.png");
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let saved = Arc::clone(&captured);
+        let expected_path = matched_path.clone();
+        let capture_match: CapturePng = Arc::new(move |frame, captured_size, path| {
+            assert_eq!(path, expected_path);
+            assert_eq!(captured_size, size);
+            *saved.lock().unwrap() = Some((frame.generation, text(frame)));
+            Ok((400, 160))
+        });
+        let wait = |pattern: &str, after_frame, screenshot_path: Option<_>| {
+            let capture_png = if screenshot_path.is_some() {
+                capture_match.clone()
+            } else {
+                screenshot.clone()
+            };
             Box::pin(registry.execute(
                 Request::WaitForText {
                     pane: 1,
@@ -188,26 +201,54 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
                     regex: false,
                     connection_generation: None,
                     after_frame: Some(after_frame),
+                    screenshot_path,
                     timeout_seconds: 1,
                 },
-                screenshot.clone(),
+                capture_png,
             ))
         };
-        let future_cursor = wait("HUD", old.generation + 1).await.unwrap_err();
+        let future_cursor = wait("HUD", old.generation + 1, None).await.unwrap_err();
         assert!(future_cursor.to_string().contains("ahead of this pane"));
-        let mut waiting = wait("new picture", old.generation);
-        let mut recurring = wait("HUD", old.generation);
+        let relative_path = wait("HUD", old.generation, Some("relative.png".into()))
+            .await
+            .unwrap_err();
+        assert!(relative_path.to_string().contains("path must be absolute"));
+        let mut waiting = wait("new picture", old.generation, Some(matched_path.clone()));
+        let mut recurring = wait("HUD", old.generation, None);
         assert_pending(waiting.as_mut()).await; // queues Command::Frames
         assert_pending(recurring.as_mut()).await;
         capture(&input).await; // FIFO barrier: the worker has replied to Frames
         assert_pending(waiting.as_mut()).await; // matcher has checked the held frame
         assert_pending(recurring.as_mut()).await; // HUD already appears in the held frame
         let done = feed(&input, "\x1b[?2026l").await;
-        let found = waiting.await.unwrap();
+        // Let the wait choose the committed match. The renderer then runs
+        // off-thread, while the terminal remains free to publish another frame.
+        let next = recurring.await.unwrap();
+        // Poll once to latch the frame. The blocking renderer can finish
+        // before the poll returns, so this poll need not return Pending.
+        let capture_reply = poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await;
+        let later = feed(&input, "\r\x1b[2Jlater frame").await;
+        assert!(later.generation > done.generation);
+        let found = match capture_reply {
+            Poll::Ready(result) => result,
+            Poll::Pending => waiting.await,
+        }
+        .unwrap();
         assert!(text(&done).contains("new HUD\nnew picture"));
         assert_eq!(done.generation, old.generation + 1);
         assert_eq!(found["generation"], done.generation);
-        assert_eq!(recurring.await.unwrap()["generation"], done.generation);
+        assert_eq!(
+            found["screenshot"],
+            serde_json::json!({
+                "path": matched_path, "width": 400, "height": 160
+            })
+        );
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some((done.generation, text(&done)))
+        );
+        assert_eq!(next["generation"], done.generation);
+        assert!(next.get("screenshot").is_none());
     })
     .await;
 }

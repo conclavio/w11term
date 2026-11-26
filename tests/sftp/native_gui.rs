@@ -2777,6 +2777,9 @@ async fn native_retry_ssh_now_skips_the_current_wait_and_keeps_pane_history() {
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
     drive_mixed_gui("retry-ssh-now-ui.ps1", &ssh, state.path());
+    let matched = image::open(state.path().join("matched.png"))
+        .expect("wait-for-text should save a decodable terminal PNG");
+    assert!(matched.width() > 0 && matched.height() > 0);
     assert_eq!(accepted.load(Ordering::Relaxed), 6);
     assert_eq!(channels.load(Ordering::Relaxed), 6);
     assert_eq!(

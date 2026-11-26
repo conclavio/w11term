@@ -122,10 +122,15 @@ try {
     if ($written.pane -ne $remote -or $written.connection_generation -ne $current -or $written.bytes_written -ne $marker.Length) {
         throw 'Scoped SSH write did not acknowledge the replacement generation'
     }
-    $match = Control @('wait-for-text','--pane',"$remote",'--connection-generation',"$current",'--after-frame',"$($screenBaseline.generation)",'--timeout','15',$marker)
+    $matchedImage = Join-Path $State 'matched.png'
+    $match = Control @('wait-for-text','--pane',"$remote",'--connection-generation',"$current",'--after-frame',"$($screenBaseline.generation)",'--timeout','15','--screenshot',$matchedImage,$marker)
     if ($match.pane -ne $remote -or $match.connection_generation -ne $current -or !$match.matched -or
         $match.generation -le $screenBaseline.generation) {
         throw 'The screen match did not report a newer frame from the replacement SSH generation'
+    }
+    if ($match.screenshot.path -ne $matchedImage -or $match.screenshot.width -le 0 -or
+        $match.screenshot.height -le 0 -or !(Test-Path -LiteralPath $matchedImage -PathType Leaf)) {
+        throw 'The screen match did not save its PNG'
     }
     Reject-Retry $palette.ssh_retry_token
     Wait-RetryAccepted $background.ssh_retry_token

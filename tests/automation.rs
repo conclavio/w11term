@@ -118,6 +118,7 @@ async fn scrollback_regex_is_case_configurable_and_reports_incomplete_results() 
                 regex: false,
                 connection_generation: None,
                 after_frame: None,
+                screenshot_path: None,
                 timeout_seconds: 5,
             },
             capture.clone(),
@@ -173,6 +174,7 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
                 regex,
                 connection_generation: None,
                 after_frame: None,
+                screenshot_path: None,
                 timeout_seconds: 1,
             },
             capture.clone(),
@@ -249,6 +251,7 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
                     regex: false,
                     connection_generation: None,
                     after_frame: None,
+                    screenshot_path: None,
                     timeout_seconds: 10,
                 },
             )

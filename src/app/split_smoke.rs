@@ -241,6 +241,7 @@ async fn check_split_control(
                 pane,
                 connection_generation: None,
                 after_frame: None,
+                screenshot_path: None,
                 pattern: marker.into(),
                 regex: false,
                 timeout_seconds: 5,

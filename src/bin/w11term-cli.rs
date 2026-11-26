@@ -1106,6 +1106,56 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_text_resolves_its_optional_screenshot_path() {
+        let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
+        let (_, request) = parse_args(&[
+            "wait-for-text",
+            "--pane",
+            "7",
+            "--screenshot",
+            "match.png",
+            "--",
+            "ready",
+        ])
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::WaitForText { screenshot_path: Some(path), .. }
+                if path == std::path::absolute("match.png").unwrap()
+        ));
+        let (_, text_only) = parse_args(&["wait-for-text", "--pane", "7", "ready"]).unwrap();
+        assert!(
+            serde_json::to_value(text_only)
+                .unwrap()
+                .get("screenshot_path")
+                .is_none()
+        );
+        for args in [
+            &["wait-for-text", "--pane", "7", "ready", "--screenshot"][..],
+            &[
+                "wait-for-text",
+                "--pane",
+                "7",
+                "--screenshot",
+                "a",
+                "--screenshot",
+                "b",
+                "ready",
+            ],
+            &[
+                "find-text",
+                "--pane",
+                "7",
+                "--screenshot",
+                "match.png",
+                "ready",
+            ],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn raw_bytes_and_required_options() {
         let p = |a: &[&str]| parse(a.iter().map(|s| s.to_string()));
         let (

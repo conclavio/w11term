@@ -92,6 +92,8 @@ pub enum Request {
         connection_generation: Option<std::num::NonZeroU64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after_frame: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screenshot_path: Option<PathBuf>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
@@ -730,7 +732,14 @@ impl Registry {
                 timeout_seconds,
                 connection_generation,
                 after_frame,
+                screenshot_path,
             } => {
+                ensure!(
+                    screenshot_path
+                        .as_ref()
+                        .is_none_or(|path| path.is_absolute()),
+                    "screenshot path must be absolute"
+                );
                 ensure!(
                     (1..=3600).contains(&timeout_seconds),
                     "wait timeout must be 1..=3600 seconds"
@@ -815,6 +824,15 @@ impl Registry {
                 });
                 if let Some(generation) = expected {
                     result["connection_generation"] = generation.into();
+                }
+                if let Some(path) = screenshot_path {
+                    let (_, capture_png) = self
+                        .capture_for(pane, capture_png)
+                        .context("matched text but the pane is no longer available for capture")?;
+                    let size = frame.size;
+                    result["screenshot"] = save_screenshot(capture_png, frame, size, path)
+                        .await
+                        .context("matched text but failed to save its screenshot")?;
                 }
                 Ok(result)
             }
@@ -1258,16 +1276,27 @@ impl Registry {
                 let (target, capture_png) = self.capture_for(pane, capture_png)?;
                 let (frame, size) = Self::capture(&target).await?;
                 let generation = frame.generation;
-                let saved_path = path.clone();
-                let (width, height) =
-                    tokio::task::spawn_blocking(move || capture_png(&frame, size, &path)).await??;
-                Ok(
-                    json!({"pane":pane,"generation":generation,"path":saved_path,"width":width,"height":height}),
-                )
+                let mut result = save_screenshot(capture_png, frame, size, path).await?;
+                result["pane"] = pane.into();
+                result["generation"] = generation.into();
+                Ok(result)
             }
         }
     }
 }
+async fn save_screenshot(
+    capture_png: CapturePng,
+    frame: impl std::borrow::Borrow<Snapshot> + Send + 'static,
+    size: TerminalSize,
+    path: PathBuf,
+) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        let (width, height) = capture_png(frame.borrow(), size, &path)?;
+        Ok(json!({"path": path, "width": width, "height": height}))
+    })
+    .await?
+}
+
 fn validate_grid(cols: usize, rows: usize) -> Result<()> {
     ensure!(
         (1..=1000).contains(&cols) && (1..=500).contains(&rows),

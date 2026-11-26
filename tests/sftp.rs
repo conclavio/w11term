@@ -2485,6 +2485,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
                 regex: false,
                 connection_generation: None,
                 after_frame: None,
+                screenshot_path: None,
                 timeout_seconds: 3,
             },
             capture.clone(),
