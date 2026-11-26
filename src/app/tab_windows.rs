@@ -249,11 +249,12 @@ pub(super) enum ChildLaunch {
     Profile {
         name: String,
         source: Box<Source>,
+        grid: Option<(usize, usize)>,
     },
     Group(host_groups::WindowGroup),
     Workspace {
         opening: Rc<crate::workspace_window::Opening>,
-        control: Option<Rc<workspace_view::ControlWindowOpen>>,
+        name: String,
     },
     Tab {
         layout: Box<workspace_view::PreparedTabLayout>,
@@ -264,6 +265,7 @@ pub(super) enum ChildLaunch {
 pub(super) struct ChildWindow {
     window: NewWindow,
     pub(super) launch: ChildLaunch,
+    pub(super) control: Option<Rc<WindowControlReply>>,
     claimed: Cell<bool>,
 }
 
@@ -279,6 +281,26 @@ impl Drop for ChildWindow {
         if !self.claimed.get() {
             let _ = self.window.registry.unregister();
         }
+    }
+}
+
+pub(super) type WindowReply = tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>;
+
+pub(super) struct WindowControlReply(RefCell<Option<WindowReply>>);
+
+impl WindowControlReply {
+    pub(super) fn finish(&self, result: Result<serde_json::Value, String>) {
+        if let Some(reply) = self.0.borrow_mut().take() {
+            let _ = reply.send(result);
+        }
+    }
+}
+
+impl Drop for WindowControlReply {
+    fn drop(&mut self) {
+        self.finish(Err(
+            "Terminal window closed before it could be registered".into()
+        ));
     }
 }
 
@@ -304,6 +326,27 @@ impl TerminalApp {
         launch: ChildLaunch,
         ctx: &ComponentContext<Self>,
     ) -> anyhow::Result<()> {
+        self.launch_child_window(launch, None, ctx)
+    }
+
+    pub(super) fn open_control_child_window(
+        &self,
+        launch: ChildLaunch,
+        reply: WindowReply,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let control = Rc::new(WindowControlReply(RefCell::new(Some(reply))));
+        if let Err(error) = self.launch_child_window(launch, Some(control.clone()), ctx) {
+            control.finish(Err(format!("{error:#}")));
+        }
+    }
+
+    fn launch_child_window(
+        &self,
+        launch: ChildLaunch,
+        control: Option<Rc<WindowControlReply>>,
+        ctx: &ComponentContext<Self>,
+    ) -> anyhow::Result<()> {
         let workspace = match &launch {
             ChildLaunch::Workspace { opening, .. } => Some(opening.key.clone()),
             _ => None,
@@ -316,6 +359,7 @@ impl TerminalApp {
             child: Some(Rc::new(ChildWindow {
                 window,
                 launch,
+                control,
                 claimed: Cell::new(false),
             })),
         };
@@ -501,7 +545,7 @@ impl TerminalApp {
                     if let Some(reopening) = self.reopening_tab_window.take() {
                         reopening.published();
                     }
-                    if let Some((control, result)) = self.workspace_open_reply.take() {
+                    if let Some((control, result)) = self.child_open_reply.take() {
                         control.finish(Ok(result));
                     }
                     if let Some(offer) = &self.incoming {
@@ -518,7 +562,7 @@ impl TerminalApp {
                 }
                 Err(error) => {
                     let error = format!("Registering window: {error}");
-                    if let Some((control, _)) = self.workspace_open_reply.take() {
+                    if let Some((control, _)) = self.child_open_reply.take() {
                         control.finish(Err(error.clone()));
                     }
                     self.window_error = Some(error);

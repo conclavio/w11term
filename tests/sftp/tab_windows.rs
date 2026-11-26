@@ -142,6 +142,12 @@ async fn native_cli_opens_a_saved_workspace_in_a_new_window_without_focus() {
     run("CliWorkspaceWindow", b"source-stays-focused/new-window/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "discovers saved profiles and opens SSH and PowerShell windows without taking focus"]
+async fn native_cli_discovers_and_opens_profiles_in_new_windows() {
+    run("CliProfiles", b"fresh-profile/source-profile/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -152,7 +158,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     let state = tempfile::tempdir().unwrap();
     let data = state.path().join("data");
     fs::create_dir(&data).unwrap();
-    if first_close == "ProfileWindow" {
+    if matches!(first_close, "ProfileWindow" | "CliProfiles") {
         fs::write(
             data.join("windows.json"),
             br#"{"Destination PowerShell":{"x":32,"y":40,"width":850,"height":600,"maximized":false,"cols":96,"rows":28}}"#,
@@ -161,15 +167,24 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     }
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
+    let grid_trace = remote.path().join("pty-grid-trace");
+    let mut profiles = json!({"profiles":{
+        "window-ssh": ssh,
+        "Destination PowerShell":{
+            "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]
+        }
+    }});
+    if first_close == "CliProfiles" {
+        fs::write(&grid_trace, []).unwrap();
+        profiles["profile_order"] = json!(["Destination PowerShell", "Fixture WSL", "window-ssh"]);
+        profiles["startup_profile"] = json!("Destination PowerShell");
+        profiles["pinned_profiles"] = json!(["window-ssh"]);
+        profiles["profiles"]["Fixture WSL"] =
+            json!({"backend":"local","executable":"wsl.exe","args":["--distribution","Fixture"]});
+    }
     fs::write(
         state.path().join("profiles.json"),
-        serde_json::to_vec(&json!({"profiles":{
-            "window-ssh": ssh,
-            "Destination PowerShell":{
-                "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]
-            }
-        }}))
-        .unwrap(),
+        serde_json::to_vec(&profiles).unwrap(),
     )
     .unwrap();
     let mut shortcuts = json!({"command_palette":"F7","focus_right":"F8","focus_left":"F9",
@@ -267,6 +282,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "CliWindows"
             | "CliWorkspace"
             | "CliWorkspaceWindow"
+            | "CliProfiles"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),
@@ -278,6 +294,12 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         expected_ssh,
         "SSH channel count"
     );
+    if first_close == "CliProfiles" {
+        let requests = fs::read_to_string(grid_trace).unwrap();
+        let requests: Vec<_> = requests.lines().collect();
+        assert_eq!(requests.len(), 2, "initial SSH PTY requests");
+        assert_eq!(requests[1], "88x27", "background launch's initial SSH PTY");
+    }
     assert_eq!(
         fs::read(trace).unwrap(),
         expected_wire,
