@@ -57,6 +57,10 @@ pub enum Request {
         pane: u64,
         exit_token: u64,
     },
+    StopSshAttempt {
+        pane: u64,
+        attempt_token: crate::events::PendingSshAttempt,
+    },
     WaitForText {
         pane: u64,
         pattern: String,
@@ -576,6 +580,17 @@ impl Registry {
                 events.restart_exited(&target.input, exit_token)?;
                 Ok(json!({"pane":pane,"exit_token":exit_token,"accepted":true}))
             }
+            Request::StopSshAttempt {
+                pane,
+                attempt_token,
+            } => {
+                let events = Self::pane_events(&self.pane(pane)?).await?;
+                ensure!(
+                    events.cancel_ssh_attempt(attempt_token),
+                    "SSH attempt is no longer pending in this pane"
+                );
+                Ok(json!({"pane":pane,"attempt_token":attempt_token,"accepted":true}))
+            }
             Request::Events {
                 pane,
                 since,
@@ -593,11 +608,14 @@ impl Registry {
                 let journal = events
                     .wait(since, Duration::from_secs(timeout_seconds))
                     .await;
-                let (restart_token, ssh_phase) = events.exit_snapshot();
+                let (restart_token, ssh_phase, ssh_attempt) = events.connection_snapshot();
                 let mut result =
                     json!({"pane":pane,"journal":journal,"restart_token":restart_token});
                 if let Some(phase) = ssh_phase {
                     result["ssh_connection"] = phase.as_json();
+                }
+                if let Some(attempt) = ssh_attempt {
+                    result["ssh_attempt_token"] = json!(attempt);
                 }
                 Ok(result)
             }
@@ -899,6 +917,7 @@ impl Registry {
                             frame,
                             restart_token,
                             ssh_phase,
+                            ssh_attempt,
                         }) => {
                             let mut session = json!({
                                 "title": frame.title,
@@ -911,6 +930,9 @@ impl Registry {
                             if let Some(phase) = ssh_phase {
                                 session["ssh_connection"] = phase.as_json();
                                 session["restart_token"] = json!(restart_token);
+                            }
+                            if let Some(attempt) = ssh_attempt {
+                                session["ssh_attempt_token"] = json!(attempt);
                             }
                             session
                         }

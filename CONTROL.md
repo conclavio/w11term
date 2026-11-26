@@ -640,6 +640,19 @@ The `reconnecting` journal event records the scheduled wait's `attempt`,
 values round up to whole seconds. When `will_retry` is false, the wait ends
 at the retry deadline and the client starts no further automatic attempt.
 
+While a direct SSH login or retry is pending, `list` and `events` also include
+`ssh_attempt_token` for its pane. The `ssh-attempt` journal event carries
+`attempt_token` and a `pending` flag whenever the token is offered or retired.
+Use the token with the same process ID and pane ID.
+
+```powershell
+& $ctl --pid 12345 stop-ssh-attempt --pane 2 --attempt-token 4
+```
+
+An accepted stop returns `pane`, `attempt_token`, and `accepted: true`. Wait
+for the pane's `stopped` phase or a `restart_token` before restarting it. A
+retired token returns an error. The pane, its history, and desktop focus stay in place.
+
 A command completion watch armed in the GUI adds one `command-finished` event to
 the originating pane. Its data is `{"exit_code":17}` for a reported status or
 `{"exit_code":null}` when the shell supplied none. Command lines and output stay

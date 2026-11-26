@@ -819,7 +819,7 @@ pub enum Action {
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
-    StopPending(TabId, Vec<reconnect::Attempt>),
+    StopPending(TabId, Vec<PendingPaneAttempt>),
     ConnectionNotice(TabId, connection_notice::Action),
     CloseEnded(TabId, close_ended::Action),
     Disconnect(TabId, disconnect::Action),

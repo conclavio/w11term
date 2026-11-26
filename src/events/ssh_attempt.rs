@@ -1,9 +1,20 @@
-use super::{Events, SshConnectionPhase};
-use std::sync::Arc;
+use super::{EventLinks, Events, SshConnectionPhase, State};
+use serde::{Deserialize, Serialize};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, MutexGuard},
+};
 use tokio::sync::{oneshot, watch};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingSshAttempt(u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PendingSshAttempt(NonZeroU64);
+
+impl From<NonZeroU64> for PendingSshAttempt {
+    fn from(id: NonZeroU64) -> Self {
+        Self(id)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SshAttemptOutcome {
@@ -49,7 +60,9 @@ impl Events {
         let mut state = self.state.lock().unwrap();
         let attempts = &mut state.ssh_attempts;
         attempts.next += 1;
-        let id = PendingSshAttempt(attempts.next);
+        let id = PendingSshAttempt(
+            NonZeroU64::new(attempts.next).expect("SSH attempt ID starts at one"),
+        );
         let (cancel, cancelled) = oneshot::channel();
         let (completion, _) = watch::channel(None);
         attempts.current = Some(ActiveAttempt {
@@ -57,6 +70,7 @@ impl Events {
             cancel,
             completion: completion.clone(),
         });
+        self.ssh_attempt_changed(state, id, true);
         (
             AttemptGuard {
                 events: self.clone(),
@@ -77,6 +91,25 @@ impl Events {
             .map(|attempt| attempt.id)
     }
 
+    pub(crate) fn connection_snapshot(
+        &self,
+    ) -> (
+        Option<u64>,
+        Option<SshConnectionPhase>,
+        Option<PendingSshAttempt>,
+    ) {
+        let state = self.state.lock().unwrap();
+        (
+            state.restart_token,
+            state.ssh_connection_phase.clone(),
+            state
+                .ssh_attempts
+                .current
+                .as_ref()
+                .map(|attempt| attempt.id),
+        )
+    }
+
     pub fn watch_ssh_attempt(&self, id: PendingSshAttempt) -> Option<SshAttemptCompletion> {
         let state = self.state.lock().unwrap();
         let attempt = state
@@ -90,7 +123,7 @@ impl Events {
     /// Only the exit of this attempt can be claimed for a report retry.
     pub fn failed_ssh_restart_token(&self, id: PendingSshAttempt) -> Option<u64> {
         let state = self.state.lock().unwrap();
-        if state.ssh_attempts.next == id.0
+        if state.ssh_attempts.next == id.0.get()
             && state.ssh_attempts.current.is_none()
             && matches!(
                 state.ssh_connection_phase,
@@ -113,12 +146,33 @@ impl Events {
     }
 
     fn take_ssh_attempt(&self, id: PendingSshAttempt) -> Option<ActiveAttempt> {
-        self.state
-            .lock()
-            .unwrap()
+        let mut state = self.state.lock().unwrap();
+        let attempt = state
             .ssh_attempts
             .current
-            .take_if(|attempt| attempt.id == id)
+            .take_if(|attempt| attempt.id == id)?;
+        self.ssh_attempt_changed(state, id, false);
+        Some(attempt)
+    }
+
+    fn ssh_attempt_changed(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        id: PendingSshAttempt,
+        pending: bool,
+    ) {
+        Self::append_locked(
+            &mut state,
+            "ssh-attempt",
+            serde_json::json!({"attempt_token": id, "pending": pending}),
+            EventLinks::default(),
+        );
+        let inbox = state.inbox.as_ref().map(|(_, _, inbox)| inbox.clone());
+        drop(state);
+        self.changed.notify_waiters();
+        if let Some(inbox) = inbox {
+            inbox.refresh();
+        }
     }
 }
 
@@ -151,6 +205,7 @@ mod tests {
         let events = Events::default();
         let (first, mut cancelled) = events.begin_ssh_attempt();
         let old = events.pending_ssh_attempt().unwrap();
+        assert_eq!(events.connection_snapshot().2, Some(old));
         let watching_first = events.watch_ssh_attempt(old).unwrap();
         assert!(events.cancel_ssh_attempt(old));
         assert_eq!(cancelled.try_recv(), Ok(()));
@@ -179,6 +234,22 @@ mod tests {
             Err(oneshot::error::TryRecvError::Closed)
         );
         assert_eq!(events.pending_ssh_attempt(), None);
+        assert_eq!(events.connection_snapshot().2, None);
+        let records: Vec<_> = events
+            .since(0)
+            .events
+            .into_iter()
+            .map(|event| (event.kind, event.data))
+            .collect();
+        assert_eq!(
+            records,
+            [(old, true), (old, false), (current, true), (current, false)].map(
+                |(attempt_token, pending)| (
+                    "ssh-attempt".into(),
+                    serde_json::json!({ "attempt_token": attempt_token, "pending": pending })
+                )
+            )
+        );
     }
 
     #[test]

@@ -103,6 +103,7 @@ pub enum CommandId {
     SharedFolders(Option<u64>),
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
+    StopSshAttempt(PendingPaneAttempt),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     LongCommands(Option<clipboard_paste::Origin>, bool),
     SavedCommand(
@@ -184,6 +185,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                         && (key == "save-scrollback".into()
                             || key == "copy-selection".into()
                             || key == "restart-exited".into()
+                            || key == "stop-ssh-attempt".into()
                             || key == "shared-folders".into()
                             || key == "local-forward".into()))
                 {
@@ -489,6 +491,14 @@ impl TerminalApp {
             chord: String::new(),
             enabled: exited.is_some(),
         });
+        if let Some(attempt) = self.tabs.active().and_then(AppTab::pending_pane_attempt) {
+            rows.push(Row {
+                id: CommandId::StopSshAttempt(attempt),
+                label: STOP_SSH_ATTEMPT.into(),
+                chord: String::new(),
+                enabled: true,
+            });
+        }
         rows.push(Row {
             id: CommandId::SaveScrollback(pane),
             label: text_export::SCROLLBACK_LABEL.into(),
@@ -869,6 +879,7 @@ impl TerminalApp {
             CommandId::SharedFolders(None) => return,
             CommandId::RestartExited(Some(exit)) => Message::RestartExited(exit),
             CommandId::RestartExited(None) => return,
+            CommandId::StopSshAttempt(attempt) => Message::StopSshAttempt(attempt),
             CommandId::SaveScrollback(pane) => {
                 Message::Export(text_export::Action::StartScrollback(pane))
             }

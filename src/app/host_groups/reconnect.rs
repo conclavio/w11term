@@ -1,11 +1,5 @@
 use super::*;
-use w11term::events::{PendingSshAttempt, SshAttemptOutcome, SshLoginResult};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Attempt {
-    pub(super) pane: u64,
-    pub(super) token: PendingSshAttempt,
-}
+use w11term::events::{SshAttemptOutcome, SshLoginResult};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedLogin {
@@ -59,13 +53,17 @@ impl HostGroup {
 }
 
 impl TerminalApp {
-    pub(super) fn pending_attempts(&self, page: &HostGroup, shown: &[&Target]) -> Vec<Attempt> {
+    pub(super) fn pending_attempts(
+        &self,
+        page: &HostGroup,
+        shown: &[&Target],
+    ) -> Vec<PendingPaneAttempt> {
         shown
             .iter()
             .filter(|target| !target.connected && page.selected.contains(&target.pane))
             .filter_map(|target| {
                 let session = self.direct_ssh_session(target.pane)?;
-                Some(Attempt {
+                Some(PendingPaneAttempt {
                     pane: target.pane,
                     token: session.events.pending_ssh_attempt()?,
                 })
@@ -73,7 +71,7 @@ impl TerminalApp {
             .collect()
     }
 
-    pub(super) fn stop_pending_host_group(&mut self, id: TabId, offered: &[Attempt]) {
+    pub(super) fn stop_pending_host_group(&mut self, id: TabId, offered: &[PendingPaneAttempt]) {
         if offered.is_empty() || self.host_group_command_target() != Some(id) {
             return;
         }
@@ -248,7 +246,7 @@ pub(super) fn selection_controls(
     id: TabId,
     page: &HostGroup,
     shown: &[&Target],
-    pending: Vec<Attempt>,
+    pending: Vec<PendingPaneAttempt>,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let visible_exit = shown.iter().any(|target| target.state.exit().is_some());

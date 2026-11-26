@@ -35,6 +35,7 @@ use windows_reactor::*;
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 const RESTART_EXITED_PANE: &str = "Restart exited pane";
+const STOP_SSH_ATTEMPT: &str = "Stop SSH attempt";
 const PIN_TAB: &str = "Pin tab";
 const UNPIN_TAB: &str = "Unpin tab";
 
@@ -433,6 +434,16 @@ impl AppTab {
         Some(ExitedPane {
             pane: live.session.pane_id,
             token: live.session.events.restart_token()?,
+        })
+    }
+
+    fn pending_pane_attempt(&self) -> Option<PendingPaneAttempt> {
+        let Page::Terminal(live) = &self.page else {
+            return None;
+        };
+        Some(PendingPaneAttempt {
+            pane: live.session.pane_id,
+            token: live.session.events.pending_ssh_attempt()?,
         })
     }
 
@@ -1020,6 +1031,7 @@ struct CaretMenuBinding {
     closed_group: Option<TabId>,
     closed_pane: Option<TabId>,
     exited: Option<ExitedPane>,
+    pending_ssh: Option<PendingPaneAttempt>,
     on_click: Callback<String>,
 }
 
@@ -1165,6 +1177,12 @@ pub struct ExitedPane {
     token: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingPaneAttempt {
+    pane: u64,
+    token: w11term::events::PendingSshAttempt,
+}
+
 pub enum Message {
     LocalForward(local_forwards::Action),
     ProfileForward(TabId, profile_forwards::Edit),
@@ -1172,6 +1190,7 @@ pub enum Message {
     FolderShare(folder_shares::Action),
     FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
+    StopSshAttempt(PendingPaneAttempt),
     Export(text_export::Action),
     Recording(recordings::Action),
     ClearScrollback(u64),
@@ -3636,6 +3655,7 @@ impl TerminalApp {
         recordings: recordings::Choices,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
+        let pending_ssh = self.tabs.active().and_then(AppTab::pending_pane_attempt);
         let paste = self.paste_origin();
         let group = self.tabs.active_group_id();
         let mut cached = self.caret_menu_binding.borrow_mut();
@@ -3660,6 +3680,7 @@ impl TerminalApp {
             && binding.arrangement == arrangement
             && binding.directory_split == directory_split
             && binding.exited == exited
+            && binding.pending_ssh == pending_ssh
         {
             return binding.on_click.clone();
         }
@@ -3716,6 +3737,7 @@ impl TerminalApp {
             }
             value if recordings::is_command(value) => recordings::invoke(recordings.target(value)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
+            STOP_SSH_ATTEMPT => pending_ssh.map_or(Message::ControlIdle, Message::StopSshAttempt),
             "Paste" => Message::Clipboard(clipboard_paste::Action::Start(paste, false)),
             "Paste raw (no bracketed paste)" => {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
@@ -3772,6 +3794,7 @@ impl TerminalApp {
             group,
             arrangement,
             exited,
+            pending_ssh,
             on_click: on_click.clone(),
         });
         on_click
@@ -4378,6 +4401,14 @@ impl TerminalApp {
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
             self.broadcast_menu(),
         ]);
+        if self
+            .tabs
+            .active()
+            .and_then(AppTab::pending_pane_attempt)
+            .is_some()
+        {
+            items.push(MenuItem::item("stop-ssh-attempt", STOP_SSH_ATTEMPT));
+        }
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
             items.push(MenuItem::item("files", "SFTP files"));
@@ -5379,6 +5410,16 @@ impl Component for TerminalApp {
                 if let Err(error) = self.restart_exited_pane(exit, None) {
                     self.window_error =
                         Some(format!("Could not restart pane {}: {error:#}", exit.pane));
+                }
+                self.refresh_open_commands();
+            }
+            Message::StopSshAttempt(attempt) => {
+                // An open flyout may still hold a token from a previous attempt.
+                if let Some(tab) = self.tabs.active()
+                    && tab.pending_pane_attempt() == Some(attempt)
+                    && let Page::Terminal(live) = &tab.page
+                {
+                    live.session.events.cancel_ssh_attempt(attempt.token);
                 }
                 self.refresh_open_commands();
             }

@@ -2640,6 +2640,32 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "stops initial and retrying SSH attempts from pane actions and the CLI"]
+async fn native_stop_ssh_attempt_preserves_the_pane_and_rejects_stale_tokens() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 5, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(remote.path().join("withhold-shell-reply"), []).unwrap();
+    fs::write(remote.path().join("keep-first-connection"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("stop-ssh-attempt-ui.ps1", &ssh, state.path());
+    assert_eq!(accepted.load(Ordering::Relaxed), 5);
+    assert_eq!(channels.load(Ordering::Relaxed), 5);
+    assert_eq!(fs::read(trace).unwrap(), b"before-retry/");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "previews read-only remote text through the native drawer in a live SSH and PowerShell split"]
 async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

@@ -327,11 +327,6 @@ impl Events {
         self.state.lock().unwrap().ssh_connection_phase.clone()
     }
 
-    pub(crate) fn exit_snapshot(&self) -> (Option<u64>, Option<SshConnectionPhase>) {
-        let state = self.state.lock().unwrap();
-        (state.restart_token, state.ssh_connection_phase.clone())
-    }
-
     pub(crate) fn set_ssh_connection_phase(&self, phase: SshConnectionPhase) {
         let mut state = self.state.lock().unwrap();
         let changed = Self::record_ssh_phase(&mut state, phase);
@@ -1186,7 +1181,10 @@ mod tests {
         assert!(events.restart_exited(&commands, 5).is_err());
         assert!(received.try_recv().is_err());
         events.pane_exited(6, Some(Stopped));
-        assert_eq!(events.exit_snapshot(), (None, Some(Disconnected)));
+        assert_eq!(
+            events.connection_snapshot(),
+            (None, Some(Disconnected), None)
+        );
     }
 
     #[test]
@@ -1194,18 +1192,18 @@ mod tests {
         use SshConnectionPhase::*;
         use serde_json::json;
         let events = Events::default();
-        assert_eq!(events.exit_snapshot(), (None, None));
+        assert_eq!(events.connection_snapshot(), (None, None, None));
         events.set_ssh_connection_phase(Connecting);
         events.set_ssh_connection_phase(Connecting);
         events.set_ssh_connection_phase(Reconnecting { attempt: Some(2) });
         events.pane_exited(7, Some(Stopped));
-        assert_eq!(events.exit_snapshot(), (Some(7), Some(Stopped)));
+        assert_eq!(events.connection_snapshot(), (Some(7), Some(Stopped), None));
 
         let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
         events.restart_exited(&commands, 7).unwrap();
         assert_eq!(
-            events.exit_snapshot(),
-            (None, Some(Reconnecting { attempt: None }))
+            events.connection_snapshot(),
+            (None, Some(Reconnecting { attempt: None }), None)
         );
         events.set_ssh_connection_phase(Connected);
         events.set_ssh_connection_phase(Disconnected);

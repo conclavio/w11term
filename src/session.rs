@@ -266,6 +266,7 @@ pub struct PaneDescription {
     pub(crate) frame: Arc<Snapshot>,
     pub(crate) restart_token: Option<u64>,
     pub(crate) ssh_phase: Option<SshConnectionPhase>,
+    pub(crate) ssh_attempt: Option<crate::events::PendingSshAttempt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1340,11 +1341,12 @@ async fn run(
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
                     Some(Command::DescribePane(reply)) => {
-                        let (restart_token, ssh_phase) = events.exit_snapshot();
+                        let (restart_token, ssh_phase, ssh_attempt) = events.connection_snapshot();
                         let _ = reply.send(PaneDescription {
                             frame: live_frames.load(),
                             restart_token,
                             ssh_phase,
+                            ssh_attempt,
                         });
                         Ok(())
                     }

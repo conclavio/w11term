@@ -53,6 +53,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "record"
             | "save-text"
             | "restart"
+            | "stop-ssh-attempt"
             | "list-commands"
             | "get-command"
             | "inspect"
