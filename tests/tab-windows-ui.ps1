@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -915,6 +915,68 @@ function Test-ControlPaneView {
     }
     Expect-Focus $origin $ssh.id 'Selection and zoom in the sibling window preserve desktop focus'
     Close-FixtureWindow $hwnd
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlMoveTab {
+    Expect-Focus $origin $ssh.id 'The original SSH pane has desktop focus before moving its tab' -PrepareWindow
+    Type-In $origin 'before-tab/'
+    Expect-Text $ssh.id 'before-tab/'
+    $other = Control @('open','--profile','Destination PowerShell','--new-window')
+    $otherWindow = Wait-DetachedWindow $origin
+    $null = Control @('zoom-pane','--pane',"$($moved.id)",'--on')
+    Expect-Focus $origin $moved.id 'PowerShell is the zoomed pane before transferring its tab'
+    $before = Control @('get-tab-layout','--pane',"$($moved.id)")
+    $tree = $before.layout | ConvertTo-Json -Depth 8 -Compress
+
+    $failed = & $Cli --pid $app.Id move-tab --pane "$($ssh.id)" --window "$($ssh.window_id)" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -cne 'Choose a different destination window') {
+        throw 'A move to the source window did not fail cleanly'
+    }
+    $move = Control @('move-tab','--pane',"$($ssh.id)",'--window',"$($other.window_id)")
+    if ($move.tab_id -ne $ssh.tab_id -or $move.window_id -ne $other.window_id -or $move.active -or
+        ($move.panes -join ',') -cne "$($ssh.id),$($moved.id)") { throw 'The tab moved without its exact pane IDs and order' }
+    $background = Control @('get-tab-layout','--pane',"$($ssh.id)")
+    if ($background.selected -or !$background.zoomed -or $background.focused_pane -ne $moved.id -or
+        ($background.layout | ConvertTo-Json -Depth 8 -Compress) -cne $tree -or
+        !(Control @('get-tab-layout','--pane',"$($other.pane)")).selected) {
+        throw 'The background move lost the layout or changed the destination selection'
+    }
+    Expect-Focus $origin $anchor.id 'The first move keeps desktop focus in the source window'
+    Expect-Text $ssh.id 'before-tab/'
+    $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','existing-tab/')
+    Expect-Text $ssh.id 'existing-tab/'
+
+    $back = Control @('move-tab','--pane',"$($moved.id)",'--window',"$($ssh.window_id)",'--activate')
+    if (!$back.active -or $back.window_id -ne $ssh.window_id -or $back.tab_id -ne $ssh.tab_id) {
+        throw 'The returning tab did not become selected in its destination'
+    }
+    Expect-Focus $origin $moved.id 'The returned tab keeps its remembered zoomed pane'
+    Close-FixtureWindow $otherWindow
+    $null = Wait-Until 'only the source window remains before opening another' {
+        @((Control @('list-windows')).windows).Count -eq 1
+    }
+    $move = Control @('move-tab','--pane',"$($moved.id)",'--new-window')
+    $newWindow = Wait-DetachedWindow $origin
+    $fresh = Control @('get-tab-layout','--pane',"$($moved.id)")
+    if (!$move.active -or $move.window_id -eq $ssh.window_id -or $move.tab_id -ne $ssh.tab_id -or
+        $fresh.window_id -ne $move.window_id -or !$fresh.selected -or !$fresh.zoomed -or
+        $fresh.focused_pane -ne $moved.id -or ($fresh.layout | ConvertTo-Json -Depth 8 -Compress) -cne $tree) {
+        throw 'Moving to a new window lost its layout, selection, or zoom'
+    }
+    Expect-Focus $origin $anchor.id 'The new tab window opens without stealing desktop focus'
+    Expect-Text $ssh.id 'existing-tab/'
+    $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','new-tab/')
+    Expect-Text $ssh.id 'new-tab/'
+    Send-Line $moved.id ('"same-shell=" + (("$PID/" + $global:WindowNonce) -ceq "' + $localIdentity + '")')
+    Expect-Text $moved.id 'same-shell=True'
+
+    $last = & $Cli --pid $app.Id move-tab --pane "$($ssh.id)" --window "$($ssh.window_id)" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $last.ok -or $last.error -cne 'Moving the last tab would close its window' -or
+        (Control @('get-tab-layout','--pane',"$($ssh.id)")).window_id -ne $move.window_id) {
+        throw 'A last-tab move changed the location or closed the source window'
+    }
+    Close-FixtureWindow $newWindow
     Close-FixtureWindow $origin
 }
 
@@ -1865,7 +1927,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -1877,6 +1939,7 @@ try {
             'CliLayout' { Test-ControlTabLayout }
             'CliResizeSplit' { Test-ControlResizeSplit }
             'CliSaveWorkspace' { Test-ControlSaveWorkspace }
+            'CliMoveTab' { Test-ControlMoveTab }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

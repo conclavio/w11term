@@ -5642,7 +5642,7 @@ impl Component for TerminalApp {
             });
         })
         .expect("installing terminal input adapter");
-        if child_control.is_some() {
+        if input.preserves_desktop_focus() {
             // WinUI can close a window shown without activation through its window API.
             let sender = context.sender();
             keyboard.on_close_request(move || sender.send(Message::CloseWindow));
@@ -6878,6 +6878,16 @@ impl Component for TerminalApp {
             }) => {
                 if !reply.is_closed() {
                     self.control_move_pane(pane, target_pane, direction, activate, reply, context);
+                }
+            }
+            Message::Control(w11term::control::UiRequest::MoveTab {
+                pane,
+                window_id,
+                activate,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    self.control_move_tab(pane, window_id, activate, reply, context);
                 }
             }
             Message::Control(w11term::control::UiRequest::SelectPaneView { pane, zoom, reply }) => {
@@ -8341,12 +8351,7 @@ impl Component for TerminalApp {
             WindowVisuals::new()
                 .client_size(self.client_size.0, self.client_size.1)
                 .theme(WindowTheme::Dark)
-                .preserve_focus_on_show(
-                    input
-                        .child
-                        .as_ref()
-                        .is_some_and(|child| child.control.is_some()),
-                )
+                .preserve_focus_on_show(input.preserves_desktop_focus())
                 .constraints(WindowConstraints {
                     min_width: Some(640.0_f64.min(self.client_size.0)),
                     min_height: Some(360.0_f64.min(self.client_size.1)),

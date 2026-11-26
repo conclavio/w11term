@@ -571,6 +571,7 @@ mod tests {
                 | UiRequest::Resize { reply, .. }
                 | UiRequest::ClosePane { reply, .. }
                 | UiRequest::SplitPane { reply, .. }
+                | UiRequest::MoveTab { reply, .. }
                 | UiRequest::SelectPaneView { reply, .. }
                 | UiRequest::GetTabLayout { reply, .. } => reply,
                 _ => unreachable!("unexpected window control request"),
@@ -806,6 +807,17 @@ mod tests {
         let (reply, layout) = oneshot::channel();
         one.post_pane_request(5, UiRequest::GetTabLayout { pane: 5, reply });
         let queued_layout = source_ui.try_recv().unwrap();
+        let (reply, moved_tab) = oneshot::channel();
+        one.post_pane_request(
+            5,
+            UiRequest::MoveTab {
+                pane: 5,
+                window_id: Some(3),
+                activate: false,
+                reply,
+            },
+        );
+        let queued_move_tab = source_ui.try_recv().unwrap();
         let transfer = one.begin_transfer(&[5]).unwrap();
         two.replace([pane]);
         one.replace([]);
@@ -815,11 +827,13 @@ mod tests {
         assert!(one.for_this_window(queued_split).is_none());
         assert!(one.for_this_window(queued_selection).is_none());
         assert!(one.for_this_window(queued_layout).is_none());
+        assert!(one.for_this_window(queued_move_tab).is_none());
         assert_eq!(received.await.unwrap().unwrap(), 2);
         assert_eq!(closed.await.unwrap().unwrap(), 2);
         assert_eq!(split.await.unwrap().unwrap(), 2);
         assert_eq!(selection.await.unwrap().unwrap(), 2);
         assert_eq!(layout.await.unwrap().unwrap(), 2);
+        assert_eq!(moved_tab.await.unwrap().unwrap(), 2);
     }
 
     #[tokio::test]

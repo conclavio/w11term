@@ -71,6 +71,17 @@ The destination keeps its selection and zoom by default. Use `--activate` to sel
 
 Direct pipe clients can send `{"verb":"move-pane","pane":42,"target_pane":57,"direction":"right"}`.
 
+`move-tab --pane ID --window ID` moves the entire tab containing the pane to an existing window of the same process. Use `--new-window` in place of `--window` to move it to a fresh window. The move preserves the tab ID, pane IDs, split geometry, remembered selection, zoom state, and live sessions. The source needs another tab so moving the requested one leaves its window open.
+
+An existing destination keeps its selection unless you pass `--activate`. A new window selects the moved tab. Both forms preserve desktop focus. The reply gives the destination `window_id`, `tab_id`, `panes` in layout order, and `active` for selection within the destination.
+
+```powershell
+& $ctl --pid 12345 move-tab --pane $pane --window 2
+& $ctl --pid 12345 move-tab --pane $pane --new-window
+```
+
+Direct pipe clients can send `{"verb":"move-tab","pane":42,"window_id":2}` or `{"verb":"move-tab","pane":42,"new_window":true}`.
+
 `focus-pane --pane ID` selects that pane and its tab in the owning window. If the tab is zoomed, the selected pane fills it. The command follows the pane across window moves and preserves desktop focus.
 
 `zoom-pane --pane ID --on` selects and enlarges the pane within its split tab. `--off` restores the target tab's split layout while keeping its selection and the window's current tab. Both settings can be applied repeatedly. Each reply includes `pane`, `window_id`, `tab_id`, `active` for selection within that window, and `zoomed` for the target tab's resulting state.

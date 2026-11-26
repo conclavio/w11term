@@ -139,6 +139,15 @@ pub enum Request {
         #[serde(default)]
         activate: bool,
     },
+    MoveTab {
+        pane: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_id: Option<WindowId>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        new_window: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        activate: bool,
+    },
     FocusPane {
         pane: u64,
     },
@@ -544,6 +553,12 @@ pub enum UiRequest {
         activate: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    MoveTab {
+        pane: u64,
+        window_id: Option<WindowId>,
+        activate: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     SelectPaneView {
         pane: u64,
         zoom: Option<bool>,
@@ -573,6 +588,7 @@ impl UiRequest {
             | Self::ClosePane { reply, .. }
             | Self::SplitPane { reply, .. }
             | Self::MovePane { reply, .. }
+            | Self::MoveTab { reply, .. }
             | Self::SelectPaneView { reply, .. }
             | Self::GetTabLayout { reply, .. }
             | Self::ResizeSplit { reply, .. }
@@ -618,6 +634,7 @@ impl UiRequest {
             | Self::ClosePane { pane, .. }
             | Self::SplitPane { pane, .. }
             | Self::MovePane { pane, .. }
+            | Self::MoveTab { pane, .. }
             | Self::SelectPaneView { pane, .. }
             | Self::GetTabLayout { pane, .. }
             | Self::ResizeSplit { pane, .. } => Some(*pane),
@@ -632,6 +649,7 @@ impl UiRequest {
             | Self::ClosePane { reply, .. }
             | Self::SplitPane { reply, .. }
             | Self::MovePane { reply, .. }
+            | Self::MoveTab { reply, .. }
             | Self::SelectPaneView { reply, .. }
             | Self::GetTabLayout { reply, .. }
             | Self::ResizeSplit { reply, .. }
@@ -847,6 +865,36 @@ impl Registry {
                 tokio::time::timeout(TIMEOUT + Duration::from_secs(2), response)
                     .await
                     .context("move-pane timed out; use list to check the pane's location")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::MoveTab {
+                pane,
+                window_id,
+                new_window,
+                activate,
+            } => {
+                ensure!(
+                    new_window != window_id.is_some(),
+                    "provide a destination window or request a new window"
+                );
+                ensure!(
+                    !new_window || !activate,
+                    "a new window already selects the moved tab"
+                );
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(
+                    pane,
+                    UiRequest::MoveTab {
+                        pane,
+                        window_id,
+                        activate,
+                        reply,
+                    },
+                );
+                tokio::time::timeout(TIMEOUT + Duration::from_secs(2), response)
+                    .await
+                    .context("move-tab timed out; use list to check the tab's location")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }

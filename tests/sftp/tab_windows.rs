@@ -188,6 +188,12 @@ async fn native_cli_saves_and_reopens_a_live_workspace() {
     run("CliSaveWorkspace", b"source-saved/restored-save/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "moves a zoomed SSH and PowerShell tab to existing and new windows while preserving its sessions and desktop focus"]
+async fn native_cli_moves_whole_live_tabs_across_windows() {
+    run("CliMoveTab", b"before-tab/existing-tab/new-tab/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
