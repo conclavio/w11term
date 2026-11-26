@@ -79,7 +79,17 @@ Each GUI owns `\\.\pipe\w11term-<pid>` and publishes `%LOCALAPPDATA%\w11term\ins
 
 The pipe accepts only the process's Windows user and SYSTEM, and rejects remote clients. Treat access as permission to type into that user's SSH and local sessions and save screenshots with that user's filesystem permissions. Discovery records are removed on normal exit; stale records from a crash are ignored when the pipe cannot be opened.
 
-Open a new pipe connection for each command. Write one UTF-8 JSON object followed by LF. Replies are UTF-8 JSON objects followed by LF. `follow-ssh-group-output` sends a sequence of replies on the same connection. Maximum request size is 2 MiB. The server allows eight ordinary requests and sixteen waits or followers concurrently. The initial read and each reply write time out after ten seconds. Input and snapshot requests have a ten-second execution timeout, and the CLI allows thirty seconds for a reply to accommodate rendering.
+Open a new pipe connection for each command. Write one UTF-8 JSON object followed
+by LF. Replies are UTF-8 JSON objects followed by LF. `follow-ssh-group-output`
+sends a sequence of replies on the same connection. Maximum request size is
+2 MiB. The server allows eight ordinary requests and sixteen waits or followers
+concurrently. The initial read and each reply write time out after ten seconds.
+Input and snapshot requests have a ten-second execution timeout, and the CLI
+allows thirty seconds for a reply to accommodate rendering.
+
+Keep the connection open while waiting for replies. Disconnecting cancels a
+pending wait or output follower and releases its slot. A screenshot write that
+already started after a text match can still finish.
 
 ```json
 {"verb":"list"}
@@ -609,7 +619,8 @@ size, and can match across LF-separated rows. It does not search scrollback or O
 images. Timeout defaults to 30 seconds, range 1–3600; no match is a JSON error.
 Success returns `pane`, `matched`, `generation`, `cols`, `rows`, and matching screen
 `text`. It observes screen state, not every transient byte that may have appeared
-between snapshots.
+between snapshots. Closing the target pane ends a pending text wait with
+an error.
 
 Pass `--screenshot PATH` to save the exact matched frame as a PNG, even if the
 pane has already repainted. The reply includes `screenshot` with the absolute
@@ -700,7 +711,7 @@ the reply has an empty `journal.events` array. An unread history gap returns
 
 The cursor always follows the full pane journal and advances past skipped
 events. Keep separate cursors if you also need to read those skipped kinds.
-Unfiltered calls keep their existing behavior.
+Closing the target pane ends a pending event wait with an error.
 
 For SSH panes the reply also includes `ssh_connection`, an object with a
 `phase` of `queued`, `connecting`, `connected`, `reconnecting`, `disconnected`,

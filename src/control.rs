@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    future::Future,
     num::NonZeroUsize,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
@@ -16,7 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer},
     sync::{mpsc, oneshot},
 };
@@ -732,14 +733,19 @@ impl Registry {
                     timeout_seconds <= 3600,
                     "events timeout must be 0..=3600 seconds"
                 );
-                let events = Self::pane_events(&self.pane(pane)?).await?;
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
                 ensure!(
                     since <= events.cursor(),
                     "event cursor is ahead of this pane; check the instance/pane identity"
                 );
-                let journal = events
-                    .wait_kind(since, Duration::from_secs(timeout_seconds), kind.as_deref())
-                    .await;
+                let wait =
+                    events.wait_kind(since, Duration::from_secs(timeout_seconds), kind.as_deref());
+                let journal = tokio::select! {
+                    biased;
+                    journal = wait => journal,
+                    _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                };
                 let connection = events.connection_snapshot();
                 let mut result =
                     json!({"pane":pane,"journal":journal,"restart_token":connection.restart_token});
@@ -841,7 +847,11 @@ impl Registry {
                     ensure!(events.terminal_connection_is(generation), STALE);
                     result
                 } else {
-                    wait.await?
+                    tokio::select! {
+                        biased;
+                        result = wait => result?,
+                        _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                    }
                 };
                 let mut result = json!({
                     "pane": pane,
@@ -1496,7 +1506,7 @@ async fn serve(
     } else {
         match serde_json::from_slice::<Request>(&line) {
             Ok(r) => {
-                let pool = if matches!(
+                let is_wait = matches!(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitSshConnected { .. }
@@ -1511,11 +1521,8 @@ async fn serve(
                             timeout_seconds: 1..,
                             ..
                         }
-                ) {
-                    waits
-                } else {
-                    commands
-                };
+                );
+                let pool = if is_wait { waits } else { commands };
                 match pool.try_acquire_owned() {
                     Ok(_permit) => match r {
                         Request::FollowSshGroupOutput {
@@ -1526,19 +1533,29 @@ async fn serve(
                             after_line,
                             timeout_seconds,
                         } => {
-                            return registry
-                                .follow_ssh_group_output(
-                                    &mut pipe,
-                                    ssh_groups::GroupOutputFollow {
-                                        window: window_id,
-                                        tab: tab_id,
-                                        run: run_id,
-                                        pane,
-                                        after_line,
-                                        timeout_seconds,
-                                    },
-                                )
-                                .await;
+                            let (mut reader, mut writer) = tokio::io::split(&mut pipe);
+                            let follow = registry.follow_ssh_group_output(
+                                &mut writer,
+                                ssh_groups::GroupOutputFollow {
+                                    window: window_id,
+                                    tab: tab_id,
+                                    run: run_id,
+                                    pane,
+                                    after_line,
+                                    timeout_seconds,
+                                },
+                            );
+                            return while_client_waits(&mut reader, follow)
+                                .await
+                                .unwrap_or(Ok(()));
+                        }
+                        request if is_wait => {
+                            let execution = registry.execute(request, capture_png);
+                            let Some(result) = while_client_waits(&mut pipe, execution).await
+                            else {
+                                return Ok(());
+                            };
+                            result
                         }
                         request => registry.execute(request, capture_png).await,
                     },
@@ -1552,7 +1569,21 @@ async fn serve(
     };
     write_reply(&mut pipe, result).await
 }
-async fn write_reply(pipe: &mut NamedPipeServer, result: Result<Value>) -> Result<()> {
+async fn while_client_waits<T>(
+    reader: &mut (impl AsyncRead + Unpin),
+    wait: impl Future<Output = T>,
+) -> Option<T> {
+    // A valid client sends one request and then reads replies. Any further
+    // input, including a broken pipe or EOF, ends its pending wait.
+    let mut probe = [0];
+    tokio::select! {
+        biased;
+        _ = reader.read(&mut probe) => None,
+        result = wait => Some(result),
+    }
+}
+
+async fn write_reply(pipe: &mut (impl AsyncWrite + Unpin), result: Result<Value>) -> Result<()> {
     let mut bytes = serde_json::to_vec(&Reply::from_result(result))?;
     bytes.push(b'\n');
     tokio::time::timeout(TIMEOUT, pipe.write_all(&bytes)).await??;
