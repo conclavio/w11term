@@ -95,6 +95,8 @@ Turn on **Use wildcards** for a list such as `web-[01][0-9], db-??, !*-canary`. 
 
 The command bar above the host filter shows how many selected, visible hosts are ready. The Send button shows the recipient count, and its adjacent **Send options** menu offers recording and alerts. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
 
+Expand **Dispatch settings** to configure readiness, parallelism, pacing, expiry, and canary behavior. The collapsed header shows the active non-default settings. The adjacent **Preview send order** button shows how the current draft would run.
+
 Turn on **Require all recipients ready** to wait for every visible, checked host to have a verified prompt before **Send** or **Send and record** becomes available. Choose when to send once they are ready. The app checks every prompt again before dispatch, and each pane reports its own delivery outcome.
 
 Set **Parallel SSH commands** to run a submission in batches. The default is **Unlimited**. With a limit, the results show queued hosts and the next host gets a slot when an earlier command settles. A queued command still needs the original verified prompt. **Cancel queued commands** withholds the remaining sends while active commands continue.

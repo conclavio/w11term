@@ -218,27 +218,33 @@ function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$St
         }
     }
 }
-function Get-SftpOptionsExpander {
-    $name = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty, 'File options')
+function Get-NativeExpander([string]$Name) {
+    $label = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
     $expandable = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty, $true)
-    $query = [System.Windows.Automation.AndCondition]::new($name, $expandable)
+    $query = [System.Windows.Automation.AndCondition]::new($label, $expandable)
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $query)
     if ($element -and $element.Current.IsEnabled) {
         $element.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
     }
 }
-function Set-SftpOptionsExpansion([bool]$Expanded) {
+function Set-NativeExpansion([string]$Name, [bool]$Expanded) {
     $expected = if ($Expanded) { 'Expanded' } else { 'Collapsed' }
-    $null = Wait-Until "File options is $expected" {
-        $options = Get-SftpOptionsExpander
+    $null = Wait-Until "'$Name' is $expected" {
+        $options = Get-NativeExpander $Name
         if (!$options) { return }
         $state = $options.Current.ExpandCollapseState
         if ($state -eq $expected) { return $true }
         if ($Expanded) { $options.Expand() } else { $options.Collapse() }
     }
+}
+function Get-SftpOptionsExpander {
+    Get-NativeExpander 'File options'
+}
+function Set-SftpOptionsExpansion([bool]$Expanded) {
+    Set-NativeExpansion 'File options' $Expanded
 }
 function Enable-SftpFileOption([string]$Name) {
     Set-SftpOptionsExpansion $true

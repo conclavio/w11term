@@ -1336,7 +1336,10 @@ try {
     Outcome $westName "Not sent${dot}Prompt unverified"
     $requireReady = 'Require all recipients ready'
     $sendRecordedOption = 'Send and record' + [char]0x2026
+    Set-NativeExpansion 'Dispatch settings' $true
     (Wait-CheckBox $requireReady Off).Toggle()
+    $null = Wait-CheckBox $requireReady On
+    Set-NativeExpansion 'Dispatch settings' $false
     (Command-Editor).SetValue('after-reconnect')
     $null = Wait-Until 'send waits for the unverified checked host' {
         $send = Find-Element 'Send to 2 hosts' $button
@@ -1371,7 +1374,10 @@ try {
         Find-Element "Pane $west${dot}Last command${dot}Exit 17${dot}west-accepted after-reconnect"
     }
     (Wait-CheckBox $showLastOutput On).Toggle()
+    Set-NativeExpansion 'Dispatch settings' $true
     (Wait-CheckBox $requireReady On).Toggle()
+    $null = Wait-CheckBox $requireReady Off
+    Set-NativeExpansion 'Dispatch settings' $false
     $null = Wait-Until 'finished results cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled

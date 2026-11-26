@@ -229,6 +229,7 @@ try {
     $allReady = 'Require all recipients ready'
     Roster-Choice 'Tab order'
     Roster-Choice 'Host label' -Choose
+    Set-NativeExpansion 'Dispatch settings' $true
     Roster-Choice 'Unlimited' -ControlName 'Parallel SSH commands'
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands' -Choose
     Roster-Choice 'No delay' -ControlName 'Time between sends'
@@ -240,6 +241,7 @@ try {
     (Wait-CheckBox $allReady Off).Toggle()
     (Wait-CheckBox $showOutput Off).Toggle()
     $null = Wait-CheckBox $allReady On
+    Set-NativeExpansion 'Dispatch settings' $false
     $null = Wait-CheckBox $showOutput On
     Click $saveDefaults
     $null = Wait-Until 'the defaults are saved for Fleet' {
@@ -252,6 +254,7 @@ try {
     }
     (Wait-CheckBox $showOutput On).Toggle()
     $null = Wait-CheckBox $showOutput Off
+    Set-NativeExpansion 'Dispatch settings' $true
     Roster-Choice '10 seconds' -ControlName 'Time between sends' -Choose
     Close-GroupWindow
     Launch-Window
@@ -259,11 +262,16 @@ try {
     Click "Open SSH group${dot}Fleet"
     $null = Wait-Until 'reopened Fleet with its own roster defaults' { Find-Element 'Opened 2 SSH panes for Fleet' }
     Roster-Choice 'Host label'
+    $null = Wait-Until 'the closed dispatch panel shows all saved non-default policies' {
+        Find-Element "2 at a time${dot}2s between sends${dot}Expires after 15s${dot}Stop on failure${dot}All recipients must be ready" -Visible
+    }
+    Set-NativeExpansion 'Dispatch settings' $true
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands'
     Roster-Choice '2 seconds' -ControlName 'Time between sends'
     Roster-Choice '15 seconds' -ControlName 'Expire unsent commands'
     $null = Wait-CheckBox 'Stop queue on failure' On
     $null = Wait-CheckBox $allReady On
+    Set-NativeExpansion 'Dispatch settings' $false
     $null = Wait-CheckBox $showOutput On
     $null = Wait-Until 'the loaded preferences match the saved defaults' {
         $save = Find-Element $saveDefaults $button

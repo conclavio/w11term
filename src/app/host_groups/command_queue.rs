@@ -221,37 +221,43 @@ pub(super) fn canary_picker(
     {
         hosts.push((Some(pane), format!("Canary unavailable · Pane {pane}")));
     }
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(8.0)
-        .children((
-            TextBlock::new()
-                .vertical_alignment(VerticalAlignment::Center)
-                .text("Canary host"),
-            ComboBox::new()
-                .automation_name("Canary host")
-                .max_width(248.0)
-                .is_enabled(
-                    !page.recorded_send.pending() && (page.canary.is_some() || targets.len() > 1),
-                )
-                .items_source(hosts.iter().map(|(_, label)| label.as_str()))
-                .selected_index(hosts.iter().position(|(pane, _)| *pane == page.canary))
-                .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                    index
-                        .and_then(|index| hosts.get(index))
-                        .map_or(Message::ControlIdle, |&(pane, _)| {
-                            Message::HostGroup(super::Action::CommandCanary(id, pane))
-                        })
-                })),
-            CheckBox::new()
-                .automation_name("Notify when canary finishes")
-                .is_checked(page.canary.is_some() && page.notify_canary)
-                .is_enabled(page.canary.is_some() && !page.recorded_send.pending())
-                .on_is_checked_changed(ctx.callback(move |enabled| {
-                    Message::HostGroup(super::Action::NotifyCanary(id, enabled))
-                }))
-                .content("Notify when canary finishes"),
-        ))
+    StackPanel::new().spacing(4.0).children((
+        Grid::new()
+            .columns([GridLength::Auto, GridLength::STAR])
+            .column_spacing(8.0)
+            .children((
+                TextBlock::new()
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text("Canary host"),
+                ComboBox::new()
+                    .grid_column(1)
+                    .min_width(0.0)
+                    .max_width(248.0)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name("Canary host")
+                    .is_enabled(
+                        !page.recorded_send.pending()
+                            && (page.canary.is_some() || targets.len() > 1),
+                    )
+                    .items_source(hosts.iter().map(|(_, label)| label.as_str()))
+                    .selected_index(hosts.iter().position(|(pane, _)| *pane == page.canary))
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index
+                            .and_then(|index| hosts.get(index))
+                            .map_or(Message::ControlIdle, |&(pane, _)| {
+                                Message::HostGroup(super::Action::CommandCanary(id, pane))
+                            })
+                    })),
+            )),
+        CheckBox::new()
+            .automation_name("Notify when canary finishes")
+            .is_checked(page.canary.is_some() && page.notify_canary)
+            .is_enabled(page.canary.is_some() && !page.recorded_send.pending())
+            .on_is_checked_changed(ctx.callback(move |enabled| {
+                Message::HostGroup(super::Action::NotifyCanary(id, enabled))
+            }))
+            .content("Notify when canary finishes"),
+    ))
 }
 
 pub(super) struct Waiting(Option<GroupTranscriptHost>);

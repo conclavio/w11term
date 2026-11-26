@@ -23,6 +23,7 @@ mod connection_notice;
 mod control_api;
 mod disconnect;
 mod dispatch_policy;
+mod dispatch_settings;
 mod environment;
 mod filter;
 mod host_list_export;
@@ -75,6 +76,7 @@ pub(super) struct HostGroup {
     ready_waiters: Vec<control_api::ReadinessWait>,
     filter: filter::Filter,
     roster_preferences: SshRosterDefaults,
+    dispatch_settings_open: bool,
     login_queue: Option<(usize, Arc<Semaphore>)>,
     roster_copy_feedback: String,
     draft: String,
@@ -791,6 +793,7 @@ pub enum Action {
     ShowLastOutput(TabId, bool),
     ShowTerminalLine(TabId, bool),
     RequireAllReady(TabId, bool),
+    ShowDispatchSettings(TabId, bool),
     CopyRoster(TabId, BTreeSet<u64>),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
@@ -1492,6 +1495,11 @@ impl TerminalApp {
             Action::ShowTerminalLine(id, show) => {
                 if let Some(page) = self.host_group_mut(id) {
                     page.roster_preferences.show_terminal_line = show;
+                }
+            }
+            Action::ShowDispatchSettings(id, open) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.dispatch_settings_open = open;
                 }
             }
             Action::RequireAllReady(id, require) => {
@@ -2411,12 +2419,7 @@ impl TerminalApp {
                 StackPanel::new().spacing(10.0).keyed_children(details),
             )
         };
-        let preview = command_order::button(
-            id,
-            page.preview_command_order,
-            !offer.targets.is_empty(),
-            ctx,
-        );
+        let dispatch = self.dispatch_settings(id, page, &offer, &selected, ctx);
         let hidden_selection = if hidden_count == 0 {
             View::empty()
         } else {
@@ -2446,54 +2449,11 @@ impl TerminalApp {
                 self.saved_host_group_toolbar(id, page, ctx),
                 StackPanel::new().grid_row(2).spacing(7.0).children((
                     command_toolbar::composer(id, page, offer, send_label, enabled, ctx),
-                    Grid::new()
-                        .column_spacing(12.0)
-                        .columns([GridLength::STAR, GridLength::Auto])
-                        .children((
-                            TextBlock::new()
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text(instructions)
-                                .text_wrapping(TextWrapping::Wrap),
-                            CheckBox::new()
-                                .grid_column(1)
-                                .automation_name(REQUIRE_READY)
-                                .is_checked(page.roster_preferences.require_all_ready)
-                                .is_enabled(!page.recorded_send.pending())
-                                .on_is_checked_changed(ctx.callback(move |require| {
-                                    Message::HostGroup(Action::RequireAllReady(id, require))
-                                }))
-                                .content(REQUIRE_READY),
-                        )),
+                    TextBlock::new()
+                        .text(instructions)
+                        .text_wrapping(TextWrapping::Wrap),
                     hidden_selection,
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(12.0)
-                        .children((
-                            parallel_limit::picker(
-                                "Parallel SSH commands",
-                                page.roster_preferences.command_limit,
-                                !page.recorded_send.pending(),
-                                move |limit| Message::HostGroup(Action::CommandLimit(id, limit)),
-                                ctx,
-                            ),
-                            CheckBox::new()
-                                .automation_name("Stop queue on failure")
-                                .is_checked(page.roster_preferences.stop_command_queue_on_failure)
-                                .is_enabled(!page.recorded_send.pending() && page.orders_commands())
-                                .on_is_checked_changed(ctx.callback(move |stop| {
-                                    Message::HostGroup(Action::StopCommandQueueOnFailure(id, stop))
-                                }))
-                                .content("Stop queue on failure"),
-                            preview,
-                        )),
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(12.0)
-                        .children((
-                            command_queue::interval_picker(id, page, ctx),
-                            command_queue::expiry_picker(id, page, ctx),
-                        )),
-                    command_queue::canary_picker(id, page, &selected, ctx),
+                    dispatch,
                     page.command_save.view(id, ctx),
                     page.recorded_send.feedback(),
                     page.alerted_send.feedback(),

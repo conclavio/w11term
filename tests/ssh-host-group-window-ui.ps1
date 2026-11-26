@@ -64,6 +64,10 @@ try {
         $null = Wait-CheckBox "$($pane.label)${dot}test@127.0.0.1:${port}${dot}Pane $($pane.id)" On
         $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','ready')
     }
+    $null = Wait-Until 'the child shows its saved readiness setting when collapsed' {
+        Find-Element 'All recipients must be ready' -Visible
+    }
+    Set-NativeExpansion 'Dispatch settings' $true
     $null = Wait-Until 'the child roster uses the saved readiness default' {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($childHwnd)
         $name = [System.Windows.Automation.PropertyCondition]::new(
