@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -23,15 +23,18 @@ public static class TabFixtureWindows {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    public static string Title(IntPtr hwnd) {
+        var title = new StringBuilder(512);
+        GetWindowText(hwnd, title, title.Capacity);
+        return title.ToString();
+    }
     public static IntPtr[] OwnedBy(int expected) {
         var found = new List<IntPtr>();
         EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
             uint owner;
             GetWindowThreadProcessId(hwnd, out owner);
             if (owner != expected || !IsWindowVisible(hwnd) || GetWindow(hwnd, 4) != IntPtr.Zero) return true;
-            var title = new StringBuilder(256);
-            GetWindowText(hwnd, title, title.Capacity);
-            if (title.ToString().StartsWith("w11term", StringComparison.OrdinalIgnoreCase)) found.Add(hwnd);
+            if (Title(hwnd).StartsWith("w11term", StringComparison.OrdinalIgnoreCase)) found.Add(hwnd);
             return true;
         }, IntPtr.Zero);
         return found.ToArray();
@@ -534,6 +537,70 @@ try {
         Expect-Focus $origin $anchor.id 'Source stays focused when the sibling result is removed'
         Close-FixtureWindow $destination
         $null = Wait-Until 'the sibling HWND closes' { [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $destination }
+        $last = $origin
+    } elseif ($FirstClose -eq 'WindowName') {
+        $separator = " $([char]0xb7) "
+        $name = 'Production Fleet'
+        $rename = 'Rename window' + [char]0x2026
+        $defaultTitle = "w11term${separator}Cockpit tools"
+        Run-WindowCommand $destination $rename
+        $field = Wait-Until 'window name editor' { Find-Here $destination 'Window name' }
+        $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
+        $field.GetCurrentPattern($valuePattern).SetValue($name)
+        Invoke-Button (Wait-Until 'enabled Save for window name' {
+            $button = Find-Here $destination 'Save'
+            if ($button -and $button.Current.IsEnabled) { $button }
+        })
+        $null = Wait-Until 'native window title includes name and active tab' {
+            [TabFixtureWindows]::Title($destination) -ceq "w11term${separator}${name}${separator}Cockpit tools"
+        }
+        if ([TabFixtureWindows]::Title($origin) -cne "w11term${separator}Source PowerShell") {
+            throw 'Renaming the detached window changed the source window title'
+        }
+        $tabResult = "Cockpit tools    Window ${newOwner}${separator}${name}${separator}Tab 1"
+        Open-TabSearch $origin 'fleet cockpit' $tabResult
+        $window = $origin
+        Press-Key 27
+        $null = Wait-Until 'tab search closes before finding a pane by window name' {
+            !(Find-Here $origin 'Search tabs')
+        }
+        Press-Key 0x75 # F6, fixture Find pane shortcut
+        $search = Wait-PickerEditor 'Find pane' 'search by window name'
+        $search.GetCurrentPattern($valuePattern).SetValue('production fleet')
+        $null = Wait-Until 'both live panes match the window name' {
+            $rows = @(Get-PickerRows)
+            $matching = @($rows | Where-Object { $_.Contains("Window ${newOwner}${separator}${name}") })
+            $rows.Count -eq 2 -and $matching.Count -eq 2
+        }
+        Press-Key 13
+        Expect-Focus $destination $ssh.id 'A named pane result focuses the original live SSH channel'
+
+        Use-Window $origin
+        $window = $origin
+        Press-Key 0x76 # F7, fixture command palette
+        $search = Wait-PickerEditor 'Search commands' 'the named move destination'
+        $search.GetCurrentPattern($valuePattern).SetValue($name)
+        $null = Wait-Until 'the move command shows the named destination and active tab' {
+            $entry = Find-Here $origin "Move tab to existing window ${newOwner}${separator}${name}${separator}Cockpit tools"
+            $entry -and $entry.Current.IsEnabled
+        }
+        Press-Key 27
+        $null = Wait-Until 'the move destination preview closes' { !(Find-Here $origin 'Search commands') }
+
+        Run-WindowCommand $destination $rename
+        $field = Wait-Until 'existing window name loads in the editor' {
+            $entry = Find-Here $destination 'Window name'
+            if ($entry -and $entry.GetCurrentPattern($valuePattern).Current.Value -ceq $name) { $entry }
+        }
+        Invoke-Button (Wait-Until 'Use default window name' { Find-Here $destination 'Use default' })
+        $null = Wait-Until 'native title returns to the active tab title' {
+            [TabFixtureWindows]::Title($destination) -ceq $defaultTitle
+        }
+        Open-TabSearch $origin "Window $newOwner cockpit" "Cockpit tools    Window ${newOwner}${separator}Tab 1"
+        $window = $origin
+        Press-Key 13
+        Expect-Focus $destination $ssh.id 'Clearing the name preserves numeric window routing'
+        Close-FixtureWindow $destination
         $last = $origin
     } elseif ($FirstClose -eq 'Search') {
         $join = [char]0x00b7

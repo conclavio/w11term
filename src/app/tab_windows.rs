@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use w11term::options::Options;
+use w11term::tabs::TabTitle;
 use w11term::{control::PaneTransfer, tabs::DetachedPane};
 use windows::Win32::{
     Foundation::HWND,
@@ -21,13 +22,28 @@ pub(super) fn menu_window(label: &str) -> Option<u64> {
     id.parse().ok().filter(|id| *id != 0)
 }
 
+pub(super) fn window_label(window: u64, name: Option<&TabTitle>) -> String {
+    match name {
+        Some(name) => format!("{WINDOW_LABEL}{window} · {}", name.as_str()),
+        None => format!("{WINDOW_LABEL}{window}"),
+    }
+}
+
 struct WindowEndpoint {
     hwnd: HWND,
     sender: LocalSender<Message>,
     outgoing: Weak<Transfer>,
+    name: Option<TabTitle>,
     tabs: Rc<[command_palette::SearchTab]>,
     panes: Rc<[pane_picker::SearchPane]>,
     search: Option<(SearchScope, std::sync::Weak<()>)>,
+}
+
+#[derive(Clone)]
+pub(super) struct WindowEntries<T> {
+    pub(super) window: u64,
+    pub(super) name: Option<TabTitle>,
+    pub(super) entries: Rc<[T]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -333,6 +349,7 @@ impl TerminalApp {
                                 hwnd,
                                 sender: ctx.sender(),
                                 outgoing: Weak::new(),
+                                name: self.window_name.clone(),
                                 tabs: self
                                     .tab_search_entries(
                                         self.appearance
@@ -398,7 +415,7 @@ impl TerminalApp {
 
     pub(super) fn sibling_tab_search_entries(
         &self,
-    ) -> Vec<(u64, Rc<[command_palette::SearchTab]>)> {
+    ) -> Vec<WindowEntries<command_palette::SearchTab>> {
         let source = self.registry.window_id();
         WINDOWS.with_borrow(|windows| {
             windows
@@ -406,7 +423,11 @@ impl TerminalApp {
                 .filter(|(id, endpoint)| {
                     **id != source && unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool()
                 })
-                .map(|(&id, endpoint)| (id, endpoint.tabs.clone()))
+                .map(|(&window, endpoint)| WindowEntries {
+                    window,
+                    name: endpoint.name.clone(),
+                    entries: endpoint.tabs.clone(),
+                })
                 .collect()
         })
     }
@@ -437,7 +458,9 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn sibling_pane_search_entries(&self) -> Vec<(u64, Rc<[pane_picker::SearchPane]>)> {
+    pub(super) fn sibling_pane_search_entries(
+        &self,
+    ) -> Vec<WindowEntries<pane_picker::SearchPane>> {
         let source = self.registry.window_id();
         WINDOWS.with_borrow(|windows| {
             windows
@@ -445,9 +468,26 @@ impl TerminalApp {
                 .filter(|(id, endpoint)| {
                     **id != source && unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool()
                 })
-                .map(|(&id, endpoint)| (id, endpoint.panes.clone()))
+                .map(|(&window, endpoint)| WindowEntries {
+                    window,
+                    name: endpoint.name.clone(),
+                    entries: endpoint.panes.clone(),
+                })
                 .collect()
         })
+    }
+
+    pub(super) fn rename_window(&mut self, name: Option<TabTitle>) {
+        if self.window_name == name {
+            return;
+        }
+        self.window_name = name.clone();
+        WINDOWS.with_borrow_mut(|windows| {
+            if let Some(endpoint) = windows.get_mut(&self.registry.window_id()) {
+                endpoint.name = name;
+            }
+        });
+        windows_changed();
     }
 
     pub(super) fn has_sibling_panes(&self) -> bool {

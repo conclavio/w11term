@@ -1034,6 +1034,7 @@ fn tab_menu_message(label: String) -> Message {
         host_groups::LABEL => Message::HostGroup(host_groups::Action::Open),
         host_groups::NEW_TAB_LABEL => Message::HostGroup(host_groups::Action::NewTab),
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
+        tab_title::RENAME_WINDOW => Message::TabTitle(tab_title::Action::ShowWindow),
         "Duplicate tab layout" => Message::Shortcut(Shortcut::DuplicateTabLayout),
         "Reopen last closed tab layout" => Message::Shortcut(Shortcut::ReopenClosedTab),
         "Reopen last closed pane" => Message::Shortcut(Shortcut::ReopenClosedPane),
@@ -1261,6 +1262,7 @@ pub struct TerminalApp {
     windows: Rc<RefCell<crate::window_state::Windows>>,
     window_profile: Option<String>,
     window_restored: bool,
+    window_name: Option<w11term::tabs::TabTitle>,
     // Unhook before dropping tabs and shutting down their independent sessions.
     keyboard: KeyboardBridge,
     broadcast_typing: Option<pane_broadcast::Plan>,
@@ -4373,6 +4375,7 @@ impl TerminalApp {
                 KeyAction::CommandPalette,
             ),
             self.pane_menu(can_restart, arrangement, directory, previous.is_some()),
+            MenuItem::item("rename-window", tab_title::RENAME_WINDOW),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             tab_colors::menu(
                 self.active_terminal_group().is_some(),
@@ -5572,6 +5575,7 @@ impl Component for TerminalApp {
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
             window_restored: child_window || options.cols.is_some() || options.rows.is_some(),
+            window_name: None,
             keyboard,
             broadcast_typing: None,
             _control: control,
@@ -7922,7 +7926,10 @@ impl Component for TerminalApp {
             |id| self.tab_label(id, application_titles),
         );
         if self.keyboard.hwnd().is_some() {
-            context.window_title(format!("w11term · {title}"));
+            context.window_title(match &self.window_name {
+                Some(name) => format!("w11term · {} · {title}", name.as_str()),
+                None => format!("w11term · {title}"),
+            });
         } else {
             context.window_title(self.keyboard.bootstrap_title());
         }
