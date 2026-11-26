@@ -253,6 +253,7 @@ impl TerminalApp {
                 if self.workspace_page_mut(id).is_none() {
                     return;
                 }
+                self.refresh_profiles();
                 let result = WorkspaceStore::open().and_then(|store| {
                     let workspace = store
                         .load()?
@@ -296,8 +297,9 @@ impl TerminalApp {
                 }
             }
             WorkspaceAction::Manage(id, action) => {
+                let profiles = self.store.path().to_owned();
                 if let Some(page) = self.workspace_page_mut(id) {
-                    page.manage(action);
+                    page.manage(action, &profiles);
                 }
             }
         }

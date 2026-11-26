@@ -1,6 +1,8 @@
 use super::*;
 use w11term::workspace::WorkspaceEntry;
 
+mod repair;
+
 pub(super) struct Editor {
     original: String,
     entry: WorkspaceEntry,
@@ -12,6 +14,7 @@ enum Mode {
     Manage,
     ConfirmRemoval,
     Duplicate(String),
+    Repair(repair::Draft),
 }
 
 enum Change {
@@ -28,6 +31,9 @@ pub enum Action {
     ReviewDuplicate,
     CopyName(String),
     SaveCopy,
+    ReviewRepair,
+    SelectReplacement(String, Option<usize>),
+    ApplyRepair,
     ReviewRemoval,
     Cancel,
     Remove,
@@ -35,7 +41,7 @@ pub enum Action {
 }
 
 impl WorkspacePage {
-    pub(super) fn manage(&mut self, action: Action) {
+    pub(super) fn manage(&mut self, action: Action, profiles: &std::path::Path) {
         match action {
             Action::Open(name) if !self.switching => {
                 self.status.clear();
@@ -78,6 +84,36 @@ impl WorkspacePage {
                     }
                     Action::ReviewRemoval if matches!(editor.mode, Mode::Manage) => {
                         editor.mode = Mode::ConfirmRemoval;
+                        return;
+                    }
+                    Action::ReviewRepair if matches!(editor.mode, Mode::Manage) => {
+                        match repair::Draft::load(&editor.entry.layout, profiles) {
+                            Ok(Some(draft)) => editor.mode = Mode::Repair(draft),
+                            Ok(None) => {
+                                self.status = "All saved SSH profiles are available.".into()
+                            }
+                            Err(error) => self.status = format!("{error:#}"),
+                        }
+                        return;
+                    }
+                    Action::SelectReplacement(name, index) => {
+                        if let Mode::Repair(draft) = &mut editor.mode {
+                            draft.select(name, index);
+                        }
+                        return;
+                    }
+                    Action::ApplyRepair if let Mode::Repair(draft) = &editor.mode => {
+                        match draft.apply(&editor.original, &editor.entry, profiles) {
+                            Ok(remaining) => {
+                                self.status = format!("Saved repaired layout {}", editor.original);
+                                if remaining != 0 {
+                                    self.status
+                                        .push_str(". Some SSH profiles still need replacements.");
+                                }
+                                self.editor = None;
+                            }
+                            Err(error) => self.status = format!("{error:#}"),
+                        }
                         return;
                     }
                     Action::Cancel => {
@@ -167,6 +203,7 @@ pub(super) fn view(
         .text(&page.status)
         .text_wrapping(TextWrapping::Wrap);
     let content = match &editor.mode {
+        Mode::Repair(draft) => return draft.view(id, &editor.original, &page.status, context),
         Mode::ConfirmRemoval => panel.children((
             heading.text(format!("Remove saved workspace {}?", editor.original)),
             TextBlock::new()
@@ -227,8 +264,16 @@ pub(super) fn view(
                     Button::new()
                         .on_click(click(Action::ReviewRemoval))
                         .content("Remove saved workspace…"),
-                    Button::new().on_click(click(Action::Back)).content("Back"),
                 )),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .on_click(click(Action::ReviewRepair))
+                            .content("Repair SSH profiles…"),
+                        Button::new().on_click(click(Action::Back)).content("Back"),
+                    )),
                 status,
             ))
         }
