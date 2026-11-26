@@ -441,6 +441,10 @@ impl WorkspaceLaunch {
 }
 
 impl Workspace {
+    pub fn pane_count(&self) -> usize {
+        self.tabs.iter().map(|tab| tab.layout.pane_count()).sum()
+    }
+
     pub fn capture<'a>(
         tabs: impl IntoIterator<Item = (&'a Layout, u64)>,
         active_tab: usize,

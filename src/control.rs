@@ -183,6 +183,10 @@ pub enum Request {
         rows: Option<usize>,
     },
     ListWorkspaces,
+    SaveWorkspace {
+        window_id: WindowId,
+        name: String,
+    },
     OpenWorkspace {
         window_id: WindowId,
         name: String,
@@ -448,6 +452,10 @@ pub enum UiRequest {
         name: String,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    SaveWorkspace {
+        name: String,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     OpenWorkspace {
         name: String,
         activate: bool,
@@ -575,6 +583,7 @@ impl UiRequest {
             | Self::ListProfiles { reply }
             | Self::OpenProfileWindow { reply, .. }
             | Self::OpenSshGroup { reply, .. }
+            | Self::SaveWorkspace { reply, .. }
             | Self::OpenWorkspace { reply, .. }
             | Self::OpenWorkspaceWindow { reply, .. }
             | Self::GetSshGroupRoster { reply, .. }
@@ -1415,19 +1424,24 @@ impl Registry {
                     .load()?
                     .into_iter()
                     .map(|(name, workspace)| {
-                        let pane_count: usize = workspace
-                            .tabs
-                            .iter()
-                            .map(|tab| tab.layout.pane_count())
-                            .sum();
                         json!({
                             "name": name,
                             "tab_count": workspace.tabs.len(),
-                            "pane_count": pane_count,
+                            "pane_count": workspace.pane_count(),
                         })
                     })
                     .collect();
                 Ok(json!({ "workspaces": workspaces }))
+            }
+            Request::SaveWorkspace { window_id, name } => {
+                let ui = self.window_ui(window_id)?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::SaveWorkspace { name, reply });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("save-workspace timed out; use list-workspaces to check the catalog")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
             }
             Request::OpenWorkspace {
                 window_id,

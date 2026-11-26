@@ -11,6 +11,41 @@ pub(super) use duplicate::{ClosedPane, ClosedTab, ClosedTabWindow, PreparedTabLa
 pub(super) use save::Action as SaveWorkspaceAction;
 
 impl TerminalApp {
+    pub(super) fn control_save_workspace(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            self.incoming.is_none() && self.outgoing.is_none(),
+            "This window is busy moving a tab or pane"
+        );
+        let workspace = self.capture_workspace()?;
+        let window_id = self.registry.window_id();
+        crate::workspace_window::save(
+            name,
+            self.store.path(),
+            &workspace,
+            None,
+            &self._control,
+            window_id,
+        )?;
+        let manager = self
+            .tabs
+            .entries()
+            .iter()
+            .find(|tab| matches!(tab.value.page, Page::Workspaces(_)))
+            .map(|tab| tab.id);
+        if let Some(page) = manager.and_then(|id| self.workspace_page_mut(id)) {
+            page.insert_saved_name(name);
+        }
+        Ok(serde_json::json!({
+            "name": name,
+            "window_id": window_id,
+            "tab_count": workspace.tabs.len(),
+            "pane_count": workspace.pane_count(),
+        }))
+    }
+
     pub(super) fn control_open_workspace(
         &mut self,
         name: &str,
@@ -100,6 +135,15 @@ pub(super) struct WorkspacePage {
 }
 
 impl WorkspacePage {
+    fn insert_saved_name(&mut self, name: &str) {
+        if let Err(index) = self
+            .names
+            .binary_search_by(|saved| saved.as_str().cmp(name))
+        {
+            self.names.insert(index, name.to_owned());
+        }
+    }
+
     fn reload_names(&mut self) {
         match WorkspaceStore::open().and_then(|store| store.load()) {
             Ok(catalog) => {
@@ -396,11 +440,12 @@ impl TerminalApp {
             .into_iter()
             .filter(|tab| matches!(tab.value.page, Page::Terminal(_)))
             .collect();
-        // The manager itself is a utility tab. Save the most recently visited terminal group.
+        // When a utility tab is selected, remember the last terminal group.
         let active_tab = self
-            .mru_groups
-            .iter()
-            .find_map(|&group| {
+            .active_terminal_group()
+            .into_iter()
+            .chain(self.mru_groups.iter().copied())
+            .find_map(|group| {
                 headers
                     .iter()
                     .position(|h| self.tabs.group_id(h.id) == Some(group))

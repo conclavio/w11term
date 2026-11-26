@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -84,6 +84,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "list-saved-ssh-groups"
             | "open-ssh-group"
             | "open-workspace"
+            | "save-workspace"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
             | "get-ssh-group-retry-plan"
@@ -572,6 +573,43 @@ mod tests {
             "open --profile fleet --new-window --new-window",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn saves_a_live_workspace_to_a_new_name_in_an_explicit_window() {
+        let (pid, request) = parse(
+            [
+                "--pid",
+                "7",
+                "save-workspace",
+                "--window",
+                "12",
+                "--name",
+                "Fleet Ops",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"save-workspace","window_id":12,"name":"Fleet Ops"})
+        );
+        for invalid in [
+            "save-workspace --name fleet",
+            "save-workspace --window 1",
+            "save-workspace --window 0 --name fleet",
+            "save-workspace --window 1 --window 2 --name fleet",
+            "save-workspace --window 1 --name fleet --name twice",
+            "save-workspace --window 1 --name fleet --overwrite",
+            "save-workspace --window 1 --name fleet --activate",
+        ] {
+            assert!(
+                parse(invalid.split_whitespace().map(str::to_owned)).is_err(),
+                "{invalid}"
+            );
         }
     }
 
