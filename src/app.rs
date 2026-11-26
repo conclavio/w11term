@@ -6950,6 +6950,7 @@ impl Component for TerminalApp {
                 Shortcut::PickerAccept => self.accept_picker(context),
                 Shortcut::PickerCancel => self.close_picker(context),
                 Shortcut::PickerHistoryOption(option) => self.cycle_window_history(option, context),
+                Shortcut::PickerSaveHistory => self.save_window_history(context),
                 Shortcut::PickerMove(delta) => {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);

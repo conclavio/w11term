@@ -1009,7 +1009,7 @@ pub(super) fn view(
 ) -> View {
     let narrow_history = app.width < 520.0;
     let search_height = if mode == Search::CommandHistory {
-        if narrow_history { 226.0 } else { 194.0 }
+        if narrow_history { 264.0 } else { 232.0 }
     } else {
         156.0
     };
@@ -1144,18 +1144,21 @@ pub(super) fn view(
                 )),
         ));
     }
-    let history_controls = app
+    let history = app
         .picker
         .as_ref()
-        .filter(|_| mode == Search::CommandHistory)
-        .map_or_else(View::empty, |picker| {
-            picker.window_history_controls(narrow_history, ctx)
-        });
+        .filter(|_| mode == Search::CommandHistory);
+    let history_controls = history.map_or_else(View::empty, |picker| {
+        picker.window_history_controls(narrow_history, ctx)
+    });
+    let history_export =
+        history.map_or_else(View::empty, |picker| picker.history_export_button(app, ctx));
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
             history_controls,
             StackPanel::new().spacing(4.0).keyed_children(results),
+            history_export,
         )),
         (app.width - 32.0).clamp(1.0, 660.0),
     )

@@ -37,6 +37,7 @@ pub enum Subject {
         selected_pane: u64,
         selected: u64,
     },
+    WindowCommandHistory,
     HostGroupResults {
         submission: u64,
         format: GroupReportFormat,
@@ -72,6 +73,7 @@ impl Subject {
             Self::PaneText(pane) => format!("visible text from pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
             Self::CommandOutputDiff { .. } => "command output differences".into(),
+            Self::WindowCommandHistory => "command history results".into(),
             Self::HostGroupResults { format, shown, .. } => {
                 let scope = if shown { "shown " } else { "" };
                 let format = if format == GroupReportFormat::Json {
@@ -109,6 +111,7 @@ impl Subject {
             } => file_picker::Purpose::CommandOutputDiff(format!(
                 "command-diff-{reference_pane}-{reference}-to-{selected_pane}-{selected}.txt"
             )),
+            Self::WindowCommandHistory => file_picker::Purpose::WindowCommandHistory,
             Self::HostGroupResults {
                 submission,
                 format,

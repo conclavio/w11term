@@ -37,6 +37,7 @@ pub(super) enum Purpose {
     PaneImage,
     CommandOutput(String),
     CommandOutputDiff(String),
+    WindowCommandHistory,
     GroupReport(String),
     SshLoginReport(String),
     GroupJsonReport(String),
@@ -370,6 +371,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             | Purpose::PaneImage
             | Purpose::CommandOutput(_)
             | Purpose::CommandOutputDiff(_)
+            | Purpose::WindowCommandHistory
             | Purpose::GroupReport(_)
             | Purpose::SshLoginReport(_)
             | Purpose::GroupJsonReport(_)
@@ -395,6 +397,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                         w!("Save command output differences"),
                         suggestion.as_str(),
                         w!("txt"),
+                    ),
+                    Purpose::WindowCommandHistory => (
+                        w!("Save command history results as JSON"),
+                        "w11term-command-history.json",
+                        w!("json"),
                     ),
                     Purpose::GroupReport(suggestion) => (
                         w!("Save SSH group results as text"),

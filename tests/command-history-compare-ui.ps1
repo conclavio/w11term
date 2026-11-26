@@ -49,6 +49,38 @@ try {
     Wait-Focus $after
     $null = Control @('wait-for-text','--pane',"$after",'--timeout','15','capture-ready')
     $afterCommand = (Control @('list-commands','--pane',"$after")).commands[0].id
+    Run-Palette ('Find command history' + $ellipsis)
+    Wait-PickerEditor 'Search commands across panes' 'the window history search'
+    $field = Find-Element 'Search commands across panes' $edit
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('RESULT')
+    Press-Key 0x78 # Include retained output so both matches have excerpts
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $buttons = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
+    Wait-ForHistoryText 'output matches from both SSH panes' {
+        $matched = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons) |
+            Where-Object { $_.Current.Name.StartsWith('unchanged old result') -or $_.Current.Name.StartsWith('unchanged new result') })
+        $matched.Count -eq 2
+    }
+    Click "Save results as JSON$ellipsis"
+    $dialog = Wait-Until 'owned history JSON dialog' { Find-OwnedDialog 'Save command history results as JSON' }
+    $null = Wait-Until 'publish the ordered history report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $historyPath = Join-Path $State 'w11term-command-history.json'
+    $null = Wait-Until 'history report is published' { [IO.File]::Exists($historyPath) }
+    $raw = [IO.File]::ReadAllText($historyPath)
+    $historyReport = $raw | ConvertFrom-Json
+    $recent, $earlier = $historyReport.commands
+    if ($historyReport.schema_version -ne 1 -or $historyReport.query -cne 'RESULT' -or !$historyReport.include_output -or
+        $historyReport.order -cne 'newest' -or $historyReport.commands.Count -ne 2 -or
+        $recent.pane.id -ne $after -or $recent.pane.profile -cne 'History after' -or $recent.id -ne $afterCommand -or
+        $earlier.pane.id -ne $before -or $earlier.pane.profile -cne 'History before' -or $earlier.id -ne $beforeCommand -or
+        $recent.exit_code -ne 0 -or $earlier.exit_code -ne 5 -or !$recent.matched_output -or !$earlier.matched_output -or
+        !$recent.output_available -or !$earlier.output_available -or $raw -match 'old result|new result|unchanged') {
+        throw "History report changed the captures or included output text: $raw"
+    }
+    Press-Key 0x1b
+    $null = Wait-Until 'Escape closes the history search after saving' { !(Find-Element 'Search commands across panes') }
+    Wait-Focus $after
     Run-Palette 'Command history'
     $value = (Search-Control).GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     $value.SetValue('check result')

@@ -2,6 +2,7 @@ use super::*;
 use command_history::{HistoryOrder, ORDER_OPTIONS, STATUS_OPTIONS, WindowHistoryOptions};
 use w11term::control::CommandStatus;
 use w11term::events::CommandLink;
+mod export;
 
 type Selection = (u64, CommandLink);
 
@@ -16,6 +17,7 @@ pub(in crate::app) struct WindowHistoryReturn {
 pub enum Action {
     Edit(Arc<()>, Edit),
     Ready(Arc<()>, Option<Report>),
+    Save(Arc<()>),
 }
 
 pub enum Edit {
@@ -230,6 +232,12 @@ impl TerminalApp {
                 if let Some(report) = rows {
                     picker.set_window_history_rows(report.rows, report.selection);
                 }
+            }
+            Action::Save(launch)
+                if Arc::ptr_eq(&launch, &picker.launch)
+                    && picker.mode == Mode::Commands(command_palette::Search::CommandHistory) =>
+            {
+                self.save_window_history(ctx);
             }
             _ => {}
         }

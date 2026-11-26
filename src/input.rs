@@ -248,6 +248,7 @@ pub enum Shortcut {
     PickerAccept,
     PickerCancel,
     PickerHistoryOption(HistoryPickerOption),
+    PickerSaveHistory,
     PickerPlace(Direction),
     KeyboardHints,
     HintKey(u32),
@@ -1671,6 +1672,9 @@ impl State {
                     }
                     (PickerStage::CommandHistory, 0x78) if modifiers().is_empty() => {
                         Shortcut::PickerHistoryOption(HistoryPickerOption::Output)
+                    }
+                    (PickerStage::CommandHistory, 0x53) if modifiers() == KeyModifiers::CTRL => {
+                        Shortcut::PickerSaveHistory
                     }
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),

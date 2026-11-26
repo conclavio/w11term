@@ -3,8 +3,10 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = $State
 $profiles = Join-Path $State 'profiles.json'
 $peer = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $gate = Join-Path $peer 'hold-shell-output'
@@ -109,6 +111,23 @@ try {
             (Find-Element "$unknownRow    Duration unavailable" $button -Visible) -and
             !(Find-Element "$quickRow    $quickDuration" $button)
     }
+    $save = Wait-Until 'save filtered history' {
+        Find-Element ('Save results as JSON' + [char]0x2026) $button -Visible
+    }
+    Invoke-Button $save
+    $dialog = Wait-Until 'owned history save dialog' { Find-OwnedDialog 'Save command history results as JSON' }
+    $null = Wait-Until 'publish the filtered history file' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $path = Join-Path $State 'w11term-command-history.json'
+    $null = Wait-Until 'saved history file' { [IO.File]::Exists($path) }
+    $report = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+    if ($report.schema_version -ne 1 -or $report.status -cne 'failed' -or $report.order -cne 'slowest' -or
+        $report.expired_results -ne 0 -or $report.commands.Count -ne 2 -or
+        $report.commands[0].id -ne $slow.id -or $report.commands[0].duration_ms -ne $slow.duration_ms -or
+        $report.commands[1].id -ne $unknown.id -or $null -ne $report.commands[1].duration_ms) {
+        throw "Filtered history report changed its results or their order: $($report | ConvertTo-Json -Depth 6 -Compress)"
+    }
+    $field = Find-Element 'Search commands across panes' ([System.Windows.Automation.ControlType]::Edit)
+    $field.SetFocus()
     Press-Key 0x28
     Press-Key 0x0d
     $selectedUnknown = "Selected, Command $($unknown.id)${dot}exit 9"
