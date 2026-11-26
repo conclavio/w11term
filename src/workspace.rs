@@ -631,6 +631,7 @@ mod tests {
             host: host.into(),
             user: "tester".into(),
             scrollback_lines: Default::default(),
+            connect_timeout_seconds: None,
             keepalive: Default::default(),
             color_scheme: Default::default(),
             font_size: None,

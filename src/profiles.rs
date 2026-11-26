@@ -961,6 +961,9 @@ impl ProfileStore {
             if options.keepalive.is_default() {
                 object.remove("keepalive");
             }
+            if options.connect_timeout_seconds.is_none() {
+                object.remove("connect_timeout_seconds");
+            }
             if options.color_scheme.is_default() {
                 object.remove("color_scheme");
             }
@@ -1340,6 +1343,7 @@ mod tests {
             host: "new.test".into(),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            connect_timeout_seconds: None,
             keepalive: Default::default(),
             font_size: None,
             tab_color: Default::default(),
@@ -2001,6 +2005,31 @@ mod order_tests {
         );
         store.edit("Alpha", "Alpha", &initial, &saved).unwrap();
         assert!(disk(&store)["profiles"]["Alpha"].get("keepalive").is_none());
+    }
+
+    #[test]
+    fn editing_a_connect_timeout_can_restore_the_legacy_default() {
+        let (_dir, store) = fixture();
+        let initial = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(initial.connect_timeout_seconds, None);
+        let mut custom = initial.clone();
+        custom.connect_timeout_seconds = Some(18.try_into().unwrap());
+        store.edit("Alpha", "Alpha", &custom, &initial).unwrap();
+        let saved = store.inspect("Alpha").unwrap().1.options;
+        assert_eq!(
+            saved.connect_timeout_seconds,
+            custom.connect_timeout_seconds
+        );
+        assert_eq!(
+            disk(&store)["profiles"]["Alpha"]["connect_timeout_seconds"],
+            18
+        );
+        store.edit("Alpha", "Alpha", &initial, &saved).unwrap();
+        assert!(
+            disk(&store)["profiles"]["Alpha"]
+                .get("connect_timeout_seconds")
+                .is_none()
+        );
     }
 
     #[test]

@@ -400,6 +400,7 @@ impl Config<'_> {
                     | "port"
                     | "identitiesonly"
                     | "serveraliveinterval"
+                    | "connecttimeout"
                     | "serveralivecountmax" => {
                         scalars.entry(key).or_insert(d);
                     }
@@ -468,7 +469,7 @@ impl Config<'_> {
             // When an alias supplies a keepalive directive, use OpenSSH's
             // complementary default for any directive it leaves unspecified.
             SshKeepalive {
-                interval_seconds: configured(interval, "0", parse_interval)?,
+                interval_seconds: configured(interval, "0", parse_time_seconds)?,
                 max_unanswered: configured(max_unanswered, "3", |value| {
                     value
                         .parse()
@@ -476,6 +477,13 @@ impl Config<'_> {
                 })?,
             }
         };
+        let connect_timeout_seconds =
+            configured(scalars.get("connecttimeout").copied(), "none", |value| {
+                if value.eq_ignore_ascii_case("none") {
+                    return Ok(None);
+                }
+                Ok(std::num::NonZeroU32::new(parse_time_seconds(value)?))
+            })?;
         let port_text = port.to_string();
         let tokens = [
             ('h', host.as_str()),
@@ -559,6 +567,7 @@ impl Config<'_> {
                 host,
                 user: user.into(),
                 port,
+                connect_timeout_seconds,
                 keepalive,
                 authentication,
                 host_key: None,
@@ -569,25 +578,25 @@ impl Config<'_> {
     }
 }
 
-fn parse_interval(mut value: &str) -> Result<u32> {
-    ensure!(!value.is_empty(), "Missing ServerAliveInterval");
+fn parse_time_seconds(mut value: &str) -> Result<u32> {
+    ensure!(!value.is_empty(), "Missing time value");
     let mut seconds = 0_u32;
     while !value.is_empty() {
         let digits = value.len() - value.trim_start_matches(|c: char| c.is_ascii_digit()).len();
         let (number, suffix) = value.split_at(digits);
-        let number: u32 = number.parse().context("Invalid ServerAliveInterval")?;
+        let number: u32 = number.parse().context("Invalid time value")?;
         let factor = match suffix.as_bytes().first().map(u8::to_ascii_lowercase) {
             None | Some(b's') => 1,
             Some(b'm') => 60,
             Some(b'h') => 3_600,
             Some(b'd') => 86_400,
             Some(b'w') => 604_800,
-            _ => bail!("Invalid ServerAliveInterval unit"),
+            _ => bail!("Invalid time unit"),
         };
         seconds = number
             .checked_mul(factor)
             .and_then(|part| seconds.checked_add(part))
-            .context("ServerAliveInterval is too large")?;
+            .context("Time value is too large")?;
         value = suffix.get(1..).unwrap_or_default();
     }
     Ok(seconds)
@@ -779,6 +788,24 @@ mod tests {
             let report = parse_config(&format!("Host bad\n {directive}"));
             assert!(alias(&report, "bad").options.is_none(), "{directive}");
         }
+    }
+
+    #[test]
+    fn connect_timeout_imports_independent_destination_and_jump_values() {
+        let report = parse_config(
+            "Host target\n ProxyJump gateway\n ConnectTimeout 1m5s\n ConnectTimeout 4\n Host gateway\n ConnectTimeout 2s\n Host default\n ConnectTimeout none\n Host zero\n ConnectTimeout 0",
+        );
+        let timeout = |host| alias(&report, host).options.as_ref().unwrap();
+        let target = timeout("target");
+        assert_eq!(target.connect_timeout_seconds.unwrap().get(), 65);
+        assert_eq!(
+            target.proxy_jump[0].connect_timeout_seconds.unwrap().get(),
+            2
+        );
+        assert!(timeout("default").connect_timeout_seconds.is_none());
+        assert!(timeout("zero").connect_timeout_seconds.is_none());
+        let bad = parse_config("Host bad\n ConnectTimeout 2x");
+        assert!(alias(&bad, "bad").options.is_none());
     }
     #[test]
     fn resolves_nested_and_explicit_jump_routes_with_independent_flags() {

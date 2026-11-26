@@ -167,6 +167,9 @@ pub(super) fn jump_summary(hops: &[JumpHost]) -> String {
             text.push_str("\n  ");
             text.push_str(&keepalive_summary(hop.keepalive));
         }
+        if let Some(seconds) = hop.connect_timeout_seconds {
+            text.push_str(&format!("\n  SSH connection timeout · {seconds} s"));
+        }
     }
     text
 }
@@ -440,6 +443,12 @@ impl TerminalApp {
                 ));
                 if options.keepalive != SshKeepalive::default() {
                     fields.push(text("keepalive", keepalive_summary(options.keepalive)));
+                }
+                if let Some(seconds) = options.connect_timeout_seconds {
+                    fields.push(text(
+                        "connect-timeout",
+                        format!("SSH connection timeout · {seconds} s"),
+                    ));
                 }
                 if !options.proxy_jump.is_empty() {
                     fields.push(text("hops", jump_summary(&options.proxy_jump)));

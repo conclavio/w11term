@@ -17,10 +17,12 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use wezterm_term::TerminalSize;
 use zeroize::Zeroizing;
+
+mod handshake_deadline;
 
 const WORKSPACE_COMMAND_INTERRUPTED: &str =
     "Workspace command interrupted; reopen the workspace to run it again";
@@ -144,6 +146,8 @@ pub(crate) struct Handler {
     known_hosts: std::path::PathBuf,
     fingerprint: Arc<std::sync::OnceLock<String>>,
     durable_peer: Option<String>,
+    handshake_clock: watch::Sender<Option<Instant>>,
+    pause_trust_deadline: bool,
 }
 
 // OpenSSH uses a host-key alias verbatim, even for a connection on another
@@ -220,16 +224,32 @@ impl client::Handler for Handler {
                 self.options.host, self.options.port
             ))
         })?;
-        let answer = prompts
-            .ask(Question::HostKey {
-                host: self.options.host.clone(),
-                port: self.options.port,
-                host_key_alias: self.options.host_key_alias.clone(),
-                algorithm: key.algorithm().to_string(),
-                fingerprint,
-            })
-            .await
-            .map_err(|e| stop(e.to_string()))?;
+        let question = Question::HostKey {
+            host: self.options.host.clone(),
+            port: self.options.port,
+            host_key_alias: self.options.host_key_alias.clone(),
+            algorithm: key.algorithm().to_string(),
+            fingerprint,
+        };
+        let remaining = if self.pause_trust_deadline {
+            self.handshake_clock
+                .send_replace(None)
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        } else {
+            None
+        };
+        ensure!(
+            !remaining.is_some_and(|duration| duration.is_zero()),
+            "SSH handshake timed out"
+        );
+        let answer = tokio::select! {
+            answer = prompts.ask(question) => answer.map_err(|e| stop(e.to_string())),
+            () = self.handshake_clock.closed() => Err(stop("SSH handshake ended")),
+        }?;
+        if let Some(remaining) = remaining {
+            self.handshake_clock
+                .send_replace(Some(Instant::now() + remaining));
+        }
         ensure!(
             matches!(answer, Answer::Trust(true)),
             Permanent("host key was not accepted".into())
@@ -460,10 +480,15 @@ async fn connect(
             None
         };
         let address = format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port);
+        let now = Instant::now();
+        let deadline = endpoint
+            .connect_timeout_seconds
+            .map(|seconds| now + Duration::from_secs(seconds.get().into()));
+        let open_deadline = deadline.unwrap_or_else(|| now + Duration::from_secs(15));
         let (handle, fingerprint) = if let Some(hop) = &upstream {
             let handle = hop.handle();
-            let channel = tokio::time::timeout(
-                Duration::from_secs(15),
+            let channel = tokio::time::timeout_at(
+                open_deadline,
                 handle.channel_open_direct_tcpip(
                     &endpoint.host,
                     u32::from(endpoint.port),
@@ -489,18 +514,27 @@ async fn connect(
                 password,
                 expected_peer,
                 channel.into_stream(),
+                deadline,
             )
             .await
         } else {
-            let stream = tokio::time::timeout(
-                Duration::from_secs(15),
+            let stream = tokio::time::timeout_at(
+                open_deadline,
                 tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
             )
             .await
             .with_context(|| format!("SSH TCP connection to {address} timed out"))?
             .with_context(|| format!("connecting to {address}"))?;
             stream.set_nodelay(true)?;
-            handshake(&endpoint, prompts, password, expected_peer, stream).await
+            handshake(
+                &endpoint,
+                prompts,
+                password,
+                expected_peer,
+                stream,
+                deadline,
+            )
+            .await
         }
         .with_context(|| format!("SSH handshake or authentication for {address}"))?;
         upstream = Some(ConnectionShare::new(
@@ -520,6 +554,7 @@ pub(super) async fn handshake(
     password: &mut Option<Zeroizing<String>>,
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    deadline: Option<Instant>,
 ) -> Result<(client::Handle<Handler>, String)> {
     let known_hosts = match prompts.and_then(Prompts::known_hosts) {
         Some(path) => std::path::PathBuf::from(path),
@@ -553,22 +588,29 @@ pub(super) async fn handshake(
         ..Default::default()
     });
     let fingerprint = Arc::new(std::sync::OnceLock::new());
-    let mut session = tokio::time::timeout(
-        Duration::from_secs(300),
-        client::connect_stream(
-            config,
-            stream,
-            Handler {
-                options: options.clone(),
-                prompts: prompts.cloned(),
-                known_hosts,
-                fingerprint: fingerprint.clone(),
-                durable_peer: durable_peer.map(str::to_owned),
-            },
-        ),
-    )
-    .await
-    .context("SSH handshake timed out")??;
+    let (handshake_clock, mut clock) = watch::channel(Some(
+        deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(300)),
+    ));
+    let (stream, complete) = handshake_deadline::HandshakeStream::new(stream);
+    let connecting = client::connect_stream(
+        config,
+        stream,
+        Handler {
+            options: options.clone(),
+            prompts: prompts.cloned(),
+            known_hosts,
+            fingerprint: fingerprint.clone(),
+            durable_peer: durable_peer.map(str::to_owned),
+            handshake_clock,
+            pause_trust_deadline: deadline.is_some(),
+        },
+    );
+    let mut session = tokio::select! {
+        biased;
+        result = connecting => result?,
+        () = handshake_deadline::expired(&mut clock) => anyhow::bail!("SSH handshake timed out"),
+    };
+    let _ = complete.send(());
     authenticate(&mut session, options, prompts, password).await?;
     Ok((
         session,

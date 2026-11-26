@@ -29,7 +29,7 @@ function Ssh-Reference([string]$Alias) {
     if ($LASTEXITCODE -ne 0) { throw "ssh.exe -G failed for fixture alias $Alias ($LASTEXITCODE)" }
     $endpoint = @{}
     foreach ($line in $lines) {
-        if ($line -cmatch '^(hostname|user|port|proxyjump|hostkeyalias|serveraliveinterval|serveralivecountmax) (.*)$') {
+        if ($line -cmatch '^(hostname|user|port|proxyjump|hostkeyalias|connecttimeout|serveraliveinterval|serveralivecountmax) (.*)$') {
             $endpoint[$Matches[1]] = $Matches[2]
         }
     }
@@ -57,6 +57,7 @@ Host via
     User pilot
     Port 2222
     ProxyJump gateway
+    ConnectTimeout 23
     ServerAliveInterval 15
     HostKeyAlias Build.Key.Test
 '@
@@ -66,6 +67,7 @@ Host gateway
     HostKeyAlias Bastion.Key.Test
     User jump
     Port 2201
+    ConnectTimeout 11
     ServerAliveInterval 0
 '@
     Write-Config (Join-Path $fragments '30-blocked.conf') @'
@@ -124,6 +126,9 @@ Host web
     if ($via.host_key_alias -cne 'build.key.test' -or $hop.host_key_alias -cne 'bastion.key.test') { throw "Host key aliases were lost during import or edit. See $profiles" }
     if ($via.keepalive.interval_seconds -ne 15 -or $via.keepalive.max_unanswered -ne 3 -or
         $hop.keepalive.interval_seconds -ne 0) { throw "Keepalive policy was lost during import or edit. See $profiles" }
+    if ($via.connect_timeout_seconds -ne 23 -or $hop.connect_timeout_seconds -ne 11) {
+        throw "Connection timeouts were lost during import or edit. See $profiles"
+    }
     $sshExe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
     if (Test-Path -LiteralPath $sshExe -PathType Leaf) {
         $expected = Ssh-Reference 'via'
@@ -131,12 +136,14 @@ Host web
         if ($expected.proxyjump -cne 'gateway' -or $expected.hostname -cne $via.host -or $expected.user -cne $via.user -or [int]$expected.port -ne $via.port -or
             $gateway.hostname -cne $hop.host -or $gateway.user -cne $hop.user -or [int]$gateway.port -ne $hop.port -or
             $expected.hostkeyalias -cne $via.host_key_alias -or $gateway.hostkeyalias -cne $hop.host_key_alias -or
+            [int]$expected.connecttimeout -ne $via.connect_timeout_seconds -or
+            [int]$gateway.connecttimeout -ne $hop.connect_timeout_seconds -or
             [int]$expected.serveraliveinterval -ne $via.keepalive.interval_seconds -or
             [int]$expected.serveralivecountmax -ne $via.keepalive.max_unanswered -or
             [int]$gateway.serveraliveinterval -ne $hop.keepalive.interval_seconds) {
             throw "Saved profile differs from Windows OpenSSH -G. See $profiles"
         }
-        Write-Output 'Windows OpenSSH -G independently confirmed the destination, gateway and keepalive policy.'
+        Write-Output 'Windows OpenSSH -G independently confirmed the destination, gateway, timeouts, and keepalive policy.'
     }
 
     Remove-Item Env:W11TERM_UI_SMOKE, Env:W11TERM_IMPORT_SMOKE
@@ -239,23 +246,28 @@ Host web
     $interval = Field 'SSH keepalive interval (seconds)'
     $unanswered = Field 'Unanswered keepalives allowed'
     $retryWindow = Field 'SSH retry window (seconds)'
+    $connectTimeout = Field 'SSH connection timeout (seconds)'
     if ($interval.Current.Value -cne '15' -or $unanswered.Current.Value -cne '3') {
         throw 'The profile editor did not show the imported keepalive values'
     }
     if ($retryWindow.Current.Value -cne '300') { throw 'The editor did not load the default retry window' }
+    if ($connectTimeout.Current.Value -cne '23') { throw 'The editor did not load the imported connection timeout' }
     $interval.SetValue('40')
     $unanswered.SetValue('6')
     $retryWindow.SetValue('45')
+    $connectTimeout.SetValue('31')
     $null = Wait-Until 'edited SSH recovery fields' {
         (Field 'SSH keepalive interval (seconds)').Current.Value -ceq '40' -and
             (Field 'Unanswered keepalives allowed').Current.Value -ceq '6' -and
-            (Field 'SSH retry window (seconds)').Current.Value -ceq '45'
+            (Field 'SSH retry window (seconds)').Current.Value -ceq '45' -and
+            (Field 'SSH connection timeout (seconds)').Current.Value -ceq '31'
     }
     Click 'Save profile changes'
     $null = Wait-Until 'saved keepalive changes' { Find-Element 'Changes saved.' }
     $updated = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.via
     if ($updated.keepalive.interval_seconds -ne 40 -or $updated.keepalive.max_unanswered -ne 6 -or
-        $updated.proxy_jump[0].keepalive.interval_seconds -ne 0 -or $updated.player.reconnect_window_seconds -ne 45) {
+        $updated.proxy_jump[0].keepalive.interval_seconds -ne 0 -or $updated.player.reconnect_window_seconds -ne 45 -or
+        $updated.connect_timeout_seconds -ne 31 -or $updated.proxy_jump[0].connect_timeout_seconds -ne 11) {
         throw "Editing destination recovery changed the wrong policy. See $profiles"
     }
     Write-Output "OpenSSH import native smoke passed. Artifacts in $state"

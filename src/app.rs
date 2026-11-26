@@ -515,6 +515,7 @@ struct ProfileDraft {
     host: String,
     user: String,
     port: String,
+    connect_timeout: String,
     keepalive_interval: String,
     keepalive_max: String,
     reconnect_window: String,
@@ -552,6 +553,7 @@ impl Default for ProfileDraft {
             host: String::new(),
             user: String::new(),
             port: "22".into(),
+            connect_timeout: String::new(),
             keepalive_interval: keepalive.interval_seconds.to_string(),
             keepalive_max: keepalive.max_unanswered.to_string(),
             reconnect_window: player.reconnect_window_seconds.to_string(),
@@ -612,6 +614,10 @@ impl ProfileDraft {
             scrollback_lines: self.scrollback_lines.parse()?,
             user: user.into(),
             port,
+            connect_timeout_seconds: (!self.connect_timeout.trim().is_empty())
+                .then(|| self.connect_timeout.trim().parse())
+                .transpose()
+                .context("Enter a positive SSH connection timeout in whole seconds or leave it blank for the default")?,
             keepalive: SshKeepalive {
                 interval_seconds: self.keepalive_interval.trim().parse().context(
                     "Enter the SSH keepalive interval in whole seconds. Use 0 to disable it",
@@ -665,6 +671,10 @@ impl ProfileDraft {
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
+            connect_timeout: options
+                .connect_timeout_seconds
+                .map(|seconds| seconds.to_string())
+                .unwrap_or_default(),
             keepalive_interval: options.keepalive.interval_seconds.to_string(),
             keepalive_max: options.keepalive.max_unanswered.to_string(),
             reconnect_window: options.player.reconnect_window_seconds.to_string(),
@@ -998,6 +1008,7 @@ pub enum Field {
     User,
     Port,
     KeepaliveInterval,
+    ConnectTimeout,
     KeepaliveMax,
     ReconnectWindow,
     ScrollbackLines,
@@ -4625,6 +4636,12 @@ impl TerminalApp {
             (Field::User, "User", &draft.user, "root"),
             (Field::Port, "Port", &draft.port, "22"),
             (
+                Field::ConnectTimeout,
+                "SSH connection timeout (seconds)",
+                &draft.connect_timeout,
+                "Default when blank",
+            ),
+            (
                 Field::HostKeyAlias,
                 "Host key alias (optional)",
                 &draft.host_key_alias,
@@ -7185,6 +7202,7 @@ impl Component for TerminalApp {
                         Field::User => &mut draft.user,
                         Field::Port => &mut draft.port,
                         Field::KeepaliveInterval => &mut draft.keepalive_interval,
+                        Field::ConnectTimeout => &mut draft.connect_timeout,
                         Field::KeepaliveMax => &mut draft.keepalive_max,
                         Field::ReconnectWindow => &mut draft.reconnect_window,
                         Field::ScrollbackLines => &mut draft.scrollback_lines,
@@ -8679,6 +8697,7 @@ mod profile_ui_tests {
                     interval_seconds: 17,
                     max_unanswered: 4.try_into().unwrap(),
                 },
+                connect_timeout_seconds: Some(20.try_into().unwrap()),
                 font_size: Some(22.try_into().unwrap()),
                 tab_color: TabColor::Purple,
                 scrollback_lines: "0".parse().unwrap(),
@@ -8700,6 +8719,7 @@ mod profile_ui_tests {
             let mut draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
+            assert_eq!(draft.connect_timeout, "20");
             assert_eq!(draft.keepalive_interval, "17");
             assert_eq!(draft.keepalive_max, "4");
             assert_eq!(draft.scrollback_lines, "0");
@@ -8712,6 +8732,20 @@ mod profile_ui_tests {
             assert_eq!(
                 draft.ssh_options().unwrap().group_prompt,
                 options.group_prompt
+            );
+            assert_eq!(
+                draft.ssh_options().unwrap().connect_timeout_seconds,
+                options.connect_timeout_seconds
+            );
+            draft.connect_timeout = "0".into();
+            assert!(draft.ssh_options().is_err());
+            draft.connect_timeout.clear();
+            assert!(
+                draft
+                    .ssh_options()
+                    .unwrap()
+                    .connect_timeout_seconds
+                    .is_none()
             );
             draft.group_prompt = "[".into();
             assert!(draft.ssh_options().is_err());

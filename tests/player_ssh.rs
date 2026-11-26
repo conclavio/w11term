@@ -271,6 +271,7 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
     SshOptions {
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        connect_timeout_seconds: None,
         keepalive: Default::default(),
         font_size: None,
         tab_color: Default::default(),
@@ -1051,6 +1052,23 @@ async fn first_trust_is_saved_known_host_skips_prompt_and_changed_key_fails() {
     assert!(format!("{failure:#}").contains("host verification failed"));
     assert!(prompts.current().is_none());
     assert_eq!(std::fs::read(path).unwrap(), saved);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_connect_timeout_pauses_while_the_user_verifies_a_host_key() {
+    let (port, _seen, server) = fixture(vec![key()]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let prompts = Prompts::with_known_hosts(directory.path().join("known_hosts"));
+    let mut options = options(port, Authentication::None, None);
+    options.connect_timeout_seconds = Some(2.try_into().unwrap());
+    let mut client = start(options, prompts.clone());
+    let trust = prompt(&prompts).await;
+    assert!(matches!(trust.question, Question::HostKey { .. }));
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    prompts.answer(trust.id, Answer::Trust(true)).unwrap();
+    connected(&mut client, 1).await;
+    client.task.abort();
     server.abort();
 }
 

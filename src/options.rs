@@ -277,6 +277,8 @@ pub struct SshOptions {
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_seconds: Option<NonZeroU32>,
     #[serde(default, skip_serializing_if = "SshKeepalive::is_default")]
     pub keepalive: SshKeepalive,
     #[serde(default, skip_serializing_if = "TerminalType::is_default")]
@@ -318,6 +320,8 @@ pub struct JumpHost {
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_seconds: Option<NonZeroU32>,
     #[serde(default, skip_serializing_if = "SshKeepalive::is_default")]
     pub keepalive: SshKeepalive,
     #[serde(flatten)]
@@ -337,6 +341,7 @@ impl From<JumpHost> for SshOptions {
             host: hop.host,
             user: hop.user,
             port: hop.port,
+            connect_timeout_seconds: hop.connect_timeout_seconds,
             keepalive: hop.keepalive,
             terminal_type: TerminalType::default(),
             scrollback_lines: ScrollbackLines::default(),
@@ -1567,6 +1572,7 @@ mod tests {
             host_key_alias: None,
             terminal_type: TerminalType::default(),
             color_scheme: Default::default(),
+            connect_timeout_seconds: None,
             keepalive: Default::default(),
             font_size: None,
             tab_color: Default::default(),
@@ -1584,6 +1590,7 @@ mod tests {
             host: "*".into(),
             user: "jump".into(),
             port: 22,
+            connect_timeout_seconds: None,
             keepalive: Default::default(),
             authentication: Authentication::Agent,
             host_key: None,

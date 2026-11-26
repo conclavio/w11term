@@ -56,7 +56,7 @@ async fn peer() -> Result<(ConnectionShare, mpsc::UnboundedReceiver<Offer>)> {
             .await
     });
     let (handle, fingerprint) =
-        transport::handshake(&options, None, &mut None, None, client).await?;
+        transport::handshake(&options, None, &mut None, None, client, None).await?;
     Ok((
         ConnectionShare::new(handle, options, None, fingerprint, None),
         pending,

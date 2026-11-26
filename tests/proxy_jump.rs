@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     task::JoinHandle,
@@ -151,6 +152,10 @@ impl Fixture {
         Self::start_with_aliases(None).await
     }
     async fn start_with_aliases(aliases: Option<[&str; 3]>) -> Result<Self> {
+        Self::start_route(aliases, None).await
+    }
+
+    async fn start_route(aliases: Option<[&str; 3]>, stall: Option<usize>) -> Result<Self> {
         let keys = tempfile::tempdir()?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut endpoints = Vec::new();
@@ -206,6 +211,7 @@ impl Fixture {
             endpoints.push(JumpHost {
                 host: HOSTS[index].into(),
                 port: address.port(),
+                connect_timeout_seconds: None,
                 keepalive: Default::default(),
                 user: USERS[index].into(),
                 authentication: Authentication::Identity { identity: path },
@@ -225,8 +231,13 @@ impl Fixture {
                 seen: seen.clone(),
             };
             servers.push(tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                if let Ok(running) = server::run_stream(config, stream, peer).await {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if stall == Some(index) {
+                    stream.write_all(b"SSH-2.0-w11term-test\r\n").await.unwrap();
+                    let mut received = Vec::new();
+                    stream.read_to_end(&mut received).await.unwrap();
+                    assert!(received.starts_with(b"SSH-2.0-"));
+                } else if let Ok(running) = server::run_stream(config, stream, peer).await {
                     let _ = running.await;
                 }
             }));
@@ -486,4 +497,37 @@ async fn refused_forward_stops_before_the_next_ssh_handshake() {
         "{diagnostic}"
     );
     assert_eq!(*fixture.seen.lock().unwrap(), [Seen::Auth(0)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_key_exchange_expires_and_closes_a_direct_or_forwarded_stream() {
+    for stalled in [0, 1, 2] {
+        let mut fixture = Fixture::start_route(None, Some(stalled)).await.unwrap();
+        let seconds = Some(1.try_into().unwrap());
+        if let Some(hop) = fixture.options.proxy_jump.get_mut(stalled) {
+            hop.connect_timeout_seconds = seconds;
+        } else {
+            fixture.options.connect_timeout_seconds = seconds;
+        }
+        let (_input, _output, task) = fixture.connect();
+        let error = tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("the endpoint's timeout did not end the handshake")
+            .unwrap()
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("SSH handshake timed out"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains(HOSTS[stalled]), "{diagnostic}");
+        let seen: Vec<_> = (0..stalled)
+            .flat_map(|index| [Seen::Auth(index), Seen::Forward(index)])
+            .collect();
+        assert_eq!(*fixture.seen.lock().unwrap(), seen);
+        tokio::time::timeout(Duration::from_secs(5), &mut fixture.servers[2 - stalled])
+            .await
+            .expect("the timed-out handshake left its stream open")
+            .unwrap();
+    }
 }
