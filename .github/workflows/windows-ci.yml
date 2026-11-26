@@ -209,10 +209,21 @@ jobs:
   package:
     uses: ./.github/workflows/windows-package.yml
 
+  release-order:
+    name: Verify Windows release ordering
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - *checkout
+      - run: python3 -B -m unittest discover -s tests -p test_release_order.py
+
   publish:
     name: Publish the verified merge build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, native-e2e, durable-linux, shell-directory, kitty-reference, mux-replay, package]
+    needs: [test, native-e2e, durable-linux, shell-directory, kitty-reference, mux-replay, package, release-order]
+    concurrency:
+      group: publish-windows-release
+      queue: max
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -257,4 +268,18 @@ jobs:
               --notes "Built from $GITHUB_SHA after merging #$PR_NUMBER. Extract the complete ZIP and launch w11term.exe."
           fi
           gh release upload "$tag" "$archive" "$archive.sha256" --clobber
-          gh release edit "$tag" --draft=false
+          gh release edit "$tag" --draft=false --latest=false
+      - name: Fetch current main history and published tags
+        if: steps.merge.outputs.number != ''
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Mark the newest verified main build as Latest
+        if: steps.merge.outputs.number != ''
+        working-directory: source
+        run: |
+          git switch --detach "$GITHUB_SHA"
+          python3 scripts/promote_windows_release.py
