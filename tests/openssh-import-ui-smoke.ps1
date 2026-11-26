@@ -45,13 +45,24 @@ function Field([string]$Name) {
     (Wait-Until $Name { Find-Element $Name ([System.Windows.Automation.ControlType]::Edit) }).GetCurrentPattern(
         [System.Windows.Automation.ValuePattern]::Pattern)
 }
+function Write-PublicIdentity([string]$Path, [string]$Blob) {
+    [IO.File]::WriteAllText($Path, "ssh-ed25519 $Blob import-fixture`n", $utf8)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return 'SHA256:' + [Convert]::ToBase64String($sha.ComputeHash([Convert]::FromBase64String($Blob))).TrimEnd('=')
+    } finally { $sha.Dispose() }
+}
 try {
     # Absolute local paths keep both readers inside the selected fixture even
     # when the system client's -F config lives outside the user's SSH directory.
     Write-Config $config ('Include "' + $fragments.Replace('\','/') + '/*.conf"')
     $prior = Join-Path $state 'previous.conf'
     Write-Config $prior "Host previous`n    User pilot`n    HostName previous.test`n"
-    Write-Config (Join-Path $fragments '10-destination.conf') @'
+    $destinationIdentity = (Join-Path $state 'build identity.pub').Replace('\','/')
+    $gatewayIdentity = (Join-Path $state 'gateway identity').Replace('\','/')
+    $destinationFingerprint = Write-PublicIdentity $destinationIdentity 'AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF'
+    $gatewayFingerprint = Write-PublicIdentity $gatewayIdentity 'AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti'
+    Write-Config (Join-Path $fragments '10-destination.conf') @"
 Host via
     HostName target.test
     User pilot
@@ -60,8 +71,10 @@ Host via
     ConnectTimeout 23
     ServerAliveInterval 15
     HostKeyAlias Build.Key.Test
-'@
-    Write-Config (Join-Path $fragments '20-gateway.conf') @'
+    IdentityFile "$destinationIdentity"
+    IdentitiesOnly yes
+"@
+    Write-Config (Join-Path $fragments '20-gateway.conf') @"
 Host gateway
     HostName gateway.test
     HostKeyAlias Bastion.Key.Test
@@ -69,7 +82,9 @@ Host gateway
     Port 2201
     ConnectTimeout 11
     ServerAliveInterval 0
-'@
+    IdentityFile "$gatewayIdentity"
+    IdentitiesOnly yes
+"@
     Write-Config (Join-Path $fragments '30-blocked.conf') @'
 # This alias cannot be represented by a native SSH profile.
 Host blocked
@@ -89,6 +104,8 @@ Host web
     $env:W11TERM_IMPORT_SMOKE = $config
     $log = Join-Path $state 'stderr.log'
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError $log
+    # Keep the process handle so the exit code remains readable after the window closes.
+    $null = $terminal.Handle
     $app = $terminal
     $window = Wait-InputWindow
     $priorEndpoint = "Destination`npilot@previous.test:22 (SSH agent)"
@@ -113,8 +130,10 @@ Host web
             if (@($before.psobject.Properties).Count -ne 0) { throw 'Browsing unexpectedly saved a profile' }
         }
     }
-    if (-not $terminal.WaitForExit(30000) -or $terminal.ExitCode -ne 0 -or -not (Select-String -LiteralPath $log -SimpleMatch 'OpenSSH import UI smoke passed')) {
-        throw "OpenSSH import smoke failed ($log). $((Get-Content -LiteralPath $log -Tail 15) -join [Environment]::NewLine)"
+    if (-not $terminal.WaitForExit(30000)) { throw "OpenSSH import smoke did not close the GUI. See $log" }
+    $code = $terminal.ExitCode
+    if ($code -ne 0 -or -not (Select-String -LiteralPath $log -SimpleMatch 'OpenSSH import UI smoke passed')) {
+        throw "OpenSSH import smoke failed (exit $code, $log). $((Get-Content -LiteralPath $log -Tail 15) -join [Environment]::NewLine)"
     }
     $saved = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
     $via = $saved.via
@@ -123,6 +142,10 @@ Host web
     }
     $hop = $via.proxy_jump[0]
     if ($hop.host -cne 'gateway.test' -or $hop.user -cne 'jump' -or $hop.port -ne 2201) { throw "Unexpected saved included gateway. See $profiles" }
+    if ($via.auth -cne 'agent-key' -or $via.agent_fingerprint -cne $destinationFingerprint -or
+        $hop.auth -cne 'agent-key' -or $hop.agent_fingerprint -cne $gatewayFingerprint) {
+        throw "The imported destination and jump did not retain their public key fingerprints. See $profiles"
+    }
     if ($via.host_key_alias -cne 'build.key.test' -or $hop.host_key_alias -cne 'bastion.key.test') { throw "Host key aliases were lost during import or edit. See $profiles" }
     if ($via.keepalive.interval_seconds -ne 15 -or $via.keepalive.max_unanswered -ne 3 -or
         $hop.keepalive.interval_seconds -ne 0) { throw "Keepalive policy was lost during import or edit. See $profiles" }
@@ -172,7 +195,7 @@ Host web
     }
     $gatewayEntry.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $null = Wait-Until 'gateway destination preview' {
-        Find-Element "Destination`njump@gateway.test:2201 (SSH agent, host key alias bastion.key.test)"
+        Find-Element "Destination`njump@gateway.test:2201 (SSH agent key $gatewayFingerprint, host key alias bastion.key.test)"
     }
     Click 'Save profile'
     $null = Wait-Until 'gateway saved for reuse' { Find-Element 'Saved profile gateway' }
@@ -237,6 +260,9 @@ Host web
         $catalog.profiles.web.terminal_type -cne 'xterm-sixel' -or
         $catalog.profiles.'via with jump'.host -cne 'target.test' -or
         $catalog.profiles.'via with jump'.host_key_alias -cne 'build.key.test' -or
+        $catalog.profiles.gateway.agent_fingerprint -cne $gatewayFingerprint -or
+        $catalog.profiles.'via with jump'.agent_fingerprint -cne $destinationFingerprint -or
+        $catalog.profiles.'via with jump'.proxy_jump[0].agent_fingerprint -cne $gatewayFingerprint -or
         $catalog.profiles.'via with jump'.proxy_jump[0].host_key_alias -cne 'bastion.key.test') {
         throw "Unexpected saved group membership or profile options. See $profiles"
     }
@@ -247,6 +273,9 @@ Host web
     $unanswered = Field 'Unanswered keepalives allowed'
     $retryWindow = Field 'SSH retry window (seconds)'
     $connectTimeout = Field 'SSH connection timeout (seconds)'
+    if ((Field 'SSH agent key fingerprint').Current.Value -cne $destinationFingerprint) {
+        throw 'The profile editor did not restore the imported agent fingerprint'
+    }
     if ($interval.Current.Value -cne '15' -or $unanswered.Current.Value -cne '3') {
         throw 'The profile editor did not show the imported keepalive values'
     }
@@ -267,7 +296,8 @@ Host web
     $updated = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.via
     if ($updated.keepalive.interval_seconds -ne 40 -or $updated.keepalive.max_unanswered -ne 6 -or
         $updated.proxy_jump[0].keepalive.interval_seconds -ne 0 -or $updated.player.reconnect_window_seconds -ne 45 -or
-        $updated.connect_timeout_seconds -ne 31 -or $updated.proxy_jump[0].connect_timeout_seconds -ne 11) {
+        $updated.connect_timeout_seconds -ne 31 -or $updated.proxy_jump[0].connect_timeout_seconds -ne 11 -or
+        $updated.agent_fingerprint -cne $destinationFingerprint -or $updated.proxy_jump[0].agent_fingerprint -cne $gatewayFingerprint) {
         throw "Editing destination recovery changed the wrong policy. See $profiles"
     }
     Write-Output "OpenSSH import native smoke passed. Artifacts in $state"

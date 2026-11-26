@@ -1,9 +1,11 @@
 //! Import a selected OpenSSH client configuration into editable native profiles.
 use crate::options::{
-    Authentication, JumpHost, MAX_JUMPS, SshKeepalive, SshOptions, validate_host_key_alias,
+    AgentFingerprint, Authentication, JumpHost, MAX_JUMPS, SshKeepalive, SshOptions,
+    validate_host_key_alias,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
@@ -24,6 +26,7 @@ pub struct ImportedAlias {
 }
 
 mod forwards;
+mod identity;
 mod includes;
 
 pub fn import_file(path: &Path) -> Result<ImportReport> {
@@ -98,6 +101,7 @@ impl Parsed {
             sections: self.sections,
             home,
             user,
+            identity_fingerprints: RefCell::default(),
         };
         let aliases = self
             .aliases
@@ -294,7 +298,14 @@ struct Config<'a> {
     sections: Vec<Section>,
     home: &'a Path,
     user: &'a str,
+    identity_fingerprints: RefCell<BTreeMap<PathBuf, Result<Option<AgentFingerprint>, String>>>,
 }
+
+struct CredentialFile {
+    path: PathBuf,
+    source: Location,
+}
+
 impl Config<'_> {
     fn resolve(&self, alias: &str, warnings: &mut BTreeSet<String>) -> Result<SshOptions> {
         let mut route = Vec::new();
@@ -539,7 +550,7 @@ impl Config<'_> {
             "CertificateFile import requires an explicit IdentityFile for the matching private key"
         );
         let authentication = match identity {
-            Some(identity) => Authentication::identity(identity, certificate),
+            Some(identity) => self.identity_authentication(identity, certificate)?,
             None => Authentication::Agent,
         };
         Ok((
@@ -557,14 +568,47 @@ impl Config<'_> {
         ))
     }
 
+    fn identity_authentication(
+        &self,
+        identity: CredentialFile,
+        certificate: Option<CredentialFile>,
+    ) -> Result<Authentication> {
+        let mut cache = self.identity_fingerprints.borrow_mut();
+        let fingerprint = cache.entry(identity.path.clone()).or_insert_with(|| {
+            identity::public_fingerprint(&identity.path).map_err(|error| format!("{error:#}"))
+        });
+        let agent_fingerprint = match fingerprint {
+            Ok(fingerprint) => fingerprint.clone(),
+            Err(error) => bail!(
+                "{}: IdentityFile {}: {error}",
+                identity.source,
+                identity.path.display()
+            ),
+        };
+        if let Some(agent_fingerprint) = agent_fingerprint {
+            if let Some(certificate) = certificate {
+                bail!(
+                    "{}: importing CertificateFile requires a private IdentityFile, but {} is public",
+                    certificate.source,
+                    identity.path.display()
+                );
+            }
+            return Ok(Authentication::AgentKey { agent_fingerprint });
+        }
+        Ok(Authentication::identity(
+            identity.path,
+            certificate.map(|file| file.path),
+        ))
+    }
+
     fn credential_file(
         &self,
         directives: Vec<&Directive>,
         endpoint_tokens: &[(char, &str)],
         host_key_name: &str,
         label: &str,
-    ) -> Result<Option<PathBuf>> {
-        let mut selected = None;
+    ) -> Result<Option<CredentialFile>> {
+        let mut selected: Option<CredentialFile> = None;
         for d in directives {
             let value = argument(d)?;
             if value.eq_ignore_ascii_case("none") {
@@ -591,11 +635,14 @@ impl Config<'_> {
                 d.line
             );
             ensure!(
-                selected.as_ref().is_none_or(|first| first == &path),
+                selected.as_ref().is_none_or(|first| first.path == path),
                 "{}: multiple {label} entries are additive in OpenSSH; select one file for this profile",
                 d.line
             );
-            selected = Some(path);
+            selected = Some(CredentialFile {
+                path,
+                source: d.line.clone(),
+            });
         }
         Ok(selected)
     }

@@ -68,6 +68,131 @@ fn sorted_fragments_restore_global_scope_and_resolve_relative_to_ssh_home() {
 }
 
 #[test]
+fn public_identity_files_import_only_the_fingerprint_for_each_endpoint() {
+    use russh::keys::{Algorithm, PrivateKey};
+
+    let files = Files::new();
+    let key = || PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let destination = key();
+    let gateway = key();
+    let mut public = format!(
+        "\u{feff}# Jump host key\r\n\r\n\t{} ",
+        gateway.public_key().to_openssh().unwrap()
+    )
+    .into_bytes();
+    public.extend_from_slice(&[0xff, b'\n']);
+    files.put("keys/gateway", public);
+    let destination_path = files.put(
+        "keys/build key.PUB",
+        destination.public_key().to_openssh().unwrap(),
+    );
+    let config = format!(
+        "Host destination\n ProxyJump gateway\n HostKeyAlias build\n IdentitiesOnly yes\n IdentityFile \"~/keys/%k key.PUB\"\n\
+         Host gateway\n IdentitiesOnly yes\n IdentityFile \"{}\"",
+        files
+            .home()
+            .join("keys/gateway")
+            .display()
+            .to_string()
+            .replace('\\', "/"),
+    );
+    let report = files.report(&config).unwrap();
+    let profile = report.aliases[0].options.as_ref().unwrap();
+    let pinned = |key: &PrivateKey| Authentication::AgentKey {
+        agent_fingerprint: AgentFingerprint::for_key(key.public_key()),
+    };
+    assert_eq!(profile.authentication, pinned(&destination));
+    assert_eq!(profile.proxy_jump[0].authentication, pinned(&gateway));
+    assert_eq!(
+        report.aliases[1].options.as_ref().unwrap().authentication,
+        pinned(&gateway)
+    );
+    assert!(report.aliases.iter().all(|alias| alias.warnings.is_empty()));
+
+    let replacement = key();
+    fs::write(
+        destination_path,
+        replacement.public_key().to_openssh().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(profile.authentication, pinned(&destination));
+    let refreshed = files.report(&config).unwrap();
+    assert_eq!(
+        refreshed.aliases[0]
+            .options
+            .as_ref()
+            .unwrap()
+            .authentication,
+        pinned(&replacement)
+    );
+}
+
+#[test]
+fn unusable_public_identity_files_disable_only_the_affected_aliases() {
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
+
+    let files = Files::new();
+    files.put("bad.pub", "ssh-ed25519 invalid-base64");
+    files.put("long.pub", format!("ssh-ed25519 {}", "A".repeat(16_384)));
+    files.put("cert.pub", "ssh-ed25519-cert-v01@openssh.com aaa");
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    files.put("known.pub", key.public_key().to_openssh().unwrap());
+    let private = files.put(
+        "actually-private.pub",
+        key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+    );
+    let report = files
+        .report(
+            "Host missing\n IdentityFile ~/missing.pub\n IdentitiesOnly yes\n\
+         Host malformed\n IdentityFile ~/bad.pub\n\
+         Host oversized\n IdentityFile ~/long.pub\n\
+         Host certificate\n IdentityFile ~/cert.pub\n\
+         Host paired\n IdentityFile ~/known.pub\n CertificateFile ~/other-cert.pub\n\
+         Host network\n IdentityFile //invalid.example/share/key.pub\n\
+         Host private\n IdentityFile ~/actually-private.pub\n",
+        )
+        .unwrap();
+    for (name, diagnostic) in [
+        ("missing", "public key file does not exist"),
+        ("malformed", "invalid OpenSSH public key"),
+        ("oversized", "exceeds 16 KiB"),
+        (
+            "certificate",
+            "OpenSSH certificate is not a plain public IdentityFile",
+        ),
+        ("paired", "requires a private IdentityFile"),
+        ("network", "expected a local drive path"),
+    ] {
+        let entry = report
+            .aliases
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap();
+        assert!(entry.options.is_none(), "{name} unexpectedly imported");
+        assert_eq!(entry.warnings.len(), 1);
+        assert!(
+            entry.warnings[0].contains(diagnostic),
+            "{:?}",
+            entry.warnings
+        );
+        assert!(
+            entry.warnings[0].contains("config:"),
+            "{:?}",
+            entry.warnings
+        );
+    }
+    let imported_private = report
+        .aliases
+        .iter()
+        .find(|entry| entry.name == "private")
+        .unwrap();
+    assert_eq!(
+        imported_private.options.as_ref().unwrap().authentication,
+        Authentication::identity(private, None)
+    );
+}
+
+#[test]
 fn unsupported_scope_and_trust_block_only_the_relevant_alias_with_source_line() {
     let files = Files::new();
     files.put(".ssh/fragment config","Host bad\n# comment\n HostKeyAlias wildcard*\nHost nested\n Include corrupted\nHost port\n Port 0\nHost ok\n");
