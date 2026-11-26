@@ -66,6 +66,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "wait-ssh-connected"
             | "wait-pane-exit"
             | "close-pane"
+            | "split-pane"
             | "list-commands"
             | "get-command"
             | "get-running-output"
@@ -364,6 +365,57 @@ mod tests {
             "open --profile desk --window 0",
             "open --profile desk --window 1 --window 2",
             "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn splits_an_explicit_pane_with_a_saved_profile() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (pid, request) = parse(
+            [
+                "--pid",
+                "7",
+                "split-pane",
+                "--pane",
+                "42",
+                "--profile",
+                "Fleet Ops",
+                "--axis",
+                "columns",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb": "split-pane", "pane": 42, "profile": "Fleet Ops", "axis": "columns",
+                "activate": false,
+            })
+        );
+        assert!(matches!(
+            parse_line("split-pane --pane 42 --profile local --axis rows --activate")
+                .unwrap()
+                .1,
+            Request::SplitPane {
+                axis: w11term::pane_layout::Axis::Rows,
+                activate: true,
+                ..
+            }
+        ));
+        for invalid in [
+            "split-pane --pane 42 --profile local",
+            "split-pane --pane 42 --axis rows",
+            "split-pane --profile local --axis rows",
+            "split-pane --pane 0 --profile local --axis rows",
+            "split-pane --pane 42 --pane 43 --profile local --axis rows",
+            "split-pane --pane 42 --profile local --profile remote --axis rows",
+            "split-pane --pane 42 --profile local --axis diagonal",
+            "split-pane --pane 42 --profile local --axis rows --axis columns",
+            "split-pane --pane 42 --profile local --axis rows --window 1",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

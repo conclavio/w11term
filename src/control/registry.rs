@@ -559,7 +559,8 @@ mod tests {
             let reply = match request {
                 UiRequest::Open { reply, .. }
                 | UiRequest::Resize { reply, .. }
-                | UiRequest::ClosePane { reply, .. } => reply,
+                | UiRequest::ClosePane { reply, .. }
+                | UiRequest::SplitPane { reply, .. } => reply,
                 _ => unreachable!("unexpected window control request"),
             };
             let _ = reply.send(Ok(json!(id)));
@@ -768,14 +769,28 @@ mod tests {
         let (reply, closed) = oneshot::channel();
         one.post_pane_request(5, UiRequest::ClosePane { pane: 5, reply });
         let queued_close = source_ui.try_recv().unwrap();
+        let (reply, split) = oneshot::channel();
+        one.post_pane_request(
+            5,
+            UiRequest::SplitPane {
+                pane: 5,
+                profile: "desk".into(),
+                axis: crate::pane_layout::Axis::Columns,
+                activate: false,
+                reply,
+            },
+        );
+        let queued_split = source_ui.try_recv().unwrap();
         let transfer = one.begin_transfer(&[5]).unwrap();
         two.replace([pane]);
         one.replace([]);
         drop(transfer);
         assert!(one.for_this_window(queued_resize).is_none());
         assert!(one.for_this_window(queued_close).is_none());
+        assert!(one.for_this_window(queued_split).is_none());
         assert_eq!(received.await.unwrap().unwrap(), 2);
         assert_eq!(closed.await.unwrap().unwrap(), 2);
+        assert_eq!(split.await.unwrap().unwrap(), 2);
     }
 
     #[tokio::test]

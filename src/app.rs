@@ -3431,25 +3431,28 @@ impl TerminalApp {
         if selected {
             self.activate(context);
         } else if in_active_tab {
-            // Refresh layout-dependent state without retargeting the keyboard
-            // or restarting selection and find in the surviving active pane.
-            self.pane_drop.cancel();
-            self.cancel_frame_tasks();
-            self.sync_active_window_profile(false);
-            self.refresh_wheel_panes();
-            self.refresh_notification_visibility();
-            let survivors = self
-                .tabs
-                .active_layout()
-                .expect("split has a surviving pane")
-                .leaves();
-            self.panes_rearranged(survivors);
-            self.watch_frames(context);
-            self.refresh_open_commands();
+            self.refresh_split_layout(context);
         } else {
             self.publish_panes();
             self.refresh_open_commands();
         }
+    }
+
+    /// Refresh the selected split's layout while leaving its keyboard target and search in place.
+    fn refresh_split_layout(&mut self, context: &ComponentContext<Self>) {
+        self.pane_drop.cancel();
+        self.cancel_frame_tasks();
+        self.sync_active_window_profile(false);
+        self.refresh_wheel_panes();
+        self.refresh_notification_visibility();
+        let panes = self
+            .tabs
+            .active_layout()
+            .expect("the selected tab still has panes")
+            .leaves();
+        self.panes_rearranged(panes);
+        self.watch_frames(context);
+        self.refresh_open_commands();
     }
 
     fn control_close_pane(
@@ -3594,7 +3597,7 @@ impl TerminalApp {
             None,
         )
         .with_profile(profile_name);
-        self.insert_split(id, leaf, axis, context);
+        let _ = self.insert_split(id, leaf, axis, context);
     }
 
     fn insert_split(
@@ -3603,12 +3606,57 @@ impl TerminalApp {
         leaf: AppTab,
         axis: Axis,
         context: &ComponentContext<Self>,
-    ) {
-        if self.tabs.split(id, leaf, axis).is_some() {
-            self.initial_grid.set(None);
-            self.sync_selection(context);
-            self.activate(context);
+    ) -> Option<TabId> {
+        let child = self.tabs.split(id, leaf, axis)?;
+        self.initial_grid.set(None);
+        self.sync_selection(context);
+        self.activate(context);
+        Some(child)
+    }
+
+    fn control_split_pane(
+        &mut self,
+        pane: u64,
+        profile: String,
+        axis: Axis,
+        activate: bool,
+        context: &ComponentContext<Self>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let target = self
+            .tab_for_pane(pane)
+            .with_context(|| format!("unknown terminal pane {pane}"))?;
+        let tab_id = self.tabs.group_id(target).context("the pane has no tab")?;
+        let source = self
+            .store
+            .catalog()?
+            .source(&profile)
+            .with_context(|| format!("unknown profile {profile}"))?;
+        let leaf = self.make_live_tab(profile.clone(), source, Some(profile));
+        let new_pane = leaf.pane_id().expect("new terminal has a pane ID");
+        if activate {
+            self.insert_split(target, leaf, axis, context)
+                .context("could not split the target pane")?;
+        } else {
+            let child = self
+                .tabs
+                .split_background(target, leaf, axis)
+                .context("could not split the target pane")?;
+            if self.tabs.visible(child) {
+                self.initial_grid.set(None);
+                self.refresh_split_layout(context);
+            } else {
+                self.publish_panes();
+                self.refresh_open_commands();
+            }
         }
+        Ok(serde_json::json!({
+            "source_pane": pane,
+            "pane": new_pane,
+            "tab_id": tab_id,
+            "window_id": self.registry.window_id(),
+            "axis": axis,
+            "active": activate,
+        }))
     }
 
     fn resize_split(&mut self, id: TabId, cols: usize, rows: usize) -> anyhow::Result<()> {
@@ -6703,6 +6751,18 @@ impl Component for TerminalApp {
             Message::Control(w11term::control::UiRequest::ClosePane { pane, reply }) => {
                 if !reply.is_closed() {
                     let result = self.control_close_pane(pane, context);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::SplitPane {
+                pane,
+                profile,
+                axis,
+                activate,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = self.control_split_pane(pane, profile, axis, activate, context);
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }

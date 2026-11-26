@@ -781,6 +781,15 @@ impl<T> Tabs<T> {
     }
 
     pub fn split(&mut self, target: TabId, value: T, axis: Axis) -> Option<TabId> {
+        self.insert_split(target, value, axis, true)
+    }
+
+    /// Split a leaf while retaining the selected tab, pane and zoom.
+    pub fn split_background(&mut self, target: TabId, value: T, axis: Axis) -> Option<TabId> {
+        self.insert_split(target, value, axis, false)
+    }
+
+    fn insert_split(&mut self, target: TabId, value: T, axis: Axis, select: bool) -> Option<TabId> {
         let group_id = self.group_id(target)?;
         let group = self.groups.iter_mut().find(|g| g.id == group_id)?;
         let id = next_id();
@@ -793,9 +802,11 @@ impl<T> Tabs<T> {
             value,
             visit: None,
         });
-        group.focused = id;
-        group.zoomed = false;
-        self.active_group = Some(group_id);
+        if select {
+            group.focused = id;
+            group.zoomed = false;
+            self.active_group = Some(group_id);
+        }
         Some(id)
     }
     pub fn select(&mut self, id: TabId) -> bool {
@@ -1937,6 +1948,29 @@ mod tests {
         let reopened = tabs.reopen_pane(&location, "fresh local");
         assert_eq!(tabs.active_layout(), Some(&Layout::Leaf(reopened)));
         assert_eq!(tabs.layout_for(other), Some(&existing));
+    }
+
+    #[test]
+    fn background_split_preserves_both_tab_selections_and_the_target_zoom() {
+        let mut tabs = Tabs::default();
+        let left = tabs.insert("left");
+        let right = tabs.split(left, "right", Axis::Columns).unwrap();
+        assert!(tabs.toggle_zoom());
+        let other = tabs.insert("other");
+        let beside = tabs.split_background(left, "beside", Axis::Rows).unwrap();
+        assert_eq!(tabs.active_id(), Some(other));
+        assert!(!tabs.visible(beside));
+
+        assert!(tabs.select_index(0));
+        assert_eq!(tabs.active_id(), Some(right));
+        assert!(tabs.zoomed());
+        assert!(tabs.visible(right) && !tabs.visible(beside));
+        assert!(tabs.toggle_zoom());
+        assert_eq!(
+            tabs.active_layout().unwrap().leaves(),
+            [left, beside, right]
+        );
+        assert!(tabs.visible(beside));
     }
 
     #[test]
