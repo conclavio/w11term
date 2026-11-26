@@ -190,6 +190,28 @@ async fn serve_forward_http(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manages two real loopback forwarding listeners across background SSH panes"]
+async fn native_active_port_forwards_manages_background_listeners() {
+    let (Source::Ssh(mut ssh), root, shells, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    ssh.player.reconnect = false;
+    let state = tempfile::tempdir().unwrap();
+    let (_, service) = serve_forward_http(state.path(), root.path(), 2).await;
+    fs::write(root.path().join("disconnect-on-eot"), []).unwrap();
+    drive_mixed_gui("active-port-forwards-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), service)
+            .await
+            .unwrap()
+            .unwrap(),
+        [1, 2]
+    );
+    assert_eq!(shells.load(Ordering::Relaxed), 2, "one shell per pane");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "imports and edits loopback SSH forward presets and starts one only on explicit request"]
 async fn native_imported_forward_preset_remains_inactive_across_save_open_and_reconnect() {
     let accepted = Arc::new(AtomicUsize::new(0));

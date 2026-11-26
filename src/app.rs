@@ -389,6 +389,7 @@ enum SettingsEditor {
 }
 enum Page {
     LocalForwards(local_forwards::Panel),
+    ForwardOverview(String),
     SharedFolders(folder_shares::Panel),
     Attention(attention::AttentionPage),
     SftpTransfers,
@@ -798,6 +799,9 @@ fn tab_menu_message(label: String) -> Message {
         "Move tab left" => Message::Shortcut(Shortcut::MoveTabLeft),
         "Move tab right" => Message::Shortcut(Shortcut::MoveTabRight),
         "SFTP files" => Message::Files(FileAction::Toggle),
+        local_forwards::overview::LABEL => {
+            Message::LocalForward(local_forwards::Action::OpenOverview)
+        }
         "Workspace startup…" => {
             Message::Workspace(workspace_view::WorkspaceAction::ConfigureStartup)
         }
@@ -3904,6 +3908,7 @@ impl TerminalApp {
             self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
             MenuItem::item("ssh-host-group", host_groups::LABEL),
             MenuItem::item("sftp-transfers", sftp_transfers::LABEL),
+            MenuItem::item("active-port-forwards", local_forwards::overview::LABEL),
             MenuItem::item("inbox", "Attention inbox"),
             MenuItem::item("settings", "Settings"),
             MenuItem::separator("window-actions"),
@@ -7348,6 +7353,7 @@ impl Component for TerminalApp {
                 Page::HostGroup(page) => self.host_group_view(id, page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),
                 Page::LocalForwards(page) => self.forward_view(id, page, context),
+                Page::ForwardOverview(feedback) => self.forward_overview(id, feedback, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,

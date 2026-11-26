@@ -3,7 +3,9 @@ use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 use w11term::options::LocalForwardPreset;
-use w11term::ssh::LocalForward;
+use w11term::ssh::{LocalForward, LocalForwardStatus};
+
+pub(super) mod overview;
 
 pub(super) const LABEL: &str = "Forward a local port…";
 const TITLE: &str = "Local port forwards";
@@ -38,6 +40,38 @@ struct Route {
     generation: u64,
     handle: LocalForward,
     stopping: bool,
+}
+
+impl Route {
+    fn state_label(&self, status: &LocalForwardStatus) -> String {
+        if self.stopping {
+            "Stopping…".into()
+        } else if status.running {
+            let count = status.active_clients;
+            format!(
+                "Listening · {count} active connection{}",
+                if count == 1 { "" } else { "s" }
+            )
+        } else {
+            "Stopped".into()
+        }
+    }
+
+    fn copy_address(&self) -> Option<String> {
+        if self.stopping || !self.handle.status().running {
+            return None;
+        }
+        let address = windows_address(self.handle.local_port());
+        Some(match w11term::clipboard::write(&address) {
+            Ok(()) => format!("Copied Windows address {address}."),
+            Err(error) => format!("Could not copy address · {error:#}"),
+        })
+    }
+
+    fn stop(&mut self) {
+        self.stopping = true;
+        self.handle.stop();
+    }
 }
 
 // Owned by the terminal pane. A manager can be opened and closed independently.
@@ -171,6 +205,8 @@ impl Panel {
 pub enum Action {
     Open(Origin),
     Panel(TabId, Origin, Edit),
+    OpenOverview,
+    Overview(TabId, overview::Edit),
 }
 
 pub enum Edit {
@@ -226,6 +262,27 @@ fn changed<T>(watches: &mut Vec<watch::Receiver<T>>) -> bool {
     changed
 }
 
+fn watch_updates(
+    ctx: &ComponentContext<TerminalApp>,
+    mut connections: Vec<watch::Receiver<()>>,
+    mut listeners: Vec<watch::Receiver<LocalForwardStatus>>,
+    refresh: impl Fn() -> Message + 'static,
+) -> Option<crate::ui_timer::RetryTimer> {
+    if connections.is_empty() && listeners.is_empty() {
+        return None;
+    }
+    let sender = ctx.sender();
+    const INTERVAL: u32 = 250;
+    crate::ui_timer::RetryTimer::with_next_delay(INTERVAL, move || {
+        let connection_changed = changed(&mut connections);
+        if changed(&mut listeners) || connection_changed {
+            sender.send(refresh());
+        }
+        INTERVAL
+    })
+    .ok()
+}
+
 impl TerminalApp {
     pub(super) fn forward_origin(&self) -> Option<Origin> {
         let Page::Terminal(tab) = &self.tabs.active()?.page else {
@@ -247,6 +304,13 @@ impl TerminalApp {
         let Some(id) = self.tabs.active_id() else {
             return;
         };
+        if matches!(
+            self.tabs.get(id).map(|tab| &tab.page),
+            Some(Page::ForwardOverview(_))
+        ) {
+            self.watch_forward_overview(id, ctx);
+            return;
+        }
         let Some(AppTab {
             page: Page::LocalForwards(panel),
             ..
@@ -261,7 +325,7 @@ impl TerminalApp {
         let Page::Terminal(tab) = &self.tabs.get(source).unwrap().page else {
             return;
         };
-        let mut connection = vec![tab.session.ssh_connection_changes()];
+        let connections = vec![tab.session.ssh_connection_changes()];
         let mut listeners = Vec::new();
         for route in &tab.forwards.entries {
             let watch = route.handle.subscribe();
@@ -271,16 +335,9 @@ impl TerminalApp {
             }
         }
         self.finish_stopped_forwards(id, source);
-        let sender = ctx.sender();
-        const INTERVAL: u32 = 250;
-        self.forward_watch = crate::ui_timer::RetryTimer::with_next_delay(INTERVAL, move || {
-            let connection_changed = changed(&mut connection);
-            if changed(&mut listeners) || connection_changed {
-                sender.send(edit(id, origin, Edit::Refresh));
-            }
-            INTERVAL
-        })
-        .ok();
+        self.forward_watch = watch_updates(ctx, connections, listeners, move || {
+            edit(id, origin, Edit::Refresh)
+        });
     }
 
     fn finish_stopped_forwards(&mut self, panel_id: TabId, source: TabId) {
@@ -340,6 +397,8 @@ impl TerminalApp {
                 return;
             }
             Action::Panel(id, origin, action) => (id, origin, action),
+            Action::OpenOverview => return self.open_forward_overview(ctx),
+            Action::Overview(id, action) => return self.edit_forward_overview(id, action, ctx),
         };
         if self.tabs.active_id() != Some(id) {
             return;
@@ -426,19 +485,14 @@ impl TerminalApp {
                     }) else {
                         return;
                     };
-                    let port = route.handle.local_port();
                     if matches!(action, Edit::Copy(_)) {
-                        if !route.handle.status().running {
+                        let Some(feedback) = route.copy_address() else {
                             return;
-                        }
-                        match w11term::clipboard::write(&windows_address(port)) {
-                            Ok(()) => format!("Copied Windows address {}.", windows_address(port)),
-                            Err(error) => format!("Could not copy address · {error:#}"),
-                        }
+                        };
+                        feedback
                     } else {
-                        route.stopping = true;
-                        route.handle.stop();
-                        format!("Stopping forwarding port {port}…")
+                        route.stop();
+                        format!("Stopping forwarding port {}…", route.handle.local_port())
                     }
                 }
                 _ => return,
@@ -540,17 +594,7 @@ impl TerminalApp {
                 let local = route.handle.local_port();
                 let remote = route.handle.remote_port();
                 let status = route.handle.status();
-                let state = if route.stopping {
-                    "Stopping…".to_owned()
-                } else if status.running {
-                    let count = status.active_clients;
-                    format!(
-                        "Listening · {count} active connection{}",
-                        if count == 1 { "" } else { "s" }
-                    )
-                } else {
-                    "Stopped".to_owned()
-                };
+                let state = route.state_label(&status);
                 let mut details = vec![
                     KeyedView::new(
                         "address",

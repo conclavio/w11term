@@ -716,6 +716,8 @@ If a development server on the SSH host listens on `127.0.0.1:8000`, open the co
 
 Both endpoints use IPv4 loopback. Each client connection uses the pane's authenticated SSH connection, and the SSH server must allow local TCP forwarding. Use **Stop** on a forward to close its listener and connected clients. Closing the owning pane or losing its SSH connection also stops its forwards, even when another pane shares that login. You can start a fresh forward after reconnecting. [OpenSSH local forwarding](https://man.openbsd.org/ssh#L)
 
+Choose **More → Active port forwards** or find the same action in the command palette to see listeners across the current window, including background tabs. Each row shows its SSH pane, Windows and remote endpoints, and active client count. Copy the Windows address, focus the owning pane, or stop that listener from the list.
+
 The OpenSSH profile importer recognizes loopback port pairs such as `LocalForward 15432 127.0.0.1:5432`. The import preview lists the saved pairs and identifies rules it skips by alias and source line. In the profile's SSH pane, choose **Forward a local port… → Use saved forward… → Windows 15432 → remote 5432** to fill in both ports. Choose **Start forwarding** when you need the connection. After reconnecting, you can select and start the saved pair again. [OpenSSH LocalForward](https://man.openbsd.org/ssh_config#LocalForward)
 
 To manage these pairs directly, open **Settings → Profiles → Edit… → Saved local forwards**. Enter the Windows and remote loopback ports and choose **Add saved forward**, or remove an existing pair. Save the profile and open a new session to use the updated list. Saving the profile leaves listeners under manual control.
