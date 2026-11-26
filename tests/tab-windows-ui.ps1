@@ -1205,7 +1205,13 @@ function Test-CopySavedWorkspace {
         $sourceClaim.workspace -cne $originalClaim.workspace) {
         throw 'The copy shares the original workspace identity'
     }
-    (Find-Here $copied 'Cockpit tools').GetCurrentPattern($select).Select()
+    $null = Wait-Until 'the copied split is selected after the WinUI tab collection settles' {
+        if ((Control @('list')).sessions | Where-Object { $_.id -eq $copySsh.id -and $_.active }) {
+            return $true
+        }
+        $tab = Find-Here $copied 'Cockpit tools'
+        if ($tab) { $tab.GetCurrentPattern($select).Select() }
+    }
     Expect-Focus $copied $copySsh.id 'The copied split has its own SSH pane'
     Expect-Text $copySsh.id 'ready'
     Type-In $copied 'copy-recipe/'
