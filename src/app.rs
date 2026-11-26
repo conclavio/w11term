@@ -809,6 +809,8 @@ fn tab_menu_message(label: String) -> Message {
         "Cancel command notification" => Message::Attention(attention::Action::WatchCommand(false)),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
+        command_palette::SPLIT_RIGHT_PROFILE_LABEL => Message::FindSplitProfile(Axis::Columns),
+        command_palette::SPLIT_BELOW_PROFILE_LABEL => Message::FindSplitProfile(Axis::Rows),
         "Split right in current directory" => {
             Message::Shortcut(Shortcut::SplitRightInCurrentDirectory)
         }
@@ -1101,6 +1103,7 @@ pub enum Message {
     HintRevealed(Arc<()>, Result<(), String>),
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
+    FindSplitProfile(Axis),
     OpenInDirectory(directory_split::Destination, directory_split::Origin),
     OpenExplorer(directory_split::Origin),
     CopyCurrentDirectory(directory_split::Origin),
@@ -4113,10 +4116,21 @@ impl TerminalApp {
         }
     }
 
-    fn split_items(&self) -> [MenuItem; 2] {
+    fn split_items(&self) -> [MenuItem; 4] {
+        let can_choose = self.move_source().is_some();
         [
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            command_menu_item(
+                "find-profile-split-right",
+                command_palette::SPLIT_RIGHT_PROFILE_LABEL,
+                can_choose,
+            ),
+            command_menu_item(
+                "find-profile-split-below",
+                command_palette::SPLIT_BELOW_PROFILE_LABEL,
+                can_choose,
+            ),
         ]
     }
 
@@ -6358,6 +6372,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::SplitPane(axis, profile) => self.split_pane(axis, profile, context),
+            Message::FindSplitProfile(axis) => self.open_profile_search(Some(axis), context),
             Message::OpenInDirectory(destination, origin) => {
                 self.open_in_directory(destination, origin, context)
             }
@@ -6572,7 +6587,7 @@ impl Component for TerminalApp {
             },
             Message::ProfileMenu(label) => {
                 if label == command_palette::FIND_PROFILE_LABEL {
-                    self.open_profile_search(context);
+                    self.open_profile_search(None, context);
                 } else if label == NEW_PROFILE {
                     self.utility(false, context);
                 } else if label == quick_connect::LABEL {

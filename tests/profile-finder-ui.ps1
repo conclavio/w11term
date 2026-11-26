@@ -12,6 +12,8 @@ $port = $catalog.profiles.'Fleet North'.port
 $newPort = if ($port -eq 65535) { $port - 1 } else { $port + 1 }
 $dot = ' ' + [char]0xb7 + ' '
 $findProfile = 'Find profile' + [char]0x2026
+$findRight = 'Find profile to split right' + [char]0x2026
+$findBelow = 'Find profile to split below' + [char]0x2026
 $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
 $value = [System.Windows.Automation.ValuePattern]::Pattern
@@ -24,8 +26,8 @@ function Open-ProfileFinder {
     Invoke-Button $entry
     Wait-PickerEditor 'Search profiles' 'the New tab profile finder'
 }
-function Select-Search([string]$Query, [string]$Result) {
-    $field = Wait-PickerEditor 'Search profiles' 'the current profile finder'
+function Select-Search([string]$Query, [string]$Result, [string]$Editor = 'Search profiles') {
+    $field = Wait-PickerEditor $Editor 'the current profile finder'
     $field.GetCurrentPattern($value).SetValue($Query)
     $null = Wait-Until "profile result '$Result'" { Find-Element $Result $button -Visible }
     Press-Key 13
@@ -81,6 +83,53 @@ try {
     if ($ids.Count -ne 3 -or $origin -notin $ids -or $remote -notin $ids) {
         throw 'The profile finder changed the previous live panes'
     }
+
+    $tabId = ((Control @('list')).sessions | Where-Object id -eq $local).tab_id
+    $full = Wait-Until 'measured unsplit PowerShell' {
+        $area = Control @('inspect','--pane',"$local")
+        if ($area.pixel_width -gt 0 -and $area.pixel_height -gt 0) { $area }
+    }
+    Invoke-NativeMenuAction 'Pane layout' $findRight
+    $field = Wait-PickerEditor 'Search profiles to split right' 'Pane layout'
+    $field.GetCurrentPattern($value).SetValue('Fleet North')
+    $null = Wait-Until 'the right split offers the SSH profile' { Find-Element $north $button -Visible }
+    Press-Key 27
+    $null = Wait-Until 'Escape closes the split finder' { !(Find-Element 'Search profiles to split right' $edit) }
+    Wait-Focus $local
+    if (@((Control @('list')).sessions).Count -ne $ids.Count) { throw 'Canceling the split created a pane' }
+
+    Invoke-NativeMenuAction 'Pane layout' $findRight
+    Select-Search "$port NORTH TEST@127.0.0.1" $north 'Search profiles to split right'
+    $right = Wait-Until 'SSH opens on the PowerShell tab' {
+        ((Control @('list')).sessions | Where-Object {
+            $_.label -ceq 'Fleet North' -and $_.active -and $_.tab_id -eq $tabId
+        }).id
+    }
+    $null = Control @('wait-for-text','--pane',"$right",'--timeout','15','ready')
+    $rightArea = Wait-Until 'the right split divides the tab horizontally' {
+        $left = Control @('inspect','--pane',"$local")
+        $rightSize = Control @('inspect','--pane',"$right")
+        if ($left.pixel_width -gt 0 -and $rightSize.pixel_width -gt 0 -and
+            $left.pixel_width -lt $full.pixel_width -and $rightSize.pixel_width -lt $full.pixel_width -and
+            $left.pixel_height -eq $rightSize.pixel_height) { $rightSize }
+    }
+
+    Run-Palette $findBelow
+    Select-Search 'local PALETTE' "Palette PowerShell${dot}Local" 'Search profiles to split below'
+    $below = Wait-Until 'another PowerShell opens below the SSH pane on the same tab' {
+        ((Control @('list')).sessions | Where-Object {
+            $_.label -ceq 'Palette PowerShell' -and $_.active -and $_.tab_id -eq $tabId -and $_.id -ne $local
+        }).id
+    }
+    $null = Control @('wait-for-text','--pane',"$below",'--timeout','15','PS ')
+    $null = Wait-Until 'the below split divides the right column vertically' {
+        $upper = Control @('inspect','--pane',"$right")
+        $lower = Control @('inspect','--pane',"$below")
+        $upper.pixel_height -gt 0 -and $lower.pixel_height -gt 0 -and
+            $upper.pixel_height -lt $rightArea.pixel_height -and $lower.pixel_height -lt $rightArea.pixel_height -and
+            $upper.pixel_width -eq $lower.pixel_width
+    }
+    $ids += @($right, $below)
 
     Run-Palette 'Settings'
     $filter = Wait-Until 'profile filter in Settings' { Find-Element 'Filter profiles' $edit -Visible }

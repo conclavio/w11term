@@ -766,9 +766,12 @@ async fn native_profile_order_survives_restart_and_launches_the_selected_backend
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "searches the native new-tab profiles and revalidates the offered SSH endpoint"]
+#[ignore = "searches native profiles for tabs and splits and revalidates the offered SSH endpoint"]
 async fn native_profile_finder_matches_address_and_opens_ssh_and_powershell() {
-    let (Source::Ssh(ssh), _remote, channels, server) = fixture_server(false).await else {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), _remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
         unreachable!()
     };
     let state = tempfile::tempdir().unwrap();
@@ -794,9 +797,10 @@ async fn native_profile_finder_matches_address_and_opens_ssh_and_powershell() {
     drive_gui("profile-finder-ui.ps1", state.path());
     assert_eq!(
         channels.load(Ordering::Relaxed),
-        1,
-        "only the selected SSH shell"
+        2,
+        "only the two selected SSH shells"
     );
+    assert_eq!(accepted.load(Ordering::Relaxed), 2, "each SSH login");
     server.abort();
 }
 

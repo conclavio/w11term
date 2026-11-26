@@ -6,12 +6,20 @@ use w11term::terminal::BookmarkScreen;
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
 pub(super) const FIND_PROFILE_LABEL: &str = "Find profile…";
+pub(super) const SPLIT_RIGHT_PROFILE_LABEL: &str = "Find profile to split right…";
+pub(super) const SPLIT_BELOW_PROFILE_LABEL: &str = "Find profile to split below…";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileDestination {
+    Tab,
+    Split { axis: Axis, origin: TabId },
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Search {
     Window,
     Tabs,
-    Profiles,
+    Profiles(ProfileDestination),
     GroupLibrary(TabId),
     GroupRecent(TabId),
     GroupRuns(TabId),
@@ -20,11 +28,22 @@ pub(super) enum Search {
 }
 
 impl Search {
+    pub(super) fn is_profiles(self) -> bool {
+        matches!(self, Self::Profiles(_))
+    }
+
     fn placeholder(self) -> &'static str {
         match self {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
-            Self::Profiles => "Search profiles",
+            Self::Profiles(ProfileDestination::Tab) => "Search profiles",
+            Self::Profiles(ProfileDestination::Split {
+                axis: Axis::Columns,
+                ..
+            }) => "Search profiles to split right",
+            Self::Profiles(ProfileDestination::Split {
+                axis: Axis::Rows, ..
+            }) => "Search profiles to split below",
             Self::Bookmarks(..) => "Search scrollback bookmarks",
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
@@ -51,7 +70,7 @@ impl Search {
             }
             Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
-            Self::Profiles => "No matching profiles",
+            Self::Profiles(_) => "No matching profiles",
             Self::Bookmarks(..) if query.is_empty() => "No retained scrollback bookmarks",
             Self::Bookmarks(..) => "No matching scrollback bookmarks",
             _ => "No matching commands",
@@ -119,7 +138,7 @@ pub enum CommandId {
     OpenExplorer(Option<directory_split::Origin>),
     CopyCurrentDirectory(Option<directory_split::Origin>),
     Profile(String),
-    LaunchProfile(String, Option<String>),
+    LaunchProfile(ProfileDestination, String, Option<String>),
     Shortcut(Shortcut),
 }
 
@@ -239,7 +258,11 @@ fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
     rows
 }
 
-pub(super) fn profile_search_rows(catalog: &Profiles, query: &str) -> Vec<Row> {
+pub(super) fn profile_search_rows(
+    catalog: &Profiles,
+    destination: ProfileDestination,
+    query: &str,
+) -> Vec<Row> {
     let query = profile_query::Query::new(query);
     let mut matches = Vec::new();
     for name in &catalog.profile_order {
@@ -250,7 +273,7 @@ pub(super) fn profile_search_rows(catalog: &Profiles, query: &str) -> Vec<Row> {
                 rank,
                 Row {
                     label: format!("{name} · {details}"),
-                    id: CommandId::LaunchProfile(name.clone(), endpoint),
+                    id: CommandId::LaunchProfile(destination, name.clone(), endpoint),
                     chord: String::new(),
                     enabled: true,
                 },
@@ -878,9 +901,19 @@ impl TerminalApp {
                 attention::set_long_commands(origin, enabled)
             }
             CommandId::Profile(label) => Message::ProfileMenu(label),
-            CommandId::LaunchProfile(name, _) => {
-                if let Some(source) = self.catalog.source(&name) {
-                    self.open(name.clone(), source, Some(name), ctx);
+            CommandId::LaunchProfile(destination, name, _) => {
+                match destination {
+                    ProfileDestination::Tab => {
+                        if let Some(source) = self.catalog.source(&name) {
+                            self.open(name.clone(), source, Some(name), ctx);
+                        }
+                    }
+                    ProfileDestination::Split { axis, origin }
+                        if self.move_source() == Some(origin) =>
+                    {
+                        self.split_pane(axis, Some(name), ctx);
+                    }
+                    ProfileDestination::Split { .. } => {}
                 }
                 return;
             }
@@ -919,7 +952,7 @@ pub(super) fn view(
     let trimming = if matches!(
         mode,
         Search::Tabs
-            | Search::Profiles
+            | Search::Profiles(_)
             | Search::GroupRecent(_)
             | Search::GroupRuns(_)
             | Search::WindowGroupRuns(_)
@@ -935,7 +968,7 @@ pub(super) fn view(
             TextBox::new()
                 .element_ref(input)
                 .text(query)
-                .placeholder_text(if mode == Search::Profiles {
+                .placeholder_text(if mode.is_profiles() {
                     "Search by profile name or SSH address"
                 } else {
                     search_label
@@ -947,7 +980,7 @@ pub(super) fn view(
                 .style(ButtonStyle::Subtle)
                 .automation_name(match mode {
                     Search::Tabs => "Close tab search",
-                    Search::Profiles => "Close profile search",
+                    Search::Profiles(_) => "Close profile search",
                     Search::Bookmarks(..) => "Close bookmark search",
                     _ => "Close command palette",
                 })
@@ -994,7 +1027,7 @@ pub(super) fn view(
                     .as_ref()
                     .and_then(|picker| picker.bookmark_status(app))
                     .unwrap_or_else(|| {
-                        if mode == Search::Profiles && app.profile_error.is_some() {
+                        if mode.is_profiles() && app.profile_error.is_some() {
                             "Could not load profiles"
                         } else {
                             mode.empty(query)
@@ -1013,7 +1046,7 @@ pub(super) fn view(
                     Button::new()
                         .automation_name(match mode {
                             Search::Tabs => "Previous tabs",
-                            Search::Profiles => "Previous profiles",
+                            Search::Profiles(_) => "Previous profiles",
                             _ => "Previous commands",
                         })
                         .is_enabled(first > 0)
@@ -1027,7 +1060,7 @@ pub(super) fn view(
                     Button::new()
                         .automation_name(match mode {
                             Search::Tabs => "Next tabs",
-                            Search::Profiles => "Next profiles",
+                            Search::Profiles(_) => "Next profiles",
                             _ => "Next commands",
                         })
                         .is_enabled(last < rows.len())
@@ -1071,7 +1104,7 @@ mod tests {
             .into();
 
         let labels = |query| {
-            profile_search_rows(&catalog, query)
+            profile_search_rows(&catalog, ProfileDestination::Tab, query)
                 .into_iter()
                 .map(|row| row.label)
                 .collect::<Vec<_>>()
@@ -1092,8 +1125,12 @@ mod tests {
         assert_eq!(labels("west lab")[0], "West lab · ops@[2001:db8::1]:6789");
         assert!(labels("west east").is_empty());
         assert_eq!(
-            profile_search_rows(&catalog, "6792")[0].id,
-            CommandId::LaunchProfile("West    lab".into(), Some("ops@[2001:db8::1]:6792".into()))
+            profile_search_rows(&catalog, ProfileDestination::Tab, "6792")[0].id,
+            CommandId::LaunchProfile(
+                ProfileDestination::Tab,
+                "West    lab".into(),
+                Some("ops@[2001:db8::1]:6792".into())
+            )
         );
     }
 

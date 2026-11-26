@@ -632,11 +632,24 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
-    pub(super) fn open_profile_search(&mut self, ctx: &ComponentContext<Self>) {
-        if self.picker.is_none() {
-            self.start_picker(Mode::Commands(command_palette::Search::Profiles), ctx);
-            self.restore_picker_focus_after_menu(ctx);
+    pub(super) fn open_profile_search(&mut self, axis: Option<Axis>, ctx: &ComponentContext<Self>) {
+        if self.picker.is_some() {
+            return;
         }
+        let destination = match axis {
+            None => command_palette::ProfileDestination::Tab,
+            Some(axis) => {
+                let Some(origin) = self.move_source() else {
+                    return;
+                };
+                command_palette::ProfileDestination::Split { axis, origin }
+            }
+        };
+        self.start_picker(
+            Mode::Commands(command_palette::Search::Profiles(destination)),
+            ctx,
+        );
+        self.restore_picker_focus_after_menu(ctx);
     }
 
     pub(super) fn open_bookmark_search(
@@ -816,11 +829,11 @@ impl TerminalApp {
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
-            Mode::Commands(command_palette::Search::Profiles) => {
+            Mode::Commands(command_palette::Search::Profiles(destination)) => {
                 if self.profile_error.is_some() {
                     Vec::new()
                 } else {
-                    command_palette::profile_search_rows(&self.catalog, query)
+                    command_palette::profile_search_rows(&self.catalog, destination, query)
                 }
             }
             Mode::Commands(command_palette::Search::Bookmarks(origin, screen)) => {
@@ -867,7 +880,7 @@ impl TerminalApp {
             return;
         }
         // A profile, pane, selection, or remote connection can change while the palette is open.
-        if picker.mode == Mode::Commands(command_palette::Search::Profiles) {
+        if matches!(picker.mode, Mode::Commands(search) if search.is_profiles()) {
             self.refresh_profiles();
         }
         let Some(picker) = &self.picker else { return };
@@ -985,7 +998,9 @@ impl TerminalApp {
         let (matches, commands) = if mode.has_commands() {
             if matches!(
                 mode,
-                Mode::Commands(command_palette::Search::Window | command_palette::Search::Profiles)
+                Mode::Commands(
+                    command_palette::Search::Window | command_palette::Search::Profiles(_)
+                )
             ) {
                 self.refresh_profiles();
             }
