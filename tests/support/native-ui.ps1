@@ -190,7 +190,7 @@ function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Typ
 function Invoke-Button($Element) {
     $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }
-function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Submenu, [switch]$AllowDisabled, [scriptblock]$Reveal) {
+function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Submenu, [switch]$AllowDisabled, [scriptblock]$Reveal, [switch]$VisibleItem) {
     $button = [System.Windows.Automation.ControlType]::Button
     $menu = [System.Windows.Automation.ControlType]::MenuItem
     try {
@@ -208,7 +208,7 @@ function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Subm
         $category.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     }
     try { Wait-Until "'$Name' in '$TriggerName'" {
-        $item = Find-Element $Name $menu
+        $item = Find-Element $Name $menu -Visible:$VisibleItem
         if ($item -and ($AllowDisabled -or $item.Current.IsEnabled)) { $item }
     } } catch {
         $item = Find-Element $Name $menu

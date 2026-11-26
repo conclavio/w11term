@@ -48,8 +48,15 @@ $utf8 = [Text.UTF8Encoding]::new($false,$true)
 $esc = [string][char]27
 $snow = [string][char]0x96ea
 $button = [System.Windows.Automation.ControlType]::Button
+$menu = [System.Windows.Automation.ControlType]::MenuItem
 $profiles = Join-Path $State 'profiles.json'
 $account = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'
+$pasteNotices = @{
+    'multiple lines' = 'The clipboard contains multiple lines.'
+    '5,120' = 'The clipboard exceeds 5,120 UTF-16 code units.'
+    'both' = 'The clipboard contains multiple lines and exceeds 5,120 UTF-16 code units.'
+    'control characters' = 'The clipboard contains control or escape characters.'
+}
 
 function Set-FixtureClipboard([string]$Value) {
     if (!$realClipboard) { [IO.File]::WriteAllText($env:W11TERM_TEST_PASTE_FILE,$Value,$utf8); return }
@@ -87,6 +94,11 @@ function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" { $b = Find-Element $Name $button; if ($b -and $b.Current.IsEnabled) { $b } })
 }
 function Start-Paste([string]$Route) {
+    if ($realClipboard) {
+        $null = Wait-Until "the fixture window to own foreground before $Route paste" {
+            [FixtureMessages]::GetForegroundWindow() -eq $window
+        }
+    }
     if ($realClipboard -and $Route -eq 'Right') { [PastePointer]::RightClick($window); return }
     if ($realClipboard -and $Route -in 'CtrlV','CtrlAltV') {
         if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'Fixture does not own keyboard input' }
@@ -96,21 +108,28 @@ function Start-Paste([string]$Route) {
     }
     $raw = $Route -in 'Raw','CtrlAltV'
     $name = if ($raw) { 'Paste raw (no bracketed paste)' } else { 'Paste' }
-    Invoke-NativeMenuAction 'Tab menu' $name
+    Invoke-Button (Get-NativeMenuAction 'Tab menu' $name -VisibleItem)
     $null = Wait-Until 'the paste flyout closes' {
-        !(Find-Element 'Settings' ([System.Windows.Automation.ControlType]::MenuItem) -Visible)
+        !(Find-Element $name $menu -Visible) -and !(Find-Element 'Settings' $menu -Visible)
     }
 }
 function Wait-Prompt([string]$Primary, [string]$Reason) {
-    $notice = switch ($Reason) {
-        'multiple lines' { 'The clipboard contains multiple lines.' }
-        '5,120' { 'The clipboard exceeds 5,120 UTF-16 code units.' }
-        default { throw "Unknown confirmation reason '$Reason'" }
-    }
-    $null = Wait-Until 'native paste confirmation for the source SSH pane' {
-        (Find-Element 'Confirm paste') -and (Find-Element $Primary $button) -and
-            (Find-Element "Paste into $($account.user)@$($account.host):$($account.port) (pane $remote).") -and
-            (Find-Element $notice)
+    $notice = $pasteNotices[$Reason]
+    if (!$notice) { throw "Unknown confirmation reason '$Reason'" }
+    $destination = "Paste into $($account.user)@$($account.host):$($account.port) (pane $remote)."
+    try {
+        $null = Wait-Until "'$Primary' confirmation for pane $remote with '$Reason' warning" {
+            (Find-Element 'Confirm paste' -Visible) -and (Find-Element $Primary $button -Visible) -and
+                (Find-Element $destination -Visible) -and (Find-Element $notice -Visible)
+        }
+    } catch {
+        $dialog = [bool](Find-Element 'Confirm paste' -Visible)
+        $action = [bool](Find-Element $Primary $button -Visible)
+        $matchesPane = [bool](Find-Element $destination -Visible)
+        $warnings = @($pasteNotices.Keys | Sort-Object | Where-Object {
+            Find-Element $pasteNotices[$_] -Visible
+        }) -join ', '
+        throw "$_ Dialog=$dialog Action=$action Destination=$matchesPane Warnings=[$warnings] Foreground=$([FixtureMessages]::GetForegroundWindow()) Fixture=$window"
     }
 }
 function Wait-NoPrompt {
