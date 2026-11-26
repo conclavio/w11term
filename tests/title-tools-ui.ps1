@@ -109,7 +109,7 @@ try {
     (Wait-FilesToggle 'Off').Toggle()
     $null = Wait-FilesToggle 'On'
     $null = Wait-Until 'remote folder listing from title bar' { Find-Element 'title-tools.txt' }
-    (Wait-FilesToggle 'On').Toggle()
+    Invoke-Button (Get-NativeMenuAction 'Tab menu' 'SFTP files' -Submenu 'Panes')
     $null = Wait-FilesToggle 'Off'
     $null = Wait-Until 'remote file drawer closed' { !(Find-Element 'title-tools.txt') }
 
@@ -170,11 +170,71 @@ try {
         $named.Count -eq 1 -and $named[0].id -eq $split -and $named[0].active -and
             @($sessions).Count -eq 3
     }
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $bounds = $root.Current.BoundingRectangle
+    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
+    $compactWidth = [Math]::Round(680 * $scale)
+    $resize.Resize($compactWidth, $bounds.Height)
+    $null = Wait-Until 'Terminal tools and Attention remain visible in the compact title bar' {
+        (Find-Element 'Terminal tools' $button -Visible) -and
+            (Find-Element 'Attention inbox, 0 unread' $button -Visible) -and
+            !(Find-Element 'Pane layout' $button -Visible)
+    }
+    $localFiles = Get-NativeMenuAction 'Terminal tools' 'Show SFTP files' -AllowDisabled
+    if ($localFiles.Current.IsEnabled) { throw 'The compact menu offered SFTP for PowerShell' }
+    Click 'Find in scrollback    Ctrl+Shift+F' $menu
+    $null = Wait-PickerEditor 'Find in scrollback' 'Find from Terminal tools'
+    Press-Key 0x1b
+    $null = Wait-Until 'compact Find closes' { !(Find-Element 'Find in scrollback' $edit) }
+    Invoke-Button (Get-NativeMenuAction 'Terminal tools' $zoom -Submenu 'Pane layout')
+    $null = Wait-Until 'zoom from the compact Pane layout submenu' {
+        $visible = @((Control @('list')).sessions | Where-Object visible)
+        $visible.Count -eq 1 -and $visible[0].id -eq $split
+    }
+    Invoke-Button (Get-NativeMenuAction 'Terminal tools' 'Restore panes    Ctrl+Alt+Shift+Z' -Submenu 'Pane layout')
+    $null = Wait-Until 'both local panes restored from compact tools' {
+        @((Control @('list')).sessions | Where-Object visible).Count -eq 2
+    }
+    Invoke-NativeMenuAction 'Terminal tools' ('Command palette' + [char]0x2026 + '    F7')
+    $null = Wait-PickerEditor 'Search commands' 'Command palette from Terminal tools'
+    Press-Key 0x1b
+    $null = Wait-Until 'compact command palette closes' { !(Find-Element 'Search commands' $edit) }
+
+    $remoteTab = Wait-Until 'the original SSH tab remains visible' { Find-Element 'palette-ssh' $tab -Visible }
+    $remoteTab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Wait-Focus $remote
+    # The single-pane SSH profile can restore its own size after activation.
+    # Reapply the compact size if that restoration happens during the handoff.
+    $keepCompact = {
+        if ($root.Current.BoundingRectangle.Width -gt $compactWidth + 8 * $scale) {
+            $resize.Resize($compactWidth, $bounds.Height)
+        }
+    }
+    & $keepCompact
+    Invoke-Button (Get-NativeMenuAction 'Terminal tools' 'Show SFTP files' -Reveal $keepCompact)
+    $null = Wait-Until 'compact SSH files open the original drawer' { Find-Element 'title-tools.txt' }
+    Invoke-Button (Get-NativeMenuAction 'Terminal tools' 'Hide SFTP files' -Reveal $keepCompact)
+    $null = Wait-Until 'compact SSH files close the same drawer' { !(Find-Element 'title-tools.txt') }
+    Invoke-NativeMenuAction 'Tab menu' 'Find in scrollback    Ctrl+Shift+F'
+    $null = Wait-PickerEditor 'Find in scrollback' 'Find from More'
+    Press-Key 0x1b
+    $null = Wait-Until 'Find from More closes' { !(Find-Element 'Find in scrollback' $edit) }
+    $resize.Resize($bounds.Width, $bounds.Height)
+    $null = Wait-FilesToggle 'Off'
+    $null = Wait-Until 'a wider title bar restores the individual tools' {
+        (Find-Element 'Pane layout' $button -Visible) -and !(Find-Element 'Terminal tools' $button -Visible)
+    }
     Click 'Tab menu'
     Click 'Settings' $menu
     $null = Wait-Until 'Settings opened from More' {
         (Find-Element 'Settings' $tab) -and (Find-Element 'Profiles')
     }
+} catch {
+    $observed = if ($window) { [System.Windows.Automation.AutomationElement]::FromHandle($window) }
+    $geometry = if ($observed) { $observed.Current.BoundingRectangle }
+    throw "$_ at $($_.ScriptStackTrace). Window bounds=$geometry"
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

@@ -11,6 +11,10 @@ const COMPACT_TOOLS_WIDTH: f64 = BUTTON_WIDTH + GAP + INBOX_WIDTH;
 const TAB_CHROME_RESERVE: f64 = 390.0;
 const MIN_TAB_STRIP_WIDTH: f64 = 140.0;
 
+pub(super) const SHOW_FILES: &str = "Show SFTP files";
+pub(super) const HIDE_FILES: &str = "Hide SFTP files";
+pub(super) const FIND_SCROLLBACK: &str = "Find in scrollback";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tools {
     Full,
@@ -66,6 +70,18 @@ pub(super) fn below(text: impl Into<String>) -> Tooltip {
 }
 
 impl TerminalApp {
+    pub(super) fn scrollback_find_item(&self) -> MenuItem {
+        self.binding_menu_enabled(
+            "find-scrollback",
+            FIND_SCROLLBACK,
+            KeyAction::Find,
+            matches!(
+                self.tabs.active().map(|tab| &tab.page),
+                Some(Page::Terminal(live)) if live.find_available()
+            ),
+        )
+    }
+
     fn pane_layout_items(&self, arrangement: &PaneArrangement) -> Vec<MenuItem> {
         let mut items = Vec::from(self.split_items());
         if self.active_layout_is_split() {
@@ -92,6 +108,50 @@ impl TerminalApp {
             _ => None,
         });
         let ssh = live.filter(|live| matches!(live.source, Source::Ssh(_)));
+        let tools = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .spacing(GAP);
+        if layout.tools == Tools::Compact {
+            let files_label = if ssh.is_some_and(|live| live.files.open) {
+                HIDE_FILES
+            } else {
+                SHOW_FILES
+            };
+            let panes = if live.is_some() {
+                MenuItem::submenu(
+                    "pane-layout",
+                    "Pane layout",
+                    self.pane_layout_items(arrangement),
+                )
+            } else {
+                MenuItem::disabled("pane-layout", "Pane layout")
+            };
+            let compact = button("Terminal tools")
+                .automation_id("w11term-title-terminal-tools")
+                .content(
+                    FontIcon::new()
+                        .glyph("\u{e700}")
+                        .tooltip_with(below("Terminal tools")),
+                )
+                .menu(Menu::new(
+                    [
+                        command_menu_item("sftp-files", files_label, ssh.is_some()),
+                        panes,
+                        self.scrollback_find_item(),
+                        self.binding_menu(
+                            "command-palette",
+                            "Command palette…",
+                            KeyAction::CommandPalette,
+                        ),
+                    ],
+                    menu_action,
+                ));
+            return tools.keyed_children([
+                KeyedView::new("compact", compact),
+                KeyedView::new("inbox", self.inbox_button(context)),
+            ]);
+        }
         let pane = ssh.map(|live| live.session.pane_id);
         let files = ToggleButton::new()
             .padding(0.0)
@@ -109,16 +169,6 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e8b7}"))
             .tooltip_with(below("SFTP files"));
 
-        let tools = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .spacing(GAP);
-        if layout.tools == Tools::Compact {
-            return tools.keyed_children([
-                KeyedView::new("files", files),
-                KeyedView::new("inbox", self.inbox_button(context)),
-            ]);
-        }
         let panes = button("Pane layout")
             .automation_id("w11term-title-layout")
             .is_enabled(live.is_some())

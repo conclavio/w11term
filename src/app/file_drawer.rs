@@ -4341,6 +4341,9 @@ impl TerminalApp {
         files.publish_ended_transfer(session, previous_transfer, !visible || !files.open, outcome);
         if visible {
             let return_to_terminal = finish_filter && !tab.files.filter_editing();
+            if drawer_was_open != tab.files.open {
+                self.header.borrow_mut().take();
+            }
             if !keep_directory {
                 tab.follow_shell_directory(&frame, context);
             }

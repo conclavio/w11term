@@ -852,6 +852,7 @@ fn tab_menu_message(label: String) -> Message {
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         "Command palette…" => Message::Shortcut(Shortcut::CommandPalette),
+        title_tools::FIND_SCROLLBACK => Message::Shortcut(Shortcut::Find),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         command_palette::FIND_TAB_LABEL => Message::Shortcut(Shortcut::FindTab),
         pane_picker::FIND_TEXT_LABEL => Message::Shortcut(Shortcut::FindAllPanes),
@@ -3502,6 +3503,10 @@ impl TerminalApp {
                     Message::PaneColorScheme(id, scheme)
                 }),
             local_forwards::LABEL => local_forwards::open(forward),
+            title_tools::SHOW_FILES | title_tools::HIDE_FILES => pane
+                .map_or(Message::ControlIdle, |id| {
+                    Message::SetTitleFiles(id, label == title_tools::SHOW_FILES)
+                }),
             tab_title::RENAME_PANE => tab_title::show_pane(pane.zip(group)),
             live_profile::SAVE => live_profile::open(paste),
             directory_split::OPEN_EXPLORER => {
@@ -3891,6 +3896,7 @@ impl TerminalApp {
                 KeyAction::MoveTabRight,
                 self.tabs.can_move_active_tab(Direction::Right),
             ),
+            self.scrollback_find_item(),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             self.binding_menu(
                 "find-tab",
