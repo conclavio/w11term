@@ -69,6 +69,7 @@ mod pane_drop;
 mod pane_text_size;
 mod pattern_settings;
 mod profile_forwards;
+mod profile_jumps;
 mod saved_commands;
 mod shell_setup;
 mod word_delimiters;
@@ -519,6 +520,7 @@ struct ProfileDraft {
     folder_revoke: folder_revoke::Editor,
     confirm_delete: bool,
     proxy_jump: Vec<w11term::options::JumpHost>,
+    jump_editor: profile_jumps::Editor,
     local_forwards: Vec<w11term::options::LocalForwardPreset>,
     forward_editor: profile_forwards::Editor,
     durable: bool,
@@ -557,6 +559,7 @@ impl Default for ProfileDraft {
             folder_revoke: Default::default(),
             confirm_delete: false,
             proxy_jump: Vec::new(),
+            jump_editor: Default::default(),
             local_forwards: Vec::new(),
             forward_editor: Default::default(),
             durable: false,
@@ -590,24 +593,11 @@ impl Default for ProfileDraft {
 
 impl ProfileDraft {
     fn ssh_options(&self) -> anyhow::Result<SshOptions> {
-        let host = self.host.trim().trim_matches(['[', ']']);
-        let user = self.user.trim();
         anyhow::ensure!(
-            !host.is_empty() && !user.is_empty(),
-            "Enter a host and user"
+            !self.jump_editor.editing(),
+            "Apply or cancel the pending edit under SSH jump hosts"
         );
-        anyhow::ensure!(
-            !host.chars().any(|c| c.is_whitespace() || c.is_control())
-                && !user.chars().any(|c| c.is_whitespace() || c.is_control()),
-            "Host and user cannot contain spaces or control characters"
-        );
-        w11term::options::validate_ssh_host(host)?;
-        let port = self
-            .port
-            .trim()
-            .parse::<std::num::NonZeroU16>()
-            .map_err(|_| anyhow::anyhow!("Port must be between 1 and 65535"))?
-            .get();
+        let (host, user, port) = parse_ssh_address(&self.host, &self.user, &self.port)?;
         let authentication = ssh_authentication(self.authentication, &self.identity)?;
         let mut player = self.player.clone();
         match self.reconnect_window.trim().parse() {
@@ -618,28 +608,16 @@ impl ProfileDraft {
             Err(_) => {}
         }
         Ok(SshOptions {
-            host: host.into(),
+            host,
             terminal_type: self.terminal_type()?,
             color_scheme: self.color_scheme,
             font_size: profile_font_size(&self.font_size)?,
             tab_color: self.tab_color,
             scrollback_lines: self.scrollback_lines.parse()?,
-            user: user.into(),
+            user,
             port,
-            connect_timeout_seconds: (!self.connect_timeout.trim().is_empty())
-                .then(|| self.connect_timeout.trim().parse())
-                .transpose()
-                .context("Enter a positive SSH connection timeout in whole seconds or leave it blank for the default")?,
-            keepalive: SshKeepalive {
-                interval_seconds: self.keepalive_interval.trim().parse().context(
-                    "Enter the SSH keepalive interval in whole seconds. Use 0 to disable it",
-                )?,
-                max_unanswered: self
-                    .keepalive_max
-                    .trim()
-                    .parse()
-                    .context("Enter a positive whole number of unanswered SSH keepalives")?,
-            },
+            connect_timeout_seconds: parse_ssh_connect_timeout(&self.connect_timeout)?,
+            keepalive: parse_ssh_keepalive(&self.keepalive_interval, &self.keepalive_max)?,
             authentication,
             host_key: (!self.fingerprint.trim().is_empty()).then(|| self.fingerprint.trim().into()),
             host_key_alias: self.host_key_alias(),
@@ -668,13 +646,7 @@ impl ProfileDraft {
     }
 
     fn from_options(name: String, options: &SshOptions) -> Self {
-        let (authentication, identity) = match &options.authentication {
-            Authentication::Agent => (0, String::new()),
-            Authentication::Identity { identity } => (1, identity.to_string_lossy().into_owned()),
-            Authentication::None => (2, String::new()),
-            Authentication::Password => (3, String::new()),
-            Authentication::KeyboardInteractive => (4, String::new()),
-        };
+        let (authentication, identity) = ssh_auth_fields(&options.authentication);
         Self {
             proxy_jump: options.proxy_jump.clone(),
             local_forwards: options.local_forwards.clone(),
@@ -726,6 +698,60 @@ const SSH_AUTH_LABELS: [&str; 5] = [
     "Password",
     "Keyboard-interactive (password / MFA)",
 ];
+
+fn parse_ssh_address(host: &str, user: &str, port: &str) -> anyhow::Result<(String, String, u16)> {
+    let host = host.trim().trim_matches(['[', ']']);
+    let user = user.trim();
+    anyhow::ensure!(
+        !host.is_empty() && !user.is_empty(),
+        "Enter a host and user"
+    );
+    anyhow::ensure!(
+        !host.chars().any(|c| c.is_whitespace() || c.is_control())
+            && !user.chars().any(|c| c.is_whitespace() || c.is_control()),
+        "Host and user cannot contain spaces or control characters"
+    );
+    w11term::options::validate_ssh_host(host)?;
+    let port = port
+        .trim()
+        .parse::<std::num::NonZeroU16>()
+        .map_err(|_| anyhow::anyhow!("Port must be between 1 and 65535"))?
+        .get();
+    Ok((host.into(), user.into(), port))
+}
+
+fn parse_ssh_connect_timeout(value: &str) -> anyhow::Result<Option<std::num::NonZeroU32>> {
+    let value = value.trim();
+    (!value.is_empty())
+        .then(|| value.parse())
+        .transpose()
+        .context("Enter a positive SSH connection timeout in whole seconds or leave it blank for the default")
+}
+
+fn parse_ssh_keepalive(interval: &str, max: &str) -> anyhow::Result<SshKeepalive> {
+    Ok(SshKeepalive {
+        interval_seconds: interval
+            .trim()
+            .parse()
+            .context("Enter the SSH keepalive interval in whole seconds. Use 0 to disable it")?,
+        max_unanswered: max
+            .trim()
+            .parse()
+            .context("Enter a positive whole number of unanswered SSH keepalives")?,
+    })
+}
+
+fn ssh_auth_fields(authentication: &Authentication) -> (usize, String) {
+    match authentication {
+        Authentication::Agent => (0, String::new()),
+        Authentication::Identity { identity } => {
+            (PRIVATE_KEY_AUTH, identity.to_string_lossy().into_owned())
+        }
+        Authentication::None => (2, String::new()),
+        Authentication::Password => (3, String::new()),
+        Authentication::KeyboardInteractive => (4, String::new()),
+    }
+}
 
 fn ssh_authentication(index: usize, identity: &str) -> anyhow::Result<Authentication> {
     Ok(match index {
@@ -1218,6 +1244,7 @@ pub struct PendingPaneRetry {
 pub enum Message {
     LocalForward(local_forwards::Action),
     ProfileForward(TabId, profile_forwards::Edit),
+    ProfileJump(TabId, profile_jumps::Edit),
     FolderAuthority,
     FolderShare(folder_shares::Action),
     FolderRevoke(TabId, u64, folder_revoke::Action),
@@ -4657,14 +4684,6 @@ impl TerminalApp {
             fields.push(self.folder_revoke_view(id, base, &draft.folder_revoke, context));
         }
         // Keep the feedback slot mounted so save/error messages do not remount inputs.
-        if !draft.proxy_jump.is_empty() {
-            fields.push(
-                TextBlock::new()
-                    .text(config_import::jump_summary(&draft.proxy_jump))
-                    .text_wrapping(TextWrapping::Wrap)
-                    .into(),
-            );
-        }
         fields.push(
             TextBlock::new()
                 .text(draft.error.as_deref().unwrap_or(if draft.saved {
@@ -4798,6 +4817,7 @@ impl TerminalApp {
                     ),
             )),
         );
+        fields.push(draft.jump_editor.view(id, &draft.proxy_jump, context));
         fields.push(
             draft
                 .forward_editor
@@ -4917,7 +4937,7 @@ impl TerminalApp {
                 Button::new()
                     .style(ButtonStyle::Accent)
                     .automation_name("Save profile changes")
-                    .is_enabled(!draft.generating)
+                    .is_enabled(!draft.generating && !draft.jump_editor.editing())
                     .on_click(context.callback(move |_| Message::SaveProfileOnly(id)))
                     .content(if matches!(draft.origin, DraftOrigin::Copy(_)) {
                         "Save copy"
@@ -4931,7 +4951,7 @@ impl TerminalApp {
             "save",
             Button::new()
                 .style(is_new.then_some(ButtonStyle::Accent))
-                .is_enabled(!draft.generating)
+                .is_enabled(!draft.generating && !draft.jump_editor.editing())
                 .on_click(context.callback(move |_| Message::SaveProfile(id)))
                 .content("Save and connect"),
         )];
@@ -4939,7 +4959,7 @@ impl TerminalApp {
             actions.push(KeyedView::new(
                 "once",
                 Button::new()
-                    .is_enabled(!draft.generating)
+                    .is_enabled(!draft.generating && !draft.jump_editor.editing())
                     .on_click(context.callback(move |_| Message::ConnectOnce(id)))
                     .content("Connect without saving"),
             ));
@@ -7290,6 +7310,17 @@ impl Component for TerminalApp {
                     && draft
                         .forward_editor
                         .update(&mut draft.local_forwards, action)
+                {
+                    draft.saved = false;
+                    draft.error = None;
+                }
+            }
+            Message::ProfileJump(id, action) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && draft.jump_editor.update(&mut draft.proxy_jump, action)
                 {
                     draft.saved = false;
                     draft.error = None;

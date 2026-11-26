@@ -233,12 +233,12 @@ function Invoke-SftpEntryAction([string]$Name) {
 function Invoke-NativeMenuAction([string]$Trigger, [string]$Name) {
     Invoke-Button (Get-NativeMenuAction $Trigger $Name)
 }
-function Get-RunAction([string]$Name) {
+function Get-ScrollableMenuAction([string]$TriggerName, [string]$Name, [switch]$VisibleItem) {
     $button = [System.Windows.Automation.ControlType]::Button
     $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
     $search = @{ scroll = $null }
-    Get-NativeMenuAction 'Run actions' $Name -Reveal {
-        $trigger = Find-Element 'Run actions' $button
+    Get-NativeMenuAction $TriggerName $Name -VisibleItem:$VisibleItem -Reveal {
+        $trigger = Find-Element $TriggerName $button
         if (!$trigger -or !$trigger.Current.IsEnabled -or !$trigger.Current.IsOffscreen) { return }
         if ($search.scroll) {
             if ($search.scroll.Current.VerticalScrollPercent -lt 100) {
@@ -258,8 +258,11 @@ function Get-RunAction([string]$Name) {
             }
             $parent = $walker.GetParent($parent)
         }
-        throw 'The run toolbar is offscreen without a scrollable ancestor'
+        throw "'$TriggerName' is offscreen without a scrollable ancestor"
     }
+}
+function Get-RunAction([string]$Name) {
+    Get-ScrollableMenuAction 'Run actions' $Name
 }
 function Invoke-RunAction([string]$Name) {
     Invoke-Button (Get-RunAction $Name)

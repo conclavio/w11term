@@ -127,7 +127,7 @@ pub enum Action {
     Group(TabId, u64, group::Change),
 }
 
-fn endpoint(
+pub(super) fn endpoint(
     host: &str,
     port: u16,
     user: &str,
@@ -152,7 +152,7 @@ fn endpoint(
     }
 }
 
-pub(super) fn jump_summary(hops: &[JumpHost]) -> String {
+fn jump_summary(hops: &[JumpHost]) -> String {
     let mut text = String::from("ProxyJump route");
     for hop in hops {
         text.push('\n');

@@ -21,6 +21,56 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits a profile's jump route in WinUI and connects through two loopback peers"]
+async fn native_profile_jump_editor_saves_and_connects_the_ordered_route() {
+    let (Source::Ssh(destination), _destination_root, shells, destination_server) =
+        fixture_connections(false, 2).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(mut outer), outer_root, outer_shells, outer_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(mut inner), inner_root, inner_shells, inner_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    outer.user = "outer".into();
+    inner.user = "inner".into();
+    for (root, port) in [
+        (outer_root.path(), inner.port),
+        (inner_root.path(), destination.port),
+    ] {
+        fs::write(root.join("forward-port"), port.to_string()).unwrap();
+        fs::write(root.join("forward-trace"), []).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-jumps.json"),
+        serde_json::to_vec(&[&outer, &inner]).unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("profile-jumps-ui.ps1", &destination, state.path());
+    for (root, port) in [
+        (outer_root.path(), inner.port),
+        (inner_root.path(), destination.port),
+    ] {
+        let trace = fs::read_to_string(root.join("forward-trace")).unwrap();
+        assert_eq!(trace.lines().count(), 1, "{trace}");
+        assert!(trace.starts_with(&format!("127.0.0.1:{port} ")), "{trace}");
+    }
+    assert_eq!(outer_shells.load(Ordering::Relaxed), 0);
+    assert_eq!(inner_shells.load(Ordering::Relaxed), 0);
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
+    outer_server.abort();
+    inner_server.abort();
+    destination_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks persisted Follow Windows colors and reports against native UISettings"]
 async fn native_follow_windows_profile_matches_the_host_and_can_be_overridden_live() {
     let (Source::Ssh(ssh), remote, shells, server) = fixture_connections(false, 2).await else {
