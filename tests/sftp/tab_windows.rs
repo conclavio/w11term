@@ -148,6 +148,12 @@ async fn native_cli_discovers_and_opens_profiles_in_new_windows() {
     run("CliProfiles", b"fresh-profile/source-profile/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "splits live and hidden panes with saved profiles in the exact target window without taking focus"]
+async fn native_cli_splits_live_and_background_panes() {
+    run("CliSplit", b"source-split/split-remote/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -181,6 +187,10 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         profiles["pinned_profiles"] = json!(["window-ssh"]);
         profiles["profiles"]["Fixture WSL"] =
             json!({"backend":"local","executable":"wsl.exe","args":["--distribution","Fixture"]});
+    }
+    if first_close == "CliSplit" {
+        profiles["profiles"]["Split PowerShell"] =
+            profiles["profiles"]["Destination PowerShell"].clone();
     }
     fs::write(
         state.path().join("profiles.json"),
@@ -283,6 +293,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "CliWorkspace"
             | "CliWorkspaceWindow"
             | "CliProfiles"
+            | "CliSplit"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

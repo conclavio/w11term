@@ -1,5 +1,6 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
 use crate::{
+    pane_layout::Axis,
     session::{Command, PaneDescription},
     terminal::Snapshot,
 };
@@ -123,6 +124,13 @@ pub enum Request {
     },
     ClosePane {
         pane: u64,
+    },
+    SplitPane {
+        pane: u64,
+        profile: String,
+        axis: Axis,
+        #[serde(default)]
+        activate: bool,
     },
     Sftp {
         pane: u64,
@@ -492,6 +500,13 @@ pub enum UiRequest {
         pane: u64,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    SplitPane {
+        pane: u64,
+        profile: String,
+        axis: Axis,
+        activate: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Resize {
         pane: u64,
         cols: usize,
@@ -504,6 +519,7 @@ impl UiRequest {
         let reply = match self {
             Self::Open { reply, .. }
             | Self::ClosePane { reply, .. }
+            | Self::SplitPane { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
@@ -541,7 +557,9 @@ impl UiRequest {
 
     fn routed_pane(&self) -> Option<u64> {
         match self {
-            Self::Resize { pane, .. } | Self::ClosePane { pane, .. } => Some(*pane),
+            Self::Resize { pane, .. }
+            | Self::ClosePane { pane, .. }
+            | Self::SplitPane { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
         }
@@ -551,6 +569,7 @@ impl UiRequest {
         matches!(self,
             Self::Resize { reply, .. }
             | Self::ClosePane { reply, .. }
+            | Self::SplitPane { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             if reply.is_closed()
         )
@@ -706,6 +725,29 @@ impl Registry {
                 tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("close-pane timed out. Use list to check whether the pane closed")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::SplitPane {
+                pane,
+                profile,
+                axis,
+                activate,
+            } => {
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(
+                    pane,
+                    UiRequest::SplitPane {
+                        pane,
+                        profile,
+                        axis,
+                        activate,
+                        reply,
+                    },
+                );
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("split-pane timed out; the split may have been created")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }

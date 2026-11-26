@@ -2,7 +2,8 @@
 
 mod balance;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Axis {
     /// A vertical divider, with panes arranged from left to right.
     Columns,

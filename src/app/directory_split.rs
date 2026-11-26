@@ -414,7 +414,9 @@ impl TerminalApp {
         };
         match destination {
             Destination::Tab => self.insert_tab(child, ctx),
-            Destination::Split(axis) => self.insert_split(id, child, axis, ctx),
+            Destination::Split(axis) => {
+                let _ = self.insert_split(id, child, axis, ctx);
+            }
         }
     }
 

@@ -300,13 +300,6 @@ impl SavedSource {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "Axis", rename_all = "snake_case")]
-enum SavedAxis {
-    Columns,
-    Rows,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedPane {
@@ -323,7 +316,6 @@ pub struct SavedPane {
 pub enum SavedLayout {
     Leaf(SavedPane),
     Split {
-        #[serde(with = "SavedAxis")]
         axis: Axis,
         ratio: f64,
         first: Box<Self>,

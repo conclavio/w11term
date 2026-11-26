@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -688,6 +688,77 @@ function Test-ExplicitControlWindow {
         throw 'An explicit open against a closed window did not return the expected error'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'A closed-window request fell back to the original window' }
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlSplit {
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'SSH is focused before the CLI splits any pane'
+    $invalid = & $Cli --pid $app.Id split-pane --pane "$($moved.id)" --profile 'missing profile' --axis rows | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $invalid.ok -or $invalid.error -cne 'unknown profile missing profile' -or
+        @((Control @('list')).sessions).Count -ne 3) {
+        throw 'An unknown profile did not fail before changing the layout'
+    }
+
+    $beforeRows = (Control @('inspect','--pane',"$($moved.id)")).rows
+    $below = Control @('split-pane','--pane',"$($moved.id)",'--profile','Destination PowerShell','--axis','rows')
+    if ($below.active -or $below.window_id -ne $ssh.window_id -or $below.tab_id -ne $ssh.tab_id -or
+        $below.source_pane -ne $moved.id -or $below.axis -cne 'rows') {
+        throw "Unexpected row split reply: $($below | ConvertTo-Json -Compress)"
+    }
+    $null = Wait-Until 'the exact PowerShell half is split into rows with dimensions applied to both panes' {
+        $panes = (Control @('list')).sessions
+        $top = $panes | Where-Object id -eq $moved.id
+        $bottom = $panes | Where-Object id -eq $below.pane
+        $top.visible -and $bottom.visible -and !$bottom.active -and $top.cols -eq $bottom.cols -and
+            $top.rows -lt $beforeRows -and $bottom.rows -lt $beforeRows
+    }
+    Expect-Text $below.pane 'PS '
+    if ((Shell-State $moved.id 'splitOriginal') -ne $localIdentity -or
+        (Shell-State $below.pane 'splitNew' -Init) -eq $localIdentity) { throw 'The split reused or restarted PowerShell' }
+
+    $hidden = Control @('split-pane','--pane',"$($anchor.id)",'--profile','window-ssh','--axis','columns')
+    $entries = @((Control @('list')).sessions | Where-Object tab_id -eq $anchor.tab_id)
+    if ($hidden.active -or $hidden.source_pane -ne $anchor.id -or $hidden.tab_id -ne $anchor.tab_id -or
+        $hidden.axis -cne 'columns' -or $entries.Count -ne 2 -or $hidden.pane -notin $entries.id -or
+        @($entries | Where-Object visible).Count -ne 0) { throw 'A split in a hidden tab changed the window selection' }
+
+    $child = Control @('open','--profile','Destination PowerShell','--new-window')
+    $hwnd = Wait-DetachedWindow $origin
+    $active = Control @('split-pane','--pane',"$($child.pane)",'--profile','Split PowerShell','--axis','rows','--activate')
+    $childGroup = @((Control @('list')).sessions | Where-Object window_id -eq $child.window_id)
+    if (!$active.active -or $active.window_id -ne $child.window_id -or
+        $childGroup.Count -ne 2 -or $active.pane -notin $childGroup.id -or
+        @($childGroup | Where-Object { $_.tab_id -ne $active.tab_id -or !$_.visible }).Count -ne 0) {
+        throw 'The activated split did not appear in the sibling window'
+    }
+    $null = Wait-Until 'the sibling window selects the new pane while staying in the background' {
+        $target = (Control @('list-windows')).windows | Where-Object window_id -eq $child.window_id
+        $target.active_tab_title -ceq 'Split PowerShell' -and !$target.active
+    }
+    Expect-Focus $origin $ssh.id 'Splitting a hidden tab and activating a pane in another window preserve desktop focus'
+    Type-In $origin 'source-split/'
+    Expect-Text $ssh.id 'source-split/'
+
+    $null = Control @('close-pane','--pane',"$($below.pane)")
+    $stale = & $Cli --pid $app.Id split-pane --pane "$($below.pane)" --profile 'Destination PowerShell' --axis rows | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $stale.ok -or $stale.error -cne "unknown pane $($below.pane)") {
+        throw 'A stale split target was redirected to a live pane'
+    }
+
+    $tab = Wait-Until 'the hidden tab retains its original header' { Find-Here $origin 'Source PowerShell' }
+    $tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Use-Window $origin
+    Expect-Focus $origin $anchor.id 'Selecting the split tab restores its previously selected PowerShell pane'
+    $null = Wait-Until 'both columns are visible with the same terminal height' {
+        $panes = @((Control @('list')).sessions | Where-Object tab_id -eq $anchor.tab_id)
+        $panes.Count -eq 2 -and @($panes | Where-Object visible).Count -eq 2 -and
+            $panes[0].rows -eq $panes[1].rows -and [Math]::Abs($panes[0].cols - $panes[1].cols) -le 2
+    }
+    Expect-Text $hidden.pane 'ready'
+    $null = Control @('send-text','--pane',"$($hidden.pane)",'--no-paste','split-remote/')
+    Expect-Text $hidden.pane 'split-remote/'
+    Close-FixtureWindow $hwnd
     Close-FixtureWindow $origin
 }
 
@@ -1420,12 +1491,13 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
             'CliWorkspaceWindow' { Test-ControlWorkspaceWindow }
             'CliProfiles' { Test-ControlProfileWindows }
+            'CliSplit' { Test-ControlSplit }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

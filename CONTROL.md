@@ -48,6 +48,16 @@ The reply contains `name`, `window_id`, and `tabs` in saved order. Each tab cont
 
 `resize` routes to the window that owns the pane, including after a live tab transfer. Closing one window leaves the process pipe and the remaining windows’ sessions accessible.
 
+`split-pane --pane ID --profile NAME --axis columns|rows [--activate]` starts a fresh session to the right of the pane (`columns`) or below it (`rows`). The command targets the pane's current tab and window, including background tabs and panes moved between windows. The reply includes `source_pane`, the new `pane`, `tab_id`, `window_id`, `axis`, and `active`.
+
+By default the current selection and zoom stay in place. With `--activate`, the owning window selects the new pane and shows the split. The reply's `active` field reports this window-local selection. Desktop focus stays where it is.
+
+```powershell
+& $ctl --pid 12345 split-pane --pane $pane --profile 'Windows PowerShell' --axis columns
+```
+
+Direct pipe clients can send `{"verb":"split-pane","pane":42,"profile":"Windows PowerShell","axis":"columns"}`.
+
 ```powershell
 # Literal UTF-8, including a carriage return supplied by PowerShell.
 & $ctl --pid 12345 send-text --pane $pane --no-paste "BOARD`r"
