@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -146,6 +146,20 @@ function Open-WindowTextSearch([IntPtr]$Hwnd, [int]$LocalPane, [int]$RemotePane,
     }
 }
 
+function Choose-WindowPanePlacement([IntPtr]$Hwnd, [long]$WindowId, [string]$Label) {
+    Use-Window $Hwnd
+    $window = $Hwnd
+    Press-Key 0x72 # F3, fixture Move pane to existing tab shortcut
+    $field = Wait-PickerEditor 'Find destination pane' 'the fixture pane move shortcut'
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue("Window $WindowId $Label")
+    $null = Wait-Until 'only the intended sibling pane matches' {
+        $rows = @(Get-PickerRows)
+        $rows.Count -eq 1 -and $rows[0] -like "*$Label*Window $WindowId*"
+    }
+    Press-Key 13
+    $null = Wait-Until 'the native placement controls' { Find-Here $Hwnd 'Move right' }
+}
+
 function Type-In([IntPtr]$Hwnd, [string]$Text, [switch]$Return) {
     Use-Window $Hwnd
     $window = $Hwnd
@@ -181,7 +195,12 @@ function Shell-State([int]$Pane, [string]$Label, [IntPtr]$Hwnd = [IntPtr]::Zero,
     if ($Hwnd -eq [IntPtr]::Zero) { Send-Line $Pane $line } else { Type-In $Hwnd $line -Return }
     # The echoed source contains the label but cannot contain the evaluated marker.
     $pattern = "$Label=([0-9]+/[a-f0-9]{32})"
-    $result = Control @('wait-for-text','--pane',"$Pane",'--timeout','15','--regex',$pattern)
+    try {
+        $result = Control @('wait-for-text','--pane',"$Pane",'--timeout','15','--regex',$pattern)
+    } catch {
+        $view = Control @('get-text','--pane',"$Pane")
+        throw "$_ Pane $Pane is $($view.cols) columns wide. Visible terminal text: $($view.text)"
+    }
     return [regex]::Match($result.text, $pattern).Groups[1].Value
 }
 
@@ -300,7 +319,58 @@ try {
         $null = [TabFixtureWindows]::ShowWindowAsync($destination, 7) # SW_SHOWMINNOACTIVE
         $null = Wait-Until 'the detached window to minimize' { [TabFixtureWindows]::IsIconic($destination) }
     }
-    if ($FirstClose -eq 'TextSearch') {
+    if ($FirstClose -eq 'PaneMove') {
+        Run-WindowCommand $origin ('New tab with Destination PowerShell ' + [char]0x00b7 + ' Local')
+        $temporary = Wait-Until 'the temporary destination pane' {
+            (Control @('list')).sessions | Where-Object { $_.label -eq 'Destination PowerShell' -and $_.window_id -eq $anchor.window_id }
+        }
+        Use-Window $destination
+        $window = $destination
+        Press-Key 0x77 # F8 focuses PowerShell in the split.
+        Expect-Focus $destination $moved.id 'PowerShell is the source of the transfer'
+        Choose-WindowPanePlacement $destination $anchor.window_id 'Destination PowerShell'
+        $null = Control @('close-pane','--pane',"$($temporary.id)")
+        Press-Key 39
+        $null = Wait-Until 'the stale destination is rejected' {
+            Find-Here $destination "The pane could not move. It is still available in this window.  $([char]0x00b7)  Dismiss"
+        }
+        Expect-Focus $destination $moved.id 'Rejecting the move keeps the source pane'
+        $stillSplit = @((Control @('list')).sessions | Where-Object { $_.id -in $ssh.id,$moved.id })
+        if ($stillSplit.Count -ne 2 -or @($stillSplit | Where-Object { $_.window_id -eq $newOwner -and $_.tab_id -eq $ssh.tab_id }).Count -ne 2) {
+            throw 'Rejecting the destination changed the original split'
+        }
+
+        Choose-WindowPanePlacement $destination $anchor.window_id 'Source PowerShell'
+        Press-Key 39 # Right of the original window's anchor pane.
+        Expect-Focus $origin $moved.id 'PowerShell appears beside the original shell and receives focus'
+        $null = Wait-Until 'the moved pane joins the target tab while SSH remains in the other window' {
+            $all = @((Control @('list')).sessions)
+            $newLocal = $all | Where-Object id -eq $moved.id
+            $remote = $all | Where-Object id -eq $ssh.id
+            $newLocal.window_id -eq $anchor.window_id -and $newLocal.tab_id -eq $anchor.tab_id -and
+                $remote.window_id -eq $newOwner -and $remote.tab_id -eq $ssh.tab_id -and
+                $remote.connection_generation -eq $ssh.connection_generation
+        }
+        if ((Shell-State $moved.id 'MV' $origin) -ne $localIdentity -or
+            (Shell-State $anchor.id 'AN') -ne $anchorIdentity) { throw 'The pane move restarted a local shell' }
+        Type-In $destination 'split-stays/'
+        Expect-Text $ssh.id 'split-stays/'
+
+        Choose-WindowPanePlacement $destination $anchor.window_id 'Moved PowerShell'
+        Press-Key 38 # Above the previously moved PowerShell pane.
+        $null = Wait-Until 'the empty source HWND closes after the last pane is claimed' {
+            $handles = [TabFixtureWindows]::OwnedBy($app.Id)
+            $handles.Count -eq 1 -and $handles[0] -eq $origin
+        }
+        Expect-Focus $origin $ssh.id 'The original SSH channel has focus in the destination tab'
+        $all = @((Control @('list')).sessions)
+        if ($all.Count -ne 3 -or @($all | Where-Object { $_.window_id -eq $anchor.window_id -and $_.tab_id -eq $anchor.tab_id }).Count -ne 3) {
+            throw 'The last pane did not join the selected tab'
+        }
+        Type-In $origin 'only-pane-moved/'
+        Expect-Text $ssh.id 'only-pane-moved/'
+        $last = $origin
+    } elseif ($FirstClose -eq 'TextSearch') {
         $lineBreak = [string][char]13 + [char]10
         $lines = @('', 'old fleet needle') + @(1..70 | ForEach-Object { "scrollback row $_" }) + @('ssh latest', '')
         $wire = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($lines -join $lineBreak))

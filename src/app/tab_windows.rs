@@ -3,8 +3,8 @@ use std::{
     rc::Weak,
     sync::atomic::{AtomicU64, Ordering},
 };
-use w11term::control::PaneTransfer;
 use w11term::options::Options;
+use w11term::{control::PaneTransfer, tabs::DetachedPane};
 use windows::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{
@@ -39,6 +39,13 @@ pub(super) enum SearchScope {
 pub enum SearchTarget {
     Tab(TabId),
     Pane(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaneDestination {
+    pub(super) window: u64,
+    pub(super) group: TabId,
+    pub(super) pane: u64,
 }
 
 pub(super) fn window_query(query: &str) -> Option<(Option<u64>, String)> {
@@ -135,12 +142,28 @@ pub(super) struct Transfer {
     pub(super) new_window: Option<NewWindow>,
     pub(super) group: TabId,
     panes: Vec<u64>,
+    kind: TransferKind,
     source: LocalSender<Message>,
     pub(super) target: RefCell<Option<LocalSender<Message>>>,
-    payload: RefCell<Option<OfferedTab<AppTab>>>,
+    payload: RefCell<Option<TransferPayload>>,
     pin: RefCell<Option<PaneTransfer>>,
     phase: Cell<TransferPhase>,
     started: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum TransferKind {
+    Tab,
+    Pane {
+        source: TabId,
+        target: PaneDestination,
+        side: Direction,
+    },
+}
+
+enum TransferPayload {
+    Tab(OfferedTab<AppTab>),
+    Pane(Box<DetachedPane<AppTab>>),
 }
 
 pub(super) struct NewWindow {
@@ -428,6 +451,17 @@ impl TerminalApp {
         })
     }
 
+    pub(super) fn has_sibling_panes(&self) -> bool {
+        let source = self.registry.window_id();
+        WINDOWS.with_borrow(|windows| {
+            windows.iter().any(|(&id, endpoint)| {
+                id != source
+                    && !endpoint.panes.is_empty()
+                    && unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool()
+            })
+        })
+    }
+
     pub(super) fn sibling_pane_preview(
         &self,
         window: u64,
@@ -452,18 +486,26 @@ impl TerminalApp {
         }
         let source = self.registry.window_id();
         let entries = self.pane_search_entries();
-        let Some(subscribers) = WINDOWS.with_borrow_mut(|windows| {
+        let Some((availability_changed, subscribers)) = WINDOWS.with_borrow_mut(|windows| {
             let endpoint = windows.get_mut(&source)?;
             if endpoint.panes.as_ref() == entries {
                 return None;
             }
+            let availability_changed = endpoint.panes.is_empty() != entries.is_empty();
             endpoint.panes = entries.into();
-            Some(search_subscribers(windows, source, SearchScope::Panes))
+            Some((
+                availability_changed,
+                search_subscribers(windows, source, SearchScope::Panes),
+            ))
         }) else {
             return;
         };
-        for sender in subscribers {
-            sender.send(Message::WindowSearchChanged);
+        if availability_changed {
+            windows_changed();
+        } else {
+            for sender in subscribers {
+                sender.send(Message::WindowSearchChanged);
+            }
         }
     }
 
@@ -568,11 +610,11 @@ impl TerminalApp {
             if (self.tabs.active_id() == Some(*id) && tab.prompt_id.is_some())
                 || tab.session.prompts.current().is_some()
             {
-                Some("Answer or cancel the SSH prompt before moving this tab.")
+                Some("Answer or cancel the SSH prompt before moving the session.")
             } else if tab.files.awaiting_native_result() {
-                Some("Finish choosing or preparing files before moving this tab.")
+                Some("Finish choosing or preparing files before moving the session.")
             } else if tab.device_busy {
-                Some("Wait for the SSH key operation to finish before moving this tab.")
+                Some("Wait for the SSH key operation to finish before moving the session.")
             } else {
                 None
             }
@@ -613,6 +655,51 @@ impl TerminalApp {
         else {
             return;
         };
+        self.start_window_transfer(group, panes, destination, TransferKind::Tab, ctx);
+    }
+
+    pub(super) fn move_pane_to_window(
+        &mut self,
+        source: TabId,
+        target: PaneDestination,
+        side: Direction,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.incoming.is_some() || self.outgoing.is_some() || self.move_source() != Some(source)
+        {
+            return;
+        }
+        if let Some(reason) = self.tab_move_blocker(&[source]) {
+            self.window_error = Some(reason.into());
+            return;
+        }
+        let Some(group) = self.tabs.group_id(source) else {
+            return;
+        };
+        let Some(pane) = self.tabs.get(source).and_then(AppTab::pane_id) else {
+            return;
+        };
+        self.start_window_transfer(
+            group,
+            vec![pane],
+            Some(target.window),
+            TransferKind::Pane {
+                source,
+                target,
+                side,
+            },
+            ctx,
+        );
+    }
+
+    fn start_window_transfer(
+        &mut self,
+        group: TabId,
+        panes: Vec<u64>,
+        destination: Option<u64>,
+        kind: TransferKind,
+        ctx: &ComponentContext<Self>,
+    ) {
         let (destination, new_window, target) = if let Some(destination) = destination {
             let source = self.registry.window_id();
             let target = WINDOWS.with_borrow(|windows| {
@@ -644,6 +731,7 @@ impl TerminalApp {
             new_window,
             group,
             panes,
+            kind,
             source: ctx.sender(),
             target: RefCell::new(target),
             payload: Default::default(),
@@ -688,6 +776,14 @@ impl TerminalApp {
                 .is_some_and(|id| self.tab_move_blocker(&[id]).is_some())
     }
 
+    fn pane_transfer_target(&self, target: PaneDestination) -> Option<TabId> {
+        let id = self.tab_for_pane(target.pane)?;
+        (target.window == self.registry.window_id()
+            && self.tabs.group_id(id) == Some(target.group)
+            && self.tab_move_blocker(&[id]).is_none())
+        .then_some(id)
+    }
+
     pub(super) fn accept_transfer(&mut self, source: u64, id: u64, ctx: &ComponentContext<Self>) {
         let offer = WINDOWS.with_borrow(|windows| windows.get(&source)?.outgoing.upgrade());
         let Some(offer) = offer.filter(|offer| {
@@ -697,7 +793,10 @@ impl TerminalApp {
         }) else {
             return;
         };
-        if self.incoming.is_some() || self.existing_destination_blocked() {
+        if self.incoming.is_some()
+            || self.existing_destination_blocked()
+            || matches!(offer.kind, TransferKind::Pane { target, .. } if self.pane_transfer_target(target).is_none())
+        {
             offer.phase.set(TransferPhase::Canceled);
             offer.source.send(Message::TransferCanceled(id));
             return;
@@ -723,7 +822,19 @@ impl TerminalApp {
             self.cancel_transfer(id, ctx);
             return;
         };
-        let leaves = self.tabs.layout_for(headers[index].id).unwrap().leaves();
+        let leaves = match offer.kind {
+            TransferKind::Tab => self.tabs.layout_for(headers[index].id).unwrap().leaves(),
+            TransferKind::Pane { source, .. }
+                if self.tabs.group_id(source) == Some(offer.group)
+                    && self.move_source() == Some(source) =>
+            {
+                vec![source]
+            }
+            TransferKind::Pane { .. } => {
+                self.cancel_transfer(id, ctx);
+                return;
+            }
+        };
         let panes: Vec<_> = leaves
             .iter()
             .filter_map(|leaf| self.tabs.get(*leaf)?.pane_id())
@@ -751,17 +862,28 @@ impl TerminalApp {
                 tab.end_pointer_gesture();
             }
         }
-        let Some(payload) = OfferedTab::take(&mut self.tabs, offer.group, index) else {
+        let before = self.tabs.active_id();
+        let payload = match offer.kind {
+            TransferKind::Tab => {
+                OfferedTab::take(&mut self.tabs, offer.group, index).map(TransferPayload::Tab)
+            }
+            TransferKind::Pane { source, .. } => {
+                self.tabs.detach_pane(source).map(TransferPayload::Pane)
+            }
+        };
+        let Some(payload) = payload else {
             self.cancel_transfer(id, ctx);
             return;
         };
-        let source_selection_changed = payload.was_selected;
+        let source_selection_changed = self.tabs.active_id() != before;
         if source_selection_changed {
             self.keyboard.set_target(None);
         }
         offer.payload.replace(Some(payload));
         offer.phase.set(TransferPhase::Offered);
-        self.mru_groups.retain(|g| *g != offer.group);
+        if self.tabs.group_layout(offer.group).is_none() {
+            self.mru_groups.retain(|g| *g != offer.group);
+        }
         self.refresh_source_after_transfer(source_selection_changed, ctx);
         if !offer.send_target(Message::TransferClaim(id)) {
             self.cancel_transfer(id, ctx);
@@ -791,23 +913,46 @@ impl TerminalApp {
             return;
         };
         let existing = offer.new_window.is_none();
-        if existing && self.existing_destination_blocked() {
-            offer.phase.set(TransferPhase::Canceled);
-            offer.source.send(Message::TransferCanceled(id));
-            self.cancel_transfer(id, ctx);
+        let target = match offer.kind {
+            TransferKind::Tab => None,
+            TransferKind::Pane { target, side, .. } => {
+                self.pane_transfer_target(target).map(|id| (id, side))
+            }
+        };
+        if (existing && self.existing_destination_blocked())
+            || (matches!(offer.kind, TransferKind::Pane { .. }) && target.is_none())
+        {
+            self.reject_claim(&offer, ctx);
             return;
         }
         let Some(payload) = offer.payload.take() else {
             return;
         };
-        let mut group = payload.tab;
+        let leaves = match payload {
+            TransferPayload::Tab(payload) => {
+                let leaves: Vec<_> = payload.tab.entries().iter().map(|t| t.id).collect();
+                self.tabs
+                    .restore_group(payload.tab, self.tabs.headers().len(), true);
+                leaves
+            }
+            TransferPayload::Pane(pane) => {
+                let (target, side) = target.expect("validated destination");
+                match self.tabs.insert_detached_pane(pane, target, side) {
+                    Ok(id) => vec![id],
+                    Err(pane) => {
+                        offer.payload.replace(Some(TransferPayload::Pane(pane)));
+                        self.reject_claim(&offer, ctx);
+                        return;
+                    }
+                }
+            }
+        };
         let cursor_shape = self.appearance.read().unwrap().default_cursor_style.shape();
-        let leaves: Vec<_> = group.entries().iter().map(|t| t.id).collect();
         for leaf in leaves {
             if let Some(AppTab {
                 page: Page::Terminal(live),
                 ..
-            }) = group.get_mut(leaf)
+            }) = self.tabs.get_mut(leaf)
             {
                 live.surface.window_hidden();
                 let _ = live
@@ -824,8 +969,6 @@ impl TerminalApp {
                 live.last_click = None;
             }
         }
-        self.tabs
-            .restore_group(group, self.tabs.headers().len(), true);
         self.activate(ctx);
         self.sync_selection(ctx);
         offer.phase.set(TransferPhase::Claimed);
@@ -835,6 +978,12 @@ impl TerminalApp {
         if existing && let Some(hwnd) = self.keyboard.hwnd() {
             foreground(hwnd);
         }
+    }
+
+    fn reject_claim(&mut self, offer: &Transfer, ctx: &ComponentContext<Self>) {
+        offer.phase.set(TransferPhase::Canceled);
+        offer.source.send(Message::TransferCanceled(offer.id()));
+        self.cancel_transfer(offer.id(), ctx);
     }
 
     pub(super) fn finish_transfer(&mut self, id: u64, ctx: &ComponentContext<Self>) {
@@ -868,13 +1017,25 @@ impl TerminalApp {
         self.outgoing = None;
         if let Some(payload) = offer.payload.take() {
             let before = self.tabs.active_id();
-            payload.return_to(&mut self.tabs);
+            match payload {
+                TransferPayload::Tab(tab) => tab.return_to(&mut self.tabs),
+                TransferPayload::Pane(pane) => self.tabs.return_detached_pane(*pane),
+            }
             self.refresh_source_after_transfer(self.tabs.active_id() != before, ctx);
         }
         offer.pin.take();
         offer.cancel_target();
-        self.window_error =
-            Some("The tab could not move. It is still available in this window.".into());
+        self.window_error = Some(
+            match offer.kind {
+                TransferKind::Tab => {
+                    "The tab could not move. It is still available in this window."
+                }
+                TransferKind::Pane { .. } => {
+                    "The pane could not move. It is still available in this window."
+                }
+            }
+            .into(),
+        );
     }
 }
 

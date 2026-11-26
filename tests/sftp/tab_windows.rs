@@ -52,6 +52,12 @@ async fn native_find_text_across_windows() {
     run("TextSearch", wire.as_bytes()).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "moves one live PowerShell pane and then the last SSH pane to an existing tab in a sibling HWND"]
+async fn native_move_live_panes_to_a_sibling_tab() {
+    run("PaneMove", b"ssh-probe/split-stays/only-pane-moved/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -77,7 +83,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     .unwrap();
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12","pane_picker":"F6","find_all_panes":"F4"}}"#,
+        br#"{"shortcuts":{"command_palette":"F7","focus_right":"F8","focus_left":"F9","copy_mode":"F10","find_tab":"F12","pane_picker":"F6","find_all_panes":"F4","move_pane_to_existing_tab":"F3"}}"#,
     )
     .unwrap();
     let local = |name| {

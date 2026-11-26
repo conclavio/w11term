@@ -150,6 +150,16 @@ pub struct TabLayoutRecipe<P> {
     strip: Vec<TabId>,
 }
 
+/// A live entry in transit, with enough layout state to return it without restarting it.
+pub struct DetachedPane<T> {
+    entry: Tab<T>,
+    original: Group,
+    remaining: Option<Layout>,
+    index: usize,
+    was_selected: bool,
+    fallback: Option<TabId>,
+}
+
 impl<P> TabLayoutRecipe<P> {
     pub fn panes(&self) -> &[P] {
         &self.panes
@@ -665,6 +675,91 @@ impl<T> Tabs<T> {
         self.active_group = Some(target_group);
         self.remove_from_layout(source_group, source);
         true
+    }
+
+    pub fn detach_pane(&mut self, id: TabId) -> Option<Box<DetachedPane<T>>> {
+        let group = self.group_id(id)?;
+        let index = self
+            .groups
+            .iter()
+            .position(|candidate| candidate.id == group)?;
+        let original = self.groups[index].clone();
+        let was_selected = self.active_id() == Some(id);
+        let entry = self.take_entry(id)?;
+        Some(Box::new(DetachedPane {
+            entry,
+            original,
+            remaining: self.group_layout(group).cloned(),
+            index,
+            was_selected,
+            fallback: self.active_id(),
+        }))
+    }
+
+    pub fn insert_detached_pane(
+        &mut self,
+        mut moved: Box<DetachedPane<T>>,
+        target: TabId,
+        side: Direction,
+    ) -> Result<TabId, Box<DetachedPane<T>>> {
+        if self.get(moved.entry.id).is_some() {
+            return Err(moved);
+        }
+        let Some(group) = self.group_id(target) else {
+            return Err(moved);
+        };
+        let destination = self
+            .groups
+            .iter_mut()
+            .find(|candidate| candidate.id == group)
+            .expect("entry has a group");
+        let id = moved.entry.id;
+        if !destination.layout.insert_beside(target, id, side) {
+            return Err(moved);
+        }
+        moved.entry.group = group;
+        destination.focused = id;
+        destination.zoomed = false;
+        self.entries.push(moved.entry);
+        self.active_group = Some(group);
+        Ok(id)
+    }
+
+    pub fn return_detached_pane(&mut self, moved: DetachedPane<T>) {
+        let select = moved.was_selected && self.active_id() == moved.fallback;
+        let original = moved.original;
+        if let Some(expected) = moved.remaining {
+            if let Some(group) = self.groups.iter_mut().find(|group| group.id == original.id)
+                && group.layout == expected
+            {
+                group.layout = original.layout;
+                if select {
+                    group.focused = moved.entry.id;
+                    group.zoomed = original.zoomed;
+                    self.active_group = Some(group.id);
+                }
+                self.entries.push(moved.entry);
+                return;
+            }
+            // The surviving layout changed during handoff. Return the live pane in its own tab.
+            let active = self.active_group;
+            self.insert_group(
+                next_id(),
+                moved.entry.id,
+                moved.entry.value,
+                moved.entry.visit,
+            );
+            if !select && active.is_some() {
+                self.active_group = active;
+            }
+        } else {
+            let index = self.group_insert_index(moved.index, original.pinned);
+            if select || self.active_group.is_none() {
+                self.active_group = Some(original.id);
+            }
+            self.groups.insert(index, original);
+            self.entries.push(moved.entry);
+        }
     }
 
     pub fn split(&mut self, target: TabId, value: T, axis: Axis) -> Option<TabId> {
@@ -1437,6 +1532,60 @@ mod tests {
             target.insert(Box::new("new"))
         );
         assert!(source.take_group(side).unwrap().get(side).is_some());
+    }
+
+    #[test]
+    fn detached_pane_rejects_a_missing_target_and_returns_to_its_original_split() {
+        let mut source = Tabs::default();
+        let left = source.insert(Box::new("SSH"));
+        let right = source
+            .split(left, Box::new("PowerShell"), Axis::Columns)
+            .unwrap();
+        assert!(source.set_ratio(&[], 0.4));
+        assert!(source.toggle_zoom());
+        let original = source.active_layout().unwrap().clone();
+        let instance = &**source.get(right).unwrap() as *const _;
+
+        let pane = source.detach_pane(right).unwrap();
+        assert_eq!(source.active_id(), Some(left));
+        let mut destination = Tabs::default();
+        let target = destination.insert(Box::new("destination"));
+        let Err(pane) = destination.insert_detached_pane(pane, right, Direction::Right) else {
+            panic!("a missing destination must return the detached pane");
+        };
+        source.return_detached_pane(*pane);
+        assert_eq!(source.active_layout(), Some(&original));
+        assert_eq!(source.active_id(), Some(right));
+        assert!(source.zoomed());
+        assert_eq!(&**source.get(right).unwrap() as *const _, instance);
+
+        let pane = source.detach_pane(right).unwrap();
+        let Ok(added) = destination.insert_detached_pane(pane, target, Direction::Right) else {
+            panic!("the available destination must accept the pane");
+        };
+        assert_eq!(added, right);
+        assert_eq!(destination.active_id(), Some(right));
+        assert_eq!(
+            destination.active_layout().unwrap().leaves(),
+            [target, right]
+        );
+        assert_eq!(&**destination.get(right).unwrap() as *const _, instance);
+    }
+
+    #[test]
+    fn canceled_pane_move_keeps_a_newer_source_split_and_selection() {
+        let mut tabs = Tabs::default();
+        let stays = tabs.insert("SSH");
+        let moving = tabs.split(stays, "PowerShell", Axis::Columns).unwrap();
+        let pane = tabs.detach_pane(moving).unwrap();
+        let added = tabs.split(stays, "new shell", Axis::Rows).unwrap();
+        let current = tabs.active_layout().unwrap().clone();
+        tabs.return_detached_pane(*pane);
+
+        assert_eq!(tabs.active_id(), Some(added));
+        assert_eq!(tabs.active_layout(), Some(&current));
+        assert_eq!(tabs.layout_for(moving), Some(&Layout::Leaf(moving)));
+        assert_eq!(tabs.get(moving), Some(&"PowerShell"));
     }
 
     #[test]

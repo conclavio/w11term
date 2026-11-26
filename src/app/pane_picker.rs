@@ -1,5 +1,5 @@
 use super::*;
-use tab_windows::{SearchScope, SearchTarget};
+use tab_windows::{PaneDestination, SearchScope, SearchTarget};
 use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
 mod running_commands;
 mod running_interrupt;
@@ -170,6 +170,7 @@ fn preview_summary(frame: &Snapshot) -> String {
 struct Choice {
     read_only: bool,
     pane: u64,
+    group: TabId,
     pane_name: Option<String>,
     tab_title: Option<String>,
     title: String,
@@ -278,13 +279,24 @@ impl SearchPane {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+pub enum PlacementTarget {
+    Local(TabId),
+    Sibling(PaneDestination),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
     Commands(command_palette::Search),
     Focus,
     HostRoster(TabId),
     Text,
-    Destination { source: TabId },
-    Placement { source: TabId, target: TabId },
+    Destination {
+        source: TabId,
+    },
+    Placement {
+        source: TabId,
+        target: PlacementTarget,
+    },
 }
 
 impl Mode {
@@ -295,7 +307,7 @@ impl Mode {
     fn window_search(self) -> Option<SearchScope> {
         match self {
             Self::Commands(command_palette::Search::Tabs) => Some(SearchScope::Tabs),
-            Self::Focus => Some(SearchScope::Panes),
+            Self::Focus | Self::Destination { .. } => Some(SearchScope::Panes),
             _ => None,
         }
     }
@@ -348,7 +360,7 @@ impl Picker {
             Some(Ok(_)) => None,
         }
     }
-    pub(super) fn placement(&self) -> Option<(TabId, TabId)> {
+    pub(super) fn placement(&self) -> Option<(TabId, PlacementTarget)> {
         match self.mode {
             Mode::Placement { source, target } => Some((source, target)),
             _ => None,
@@ -415,7 +427,7 @@ impl Picker {
     fn placement_view(
         &self,
         source: TabId,
-        target: TabId,
+        target: PlacementTarget,
         width: f64,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
@@ -530,7 +542,7 @@ impl Picker {
             children.push(KeyedView::new(
                 "empty",
                 TextBlock::new().text(if moving && self.query.is_empty() {
-                    "Open a terminal in another tab to move this pane."
+                    "Open a terminal in another tab or window to move this pane."
                 } else if roster {
                     "No matching SSH hosts in this roster"
                 } else {
@@ -666,6 +678,7 @@ impl TerminalApp {
                                 pane_name: live.pane_name.as_ref().map(|n| n.as_str().to_owned()),
                                 tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
                                 pane: pane_id,
+                                group: header.group_id(),
                                 label: label.clone(),
                                 title: String::new(),
                                 destination,
@@ -691,7 +704,7 @@ impl TerminalApp {
     }
 
     fn picker_choices(&self, mode: Mode, query: &str) -> Vec<Choice> {
-        if !matches!(mode, Mode::Focus | Mode::Text) {
+        if matches!(mode, Mode::HostRoster(_)) {
             let choices = self
                 .local_pane_search_entries(mode)
                 .iter()
@@ -699,7 +712,7 @@ impl TerminalApp {
                 .collect();
             return Picker::filter(choices, query);
         }
-        let (window_filter, stripped) = if mode == Mode::Focus {
+        let (window_filter, stripped) = if matches!(mode, Mode::Focus | Mode::Destination { .. }) {
             let Some(parsed) = tab_windows::window_query(query) else {
                 return Vec::new();
             };
@@ -712,7 +725,7 @@ impl TerminalApp {
         let mut choices = Vec::new();
         if allowed(local) {
             choices.extend(
-                self.pane_search_entries()
+                self.local_pane_search_entries(mode)
                     .iter()
                     .map(|entry| entry.row(None)),
             );
@@ -776,7 +789,7 @@ impl TerminalApp {
         let Some(picker) = self
             .picker
             .as_ref()
-            .filter(|picker| picker.mode == Mode::Focus)
+            .filter(|picker| matches!(picker.mode, Mode::Focus | Mode::Destination { .. }))
         else {
             return;
         };
@@ -1439,12 +1452,17 @@ impl TerminalApp {
         if picker.placement().is_some() {
             return;
         }
-        if let Some(window) = picker.matches[index].window {
-            self.close_picker(ctx);
-            self.request_window_result(window, SearchTarget::Pane(pane));
-            return;
-        }
-        let Some(id) = id else {
+        let choice = &picker.matches[index];
+        let target = if let Some(window) = choice.window {
+            Some(PlacementTarget::Sibling(PaneDestination {
+                window,
+                group: choice.group,
+                pane,
+            }))
+        } else {
+            id.map(PlacementTarget::Local)
+        };
+        let Some(target) = target else {
             // A pane can close while its previously rendered result is being chosen.
             picker.matches.retain(|row| row.pane != pane);
             picker.move_by(0);
@@ -1453,18 +1471,26 @@ impl TerminalApp {
         };
         if let Mode::Destination { source } = picker.mode {
             if self.tabs.active_id() != Some(source)
-                || self.tabs.group_id(source) == self.tabs.group_id(id)
+                || matches!(target, PlacementTarget::Local(id) if self.tabs.group_id(source) == self.tabs.group_id(id))
             {
                 self.close_picker(ctx);
                 return;
             }
             picker.selected = index;
-            picker.mode = Mode::Placement { source, target: id };
+            picker.mode = Mode::Placement { source, target };
             picker.preview = None;
             self.keyboard.set_picker_placement();
             self.focus_picker_input(0, ctx);
             return;
         }
+        if let PlacementTarget::Sibling(PaneDestination { window, .. }) = target {
+            self.close_picker(ctx);
+            self.request_window_result(window, SearchTarget::Pane(pane));
+            return;
+        }
+        let PlacementTarget::Local(id) = target else {
+            return;
+        };
         self.tabs.select(id);
         if matches!(self.tabs.get(id), Some(AppTab { page: Page::Terminal(live), .. }) if live.find.open)
         {
@@ -1477,13 +1503,21 @@ impl TerminalApp {
     pub(super) fn place_pane(
         &mut self,
         source: TabId,
-        target: TabId,
+        target: PlacementTarget,
         side: Direction,
         ctx: &ComponentContext<Self>,
     ) {
         if self.picker.as_ref().and_then(Picker::placement) != Some((source, target)) {
             return;
         }
+        let target = match target {
+            PlacementTarget::Local(target) => target,
+            PlacementTarget::Sibling(target) => {
+                self.close_picker(ctx);
+                self.move_pane_to_window(source, target, side, ctx);
+                return;
+            }
+        };
         let source_was_single = matches!(
             self.tabs.active_layout(),
             Some(w11term::pane_layout::Layout::Leaf(_))
@@ -1539,6 +1573,7 @@ mod tests {
         Choice {
             read_only: false,
             pane,
+            group: pane,
             pane_name: None,
             tab_title: None,
             title: title.into(),

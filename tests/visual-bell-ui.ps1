@@ -7,8 +7,39 @@ $ErrorActionPreference = 'Stop'
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
-public static class BellFixtureDpi {
+public static class BellFixtureWindow {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Rect { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct MonitorInfo { public uint size; public Rect monitor, work; public uint flags; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Point { public int x, y; }
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window, uint flags);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
+    public static string Describe(IntPtr window, int x, int y) {
+        var prior = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            Rect rect;
+            GetWindowRect(window, out rect);
+            var hit = GetAncestor(WindowFromPoint(new Point { x = x, y = y }), 2);
+            return String.Format("sample ({0},{1}) hit {2}; expected {3} bounds {4},{5} to {6},{7}", x, y, hit, window, rect.left, rect.top, rect.right, rect.bottom);
+        } finally { SetThreadDpiAwarenessContext(prior); }
+    }
+    public static bool PlaceInsideWorkArea(IntPtr window) {
+        var prior = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            var info = new MonitorInfo { size = (uint)Marshal.SizeOf(typeof(MonitorInfo)) };
+            if (!GetMonitorInfo(MonitorFromWindow(window, 2), ref info)) return false;
+            // Keep an explicitly foreground fixture clear of desktop toasts.
+            return SetWindowPos(window, new IntPtr(-1), info.work.left + 16, info.work.top + 16, 0, 0, 0x11);
+        } finally { SetThreadDpiAwarenessContext(prior); }
+    }
 }
 '@
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
@@ -34,33 +65,42 @@ function Wait-BellEvent([int]$Pane, [uint64]$Since) {
 function Measure-TopEdge([int]$Pane, [string]$Marker) {
     Send-Sequence $Pane "$esc[?25l$esc[2J$esc[H$Marker"
     $null = Control @('wait-for-text','--pane',"$Pane",'--timeout','15',$Marker)
+    Get-TopEdge $Marker
+}
+function Get-TopEdge([string]$Marker) {
     $cell = Get-CursorCell 'palette-ssh' $Marker
-    $scale = [BellFixtureDpi]::GetDpiForWindow($window) / 96.0
+    $scale = [BellFixtureWindow]::GetDpiForWindow($window) / 96.0
     # The terminal starts its first cell 12 DIPs inside the canvas. The visual
     # bell's gold stroke is 1–3 DIPs from the top edge, inside that padding.
     @{ X = $cell.X + [int][Math]::Round(10 * $scale)
        Y = $cell.Y - [int][Math]::Round(11 * $scale)
+       SideX = $cell.X - [int][Math]::Round(11 * $scale)
+       SideY = $cell.Y + [int][Math]::Round(10 * $scale)
        Height = [int][Math]::Ceiling(4 * $scale)
-       Step = [int][Math]::Ceiling(16 * $scale) }
+       Step = [int][Math]::Round(50 * $scale) }
 }
 function Read-Outline($Edge, [switch]$Green) {
-    # Either pane's top stroke is continuous. Try several nearby spots when
-    # a transient desktop window or a flyout covers the first one.
+    # The stroke surrounds the canvas. Use the top and left gutters so one
+    # partially obscured corner cannot hide the entire outline.
     $pixels = $null
-    foreach ($offset in 0,1,2,3) {
-        $pixels = [CursorCellProbe]::TryReadPixels($window, ($Edge.X + $offset * $Edge.Step), $Edge.Y, 8, $Edge.Height)
+    foreach ($offset in 0,1,2,3,4) {
+        $pixels = [CursorCellProbe]::TryReadVisiblePixels($window, ($Edge.X + $offset * $Edge.Step), $Edge.Y, 8, $Edge.Height)
+        if ($null -ne $pixels) { break }
+        $pixels = [CursorCellProbe]::TryReadVisiblePixels($window, $Edge.SideX, ($Edge.SideY + $offset * $Edge.Step), $Edge.Height, 8)
         if ($null -ne $pixels) { break }
     }
     if ($null -eq $pixels) { return $null }
+    $matching = 0
     foreach ($pixel in $pixels) {
         $r = ($pixel -shr 16) -band 255
         $g = ($pixel -shr 8) -band 255
         $b = $pixel -band 255
         if ($Green) {
-            if ($r -lt 80 -and $g -gt 190 -and $b -lt 125) { return $true }
-        } elseif ($r -gt 185 -and $g -gt 105 -and $g -lt 220 -and $b -lt 100) { return $true }
+            if ($r -lt 60 -and $g -gt 195 -and $b -lt 115) { $matching++ }
+        } elseif ($r -gt 225 -and $g -ge 150 -and $g -le 205 -and $b -ge 30 -and $b -le 90) { $matching++ }
     }
-    return $false
+    # The continuous stroke covers at least one row or column of this sample.
+    return $matching -ge 8
 }
 function Read-Outlines([switch]$Green) {
     $rightOutline = Read-Outline $rightEdge -Green:$Green
@@ -68,6 +108,32 @@ function Read-Outlines([switch]$Green) {
     if ($null -ne $rightOutline -and $null -ne $leftOutline) {
         @{ Left = $leftOutline; Right = $rightOutline }
     }
+}
+function Test-VisualFlash([string]$Color, [switch]$Green) {
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $since = Bell-Cursor $left
+        Show-CursorWindow
+        $interrupted = $false
+        $observe = [Diagnostics.Stopwatch]::StartNew()
+        Send-Sequence $left $bell
+        do {
+            $outlines = Read-Outlines -Green:$Green
+            if ($outlines.Right) { throw "$Color bell drew on the focused neighbor" }
+            if ($outlines.Left) {
+                Wait-BellEvent $left $since
+                return
+            }
+            if (!$outlines -or [FixtureMessages]::GetForegroundWindow() -ne $window) {
+                $interrupted = $true
+            }
+            Start-Sleep -Milliseconds 20
+        } while ($observe.ElapsedMilliseconds -lt 1500)
+        Wait-BellEvent $left $since
+        if (!$interrupted) { throw "$Color outline did not flash on the originating pane" }
+        # A flash is suppressed while the fixture is in the background.
+        # Recover only after a sampled foreground loss or occlusion.
+    }
+    throw "Desktop focus or visibility repeatedly interrupted the $Color bell"
 }
 function Get-BellSetting {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -86,6 +152,7 @@ try {
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $left = ((Control @('list')).sessions | Where-Object active).id
     $null = Control @('wait-for-text','--pane',"$left",'--timeout','15','ready')
+    if (![BellFixtureWindow]::PlaceInsideWorkArea($window)) { throw 'Could not position the bell fixture' }
     Show-CursorWindow
     Press-Key 0x77 # F8, split right on the same connection.
     $right = Wait-Until 'active right SSH split' {
@@ -114,6 +181,7 @@ try {
     }
     $since = $withoutBell.next
     $null = Wait-Until 'both pane edges to be visible before the disabled bell' { Read-Outlines }
+    Show-CursorWindow
     Send-Sequence $left $bell
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.ElapsedMilliseconds -lt 650) {
@@ -144,13 +212,7 @@ try {
     Show-CursorWindow
     $null = Wait-Until 'both pane edges to be visible after leaving Settings' { Read-Outlines }
     $before = (Control @('get-text','--pane',"$left")).generation
-    $since = Bell-Cursor $left
-    Send-Sequence $left $bell
-    $null = Wait-Until 'gold outline on the left pane only' {
-        $outlines = Read-Outlines
-        if ($outlines.Right) { throw 'Bell drew on the focused neighbor' }
-        $outlines.Left
-    }
+    Test-VisualFlash 'Default gold'
     # The renderer starts the cooldown when it receives the bell, after the
     # CLI has sent it. Anchor this interval to the observed stroke.
     $timer.Restart()
@@ -159,26 +221,41 @@ try {
         if ($outlines.Right) { throw 'Outline appeared on the neighboring pane' }
         $outlines -and !$outlines.Left
     }
-    Wait-BellEvent $left $since
     Wait-Focus $right
     if ((Control @('get-text','--pane',"$left")).generation -ne $before) {
         throw 'Visual bell changed committed terminal contents'
     }
+    # The parser and UI consume output and bell events independently. Publish
+    # the new color in a committed frame before asking the UI to flash it.
+    Send-Sequence $left ($esc + ']21;visual_bell=#00e850' + $esc + '\' + "$esc[HGreenBellProof")
+    $null = Control @('wait-for-text','--pane',"$left",'--timeout','15','GreenBellProof')
+    Show-CursorWindow
+    Press-Key 0x75 # Resolve fresh bounds for each exposed terminal document.
+    Wait-Focus $left
+    $leftEdge = Get-TopEdge 'GreenBellProof'
+    Press-Key 0x78
+    Wait-Focus $right
+    $rightEdge = Get-TopEdge 'RightBellProof'
     $null = Wait-Until 'the per-pane bell cooldown has elapsed' { $timer.ElapsedMilliseconds -ge 1050 }
-    $since = Bell-Cursor $left
-    Send-Sequence $left ($esc + ']21;visual_bell=#00e850' + $esc + '\' + $bell)
-    $null = Wait-Until 'application-set green outline on the left pane only' {
-        $outlines = Read-Outlines -Green
-        if ($outlines.Right) { throw 'Custom bell drew on the focused neighbor' }
-        $outlines.Left
-    }
+    $null = Wait-Until 'both pane edges to be visible before the custom bell' { Read-Outlines -Green }
+    Test-VisualFlash 'Application-set green' -Green
     $null = Wait-Until 'custom outline expires with idle output' {
         $outlines = Read-Outlines -Green
         if ($outlines.Right) { throw 'Custom outline appeared on the neighboring pane' }
         $outlines -and !$outlines.Left
     }
-    Wait-BellEvent $left $since
     Wait-Focus $right
+} catch {
+    if ($leftEdge -and $rightEdge) {
+        Write-Output ("Left: " + [BellFixtureWindow]::Describe($window,$leftEdge.X,$leftEdge.Y))
+        Write-Output ("Right: " + [BellFixtureWindow]::Describe($window,$rightEdge.X,$rightEdge.Y))
+        Write-Output "Foreground: $([FixtureMessages]::GetForegroundWindow())"
+        $leftPixels = [CursorCellProbe]::TryReadVisiblePixels($window,$leftEdge.X,$leftEdge.Y,8,$leftEdge.Height)
+        $rightPixels = [CursorCellProbe]::TryReadVisiblePixels($window,$rightEdge.X,$rightEdge.Y,8,$rightEdge.Height)
+        Write-Output "Pixel counts: left $($leftPixels.Count), right $($rightPixels.Count)"
+        Write-Output "Outline state: $(Read-Outlines -Green | ConvertTo-Json -Compress)"
+    }
+    throw
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
