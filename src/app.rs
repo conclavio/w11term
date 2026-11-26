@@ -994,6 +994,9 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(window) = tab_windows::menu_all_tabs_window(&label) {
+        return Message::MoveAllTerminalTabs(window);
+    }
     if let Some(window) = tab_windows::menu_window(&label) {
         return Message::MoveTabToExistingWindow(None, window);
     }
@@ -1438,6 +1441,7 @@ pub enum Message {
     MovePaneToNewWindow(Option<u64>),
     MoveTabToWindow,
     MoveTabToExistingWindow(Option<TabId>, u64),
+    MoveAllTerminalTabs(u64),
     DuplicateTabLayout(TabId, DuplicateTabDestination),
     ReopenClosedTab(Option<TabId>),
     PickerReopenTabInWindow(TabId),
@@ -4396,6 +4400,7 @@ impl TerminalApp {
             ),
             self.pane_menu(can_restart, arrangement, directory, previous.is_some()),
             MenuItem::item("rename-window", tab_title::RENAME_WINDOW),
+            self.existing_window_menu(true),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             tab_colors::menu(
                 self.active_terminal_group().is_some(),
@@ -5955,6 +5960,7 @@ impl Component for TerminalApp {
                     self.move_tab_window(Some(window), context);
                 }
             }
+            Message::MoveAllTerminalTabs(window) => self.move_all_terminal_tabs(window, context),
             Message::DuplicateTabLayout(group, destination) => {
                 if self.tabs.active_group_id() == Some(group) {
                     self.duplicate_tab_from_menu(group, destination, context);

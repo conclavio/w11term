@@ -151,7 +151,7 @@ impl TerminalApp {
             || self
                 .outgoing
                 .as_ref()
-                .is_some_and(|transfer| transfer.group == origin.group)
+                .is_some_and(|transfer| transfer.includes_group(origin.group))
             || self.title_editor.is_some()
             || self.export.pending.is_some()
             || self.picker.is_some()

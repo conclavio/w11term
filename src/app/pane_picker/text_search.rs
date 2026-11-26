@@ -779,10 +779,11 @@ impl TerminalApp {
         let Page::Terminal(live) = &self.tabs.get(id)?.page else {
             return None;
         };
-        let transferring = self
-            .outgoing
-            .as_ref()
-            .is_some_and(|t| self.tabs.group_id(id) == Some(t.group));
+        let transferring = self.outgoing.as_ref().is_some_and(|transfer| {
+            self.tabs
+                .group_id(id)
+                .is_some_and(|group| transfer.includes_group(group))
+        });
         (!transferring
             && !live.device_busy
             && !live.browsing_sessions()
