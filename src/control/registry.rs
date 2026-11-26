@@ -490,7 +490,9 @@ mod tests {
         let id = registry.window_id();
         registry.set_ui(move |request| {
             let reply = match request {
-                UiRequest::Open { reply, .. } | UiRequest::Resize { reply, .. } => reply,
+                UiRequest::Open { reply, .. }
+                | UiRequest::Resize { reply, .. }
+                | UiRequest::ClosePane { reply, .. } => reply,
                 _ => unreachable!("unexpected window control request"),
             };
             let _ = reply.send(Ok(json!(id)));
@@ -637,7 +639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_queued_resize_follows_a_completed_transfer() {
+    async fn already_queued_pane_requests_follow_a_completed_transfer() {
         let one = Registry::default();
         let two = one.register_window(2, None).unwrap();
         let (tx, mut source_ui) = mpsc::unbounded_channel();
@@ -655,13 +657,18 @@ mod tests {
                 reply,
             },
         );
-        let queued = source_ui.try_recv().unwrap();
+        let queued_resize = source_ui.try_recv().unwrap();
+        let (reply, closed) = oneshot::channel();
+        one.post_pane_request(5, UiRequest::ClosePane { pane: 5, reply });
+        let queued_close = source_ui.try_recv().unwrap();
         let transfer = one.begin_transfer(&[5]).unwrap();
         two.replace([pane]);
         one.replace([]);
         drop(transfer);
-        assert!(one.for_this_window(queued).is_none());
+        assert!(one.for_this_window(queued_resize).is_none());
+        assert!(one.for_this_window(queued_close).is_none());
         assert_eq!(received.await.unwrap().unwrap(), 2);
+        assert_eq!(closed.await.unwrap().unwrap(), 2);
     }
 
     #[tokio::test]

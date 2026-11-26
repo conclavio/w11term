@@ -59,6 +59,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "disconnect-ssh-shell"
             | "wait-ssh-connected"
             | "wait-pane-exit"
+            | "close-pane"
             | "list-commands"
             | "get-command"
             | "inspect"
@@ -97,7 +98,10 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                     .map(|(pid, request)| Invocation::new(pid, request));
             }
             "--pid" => pid = Some(value(&mut args)?.parse()?),
-            "--pane" => pane = Some(value(&mut args)?.parse()?),
+            "--pane" => {
+                ensure!(pane.is_none(), "specify --pane only once");
+                pane = Some(value(&mut args)?.parse()?);
+            }
             "--no-paste" => no_paste = true,
             "--connection-generation" if verb.as_deref() == Some("send-text") => {
                 ensure!(
@@ -1102,6 +1106,25 @@ mod tests {
             "events --pane 7 --after-frame 15",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn close_pane_requires_one_explicit_positive_id() {
+        let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
+        assert!(matches!(
+            parse_args(&["--pid", "5", "close-pane", "--pane", "7"]).unwrap(),
+            (Some(5), Request::ClosePane { pane: 7 })
+        ));
+        for args in [
+            &["close-pane"][..],
+            &["close-pane", "--pane", "0"],
+            &["close-pane", "--pane", "3", "--pane", "7"],
+            &["--pane", "3", "--pane", "7", "close-pane"],
+            &["--pane", "3", "close-pane", "--pane", "7"],
+            &["close-pane", "--pane", "7", "--activate"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
         }
     }
 

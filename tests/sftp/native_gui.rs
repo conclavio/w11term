@@ -2450,7 +2450,7 @@ async fn native_reopen_closed_tab_layout_restores_position_focus_and_input_lock(
 async fn native_reopen_closed_pane_keeps_the_neighboring_ssh_session() {
     check_mixed_tab_layout(
         "reopen-pane-ui.ps1",
-        b"before-local-close/after-local-reopen/",
+        b"before-local-close/after-local-reopen/after-control-close/",
         1,
     )
     .await;

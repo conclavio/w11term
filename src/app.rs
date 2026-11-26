@@ -3008,6 +3008,53 @@ impl TerminalApp {
         }
     }
 
+    fn sync_active_window_profile(&mut self, group_changed: bool) {
+        let profile = self
+            .tabs
+            .active()
+            .and_then(AppTab::profile_name)
+            .filter(|name| {
+                matches!(
+                    self.tabs.active_layout(),
+                    Some(w11term::pane_layout::Layout::Leaf(_))
+                ) && (self.catalog.profiles.contains_key(*name)
+                    || self.catalog.local.contains_key(*name))
+            })
+            .map(str::to_owned);
+        if profile != self.window_profile {
+            if let Some(previous) = self.window_profile.take() {
+                let _ = self.windows.borrow_mut().remember(&previous);
+            }
+            self.window_profile = profile;
+            if group_changed {
+                self.restore_window();
+            }
+        }
+        let windows = self.windows.clone();
+        let profile = self.window_profile.clone();
+        self.keyboard.on_close(move || {
+            if let Some(name) = &profile {
+                let _ = windows.borrow_mut().remember(name);
+            }
+        });
+    }
+
+    fn refresh_wheel_panes(&self) {
+        self.keyboard
+            .set_wheel_panes(self.tabs.entries().iter().filter_map(|entry| {
+                let Page::Terminal(tab) = &entry.value.page else {
+                    return None;
+                };
+                (self.tabs.visible(entry.id) && !tab.browsing_sessions()).then(|| {
+                    (
+                        entry.id,
+                        tab.session.input.clone(),
+                        tab.session.frames.clone(),
+                    )
+                })
+            }));
+    }
+
     fn activate(&mut self, context: &ComponentContext<Self>) {
         self.update_host_group_timer(context);
         if self.pointer_over.is_some_and(|id| !self.tabs.visible(id)) {
@@ -3036,16 +3083,6 @@ impl TerminalApp {
             self.tabs.active_layout(),
             Some(w11term::pane_layout::Layout::Leaf(_))
         );
-        let profile = self
-            .tabs
-            .active()
-            .and_then(AppTab::profile_name)
-            .filter(|name| {
-                single
-                    && (self.catalog.profiles.contains_key(*name)
-                        || self.catalog.local.contains_key(*name))
-            })
-            .map(str::to_owned);
         let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
         let previous_group = self.active_group.replace(group);
         let group_changed = previous_group != group;
@@ -3059,22 +3096,7 @@ impl TerminalApp {
                 _ => {}
             }
         }
-        if profile != self.window_profile {
-            if let Some(previous) = self.window_profile.take() {
-                let _ = self.windows.borrow_mut().remember(&previous);
-            }
-            self.window_profile = profile;
-            if group_changed {
-                self.restore_window();
-            }
-        }
-        let windows = self.windows.clone();
-        let profile = self.window_profile.clone();
-        self.keyboard.on_close(move || {
-            if let Some(name) = &profile {
-                let _ = windows.borrow_mut().remember(name);
-            }
-        });
+        self.sync_active_window_profile(group_changed);
         if let Some(group) = group {
             self.mru_groups.retain(|g| *g != group);
             self.mru_groups.insert(0, group);
@@ -3132,19 +3154,7 @@ impl TerminalApp {
         }
         self.keyboard.set_target(target);
         self.sync_ime_surface();
-        self.keyboard
-            .set_wheel_panes(self.tabs.entries().iter().filter_map(|entry| {
-                let Page::Terminal(tab) = &entry.value.page else {
-                    return None;
-                };
-                (self.tabs.visible(entry.id) && !tab.browsing_sessions()).then(|| {
-                    (
-                        entry.id,
-                        tab.session.input.clone(),
-                        tab.session.frames.clone(),
-                    )
-                })
-            }));
+        self.refresh_wheel_panes();
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
             self.discovery_action(session_browser::Action::Focus(id, 0), context);
@@ -3209,6 +3219,76 @@ impl TerminalApp {
                 self.initial_grid.set(Some((cols, rows)));
             }
         }
+    }
+
+    fn close_pane_entry(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        if !matches!(
+            self.tabs.layout_for(id),
+            Some(w11term::pane_layout::Layout::Split { .. })
+        ) {
+            self.close_user_tab(id, context);
+            return;
+        }
+        let selected = self.tabs.active_id() == Some(id);
+        let in_active_tab = self.tabs.group_id(id) == self.tabs.active_group_id();
+        self.remember_closed_pane(id);
+        if selected {
+            self.keyboard.set_target(None);
+        }
+        if self.pointer_over == Some(id) {
+            self.change_pointer_pane(None);
+        }
+        self.tabs.remove(id);
+        self.sync_selection(context);
+        if selected {
+            self.activate(context);
+        } else if in_active_tab {
+            // Refresh layout-dependent state without retargeting the keyboard
+            // or restarting selection and find in the surviving active pane.
+            self.pane_drop.cancel();
+            self.cancel_frame_tasks();
+            self.sync_active_window_profile(false);
+            self.refresh_wheel_panes();
+            self.refresh_notification_visibility();
+            let survivors = self
+                .tabs
+                .active_layout()
+                .expect("split has a surviving pane")
+                .leaves();
+            self.panes_rearranged(survivors);
+            self.watch_frames(context);
+            self.refresh_open_commands();
+        } else {
+            self.publish_panes();
+            self.refresh_open_commands();
+        }
+    }
+
+    fn control_close_pane(
+        &mut self,
+        pane: u64,
+        context: &ComponentContext<Self>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let id = self
+            .tab_for_pane(pane)
+            .with_context(|| format!("unknown terminal pane {pane}"))?;
+        let tab_closed = matches!(
+            self.tabs.layout_for(id),
+            Some(w11term::pane_layout::Layout::Leaf(_))
+        );
+        if tab_closed {
+            let group = self.tabs.group_id(id).context("the pane has no tab")?;
+            anyhow::ensure!(
+                !self.tabs.group_is_pinned(group),
+                "the pane's tab is pinned"
+            );
+            anyhow::ensure!(
+                self.tabs.entries().len() > 1,
+                "Use the window controls to close its last tab"
+            );
+        }
+        self.close_pane_entry(id, context);
+        Ok(serde_json::json!({"pane":pane,"tab_closed":tab_closed}))
     }
 
     fn close_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
@@ -6158,6 +6238,12 @@ impl Component for TerminalApp {
                 })();
                 let _ = reply.send(result.map_err(|e| format!("{e:#}")));
             }
+            Message::Control(w11term::control::UiRequest::ClosePane { pane, reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_close_pane(pane, context);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::Resize {
                 pane,
                 cols,
@@ -6559,17 +6645,7 @@ impl Component for TerminalApp {
             }
             Message::ClosePane => {
                 if let Some(id) = self.tabs.active_id() {
-                    if self.tabs.active_layout().is_some_and(|layout| {
-                        matches!(layout, w11term::pane_layout::Layout::Split { .. })
-                    }) {
-                        self.remember_closed_pane(id);
-                        self.keyboard.set_target(None);
-                        self.tabs.remove(id);
-                        self.sync_selection(context);
-                        self.activate(context);
-                    } else {
-                        self.close_user_tab(id, context);
-                    }
+                    self.close_pane_entry(id, context);
                 }
             }
             Message::SplitPane(axis, profile) => self.split_pane(axis, profile, context),

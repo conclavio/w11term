@@ -3,6 +3,13 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
 
+function Reject-Close([int]$Pane, [string]$Reason) {
+    $reply = & $Cli --pid $app.Id close-pane --pane $Pane | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $reply.ok -or $reply.error -notmatch $Reason) {
+        throw "Expected close-pane to fail for pane $Pane with '$Reason'"
+    }
+}
+
 function Tab-MenuItem([string]$Name, [switch]$Panes) {
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' $button })
     $menu = [System.Windows.Automation.ControlType]::MenuItem
@@ -69,6 +76,43 @@ try {
     Send-Remote $sourceSsh.id 'after-local-reopen/'
     Check-History $sourceSsh.id 'before-local-close/' 'ReopenedPane='
     if ((Tab-MenuItem 'Reopen last closed pane').Current.IsEnabled) { throw 'Reopen slot was not consumed' }
+    Press-Key 0x1b # Dismiss the menu before sending further UI shortcuts.
+
+    $background = (Control @('open','--profile','Palette PowerShell')).pane
+    Wait-Text $background 'PS '
+    Wait-Focus $restored.id
+    Press-Key 0x73 # F4 moves focus to the SSH pane on the left.
+    Wait-Focus $sourceSsh.id
+
+    $closed = Control @('close-pane','--pane',"$($restored.id)")
+    $running = @(Sessions)
+    if ($closed.pane -ne $restored.id -or $closed.tab_closed -or
+        $running.Count -ne 2 -or ($running | Where-Object id -eq $restored.id)) {
+        throw 'Closing the split did not remove exactly the addressed pane before acknowledging'
+    }
+    $null = Wait-Until 'focused SSH to fill its tab without reconnecting' {
+        $row = Sessions | Where-Object id -eq $sourceSsh.id
+        $row.active -and $row.cols -gt $sourceSsh.cols -and
+            $row.connection_generation -eq $sourceSsh.connection_generation
+    }
+    $closedProcess = [int]$fresh[1].Value
+    $null = Wait-Until 'closed PowerShell process to exit' { !(Get-Process -Id $closedProcess -ErrorAction SilentlyContinue) }
+
+    Run-Palette 'Pin tab'
+    Reject-Close $sourceSsh.id 'pinned'
+    Run-Palette 'Unpin tab'
+    Wait-Focus $sourceSsh.id
+    $closed = Control @('close-pane','--pane',"$background")
+    $running = @(Sessions)
+    if ($closed.pane -ne $background -or !$closed.tab_closed -or
+        $running.Count -ne 1 -or $running[0].id -ne $sourceSsh.id -or !$running[0].active) {
+        throw 'Closing the background tab changed focus or failed to remove it'
+    }
+    Reject-Close $background 'unknown pane'
+    Reject-Close $sourceSsh.id 'last tab'
+    Wait-Focus $sourceSsh.id
+    Type-Text 'after-control-close/'
+    Wait-Text $sourceSsh.id 'after-control-close/'
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

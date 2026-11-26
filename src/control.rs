@@ -118,6 +118,9 @@ pub enum Request {
         #[serde(default)]
         activate: bool,
     },
+    ClosePane {
+        pane: u64,
+    },
     Sftp {
         pane: u64,
         #[serde(default = "sftp_default_timeout")]
@@ -406,6 +409,10 @@ pub enum UiRequest {
         activate: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    ClosePane {
+        pane: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Resize {
         pane: u64,
         cols: usize,
@@ -417,6 +424,7 @@ impl UiRequest {
     pub fn fail(self, message: &str) {
         let reply = match self {
             Self::Open { reply, .. }
+            | Self::ClosePane { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
@@ -450,14 +458,19 @@ impl UiRequest {
 
     fn routed_pane(&self) -> Option<u64> {
         match self {
-            Self::Resize { pane, .. } => Some(*pane),
+            Self::Resize { pane, .. } | Self::ClosePane { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
         }
     }
 
     fn pane_reply_closed(&self) -> bool {
-        matches!(self, Self::Resize { reply, .. } | Self::CancelSftpTransfer { reply, .. } if reply.is_closed())
+        matches!(self,
+            Self::Resize { reply, .. }
+            | Self::ClosePane { reply, .. }
+            | Self::CancelSftpTransfer { reply, .. }
+            if reply.is_closed()
+        )
     }
 }
 
@@ -585,6 +598,15 @@ impl Registry {
                 tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("open timed out; tab may have been created")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::ClosePane { pane } => {
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(pane, UiRequest::ClosePane { pane, reply });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("close-pane timed out. Use list to check whether the pane closed")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }

@@ -654,6 +654,15 @@ the current window grid. Replies return `pane`, `cols`, `rows`, and `active`. Ne
 tabs may still be connecting or awaiting a native trust/authentication prompt;
 scripts can inspect `list`. No command starts a new GUI process.
 
+`close-pane --pane ID` closes one terminal pane and acknowledges after it has
+been removed from `list`. It can close a background tab without selecting it, or
+remove a split while keeping a surviving active pane selected. The reply contains
+`pane` and `tab_closed`, which is true when the pane was alone in its tab. A
+single-pane tab must be unpinned and have another tab in the same window. Closing
+discards the pane's scrollback and shuts down its local process or SSH shell
+channel. As with closing through the UI, an eligible closed layout can be reopened
+with a fresh session. Use the pane ID returned by `open` to clean up a script's tab.
+
 `wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]`
 waits until an existing SSH pane reports a successful connection. The reply
 contains `pane` and `connection_generation`. An already connected pane returns
@@ -793,6 +802,7 @@ if ($exitReply.ok -and $null -ne $exitReply.result.restart_token) {
 {"verb":"wait-for-text","pane":1,"connection_generation":2,"after_frame":35,"screenshot_path":"C:\\tests\\ready.png","pattern":"ready","timeout_seconds":15}
 {"verb":"resize","pane":1,"cols":170,"rows":48}
 {"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
+{"verb":"close-pane","pane":3}
 {"verb":"events","pane":1,"since":42,"kind":"bell","timeout_seconds":30}
 {"verb":"wait-pane-exit","pane":1,"after_exit_token":1,"timeout_seconds":30}
 {"verb":"restart","pane":1,"exit_token":1}
