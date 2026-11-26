@@ -65,7 +65,7 @@ try {
         $m = Inspect
         $m.ssh_connection.phase -ceq 'connecting' -and $m.ssh_progress.step -ceq 'requesting-terminal' -and
             $m.ssh_progress.host -ceq $peer.host -and $m.ssh_progress.port -eq $peer.port -and
-            !$m.ssh -and (Find-Element 'SSH connection   Connecting') -and (Find-Element 'Requesting PTY and shell')
+            !$m.ssh -and !$m.ssh_transport -and (Find-Element 'SSH connection   Connecting') -and (Find-Element 'Requesting PTY and shell')
     }
     $hold = [IO.File]::ReadAllText((Join-Path $State 'hold-shell-request'))
     [IO.File]::Delete($hold)
@@ -123,7 +123,7 @@ try {
     Wait-Focus $localPane
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','20','PS ')
     $localInspect = Control @('inspect','--pane',"$localPane")
-    if ($localInspect.ssh -or $localInspect.ssh_progress -or $localInspect.ssh_connection) {
+    if ($localInspect.ssh -or $localInspect.ssh_transport -or $localInspect.ssh_progress -or $localInspect.ssh_connection) {
         throw 'PowerShell reported SSH diagnostics'
     }
     Type-Line '$inspectPid = $PID; "local-inspect-" + "ready"'
@@ -161,7 +161,7 @@ try {
     $null = Wait-Until 'a lost SSH transport retires the verified route and shows the failure' {
         $m = Inspect
         (Find-Element 'Close terminal inspector' $button) -and
-            !(Find-Element 'Verified SSH route') -and !$m.ssh -and !$m.ssh_progress -and
+            !(Find-Element 'Verified SSH route') -and !$m.ssh -and !$m.ssh_transport -and !$m.ssh_progress -and
             $m.ssh_connection.phase -ceq 'failed' -and $m.ssh_connection.reason -and
             (Find-Element 'SSH connection   Failed') -and (Find-Element $m.ssh_connection.reason)
     }

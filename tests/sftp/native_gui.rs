@@ -2333,6 +2333,30 @@ async fn native_inspect_reads_background_ssh_without_disturbing_powershell() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reports shared and independent SSH transports and updates inspector membership live"]
+async fn native_inspector_tracks_other_panes_on_the_same_ssh_transport() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), _remote, channels, server) =
+        fixture_counting_accepts(false, 4, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("ssh-transport-membership-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        3,
+        "one shared login and two independent logins"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        4,
+        "one shell per pane or restart"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "duplicates a named, zoomed SSH and PowerShell split and verifies two independent sets of sessions"]
 async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
     check_mixed_tab_layout(

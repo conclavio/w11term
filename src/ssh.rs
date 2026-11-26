@@ -18,8 +18,8 @@ pub use folder_share::{
 };
 pub use local_forward::{LocalForward, LocalForwardStatus};
 pub use negotiation::InitialSshAlgorithms;
-pub use sharing::{ConnectionShare, VerifiedSshPeer, VerifiedSshRoute};
-pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing};
+pub use sharing::{ConnectionShare, SshTransport, VerifiedSshPeer, VerifiedSshRoute};
+pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing, TransportWatch};
 pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};
 

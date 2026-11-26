@@ -121,6 +121,8 @@ A connected SSH pane also reports `ssh.destination` and `ssh.jump_hosts`, ordere
 
 Each peer's `initial_algorithms` reports `key_exchange`, `host_key`, `cipher`, and the boolean `strict_key_exchange` from the first key exchange on that transport. `host_key` includes the SSH certificate algorithm suffix when a certificate was presented. Panes that share a transport report the same initial algorithms. Reopening the transport uses the next connection's negotiation.
 
+While the pane has an active SSH transport, `inspect` reports `ssh_transport` with its numeric `id` and a sorted `pane_ids` list, including the inspected pane. Match it to `ssh_transport_id` in `list` to find other panes on the same authenticated connection across the process's windows. Independent logins have different IDs, even for the same profile. A fresh transport gets a new ID. These fields are omitted when the pane has no active SSH transport.
+
 `mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
 When xterm modified-key reporting or its alternate format is enabled, `keyboard.modify_other_keys` is the active level from 0 through 3 and `keyboard.format_other_keys` is `xterm-27` or `csi-u`.

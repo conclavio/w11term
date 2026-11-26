@@ -265,6 +265,7 @@ impl Command {
 pub struct PaneDescription {
     pub(crate) frame: Arc<Snapshot>,
     pub(crate) connection: crate::events::SshConnectionSnapshot,
+    pub(crate) ssh_transport_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,6 +273,7 @@ pub struct PaneInspection {
     pub connection_generation: u64,
     pub modes: terminal::TerminalModes,
     pub ssh: Option<Arc<ssh::VerifiedSshRoute>>,
+    pub ssh_transport: Option<Arc<ssh::SshTransport>>,
     pub ssh_connection: Option<crate::events::SshConnectionPhase>,
     pub ssh_progress: Option<Arc<ssh::ConnectionProgress>>,
 }
@@ -283,20 +285,29 @@ impl PaneInspection {
         ssh: &ssh::ShareSlot,
         events: &crate::events::Events,
         progress: Option<&Arc<ssh::ConnectionProgress>>,
-    ) -> Self {
+    ) -> (Self, Option<ssh::TransportWatch>) {
         use crate::events::SshConnectionPhase::*;
+        let (route, ssh_transport, transport_watch) = ssh
+            .inspect_transport(connection_generation)
+            .map_or((None, None, None), |(route, transport, watch)| {
+                (Some(route), Some(transport), Some(watch))
+            });
         let ssh_connection = events.ssh_connection_phase();
         let ssh_progress = match ssh_connection {
             Some(Connecting | Reconnecting { .. } | Failed(_)) => progress.cloned(),
             _ => None,
         };
-        Self {
-            connection_generation,
-            modes: terminal::TerminalModes::read(terminal),
-            ssh: ssh.verified_route_at(connection_generation),
-            ssh_connection,
-            ssh_progress,
-        }
+        (
+            Self {
+                connection_generation,
+                modes: terminal::TerminalModes::read(terminal),
+                ssh: route,
+                ssh_transport,
+                ssh_connection,
+                ssh_progress,
+            },
+            transport_watch,
+        )
     }
 }
 
@@ -403,9 +414,7 @@ impl Session {
     }
     /// Require the same authenticated transport generation as a pane snapshot.
     pub fn ssh_connection_at(&self, generation: u64) -> Option<ssh::ConnectionShare> {
-        self.ssh_connection
-            .generation()
-            .and_then(|(current, link)| (current == generation).then_some(link))
+        self.ssh_connection.connection_at(generation)
     }
     pub fn ssh_connection_generation(&self) -> Option<u64> {
         self.ssh_connection
@@ -625,6 +634,7 @@ impl Session {
         launch_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let pane_id = NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (commands, input) = mpsc::unbounded_channel();
         let prompts = crate::prompts::Prompts::default();
         let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
@@ -701,7 +711,7 @@ impl Session {
         let worker_live_frames = live_frames.clone();
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
-        let ssh_connection = ssh::ShareSlot::default();
+        let ssh_connection = ssh::ShareSlot::for_pane(pane_id);
         let (durable, lifecycle) = saved
             .filter(|_| matches!(source, Source::Ssh(_)))
             .map(ssh::DurableControl::new)
@@ -751,7 +761,7 @@ impl Session {
             })
             .expect("starting terminal worker");
         Self {
-            pane_id: NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            pane_id,
             prompts,
             events,
             player,
@@ -1001,15 +1011,19 @@ async fn run(
                 events.set_ssh_connection_phase(phase);
             }
         }
-        if inspecting {
-            frames.set_inspection(Some(PaneInspection::read(
+        let mut inspected_transport = if inspecting {
+            let (inspection, transport) = PaneInspection::read(
                 &terminal,
                 connection_generation,
                 &published_ssh,
                 &events,
                 ssh_progress.as_ref(),
-            )));
-        }
+            );
+            frames.set_inspection(Some(inspection));
+            transport
+        } else {
+            None
+        };
         let notification_expiry = events.next_notification_expiry();
         let animation_deadline = presentation.animation_deadline(&terminal);
         let replay_deadline = animation_deadline
@@ -1017,6 +1031,11 @@ async fn run(
             .chain(presentation.deadline)
             .min();
         tokio::select! {
+            _ = async {
+                if let Some(transport) = &mut inspected_transport {
+                    let _ = transport.changed().await;
+                }
+            }, if inspected_transport.is_some() => {},
             step = async { playback.as_mut().unwrap().next(replay_deadline).await }, if playback.is_some() => {
                 use crate::recorder::ReplayEvent;
                 use timed_replay::Update;
@@ -1355,9 +1374,13 @@ async fn run(
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
                     Some(Command::DescribePane(reply)) => {
+                        let frame = live_frames.load();
+                        let ssh_transport_id = published_ssh.connection_at(frame.connection_generation)
+                            .map(|link| link.transport_id());
                         let _ = reply.send(PaneDescription {
-                            frame: live_frames.load(),
+                            frame,
                             connection: events.connection_snapshot(),
+                            ssh_transport_id,
                         });
                         Ok(())
                     }
@@ -1368,9 +1391,10 @@ async fn run(
                     },
                     Some(Command::ReadModes(reply)) => {
                         if !reply.is_closed() {
-                            let _ = reply.send(PaneInspection::read(
+                            let (inspection, _) = PaneInspection::read(
                                 &terminal, connection_generation, &published_ssh, &events, ssh_progress.as_ref(),
-                            ));
+                            );
+                            let _ = reply.send(inspection);
                         }
                         Ok(())
                     }

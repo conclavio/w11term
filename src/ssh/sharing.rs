@@ -4,8 +4,9 @@ use super::{Handler, InitialSshAlgorithms, SESSION_SETUP_TIMEOUT, negotiation::V
 use crate::{events::SshConnectionPhase, options::SshOptions, prompts::Prompts};
 use anyhow::{Context, Result};
 use russh::{Channel, client};
-use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::{collections::BTreeSet, path::PathBuf};
 use tokio::{
     runtime,
     sync::{Semaphore, oneshot, watch},
@@ -28,6 +29,7 @@ struct Link {
     handle: Arc<client::Handle<Handler>>,
     verified: VerifiedHandshake,
     verified_route: OnceLock<Arc<VerifiedSshRoute>>,
+    transport: watch::Sender<Arc<SshTransport>>,
     options: SshOptions,
     known_hosts: Option<PathBuf>,
     runtime: runtime::Handle,
@@ -47,6 +49,14 @@ impl Drop for Link {
 
 #[derive(Clone)]
 pub struct ConnectionShare(Arc<Link>);
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SshTransport {
+    pub id: u64,
+    pub pane_ids: BTreeSet<u64>,
+}
+
+pub(crate) type TransportWatch = watch::Receiver<Arc<SshTransport>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct VerifiedSshPeer {
@@ -74,10 +84,15 @@ impl ConnectionShare {
         verified: VerifiedHandshake,
         upstream: Option<ConnectionShare>,
     ) -> Self {
+        static NEXT_TRANSPORT_ID: AtomicU64 = AtomicU64::new(1);
         Self(Arc::new(Link {
             handle: Arc::new(handle),
             verified,
             verified_route: OnceLock::new(),
+            transport: watch::Sender::new(Arc::new(SshTransport {
+                id: NEXT_TRANSPORT_ID.fetch_add(1, Ordering::Relaxed),
+                pane_ids: BTreeSet::new(),
+            })),
             upstream,
             options,
             known_hosts: prompts.and_then(Prompts::known_hosts).map(PathBuf::from),
@@ -138,6 +153,19 @@ impl ConnectionShare {
                 })
             })
             .clone()
+    }
+    pub(crate) fn transport_id(&self) -> u64 {
+        self.0.transport.borrow().id
+    }
+    fn register_pane(&self, pane: u64) {
+        self.0
+            .transport
+            .send_if_modified(|transport| Arc::make_mut(transport).pane_ids.insert(pane));
+    }
+    fn unregister_pane(&self, pane: u64) {
+        self.0
+            .transport
+            .send_if_modified(|transport| Arc::make_mut(transport).pane_ids.remove(&pane));
     }
     fn verified_peer(&self) -> VerifiedSshPeer {
         let (host, user, port, key_fingerprint) = self.verified_endpoint();
@@ -233,6 +261,7 @@ struct Publication {
 
 #[derive(Clone)]
 pub(crate) struct ShareSlot {
+    pane_id: Option<u64>,
     publication: Arc<Mutex<Publication>>,
     changed: watch::Sender<()>,
     pub(super) forward_listeners: Arc<Semaphore>,
@@ -241,6 +270,7 @@ pub(crate) struct ShareSlot {
 impl Default for ShareSlot {
     fn default() -> Self {
         Self {
+            pane_id: None,
             publication: Default::default(),
             changed: Default::default(),
             forward_listeners: Arc::new(Semaphore::new(
@@ -259,6 +289,9 @@ impl Drop for PublishedShell {
     fn drop(&mut self) {
         let mut state = self.slot.publication.lock().unwrap();
         if state.current.ptr_eq(&self.link) {
+            if let (Some(pane), Some(link)) = (self.slot.pane_id, self.link.upgrade()) {
+                link.unregister_pane(pane);
+            }
             state.current = Weak::new();
             self.slot.changed.send_replace(());
         }
@@ -266,6 +299,12 @@ impl Drop for PublishedShell {
 }
 
 impl ShareSlot {
+    pub(crate) fn for_pane(pane_id: u64) -> Self {
+        Self {
+            pane_id: Some(pane_id),
+            ..Self::default()
+        }
+    }
     /// Sample the published shell and subscribe under the publication lock: the
     /// next notification retires this authority, even if a sibling retains the transport.
     pub(super) fn forward_lease(
@@ -288,9 +327,27 @@ impl ShareSlot {
             .filter(|share| !share.0.handle.is_closed())
             .map(|share| (state.generation, (*share).clone()))
     }
-    pub(crate) fn verified_route_at(&self, generation: u64) -> Option<Arc<VerifiedSshRoute>> {
+    pub(crate) fn connection_at(&self, generation: u64) -> Option<ConnectionShare> {
         let (current, link) = self.generation()?;
-        (current == generation).then(|| link.verified_route())
+        (current == generation).then_some(link)
+    }
+    pub(crate) fn inspect_transport(
+        &self,
+        generation: u64,
+    ) -> Option<(Arc<VerifiedSshRoute>, Arc<SshTransport>, TransportWatch)> {
+        let (link, snapshot, watch) = {
+            let state = self.publication.lock().unwrap();
+            let link = state.current.upgrade()?;
+            if state.generation != generation || link.0.handle.is_closed() {
+                return None;
+            }
+            // Read membership before releasing this pane's publication. A
+            // concurrent disconnect cannot remove it from this observation.
+            let mut watch = link.0.transport.subscribe();
+            let snapshot = watch.borrow_and_update().clone();
+            (link, snapshot, watch)
+        };
+        Some((link.verified_route(), snapshot, watch))
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
         self.changed.subscribe()
@@ -305,6 +362,14 @@ impl ShareSlot {
         // Each pane owns its own outer Arc. Its offer expires on disconnect
         // even when other panes continue to use the underlying Link.
         let mut state = self.publication.lock().unwrap();
+        if let Some(pane) = self.pane_id {
+            if let Some(previous) = state.current.upgrade()
+                && !Arc::ptr_eq(&previous.0, &local.0)
+            {
+                previous.unregister_pane(pane);
+            }
+            local.register_pane(pane);
+        }
         state.generation = generation;
         state.current = Arc::downgrade(local);
         self.changed.send_replace(());

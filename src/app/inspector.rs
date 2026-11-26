@@ -2,7 +2,7 @@ use super::*;
 use termwiz::input::KeyboardEncoding;
 use w11term::events::SshConnectionPhase;
 use w11term::session::PaneInspection;
-use w11term::ssh::{ConnectionStep, VerifiedSshPeer, VerifiedSshRoute};
+use w11term::ssh::{ConnectionStep, SshTransport, VerifiedSshPeer, VerifiedSshRoute};
 use w11term::terminal::TerminalModes;
 use wezterm_input_types::KittyKeyboardFlags as Flags;
 use wezterm_term::MouseEncoding;
@@ -259,6 +259,23 @@ fn ssh_route_view(
         ])
 }
 
+fn ssh_transport_view(transport: &SshTransport, pane: u64) -> View {
+    let others = transport
+        .pane_ids
+        .iter()
+        .filter(|&&member| member != pane)
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let members = if others.is_empty() { "None" } else { &others };
+    StackPanel::new().spacing(3.0).children((
+        TextBlock::new().text(format!("SSH transport   #{}", transport.id)),
+        TextBlock::new()
+            .text(format!("Other panes   {members}"))
+            .text_wrapping(TextWrapping::Wrap),
+    ))
+}
+
 impl Inspection {
     pub(super) fn set_ssh_expanded(&mut self, expanded: bool) {
         self.ssh_expanded = expanded
@@ -354,6 +371,13 @@ impl Inspection {
             .map_or_else(View::empty, |route| {
                 ssh_route_view(route, self.pane, self.ssh_expanded, context)
             });
+        let transport = self
+            .current
+            .as_ref()
+            .and_then(|value| value.ssh_transport.as_deref())
+            .map_or_else(View::empty, |transport| {
+                ssh_transport_view(transport, self.pane)
+            });
         Border::new()
             .grid_row(1)
             .horizontal_alignment(HorizontalAlignment::Right)
@@ -386,6 +410,7 @@ impl Inspection {
                                 self.current
                                     .as_ref()
                                     .map_or_else(View::empty, ssh_status_view),
+                                transport,
                                 ssh,
                                 self.readout.clone(),
                                 TextBlock::new().text(self.pointer.cell.map_or_else(
@@ -565,6 +590,7 @@ mod tests {
             connection_generation: 0,
             modes,
             ssh: None,
+            ssh_transport: None,
             ssh_connection: None,
             ssh_progress: None,
         };

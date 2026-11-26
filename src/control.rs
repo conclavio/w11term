@@ -953,7 +953,11 @@ impl Registry {
                 let mut sessions = Vec::new();
                 for (window_id, pane) in self.listing() {
                     let mut session = match Self::describe_pane(&pane).await {
-                        Ok(PaneDescription { frame, connection }) => {
+                        Ok(PaneDescription {
+                            frame,
+                            connection,
+                            ssh_transport_id,
+                        }) => {
                             let mut session = json!({
                                 "title": frame.title,
                                 "status": frame.status,
@@ -971,6 +975,9 @@ impl Registry {
                             }
                             if let Some(retry) = connection.retry {
                                 session["ssh_retry_token"] = json!(retry);
+                            }
+                            if let Some(id) = ssh_transport_id {
+                                session["ssh_transport_id"] = id.into();
                             }
                             session
                         }
@@ -1071,6 +1078,9 @@ impl Registry {
                 report["connection_generation"] = inspection.connection_generation.into();
                 if let Some(ssh) = inspection.ssh {
                     report["ssh"] = serde_json::to_value(ssh.as_ref())?;
+                }
+                if let Some(transport) = inspection.ssh_transport {
+                    report["ssh_transport"] = serde_json::to_value(transport.as_ref())?;
                 }
                 if let Some(connection) = inspection.ssh_connection {
                     report["ssh_connection"] = connection.as_json();
