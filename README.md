@@ -357,7 +357,9 @@ Click a pane to focus it, drag a divider to resize, or zoom one pane and restore
 
 Choose **More → Pin tab** or use the command palette to keep a terminal tab on the left of the strip. A pushpin marks the tab and its close button disappears. **Close tab** and **Close pane** leave it open when the action would close the whole tab. You can still close an individual split, move the live tab to another window, or close the window itself. Choose **Unpin tab** to restore the tab’s close button. Saved workspaces remember pins.
 
-Choose **Close other tabs** or **Close tabs to the right** from the More menu or command palette. Both preserve the selected tab and all pinned tabs. Closed terminal layouts enter the usual reopen history, with the rightmost eligible tab reopening first.
+Right-click a tab header to rename it, set its color, pin or unpin it, duplicate its layout, or close it. Rename, color, pin and close can operate on a background tab while your current pane stays selected. Duplicating opens and selects the new tab.
+
+Choose **Close other tabs** or **Close tabs to the right** from the More menu or command palette to close tabs around your selection. From a tab's right-click menu, both commands use the clicked tab. All pinned tabs stay open. Focus stays on the selected tab if it survives and moves to the clicked tab if the selection closes. Closed terminal layouts enter the usual reopen history, with the rightmost eligible tab reopening first.
 
 Choose **More → Duplicate tab layout** to open a fresh copy near the current tab. It keeps the tab name, pane arrangement, divider positions, focused pane, zoom and read-only input locks. Each SSH pane makes an independent login, and each local shell starts a new process. The original tab keeps its jobs and scrollback. A configured local or SSH starting directory carries over. Copies start unpinned. You can assign **Duplicate tab layout** a shortcut in Settings.
 
@@ -370,6 +372,8 @@ Duplication works with ordinary SSH and interactive local shell launches. The me
 Choose **More → Panes → Move tab to new window** to move the whole terminal tab, including every split, to another native window. The tab keeps its title, focused pane, split proportions and zoom. Each SSH channel and local shell keeps running with its scrollback. The last tab leaving a window closes that window after the destination takes ownership. Both windows share a process and control pipe. Use the pane’s `window_id` in `w11term-cli list` to find its current window.
 
 Use **More → Panes → Move tab to existing window** to move the live tab back into another window in the same process. Choose a destination by its window ID and active tab title. The moved tab joins the end of the destination’s tab strip and becomes selected. The command palette also lists the available destinations.
+
+Both move commands are also on the tab header’s right-click menu. Moving a background tab keeps the source window’s current tab selected.
 
 To monitor an SSH or local shell, choose **More → Panes → Enable read-only pane input** or search for **read-only** in the command palette. The pane’s status line and picker entry show **Read-only**, and `w11term-cli list` reports `read_only: true`. Typing, IME commits, paste, and application mouse input are blocked. A control-pipe write gets a read-only error. Output, terminal query replies, resizing, selection, copying, and scrollback search continue. Use **Disable read-only pane input** to resume typing. The lock follows the live pane when it moves. Newly opened panes start unlocked. Closing panes and SFTP file operations are still available.
 

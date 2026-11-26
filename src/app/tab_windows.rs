@@ -13,6 +13,7 @@ use windows::Win32::{
 };
 
 const WINDOW_LABEL: &str = "Window ";
+pub(super) const NEW_WINDOW_LABEL: &str = "Move tab to new window";
 static NEXT_WINDOW: AtomicU64 = AtomicU64::new(2);
 
 pub(super) fn menu_window(label: &str) -> Option<u64> {
@@ -296,7 +297,18 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn existing_window_menu(&self) -> MenuItem {
+    pub(super) fn tab_window_items(&self) -> [MenuItem; 2] {
+        [
+            command_menu_item(
+                "move-tab-window",
+                NEW_WINDOW_LABEL,
+                self.outgoing.is_none() && self.incoming.is_none(),
+            ),
+            self.existing_window_menu(),
+        ]
+    }
+
+    fn existing_window_menu(&self) -> MenuItem {
         let windows = if self.incoming.is_some() || self.outgoing.is_some() {
             Vec::new()
         } else {
@@ -356,14 +368,21 @@ impl TerminalApp {
         destination: Option<u64>,
         ctx: &ComponentContext<Self>,
     ) {
+        if let Some(group) = self.tabs.active_group_id() {
+            self.move_tab_group_to_window(group, destination, ctx);
+        }
+    }
+
+    pub(super) fn move_tab_group_to_window(
+        &mut self,
+        group: TabId,
+        destination: Option<u64>,
+        ctx: &ComponentContext<Self>,
+    ) {
         if self.outgoing.is_some() || self.incoming.is_some() {
             return;
         }
-        let Some(id) = self.tabs.active_id() else {
-            return;
-        };
-        let group = self.tabs.group_id(id).unwrap();
-        let Some(layout) = self.tabs.active_layout() else {
+        let Some(layout) = self.tabs.group_layout(group) else {
             return;
         };
         let leaves = layout.leaves();
@@ -516,21 +535,34 @@ impl TerminalApp {
                 tab.end_pointer_gesture();
             }
         }
-        self.cancel_frame_tasks();
         let Some(payload) = OfferedTab::take(&mut self.tabs, offer.group, index) else {
             self.cancel_transfer(id, ctx);
             return;
         };
-        if payload.was_selected {
+        let source_selection_changed = payload.was_selected;
+        if source_selection_changed {
             self.keyboard.set_target(None);
         }
         offer.payload.replace(Some(payload));
         offer.phase.set(TransferPhase::Offered);
         self.mru_groups.retain(|g| *g != offer.group);
-        self.sync_selection(ctx);
-        self.activate(ctx);
+        self.refresh_source_after_transfer(source_selection_changed, ctx);
         if !offer.send_target(Message::TransferClaim(id)) {
             self.cancel_transfer(id, ctx);
+        }
+    }
+
+    fn refresh_source_after_transfer(
+        &mut self,
+        selection_changed: bool,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.sync_selection(ctx);
+        if selection_changed {
+            self.activate(ctx);
+        } else {
+            self.publish_panes();
+            self.refresh_open_commands();
         }
     }
 
@@ -624,9 +656,9 @@ impl TerminalApp {
         offer.phase.set(TransferPhase::Canceled);
         self.outgoing = None;
         if let Some(payload) = offer.payload.take() {
+            let before = self.tabs.active_id();
             payload.return_to(&mut self.tabs);
-            self.activate(ctx);
-            self.sync_selection(ctx);
+            self.refresh_source_after_transfer(self.tabs.active_id() != before, ctx);
         }
         offer.pin.take();
         offer.cancel_target();

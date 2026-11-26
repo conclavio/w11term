@@ -310,8 +310,13 @@ impl<T> Tabs<T> {
         Some(&self.groups.get(self.active_index()?)?.layout)
     }
     pub fn layout_for(&self, entry: TabId) -> Option<&Layout> {
-        let id = self.group_id(entry)?;
-        self.groups.iter().find(|g| g.id == id).map(|g| &g.layout)
+        self.group_layout(self.group_id(entry)?)
+    }
+    pub fn group_layout(&self, group: TabId) -> Option<&Layout> {
+        self.groups
+            .iter()
+            .find(|g| g.id == group)
+            .map(|g| &g.layout)
     }
     pub fn zoomed(&self) -> bool {
         self.active_index()
@@ -502,9 +507,18 @@ impl<T> Tabs<T> {
         let Some(group) = self.active_group_id() else {
             return Ok(None);
         };
-        let recipe = self
-            .capture_group(group, prepare)?
-            .expect("active group exists");
+        self.duplicate_group(group, prepare, launch)
+    }
+
+    pub fn duplicate_group<P, E>(
+        &mut self,
+        group: TabId,
+        prepare: impl FnMut(&T) -> Result<P, E>,
+        launch: impl FnMut(P) -> T,
+    ) -> Result<Option<TabId>, E> {
+        let Some(recipe) = self.capture_group(group, prepare)? else {
+            return Ok(None);
+        };
         Ok(Some(self.insert_fresh_group(
             recipe.index + 1,
             recipe.group,

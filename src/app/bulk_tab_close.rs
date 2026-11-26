@@ -7,6 +7,8 @@ pub(super) enum Scope {
 }
 
 impl Scope {
+    pub(super) const ALL: [Self; 2] = [Self::Other, Self::Right];
+
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Other => "Close other tabs",
@@ -15,42 +17,90 @@ impl Scope {
     }
 
     pub(super) fn from_label(label: &str) -> Option<Self> {
-        [Self::Other, Self::Right]
-            .into_iter()
-            .find(|scope| scope.label() == label)
+        Self::ALL.into_iter().find(|scope| scope.label() == label)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Origin {
+    ActiveTab,
+    TabHeader,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Offer {
     scope: Scope,
     anchor: TabId,
+    origin: Origin,
     targets: Vec<TabId>,
+}
+
+pub(super) fn strip_order<T>(
+    tabs: &Tabs<T>,
+    headers: &[&w11term::tabs::Tab<T>],
+) -> Vec<(TabId, bool)> {
+    headers
+        .iter()
+        .map(|tab| {
+            let group = tab.group_id();
+            (group, tabs.group_is_pinned(group))
+        })
+        .collect()
 }
 
 impl Offer {
     fn capture<T>(tabs: &Tabs<T>, scope: Scope) -> Option<Self> {
-        let anchor = tabs.active_group_id()?;
+        Self::capture_from(
+            &strip_order(tabs, &tabs.headers()),
+            tabs.active_group_id()?,
+            scope,
+            Origin::ActiveTab,
+        )
+    }
+
+    pub(super) fn from_header(
+        strip: &[(TabId, bool)],
+        anchor: TabId,
+        scope: Scope,
+    ) -> Option<Self> {
+        Self::capture_from(strip, anchor, scope, Origin::TabHeader)
+    }
+
+    fn capture_from(
+        strip: &[(TabId, bool)],
+        anchor: TabId,
+        scope: Scope,
+        origin: Origin,
+    ) -> Option<Self> {
+        let anchor_index = strip.iter().position(|&(group, _)| group == anchor)?;
         let start = match scope {
             Scope::Other => 0,
-            Scope::Right => tabs.active_index()? + 1,
+            Scope::Right => anchor_index + 1,
         };
-        let targets: Vec<_> = tabs
-            .headers()
+        let targets: Vec<_> = strip[start..]
             .iter()
-            .skip(start)
-            .map(|tab| tab.group_id())
-            .filter(|&group| group != anchor && !tabs.group_is_pinned(group))
+            .filter_map(|&(group, pinned)| (group != anchor && !pinned).then_some(group))
             .collect();
         (!targets.is_empty()).then_some(Self {
             scope,
             anchor,
+            origin,
             targets,
         })
     }
 
     fn still_matches<T>(&self, tabs: &Tabs<T>) -> bool {
-        Self::capture(tabs, self.scope).as_ref() == Some(self)
+        if self.origin == Origin::ActiveTab && tabs.active_group_id() != Some(self.anchor) {
+            return false;
+        }
+        Self::capture_from(
+            &strip_order(tabs, &tabs.headers()),
+            self.anchor,
+            self.scope,
+            self.origin,
+        )
+        .as_ref()
+            == Some(self)
     }
 }
 
@@ -64,15 +114,24 @@ impl TerminalApp {
         if !offer.still_matches(&self.tabs) {
             return;
         }
-        let entries: Vec<_> = self
-            .tabs
-            .headers()
+        let headers = self.tabs.headers();
+        let entries: Vec<_> = headers
             .iter()
             .filter(|tab| offer.targets.contains(&tab.group_id()))
             .map(|tab| (tab.group_id(), tab.id))
             .collect();
+        let anchor = tab_title::switcher_leaf(&headers, offer.anchor);
         for &(group, _) in &entries {
             self.remember_closed_tab(group);
+        }
+        // The clicked tab takes focus when the current selection is closing.
+        if self
+            .tabs
+            .active_group_id()
+            .is_some_and(|group| offer.targets.contains(&group))
+            && let Some(anchor) = anchor
+        {
+            self.tabs.select(anchor);
         }
         self.close_tabs(entries.into_iter().map(|(_, id)| id), context);
     }
@@ -119,5 +178,32 @@ mod tests {
         assert!(offer.still_matches(&tabs));
         tabs.set_group_pinned(later, true);
         assert!(!offer.still_matches(&tabs));
+    }
+
+    #[test]
+    fn a_header_offer_uses_the_named_tab_and_rechecks_the_original_targets() {
+        let mut tabs = Tabs::default();
+        let left = tabs.insert("left");
+        let anchor = tabs.insert("anchor");
+        let right = tabs.insert("right");
+        let pinned = tabs.insert("pinned");
+        tabs.set_group_pinned(pinned, true);
+        tabs.select(left);
+        let strip = strip_order(&tabs, &tabs.headers());
+        let to_the_right = Offer::from_header(&strip, anchor, Scope::Right).unwrap();
+        assert_eq!(to_the_right.targets, [right]);
+        assert_eq!(
+            Offer::from_header(&strip, anchor, Scope::Other)
+                .unwrap()
+                .targets,
+            [left, right]
+        );
+        assert!(Offer::from_header(&strip, right, Scope::Right).is_none());
+        tabs.select(right);
+        assert!(to_the_right.still_matches(&tabs));
+        tabs.insert("new");
+        assert!(!to_the_right.still_matches(&tabs));
+        tabs.remove_group(anchor);
+        assert!(!to_the_right.still_matches(&tabs));
     }
 }

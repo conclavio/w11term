@@ -2,9 +2,10 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+. (Join-Path $PSScriptRoot 'support/tab-context.ps1')
 Add-Type @"
 using System;
 using System.Collections.Generic;
@@ -191,7 +192,16 @@ try {
     $anchorIdentity = Shell-State $anchor.id 'anchorBefore' -Init
     if ($localIdentity -eq $anchorIdentity) { throw 'Expected independent PowerShell children' }
     Write-Output "Moving split from source $origin"
-    Run-WindowCommand $origin 'Move tab to new window'
+    if ($FirstClose -eq 'Context') {
+        Use-Window $origin
+        $window = $origin
+        Expect-Focus $origin $anchor.id 'The source shell is active before opening the background tab menu'
+        Press-Key 0x79 # F10 enters copy mode on the source shell.
+        $null = Wait-Until 'copy mode in the source shell before moving the background tab' { Copy-ModeOpen }
+        Invoke-Button (Open-Context 'Cockpit tools' 'Move tab to new window')
+    } else {
+        Run-WindowCommand $origin 'Move tab to new window'
+    }
     $destination = Wait-Until 'two distinct native HWNDs owned by the same process' {
         $handles = [TabFixtureWindows]::OwnedBy($app.Id)
         if ($handles.Count -eq 2 -and $handles -contains $origin) {
@@ -214,6 +224,12 @@ try {
     if ((Shell-State $moved.id 'movedAfter' $destination) -ne $localIdentity) { throw 'Moved PowerShell restarted' }
     Use-Window $origin
     Expect-Focus $origin $anchor.id 'Returning to the source selects its PowerShell pane'
+    if ($FirstClose -eq 'Context') {
+        $window = $origin
+        $null = Wait-Until 'the source shell is still in copy mode' { Copy-ModeOpen }
+        Press-Key 27
+        $null = Wait-Until 'copy mode closes on Escape' { !(Copy-ModeOpen) }
+    }
     if ((Shell-State $anchor.id 'sourceAfter' $origin) -ne $anchorIdentity) { throw 'Source PowerShell restarted' }
     Use-Window $destination
     Expect-Focus $destination $moved.id 'Returning to the destination restores its PowerShell focus'
@@ -221,9 +237,7 @@ try {
     Press-Key 0x78 # F9 focuses the left SSH pane
     Expect-Focus $destination $ssh.id 'F9 selects the destination SSH pane'
 
-    if ($FirstClose -eq 'Existing') {
-        # The two-pane tab is the detached window's only tab. Move it into
-        # the original window, which still has its own PowerShell tab.
+    if ($FirstClose -in 'Existing','Context') {
         $baselineHeight = Wait-Until 'SSH cells before pane zoom' { Get-PaneCellHeight $ssh.id }
         Run-WindowCommand $destination 'Increase pane text size'
         $zoomedHeight = Wait-Until 'SSH cells enlarged before moving to the existing window' {
@@ -231,14 +245,40 @@ try {
             if ($height -gt $baselineHeight) { $height }
         }
         Write-Output "Moving the live split back into existing window $origin"
-        Run-WindowCommand $destination "Move tab to existing window $($anchor.window_id) $([char]0x00b7) Source PowerShell"
-        $returned = Expect-Group 3 $newOwner
+        $target = "$($anchor.window_id) $([char]0x00b7) Source PowerShell"
+        if ($FirstClose -eq 'Context') {
+            Run-WindowCommand $destination ('New tab with Destination PowerShell ' + [char]0x00b7 + ' Local')
+            $helper = Wait-Until 'a separate selected shell in the detached window' {
+                (Control @('list')).sessions | Where-Object {
+                    $_.label -eq 'Destination PowerShell' -and $_.window_id -eq $newOwner -and $_.active
+                }
+            }
+            Expect-Text $helper.id 'PS '
+            $helperIdentity = Shell-State $helper.id 'helperBefore' -Init
+            $window = $destination
+            $submenu = Open-Context 'Cockpit tools' 'Move tab to existing window'
+            $submenu.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+            Invoke-Button (Wait-Until 'original window in the tab context menu' {
+                Find-Element "Window $target" ([System.Windows.Automation.ControlType]::MenuItem) -Visible
+            })
+            $returned = Expect-Group 4 $newOwner
+            Use-Window $destination
+            Expect-Focus $destination $helper.id 'The detached window keeps its selected shell'
+            if ((Shell-State $helper.id 'helperAfter' $destination) -ne $helperIdentity) {
+                throw 'Moving the background split restarted the selected shell'
+            }
+            Close-FixtureWindow $destination
+        } else {
+            Run-WindowCommand $destination "Move tab to existing window $target"
+            $returned = Expect-Group 3 $newOwner
+        }
         if ($returned -ne $anchor.window_id) { throw 'Split moved to a different window ID' }
         $last = $origin
         $null = Wait-Until 'the original HWND to remain after the empty source closes' {
             $handles = [TabFixtureWindows]::OwnedBy($app.Id)
             $handles.Count -eq 1 -and $handles[0] -eq $origin
         }
+        if ($FirstClose -eq 'Context') { Use-Window $origin }
         Expect-Focus $origin $ssh.id 'Existing destination receives the moved tab and keyboard focus'
         $null = Wait-Until 'the moved pane still renders at its enlarged text size' {
             $grid = Control @('inspect','--pane',"$($ssh.id)")

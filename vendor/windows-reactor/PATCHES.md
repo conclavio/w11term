@@ -20,3 +20,9 @@ to reserve the content area for their icons.
 An explicit tab strip width or selection change queues a scroll to the
 selected header after layout. This keeps the selected header visible when
 the native title bar narrows.
+
+A menu attached to a TabViewItem uses WinUI's ContextFlyout property for
+the mouse and keyboard context-menu gestures. The native TitleBar left
+header accepts the tab strip in a pointer-interactive region. The runtime
+refreshes its drag regions when the strip width changes independently of
+the window.

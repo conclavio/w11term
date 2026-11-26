@@ -235,13 +235,9 @@ impl TerminalApp {
     }
 
     pub(in crate::app) fn can_duplicate_tab_layout(&self, group: TabId) -> Result<()> {
-        ensure!(
-            self.tabs.active_group_id() == Some(group),
-            "The original tab is no longer active"
-        );
         let layout = self
             .tabs
-            .active_layout()
+            .group_layout(group)
             .context("The original tab was closed")?;
         for id in layout.leaves() {
             let tab = self.tabs.get(id).context("The original pane was closed")?;
@@ -265,7 +261,8 @@ impl TerminalApp {
         // A moved/deleted catalog cannot change a live pane's launch recipe.
         let catalog = self.store.catalog().ok();
         let preferences = self.appearance.read().unwrap().pane_preferences();
-        self.tabs.duplicate_active_group(
+        self.tabs.duplicate_group(
+            group,
             |tab| NewShell::capture(tab)?.prepare(catalog.as_ref()),
             |recipe| recipe.launch(preferences),
         )?;

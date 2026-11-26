@@ -6,6 +6,7 @@ pub(super) const RENAME_PANE: &str = "Rename focused pane…";
 
 pub enum Action {
     Show,
+    ShowGroup(TabId),
     ShowPane(u64, TabId),
     SaveProfile(clipboard_paste::Origin),
     Edit(u64, String),
@@ -195,7 +196,11 @@ impl TerminalApp {
     }
 
     fn show_title_editor(&mut self, target: Target) {
-        let Some(id) = self.tabs.active_id() else {
+        let id = match target {
+            Target::Group(group) => switcher_leaf(&self.tabs.headers(), group),
+            _ => self.tabs.active_id(),
+        };
+        let Some(id) = id else {
             return;
         };
         let Some(AppTab {
@@ -206,11 +211,16 @@ impl TerminalApp {
             return;
         };
         let group = self.tabs.group_id(id).expect("pane has a tab");
+        let blocked = |live: &LiveTab| {
+            live.session.frames.load().prompt.is_some()
+                || live.session.prompts.current().is_some()
+                || live.files.entry_dialog_open()
+        };
         if !target.matches_focus(live.session.pane_id, group)
             || matches!(target, Target::Profile(origin) if self.saveable_ssh_origin() != Some(origin))
-            || live.session.frames.load().prompt.is_some()
-            || live.session.prompts.current().is_some()
-            || live.files.entry_dialog_open()
+            || blocked(live)
+            || (self.tabs.active_id() != Some(id)
+                && matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(active)) if blocked(active)))
             || self.clipboard.is_open()
         {
             return;
@@ -245,6 +255,7 @@ impl TerminalApp {
                     self.show_title_editor(Target::Group(group));
                 }
             }
+            Action::ShowGroup(group) => self.show_title_editor(Target::Group(group)),
             Action::ShowPane(pane, group) => self.show_title_editor(Target::Pane { pane, group }),
             Action::SaveProfile(origin) => self.show_title_editor(Target::Profile(origin)),
             Action::Edit(serial, text) => {

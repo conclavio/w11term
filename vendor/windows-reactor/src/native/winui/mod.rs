@@ -1972,7 +1972,16 @@ impl WinUiRuntime {
                 )
                     && let Some(Handle::TabView(tabs)) = self.handles.get(node)
                 {
-                    reveal_selected_tab_after_layout(tabs);
+                    let title_bar = self
+                        .window_title_bars
+                        .values()
+                        .find_map(|(title_bar, _)| match self.handles.get(title_bar) {
+                            Some(Handle::TitleBar(title_bar)) if *property == PropertyId::Width => {
+                                Some(title_bar)
+                            }
+                            _ => None,
+                        });
+                    reveal_selected_tab_after_layout(tabs, title_bar);
                 }
                 if controlled_collection_for_property(*property).is_some()
                     && let PropertyValue::I32(value) = value
@@ -2223,6 +2232,12 @@ impl WinUiRuntime {
             } => {
                 if let Some(previous) = self.owned_menus.remove(owner) {
                     match previous.kind {
+                        OwnedMenuKind::TabViewItemContext => {
+                            self.ui_element(previous.target)?
+                                .cast::<IUIElement>()
+                                .and_then(|element| element.SetContextFlyout(None::<&FlyoutBase>))
+                                .map_err(native_error)?;
+                        }
                         OwnedMenuKind::ButtonFlyout | OwnedMenuKind::DropDownButtonFlyout => {
                             let button = self
                                 .ui_element(previous.target)?
@@ -2250,7 +2265,9 @@ impl WinUiRuntime {
                 let sink = self.event_sink()?;
                 let mut revokers = Vec::new();
                 let flyout = match kind {
-                    OwnedMenuKind::ButtonFlyout | OwnedMenuKind::DropDownButtonFlyout => {
+                    OwnedMenuKind::ButtonFlyout
+                    | OwnedMenuKind::DropDownButtonFlyout
+                    | OwnedMenuKind::TabViewItemContext => {
                         let flyout = MenuFlyout::new().map_err(native_error)?;
                         build_menu_items(
                             items,
@@ -2260,10 +2277,17 @@ impl WinUiRuntime {
                             &flyout.Items().map_err(native_error)?,
                             &mut revokers,
                         )?;
-                        self.ui_element(*target)?
-                            .cast::<IButton>()
-                            .and_then(|button| button.SetFlyout(&flyout))
-                            .map_err(native_error)?;
+                        let element = self.ui_element(*target)?;
+                        if *kind == OwnedMenuKind::TabViewItemContext {
+                            element
+                                .cast::<IUIElement>()
+                                .and_then(|element| element.SetContextFlyout(&flyout))
+                        } else {
+                            element
+                                .cast::<IButton>()
+                                .and_then(|button| button.SetFlyout(&flyout))
+                        }
+                        .map_err(native_error)?;
                         Some(flyout)
                     }
                     OwnedMenuKind::MenuBarItem => {
@@ -3544,10 +3568,14 @@ fn is_internal_detach(command: &Command, destroyed: &HashSet<NodeId>) -> bool {
     }
 }
 
-fn reveal_selected_tab_after_layout(tabs: &bindings::TabView) {
+fn reveal_selected_tab_after_layout(
+    tabs: &bindings::TabView,
+    title_bar: Option<&bindings::TitleBar>,
+) {
     let Ok(tabs) = tabs.downgrade() else {
         return;
     };
+    let title_bar = title_bar.and_then(|title_bar| title_bar.downgrade().ok());
     // Selection and the title bar width can change in the same update.
     let handler = DispatcherQueueHandler::new(move || {
         let Some(tabs) = tabs.upgrade() else {
@@ -3563,6 +3591,12 @@ fn reveal_selected_tab_after_layout(tabs: &bindings::TabView) {
             Ok(())
         };
         let _ = reveal();
+        if let Some(title_bar) = title_bar.as_ref().and_then(|title_bar| title_bar.upgrade()) {
+            // The total title bar width can stay fixed as its tab header grows.
+            let _ = title_bar
+                .cast::<ITitleBar2>()
+                .and_then(|title_bar| title_bar.RecomputeDragRegions());
+        }
     });
     let _ = DispatcherQueue::GetForCurrentThread().and_then(|queue| {
         queue.TryEnqueueWithPriority(DispatcherQueuePriority::Low, &handler)
