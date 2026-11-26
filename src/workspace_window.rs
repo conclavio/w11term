@@ -36,6 +36,21 @@ impl PartialEq for Opening {
 }
 
 impl Opening {
+    fn load(
+        catalog: PathBuf,
+        name: &str,
+        profiles: &Path,
+        key: String,
+        lock: File,
+    ) -> Result<Rc<Self>> {
+        let layout = WorkspaceLaunch::load(&WorkspaceStore::new(catalog), name, profiles)?;
+        Ok(Rc::new(Self {
+            key,
+            layout,
+            registration_lock: RefCell::new(Some(lock)),
+        }))
+    }
+
     pub fn published(&self) {
         self.registration_lock.take();
     }
@@ -65,16 +80,17 @@ pub fn prepare(options: Options) -> Result<Option<Launch>> {
     if options.switch_workspace && focus_existing(&key, None)? {
         return Ok(None);
     }
-    let layout =
-        WorkspaceLaunch::load(&WorkspaceStore::new(catalog), name, &options.profiles_path)?;
-    Ok(Some((
-        options,
-        Some(Rc::new(Opening {
-            key,
-            layout,
-            registration_lock: RefCell::new(Some(lock)),
-        })),
-    )))
+    let opening = Opening::load(catalog, name, &options.profiles_path, key, lock)?;
+    Ok(Some((options, Some(opening))))
+}
+
+pub fn prepare_copy(name: &str, profiles: &Path) -> Result<Rc<Opening>> {
+    let catalog = w11term::keys::data_dir()?.join("workspaces.json");
+    let key = workspace_key(&catalog, profiles, name)?;
+    let lock = registration_lock(&key)?;
+    lock.try_lock()
+        .context("Another window is registering this workspace. Try opening it again.")?;
+    Opening::load(catalog, name, profiles, key, lock)
 }
 
 fn owner(key: &str, caller: Option<control::WindowId>) -> Result<Option<control::WorkspaceOwner>> {

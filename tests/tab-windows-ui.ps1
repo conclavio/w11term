@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -410,6 +410,82 @@ function Test-ProfileInNewWindow {
     Close-FixtureWindow $remoteWindow
 }
 
+function Test-WorkspaceInNewWindow {
+    Run-WindowCommand $origin ('Workspaces' + [char]0x2026)
+    Invoke-Button (Wait-Until 'the broken workspace offers a new window' {
+        Find-Here $origin 'Open workspace broken-copy in new window'
+    })
+    $null = Wait-Until 'workspace preflight shows the missing profile in the original window' {
+        Find-Here $origin 'Unknown workspace profile missing-window-profile'
+    }
+    if ([TabFixtureWindows]::OwnedBy($app.Id).Count -ne 1 -or @((Control @('list')).sessions).Count -ne 3) {
+        throw 'An invalid workspace created a window or started a pane'
+    }
+    if (!(Find-Here $origin 'Open workspace two-windows in new tabs')) {
+        throw 'The existing append action is missing'
+    }
+
+    Invoke-Button (Wait-Until 'the saved workspace offers a new window' {
+        Find-Here $origin 'Open workspace two-windows in new window'
+    })
+    $child = Wait-DetachedWindow $origin
+    $copy = @(Wait-Until 'all three fresh panes and their two tabs are registered' {
+        $panes = @((Control @('list')).sessions)
+        $new = @($panes | Where-Object window_id -ne $ssh.window_id)
+        if ($panes.Count -eq 6 -and $new.Count -eq 3 -and
+            @($new.window_id | Sort-Object -Unique).Count -eq 1 -and
+            @($new.tab_id | Sort-Object -Unique).Count -eq 2 -and
+            !($new | Where-Object { $_.tab_id -in @($ssh.tab_id,$anchor.tab_id) })) { $new }
+    })
+    $copyAnchor = $copy | Where-Object label -eq 'Source PowerShell'
+    $copyShell = $copy | Where-Object label -eq 'Moved PowerShell'
+    $copySsh = $copy | Where-Object label -eq 'window-ssh'
+    if (!$copyAnchor -or !$copyShell -or !$copySsh -or $copyShell.tab_id -ne $copySsh.tab_id -or
+        $copySsh.tab_title -cne 'Cockpit tools') { throw 'The workspace copy lost its saved split or title' }
+    Expect-Focus $child $copyAnchor.id 'The new window restores the saved active tab'
+    Expect-Text $copyAnchor.id 'PS '
+    if ((Shell-State $copyAnchor.id 'workspaceCopy' -Init) -eq $anchorIdentity) {
+        throw 'The copied workspace reused the original PowerShell process'
+    }
+    $discovery = Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json
+    $claims = @($discovery.workspace_windows | Where-Object window_id -in @($ssh.window_id,$copySsh.window_id))
+    if ($claims.Count -ne 2 -or @($claims.workspace | Select-Object -Unique).Count -ne 1 -or
+        !$claims[0].workspace) { throw 'The copy did not register the same workspace key' }
+
+    Run-WindowCommand $child ('Workspaces' + [char]0x2026)
+    Invoke-Button (Wait-Until 'the copy can select its own workspace' {
+        Find-Here $child 'Switch to workspace two-windows'
+    })
+    Expect-Focus $child $copyAnchor.id 'Switch workspace from a registered copy stays in that window'
+    $childSplit = Wait-Until 'the restored split header' { Find-Here $child 'Cockpit tools' }
+    $childSplit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Expect-Focus $child $copySsh.id 'The copy also restores the focused SSH split'
+    Expect-Text $copySsh.id 'ready'
+    $null = Wait-Until 'the copied split restores the saved asymmetric divider' {
+        $panes = (Control @('list')).sessions
+        $left = $panes | Where-Object id -eq $copySsh.id
+        $right = $panes | Where-Object id -eq $copyShell.id
+        $left.visible -and $right.visible -and $right.cols -gt $left.cols -and
+            [Math]::Abs($left.cols / ($left.cols + $right.cols) - 0.375) -lt 0.04
+    }
+    Type-In $child 'workspace-copy/'
+    Expect-Text $copySsh.id 'workspace-copy/'
+    if ((Control @('get-text','--pane',"$($ssh.id)")).text.Contains('workspace-copy/')) {
+        throw 'The copied workspace sent input to the original SSH channel'
+    }
+
+    Close-FixtureWindow $child
+    $null = Wait-Until 'the original panes outlive the copied workspace' {
+        @((Control @('list')).sessions).Count -eq 3
+    }
+    Use-Window $origin
+    $sourceSplit = Wait-Until 'the original split header' { Find-Here $origin 'Cockpit tools' }
+    $sourceSplit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Expect-Focus $origin $ssh.id 'The original workspace remains usable'
+    Type-In $origin 'original-workspace/'
+    Expect-Text $ssh.id 'original-workspace/'
+}
+
 function Test-DuplicateInNewWindow {
     Use-Window $origin
     $window = $origin
@@ -534,6 +610,14 @@ try {
         Close-FixtureWindow $origin
         if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
             throw 'Closing the source did not release the process and its control pipe'
+        }
+        return
+    }
+    if ($FirstClose -eq 'WorkspaceWindow') {
+        Test-WorkspaceInNewWindow
+        Close-FixtureWindow $origin
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'Closing the last workspace window did not release the process and control pipe'
         }
         return
     }

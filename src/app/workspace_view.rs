@@ -71,6 +71,7 @@ pub enum WorkspaceAction {
     Switched(TabId, Result<(), String>),
     Save(TabId),
     Open(TabId, String),
+    OpenInWindow(TabId, String),
 }
 
 impl TerminalApp {
@@ -284,6 +285,23 @@ impl TerminalApp {
                     }
                 }
             }
+            WorkspaceAction::OpenInWindow(id, name) => {
+                if self.workspace_page_mut(id).is_none() {
+                    return;
+                }
+                let result = crate::workspace_window::prepare_copy(&name, self.store.path())
+                    .and_then(|opening| {
+                        self.open_child_window(
+                            tab_windows::ChildLaunch::Workspace(opening),
+                            context,
+                        )
+                    });
+                if let Some(page) = self.workspace_page_mut(id) {
+                    page.status = result
+                        .err()
+                        .map_or_else(String::new, |error| format!("{error:#}"));
+                }
+            }
         }
     }
 
@@ -489,11 +507,12 @@ impl TerminalApp {
         for name in matches {
             let switch = name.clone();
             let saved = name.clone();
+            let window = name.clone();
             children.push(KeyedView::new(
                 format!("workspace-{name}"),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                    .column_spacing(8.0)
                     .children((
                         Button::new()
                             .is_enabled(!page.switching)
@@ -501,13 +520,29 @@ impl TerminalApp {
                             .on_click(context.callback(move |_| {
                                 Message::Workspace(WorkspaceAction::Switch(id, switch.clone()))
                             }))
-                            .content(name.as_str()),
+                            .horizontal_content_alignment(HorizontalAlignment::Left)
+                            .content(
+                                TextBlock::new()
+                                    .text(name.as_str())
+                                    .text_trimming(TextTrimming::CharacterEllipsis),
+                            ),
                         Button::new()
+                            .grid_column(1)
                             .automation_name(format!("Open workspace {name} in new tabs"))
                             .on_click(context.callback(move |_| {
                                 Message::Workspace(WorkspaceAction::Open(id, saved.clone()))
                             }))
                             .content("Append in this window"),
+                        Button::new()
+                            .grid_column(2)
+                            .automation_name(format!("Open workspace {name} in new window"))
+                            .on_click(context.callback(move |_| {
+                                Message::Workspace(WorkspaceAction::OpenInWindow(
+                                    id,
+                                    window.clone(),
+                                ))
+                            }))
+                            .content("Open in new window"),
                     )),
             ));
         }
@@ -515,7 +550,7 @@ impl TerminalApp {
             StackPanel::new()
                 .spacing(12.0)
                 .margin(32.0)
-                .width(420.0)
+                .width(510.0)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .keyed_children(children),
         )
