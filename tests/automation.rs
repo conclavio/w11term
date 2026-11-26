@@ -22,6 +22,7 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
         active: false,
         visible: false,
         read_only: true,
+        capture: None,
         input,
     };
     // Occupy every scan slot. Their timeouts must leave room for the
@@ -105,6 +106,7 @@ async fn scrollback_regex_is_case_configurable_and_reports_incomplete_results() 
         active: false,
         visible: false,
         read_only: true,
+        capture: None,
         input: session.input.clone(),
     }]);
     let capture: w11term::control::CapturePng = Arc::new(|_, _, _| anyhow::bail!("unused"));
@@ -157,6 +159,7 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
         active: false,
         visible: false,
         read_only: false,
+        capture: None,
         input: session.input.clone(),
     }]);
     let capture: w11term::control::CapturePng = Arc::new(|_, _, _| anyhow::bail!("unused"));
@@ -219,6 +222,7 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
         active: false,
         visible: false,
         read_only: false,
+        capture: None,
         input: session.input.clone(),
     }]);
     let discovery = tempfile::tempdir().unwrap();
@@ -305,6 +309,7 @@ async fn list_keeps_closed_sessions_with_an_explicit_error() {
         active: false,
         visible: true,
         read_only: false,
+        capture: None,
         input,
     }]);
     let result = registry

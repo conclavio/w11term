@@ -281,7 +281,16 @@ impl TerminalApp {
             return;
         };
         // Freeze the displayed viewport and appearance before showing the Save dialog.
-        let appearance = self.appearance.read().unwrap().clone();
+        let font_size = self
+            .tab_for_pane(pane)
+            .and_then(|id| match &self.tabs.get(id)?.page {
+                Page::Terminal(tab) => tab.surface.font_size.get(),
+                _ => None,
+            });
+        let mut appearance = self.appearance.read().unwrap().clone();
+        if let Some(font_size) = font_size {
+            appearance.font_size = font_size;
+        }
         let render = move || crate::renderer::render_grid(&frame, frame.size, &appearance);
         match destination {
             ImageDestination::File => self.begin_text_export(

@@ -123,6 +123,7 @@ impl TerminalApp {
 
     fn pane_layout_items(&self, arrangement: &PaneArrangement) -> Vec<MenuItem> {
         let mut items = Vec::from(self.split_items());
+        items.push(self.pane_text_size_menu());
         if self.active_layout_is_split() {
             items.push(MenuItem::separator("layout-adjustments"));
             items.push(self.pane_zoom_item());

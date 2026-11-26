@@ -248,10 +248,10 @@ impl Registry {
             .panes
             .get(&id)
             .with_context(|| format!("unknown pane {id}"))?;
-        let capture = state
-            .windows
-            .get(owner)
-            .and_then(|w| w.capture.clone())
+        let capture = pane
+            .capture
+            .clone()
+            .or_else(|| state.windows.get(owner).and_then(|w| w.capture.clone()))
             .unwrap_or(fallback);
         Ok((pane.clone(), capture))
     }
@@ -507,6 +507,7 @@ mod tests {
             active: true,
             visible: true,
             read_only: false,
+            capture: None,
             input: mpsc::unbounded_channel().0,
         }
     }

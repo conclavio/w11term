@@ -764,6 +764,12 @@ async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "zooms text in one split, preserves the adjacent shell and captures the adjusted font"]
+async fn native_pane_text_size_preserves_the_neighbor_and_screenshot_grid() {
+    run_palette_fixture("pane-text-size-ui.ps1", b"", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens Files, Find, Commands, pane layout and Settings from native title-bar controls"]
 async fn native_title_tools_follow_the_active_ssh_and_powershell_panes() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

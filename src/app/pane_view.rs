@@ -210,6 +210,7 @@ enum WindowGrid {
 
 #[derive(Default)]
 pub(super) struct PaneSurface {
+    pub(super) font_size: Cell<Option<f32>>,
     #[cfg(feature = "ui-smoke")]
     pub(super) paint_count: Rc<Cell<u64>>,
     pub(super) metrics: Rc<Cell<Metrics>>,
@@ -451,7 +452,7 @@ impl TerminalApp {
         let mut renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size(),
+            appearance.terminal_font_size_for(surface.font_size.get()),
         )?;
         renderer.live_cursor = Some(surface.cursor_blink.clone());
         let renderer = RefCell::new(renderer);
@@ -465,6 +466,7 @@ impl TerminalApp {
         let windows = self.windows.clone();
         let window_size = surface.window_size.clone();
         let window_grid = surface.window_grid.clone();
+        let remember_grid = surface.font_size.get().is_none();
         let area = surface.area.clone();
         let selection = tab.selection.clone();
         let read_only = tab.read_only.clone();
@@ -536,7 +538,10 @@ impl TerminalApp {
             );
             let window_mode = window_grid.get();
             if matches!(window_mode, WindowGrid::Terminal) {
-                if initial_grid
+                if !remember_grid {
+                    // The next launch will use the window font again.
+                    windows.borrow_mut().grid = None;
+                } else if initial_grid
                     .get()
                     .is_none_or(|grid| grid == (measured.cols, measured.rows))
                 {

@@ -375,6 +375,8 @@ To trade places with a neighboring pane in the same tab, choose **More → Panes
 
 In a split tab, the **Pane layout** toolbar menu offers **Zoom pane**. It becomes **Restore panes** while the focused pane is zoomed. The layout commands are also available under **More → Panes**.
 
+Use **Pane layout → Pane text size** or search the command palette for **Increase pane text size** or **Decrease pane text size** to change the focused pane's font size. It follows the live pane when you move it. **Reset pane text size** returns it to the window's default. The adjustment applies to previews and PNG captures and lasts until the pane closes.
+
 Choose **Pane layout → Rotate split** to turn the divider next to the focused pane. Side-by-side panes become stacked, with the left pane on top. Rotate again to restore the original arrangement. In a nested layout this changes only the focused pane’s immediate split and preserves both branches, their proportions and running sessions. The action is available when the split is visible and the panes fit in the new orientation. You can assign it a shortcut under **Settings → Keyboard**.
 
 Choose **Pane layout → Balance panes** to even out the rows and columns in the current tab. For example, splitting the right half of a tab again creates three columns of different widths. **Balance panes** gives each about a third of the available width. It accounts for the dividers and each pane’s minimum size, and keeps your focused pane, running shells and split arrangement. You can also run it from the command palette or assign a shortcut under **Settings → Keyboard**.

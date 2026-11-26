@@ -30,6 +30,7 @@ async fn inspect_reads_live_modes_during_a_held_frame_without_enabling_the_gui_i
             active: false,
             visible: false,
             read_only: true,
+            capture: None,
             input: input.clone(),
         }]);
         let old = feed(&input, "shell").await;
@@ -142,6 +143,7 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
             active: true,
             visible: true,
             read_only: false,
+            capture: None,
             input: input.clone(),
         }]);
 

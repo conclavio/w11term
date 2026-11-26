@@ -1388,6 +1388,7 @@ fn registry(session: &Session) -> Registry {
         active: false,
         visible: false,
         read_only: false,
+        capture: None,
         input: session.input.clone(),
     }]);
     r

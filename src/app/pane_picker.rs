@@ -15,7 +15,7 @@ struct Preview {
 }
 
 impl Preview {
-    fn new(pane: u64, frames: FrameStore, appearance: &Appearance) -> Self {
+    fn new(pane: u64, frames: FrameStore, appearance: &Appearance, font_size: Option<f32>) -> Self {
         let snapshot = frames.load();
         let summary = preview_summary(&snapshot);
         let frame = Rc::new(RefCell::new(snapshot));
@@ -23,7 +23,7 @@ impl Preview {
         let canvas = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
-            appearance.terminal_font_size(),
+            appearance.terminal_font_size_for(font_size),
         )
         .map(|renderer| {
             let renderer = RefCell::new(renderer);
@@ -1130,6 +1130,7 @@ impl TerminalApp {
                 pane,
                 live.session.frames.clone(),
                 &self.appearance.read().unwrap(),
+                live.surface.font_size.get(),
             ))
         });
         self.picker.as_mut().unwrap().preview = preview;

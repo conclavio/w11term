@@ -475,6 +475,7 @@ pub struct Pane {
     pub active: bool,
     pub visible: bool,
     pub input: mpsc::UnboundedSender<Command>,
+    pub capture: Option<CapturePng>,
 }
 impl Registry {
     async fn pane_events(pane: &Pane) -> Result<crate::events::Events> {

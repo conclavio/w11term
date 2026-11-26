@@ -63,6 +63,7 @@ mod live_profile;
 mod local_forwards;
 mod local_profile;
 mod pane_drop;
+mod pane_text_size;
 mod pattern_settings;
 mod profile_forwards;
 mod saved_commands;
@@ -788,6 +789,9 @@ fn tab_menu_message(label: String) -> Message {
         .map_or(label.as_str(), |(name, _)| name);
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
+        pane_text_size::INCREASE => Message::PaneTextSize(pane_text_size::Change::Increase),
+        pane_text_size::DECREASE => Message::PaneTextSize(pane_text_size::Change::Decrease),
+        pane_text_size::RESET => Message::PaneTextSize(pane_text_size::Change::Reset),
         "Attention inbox" => Message::Attention(attention::Action::Open),
         sftp_transfers::LABEL => Message::SftpTransfers(sftp_transfers::Action::Open),
         host_groups::LABEL => Message::HostGroup(host_groups::Action::Open),
@@ -1094,6 +1098,7 @@ pub enum Message {
     AttentionChanged,
     VisualBellTick,
     ToggleInspector,
+    PaneTextSize(pane_text_size::Change),
     InspectSshRoute(u64, bool),
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
@@ -2194,28 +2199,36 @@ impl TerminalApp {
             .map(|e| format!("Settings could not be saved: {e:#}"));
     }
     fn remeasure_terminal_font(&mut self, appearance: &Appearance) -> bool {
-        let mut renderer = match Renderer::with_size(
-            &appearance.font_family,
-            appearance.ligatures,
-            appearance.terminal_font_size(),
-        ) {
-            Ok(renderer) => renderer,
-            Err(e) => {
-                self.appearance_error = Some(format!("Unable to use font: {e}"));
-                return false;
-            }
-        };
-        for entry in self.tabs.entries() {
-            if let Page::Terminal(tab) = &entry.value.page {
-                tab.selection.borrow_mut().take();
-                tab.hover.borrow_mut().take();
-                if let Some(size) = tab.surface.remeasure(&mut renderer) {
-                    tab.last_size.set(Some(size));
-                    let _ = tab.session.input.send(Command::Resize(size));
+        let panes = self
+            .tabs
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.value.page {
+                Page::Terminal(tab) => Some(tab),
+                _ => None,
+            });
+        let pane_size =
+            |tab: &LiveTab| appearance.terminal_font_size_for(tab.surface.font_size.get());
+        let sizes =
+            std::iter::once(appearance.terminal_font_size()).chain(panes.clone().map(pane_size));
+        let mut renderers = BTreeMap::new();
+        for size in sizes {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                renderers.entry(size.to_bits())
+            {
+                match Renderer::with_size(&appearance.font_family, appearance.ligatures, size) {
+                    Ok(renderer) => {
+                        entry.insert(renderer);
+                    }
+                    Err(error) => {
+                        self.appearance_error = Some(format!("Unable to use font: {error}"));
+                        return false;
+                    }
                 }
-                tab.surface.release();
-                tab.surface.invalidator.invalidate();
             }
+        }
+        for tab in panes {
+            tab.remeasure_font(renderers.get_mut(&pane_size(tab).to_bits()).unwrap());
         }
         self.keyboard.set_selection(false);
         self.invalidator.invalidate();
@@ -2655,6 +2668,11 @@ impl TerminalApp {
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
+                    capture: tab
+                        .surface
+                        .font_size
+                        .get()
+                        .map(|size| pane_text_size::capture(self.appearance.clone(), Some(size))),
                 })
             }));
     }
@@ -3006,6 +3024,8 @@ impl TerminalApp {
                 return;
             }
             if windows.restore(name).is_ok()
+                && matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(tab))
+                    if tab.surface.font_size.get().is_none())
                 && let Some(placement) = windows.profiles.get(name)
                 && let Some((cols, rows)) = placement.cols.zip(placement.rows)
                 && (1..=1000).contains(&cols)
@@ -4217,6 +4237,7 @@ impl TerminalApp {
         };
         let can_split_directory = directory.is_some();
         let mut items = Vec::from(self.split_items());
+        items.push(self.pane_text_size_menu());
         items.extend([
             self.binding_menu_enabled(
                 "split-right-here",
@@ -4980,11 +5001,7 @@ impl Component for TerminalApp {
                 request.fail("GUI control queue is unavailable or full");
             }
         });
-        let capture_appearance = appearance.clone();
-        let capture: w11term::control::CapturePng = Arc::new(move |frame, size, path| {
-            let appearance = capture_appearance.read().unwrap().clone();
-            crate::renderer::screenshot_with_font(frame, size, path, &appearance)
-        });
+        let capture = pane_text_size::capture(appearance.clone(), None);
         registry.set_capture(capture.clone());
         let control = new_window.map_or_else(
             || {
@@ -5367,6 +5384,7 @@ impl Component for TerminalApp {
                 self.cancel_frame_tasks();
                 self.watch_frames(context);
             }
+            Message::PaneTextSize(change) => self.change_pane_text_size(change),
             Message::InspectSshRoute(pane, open) => {
                 if let Some(inspector) = self
                     .inspection

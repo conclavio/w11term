@@ -426,6 +426,7 @@ async fn roundtrip(
                 active: false,
                 visible: false,
                 read_only: false,
+                capture: None,
                 input: session.input.clone(),
             }]);
             let discovery = tempfile::tempdir().unwrap();

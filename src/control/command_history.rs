@@ -103,6 +103,7 @@ mod tests {
             pane_name: None,
             label: "background pane".into(),
             read_only: true,
+            capture: None,
             active: false,
             visible: false,
             input: session.input.clone(),
