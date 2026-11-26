@@ -731,7 +731,7 @@ try {
     $setsButton = 'Recipient sets' + [char]0x2026
     (Wait-CheckBox $eastName Off).Toggle()
     $null = Wait-CheckBox $eastName On
-    Click $setsButton
+    Invoke-NativeMenuAction 'Roster actions' $setsButton
     $null = Wait-Until 'recipient sets belong to the tab source group' {
         (Find-Element "Recipient sets${dot}Fleet East") -and (Find-Element "Current selection${dot}East")
     }
@@ -742,7 +742,7 @@ try {
     (Field 'Host filter').SetValue('')
     (Wait-CheckBox $westName Off).Toggle()
     $null = Wait-CheckBox $westName On
-    Click $setsButton
+    Invoke-NativeMenuAction 'Roster actions' $setsButton
     (Field 'Recipient set name').SetValue('Fleet')
     Click 'Save recipient set'
     $null = Wait-Until 'the fleet set is saved' { Find-Element 'Saved recipient set Fleet' }
@@ -910,7 +910,7 @@ try {
     $null = Wait-Until 'the second update is saved' { Find-Element 'Saved live membership for Fleet East' }
     $groups = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_host_groups
     if (($groups.'Fleet East' -join ',') -cne 'East') { throw 'The second roster change did not persist' }
-    Click $setsButton
+    Invoke-NativeMenuAction 'Roster actions' $setsButton
     Click 'Delete recipient set Fleet'
     Click 'Confirm delete recipient set Fleet'
     $null = Wait-Until 'the invalidated set can be removed' { Find-Element 'Deleted recipient set Fleet' }

@@ -24,6 +24,7 @@ public static class FixtureMessages {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(
         IntPtr hwnd, uint msg, UIntPtr key, IntPtr detail);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern uint MapVirtualKeyW(uint key, uint mapping);
     public static bool PostKey(IntPtr hwnd, uint msg, uint key) {
         uint detail = 0;

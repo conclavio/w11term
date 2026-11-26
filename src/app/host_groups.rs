@@ -44,6 +44,7 @@ mod retry;
 mod reuse;
 mod roster_commands;
 mod roster_report;
+mod roster_toolbar;
 mod run_search;
 mod save_command;
 mod saved;
@@ -2199,6 +2200,37 @@ impl TerminalApp {
                 }))
                 .content(label)
         };
+        let selection_actions = StackPanel::new()
+            .orientation(if self.width >= 680.0 {
+                Orientation::Horizontal
+            } else {
+                Orientation::Vertical
+            })
+            .spacing(6.0)
+            .children((
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .children((
+                        bulk("Select shown", ShownSelection::All),
+                        bulk("Deselect shown", ShownSelection::None),
+                    )),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .children((
+                        bulk("Select only ready shown", ShownSelection::Ready),
+                        Button::new()
+                            .is_enabled(!selected_shown.is_empty())
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::Saved(
+                                    id,
+                                    saved::Action::NewFromSelection(selected_shown.clone()),
+                                ))
+                            }))
+                            .content("Save selection as group…"),
+                    )),
+            ));
         let filter_input = Grid::new()
             .column_spacing(8.0)
             .columns([
@@ -2303,22 +2335,15 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap)
                     .into()
             }),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
+            Grid::new()
+                .columns([GridLength::STAR, GridLength::Auto])
+                .column_spacing(8.0)
                 .children((
-                    bulk("Select shown", ShownSelection::All),
-                    bulk("Deselect shown", ShownSelection::None),
-                    bulk("Select only ready shown", ShownSelection::Ready),
-                    Button::new()
-                        .is_enabled(!selected_shown.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            Message::HostGroup(Action::Saved(
-                                id,
-                                saved::Action::NewFromSelection(selected_shown.clone()),
-                            ))
-                        }))
-                        .content("Save selection as group…"),
+                    selection_actions,
+                    Border::new()
+                        .grid_column(1)
+                        .vertical_alignment(VerticalAlignment::Top)
+                        .content(roster_toolbar::button(id, page, &selected, shown_ids, ctx)),
                 )),
             reconnect::selection_controls(
                 id,
@@ -2332,31 +2357,6 @@ impl TerminalApp {
             page.disconnect
                 .controls(id, self.disconnect_recipients(selected.iter()), ctx),
             next_prompt,
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    transfer::button(id, &selected, transfer::Direction::Upload, ctx),
-                    transfer::button(id, &selected, transfer::Direction::Download, ctx),
-                    if page.saved.origin().is_some() {
-                        recipient_sets::button(id, ctx)
-                    } else {
-                        View::empty()
-                    },
-                    host_list_export::button(id, &selected, ctx),
-                )),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    environment::button(id, page, &selected, ctx),
-                    Button::new()
-                        .is_enabled(!shown_ids.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            Message::HostGroup(Action::CopyRoster(id, shown_ids.clone()))
-                        }))
-                        .content("Copy shown roster"),
-                )),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)

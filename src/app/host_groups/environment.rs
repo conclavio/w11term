@@ -180,22 +180,8 @@ impl State {
     }
 }
 
-pub(super) fn button(
-    id: TabId,
-    page: &HostGroup,
-    selected: &[Target],
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    Button::new()
-        .is_enabled(
-            !page.sending()
-                && !selected.is_empty()
-                && selected.iter().all(|target| target.state.is_ready()),
-        )
-        .on_click(
-            ctx.callback(move |_| Message::HostGroup(super::Action::Environment(id, Action::Open))),
-        )
-        .content("Export group variables…")
+pub(super) fn available(page: &HostGroup, selected: &[Target]) -> bool {
+    !page.sending() && !selected.is_empty() && selected.iter().all(|target| target.state.is_ready())
 }
 
 impl TerminalApp {

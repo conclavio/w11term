@@ -68,7 +68,7 @@ try {
     foreach ($name in $targets.Values) { $null = Wait-CheckBox $name On }
     Set-Field 'Host filter' 'Fleet'
     $null = Wait-Until 'Witness is hidden by the roster filter' { Find-Element '1 selected host is hidden by the filter.' }
-    Click "Upload files$ellipsis"
+    Invoke-NativeMenuAction 'Roster actions' "Upload files$ellipsis"
     $null = Wait-Until 'upload review includes only shown hosts' {
         (Find-Element 'Upload to selected SSH hosts') -and
         (Find-Element $targets['Fleet East']) -and
@@ -119,7 +119,7 @@ try {
     $null = Wait-CheckBox $targets['Fleet East'] On
     (Wait-CheckBox $targets['Fleet Stale'] On).Toggle()
     $null = Wait-CheckBox $targets['Fleet Stale'] Off
-    Click "Upload files$ellipsis"
+    Invoke-NativeMenuAction 'Roster actions' "Upload files$ellipsis"
     Click "Choose local files$ellipsis"
     $picker = Wait-Until 'owned multi-file picker' { Find-OwnedDialog 'Choose files to upload' }
     Select-DialogItem $picker 'fleet-source'

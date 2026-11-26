@@ -100,14 +100,6 @@ fn capture(
     Ok(profiles)
 }
 
-pub(super) fn button(id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
-    Button::new()
-        .on_click(
-            ctx.callback(move |_| Message::HostGroup(HostAction::RecipientSets(id, Action::Open))),
-        )
-        .content("Recipient sets…")
-}
-
 impl State {
     pub(super) fn is_open(&self) -> bool {
         self.editor.is_some()

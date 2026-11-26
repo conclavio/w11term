@@ -731,7 +731,7 @@ try {
     $hostList = "test@127.0.0.1:$($profileData.East.port)`n"
     $hostListDestination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-hosts.txt'
     $saveHostList = 'Save host list' + [char]0x2026
-    Click ('Export host list' + [char]0x2026)
+    Invoke-NativeMenuAction 'Roster actions' ('Export host list' + [char]0x2026)
     $null = Wait-Until 'the checked host list preview' { Find-Element 'SSH host list preview' }
     Click 'Copy host list'
     $null = Wait-Until 'only the shown checked East address is copied' {
@@ -1225,7 +1225,7 @@ try {
     $null = Wait-Until 'the roster summarizes both ready and alternate-screen hosts' {
         Find-Element "2 matching hosts${dot}Ready (1)${dot}Alternate screen (1)"
     }
-    Click $copyRoster
+    Invoke-NativeMenuAction 'Roster actions' $copyRoster
     $null = Wait-Until 'the copied roster includes both the ready and unchecked alternate-screen host' {
         $report = Read-ClipboardFixture
         (Find-Element 'Copied roster with 2 hosts') -and $report -and
@@ -1268,10 +1268,12 @@ try {
     }
     Set-HostFilter 'east'
     $null = Wait-Until 'the text filter still applies inside the selected host state' {
-        $copy = Find-Element $copyRoster $button
-        (Find-Element 'No SSH panes match this filter.') -and $copy -and !$copy.Current.IsEnabled -and
+        (Find-Element 'No SSH panes match this filter.') -and
             (Find-Element "Showing 0 of 1 matching host${dot}Ready (1)")
     }
+    $copyItem = Get-NativeMenuAction 'Roster actions' $copyRoster -AllowDisabled
+    if ($copyItem.Current.IsEnabled) { throw 'Copy shown roster is available with no shown hosts' }
+    Close-NativeMenu $copyRoster
     Set-HostFilter ''
     $null = Wait-CheckBox $westName On
     $null = Wait-Until 'West is shown with its original check but cannot receive a command' {
@@ -1327,7 +1329,7 @@ try {
         (Find-Element "Pane $west${dot}Reconnecting${dot}attempt 1") -and
             !(Find-Element "Focus pane $east" $button) -and !(Find-Element "Reconnect SSH pane $west" $button)
     }
-    Click $copyRoster
+    Invoke-NativeMenuAction 'Roster actions' $copyRoster
     $null = Wait-Until 'the roster report carries the automatic retry' {
         $report = Read-ClipboardFixture
         $report -and $report.Contains("$westName${dot}Reconnecting${dot}attempt 1") -and !$report.Contains($eastName)
@@ -1581,7 +1583,7 @@ try {
         (Find-Element $failureReason) -and (Find-Element "Reconnect SSH pane $west" $button) -and
             !(Find-Element "Focus pane $east" $button)
     }
-    Click $copyRoster
+    Invoke-NativeMenuAction 'Roster actions' $copyRoster
     $null = Wait-Until 'the copied roster includes the failed connection state' {
         $report = Read-ClipboardFixture
         $report -and $report.Contains("$westName${dot}Connection failed${dot}reconnect available")
