@@ -54,6 +54,23 @@ function Read-PeerTrace([IO.BinaryReader]$Reader) {
     return ,$Reader.ReadBytes([int]$Reader.BaseStream.Length)
 }
 
+function Close-FixtureApp([Diagnostics.Process]$Process) {
+    try {
+        if ($Process.HasExited) { return }
+        $null = $Process.CloseMainWindow()
+        if ($Process.WaitForExit(5000)) { return }
+        try {
+            $Process.Kill()
+        } catch {
+            # Windows can reject termination after the child has already exited.
+            if (!$Process.WaitForExit(1000)) { throw }
+        }
+        if (!$Process.WaitForExit(5000)) {
+            throw "Fixture process $($Process.Id) did not exit after termination"
+        }
+    } finally { $Process.Dispose() }
+}
+
 # Give the app permission to finish its write while the fixture polls.
 function Read-ClipboardFixture {
     try {
