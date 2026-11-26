@@ -4433,13 +4433,7 @@ impl TerminalApp {
                         Some((pane, status)) => taskbar::program_tooltip(&label, *pane, status),
                         None => label.clone(),
                     };
-                    let color =
-                        self.tabs
-                            .group_color(group)
-                            .unwrap_or_else(|| match &tab.value.page {
-                                Page::Terminal(live) => live.source.tab_color(),
-                                _ => TabColor::None,
-                            });
+                    let color = self.effective_tab_color(group, &tab.value.page);
                     let (header, name) = tab_header_content(label, pinned, color);
                     KeyedView::new(
                         group.to_string(),
@@ -6243,10 +6237,8 @@ impl Component for TerminalApp {
             }
             Message::TabHeaderMenu(group, label) => self.tab_header_action(group, &label, context),
             Message::SetTabColor(group, color) => {
-                if self.active_terminal_group() == Some(group)
-                    && self.tabs.set_group_color(group, color)
-                {
-                    self.refresh_open_commands();
+                if self.active_terminal_group() == Some(group) {
+                    self.set_tab_color(group, color);
                 }
             }
             Message::CloseTabs(offer) => self.close_tabs_from_offer(offer, context),
@@ -6827,6 +6819,16 @@ impl Component for TerminalApp {
                         Some(order) => self.control_reorder_tabs(&order, context),
                         None => Ok(self.control_list_tabs()),
                     };
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::TabAppearance {
+                tab_id,
+                change,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = self.control_tab_appearance(tab_id, change, context);
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }

@@ -758,6 +758,8 @@ impl TerminalApp {
                     "title": self.tab_label(header.id, follow_titles),
                     "selected": active_group == Some(tab_id),
                     "pinned": self.tabs.group_is_pinned(tab_id),
+                    "color_override": self.tabs.group_color(tab_id),
+                    "color": self.effective_tab_color(tab_id, &header.value.page),
                     "zoomed": self.tabs.group_zoomed(tab_id),
                     "pane_count": pane_count,
                     "focused_pane": focused_pane,

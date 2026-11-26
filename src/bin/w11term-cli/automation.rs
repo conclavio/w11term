@@ -4,6 +4,7 @@ use w11term::control::{
     CommandOutputFile, CommandStatus, Request, SshGroupExpectedOutput, SshGroupQueueAction,
     SshGroupReportFormat, validate_group_panes, validate_group_submission, validate_split_percent,
 };
+use w11term::options::TabColor;
 use w11term::pane_layout::{Axis, Direction};
 use w11term::session::ReplayAction;
 use w11term::tabs::TabTitle;
@@ -68,10 +69,11 @@ pub(super) fn parse(
     let mut axis = None;
     let mut target_pane = None;
     let mut direction = None;
-    let mut zoom = None;
+    let mut enabled = None;
     let mut percent = None;
     let mut ordered_tabs = Vec::new();
-    let mut reset_name = false;
+    let mut reset = false;
+    let mut color = None;
     let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
@@ -201,9 +203,9 @@ pub(super) fn parse(
                     _ => bail!("--direction requires left, right, up, or down"),
                 });
             }
-            "--on" | "--off" if verb == "zoom-pane" => {
-                ensure!(zoom.is_none(), "specify exactly one of --on or --off");
-                zoom = Some(arg == "--on");
+            "--on" | "--off" if matches!(verb, "zoom-pane" | "pin-tab") => {
+                ensure!(enabled.is_none(), "specify exactly one of --on or --off");
+                enabled = Some(arg == "--on");
             }
             "--percent" if verb == "resize-split" => {
                 ensure!(percent.is_none(), "specify --percent only once");
@@ -224,9 +226,21 @@ pub(super) fn parse(
                 ensure!(name.is_none(), "specify --name only once");
                 name = Some(value(&mut args)?);
             }
-            "--reset" if matches!(verb, "rename-tab" | "rename-pane") => {
-                ensure!(!reset_name, "specify --reset only once");
-                reset_name = true;
+            "--reset" if matches!(verb, "rename-tab" | "rename-pane" | "set-tab-color") => {
+                ensure!(!reset, "specify --reset only once");
+                reset = true;
+            }
+            "--color" if verb == "set-tab-color" => {
+                ensure!(color.is_none(), "specify --color only once");
+                let name = value(&mut args)?;
+                color = Some(
+                    TabColor::ALL
+                        .into_iter()
+                        .find(|color| color.label().eq_ignore_ascii_case(&name))
+                        .context(
+                            "--color requires none, red, orange, yellow, green, blue, or purple",
+                        )?,
+                );
             }
             "--activate"
                 if matches!(
@@ -432,7 +446,8 @@ pub(super) fn parse(
                         | "list-tabs"
                         | "reorder-tabs"
                 ) && arg == "--window")
-                    || (verb == "rename-tab" && matches!(arg.as_str(), "--window" | "--tab"))
+                    || (matches!(verb, "rename-tab" | "pin-tab" | "set-tab-color")
+                        && matches!(arg.as_str(), "--window" | "--tab"))
                     || matches!(
                         verb,
                         "get-ssh-group-roster"
@@ -644,11 +659,11 @@ pub(super) fn parse(
             pane: pane
                 .filter(|id| *id > 0)
                 .context("provide a positive --pane ID")?,
-            zoomed: zoom.context("specify --on or --off")?,
+            zoomed: enabled.context("specify --on or --off")?,
         },
         "rename-tab" | "rename-pane" => {
             ensure!(
-                reset_name != name.is_some(),
+                reset != name.is_some(),
                 "provide exactly one of --name NAME or --reset"
             );
             let name = name
@@ -666,6 +681,27 @@ pub(super) fn parse(
                         .filter(|id| *id > 0)
                         .context("provide a positive --pane ID")?,
                     name,
+                }
+            }
+        }
+        "pin-tab" | "set-tab-color" => {
+            let window_id = window_id.context("--window is required (from list-windows)")?;
+            let tab_id = tab_id.context("--tab is required (from list-tabs)")?;
+            if verb == "pin-tab" {
+                Request::PinTab {
+                    window_id,
+                    tab_id,
+                    pinned: enabled.context("specify --on or --off")?,
+                }
+            } else {
+                ensure!(
+                    reset != color.is_some(),
+                    "provide exactly one of --color NAME or --reset"
+                );
+                Request::SetTabColor {
+                    window_id,
+                    tab_id,
+                    color,
                 }
             }
         }

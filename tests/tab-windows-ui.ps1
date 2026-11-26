@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -915,6 +915,76 @@ function Test-ControlPaneView {
     }
     Expect-Focus $origin $ssh.id 'Selection and zoom in the sibling window preserve desktop focus'
     Close-FixtureWindow $hwnd
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlTabAppearance {
+    Expect-Focus $origin $ssh.id 'SSH starts selected before applying tab settings' -PrepareWindow
+    $windowId = "$($ssh.window_id)"
+    $tabId = "$($ssh.tab_id)"
+    $first = (Control @('list-tabs','--window',$windowId)).tabs | Where-Object tab_id -eq $ssh.tab_id
+    if ($first.color -cne 'orange' -or $null -ne $first.color_override -or $first.pinned) {
+        throw 'The SSH tab did not start with its profile color and no pin'
+    }
+    $other = Control @('open','--profile','Destination PowerShell','--new-window')
+    $otherWindow = Wait-DetachedWindow $origin
+    Expect-Focus $otherWindow $other.pane 'The sibling window has desktop focus before the pin and color commands' -PrepareWindow
+
+    $pinArgs = @('pin-tab','--window',$windowId,'--tab',"$($anchor.tab_id)",'--on')
+    $pin = Control $pinArgs
+    if (!$pin.changed -or !$pin.pinned -or $pin.tab_id -ne $anchor.tab_id -or (Control $pinArgs).changed) {
+        throw 'Pinning the hidden PowerShell tab was not exact or idempotent'
+    }
+    $close = & $Cli --pid $app.Id close-pane --pane "$($anchor.id)" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $close.ok -or $close.error -notlike '*tab is pinned*') {
+        throw 'The new pin did not protect its single-pane tab'
+    }
+    $null = Control @('pin-tab','--window',$windowId,'--tab',$tabId,'--on')
+    $blueArgs = @('set-tab-color','--window',$windowId,'--tab',$tabId,'--color','Blue')
+    $blue = Control $blueArgs
+    if (!$blue.changed -or !$blue.pinned -or $blue.color -cne 'blue' -or $blue.color_override -cne 'blue' -or (Control $blueArgs).changed) {
+        throw 'The fixed tab color did not apply idempotently'
+    }
+    $tabs = (Control @('list-tabs','--window',$windowId)).tabs
+    if (($tabs.tab_id -join ',') -cne "$($anchor.tab_id),$tabId" -or !$tabs[1].selected -or
+        $tabs[1].focused_pane -ne $ssh.id -or $tabs[1].color -cne 'blue' -or $tabs[1].color_override -cne 'blue') {
+        throw 'Pinning or coloring changed pane selection or the pinned order'
+    }
+    $savedName = 'CLI tab appearance'
+    $null = Control @('save-workspace','--window',$windowId,'--name',$savedName)
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $saved = (Get-Content -Raw -LiteralPath $catalog | ConvertFrom-Json).workspaces.$savedName
+    if ($saved.tabs.Count -ne 2 -or !$saved.tabs[0].pinned -or !$saved.tabs[1].pinned -or
+        $saved.tabs[1].tab_color -cne 'blue' -or $saved.active_tab -ne 1) {
+        throw 'The workspace did not save pin order and tab color'
+    }
+
+    $foreignTab = (Control @('list-tabs','--window',"$($other.window_id)")).tabs[0].tab_id
+    $failed = & $Cli --pid $app.Id pin-tab --window $windowId --tab "$foreignTab" --on | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike 'unknown tab *') {
+        throw 'A tab in another window was accepted with the wrong window ID'
+    }
+    $hidden = Control @('set-tab-color','--window',$windowId,'--tab',$tabId,'--color','none')
+    if (!$hidden.changed -or $hidden.color -cne 'none' -or $hidden.color_override -cne 'none') {
+        throw 'An explicit hidden marker fell back to the profile color'
+    }
+    $reset = Control @('set-tab-color','--window',$windowId,'--tab',$tabId,'--reset')
+    if (!$reset.changed -or $reset.color -cne 'orange' -or $null -ne $reset.color_override) {
+        throw 'Resetting the marker did not restore the profile color'
+    }
+    $unpin = Control @('pin-tab','--window',$windowId,'--tab',"$($anchor.tab_id)",'--off')
+    $tabs = (Control @('list-tabs','--window',$windowId)).tabs
+    if (!$unpin.changed -or $unpin.pinned -or ($tabs.tab_id -join ',') -cne "$tabId,$($anchor.tab_id)" -or !$tabs[0].selected) {
+        throw 'Unpinning did not move just the target back into the unpinned section'
+    }
+    Expect-Focus $otherWindow $other.pane 'Tab pin and color operations preserve desktop focus'
+    Expect-Focus $origin $ssh.id 'The same terminal remains selected after tab updates' -PrepareWindow
+    $null = Wait-Until 'the native header shows the pin and restored profile color' {
+        Find-Here $origin 'Pinned: Cockpit tools (Orange tab)' ([System.Windows.Automation.ControlType]::TabItem)
+    }
+    Type-In $origin 'after-style/'
+    Expect-Text $ssh.id 'after-style/'
+    Close-FixtureWindow $otherWindow
     Close-FixtureWindow $origin
 }
 
@@ -2071,7 +2141,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -2086,6 +2156,7 @@ try {
             'CliMoveTab' { Test-ControlMoveTab }
             'CliTabOrder' { Test-ControlTabOrder }
             'CliTerminalNames' { Test-ControlTerminalNames }
+            'CliTabAppearance' { Test-ControlTabAppearance }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

@@ -206,6 +206,12 @@ async fn native_cli_names_and_resets_live_tabs_and_panes() {
     run("CliTerminalNames", b"named/renamed/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "pins and colors background native tabs, checks inherited color and close behavior, and saves the workspace"]
+async fn native_cli_sets_live_tab_pins_and_colors() {
+    run("CliTabAppearance", b"after-style/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -243,6 +249,9 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     if first_close == "CliSplit" {
         profiles["profiles"]["Split PowerShell"] =
             profiles["profiles"]["Destination PowerShell"].clone();
+    }
+    if first_close == "CliTabAppearance" {
+        profiles["profiles"]["window-ssh"]["tab_color"] = json!("orange");
     }
     fs::write(
         state.path().join("profiles.json"),
