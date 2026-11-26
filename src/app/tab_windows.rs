@@ -170,7 +170,7 @@ pub struct WindowLaunch {
     pub(super) options: Options,
     pub(super) opening: Option<Rc<crate::workspace_window::Opening>>,
     pub(super) transfer: Option<Rc<Transfer>>,
-    pub(super) group: Option<Rc<GroupWindow>>,
+    pub(super) child: Option<Rc<ChildWindow>>,
 }
 
 impl WindowLaunch {
@@ -179,7 +179,7 @@ impl WindowLaunch {
             options,
             opening,
             transfer: None,
-            group: None,
+            child: None,
         }
     }
 }
@@ -189,8 +189,8 @@ impl PartialEq for WindowLaunch {
         self.options == other.options
             && self.opening == other.opening
             && self.transfer.as_ref().map(|t| t.id()) == other.transfer.as_ref().map(|t| t.id())
-            && self.group.as_ref().map(|g| g.window.registry.window_id())
-                == other.group.as_ref().map(|g| g.window.registry.window_id())
+            && self.child.as_ref().map(|w| w.window.registry.window_id())
+                == other.child.as_ref().map(|w| w.window.registry.window_id())
     }
 }
 
@@ -230,20 +230,25 @@ pub(super) struct NewWindow {
     pub(super) server: Arc<Server>,
 }
 
-pub(super) struct GroupWindow {
+pub(super) enum ChildLaunch {
+    Profile { name: String, source: Box<Source> },
+    Group(host_groups::WindowGroup),
+}
+
+pub(super) struct ChildWindow {
     window: NewWindow,
-    pub(super) launch: host_groups::WindowGroup,
+    pub(super) launch: ChildLaunch,
     claimed: Cell<bool>,
 }
 
-impl GroupWindow {
+impl ChildWindow {
     pub(super) fn claim(&self) -> &NewWindow {
         self.claimed.set(true);
         &self.window
     }
 }
 
-impl Drop for GroupWindow {
+impl Drop for ChildWindow {
     fn drop(&mut self) {
         if !self.claimed.get() {
             let _ = self.window.registry.unregister();
@@ -265,20 +270,28 @@ impl TerminalApp {
         group: host_groups::WindowGroup,
         ctx: &ComponentContext<Self>,
     ) -> anyhow::Result<()> {
+        self.open_child_window(ChildLaunch::Group(group), ctx)
+    }
+
+    pub(super) fn open_child_window(
+        &self,
+        launch: ChildLaunch,
+        ctx: &ComponentContext<Self>,
+    ) -> anyhow::Result<()> {
         let window = self.reserve_child_window()?;
         let launch = WindowLaunch {
             options: self.window_launch.clone(),
             opening: None,
             transfer: None,
-            group: Some(Rc::new(GroupWindow {
+            child: Some(Rc::new(ChildWindow {
                 window,
-                launch: group,
+                launch,
                 claimed: Cell::new(false),
             })),
         };
         anyhow::ensure!(
             ctx.open_window(View::component::<Self>(launch)),
-            "The SSH group window could not be opened."
+            "The new terminal window could not be opened."
         );
         Ok(())
     }
@@ -871,7 +884,7 @@ impl TerminalApp {
                 options: self.window_launch.clone(),
                 opening: None,
                 transfer: Some(transfer.clone()),
-                group: None,
+                child: None,
             };
             ctx.open_window(View::component::<Self>(launch))
         } else {

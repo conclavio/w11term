@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -318,6 +318,98 @@ function Test-PaneInNewWindow {
     }
 }
 
+function Open-ProfileWindowPicker([IntPtr]$Source, [switch]$FromPalette) {
+    $action = 'Open profile in new window' + [char]0x2026
+    $window = $Source
+    if ($FromPalette) {
+        Run-WindowCommand $Source $action
+    } else {
+        Use-Window $Source
+        Invoke-Button (Get-NativeMenuAction 'New tab' $action)
+    }
+    Wait-PickerEditor 'Search profiles for a new window' 'the new-window profile picker'
+}
+
+function Test-ProfileInNewWindow {
+    $field = Open-ProfileWindowPicker $origin
+    $window = $origin
+    Press-Key 27
+    $null = Wait-Until 'Escape dismisses the new-window profile picker' {
+        !(Find-Here $origin 'Search profiles for a new window')
+    }
+    Expect-Focus $origin $ssh.id 'Escape keeps the original SSH pane'
+    if ([TabFixtureWindows]::OwnedBy($app.Id).Count -ne 1) { throw 'Escape opened a window' }
+
+    $field = Open-ProfileWindowPicker $origin
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $field.GetCurrentPattern($value).SetValue('powershell local')
+    $null = Wait-Until 'the PowerShell profile appears in the new window picker' {
+        Find-Here $origin ('Destination PowerShell ' + [char]0x00b7 + ' Local')
+    }
+    Press-Key 13
+    $localWindow = Wait-DetachedWindow $origin
+    $local = Wait-Until 'the new PowerShell pane is on the original control pipe' {
+        (Control @('list')).sessions | Where-Object {
+            $_.label -eq 'Destination PowerShell' -and $_.window_id -ne $ssh.window_id
+        }
+    }
+    Expect-Focus $localWindow $local.id 'The PowerShell profile opens in the new window'
+    Expect-Text $local.id 'PS '
+    $null = Wait-Until 'the new window restores the saved PowerShell cell grid' {
+        $grid = Control @('inspect','--pane',"$($local.id)")
+        $grid.cols -eq 96 -and $grid.rows -eq 28
+    }
+    $localProof = Shell-State $local.id 'freshLocal' -Init
+    if ($localProof -in $localIdentity,$anchorIdentity) { throw 'A source PowerShell process was reused' }
+
+    $field = Open-ProfileWindowPicker $origin -FromPalette
+    $target = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'window-ssh'
+    $field.GetCurrentPattern($value).SetValue("$($target.port) $($target.user)")
+    $null = Wait-Until 'the SSH profile matches its address' {
+        Find-Here $origin ("window-ssh " + [char]0x00b7 + " $($target.user)@$($target.host):$($target.port)")
+    }
+    Press-Key 13
+    $remoteWindow = Wait-Until 'a third native window in the same process' {
+        $handles = [TabFixtureWindows]::OwnedBy($app.Id)
+        if ($handles.Count -eq 3 -and $handles -contains $origin -and $handles -contains $localWindow) {
+            $handles | Where-Object { $_ -notin @($origin,$localWindow) }
+        }
+    }
+    $remote = Wait-Until 'the new SSH pane has its own window and its login is ready' {
+        (Control @('list')).sessions | Where-Object {
+            $_.label -eq 'window-ssh' -and $_.id -ne $ssh.id -and
+                $_.window_id -notin @($ssh.window_id,$local.window_id) -and $_.connection_generation -gt 0
+        }
+    }
+    Expect-Focus $remoteWindow $remote.id 'The SSH profile opens in the third window'
+    Expect-Text $remote.id 'ready'
+    Type-In $remoteWindow 'fresh-window/'
+    Expect-Text $remote.id 'fresh-window/'
+    if ((Control @('get-text','--pane',"$($ssh.id)")).text.Contains('fresh-window/')) {
+        throw 'New-window input reached the original SSH channel'
+    }
+
+    Use-Window $origin
+    Expect-Focus $origin $ssh.id 'Each new-window launch keeps the source selection'
+    $original = (Control @('list')).sessions | Where-Object id -eq $ssh.id
+    if ($original.tab_id -ne $ssh.tab_id -or $original.window_id -ne $ssh.window_id -or
+        $original.connection_generation -ne $ssh.connection_generation -or
+        (Shell-State $moved.id 'originalLocal') -ne $localIdentity) {
+        throw 'A launch changed the original layout or a source process'
+    }
+    Type-In $origin 'source-window/'
+    Expect-Text $ssh.id 'source-window/'
+    Close-FixtureWindow $origin
+    $null = Wait-Until 'both new windows outlive their source' {
+        $panes = @((Control @('list')).sessions)
+        $panes.Count -eq 2 -and $remote.id -in $panes.id -and $local.id -in $panes.id
+    }
+    if ((Shell-State $local.id 'stillLocal') -ne $localProof) { throw 'The new PowerShell process restarted' }
+    Expect-Text $remote.id 'fresh-window/'
+    Close-FixtureWindow $localWindow
+    Close-FixtureWindow $remoteWindow
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--workspace', 'two-windows') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     # Retain the process handle before any native close so Windows PowerShell can read its exit code.
@@ -350,6 +442,13 @@ try {
     if ($localIdentity -eq $anchorIdentity) { throw 'Expected independent PowerShell children' }
     if ($FirstClose -eq 'PaneWindow') {
         Test-PaneInNewWindow
+        return
+    }
+    if ($FirstClose -eq 'ProfileWindow') {
+        Test-ProfileInNewWindow
+        if (!$app.WaitForExit(10000) -or (Test-Path -LiteralPath $manifest)) {
+            throw 'Closing the last profile window did not release the process and its control pipe'
+        }
         return
     }
     Write-Output "Moving split from source $origin"

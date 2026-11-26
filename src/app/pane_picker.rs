@@ -834,9 +834,6 @@ impl TerminalApp {
     }
 
     pub(super) fn open_profile_search(&mut self, axis: Option<Axis>, ctx: &ComponentContext<Self>) {
-        if self.picker.is_some() {
-            return;
-        }
         let destination = match axis {
             None => command_palette::ProfileDestination::Tab,
             Some(axis) => {
@@ -846,6 +843,17 @@ impl TerminalApp {
                 command_palette::ProfileDestination::Split { axis, origin }
             }
         };
+        self.start_profile_search(destination, ctx);
+    }
+
+    pub(super) fn start_profile_search(
+        &mut self,
+        destination: command_palette::ProfileDestination,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.picker.is_some() {
+            return;
+        }
         self.start_picker(
             Mode::Commands(command_palette::Search::Profiles(destination)),
             ctx,

@@ -4296,6 +4296,7 @@ impl TerminalApp {
     fn profile_items(&self) -> Vec<MenuItem> {
         let mut menu = vec![
             MenuItem::item("find-profile", command_palette::FIND_PROFILE_LABEL),
+            MenuItem::item("window-profile", command_palette::WINDOW_PROFILE_LABEL),
             MenuItem::separator("profile-search-end"),
         ];
         let profile_item = |name: &String| {
@@ -5343,8 +5344,8 @@ impl Component for TerminalApp {
         let options = &input.options;
         let opening = &input.opening;
         let moving = input.transfer.is_some();
-        let group_window = input.group.as_ref();
-        let child_window = moving || group_window.is_some();
+        let child = input.child.as_ref();
+        let child_window = moving || child.is_some();
         let sender = context.sender();
         let clipboard = clipboard_paste::State::default();
         let paste_origin = clipboard.input_origin.clone();
@@ -5527,7 +5528,7 @@ impl Component for TerminalApp {
             .transfer
             .as_ref()
             .and_then(|transfer| transfer.new_window.as_ref())
-            .or_else(|| group_window.map(|group| group.claim()));
+            .or_else(|| child.map(|child| child.claim()));
         let registry = new_window.map_or_else(
             || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
             |window| window.registry.clone(),
@@ -5660,13 +5661,21 @@ impl Component for TerminalApp {
         }
         app.arm_window_tick(context);
         context.sender().send(Message::WindowTick);
-        if let Some(group_window) = group_window {
-            app.start_group_window(&group_window.launch, context);
-        } else {
-            app.activate(context);
+        match child.map(|child| &child.launch) {
+            Some(tab_windows::ChildLaunch::Group(group)) => app.start_group_window(group, context),
+            Some(tab_windows::ChildLaunch::Profile { name, source }) => {
+                app.window_restored = false;
+                app.open(
+                    name.clone(),
+                    source.as_ref().clone(),
+                    Some(name.clone()),
+                    context,
+                );
+            }
+            None => app.activate(context),
         }
         app.watch_control(context);
-        if group_window.is_none() {
+        if child.is_none() {
             app.sync_selection(context);
         }
         #[cfg(feature = "ui-smoke")]
@@ -7188,6 +7197,8 @@ impl Component for TerminalApp {
             Message::ProfileMenu(label) => {
                 if label == command_palette::FIND_PROFILE_LABEL {
                     self.open_profile_search(None, context);
+                } else if label == command_palette::WINDOW_PROFILE_LABEL {
+                    self.start_profile_search(command_palette::ProfileDestination::Window, context);
                 } else if label == NEW_PROFILE {
                     self.utility(false, context);
                 } else if label == quick_connect::LABEL {
