@@ -729,6 +729,92 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn control_list_tabs(&self) -> serde_json::Value {
+        let follow_titles = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .application_tab_titles;
+        let active_group = self.tabs.active_group_id();
+        let tabs: Vec<_> = self
+            .tabs
+            .headers()
+            .into_iter()
+            .map(|header| {
+                let tab_id = header.group_id();
+                let focused_pane = header.value.pane_id();
+                let pane_count = if focused_pane.is_some() {
+                    self.tabs
+                        .group_layout(tab_id)
+                        .expect("a tab header has a layout")
+                        .leaves()
+                        .len()
+                } else {
+                    0
+                };
+                serde_json::json!({
+                    "tab_id": tab_id,
+                    "title": self.tab_label(header.id, follow_titles),
+                    "selected": active_group == Some(tab_id),
+                    "pinned": self.tabs.group_is_pinned(tab_id),
+                    "zoomed": self.tabs.group_zoomed(tab_id),
+                    "pane_count": pane_count,
+                    "focused_pane": focused_pane,
+                })
+            })
+            .collect();
+        serde_json::json!({ "window_id": self.registry.window_id(), "tabs": tabs })
+    }
+
+    pub(super) fn control_reorder_tabs(
+        &mut self,
+        order: &[TabId],
+        ctx: &ComponentContext<Self>,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            self.incoming.is_none() && self.outgoing.is_none(),
+            "This window is busy moving a tab or pane"
+        );
+        let current: Vec<_> = self
+            .tabs
+            .headers()
+            .into_iter()
+            .map(|tab| tab.group_id())
+            .collect();
+        let valid = "Provide every current tab ID in this window exactly once. Use list-tabs to refresh the order.";
+        anyhow::ensure!(
+            !order.is_empty()
+                && order.len() == current.len()
+                && order
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == current.iter().copied().collect(),
+            valid
+        );
+        anyhow::ensure!(
+            order
+                .iter()
+                .map(|&tab| !self.tabs.group_is_pinned(tab))
+                .is_sorted(),
+            "Pinned tabs must precede unpinned tabs"
+        );
+        let changed = current.as_slice() != order;
+        if changed {
+            let entries: Vec<_> = order
+                .iter()
+                .map(|&id| self.tabs.group_focus(id).expect("validated tab ID"))
+                .collect();
+            anyhow::ensure!(self.tabs.reorder(&entries), valid);
+            self.sync_selection(ctx);
+            self.refresh_open_commands();
+        }
+        Ok(
+            serde_json::json!({ "window_id": self.registry.window_id(), "tab_ids": order, "changed": changed }),
+        )
+    }
+
     fn publish_control_window(
         &self,
         tabs: &[command_palette::SearchTab],

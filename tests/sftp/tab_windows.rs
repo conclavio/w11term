@@ -194,6 +194,12 @@ async fn native_cli_moves_whole_live_tabs_across_windows() {
     run("CliMoveTab", b"before-tab/existing-tab/new-tab/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "lists and reorders native tabs in a background window, then saves their terminal order"]
+async fn native_cli_lists_and_reorders_a_window_tab_strip() {
+    run("CliTabOrder", b"after-order/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =

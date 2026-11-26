@@ -183,6 +183,13 @@ pub enum Request {
     },
     List,
     ListWindows,
+    ListTabs {
+        window_id: WindowId,
+    },
+    ReorderTabs {
+        window_id: WindowId,
+        tab_ids: Vec<crate::tabs::TabId>,
+    },
     ListProfiles,
     OpenProfileWindow {
         profile: String,
@@ -465,6 +472,10 @@ pub enum UiRequest {
         name: String,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    TabOrder {
+        order: Option<Vec<crate::tabs::TabId>>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     OpenWorkspace {
         name: String,
         activate: bool,
@@ -600,6 +611,7 @@ impl UiRequest {
             | Self::OpenProfileWindow { reply, .. }
             | Self::OpenSshGroup { reply, .. }
             | Self::SaveWorkspace { reply, .. }
+            | Self::TabOrder { reply, .. }
             | Self::OpenWorkspace { reply, .. }
             | Self::OpenWorkspaceWindow { reply, .. }
             | Self::GetSshGroupRoster { reply, .. }
@@ -712,6 +724,21 @@ pub struct Pane {
     pub capture: Option<CapturePng>,
 }
 impl Registry {
+    async fn tab_order(
+        &self,
+        window_id: WindowId,
+        order: Option<Vec<crate::tabs::TabId>>,
+    ) -> Result<Value> {
+        let ui = self.window_ui(window_id)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::TabOrder { order, reply });
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("tab order request timed out; use list-tabs to check the current order")?
+            .context("GUI is closed")?
+            .map_err(anyhow::Error::msg)
+    }
+
     async fn select_pane_view(&self, pane: u64, zoom: Option<bool>) -> Result<Value> {
         let (reply, response) = oneshot::channel();
         self.post_pane_request(pane, UiRequest::SelectPaneView { pane, zoom, reply });
@@ -1432,6 +1459,10 @@ impl Registry {
                 anyhow::bail!("follow-ssh-group-output requires a streaming reply")
             }
             Request::ListWindows => Ok(self.list_windows()),
+            Request::ListTabs { window_id } => self.tab_order(window_id, None).await,
+            Request::ReorderTabs { window_id, tab_ids } => {
+                self.tab_order(window_id, Some(tab_ids)).await
+            }
             Request::ListProfiles => {
                 let ui = self.active_ui()?;
                 let (reply, response) = oneshot::channel();

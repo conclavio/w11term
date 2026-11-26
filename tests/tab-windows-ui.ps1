@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -915,6 +915,86 @@ function Test-ControlPaneView {
     }
     Expect-Focus $origin $ssh.id 'Selection and zoom in the sibling window preserve desktop focus'
     Close-FixtureWindow $hwnd
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlTabOrder {
+    Expect-Focus $origin $ssh.id 'The original split is selected before pinning it' -PrepareWindow
+    Run-WindowCommand $origin 'Pin tab'
+    Run-WindowCommand $origin 'Settings'
+    $null = Wait-Until 'Settings has opened beside the two terminal tabs' {
+        Find-Here $origin 'Settings' ([System.Windows.Automation.ControlType]::TabItem)
+    }
+    $sourceId = "$($ssh.window_id)"
+    $spare = Control @('open','--window',$sourceId,'--profile','Destination PowerShell')
+    $listing = Control @('list-tabs','--window',$sourceId)
+    $original = $listing.tabs
+    $settings = $original | Where-Object title -ceq 'Settings'
+    $split = $original | Where-Object tab_id -eq $ssh.tab_id
+    $spareTab = $original | Where-Object focused_pane -eq $spare.pane
+    if ($listing.window_id -ne $ssh.window_id -or $original.Count -ne 4 -or
+        ($original.tab_id -join ',') -cne "$($ssh.tab_id),$($anchor.tab_id),$($settings.tab_id),$($spareTab.tab_id)" -or
+        !$split.pinned -or $split.pane_count -ne 2 -or $split.focused_pane -ne $ssh.id -or
+        !$settings.selected -or $settings.pane_count -ne 0 -or $null -ne $settings.focused_pane) {
+        throw "Unexpected native strip before reorder: $($listing | ConvertTo-Json -Depth 6 -Compress)"
+    }
+
+    $null = Control @('focus-pane','--pane',"$($anchor.id)")
+    $other = Control @('open','--profile','Destination PowerShell','--new-window')
+    $otherWindow = Wait-DetachedWindow $origin
+    Expect-Focus $otherWindow $other.pane 'The sibling window has desktop focus before reordering' -PrepareWindow
+    $otherTab = (Control @('list-tabs','--window',"$($other.window_id)")).tabs[0]
+    $expected = @($ssh.tab_id,$spareTab.tab_id,$settings.tab_id,$anchor.tab_id)
+    $arguments = @('reorder-tabs','--window',$sourceId)
+    foreach ($id in $expected) { $arguments += @('--tab',"$id") }
+    $order = Control $arguments
+    if (!$order.changed -or $order.window_id -ne $ssh.window_id -or
+        ($order.tab_ids -join ',') -cne ($expected -join ',') -or (Control $arguments).changed) {
+        throw 'The absolute order was not applied idempotently'
+    }
+    foreach ($invalid in @(
+        @{ tabs = @($anchor.tab_id,$ssh.tab_id,$spareTab.tab_id,$settings.tab_id); error = '*Pinned tabs*' },
+        @{ tabs = @($ssh.tab_id,$spareTab.tab_id,$spareTab.tab_id,$anchor.tab_id); error = '*exactly once*' },
+        @{ tabs = @($ssh.tab_id,$spareTab.tab_id,$anchor.tab_id); error = '*exactly once*' },
+        @{ tabs = @($ssh.tab_id,$spareTab.tab_id,$settings.tab_id,$otherTab.tab_id); error = '*exactly once*' }
+    )) {
+        $badArgs = @('reorder-tabs','--window',$sourceId)
+        foreach ($id in $invalid.tabs) { $badArgs += @('--tab',"$id") }
+        $failed = & $Cli --pid $app.Id @badArgs | ConvertFrom-Json
+        if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike $invalid.error) {
+            throw "An invalid tab permutation was not rejected: $($invalid.tabs -join ',')"
+        }
+    }
+    $actual = (Control @('list-tabs','--window',$sourceId)).tabs
+    $selected = $actual | Where-Object selected
+    if (($actual.tab_id -join ',') -cne ($expected -join ',') -or $selected.tab_id -ne $anchor.tab_id -or
+        $selected.focused_pane -ne $anchor.id -or (Control @('list-tabs','--window',"$($other.window_id)")).tabs.Count -ne 1) {
+        throw 'Reordering changed the wrong window, changed the selection, or accepted an invalid order'
+    }
+    Expect-Focus $otherWindow $other.pane 'Reordering another window leaves desktop focus in place'
+
+    $savedName = 'CLI tab order'
+    $null = Control @('save-workspace','--window',$sourceId,'--name',$savedName)
+    $saved = (Get-Content -Raw -LiteralPath (Join-Path $env:W11TERM_DATA_DIR 'workspaces.json') | ConvertFrom-Json).workspaces.$savedName
+    if ($saved.tabs.Count -ne 3 -or $saved.active_tab -ne 2 -or !$saved.tabs[0].pinned -or
+        $saved.tabs[1].layout.source.value.name -cne 'Destination PowerShell' -or
+        $saved.tabs[2].layout.source.value.name -cne 'Source PowerShell') {
+        throw 'The saved workspace did not inherit the live terminal order and selection'
+    }
+    Expect-Focus $origin $anchor.id 'The original window still selects the same pane after reordering' -PrepareWindow
+    $null = Wait-Until 'the native tab items appear in the new left-to-right order' {
+        $type = [System.Windows.Automation.ControlType]::TabItem
+        $labels = @('Pinned: Cockpit tools','Destination PowerShell','Settings','Source PowerShell')
+        $items = @($labels | ForEach-Object { Find-Here $origin $_ $type } | Where-Object { $_ })
+        if ($items.Count -ne 4 -or @($items | Where-Object { $_.Current.BoundingRectangle.Width -le 0 }).Count) { return }
+        $x = @($items | ForEach-Object { $_.Current.BoundingRectangle.X })
+        $x[0] -lt $x[1] -and $x[1] -lt $x[2] -and $x[2] -lt $x[3]
+    }
+    $null = Control @('focus-pane','--pane',"$($ssh.id)")
+    Expect-Focus $origin $ssh.id 'The SSH tab still accepts keyboard input after reordering'
+    Type-In $origin 'after-order/'
+    Expect-Text $ssh.id 'after-order/'
+    Close-FixtureWindow $otherWindow
     Close-FixtureWindow $origin
 }
 
@@ -1927,7 +2007,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -1940,6 +2020,7 @@ try {
             'CliResizeSplit' { Test-ControlResizeSplit }
             'CliSaveWorkspace' { Test-ControlSaveWorkspace }
             'CliMoveTab' { Test-ControlMoveTab }
+            'CliTabOrder' { Test-ControlTabOrder }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

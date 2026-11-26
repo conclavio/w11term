@@ -69,6 +69,7 @@ pub(super) fn parse(
     let mut direction = None;
     let mut zoom = None;
     let mut percent = None;
+    let mut ordered_tabs = Vec::new();
     let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
@@ -412,6 +413,8 @@ pub(super) fn parse(
                         | "open-ssh-group"
                         | "list-saved-ssh-groups"
                         | "move-tab"
+                        | "list-tabs"
+                        | "reorder-tabs"
                 ) && arg == "--window")
                     || matches!(
                         verb,
@@ -450,6 +453,13 @@ pub(super) fn parse(
                     _ => &mut run_id,
                 };
                 ensure!(slot.replace(id).is_none(), "specify {arg} only once");
+            }
+            "--tab" if verb == "reorder-tabs" => {
+                let id: u64 = value(&mut args)?
+                    .parse()
+                    .context("--tab requires a positive integer")?;
+                ensure!(id != 0, "--tab requires a positive integer");
+                ordered_tabs.push(id);
             }
             "--" if verb == "submit-ssh-group-command" => {
                 ensure!(text.is_none(), "provide one quoted shell command line");
@@ -520,6 +530,19 @@ pub(super) fn parse(
                     rows,
                     activate,
                 }
+            }
+        }
+        "list-tabs" => Request::ListTabs {
+            window_id: window_id.context("--window is required (from list-windows)")?,
+        },
+        "reorder-tabs" => {
+            ensure!(
+                !ordered_tabs.is_empty(),
+                "provide all tab IDs in order with --tab"
+            );
+            Request::ReorderTabs {
+                window_id: window_id.context("--window is required (from list-windows)")?,
+                tab_ids: ordered_tabs,
             }
         }
         "save-workspace" => Request::SaveWorkspace {
