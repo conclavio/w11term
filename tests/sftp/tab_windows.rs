@@ -182,6 +182,12 @@ async fn native_cli_resizes_live_split_dividers() {
     run("CliResizeSplit", b"resized-layout/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "saves a mixed background workspace without overwriting, then restores its native layout under the same identity"]
+async fn native_cli_saves_and_reopens_a_live_workspace() {
+    run("CliSaveWorkspace", b"source-saved/restored-save/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -323,6 +329,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
             | "CliProfiles"
             | "CliSplit"
             | "CliPaneView"
+            | "CliSaveWorkspace"
     ));
     assert_eq!(
         transports.load(Ordering::Relaxed),

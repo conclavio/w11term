@@ -6815,6 +6815,12 @@ impl Component for TerminalApp {
                 })();
                 let _ = reply.send(result.map_err(|e| format!("{e:#}")));
             }
+            Message::Control(w11term::control::UiRequest::SaveWorkspace { name, reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_save_workspace(&name);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::OpenWorkspace {
                 name,
                 activate,

@@ -95,12 +95,7 @@ impl TerminalApp {
         if let Some(page) = self.workspace_page_mut(id) {
             page.status = match result {
                 Ok(()) => {
-                    if let Err(index) = page
-                        .names
-                        .binary_search_by(|saved| saved.as_str().cmp(name))
-                    {
-                        page.names.insert(index, name.to_owned());
-                    }
+                    page.insert_saved_name(name);
                     if expected.is_some() {
                         format!("Updated {name}")
                     } else {

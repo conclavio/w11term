@@ -206,7 +206,7 @@ pub(super) fn parse(
                 validate_split_percent(size)?;
                 percent = Some(size);
             }
-            "--name" if matches!(verb, "open-ssh-group" | "open-workspace") => {
+            "--name" if matches!(verb, "open-ssh-group" | "open-workspace" | "save-workspace") => {
                 ensure!(name.is_none(), "specify --name only once");
                 name = Some(value(&mut args)?);
             }
@@ -402,7 +402,11 @@ pub(super) fn parse(
             "--window" | "--tab" | "--run"
                 if (matches!(
                     verb,
-                    "open" | "open-workspace" | "open-ssh-group" | "list-saved-ssh-groups"
+                    "open"
+                        | "open-workspace"
+                        | "save-workspace"
+                        | "open-ssh-group"
+                        | "list-saved-ssh-groups"
                 ) && arg == "--window")
                     || matches!(
                         verb,
@@ -513,6 +517,12 @@ pub(super) fn parse(
                 }
             }
         }
+        "save-workspace" => Request::SaveWorkspace {
+            window_id: window_id.context("--window is required (from list-windows)")?,
+            name: name
+                .filter(|name| !name.trim().is_empty())
+                .context("provide a new workspace name with --name")?,
+        },
         "open-workspace" => {
             ensure!(pane.is_none(), "open-workspace does not accept --pane");
             let name = name.context("--name is required")?;

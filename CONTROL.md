@@ -32,6 +32,8 @@ Omit `--pid` when exactly one process is running. Each process serves all its wi
 
 `list-workspaces` reads the saved workspace catalog and returns `workspaces` in name order. Each entry has `name`, `tab_count`, and `pane_count`.
 
+`save-workspace --window ID --name NAME` saves the terminal tabs in that window as a new workspace and registers the window under the saved name for the workspace switcher. It captures the same pane launch recipes, split proportions, titles, and remembered selection as **Save workspace** in the GUI. Utility tabs are skipped. Saving keeps the current sessions, selection, and desktop focus in place. Existing names are rejected, and the reply includes `name`, `window_id`, `tab_count`, and `pane_count`. Direct pipe clients can send `{"verb":"save-workspace","window_id":2,"name":"Fleet Ops"}`.
+
 `open-workspace --window ID --name NAME` appends a fresh copy of a saved layout to the specified window. The existing selection stays in place by default. Pass `--activate` to select the saved tab and pane within that window while preserving desktop focus. Missing SSH profiles cause the entire request to fail before any tabs are added.
 
 `open-workspace --new-window --name NAME` opens a fresh copy in a new window of the same process and selects its saved pane while preserving desktop focus. The reply arrives after the new window has registered with the control pipe. The window has the usual saved workspace identity and can be found by the workspace switcher. For direct pipe clients, send `{"verb":"open-workspace-window","name":"Fleet Ops"}`.
@@ -42,6 +44,7 @@ The reply contains `name`, `window_id`, and `tabs` in saved order. Each tab cont
 & $ctl --pid 12345 list-profiles
 & $ctl --pid 12345 open --profile 'Fleet Ops' --new-window --cols 120 --rows 32
 & $ctl --pid 12345 list-workspaces
+& $ctl --pid 12345 save-workspace --window 2 --name 'Fleet Ops'
 & $ctl --pid 12345 open-workspace --window 2 --name 'Fleet Ops' --activate
 & $ctl --pid 12345 open-workspace --new-window --name 'Fleet Ops'
 ```

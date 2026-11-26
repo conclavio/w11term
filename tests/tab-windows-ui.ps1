@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -1139,6 +1139,79 @@ function Test-ControlProfileWindows {
     Close-FixtureWindow $remoteWindow
 }
 
+function Test-ControlSaveWorkspace {
+    Expect-Focus $origin $ssh.id 'SSH is selected before building the workspace' -PrepareWindow
+    $name = 'CLI saved Ops'
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $null = Control @('resize-split','--pane',"$($ssh.id)",'--target-pane',"$($moved.id)",'--percent','62.5')
+    $null = Control @('focus-pane','--pane',"$($moved.id)")
+    Run-WindowCommand $origin ('Workspaces' + [char]0x2026)
+    $null = Wait-Until 'workspace manager is selected in the source window' {
+        Find-Here $origin 'Workspace name'
+    }
+
+    $other = Control @('open','--profile','Destination PowerShell','--new-window')
+    $otherWindow = Wait-DetachedWindow $origin
+    Expect-Focus $otherWindow $other.pane 'The other window has focus before saving' -PrepareWindow
+    $beforeSave = @((Control @('list')).sessions).Count
+    $save = Control @('save-workspace','--window',"$($ssh.window_id)",'--name',$name)
+    if ($save.name -cne $name -or $save.window_id -ne $ssh.window_id -or $save.tab_count -ne 2 -or
+        $save.pane_count -ne 3 -or @((Control @('list')).sessions).Count -ne $beforeSave) {
+        throw 'Saving did not capture only the source terminal tabs and leave the sessions live'
+    }
+    $null = Wait-Until 'the open workspace manager sees the new CLI save' {
+        Find-Here $origin "Switch to workspace $name"
+    }
+    Expect-Focus $otherWindow $other.pane 'Saving in a background window preserves desktop focus'
+    $claims = (Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows
+    $claim = $claims | Where-Object window_id -eq $ssh.window_id
+    if (!$claim.workspace -or ($claims | Where-Object window_id -eq $other.window_id)) {
+        throw 'Save did not register the explicitly targeted window'
+    }
+    $saved = (Control @('list-workspaces')).workspaces | Where-Object name -ceq $name
+    if ($saved.tab_count -ne 2 -or $saved.pane_count -ne 3) { throw 'The saved workspace is missing from the catalog' }
+
+    $beforeFailure = [IO.File]::ReadAllText($catalog)
+    $failed = & $Cli --pid $app.Id save-workspace --window "$($other.window_id)" --name $name | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*already exists*') {
+        throw 'Saving a second layout to the same name did not fail cleanly'
+    }
+    $failed = & $Cli --pid $app.Id save-workspace --window 999999 --name 'Invalid target' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -cne 'unknown window 999999' -or
+        [IO.File]::ReadAllText($catalog) -cne $beforeFailure) {
+        throw 'A failed save changed the workspace catalog'
+    }
+    Close-FixtureWindow $otherWindow
+    $null = Wait-Until 'the temporary foreground window has closed' {
+        @((Control @('list-windows')).windows).Count -eq 1
+    }
+    $null = Control @('focus-pane','--pane',"$($ssh.id)")
+    Expect-Focus $origin $ssh.id 'The original SSH pane remains live after saving' -PrepareWindow
+    Type-In $origin 'source-saved/'
+    Expect-Text $ssh.id 'source-saved/'
+
+    $reopened = Control @('open-workspace','--new-window','--name',$name)
+    $copy = Wait-DetachedWindow $origin
+    $freshSsh = $reopened.tabs[0].panes[0]
+    $freshShell = $reopened.tabs[0].panes[1]
+    $layout = Control @('get-tab-layout','--pane',"$freshSsh")
+    if ($reopened.tabs.Count -ne 2 -or $reopened.tabs[1].panes.Count -ne 1 -or
+        $reopened.workspace_active_pane -ne $freshShell -or $freshSsh -eq $ssh.id -or $freshShell -eq $moved.id -or
+        !$layout.selected -or $layout.focused_pane -ne $freshShell -or $layout.layout[0].ratio -ne 0.625) {
+        throw 'Reopening did not restore the saved ratio and remembered pane with fresh sessions'
+    }
+    $copyClaim = (Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows |
+        Where-Object window_id -eq $reopened.window_id
+    if ($copyClaim.workspace -cne $claim.workspace) { throw 'The reopened window has a different workspace identity' }
+    Expect-Focus $origin $ssh.id 'Reopening the saved workspace leaves the original window focused'
+    Expect-Text $freshSsh 'ready'
+    Expect-Text $freshShell 'PS '
+    $null = Control @('send-text','--pane',"$freshSsh",'--no-paste','restored-save/')
+    Expect-Text $freshSsh 'restored-save/'
+    Close-FixtureWindow $copy
+    Close-FixtureWindow $origin
+}
+
 function Test-ControlWorkspace {
     $window = $origin
     $field = Open-ProfileWindowPicker $origin -FromPalette
@@ -1792,7 +1865,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -1803,6 +1876,7 @@ try {
             'CliPaneView' { Test-ControlPaneView }
             'CliLayout' { Test-ControlTabLayout }
             'CliResizeSplit' { Test-ControlResizeSplit }
+            'CliSaveWorkspace' { Test-ControlSaveWorkspace }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"
