@@ -263,6 +263,28 @@ try {
     $null = Wait-Until 'the PowerShell notification opens the same capture' {
         Find-Element ("Selected, $diagnostic" + ' ' + [char]0xb7 + ' exit 0')
     }
+    Click 'Return to pane'
+    Wait-Focus $pane
+    $loop = 'while ($true) { Start-Sleep -Milliseconds 40 }'
+    $wire = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($loop + [char]13))
+    $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64',$wire)
+    $target = Wait-Until 'the local PowerShell loop starts' {
+        $r = (Control @('inspect','--pane',"$pane")).running_command
+        if ($r.command -ceq $loop -and $r.start_token -gt 0) { $r }
+    }
+    Picker-Query 'palette-ssh'
+    Press-Key 13
+    Wait-Focus $remote
+    $ack = Control @('interrupt-command','--pane',"$pane",'--start-token',"$($target.start_token)")
+    if (!$ack.sent -or $ack.pane -ne $pane) { throw 'Ctrl+C was not confirmed for the background PowerShell pane' }
+    $null = Wait-Until 'PowerShell returns from the interrupted command' {
+        !(Control @('inspect','--pane',"$pane")).running_command
+    }
+    Wait-Focus $remote
+    $proof = "Write-Output ('interrupt-' + 'recovered')"
+    $wire = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($proof + [char]13))
+    $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64',$wire)
+    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','interrupt-recovered')
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

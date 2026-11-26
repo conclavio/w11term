@@ -159,6 +159,7 @@ pub enum ScopedInput {
     Notification,
     GroupCommand(crate::events::GroupWriteReceipt),
     GroupInterrupt(crate::events::GroupInterruptTarget),
+    CommandInterrupt(crate::events::CommandInterruptPermit),
 }
 
 impl ScopedInput {
@@ -182,11 +183,14 @@ impl ScopedInput {
             Self::Notification => "The terminal connection changed before the notification reply.",
             Self::GroupCommand(_) => "The host reconnected before the command was sent.",
             Self::GroupInterrupt(_) => "The host reconnected before Ctrl+C was sent.",
+            Self::CommandInterrupt(_) => "The pane connection changed before Ctrl+C was sent.",
         }
     }
 }
 
 pub(crate) const GROUP_COMMAND_ENDED: &str = "The selected group command is no longer running.";
+pub(crate) const COMMAND_INTERRUPT_EXPIRED: &str =
+    "The selected command is no longer interruptible; Ctrl+C was not sent.";
 
 struct ReplyWriter {
     sender: mpsc::UnboundedSender<TransportInput>,
@@ -642,7 +646,7 @@ fn encode_kitty_key_event(
 pub(crate) fn group_command_bytes(terminal: &Terminal, text: &str) -> anyhow::Result<Vec<u8>> {
     use wezterm_term::{KeyCode, KeyModifiers};
     let mut encoded = terminal.encode_paste(text);
-    encoded.push_str(&group_key_press(
+    encoded.push_str(&encode_key_press(
         terminal,
         KeyCode::Enter,
         KeyModifiers::NONE,
@@ -650,12 +654,12 @@ pub(crate) fn group_command_bytes(terminal: &Terminal, text: &str) -> anyhow::Re
     Ok(encoded.into_bytes())
 }
 
-pub(crate) fn group_interrupt_bytes(terminal: &Terminal) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn interrupt_bytes(terminal: &Terminal) -> anyhow::Result<Vec<u8>> {
     use wezterm_term::{KeyCode, KeyModifiers};
-    Ok(group_key_press(terminal, KeyCode::Char('c'), KeyModifiers::CTRL)?.into_bytes())
+    Ok(encode_key_press(terminal, KeyCode::Char('c'), KeyModifiers::CTRL)?.into_bytes())
 }
 
-fn group_key_press(
+fn encode_key_press(
     terminal: &Terminal,
     key: wezterm_term::KeyCode,
     modifiers: wezterm_term::KeyModifiers,
@@ -1598,7 +1602,7 @@ mod tests {
     #[test]
     fn group_interrupt_uses_the_panes_ctrl_c_encoding() {
         let (mut term, mut outgoing) = engine();
-        assert_eq!(group_interrupt_bytes(&term).unwrap(), b"\x03");
+        assert_eq!(interrupt_bytes(&term).unwrap(), b"\x03");
         term.advance_bytes(b"\x1b[>11u");
         let mut expected = Vec::new();
         for down in [true, false] {
@@ -1616,7 +1620,7 @@ mod tests {
                 item => panic!("expected Kitty Ctrl+C: {item:?}"),
             }
         }
-        assert_eq!(group_interrupt_bytes(&term).unwrap(), expected);
+        assert_eq!(interrupt_bytes(&term).unwrap(), expected);
     }
 
     #[test]
@@ -1932,6 +1936,43 @@ mod tests {
             batch.events[0].data["started_unix_ms"],
             record.timing.started_unix_ms.unwrap()
         );
+    }
+
+    #[test]
+    fn transport_cannot_claim_interrupt_after_observed_prompt_or_capture_replacement() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(5));
+        term.advance_bytes(b"\x1b]133;C\x07first");
+        let target = |term: &Terminal| {
+            crate::events::RunningCommandTarget::new(5, &term.running_command().unwrap())
+        };
+        let arm = |term: &Terminal| events.arm_command_interrupt(target(term)).unwrap();
+        let replacement = arm(&term);
+        term.advance_bytes(b"\x1b]133;C\x07second");
+        assert!(
+            !replacement.claim(),
+            "the new marker must invalidate the queued write immediately"
+        );
+
+        let superseded = arm(&term);
+        let current = arm(&term);
+        assert!(!superseded.claim());
+        assert!(current.claim());
+        assert!(
+            !current.claim(),
+            "the transport may claim a permit only once"
+        );
+
+        let read_only = arm(&term);
+        events.cancel_command_interrupt();
+        assert!(!read_only.claim());
+        let completed = arm(&term);
+        term.advance_bytes(b"\x1b]133;D;0\x07");
+        assert!(!completed.claim());
+        term.advance_bytes(b"\x1b]133;C\x07third");
+        let disconnected = arm(&term);
+        events.command_stream(None);
+        assert!(!disconnected.claim());
     }
 
     #[test]

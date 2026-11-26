@@ -699,6 +699,8 @@ Use `w11term-cli wait-running-output` with the same token to wait for a status l
 
 Use `w11term-cli wait-command --start-token` to get that command's exit status and full retained output. The same token works if the command finished before the script began waiting. [Completed shell commands](CONTROL.md#completed-shell-commands)
 
+Use `w11term-cli interrupt-command` to send Ctrl+C to an exact running capture on SSH or local PowerShell without switching panes. [Running command controls](CONTROL.md#running-command-output)
+
 Highlight a result and choose **Notify when selected command finishes** to watch it while keeping your current pane. The Attention inbox opens the capture from that notification. Choose **Cancel selected command notification** to disarm it. **F8** toggles the watch for the highlighted result. The watch ends if the selected capture is replaced or its session disconnects.
 
 For an SSH pane, the inspector shows the connection state and the current step and endpoint during login or reconnection. If the connection ends during a failed step, the inspector keeps the step and error visible. Once connected, expand **Verified SSH route** to see the destination and each jump host with its verified SHA256 host-key fingerprint and any configured host-key alias. Each peer shows the initial key exchange, host-key algorithm, cipher, and whether strict key exchange was negotiated. The route disappears when the authenticated connection ends.

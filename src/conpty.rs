@@ -77,6 +77,13 @@ fn write_input(
             } => {
                 let _ = reply.send(Err("Group interrupts require a direct SSH shell.".into()));
             }
+            TransportInput::Scoped {
+                kind: ScopedInput::CommandInterrupt(permit),
+                reply,
+                ..
+            } if reply.is_closed() || !permit.claim() => {
+                let _ = reply.send(Err(crate::terminal::COMMAND_INTERRUPT_EXPIRED.into()));
+            }
             TransportInput::Raw(bytes, reply) | TransportInput::Scoped { bytes, reply, .. } => {
                 let result = pipe.write_all(&bytes);
                 let _ = reply.send(

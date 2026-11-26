@@ -50,6 +50,19 @@ function Assert-StaleOutput([long]$Pane, [long]$Token) {
         throw "Expected stale command output to be rejected in pane ${Pane}: $($reply | ConvertTo-Json -Compress)"
     }
 }
+function Assert-InterruptRejected([long]$Pane, [long]$Token, [string]$Reason) {
+    $reply = & $Cli --pid $app.Id interrupt-command --pane "$Pane" --start-token "$Token" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $reply.ok -or $reply.error -notlike "*$Reason*") {
+        throw "Expected interrupt to be rejected in pane ${Pane}: $($reply | ConvertTo-Json -Compress)"
+    }
+}
+function Count-PeerInterrupts {
+    $count = 0
+    foreach ($byte in (Read-PeerTrace $wire)) {
+        if ($byte -eq 3) { $count++ }
+    }
+    return $count
+}
 function Type-Line([string]$Line) {
     foreach ($ch in $Line.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     Press-Key 13
@@ -306,6 +319,17 @@ try {
         $sample.state -ceq 'ready' -and $sample.text -clike '*replacement-preview*' -and
             $sample.text -cnotlike '*original-preview*'
     }
+    $beforeInterrupt = Count-PeerInterrupts
+    Assert-InterruptRejected $remote $first.start_token 'no longer running'
+    Assert-InterruptRejected $localPane $replacement.start_token 'no longer running'
+    Assert-InterruptRejected $remote $started.start_token 'no longer running'
+    $ack = Control @('interrupt-command','--pane',"$remote",'--start-token',"$($replacement.start_token)")
+    if (!$ack.sent -or $ack.pane -ne $remote -or $ack.start_token -ne $replacement.start_token) {
+        throw 'The interrupt receipt did not identify the targeted SSH capture'
+    }
+    $null = Wait-Until 'the peer observes exactly one Ctrl+C from the verified command' {
+        (Count-PeerInterrupts) -eq ($beforeInterrupt + 1)
+    }
     Wait-Focus $localPane
     if ($foreground -ne $window -and [FixtureMessages]::GetForegroundWindow() -eq $window) { throw 'Running output activated the fixture window' }
     Invoke-NativeMenuAction 'Tab menu' ('Find running commands' + [char]0x2026)
@@ -321,6 +345,18 @@ try {
     }
     Press-Key 13
     Wait-Focus $remote
+    Run-Palette 'Enable read-only pane input'
+    $null = Wait-Until 'SSH pane input is read-only' {
+        ((Control @('list')).sessions | Where-Object id -eq $remote).read_only
+    }
+    Assert-InterruptRejected $remote $replacement.start_token 'read-only'
+    Run-Palette 'Disable read-only pane input'
+    $null = Wait-Until 'SSH pane input is unlocked' {
+        !((Control @('list')).sessions | Where-Object id -eq $remote).read_only
+    }
+    if ((Count-PeerInterrupts) -ne ($beforeInterrupt + 1)) {
+        throw 'An invalid target wrote Ctrl+C to the peer'
+    }
     Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
     $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
     $null = Wait-Until 'the unfinished command is visible before disconnect' {

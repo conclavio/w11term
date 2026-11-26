@@ -118,6 +118,31 @@ impl RunningCommandTarget {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CommandInterruptPermit {
+    events: Events,
+    nonce: Arc<()>,
+}
+
+impl CommandInterruptPermit {
+    /// Called by the transport immediately before the write. Each permit is single-use.
+    pub(crate) fn claim(&self) -> bool {
+        let mut state = self.events.state.lock().unwrap();
+        let current = state
+            .command_interrupt
+            .as_ref()
+            .is_some_and(|(_, pending)| {
+                pending
+                    .upgrade()
+                    .is_some_and(|nonce| Arc::ptr_eq(&nonce, &self.nonce))
+            });
+        if current {
+            state.command_interrupt = None;
+        }
+        current
+    }
+}
+
 #[derive(Debug)]
 pub struct CommandCompletionCapture {
     pub connection_generation: u64,
@@ -197,6 +222,7 @@ struct State {
     command_watch: Option<CommandWatch>,
     running_output: Vec<running_output::Waiter>,
     command_completion: Vec<CompletionWait>,
+    command_interrupt: Option<(RunningCommandTarget, std::sync::Weak<()>)>,
     group_run: Option<GroupRun>,
     group_prompt_pattern: Option<GroupPromptPattern>,
     group_serial: u64,
@@ -803,6 +829,26 @@ impl Events {
         !state.running_output.is_empty()
     }
 
+    pub(crate) fn arm_command_interrupt(
+        &self,
+        target: RunningCommandTarget,
+    ) -> Option<CommandInterruptPermit> {
+        let mut state = self.state.lock().unwrap();
+        if state.command_watch.as_ref()?.generation != target.generation {
+            return None;
+        }
+        let nonce = Arc::new(());
+        state.command_interrupt = Some((target, Arc::downgrade(&nonce)));
+        Some(CommandInterruptPermit {
+            events: self.clone(),
+            nonce,
+        })
+    }
+
+    pub(crate) fn cancel_command_interrupt(&self) {
+        self.state.lock().unwrap().command_interrupt = None;
+    }
+
     pub(crate) fn group_command_line(&self, id: u64, label: Option<&str>) {
         if let Some(run) = &self.state.lock().unwrap().group_run {
             run.identify(id, label);
@@ -854,6 +900,13 @@ impl Events {
     pub(crate) fn retain_running_capture(&self, running: Option<RunningCommandTarget>) {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
+        if state
+            .command_interrupt
+            .as_ref()
+            .is_some_and(|(target, _)| Some(*target) != running)
+        {
+            state.command_interrupt = None;
+        }
         if let Some(watch) = &mut state.command_watch
             && matches!(watch.armed, Some(ManualCommandWatch::Running(target)) if Some(target) != running)
         {
@@ -878,6 +931,7 @@ impl Events {
 
     pub(crate) fn command_stream(&self, generation: Option<u64>) {
         let mut state = self.state.lock().unwrap();
+        state.command_interrupt = None;
         let previous = state.watch_state();
         if let Some(run) = state.group_run.take() {
             run.abandon("The connection closed before the shell reported a result.");
@@ -898,6 +952,7 @@ impl Events {
 
     pub(crate) fn reset_command_watch(&self) {
         let mut state = self.state.lock().unwrap();
+        state.command_interrupt = None;
         let previous = state.watch_state();
         if let Some(run) = state.group_run.take() {
             run.abandon("The terminal reset before the shell reported a result.");
@@ -938,7 +993,21 @@ impl Events {
         started: Option<(u64, Option<&str>)>,
         completed: Option<wezterm_term::ShellCommandCompletion<'_>>,
     ) {
+        use wezterm_term::{FinalTermPromptKind, FinalTermSemanticPrompt::*};
         let mut state = self.state.lock().unwrap();
+        if completed.is_some()
+            || matches!(
+                marker,
+                FreshLineAndStartPrompt { .. }
+                    | StartPrompt(FinalTermPromptKind::Initial)
+                    | MarkEndOfCommandWithFreshLine { .. }
+                    | MarkEndOfPromptAndStartOfInputUntilNextMarker
+                    | MarkEndOfPromptAndStartOfInputUntilEndOfLine
+                    | MarkEndOfInputAndStartOfOutput { .. }
+            )
+        {
+            state.command_interrupt = None;
+        }
         let now = Instant::now();
         if let Some(run) = &mut state.group_run
             && !run.marker(

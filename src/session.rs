@@ -136,6 +136,10 @@ pub enum Command {
         target: crate::events::GroupInterruptTarget,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    InterruptCommand {
+        start_token: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     DisconnectSshShell {
         connection: u64,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -1200,6 +1204,7 @@ async fn run(
                             continue;
                         }
                         Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
+                        Some(Command::InterruptCommand { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; Ctrl+C was not sent.".into())); continue; }
                         Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::NotificationReply(_)) => continue,
@@ -1222,7 +1227,7 @@ async fn run(
                             let _ = reply.send(Err(reason.into()));
                             continue;
                         }
-                        Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
+                        Some(Command::InterruptGroupCommand { reply, .. } | Command::InterruptCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
                         Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
@@ -1308,7 +1313,7 @@ async fn run(
                         }
                         match terminal::group_command_bytes(&terminal, &text) {
                             Ok(bytes) => {
-                                if write_group_input(&writer, prompt.connection, bytes, reply, kind) {
+                                if write_scoped_input(&writer, prompt.connection, bytes, reply, kind) {
                                     events.observe_group_command(prompt.connection, text, execution, transcript);
                                 }
                             }
@@ -1327,11 +1332,30 @@ async fn run(
                         } else if !events.group_command_running(target) {
                             Err(terminal::GROUP_COMMAND_ENDED.into())
                         } else {
-                            terminal::group_interrupt_bytes(&terminal).map_err(|error| error.to_string())
+                            terminal::interrupt_bytes(&terminal).map_err(|error| error.to_string())
                         };
                         match bytes {
-                            Ok(bytes) => { write_group_input(&writer, target.generation, bytes, reply, kind); }
+                            Ok(bytes) => { write_scoped_input(&writer, target.generation, bytes, reply, kind); }
                             Err(error) => { let _ = reply.send(Err(error)); }
+                        }
+                        Ok(())
+                    }
+                    Some(Command::InterruptCommand { start_token, reply }) => {
+                        if !reply.is_closed() {
+                            let dispatch = if prompts.current().is_some() {
+                                Err("The host requires authentication.".into())
+                            } else {
+                                prepare_command_interrupt(&terminal, &events, connection_generation, start_token)
+                            };
+                            match dispatch {
+                                Ok((bytes, permit)) => {
+                                    write_scoped_input(
+                                        &writer, connection_generation, bytes, reply,
+                                        terminal::ScopedInput::CommandInterrupt(permit),
+                                    );
+                                }
+                                Err(reason) => { let _ = reply.send(Err(reason)); }
+                            }
                         }
                         Ok(())
                     }
@@ -1427,6 +1451,9 @@ async fn run(
                     }
                     Some(Command::SetReadOnly(enabled)) => {
                         read_only = enabled;
+                        if enabled {
+                            events.cancel_command_interrupt();
+                        }
                         if enabled && matches!(last_mouse.button, wezterm_term::MouseButton::Left | wezterm_term::MouseButton::Middle | wezterm_term::MouseButton::Right)
                             && last_mouse.kind != wezterm_term::MouseEventKind::Release {
                             let release = MouseEvent { kind: wezterm_term::MouseEventKind::Release, ..last_mouse };
@@ -2003,6 +2030,20 @@ fn wait_for_capture(
     }
 }
 
+fn prepare_command_interrupt(
+    terminal: &wezterm_term::Terminal,
+    events: &crate::events::Events,
+    generation: u64,
+    start_token: u64,
+) -> Result<(Vec<u8>, crate::events::CommandInterruptPermit), String> {
+    let running = find_running_command(terminal, events, generation, start_token)?;
+    let bytes = terminal::interrupt_bytes(terminal).map_err(|error| error.to_string())?;
+    let permit = events
+        .arm_command_interrupt(RunningCommandTarget::new(generation, &running))
+        .ok_or(terminal::COMMAND_INTERRUPT_EXPIRED)?;
+    Ok((bytes, permit))
+}
+
 fn read_running_output(
     terminal: &wezterm_term::TerminalState,
     events: &crate::events::Events,
@@ -2074,7 +2115,7 @@ fn send_notification_reply(
     }
 }
 
-fn write_group_input(
+fn write_scoped_input(
     writer: &mpsc::UnboundedSender<TransportInput>,
     connection: u64,
     bytes: Vec<u8>,

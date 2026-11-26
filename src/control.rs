@@ -338,6 +338,10 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    InterruptCommand {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
+    },
     FindText {
         pattern: String,
         pane: Option<u64>,
@@ -1349,6 +1353,22 @@ impl Registry {
             } => {
                 self.wait_command_capture(pane, start_token.get(), timeout_seconds, output_file)
                     .await
+            }
+            Request::InterruptCommand { pane, start_token } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::InterruptCommand {
+                        start_token: start_token.get(),
+                        reply,
+                    })
+                    .context("pane is closed")?;
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("Ctrl+C write was not confirmed before the timeout")?
+                    .context("pane closed before confirming the Ctrl+C write")?
+                    .map_err(anyhow::Error::msg)?;
+                Ok(json!({"pane":pane,"start_token":start_token,"sent":true}))
             }
             Request::Playback { pane, action } => {
                 let (reply, response) = oneshot::channel();

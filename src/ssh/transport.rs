@@ -1766,6 +1766,10 @@ async fn run_channel(
                         if !events.group_command_running(link) => {
                         let _ = reply.send(Err(crate::terminal::GROUP_COMMAND_ENDED.into()));
                     }
+                    Some(TransportInput::Scoped { kind: ScopedInput::CommandInterrupt(permit), reply, .. })
+                        if reply.is_closed() || !permit.claim() => {
+                        let _ = reply.send(Err(crate::terminal::COMMAND_INTERRUPT_EXPIRED.into()));
+                    }
                     Some(TransportInput::Scoped { kind: ScopedInput::GroupCommand(receipt), bytes, reply, .. }) => {
                         // A failed write can follow a partial send. Dropping the
                         // reply leaves group delivery unconfirmed.
@@ -1876,6 +1880,9 @@ async fn run_herdr_channel(
                 }
                 Some(TransportInput::Scoped {kind:ScopedInput::GroupInterrupt(_),reply,..}) => {
                     let _=reply.send(Err("Group interrupts require a direct SSH shell.".into()));
+                }
+                Some(TransportInput::Scoped {kind:ScopedInput::CommandInterrupt(_),reply,..}) => {
+                    let _=reply.send(Err("A command interrupt requires a live shell.".into()));
                 }
                 Some(TransportInput::Raw(data,reply) | TransportInput::Scoped {bytes:data,reply,..})=>{
                     let result=viewer.input(&data).await;

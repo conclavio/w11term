@@ -208,6 +208,21 @@ The pipe request uses `verb: "wait-running-output"` with `pane`,
 and `timeout_seconds`. It uses the same wait capacity as `wait-for-text` and
 leaves focus, scroll position, and shell input in place.
 
+`interrupt-command --pane ID --start-token TOKEN` sends Ctrl+C to that
+observed running command on native SSH or local ConPTY. Take the token from
+`inspect` or `command-started`. It works on a background pane and uses the
+pane's negotiated keyboard encoding. The worker checks that the pane accepts
+input, then the transport rechecks the queued interrupt against the client's
+latest observed capture before writing. A newer interrupt request for the same
+pane supersedes an older request still waiting to write.
+
+The result contains `pane`, `start_token`, and `sent: true`. This confirms
+the transport write. Use `wait-command --start-token` to check whether the
+shell reports completion and which exit status it returns. Read-only panes,
+authentication prompts, stale tokens, and disconnections produce errors.
+The equivalent pipe request is
+`{"verb":"interrupt-command","pane":2,"start_token":27}`.
+
 ## Completed shell commands
 
 `list-commands --pane ID` reads the pane’s OSC 133 or OSC 633 command history. It

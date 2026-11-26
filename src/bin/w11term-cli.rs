@@ -70,6 +70,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "get-command"
             | "get-running-output"
             | "wait-running-output"
+            | "interrupt-command"
             | "wait-command"
             | "inspect"
             | "playback"
@@ -957,6 +958,29 @@ mod tests {
             "wait-running-output --pane 8 --start-token 27 --timeout 3601 ready",
             "wait-running-output --pane 8 --start-token 27 --timeout 1 --timeout 2 ready",
             "get-running-output --pane 8 --start-token 27 --regex ready",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn interrupt_command_requires_a_positive_pane_and_start_token() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (pid, request) =
+            parse_line("--pid 42 interrupt-command --pane 8 --start-token 27").unwrap();
+        assert_eq!(pid, Some(42));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"interrupt-command","pane":8,"start_token":27})
+        );
+        for line in [
+            "interrupt-command --pane 8",
+            "interrupt-command --start-token 27",
+            "interrupt-command --pane 0 --start-token 27",
+            "interrupt-command --pane 8 --start-token 0",
+            "interrupt-command --pane 8 --start-token 27 --start-token 28",
+            "interrupt-command --pane 8 --pane 9 --start-token 27",
+            "interrupt-command --pane 8 --start-token 27 --connection-generation 1",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
         }
