@@ -12,6 +12,15 @@ $profiles = Join-Path $State 'profiles.json'
 function Sample-Cell {
     [CursorCellProbe]::Sample($window, $bounds.X, $bounds.Y, $bounds.Width, $bounds.Height)
 }
+function Test-CursorInk {
+    $pixels = [CursorCellProbe]::ReadPixels($window, $window, $bounds.X, $bounds.Y,
+        $bounds.Width, $bounds.Height)
+    foreach ($pixel in $pixels) {
+        if ((($pixel -shr 16) -band 255) -gt 180 -and (($pixel -shr 8) -band 255) -lt 80 -and
+            ($pixel -band 255) -gt 180) { return $true }
+    }
+    return $false
+}
 function Read-Generation {
     (Control @('get-text','--pane',"$pane")).generation
 }
@@ -31,6 +40,39 @@ function Send-Sequence([string]$Suffix) {
     $bytes = [Text.Encoding]::ASCII.GetBytes(([string][char]27) + $Suffix)
     $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64',[Convert]::ToBase64String($bytes))
     Wait-Until "SSH peer to echo $Suffix" { $g = Read-Generation; if ($g -gt $before) { $g } }
+}
+
+function Set-CursorPreference([string]$Name, [string]$Choice, [string]$Property, [string]$Value) {
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $listItem = [System.Windows.Automation.ControlType]::ListItem
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selection = [System.Windows.Automation.SelectionPattern]::Pattern
+    $selectItem = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $field = Wait-Until "'$Name' dropdown" { Find-Element $Name $combo }
+    $field.SetFocus()
+    $null = Wait-Until "'$Name' selects '$Choice'" {
+        try {
+            $field = Find-Element $Name $combo -Visible
+            if (!$field -or !$field.Current.IsEnabled) { return }
+            $selected = $field.GetCurrentPattern($selection).Current.GetSelection()
+            if ($selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Choice) { return $true }
+
+            $popup = $field.GetCurrentPattern($expand)
+            if ($popup.Current.ExpandCollapseState -eq 'Collapsed') { $popup.Expand() }
+            $item = Find-Element $Choice $listItem -Visible
+            if ($item -and $item.Current.IsEnabled) { $item.GetCurrentPattern($selectItem).Select() }
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            # WinUI recreates the popup elements while applying a selection.
+        }
+    }
+    $null = Wait-Until "'$Name' persists '$Value'" { (Read-Appearance).$Property -ceq $Value }
+    $popup = (Find-Element $Name $combo).GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    $tab = Wait-Until 'SSH terminal tab' {
+        Find-Element 'palette-ssh' ([System.Windows.Automation.ControlType]::TabItem)
+    }
+    $tab.GetCurrentPattern($selectItem).Select()
+    Wait-Focus $pane
 }
 
 function Assert-Blinking {
@@ -64,16 +106,18 @@ try {
     Show-CursorWindow
     # Position the cursor after the restore, before measuring the live cell.
     $esc = [char]27
-    $null = Send-Sequence "[2J$esc[4;4HBlinkProbe$esc[4;4H$esc[6 q$esc[?25l"
+    $bell = [char]7
+    $null = Send-Sequence "[2J$esc]12;#ff00ff$bell$esc[4;4HBlinkProbe$esc[4;4H$esc[6 q$esc[?25h"
     $bounds = Get-CursorCell 'palette-ssh' 'BlinkProbe'
-    $hidden = Sample-Cell
-    $null = Send-Sequence '[?25h'
+    # Identify the actual cursor frame by its color. The marker can appear in UI
+    # Automation before the canvas has displayed it or the bar has been drawn.
     $shown = Wait-Until 'steady bar visible in the native canvas' {
-        $sample = Sample-Cell
-        if ($sample -ne $hidden) { $sample }
+        if (Test-CursorInk) { Sample-Cell }
     }
     $null = Send-Sequence '[?25l'
-    $null = Wait-Until 'the same native cell with its bar hidden again' { (Sample-Cell) -eq $hidden }
+    $hidden = Wait-Until 'the native cell with its bar hidden' {
+        if (!(Test-CursorInk)) { Sample-Cell }
+    }
     $null = Send-Sequence '[?25h'
     $null = Wait-Until 'the original bar pixels restored' { (Sample-Cell) -eq $shown }
 
@@ -102,21 +146,7 @@ try {
         if ($sample -ne $hidden -and $sample -ne $shown) { $sample }
     }
     Run-Palette 'Settings'
-    $combo = [System.Windows.Automation.ControlType]::ComboBox
-    $field = Wait-Until 'default cursor style choice' { Find-Element 'Default cursor style' $combo }
-    $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $bar = Wait-Until 'steady bar option' {
-        Find-Element 'Steady bar' ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $bar.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    $null = Wait-Until 'cursor style persisted' {
-        (Read-Appearance).default_cursor_style -ceq 'steady_bar'
-    }
-    $field = Find-Element 'Default cursor style' $combo
-    $popup = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
-    Press-Key 0x77 # F8 selects the SSH tab.
-    Wait-Focus $pane
+    Set-CursorPreference 'Default cursor style' 'Steady bar' 'default_cursor_style' 'steady_bar'
     $null = Wait-Until 'application cursor still overrides the preference' { (Sample-Cell) -eq $block }
     $null = Send-Sequence '[0 q'
     Assert-Steady
@@ -130,20 +160,7 @@ try {
     $null = Send-Sequence (']1337;HighlightCursorLine=yes' + [char]7)
     if ((Sample-Guide) -ne $noGuide) { throw 'Cursor guide is visible with the setting off' }
     Run-Palette 'Settings'
-    $field = Wait-Until 'cursor guide choice' { Find-Element 'Cursor guide' $combo }
-    $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $follow = Wait-Until 'application-controlled cursor guide' {
-        Find-Element 'Follow applications' ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $follow.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    $null = Wait-Until 'cursor guide mode persisted' {
-        (Read-Appearance).cursor_guide -ceq 'follow_applications'
-    }
-    $field = Find-Element 'Cursor guide' $combo
-    $popup = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
-    Press-Key 0x77
-    Wait-Focus $pane
+    Set-CursorPreference 'Cursor guide' 'Follow applications' 'cursor_guide' 'follow_applications'
     $null = Wait-Until 'application guide visible on the original row' { (Sample-Guide) -ne $noGuide }
     $null = Send-Sequence '[?25l'
     $null = Wait-Until 'guide hidden with the caret' { (Sample-Guide) -eq $noGuide }
