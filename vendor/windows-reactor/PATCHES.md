@@ -16,3 +16,7 @@ log tail. [WinUI StartBringIntoView](https://learn.microsoft.com/windows/windows
 Compact toolbar buttons and toggle buttons can set native
 [Control.Padding](https://learn.microsoft.com/windows/windows-app-sdk/api/winrt/microsoft.ui.xaml.controls.control.padding)
 to reserve the content area for their icons.
+
+An explicit tab strip width or selection change queues a scroll to the
+selected header after layout. This keeps the selected header visible when
+the native title bar narrows.

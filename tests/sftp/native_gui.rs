@@ -989,6 +989,20 @@ async fn native_title_tools_follow_the_active_ssh_and_powershell_panes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "selects tabs at opposite ends of an overflowing native title strip"]
+async fn native_tab_search_reveals_the_selected_header_in_an_overflowing_strip() {
+    let (Source::Ssh(ssh), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("tab-overflow-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(trace).unwrap(), b"still-focused");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
 async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
     run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
