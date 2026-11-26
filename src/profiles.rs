@@ -1,7 +1,11 @@
 //! Profile persistence preserves unrelated JSON fields and replaces the file atomically.
 use crate::options::{Profiles, SshOptions, SshRecipientSets, SshRosterDefaults, load_profiles};
 use anyhow::{Context, Result, ensure};
-use std::{collections::BTreeMap, io::Write, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    path::PathBuf,
+};
 
 mod bookmarks;
 pub use bookmarks::{BookmarkPeer, bookmark_directory};
@@ -37,6 +41,7 @@ pub enum ImportedGroupMember<'a> {
 
 const SHARE_TOKEN: &str = "folder_share_id";
 const SHARE_EPOCH: &str = "folder_share_epoch";
+const PINNED_PROFILES: &str = "pinned_profiles";
 const STARTUP_PROFILE: &str = "startup_profile";
 const SSH_HOST_GROUPS: &str = "ssh_host_groups";
 const SSH_RECIPIENT_SETS: &str = "ssh_recipient_sets";
@@ -74,6 +79,7 @@ impl SavedSshGroup {
 #[derive(Default)]
 struct CatalogEdit {
     order: Option<Vec<String>>,
+    pinned_profiles: Option<BTreeSet<String>>,
     startup: Option<Option<String>>, // None leaves the setting untouched.
     ssh_host_groups: Option<BTreeMap<String, Vec<String>>>,
     ssh_recipient_sets: Option<BTreeMap<String, SshRecipientSets>>,
@@ -137,8 +143,17 @@ fn order_after_edit(
 }
 
 fn profile_identity_edit(catalog: &Profiles, old: Option<&str>, new: Option<&str>) -> CatalogEdit {
+    let pinned_profiles = old
+        .filter(|name| Some(*name) != new && catalog.pinned_profiles.contains(*name))
+        .map(|old| {
+            let mut pins = catalog.pinned_profiles.clone();
+            pins.remove(old);
+            pins.extend(new.map(str::to_owned));
+            pins
+        });
     CatalogEdit {
         order: order_after_edit(catalog, old, new),
+        pinned_profiles,
         startup: (old.is_some() && old != new && catalog.startup_profile.as_deref() == old)
             .then(|| new.map(str::to_owned)),
         ..Default::default()
@@ -547,6 +562,25 @@ impl ProfileStore {
             }
             Ok(CatalogEdit {
                 ssh_recipient_sets: Some(groups),
+                ..Default::default()
+            })
+        })
+    }
+
+    pub fn set_profile_pin(&self, name: &str, pinned: bool) -> Result<Profiles> {
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.profiles.contains_key(name) || catalog.local.contains_key(name),
+                "Profile {name} is no longer available"
+            );
+            let mut pins = catalog.pinned_profiles.clone();
+            if pinned {
+                pins.insert(name.into());
+            } else {
+                pins.remove(name);
+            }
+            Ok(CatalogEdit {
+                pinned_profiles: Some(pins),
                 ..Default::default()
             })
         })
@@ -1017,6 +1051,13 @@ impl ProfileStore {
         let edit = change(profiles, &catalog)?;
         if let Some(order) = edit.order {
             fields.insert("profile_order".into(), serde_json::to_value(order)?);
+        }
+        if let Some(pins) = edit.pinned_profiles {
+            if pins.is_empty() {
+                fields.remove(PINNED_PROFILES);
+            } else {
+                fields.insert(PINNED_PROFILES.into(), serde_json::to_value(pins)?);
+            }
         }
         match edit.startup {
             Some(Some(name)) => {
@@ -1657,6 +1698,41 @@ mod order_tests {
 
     fn disk(store: &ProfileStore) -> Value {
         serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn profile_pins_follow_renames_and_clear_when_removed() {
+        let (_dir, store) = fixture();
+        let original = store.catalog().unwrap();
+        assert!(original.pinned_profiles.is_empty());
+        store.set_profile_pin("Lima", true).unwrap();
+        store.set_profile_pin("Alpha", true).unwrap();
+        let pinned = disk(&store);
+        assert_eq!(pinned[PINNED_PROFILES], json!(["Alpha", "Lima"]));
+        assert_eq!(pinned["theme"]["tone"], "dark");
+        assert!(store.set_profile_pin("missing", true).is_err());
+        store.set_profile_pin("Alpha", true).unwrap();
+        assert_eq!(disk(&store), pinned);
+
+        let ssh = store.inspect("Alpha").unwrap().1;
+        store.duplicate(&ssh, "Alpha copy", &ssh.options).unwrap();
+        store
+            .edit("Alpha", "Renamed SSH", &ssh.options, &ssh.options)
+            .unwrap();
+        let local = store.inspect_local("Lima").unwrap();
+        store
+            .save_local(Some(&local), "Renamed local", &local.options)
+            .unwrap();
+        assert_eq!(
+            disk(&store)[PINNED_PROFILES],
+            json!(["Renamed SSH", "Renamed local"])
+        );
+        store
+            .delete(&store.inspect("Renamed SSH").unwrap().1)
+            .unwrap();
+        let catalog = store.set_profile_pin("Renamed local", false).unwrap();
+        assert!(catalog.pinned_profiles.is_empty());
+        assert!(disk(&store).get(PINNED_PROFILES).is_none());
     }
 
     #[test]

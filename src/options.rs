@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -539,6 +539,7 @@ pub struct Profiles {
     pub local: BTreeMap<String, LocalOptions>,
     /// Each available name once, including discovered local shells.
     pub profile_order: Vec<String>,
+    pub pinned_profiles: BTreeSet<String>,
     pub startup_profile: Option<String>,
     pub ssh_host_groups: BTreeMap<String, Vec<String>>,
     pub ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
@@ -553,6 +554,7 @@ impl Default for Profiles {
             profile_order: local.keys().cloned().collect(),
             profiles: BTreeMap::new(),
             local,
+            pinned_profiles: BTreeSet::new(),
             startup_profile: None,
             ssh_host_groups: BTreeMap::new(),
             ssh_recipient_sets: BTreeMap::new(),
@@ -647,6 +649,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         #[serde(default)]
         profile_order: Option<serde_json::Value>,
         #[serde(default)]
+        pinned_profiles: BTreeSet<String>,
+        #[serde(default)]
         startup_profile: Option<String>,
         #[serde(default)]
         ssh_host_groups: BTreeMap<String, Vec<String>>,
@@ -664,6 +668,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         .context("profile_order must be an array of profile names")?;
     let mut profiles = Profiles {
         has_explicit_order: explicit_order.is_some(),
+        pinned_profiles: document.pinned_profiles,
         startup_profile: document.startup_profile,
         ssh_host_groups: document.ssh_host_groups,
         ssh_recipient_sets: document.ssh_recipient_sets,

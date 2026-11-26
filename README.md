@@ -57,6 +57,8 @@ In **Settings → Profiles**, use **Filter profiles** to find a profile by name 
 
 In the same section, set **Startup profile** to a saved SSH or local shell profile. The choice is saved in the current profile catalog and applies on the next launch without a target. Explicit profile, workspace and replay launches use their requested target. Choose **Terminal lab** to restore the default.
 
+Use the pin button beside an SSH or local profile to keep that profile in the **+** menu. Pinned profiles follow the catalog order. Open **Other profiles** or use **Find Profile…** for the rest. The pins are saved in the current profile catalog and follow profile renames.
+
 In an SSH or local profile editor, **Scrollback lines** sets how many rows the terminal can keep above the primary screen. The default is 10,000. Set it to zero to keep only the current screen, or enter up to 32,767 for longer build logs. A wrapped line can occupy several rows. Find and **Save scrollback as text…** use the retained rows. Open a new pane from the edited profile to use its limit. Reconnecting or restarting a shell in an existing pane keeps that pane’s limit. The JSON setting is `"scrollback_lines": 2000`.
 
 When creating or editing an SSH profile, **SSH terminal type (TERM)** selects the terminfo name sent with each new PTY. Existing profiles use `xterm-256color`. Choose `xterm-sixel` for a host running Venti with Sixel graphics, or choose **Custom…** to enter a terminfo name supported by the host. This setting is stored as `"terminal_type": "xterm-sixel"` for the Sixel preset. Direct shells and PTY-based zmx and tmux attachments request `COLORTERM=truecolor`. A process already running inside a durable session keeps its existing environment.

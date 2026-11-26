@@ -1177,6 +1177,7 @@ pub enum Message {
     QuickConnect(quick_connect::Action),
     SshIdentity(identity_picker::Action),
     MoveProfile(String, isize, Arc<[String]>),
+    SetProfilePin(String, bool),
     FilterProfiles(String),
     StartupProfile(String),
     WindowActivation(bool),
@@ -2344,6 +2345,20 @@ impl TerminalApp {
                         title_tools::below(format!("Move {direction} in profile order")),
                     ))
             };
+            let pinned = self.catalog.pinned_profiles.contains(name);
+            let (pin_action, pin_glyph) = if pinned {
+                (format!("Unpin {name} from New Tab"), "\u{e77a}")
+            } else {
+                (format!("Pin {name} to New Tab"), "\u{e718}")
+            };
+            let pin_name = name.clone();
+            let pin = title_tools::button(&pin_action)
+                .is_enabled(self.profile_error.is_none())
+                .on_click(
+                    context.callback(move |_| Message::SetProfilePin(pin_name.clone(), !pinned)),
+                )
+                .content(FontIcon::new().glyph(pin_glyph))
+                .tooltip_with(title_tools::below(pin_action));
             let label = format!("{name} · {details}");
             rows.push(KeyedView::new(
                 name.clone(),
@@ -2362,6 +2377,7 @@ impl TerminalApp {
                             .spacing(2.0)
                             .children((
                                 edit.content("Edit…"),
+                                pin,
                                 movement("up", "↑", -1, index > 0),
                                 movement("down", "↓", 1, index + 1 < order.len()),
                             )),
@@ -3812,13 +3828,30 @@ impl TerminalApp {
             MenuItem::item("find-profile", command_palette::FIND_PROFILE_LABEL),
             MenuItem::separator("profile-search-end"),
         ];
-        menu.extend(self.catalog.profile_order.iter().map(|name| {
+        let profile_item = |name: &String| {
             if let Some(ssh) = self.catalog.profiles.get(name) {
                 MenuItem::item(format!("profile:{name}"), profile_label(name, ssh))
             } else {
                 MenuItem::item(format!("local:{name}"), format!("{name} · Local"))
             }
-        }));
+        };
+        let (pinned, others): (Vec<_>, Vec<_>) = self
+            .catalog
+            .profile_order
+            .iter()
+            .partition(|name| self.catalog.pinned_profiles.contains(*name));
+        if pinned.is_empty() {
+            menu.extend(others.into_iter().map(profile_item));
+        } else {
+            menu.extend(pinned.into_iter().map(profile_item));
+            if !others.is_empty() {
+                menu.push(MenuItem::submenu(
+                    "other-profiles",
+                    "Other profiles",
+                    others.into_iter().map(profile_item),
+                ));
+            }
+        }
         if self.profile_error.is_some() {
             menu.push(MenuItem::disabled("error", "Could not load profiles"));
         }
@@ -6647,6 +6680,21 @@ impl Component for TerminalApp {
                         self.refresh_profiles();
                         self.profile_action_error = Some(format!(
                             "Could not move {name}: {error:#}. Review the current order and try again."
+                        ));
+                    }
+                }
+            }
+            Message::SetProfilePin(name, pinned) => {
+                match self.store.set_profile_pin(&name, pinned) {
+                    Ok(catalog) => {
+                        self.catalog = catalog;
+                        self.profile_error = None;
+                        self.profile_action_error = None;
+                    }
+                    Err(error) => {
+                        self.refresh_profiles();
+                        self.profile_action_error = Some(format!(
+                            "Could not update the New Tab pin for {name}: {error:#}"
                         ));
                     }
                 }
