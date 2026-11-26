@@ -145,8 +145,7 @@ try {
     $null = Wait-Until 'default history search excludes output' {
         Find-Element 'No matching commands in this window'
     }
-    $box = Find-Element 'Include retained command output' ([System.Windows.Automation.ControlType]::CheckBox)
-    $box.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+    Press-Key 0x78 # F9 includes retained command output
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $buttons = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,

@@ -1,9 +1,9 @@
 use super::*;
 use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
-mod history_output;
 mod text_search;
-pub use history_output::Action as HistoryOutputAction;
+mod window_history;
 pub use text_search::Action as TextAction;
+pub use window_history::Action as WindowHistoryAction;
 pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
 
 struct Preview {
@@ -250,7 +250,7 @@ pub(super) struct Picker {
     commands: Vec<command_palette::Row>,
     bookmarks: Option<Result<Vec<BookmarkEntry>, &'static str>>,
     text: text_search::Results,
-    history_output: history_output::Search,
+    window_history: window_history::Search,
     selected: usize,
     preview: Option<Preview>,
 }
@@ -837,7 +837,13 @@ impl TerminalApp {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
             Mode::Commands(command_palette::Search::CommandHistory) => {
-                self.window_command_history_rows(query)
+                let options = self
+                    .picker
+                    .as_ref()
+                    .filter(|p| p.mode == mode)
+                    .map(|p| p.window_history.options)
+                    .unwrap_or_default();
+                self.window_command_history_rows(query, options)
             }
             Mode::Commands(command_palette::Search::Profiles(destination)) => {
                 if self.profile_error.is_some() {
@@ -906,7 +912,7 @@ impl TerminalApp {
                 self.close_picker(ctx);
                 self.run_palette_command(id, ctx);
             } else {
-                self.search_history_output(ctx);
+                self.search_window_history(ctx);
             }
             return;
         }
@@ -1066,15 +1072,15 @@ impl TerminalApp {
             commands,
             bookmarks: None,
             text: text_search::Results::default(),
-            history_output: history_output::Search::default(),
+            window_history: window_history::Search::default(),
             selected,
             preview: None,
         });
         self.sync_picker_preview(ctx);
-        self.keyboard.set_picker(Some(if mode.has_commands() {
-            PickerStage::Commands
-        } else {
-            PickerStage::Search
+        self.keyboard.set_picker(Some(match mode {
+            Mode::Commands(command_palette::Search::CommandHistory) => PickerStage::CommandHistory,
+            Mode::Commands(_) => PickerStage::Commands,
+            _ => PickerStage::Search,
         }));
         self.focus_picker_input(0, ctx);
     }
@@ -1106,10 +1112,10 @@ impl TerminalApp {
             return;
         }
         if picker.mode == Mode::Commands(command_palette::Search::CommandHistory)
-            && picker.history_output.included
+            && picker.window_history.options.include_output
         {
             self.picker.as_mut().unwrap().query = query;
-            self.search_history_output(ctx);
+            self.search_window_history(ctx);
             return;
         }
         if picker.mode.has_commands() {

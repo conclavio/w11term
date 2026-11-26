@@ -99,14 +99,14 @@ impl CopyPart {
     }
 }
 
-const STATUS_OPTIONS: [(CommandStatus, &str); 4] = [
+pub(super) const STATUS_OPTIONS: [(CommandStatus, &str); 4] = [
     (CommandStatus::All, "All commands"),
     (CommandStatus::Failed, "Failed"),
     (CommandStatus::Succeeded, "Succeeded"),
     (CommandStatus::Unknown, "Status unknown"),
 ];
 
-const ORDER_OPTIONS: [(HistoryOrder, &str); 2] = [
+pub(super) const ORDER_OPTIONS: [(HistoryOrder, &str); 2] = [
     (HistoryOrder::Newest, "Newest first"),
     (HistoryOrder::Slowest, "Slowest first"),
 ];
@@ -177,9 +177,17 @@ pub(super) struct WindowCapture {
     fields_match: bool,
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(super) struct WindowHistoryOptions {
+    pub(super) status: CommandStatus,
+    pub(super) order: HistoryOrder,
+    pub(super) include_output: bool,
+}
+
 pub(super) fn window_history_rows(
     captures: Vec<WindowCapture>,
     output_query: Option<&str>,
+    order: HistoryOrder,
     cancelled: impl Fn() -> bool,
 ) -> Vec<command_palette::Row> {
     let matcher = output_query.and_then(output_matcher);
@@ -210,8 +218,18 @@ pub(super) fn window_history_rows(
         if let Some((output, hit)) = &output_match {
             label = format!("{} · {label}", output_excerpt(output, hit));
         }
+        let (duration, elapsed) = match order {
+            HistoryOrder::Newest => (None, String::new()),
+            HistoryOrder::Slowest => (
+                command.timing.duration_ms,
+                command
+                    .timing
+                    .duration_ms
+                    .map_or_else(|| "Duration unavailable".into(), elapsed_label),
+            ),
+        };
         rows.push((
-            Reverse((command.finished_at, pane, command.id)),
+            Reverse((duration, command.finished_at, pane, command.id)),
             command_palette::Row {
                 id: command_palette::CommandId::OpenWindowCommand(
                     pane,
@@ -219,7 +237,7 @@ pub(super) fn window_history_rows(
                     output_match.map(|(_, hit)| hit),
                 ),
                 label,
-                chord: String::new(),
+                chord: elapsed,
                 enabled: true,
             },
         ));
@@ -423,14 +441,23 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn window_command_history_rows(&self, query: &str) -> Vec<command_palette::Row> {
-        window_history_rows(self.window_command_captures(query, false), None, || false)
+    pub(super) fn window_command_history_rows(
+        &self,
+        query: &str,
+        options: WindowHistoryOptions,
+    ) -> Vec<command_palette::Row> {
+        window_history_rows(
+            self.window_command_captures(query, options),
+            None,
+            options.order,
+            || false,
+        )
     }
 
     pub(super) fn window_command_captures(
         &self,
         query: &str,
-        include_output: bool,
+        options: WindowHistoryOptions,
     ) -> Vec<WindowCapture> {
         let needle = query.trim().to_lowercase();
         let mut captures = Vec::new();
@@ -456,12 +483,16 @@ impl TerminalApp {
                     .is_some_and(|name| name.to_lowercase().contains(&needle));
             let source: Arc<str> = source.into();
             let frame = live.session.frames.load();
-            for command in frame.command_history.iter() {
+            for command in frame
+                .command_history
+                .iter()
+                .filter(|entry| options.status.matches(entry.exit_code))
+            {
                 let fields_match = source_matches
                     || command_text_matches(command, &needle)
                     || command_directory(&live.source, command)
                         .is_some_and(|path| path.display().to_lowercase().contains(&needle));
-                if fields_match || (include_output && command.output.is_ok()) {
+                if fields_match || (options.include_output && command.output.is_ok()) {
                     captures.push(WindowCapture {
                         pane,
                         generation: frame.connection_generation,

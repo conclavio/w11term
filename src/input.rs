@@ -37,7 +37,15 @@ enum LocalMode {
 pub enum PickerStage {
     Search,
     Commands,
+    CommandHistory,
     Placement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryPickerOption {
+    Status,
+    Order,
+    Output,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -239,6 +247,7 @@ pub enum Shortcut {
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
+    PickerHistoryOption(HistoryPickerOption),
     PickerPlace(Direction),
     KeyboardHints,
     HintKey(u32),
@@ -1635,16 +1644,34 @@ impl State {
                 let repeat = message.lParam.0 & (1 << 30) != 0;
                 let action = match (stage, vk) {
                     (_, 0x1b) => Shortcut::PickerCancel,
-                    (PickerStage::Commands, 0x09) => {
+                    (PickerStage::Commands | PickerStage::CommandHistory, 0x09) => {
                         Shortcut::PickerMove(if modifiers().contains(KeyModifiers::SHIFT) {
                             -1
                         } else {
                             1
                         })
                     }
-                    (PickerStage::Search | PickerStage::Commands, 0x0d) => Shortcut::PickerAccept,
-                    (PickerStage::Search | PickerStage::Commands, 0x26) => Shortcut::PickerMove(-1),
-                    (PickerStage::Search | PickerStage::Commands, 0x28) => Shortcut::PickerMove(1),
+                    (
+                        PickerStage::Search | PickerStage::Commands | PickerStage::CommandHistory,
+                        0x0d,
+                    ) => Shortcut::PickerAccept,
+                    (
+                        PickerStage::Search | PickerStage::Commands | PickerStage::CommandHistory,
+                        0x26,
+                    ) => Shortcut::PickerMove(-1),
+                    (
+                        PickerStage::Search | PickerStage::Commands | PickerStage::CommandHistory,
+                        0x28,
+                    ) => Shortcut::PickerMove(1),
+                    (PickerStage::CommandHistory, 0x76) if modifiers().is_empty() => {
+                        Shortcut::PickerHistoryOption(HistoryPickerOption::Status)
+                    }
+                    (PickerStage::CommandHistory, 0x77) if modifiers().is_empty() => {
+                        Shortcut::PickerHistoryOption(HistoryPickerOption::Order)
+                    }
+                    (PickerStage::CommandHistory, 0x78) if modifiers().is_empty() => {
+                        Shortcut::PickerHistoryOption(HistoryPickerOption::Output)
+                    }
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),
                     (PickerStage::Placement, 0x27) => Shortcut::PickerPlace(Direction::Right),
@@ -1823,18 +1850,11 @@ impl State {
                             | Shortcut::FindAllPanes
                             | Shortcut::MovePaneToExistingTab
                     ) {
-                        self.picker = Some(
-                            if matches!(
-                                shortcut,
-                                Shortcut::CommandPalette
-                                    | Shortcut::FindTab
-                                    | Shortcut::FindCommandHistory
-                            ) {
-                                PickerStage::Commands
-                            } else {
-                                PickerStage::Search
-                            },
-                        );
+                        self.picker = Some(match shortcut {
+                            Shortcut::FindCommandHistory => PickerStage::CommandHistory,
+                            Shortcut::CommandPalette | Shortcut::FindTab => PickerStage::Commands,
+                            _ => PickerStage::Search,
+                        });
                         self.local_held.insert(slot, false);
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {

@@ -76,6 +76,39 @@ try {
         $detail = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $timingId)
         $detail -and $detail.Current.Name -ceq $expected
     }
+
+    Run-Palette ('Find command history' + [char]0x2026)
+    Wait-PickerEditor 'Search commands across panes' 'window command history'
+    $ssh = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'
+    $source = "palette-ssh${dot}$($ssh.user)@$($ssh.host):$($ssh.port)${dot}Pane $pane"
+    $quickRow = "${source}${dot}exit 0${dot}timing quick"
+    $slowRow = "${source}${dot}exit 2${dot}timing slow"
+    $unknownRow = "${source}${dot}exit 9${dot}Command $($unknown.id)"
+    $null = Wait-Until 'window history defaults to newest first' {
+        $first = Find-Element $quickRow $button -Visible
+        $second = Find-Element $slowRow $button -Visible
+        $first -and $second -and $first.Current.BoundingRectangle.Top -lt $second.Current.BoundingRectangle.Top
+    }
+    Press-Key 0x77 # F8 changes order without leaving the search box
+    $slowWithDuration = "$slowRow    $elapsed"
+    $quickMs = [uint64]$quick.duration_ms
+    $quickDuration = if ($quickMs -eq 0) { '<1 ms' } else { "$quickMs ms" }
+    $null = Wait-Until 'slowest first places known durations ahead of unknown durations' {
+        $first = Find-Element $slowWithDuration $button -Visible
+        $second = Find-Element "$quickRow    $quickDuration" $button -Visible
+        $last = Find-Element "$unknownRow    Duration unavailable" $button -Visible
+        $first -and $second -and $last -and
+            $first.Current.BoundingRectangle.Top -lt $second.Current.BoundingRectangle.Top -and
+            $second.Current.BoundingRectangle.Top -lt $last.Current.BoundingRectangle.Top
+    }
+    Press-Key 0x76 # F7 cycles to Failed
+    $null = Wait-Until 'failed history retains both failures and hides the success' {
+        (Find-Element $slowWithDuration $button -Visible) -and
+            (Find-Element "$unknownRow    Duration unavailable" $button -Visible) -and
+            !(Find-Element "$quickRow    $quickDuration" $button)
+    }
+    Press-Key 0x0d
+    $null = Wait-Until 'Enter opens the filtered and sorted capture' { Find-Element $slowLabel $button }
 } finally {
     [IO.File]::Delete($gate)
     Close-FixtureApp $app

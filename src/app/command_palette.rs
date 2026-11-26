@@ -1000,8 +1000,9 @@ pub(super) fn view(
     app: &TerminalApp,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
+    let narrow_history = app.width < 520.0;
     let search_height = if mode == Search::CommandHistory {
-        188.0
+        if narrow_history { 226.0 } else { 194.0 }
     } else {
         156.0
     };
@@ -1088,7 +1089,7 @@ pub(super) fn view(
                     .as_ref()
                     .and_then(|picker| {
                         picker
-                            .history_output_status()
+                            .window_history_status()
                             .or_else(|| picker.bookmark_status(app))
                     })
                     .unwrap_or_else(|| {
@@ -1136,15 +1137,17 @@ pub(super) fn view(
                 )),
         ));
     }
-    let include_output = app
+    let history_controls = app
         .picker
         .as_ref()
         .filter(|_| mode == Search::CommandHistory)
-        .map_or_else(View::empty, |picker| picker.history_output_option(ctx));
+        .map_or_else(View::empty, |picker| {
+            picker.window_history_controls(narrow_history, ctx)
+        });
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
-            include_output,
+            history_controls,
             StackPanel::new().spacing(4.0).keyed_children(results),
         )),
         (app.width - 32.0).clamp(1.0, 660.0),
