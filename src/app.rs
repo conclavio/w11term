@@ -1392,7 +1392,7 @@ pub enum Message {
     PickerFrame(u64, u64),
     BookmarksRead(Arc<()>, Option<Vec<w11term::terminal::BookmarkEntry>>),
     PickerChoose(u64),
-    PlacePane(TabId, TabId, Direction),
+    PlacePane(TabId, pane_picker::PlacementTarget, Direction),
     PickerFocus(u8),
     PickerFromMenu(Shortcut),
     SetTitleFiles(u64, bool),
@@ -4670,10 +4670,12 @@ impl TerminalApp {
         let [new_window, existing_window] = self.tab_window_items();
         let binding = action.binding();
         let move_item = if self.move_source().is_some_and(|source| {
-            self.tabs
-                .headers()
-                .iter()
-                .any(|tab| tab.id != source && tab.value.pane_id().is_some())
+            self.has_sibling_panes()
+                || self
+                    .tabs
+                    .headers()
+                    .iter()
+                    .any(|tab| tab.id != source && tab.value.pane_id().is_some())
         }) {
             self.binding_menu(binding.id, binding.label, action)
         } else {
