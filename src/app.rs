@@ -1105,6 +1105,9 @@ fn tab_menu_message(label: String) -> Message {
         title_tools::FIND_SCROLLBACK => Message::Shortcut(Shortcut::Find),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         command_palette::FIND_TAB_LABEL => Message::Shortcut(Shortcut::FindTab),
+        command_palette::FIND_COMMAND_HISTORY_LABEL => {
+            Message::Shortcut(Shortcut::FindCommandHistory)
+        }
         pane_picker::FIND_TEXT_LABEL => Message::Shortcut(Shortcut::FindAllPanes),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Select all terminal text" => Message::Shortcut(Shortcut::SelectAll),
@@ -4035,6 +4038,7 @@ impl TerminalApp {
                 Message::Shortcut(
                     shortcut @ (Shortcut::PanePicker
                     | Shortcut::FindTab
+                    | Shortcut::FindCommandHistory
                     | Shortcut::FindAllPanes
                     | Shortcut::CommandPalette
                     | Shortcut::MovePaneToExistingTab),
@@ -4406,6 +4410,11 @@ impl TerminalApp {
                 "find-all-panes",
                 pane_picker::FIND_TEXT_LABEL,
                 KeyAction::FindAllPanes,
+            ),
+            self.binding_menu(
+                "find-command-history",
+                command_palette::FIND_COMMAND_HISTORY_LABEL,
+                KeyAction::FindCommandHistory,
             ),
             MenuItem::item("new-ssh-group-tab", host_groups::NEW_TAB_LABEL),
             recordings.menu(),
@@ -6914,6 +6923,7 @@ impl Component for TerminalApp {
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
                 Shortcut::FindTab => self.open_tab_search(context),
+                Shortcut::FindCommandHistory => self.open_window_command_history(context),
                 Shortcut::FindAllPanes => self.open_text_picker(context),
                 Shortcut::MovePaneToExistingTab => self.open_move_picker(context),
                 Shortcut::PickerPlace(side) => {

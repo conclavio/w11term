@@ -327,6 +327,7 @@ impl ScreenOrAlt {
 #[derive(Debug)]
 pub struct CompletedCommand {
     pub id: u64,
+    pub finished_at: std::time::Instant,
     pub command: Option<String>,
     pub exit_code: Option<i32>,
     pub output: Result<String, &'static str>,
@@ -1107,6 +1108,7 @@ impl TerminalState {
                 .take_command_text(self.cursor.y, col, 1024 * 1024);
             let command = Arc::new(CompletedCommand {
                 id: self.next_command_id,
+                finished_at: std::time::Instant::now(),
                 command: self.command_label.take(),
                 exit_code,
                 output,

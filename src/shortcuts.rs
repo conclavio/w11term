@@ -38,6 +38,7 @@ pub enum Action {
     CommandPalette,
     PanePicker,
     FindTab,
+    FindCommandHistory,
     Find,
     FindNext,
     FindPrevious,
@@ -184,6 +185,13 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
     Binding::new(FindTab, "find_tab", "Find tab", 0, Mods::NONE),
+    Binding::new(
+        FindCommandHistory,
+        "find_command_history",
+        "Find command history",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(Find, "find", "Find in scrollback", 0x46, CTRL_SHIFT),
     Binding::new(FindNext, "find_next", "Find next", 0x72, Mods::NONE),
     Binding::new(

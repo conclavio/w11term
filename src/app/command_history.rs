@@ -1,7 +1,8 @@
 use super::*;
 use regex::{Regex, RegexBuilder};
-use std::{collections::HashMap, ops::Range, sync::Weak};
+use std::{cmp::Reverse, collections::HashMap, ops::Range, sync::Weak};
 use w11term::control::CommandStatus;
+use w11term::events::CommandLink;
 use w11term::saved_commands::{Entry, valid_command_text};
 use w11term::session::history_text_allowed;
 use w11term::terminal::Snapshot;
@@ -135,6 +136,24 @@ fn command_text_matches(entry: &CompletedCommand, needle: &str) -> bool {
             .is_some_and(|text| text.to_lowercase().contains(needle))
 }
 
+fn command_name(entry: &CompletedCommand) -> String {
+    entry.command.as_ref().map_or_else(
+        || format!("Command {}", entry.id),
+        |text| {
+            text.chars()
+                .take(120)
+                .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+                .collect()
+        },
+    )
+}
+
+fn command_status(entry: &CompletedCommand) -> String {
+    entry
+        .exit_code
+        .map_or_else(|| "status unknown".into(), |code| format!("exit {code}"))
+}
+
 fn output_preview(text: &str, hit: Option<Range<usize>>) -> String {
     const PREVIEW_BYTES: usize = 8192;
     const CONTEXT_BYTES: usize = 384;
@@ -228,6 +247,58 @@ impl TerminalApp {
             Page::Terminal(live) => Some(live.session.frames.load()),
             _ => None,
         }
+    }
+
+    pub(super) fn window_command_history_rows(&self, query: &str) -> Vec<command_palette::Row> {
+        let needle = query.trim().to_lowercase();
+        let mut rows = Vec::new();
+        for tab in self.tabs.entries().iter().map(|entry| &entry.value) {
+            let Page::Terminal(live) = &tab.page else {
+                continue;
+            };
+            let pane = live.session.pane_id;
+            let label = tab
+                .pane_name()
+                .map_or(tab.label.as_str(), |name| name.as_str());
+            let source = match &live.source {
+                Source::Ssh(ssh) => format!(
+                    "{label} · {}@{}:{} · Pane {pane}",
+                    ssh.user, ssh.host, ssh.port
+                ),
+                Source::Local(_) => format!("{label} · Pane {pane}"),
+                _ => continue,
+            };
+            let source_matches = source.to_lowercase().contains(&needle)
+                || tab
+                    .profile_name()
+                    .is_some_and(|name| name.to_lowercase().contains(&needle));
+            let frame = live.session.frames.load();
+            for command in frame
+                .command_history
+                .iter()
+                .filter(|command| source_matches || command_text_matches(command, &needle))
+            {
+                let link = CommandLink {
+                    generation: frame.connection_generation,
+                    id: command.id,
+                };
+                rows.push((
+                    Reverse((command.finished_at, pane, command.id)),
+                    command_palette::Row {
+                        id: command_palette::CommandId::OpenWindowCommand(pane, link),
+                        label: format!(
+                            "{source} · {} · {}",
+                            command_status(command),
+                            command_name(command)
+                        ),
+                        chord: String::new(),
+                        enabled: true,
+                    },
+                ));
+            }
+        }
+        rows.sort_unstable_by_key(|(order, _)| *order);
+        rows.into_iter().map(|(_, row)| row).collect()
     }
 
     fn history_insert_target(
@@ -595,18 +666,8 @@ impl TerminalApp {
         let has_matches = matches.peek().is_some();
         let rows = matches.map(|entry| {
             let id = entry.id;
-            let name = entry.command.as_ref().map_or_else(
-                || format!("Command {id}"),
-                |s| {
-                    s.chars()
-                        .take(120)
-                        .map(|c| if c.is_whitespace() { ' ' } else { c })
-                        .collect()
-                },
-            );
-            let status = entry
-                .exit_code
-                .map_or_else(|| "status unknown".into(), |code| format!("exit {code}"));
+            let name = command_name(entry);
+            let status = command_status(entry);
             let label = format!("{name} · {status}");
             let active = page.selected == Some((generation, id));
             KeyedView::new(
@@ -829,6 +890,7 @@ mod tests {
         let entry = |id, output, exit_code| {
             Arc::new(CompletedCommand {
                 id,
+                finished_at: std::time::Instant::now(),
                 command: Some(format!("run {id}")),
                 output,
                 exit_code,
@@ -868,6 +930,7 @@ mod tests {
         let command = format!("{} [Ångström]\r\n  --final", "x".repeat(130));
         let mut entry = CompletedCommand {
             id: 9,
+            finished_at: std::time::Instant::now(),
             command: Some(command.clone()),
             output: Ok("archived result\r\n".into()),
             exit_code: Some(17),

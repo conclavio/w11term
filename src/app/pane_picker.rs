@@ -632,6 +632,10 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
+    pub(super) fn open_window_command_history(&mut self, ctx: &ComponentContext<Self>) {
+        self.start_picker(Mode::Commands(command_palette::Search::CommandHistory), ctx);
+    }
+
     pub(super) fn open_profile_search(&mut self, axis: Option<Axis>, ctx: &ComponentContext<Self>) {
         if self.picker.is_some() {
             return;
@@ -829,6 +833,9 @@ impl TerminalApp {
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
+            Mode::Commands(command_palette::Search::CommandHistory) => {
+                self.window_command_history_rows(query)
+            }
             Mode::Commands(command_palette::Search::Profiles(destination)) => {
                 if self.profile_error.is_some() {
                     Vec::new()

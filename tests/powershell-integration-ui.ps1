@@ -5,6 +5,9 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$appearance = Get-Content -LiteralPath $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json
+$appearance.shortcuts | Add-Member NoteProperty 'find_command_history' 'F6'
+[IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($appearance | ConvertTo-Json -Depth 8))
 $profiles = Join-Path $State 'profiles.json'
 $labels = @('Palette PowerShell')
 if ($pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1) {
@@ -99,6 +102,40 @@ try {
         Wait-Focus $pane
         Write-Output "Verified $label"
     }
+    $picker = 'Search commands across panes'
+    Press-Key 0x75
+    Wait-PickerEditor $picker 'the remapped history shortcut'
+    Press-Key 0x1b
+    $null = Wait-Until 'Escape closes window history' { !(Find-Element $picker) }
+    Wait-Focus $pane
+
+    $find = 'Find command history' + [char]0x2026 + '    F6'
+    Run-Palette $find
+    Wait-PickerEditor $picker 'the window history picker'
+    Press-Key 0x0d
+    $null = Wait-Until 'Enter opens the newest capture across panes' { Find-Element $selected }
+    Click 'Return to pane'
+    Wait-Focus $pane
+
+    Run-Palette $find
+    Wait-PickerEditor $picker 'the window history input'
+    $catalog = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $ssh = $catalog.profiles.'palette-ssh'
+    $dot = ' ' + [char]0xb7 + ' '
+    $remoteCommand = 'inspect-history ' + ('s' * 132) + ' window-remote-needle'
+    $caption = "palette-ssh${dot}$($ssh.user)@$($ssh.host):$($ssh.port)${dot}Pane $remote${dot}exit 8${dot}$($remoteCommand.Substring(0, 120))"
+    $field = Find-Element $picker ([System.Windows.Automation.ControlType]::Edit)
+    $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    $value.SetValue('PALETTE-SSH')
+    $null = Wait-Until 'the source profile matches its SSH command' { Find-Element $caption }
+    $value.SetValue('WINDOW-REMOTE-NEEDLE')
+    $null = Wait-Until 'the full SSH command matches past the shortened caption' { Find-Element $caption }
+    Press-Key 0x0d
+    $selectedRemote = "Selected, $($remoteCommand.Substring(0, 120))${dot}exit 8"
+    $null = Wait-Until 'the exact SSH history capture opens' { Find-Element $selectedRemote }
+    Click 'Return to pane'
+    Wait-Focus $remote
+
     $null = Control @('send-text','--pane',"$remote",'--no-paste','neighbor-ok')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','neighbor-ok')
 } finally {

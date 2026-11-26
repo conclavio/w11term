@@ -281,6 +281,7 @@ mod tests {
             None,
             Some(&CompletedCommand {
                 id: 7,
+                finished_at: finished,
                 command: Some("report".into()),
                 exit_code: Some(17),
                 output: Ok(String::new()),
@@ -303,6 +304,7 @@ mod tests {
     fn group_preview_bounds_lines_and_preserves_utf8() {
         let mut command = CompletedCommand {
             id: 7,
+            finished_at: std::time::Instant::now(),
             command: None,
             exit_code: None,
             output: Ok("夜".repeat(PREVIEW_BYTES)),

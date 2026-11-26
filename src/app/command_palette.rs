@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 use w11term::terminal::BookmarkScreen;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
+pub(super) const FIND_COMMAND_HISTORY_LABEL: &str = "Find command history…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
 pub(super) const FIND_PROFILE_LABEL: &str = "Find profile…";
 pub(super) const SPLIT_RIGHT_PROFILE_LABEL: &str = "Find profile to split right…";
@@ -19,6 +20,7 @@ pub enum ProfileDestination {
 pub(super) enum Search {
     Window,
     Tabs,
+    CommandHistory,
     Profiles(ProfileDestination),
     GroupLibrary(TabId),
     GroupRecent(TabId),
@@ -36,6 +38,7 @@ impl Search {
         match self {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
+            Self::CommandHistory => "Search commands across panes",
             Self::Profiles(ProfileDestination::Tab) => "Search profiles",
             Self::Profiles(ProfileDestination::Split {
                 axis: Axis::Columns,
@@ -70,6 +73,10 @@ impl Search {
             }
             Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
+            Self::CommandHistory if query.trim().is_empty() => {
+                "No retained commands in this window"
+            }
+            Self::CommandHistory => "No matching commands in this window",
             Self::Profiles(_) => "No matching profiles",
             Self::Bookmarks(..) if query.is_empty() => "No retained scrollback bookmarks",
             Self::Bookmarks(..) => "No matching scrollback bookmarks",
@@ -120,6 +127,7 @@ pub enum CommandId {
     SearchWindowGroupRuns(WindowRunScope),
     WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(TabId),
+    OpenWindowCommand(u64, w11term::events::CommandLink),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
     ManageRecipientSets(TabId, String),
@@ -863,6 +871,13 @@ impl TerminalApp {
                 return;
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
+            CommandId::OpenWindowCommand(pane, link) => {
+                if !self.open_command_history(pane, Some(link), ctx) {
+                    self.window_error =
+                        Some("That command is no longer retained in its source pane.".into());
+                }
+                return;
+            }
             CommandId::OpenSavedHostGroup(name, members) => {
                 Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
             }
@@ -987,6 +1002,7 @@ pub(super) fn view(
     let trimming = if matches!(
         mode,
         Search::Tabs
+            | Search::CommandHistory
             | Search::Profiles(_)
             | Search::GroupRecent(_)
             | Search::GroupRuns(_)
@@ -1015,6 +1031,7 @@ pub(super) fn view(
                 .style(ButtonStyle::Subtle)
                 .automation_name(match mode {
                     Search::Tabs => "Close tab search",
+                    Search::CommandHistory => "Close command history search",
                     Search::Profiles(_) => "Close profile search",
                     Search::Bookmarks(..) => "Close bookmark search",
                     _ => "Close command palette",
