@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_DEPTH: usize = 32;
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 mod startup;
@@ -417,10 +417,10 @@ pub struct WorkspaceLaunch {
 
 impl WorkspaceLaunch {
     pub fn load(store: &WorkspaceStore, name: &str, profiles_path: &Path) -> Result<Self> {
-        let layout = store
-            .load()?
-            .remove(name)
-            .with_context(|| format!("Unknown workspace {name}"))?;
+        Self::resolve(store.entry(name)?.layout, profiles_path)
+    }
+
+    pub fn resolve(layout: Workspace, profiles_path: &Path) -> Result<Self> {
         let mut needs_profiles = false;
         for tab in &layout.tabs {
             tab.layout.visit(0, &mut |pane| {
@@ -530,6 +530,58 @@ impl Workspace {
 struct Catalog {
     version: u32,
     workspaces: BTreeMap<String, Workspace>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    identities: BTreeMap<String, WorkspaceIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceIdentity {
+    /// Keep the registration key of a workspace from the original catalog.
+    Legacy(String),
+    Unique(String),
+}
+
+impl WorkspaceIdentity {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Legacy(name) => validate_name(name),
+            Self::Unique(id) => {
+                ensure!(
+                    id.len() == 32
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                    "Invalid saved workspace identity"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspaceEntry {
+    pub identity: WorkspaceIdentity,
+    pub layout: Workspace,
+}
+
+impl Catalog {
+    fn identity(&self, name: &str) -> WorkspaceIdentity {
+        self.identities
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| WorkspaceIdentity::Legacy(name.to_owned()))
+    }
+
+    fn check_entry(&self, name: &str, expected: &WorkspaceEntry) -> Result<()> {
+        ensure!(
+            self.workspaces.get(name) == Some(&expected.layout)
+                && self.identity(name) == expected.identity,
+            "Workspace {name} changed in another window. Reopen its management page and try again."
+        );
+        Ok(())
+    }
 }
 
 pub struct WorkspaceStore {
@@ -545,10 +597,36 @@ impl WorkspaceStore {
         Self { path }
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn load(&self) -> Result<BTreeMap<String, Workspace>> {
+        Ok(self.load_catalog()?.workspaces)
+    }
+
+    pub fn entry(&self, name: &str) -> Result<WorkspaceEntry> {
+        let mut catalog = self.load_catalog()?;
+        let layout = catalog
+            .workspaces
+            .remove(name)
+            .with_context(|| format!("Unknown workspace {name}"))?;
+        Ok(WorkspaceEntry {
+            identity: catalog.identity(name),
+            layout,
+        })
+    }
+
+    fn load_catalog(&self) -> Result<Catalog> {
         let file = match File::open(&self.path) {
             Ok(file) => file,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(Catalog {
+                    version: VERSION,
+                    workspaces: BTreeMap::new(),
+                    identities: BTreeMap::new(),
+                });
+            }
             Err(e) => return Err(e).with_context(|| format!("Reading {}", self.path.display())),
         };
         let mut bytes = Vec::new();
@@ -561,22 +639,89 @@ impl WorkspaceStore {
         let catalog: Catalog = serde_json::from_slice(&bytes)
             .with_context(|| format!("Parsing {}", self.path.display()))?;
         ensure!(
-            catalog.version == VERSION,
+            catalog.version == VERSION || (catalog.version == 1 && catalog.identities.is_empty()),
             "Unsupported workspace catalog version {}",
             catalog.version
         );
+        ensure!(
+            catalog
+                .identities
+                .keys()
+                .all(|name| catalog.workspaces.contains_key(name)),
+            "A workspace identity has no saved layout"
+        );
+        let mut identities = BTreeSet::new();
         for (name, workspace) in &catalog.workspaces {
             validate_name(name)?;
             workspace
                 .validate()
                 .with_context(|| format!("Invalid workspace {name}"))?;
+            let identity = catalog.identity(name);
+            identity.validate()?;
+            ensure!(
+                identities.insert(identity),
+                "Duplicate saved workspace identity"
+            );
         }
-        Ok(catalog.workspaces)
+        Ok(catalog)
     }
 
     pub fn save(&self, name: &str, workspace: &Workspace) -> Result<()> {
+        self.save_with(name, workspace, |_| Ok(()))
+    }
+
+    /// Prepare the window's registration for the exact identity being written.
+    pub fn save_with<T>(
+        &self,
+        name: &str,
+        workspace: &Workspace,
+        prepare: impl FnOnce(&WorkspaceIdentity) -> Result<T>,
+    ) -> Result<T> {
         validate_name(name)?;
         workspace.validate()?;
+        self.edit(|catalog| {
+            let identity = if catalog.workspaces.contains_key(name) {
+                catalog.identity(name)
+            } else {
+                WorkspaceIdentity::Unique(format!("{:032x}", rand::random::<u128>()))
+            };
+            let registration = prepare(&identity)?;
+            catalog
+                .workspaces
+                .insert(name.to_owned(), workspace.clone());
+            catalog.identities.insert(name.to_owned(), identity);
+            Ok(registration)
+        })
+    }
+
+    pub fn rename(&self, old: &str, new: &str, expected: &WorkspaceEntry) -> Result<Vec<String>> {
+        validate_name(new)?;
+        self.edit(|catalog| {
+            catalog.check_entry(old, expected)?;
+            ensure!(
+                !catalog.workspaces.contains_key(new),
+                "Workspace {new} already exists"
+            );
+            let layout = catalog.workspaces.remove(old).expect("checked workspace");
+            catalog.identities.remove(old);
+            catalog.workspaces.insert(new.to_owned(), layout);
+            catalog
+                .identities
+                .insert(new.to_owned(), expected.identity.clone());
+            Ok(catalog.workspaces.keys().cloned().collect())
+        })
+    }
+
+    pub fn remove(&self, name: &str, expected: &WorkspaceEntry) -> Result<Vec<String>> {
+        self.edit(|catalog| {
+            catalog.check_entry(name, expected)?;
+            catalog.workspaces.remove(name);
+            catalog.identities.remove(name);
+            Ok(catalog.workspaces.keys().cloned().collect())
+        })
+    }
+
+    fn edit<T>(&self, change: impl FnOnce(&mut Catalog) -> Result<T>) -> Result<T> {
         let parent = self
             .path
             .parent()
@@ -584,7 +729,7 @@ impl WorkspaceStore {
             .unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         // All GUI processes lock this stable sibling through the entire
-        // read/modify/replace, so saving one workspace preserves other names.
+        // read/modify/replace, so each edit sees the latest catalog.
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -592,17 +737,12 @@ impl WorkspaceStore {
             .truncate(false)
             .open(self.path.with_extension("lock"))?;
         lock.try_lock()
-            .context("Another window may be saving workspaces; try again")?;
-        let mut workspaces = self.load()?;
-        workspaces.insert(name.to_owned(), workspace.clone());
+            .context("Another window is changing workspaces. Try again.")?;
+        let mut catalog = self.load_catalog()?;
+        let result = change(&mut catalog)?;
+        catalog.version = VERSION;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer_pretty(
-            &mut file,
-            &Catalog {
-                version: VERSION,
-                workspaces,
-            },
-        )?;
+        serde_json::to_writer_pretty(&mut file, &catalog)?;
         file.write_all(b"\n")?;
         ensure!(
             file.as_file().metadata()?.len() <= MAX_FILE_BYTES as u64,
@@ -610,7 +750,7 @@ impl WorkspaceStore {
         );
         file.as_file().sync_all()?;
         file.persist(&self.path).context("Saving workspaces")?;
-        Ok(())
+        Ok(result)
     }
 }
 
@@ -819,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_appearance_round_trips_and_clears_without_changing_the_workspace_format() {
+    fn pane_appearance_round_trips_and_clears_without_changing_workspace_identity() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("workspaces.json");
         let store = WorkspaceStore::new(path.clone());
@@ -841,6 +981,7 @@ mod tests {
         };
         let named = capture(Some("Build 雪".to_owned().try_into().unwrap()), Some(18.5));
         store.save("work", &named).unwrap();
+        let identity = store.entry("work").unwrap().identity;
         assert_eq!(store.load().unwrap()["work"], named);
         let mut json = serde_json::to_value(&named).unwrap();
         let layout = &mut json["tabs"][0]["layout"];
@@ -856,7 +997,7 @@ mod tests {
         store.save("work", &cleared).unwrap();
         let file: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(file["version"], 1);
+        assert_eq!(file["version"], VERSION);
         let tab = &file["workspaces"]["work"]["tabs"][0];
         assert_eq!(tab["title"], "Servers");
         assert_eq!(tab["focused"], 2);
@@ -864,7 +1005,13 @@ mod tests {
             assert!(tab["layout"][child].get("pane_name").is_none());
             assert!(tab["layout"][child].get("font_size").is_none());
         }
-        assert_eq!(store.load().unwrap()["work"], cleared);
+        assert_eq!(
+            store.entry("work").unwrap(),
+            WorkspaceEntry {
+                identity,
+                layout: cleared
+            }
+        );
     }
 
     #[test]
@@ -1099,7 +1246,7 @@ mod tests {
         let path = temp.path().join("workspaces.json");
         let store = WorkspaceStore::new(path.clone());
         assert!(store.load().unwrap().is_empty());
-        for bad in ["malformed", r#"{"version":2,"workspaces":{}}"#] {
+        for bad in ["malformed", r#"{"version":3,"workspaces":{}}"#] {
             std::fs::write(&path, bad).unwrap();
             assert!(store.save("ops", &demo()).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
@@ -1116,6 +1263,60 @@ mod tests {
         assert!(store.save("   ", &demo()).is_err());
         store.save("ops", &demo()).unwrap();
         assert_eq!(store.load().unwrap()["ops"], demo());
+    }
+
+    #[test]
+    fn renaming_a_legacy_workspace_preserves_identity_and_reusing_a_name_gets_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        let layout = demo();
+        std::fs::write(
+            &path,
+            serde_json::json!({"version":1,"workspaces":{"ops":layout,"lab":layout}}).to_string(),
+        )
+        .unwrap();
+        let store = WorkspaceStore::new(path);
+        let original = store.entry("ops").unwrap();
+        assert_eq!(original.identity, WorkspaceIdentity::Legacy("ops".into()));
+        assert!(store.rename("ops", "lab", &original).is_err());
+        assert_eq!(store.entry("ops").unwrap(), original);
+        assert_eq!(
+            store.rename("ops", "New ops", &original).unwrap(),
+            ["New ops", "lab"]
+        );
+        assert!(store.entry("ops").is_err());
+        assert_eq!(store.entry("New ops").unwrap(), original);
+
+        store.save("ops", &layout).unwrap();
+        let reused = store.entry("ops").unwrap();
+        assert!(matches!(reused.identity, WorkspaceIdentity::Unique(_)));
+        assert_ne!(reused.identity, original.identity);
+        assert!(store.remove("ops", &original).is_err());
+
+        store.remove("New ops", &original).unwrap();
+        store.save("New ops", &layout).unwrap();
+        assert_ne!(store.entry("New ops").unwrap().identity, original.identity);
+        assert_eq!(store.entry("ops").unwrap(), reused);
+        store.remove("ops", &reused).unwrap();
+        store.save("ops", &layout).unwrap();
+        assert_ne!(store.entry("ops").unwrap().identity, reused.identity);
+    }
+
+    #[test]
+    fn a_catalog_edit_can_detect_a_concurrent_layout_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
+        store.save("desk", &demo()).unwrap();
+        let original = store.entry("desk").unwrap();
+        let mut changed = demo();
+        changed.tabs[0].title = Some("New layout".to_owned().try_into().unwrap());
+        store.save("desk", &changed).unwrap();
+        assert!(store.rename("desk", "renamed", &original).is_err());
+        assert!(store.remove("desk", &original).is_err());
+        let updated = store.entry("desk").unwrap();
+        assert_eq!(updated.identity, original.identity);
+        assert_eq!(updated.layout, changed);
+        assert!(store.rename("desk", "renamed", &updated).is_ok());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use w11term::workspace::{
 };
 
 mod duplicate;
+mod manage;
 pub(super) use duplicate::{ClosedPane, ClosedTab, ClosedTabWindow, PreparedTabLayout};
 
 #[derive(Default)]
@@ -14,6 +15,19 @@ pub(super) struct WorkspacePage {
     names: Vec<String>,
     status: String,
     startup: Option<StartupEditor>,
+    editor: Option<manage::Editor>,
+}
+
+impl WorkspacePage {
+    fn reload_names(&mut self) {
+        match WorkspaceStore::open().and_then(|store| store.load()) {
+            Ok(catalog) => {
+                self.names = catalog.into_keys().collect();
+                self.status.clear();
+            }
+            Err(error) => self.status = format!("{error:#}"),
+        }
+    }
 }
 
 struct StartupEditor {
@@ -72,6 +86,7 @@ pub enum WorkspaceAction {
     Save(TabId),
     Open(TabId, String),
     OpenInWindow(TabId, String),
+    Manage(TabId, manage::Action),
 }
 
 impl TerminalApp {
@@ -184,10 +199,8 @@ impl TerminalApp {
                 };
                 if let Some(page) = self.workspace_page_mut(id) {
                     page.startup = None;
-                    match WorkspaceStore::open().and_then(|store| store.load()) {
-                        Ok(catalog) => page.names = catalog.into_keys().collect(),
-                        Err(error) => page.status = format!("{error:#}"),
-                    }
+                    page.editor = None;
+                    page.reload_names();
                 }
                 self.activate(context);
             }
@@ -302,6 +315,11 @@ impl TerminalApp {
                         .map_or_else(String::new, |error| format!("{error:#}"));
                 }
             }
+            WorkspaceAction::Manage(id, action) => {
+                if let Some(page) = self.workspace_page_mut(id) {
+                    page.manage(action);
+                }
+            }
         }
     }
 
@@ -387,6 +405,9 @@ impl TerminalApp {
         page: &WorkspacePage,
         context: &ViewContext<Self>,
     ) -> View {
+        if let Some(editor) = &page.editor {
+            return manage::view(id, page, editor, context);
+        }
         if let Some(editor) = &page.startup {
             let fields = editor.fields.borrow();
             let directory = TextBox::new()
@@ -508,10 +529,16 @@ impl TerminalApp {
             let switch = name.clone();
             let saved = name.clone();
             let window = name.clone();
+            let manage = name.clone();
             children.push(KeyedView::new(
                 format!("workspace-{name}"),
                 Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                    .columns([
+                        GridLength::STAR,
+                        GridLength::Auto,
+                        GridLength::Auto,
+                        GridLength::Auto,
+                    ])
                     .column_spacing(8.0)
                     .children((
                         Button::new()
@@ -543,14 +570,25 @@ impl TerminalApp {
                                 ))
                             }))
                             .content("Open in new window"),
+                        Button::new()
+                            .grid_column(3)
+                            .is_enabled(!page.switching)
+                            .automation_name(format!("Manage workspace {name}"))
+                            .on_click(context.callback(move |_| {
+                                Message::Workspace(WorkspaceAction::Manage(
+                                    id,
+                                    manage::Action::Open(manage.clone()),
+                                ))
+                            }))
+                            .content("Manage…"),
                     )),
             ));
         }
         ScrollViewer::new().content(
             StackPanel::new()
                 .spacing(12.0)
-                .margin(32.0)
-                .width(510.0)
+                .margin(24.0)
+                .width(574.0)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .keyed_children(children),
         )

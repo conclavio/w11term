@@ -661,6 +661,10 @@ Use `w11term --switch-workspace "Admin console"` for the same behavior from a la
 
 Choose **Open in new window** beside a saved workspace to restore its layout in a separate window within the same running instance. The source window stays open, and the new copy is registered for **Switch workspace** and **Find window…**.
 
+Choose **Manage…** beside a saved workspace to rename or remove it. A renamed workspace still switches to its existing window. Removing the saved layout asks for confirmation and leaves any open windows and sessions running. If you save a new workspace under the old name, it has its own identity.
+
+Existing catalogs load automatically. Saving or editing a workspace writes catalog version 2, which requires a build with workspace management support.
+
 Each restored pane receives a new process-local control ID. SSH panes normally start a fresh shell. A saved durable pane can return to its original shell. Named profile references use the current profile settings. Ad-hoc SSH panes retain their connection options and key paths. Replay panes reference their original capture files. Workspaces are stored in `%LOCALAPPDATA%\w11term\workspaces.json`, or in `W11TERM_DATA_DIR` when set.
 
 To give an ordinary SSH pane a startup command, choose **More → Workspace startup…**, enter a remote command or an absolute starting directory, and choose **Apply to pane**. Then save or update the named workspace. Reopening it sends the command as an SSH exec request on a fresh PTY. For example, set the directory to `/srv/game` and the command to `tail -f logs/server.log`. A directory alone starts an interactive shell there. Directory selection requires a POSIX-compatible remote shell. Clearing both fields restores the profile’s default shell.

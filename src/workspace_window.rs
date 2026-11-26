@@ -13,7 +13,7 @@ use std::{
 use w11term::{
     control,
     options::Options,
-    workspace::{Workspace, WorkspaceLaunch, WorkspaceStore},
+    workspace::{Workspace, WorkspaceIdentity, WorkspaceLaunch, WorkspaceStore},
 };
 use windows::{
     Win32::{
@@ -37,13 +37,19 @@ impl PartialEq for Opening {
 
 impl Opening {
     fn load(
-        catalog: PathBuf,
+        store: &WorkspaceStore,
         name: &str,
         profiles: &Path,
+        identity: &WorkspaceIdentity,
         key: String,
         lock: File,
     ) -> Result<Rc<Self>> {
-        let layout = WorkspaceLaunch::load(&WorkspaceStore::new(catalog), name, profiles)?;
+        let entry = store.entry(name)?;
+        ensure!(
+            &entry.identity == identity,
+            "Workspace {name} changed. Try opening it again."
+        );
+        let layout = WorkspaceLaunch::resolve(entry.layout, profiles)?;
         Ok(Rc::new(Self {
             key,
             layout,
@@ -62,8 +68,16 @@ pub fn prepare(options: Options) -> Result<Option<Launch>> {
     let Some(name) = &options.workspace else {
         return Ok(Some((options, None)));
     };
-    let catalog = w11term::keys::data_dir()?.join("workspaces.json");
-    let key = workspace_key(&catalog, &options.profiles_path, name)?;
+    let store = WorkspaceStore::open()?;
+    let identity = store.entry(name)?.identity;
+    let key = workspace_key(store.path(), &options.profiles_path, &identity)?;
+    ensure!(
+        options
+            .expected_workspace_key
+            .as_ref()
+            .is_none_or(|expected| expected == &key),
+        "Workspace {name} changed. Try switching again."
+    );
     let lock = registration_lock(&key)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -80,17 +94,18 @@ pub fn prepare(options: Options) -> Result<Option<Launch>> {
     if options.switch_workspace && focus_existing(&key, None)? {
         return Ok(None);
     }
-    let opening = Opening::load(catalog, name, &options.profiles_path, key, lock)?;
+    let opening = Opening::load(&store, name, &options.profiles_path, &identity, key, lock)?;
     Ok(Some((options, Some(opening))))
 }
 
 pub fn prepare_copy(name: &str, profiles: &Path) -> Result<Rc<Opening>> {
-    let catalog = w11term::keys::data_dir()?.join("workspaces.json");
-    let key = workspace_key(&catalog, profiles, name)?;
+    let store = WorkspaceStore::open()?;
+    let identity = store.entry(name)?.identity;
+    let key = workspace_key(store.path(), profiles, &identity)?;
     let lock = registration_lock(&key)?;
     lock.try_lock()
         .context("Another window is registering this workspace. Try opening it again.")?;
-    Opening::load(catalog, name, profiles, key, lock)
+    Opening::load(&store, name, profiles, &identity, key, lock)
 }
 
 fn owner(key: &str, caller: Option<control::WindowId>) -> Result<Option<control::WorkspaceOwner>> {
@@ -122,8 +137,9 @@ fn focus_existing(key: &str, caller: Option<control::WindowId>) -> Result<bool> 
 }
 
 pub fn switch(name: &str, profiles: &Path, caller: control::WindowId) -> Result<()> {
-    let catalog = w11term::keys::data_dir()?.join("workspaces.json");
-    let key = workspace_key(&catalog, profiles, name)?;
+    let store = WorkspaceStore::open()?;
+    let identity = store.entry(name)?.identity;
+    let key = workspace_key(store.path(), profiles, &identity)?;
     if focus_existing(&key, Some(caller))? {
         return Ok(());
     }
@@ -134,6 +150,8 @@ pub fn switch(name: &str, profiles: &Path, caller: control::WindowId) -> Result<
         .arg(profiles)
         .arg("--switch-workspace")
         .arg(name)
+        .arg("--expected-workspace-key")
+        .arg(&key)
         .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -144,7 +162,12 @@ pub fn switch(name: &str, profiles: &Path, caller: control::WindowId) -> Result<
         if let Some(status) = child.try_wait()? {
             if !status.success() {
                 // Surface missing profiles or invalid saved layouts in the picker.
-                WorkspaceLaunch::load(&WorkspaceStore::new(catalog), name, profiles)?;
+                let entry = store.entry(name)?;
+                ensure!(
+                    entry.identity == identity,
+                    "Workspace {name} changed. Try switching again."
+                );
+                WorkspaceLaunch::resolve(entry.layout, profiles)?;
                 bail!(
                     "Opening workspace {name} failed ({status}). See {} for details.",
                     w11term::keys::data_dir()?.join("startup.log").display()
@@ -191,12 +214,14 @@ pub fn save(
     server: &control::Server,
     window_id: control::WindowId,
 ) -> Result<()> {
-    let catalog = w11term::keys::data_dir()?.join("workspaces.json");
-    let key = workspace_key(&catalog, profiles, name)?;
-    let lock = registration_lock(&key)?;
-    lock.try_lock()
-        .context("Another window is launching this workspace. Try saving again.")?;
-    WorkspaceStore::new(catalog).save(name, layout)?;
+    let store = WorkspaceStore::open()?;
+    let (key, _lock) = store.save_with(name, layout, |identity| {
+        let key = workspace_key(store.path(), profiles, identity)?;
+        let lock = registration_lock(&key)?;
+        lock.try_lock()
+            .context("Another window is launching this workspace. Try saving again.")?;
+        Ok((key, lock))
+    })?;
     server
         .publish_window_workspace(window_id, Some(key))
         .context("Workspace saved, but its window could not be registered")
@@ -218,7 +243,7 @@ fn canonical_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn workspace_key(catalog: &Path, profiles: &Path, name: &str) -> Result<String> {
+fn workspace_key(catalog: &Path, profiles: &Path, identity: &WorkspaceIdentity) -> Result<String> {
     let mut hash = Sha256::new();
     for path in [catalog, profiles] {
         for unit in canonical_path(path)?.as_os_str().encode_wide() {
@@ -230,7 +255,14 @@ fn workspace_key(catalog: &Path, profiles: &Path, name: &str) -> Result<String> 
     hash.update(sid.as_bytes());
     hash.update(integrity.to_le_bytes());
     hash.update(session.to_le_bytes());
-    hash.update(name.as_bytes());
+    match identity {
+        WorkspaceIdentity::Legacy(name) => hash.update(name.as_bytes()),
+        WorkspaceIdentity::Unique(id) => {
+            // Legacy names cannot contain a NUL.
+            hash.update([0]);
+            hash.update(id.as_bytes());
+        }
+    }
     Ok(URL_SAFE_NO_PAD.encode(hash.finalize()))
 }
 
@@ -332,13 +364,21 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let a = root.path().join("workspaces.json");
         let b = root.path().join("profiles.json");
-        let key = workspace_key(&a, &b, "Desk").unwrap();
+        let desk = WorkspaceIdentity::Legacy("Desk".into());
+        let key = workspace_key(&a, &b, &desk).unwrap();
         assert_eq!(
-            workspace_key(&a, &root.path().join(".").join("profiles.json"), "Desk").unwrap(),
+            workspace_key(&a, &root.path().join(".").join("profiles.json"), &desk).unwrap(),
             key
         );
-        assert_ne!(workspace_key(&a, &b, "desk").unwrap(), key);
-        assert_ne!(workspace_key(&b, &a, "Desk").unwrap(), key);
-        assert_ne!(workspace_key(&a, &a, "Desk").unwrap(), key);
+        assert_ne!(
+            workspace_key(&a, &b, &WorkspaceIdentity::Legacy("desk".into())).unwrap(),
+            key
+        );
+        assert_ne!(workspace_key(&b, &a, &desk).unwrap(), key);
+        assert_ne!(workspace_key(&a, &a, &desk).unwrap(), key);
+        assert_ne!(
+            workspace_key(&a, &b, &WorkspaceIdentity::Unique("Desk".into())).unwrap(),
+            key
+        );
     }
 }
