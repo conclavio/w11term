@@ -443,7 +443,7 @@ impl TerminalApp {
                 let sensitive = picker.text.sensitive;
                 let regex = picker.text.regex;
                 let targets = self
-                    .picker_choices(Mode::Text)
+                    .picker_choices(Mode::Text, "")
                     .into_iter()
                     .enumerate()
                     .filter_map(|(order, choice)| {

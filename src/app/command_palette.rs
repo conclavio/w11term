@@ -322,26 +322,9 @@ fn search_tabs(
     active: Option<TabId>,
     windows: impl IntoIterator<Item = (u64, Rc<[SearchTab]>)>,
 ) -> Vec<Row> {
-    let query = query.to_lowercase();
-    let mut input = query.split_whitespace().peekable();
-    let mut words = Vec::new();
-    let mut window_filter = None;
-    while let Some(word) = input.next() {
-        if word == "window"
-            && let Some(window) = input.peek().and_then(|id| id.parse::<u64>().ok())
-        {
-            input.next();
-            if window_filter
-                .replace(window)
-                .is_some_and(|old| old != window)
-            {
-                return Vec::new();
-            }
-        } else {
-            words.push(word);
-        }
-    }
-    let query = words.join(" ");
+    let Some((window_filter, query)) = tab_windows::window_query(query) else {
+        return Vec::new();
+    };
     let mut matches = Vec::new();
     for (window, entries) in windows {
         if window_filter.is_some_and(|id| id != window) {
@@ -353,7 +336,7 @@ fn search_tabs(
             let position = format!("Tab {}", index + 1);
             let position_query = position.to_lowercase();
             let terms = format!("{title} {position_query}");
-            if words.iter().all(|word| terms.contains(word)) {
+            if query.split_whitespace().all(|word| terms.contains(word)) {
                 let rank = (
                     title != query,
                     position_query != query,

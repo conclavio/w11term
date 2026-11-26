@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -104,6 +104,33 @@ function Open-TabSearch([IntPtr]$Hwnd, [string]$Query, [string]$Result) {
     }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
     $null = Wait-Until "tab search result '$Result'" { Find-Here $Hwnd $Result }
+}
+
+function Open-CrossWindowPaneSearch([IntPtr]$Hwnd, [string]$Query, [string]$Match) {
+    Use-Window $Hwnd
+    $window = $Hwnd
+    Press-Key 0x75 # F6, fixture Find pane shortcut
+    $field = Wait-PickerEditor 'Find pane' "F6 for '$Query'"
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+    $null = Wait-Until "one pane matching '$Match'" {
+        $rows = @(Get-PickerRows)
+        $rows.Count -eq 1 -and $rows[0] -like "*$Match*"
+    }
+}
+
+function Wait-RemotePreview([IntPtr]$Hwnd, [string]$Marker, [long]$WindowId) {
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $null = Wait-Until "preview from Window $WindowId containing '$Marker'" {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Hwnd)
+        foreach ($node in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text)) {
+            $name = $node.Current.Name
+            if ($name.StartsWith('Preview of ') -and $name.Contains("Window $WindowId") -and $name.Contains($Marker)) {
+                return $true
+            }
+        }
+    }
 }
 
 function Type-In([IntPtr]$Hwnd, [string]$Text, [switch]$Return) {
@@ -249,7 +276,7 @@ try {
     Press-Key 0x78 # F9 focuses the left SSH pane
     Expect-Focus $destination $ssh.id 'F9 selects the destination SSH pane'
 
-    if ($FirstClose -eq 'Search') {
+    if ($FirstClose -in 'Search','PaneSearch') {
         Run-WindowCommand $destination ('New tab with Destination PowerShell ' + [char]0x00b7 + ' Local')
         $helper = Wait-Until 'the detached split to become a background tab' {
             (Control @('list')).sessions | Where-Object {
@@ -259,6 +286,53 @@ try {
         Expect-Text $helper.id 'PS '
         $null = [TabFixtureWindows]::ShowWindowAsync($destination, 7) # SW_SHOWMINNOACTIVE
         $null = Wait-Until 'the detached window to minimize' { [TabFixtureWindows]::IsIconic($destination) }
+    }
+    if ($FirstClose -eq 'PaneSearch') {
+        $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','preview-before')
+        Expect-Text $ssh.id 'preview-before'
+        $grid = Control @('get-text','--pane',"$($ssh.id)")
+        Open-CrossWindowPaneSearch $origin "Window $newOwner test@127.0.0.1" "Window $newOwner"
+        Wait-RemotePreview $origin 'preview-before' $newOwner
+        Expect-Focus $origin $anchor.id 'Preview leaves focus on the original PowerShell pane'
+        $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','-live/')
+        Wait-RemotePreview $origin 'preview-before-live/' $newOwner
+        $current = Control @('get-text','--pane',"$($ssh.id)")
+        if ($current.cols -ne $grid.cols -or $current.rows -ne $grid.rows -or
+            ![TabFixtureWindows]::IsIconic($destination)) { throw 'Preview changed the hidden pane or its window' }
+        $window = $origin
+        Press-Key 27
+        $null = Wait-Until 'Escape closes Find pane' { !(Find-Here $origin 'Find pane') }
+        Expect-Focus $origin $anchor.id 'Escape keeps the original focus'
+        $newLine = [Convert]::ToBase64String([byte[]]@(13,10))
+        $null = Control @('send-text','--pane',"$($ssh.id)",'--no-paste','--base64',$newLine)
+
+        Open-CrossWindowPaneSearch $origin "Window $newOwner Moved PowerShell" 'Tab 1 / pane 2'
+        Press-Key 13
+        Expect-Focus $destination $moved.id 'Enter restores the other window and selects the exact split pane'
+        if ((Shell-State $moved.id 'afterPaneSearch' $destination) -ne $localIdentity) {
+            throw 'The pane search did not reach the original PowerShell process'
+        }
+        Open-CrossWindowPaneSearch $destination 'window-ssh' 'Tab 1 / pane 1'
+        $window = $destination
+        Press-Key 13
+        Expect-Focus $destination $ssh.id 'Searching locally still selects the original SSH pane'
+        $null = Wait-Until 'the local picker is dismissed before typing' { !(Find-Here $destination 'Find pane') }
+        Type-In $destination 'focused-remote/'
+        Expect-Text $ssh.id 'focused-remote/'
+
+        Open-CrossWindowPaneSearch $origin "Window $newOwner Destination PowerShell" 'Tab 2 / pane 1'
+        $null = Control @('close-pane','--pane',"$($helper.id)")
+        $null = Wait-Until 'the closed sibling pane is removed with the destination window still open' {
+            (Find-Here $origin 'No matching panes') -and
+                ([TabFixtureWindows]::OwnedBy($app.Id) -contains $destination)
+        }
+        $window = $origin
+        Press-Key 27
+        Expect-Focus $origin $anchor.id 'Source stays focused when the sibling result is removed'
+        Close-FixtureWindow $destination
+        $null = Wait-Until 'the sibling HWND closes' { [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $destination }
+        $last = $origin
+    } elseif ($FirstClose -eq 'Search') {
         $join = [char]0x00b7
         $splitQuery = "Window $newOwner cockpit"
         $splitResult = "Cockpit tools    Window $newOwner $join Tab 1"
