@@ -204,7 +204,7 @@ function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Subm
         throw "$_ Trigger=$($trigger.Current.Name) Enabled=$($trigger.Current.IsEnabled) Offscreen=$($trigger.Current.IsOffscreen) Bounds=$($trigger.Current.BoundingRectangle)"
     }
     if ($Submenu) {
-        $category = Wait-Until "'$Submenu' submenu" { Find-Element $Submenu $menu }
+        $category = Wait-Until "'$Submenu' submenu" { Find-Element $Submenu $menu -Visible:$VisibleItem }
         $category.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     }
     try { Wait-Until "'$Name' in '$TriggerName'" {
@@ -214,7 +214,7 @@ function Get-NativeMenuAction([string]$TriggerName, [string]$Name, [string]$Subm
         $item = Find-Element $Name $menu
         $category = if ($Submenu) { Find-Element $Submenu $menu }
         $trigger = Find-Element $TriggerName $button
-        throw "$_ Item=$($item.Current.Name) Enabled=$($item.Current.IsEnabled) Submenu=$($category.Current.Name) Menu trigger enabled=$($trigger.Current.IsEnabled)"
+        throw "$_ Item=$($item.Current.Name) Enabled=$($item.Current.IsEnabled) Offscreen=$($item.Current.IsOffscreen) Bounds=$($item.Current.BoundingRectangle) Submenu=$($category.Current.Name) Menu trigger enabled=$($trigger.Current.IsEnabled)"
     }
 }
 function Get-SftpFolderAction([string]$Name, [switch]$Comparison, [switch]$AllowDisabled) {

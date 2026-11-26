@@ -108,9 +108,9 @@ function Start-Paste([string]$Route) {
     }
     $raw = $Route -in 'Raw','CtrlAltV'
     $name = if ($raw) { 'Paste raw (no bracketed paste)' } else { 'Paste' }
-    Invoke-Button (Get-NativeMenuAction 'Tab menu' $name -VisibleItem)
+    Invoke-Button (Get-NativeMenuAction 'Tab menu' $name -Submenu 'Clipboard' -VisibleItem)
     $null = Wait-Until 'the paste flyout closes' {
-        !(Find-Element $name $menu -Visible) -and !(Find-Element 'Settings' $menu -Visible)
+        !(Find-Element $name $menu -Visible) -and !(Find-Element 'Clipboard' $menu -Visible)
     }
 }
 function Wait-Prompt([string]$Primary, [string]$Reason) {

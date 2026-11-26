@@ -4093,7 +4093,6 @@ impl TerminalApp {
         previous: Option<previous_pane::Target>,
         recordings: recordings::Choices,
     ) -> Vec<MenuItem> {
-        let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
             _ => None,
@@ -4121,6 +4120,7 @@ impl TerminalApp {
             MenuItem::item("active-port-forwards", local_forwards::overview::LABEL),
             MenuItem::item("inbox", "Attention inbox"),
             MenuItem::item("settings", "Settings"),
+            self.clipboard_menu(),
             MenuItem::separator("window-actions"),
             self.binding_menu(
                 "command-palette",
@@ -4195,9 +4195,6 @@ impl TerminalApp {
             ),
             MenuItem::item("new-ssh-group-tab", host_groups::NEW_TAB_LABEL),
             recordings.menu(),
-            command_menu_item("paste", "Paste", can_paste),
-            command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
-            MenuItem::separator("paste-end"),
             workspace_startup,
             self.discovery_menu(),
             state_menu_item(
@@ -4461,17 +4458,6 @@ impl TerminalApp {
             },
             self.existing_window_menu(),
             self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
-            self.binding_menu_enabled(
-                "select-all",
-                KeyAction::SelectAll.binding().label,
-                KeyAction::SelectAll,
-                self.copy_mode_target().is_some(),
-            ),
-            command_menu_item(
-                "copy-selection",
-                "Copy selection    Ctrl+Shift+C",
-                self.active_selection(),
-            ),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
             self.broadcast_menu(),
         ]);

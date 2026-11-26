@@ -44,11 +44,12 @@ function Assert-Uncopied([uint32]$Sequence) {
         if ([FixtureClipboard]::GetClipboardSequenceNumber() -ne $Sequence) { throw 'Selection modified the Windows clipboard before Copy' }
     } elseif ((Read-ClipboardFixture) -cne $sentinel) { throw 'Selection copied text before explicit Copy' }
 }
-function Start-Selection([string]$Scope, [string]$Marker, [switch]$Palette) {
-    if ($Palette) {
-        $chord = if ($real) { 'Ctrl+Shift+A' } else { 'F10' }
-        Run-Palette "$label    $chord"
+function Start-Selection([string]$Scope, [string]$Marker, [switch]$Palette, [switch]$Menu) {
+    $chord = if ($real) { 'Ctrl+Shift+A' } else { 'F10' }
+    if ($Menu) {
+        Invoke-Button (Get-NativeMenuAction 'Tab menu' "$label    $chord" -Submenu 'Clipboard' -VisibleItem)
     }
+    elseif ($Palette) { Run-Palette "$label    $chord" }
     elseif ($real) { Send-Chord '^+a' }
     else { Press-Key 0x79 } # F10 rebound to the same shortcut.
     $dot = ' ' + [char]0xb7 + ' '
@@ -62,8 +63,10 @@ function Start-Selection([string]$Scope, [string]$Marker, [switch]$Palette) {
         $selected.Contains($Marker)
     }
 }
-function Copy-Selection([uint32]$Sequence,[string]$Expected) {
-    if ($real) { Send-Chord '^+c' } else { Press-Key 0x59 } # y in copy mode
+function Copy-Selection([uint32]$Sequence,[string]$Expected,[switch]$Menu) {
+    if ($Menu) {
+        Invoke-Button (Get-NativeMenuAction 'Tab menu' 'Copy selection    Ctrl+Shift+C' -Submenu 'Clipboard' -VisibleItem)
+    } elseif ($real) { Send-Chord '^+c' } else { Press-Key 0x59 } # y in copy mode
     $null = Wait-Until 'explicit Copy produced exactly the expected Unicode text' {
         if ($real) { return [FixtureClipboard]::ContainsNewText($Sequence,$Expected) }
         return (Read-ClipboardFixture) -ceq $Expected
@@ -135,7 +138,7 @@ try {
     $old = (Control @('find-text','--pane',"$remote",'EVICTED-SSH')).panes[0]
     if ($first.count -ne 1 -or $old.count -ne 0 -or $end.text.Contains('FIRST-RETAINED-SSH')) { throw 'Fixture did not evict the prelude and place the first retained marker offscreen' }
     $sequence = Set-Sentinel
-    Start-Selection 'All retained text selected' 'LAST-RETAINED-SSH'
+    Start-Selection 'All retained text selected' 'LAST-RETAINED-SSH' -Menu
     Assert-Uncopied $sequence
     Press-Key 0x1b
     $null = Wait-Until 'Escape canceled the selection' { !(Copy-ModeOpen) }
@@ -164,7 +167,7 @@ try {
     $sequence = Set-Sentinel
     Start-Selection 'Alternate screen text selected' $alternateMarker -Palette
     Assert-Uncopied $sequence
-    Copy-Selection $sequence ([IO.File]::ReadAllText((Join-Path $State 'expected-alternate.txt')))
+    Copy-Selection $sequence ([IO.File]::ReadAllText((Join-Path $State 'expected-alternate.txt'))) -Menu
     Send-RemoteBytes ([Text.Encoding]::ASCII.GetBytes(([char]27 + '[?1049l')))
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','LAST-RETAINED-SSH!')
     $null = Picker-Query 'Palette PowerShell'

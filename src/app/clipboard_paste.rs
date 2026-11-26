@@ -100,6 +100,33 @@ fn send(
 }
 
 impl TerminalApp {
+    pub(super) fn clipboard_menu(&self) -> MenuItem {
+        let can_paste = matches!(
+            self.tabs.active().map(|tab| &tab.page),
+            Some(Page::Terminal(live)) if !live.read_only.get()
+        );
+        MenuItem::submenu(
+            "clipboard",
+            "Clipboard",
+            [
+                command_menu_item("paste", "Paste", can_paste),
+                command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
+                MenuItem::separator("clipboard-selection"),
+                command_menu_item(
+                    "copy-selection",
+                    "Copy selection    Ctrl+Shift+C",
+                    self.active_selection(),
+                ),
+                self.binding_menu_enabled(
+                    "select-all",
+                    KeyAction::SelectAll.binding().label,
+                    KeyAction::SelectAll,
+                    self.copy_mode_target().is_some(),
+                ),
+            ],
+        )
+    }
+
     pub(super) fn paste_origin(&self) -> Option<Origin> {
         let Page::Terminal(tab) = &self.tabs.active()?.page else {
             return None;

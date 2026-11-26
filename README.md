@@ -831,7 +831,7 @@ The benchmark measures **only VT parsing and scrollback**. It excludes snapshot 
 
 ## Controls
 
-Press **Ctrl+Shift+A** or choose **Select all terminal text** in the command palette to select the focused pane’s retained text, including lines above the viewport. Press **Ctrl+Shift+C** to copy it as plain text, or **Esc** to cancel. Selecting leaves the clipboard untouched even when copy-on-select is on. In a full-screen application using the alternate screen, the selection covers that application’s text. For output larger than the 1 MiB clipboard limit, use **Panes → Save scrollback as text…**.
+Open **Tab menu → Clipboard** for **Paste**, **Paste raw**, **Copy selection**, and **Select all terminal text**. Press **Ctrl+Shift+A** to select the focused pane’s retained text, including lines above the viewport. Press **Ctrl+Shift+C** to copy it as plain text, or **Esc** to cancel. Selecting leaves the clipboard untouched even when copy-on-select is on. In a full-screen application using the alternate screen, the selection covers that application’s text. For output larger than the 1 MiB clipboard limit, use **Panes → Save scrollback as text…**.
 
 Use **Copy pane as image** or **Save pane image…** under **Tab menu → Panes** or in the command palette. Both capture the current terminal grid, including graphics and any scrollback currently in view. Copy places a bitmap on the Windows clipboard and Save writes a PNG. The capture excludes selection highlights and surrounding window controls.
 
@@ -863,7 +863,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Alt+drag | Rectangular selection |
 | Right-click | Paste; with auto-copy disabled, copy an existing selection first |
 | Ctrl+V / Ctrl+Shift+V / Shift+Insert | Normal paste, using negotiated bracketed-paste mode |
-| Ctrl+Alt+V / More → Paste raw | UTF-8 clipboard bytes, without bracket markers, trimming, newline conversion, or key encoding |
+| Ctrl+Alt+V / Clipboard → Paste raw | UTF-8 clipboard bytes, without bracket markers, trimming, newline conversion, or key encoding |
 | Ctrl+Shift+A | Select all retained text in the focused pane |
 | Ctrl+Shift+C / Ctrl+Insert | Copy the selection as plain Unicode text |
 | Ctrl+C with a selection | Copy; without a selection, send Ctrl+C to the remote program |
