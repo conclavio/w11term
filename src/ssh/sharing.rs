@@ -1,6 +1,6 @@
 //! A pane can explicitly lend an authenticated connection to a new shell
 //! channel. No global host cache or saved authentication answers are involved.
-use super::{Handler, SESSION_SETUP_TIMEOUT};
+use super::{Handler, InitialSshAlgorithms, SESSION_SETUP_TIMEOUT, negotiation::VerifiedHandshake};
 use crate::{events::SshConnectionPhase, options::SshOptions, prompts::Prompts};
 use anyhow::{Context, Result};
 use russh::{Channel, client};
@@ -26,7 +26,7 @@ struct Link {
     // A forwarded connection owns its authenticated upstream transport.
     upstream: Option<ConnectionShare>,
     handle: Arc<client::Handle<Handler>>,
-    fingerprint: String,
+    verified: VerifiedHandshake,
     verified_route: OnceLock<Arc<VerifiedSshRoute>>,
     options: SshOptions,
     known_hosts: Option<PathBuf>,
@@ -56,6 +56,8 @@ pub struct VerifiedSshPeer {
     pub key_fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key_alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_algorithms: Option<InitialSshAlgorithms>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -69,12 +71,12 @@ impl ConnectionShare {
         handle: client::Handle<Handler>,
         options: SshOptions,
         prompts: Option<&Prompts>,
-        fingerprint: String,
+        verified: VerifiedHandshake,
         upstream: Option<ConnectionShare>,
     ) -> Self {
         Self(Arc::new(Link {
             handle: Arc::new(handle),
-            fingerprint,
+            verified,
             verified_route: OnceLock::new(),
             upstream,
             options,
@@ -105,7 +107,7 @@ impl ConnectionShare {
         &self.0.forward_channels
     }
     pub(super) fn fingerprint(&self) -> &str {
-        &self.0.fingerprint
+        &self.0.verified.fingerprint
     }
     pub fn options(&self) -> &SshOptions {
         &self.0.options
@@ -116,7 +118,7 @@ impl ConnectionShare {
             &options.host,
             &options.user,
             options.port,
-            &self.0.fingerprint,
+            self.fingerprint(),
         )
     }
     fn verified_route(&self) -> Arc<VerifiedSshRoute> {
@@ -145,6 +147,7 @@ impl ConnectionShare {
             port,
             key_fingerprint: key_fingerprint.into(),
             host_key_alias: self.0.options.host_key_alias.clone(),
+            initial_algorithms: self.0.verified.initial_algorithms.clone(),
         }
     }
     pub(super) async fn open_shell(&self) -> Result<ShellChannel> {

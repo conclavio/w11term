@@ -203,6 +203,35 @@ fn ssh_route_view(
                         .text_wrapping(TextWrapping::Wrap)
                         .into()
                 }),
+            peer.initial_algorithms
+                .as_ref()
+                .map_or_else(View::empty, |algorithms| {
+                    let strict = if algorithms.strict_key_exchange {
+                        "On"
+                    } else {
+                        "Off"
+                    };
+                    StackPanel::new().spacing(3.0).keyed_children(
+                        [
+                            ("kex", format!("Key exchange   {}", algorithms.key_exchange)),
+                            (
+                                "host-key-algorithm",
+                                format!("Host-key algorithm   {}", algorithms.host_key),
+                            ),
+                            ("cipher", format!("Cipher   {}", algorithms.cipher)),
+                            ("strict-kex", format!("Strict key exchange   {strict}")),
+                        ]
+                        .into_iter()
+                        .map(|(key, label)| {
+                            KeyedView::new(
+                                key,
+                                TextBlock::new()
+                                    .text(label)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )
+                        }),
+                    )
+                }),
         ))
     };
     let hosts = std::iter::once(KeyedView::new(

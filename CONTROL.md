@@ -119,6 +119,8 @@ SSH panes also include `ssh_connection`, with the same phase and optional reason
 
 A connected SSH pane also reports `ssh.destination` and `ssh.jump_hosts`, ordered from the first jump toward the destination. Each peer contains `host`, `user`, `port`, the verified SHA256 `key_fingerprint`, and `host_key_alias` when configured. The `ssh` object is available only while that pane has an authenticated connection.
 
+Each peer's `initial_algorithms` reports `key_exchange`, `host_key`, `cipher`, and the boolean `strict_key_exchange` from the first key exchange on that transport. `host_key` includes the SSH certificate algorithm suffix when a certificate was presented. Panes that share a transport report the same initial algorithms. Reopening the transport uses the next connection's negotiation.
+
 `mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
 When xterm modified-key reporting or its alternate format is enabled, `keyboard.modify_other_keys` is the active level from 0 through 3 and `keyboard.format_other_keys` is `xterm-27` or `csi-u`.

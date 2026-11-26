@@ -2,7 +2,7 @@
 //! The two private host names can only be resolved by their preceding test jump.
 use anyhow::Result;
 use russh::{
-    Channel, ChannelId, ChannelOpenFailure, Pty,
+    Channel, ChannelId, ChannelOpenFailure, Preferred, Pty, cipher, kex,
     keys::{
         Algorithm, EcdsaCurve, HashAlg, PrivateKey, PublicKey,
         ssh_key::{LineEnding, certificate},
@@ -10,6 +10,7 @@ use russh::{
     server,
 };
 use std::{
+    borrow::Cow,
     fmt::Write,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -38,6 +39,16 @@ const HOSTS: [&str; 3] = [
 ];
 const USERS: [&str; 3] = ["outer-user", "inner-user", "shell-user"];
 const PROBE: &[u8] = b"through-both-jumps";
+const INSPECTION_KEX: [kex::Name; 3] = [
+    kex::CURVE25519,
+    kex::CURVE25519_PRE_RFC_8731,
+    kex::MLKEM768X25519_SHA256,
+];
+const INSPECTION_CIPHERS: [cipher::Name; 3] = [
+    cipher::AES_128_CTR,
+    cipher::AES_256_GCM,
+    cipher::CHACHA20_POLY1305,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Seen {
@@ -152,10 +163,14 @@ impl Fixture {
         Self::start_with_aliases(None).await
     }
     async fn start_with_aliases(aliases: Option<[&str; 3]>) -> Result<Self> {
-        Self::start_route(aliases, None).await
+        Self::start_route(aliases, None, false).await
     }
 
-    async fn start_route(aliases: Option<[&str; 3]>, stall: Option<usize>) -> Result<Self> {
+    async fn start_route(
+        aliases: Option<[&str; 3]>,
+        stall: Option<usize>,
+        inspect_algorithms: bool,
+    ) -> Result<Self> {
         let keys = tempfile::tempdir()?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut endpoints = Vec::new();
@@ -218,10 +233,20 @@ impl Fixture {
                 host_key: Some(host.public_key().fingerprint(HashAlg::Sha256).to_string()),
                 host_key_alias: alias.map(str::to_owned),
             });
+            let mut preferred = Preferred::default();
+            if inspect_algorithms {
+                let mut kex = vec![INSPECTION_KEX[index]];
+                if index != 0 {
+                    kex.push(kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER);
+                }
+                preferred.kex = Cow::Owned(kex);
+                preferred.cipher = Cow::Owned(vec![INSPECTION_CIPHERS[index]]);
+            }
             let config = Arc::new(server::Config {
                 certificates: vec![cert.sign(&ca)?],
                 keys: vec![host],
                 auth_rejection_time: Duration::ZERO,
+                preferred,
                 ..Default::default()
             });
             let peer = Peer {
@@ -363,11 +388,15 @@ async fn per_hop_trust_aliases_validate_certificates_without_changing_forwarding
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inspection_reports_each_verified_peer_in_connection_order() {
-    let fixture = Fixture::start_with_aliases(Some([
-        "outer-inspect.invalid",
-        "inner-inspect.invalid",
-        "destination-inspect.invalid",
-    ]))
+    let fixture = Fixture::start_route(
+        Some([
+            "outer-inspect.invalid",
+            "inner-inspect.invalid",
+            "destination-inspect.invalid",
+        ]),
+        None,
+        true,
+    )
     .await
     .unwrap();
     let session = Session::start(Source::Ssh(fixture.options.clone()));
@@ -435,11 +464,13 @@ async fn inspection_reports_each_verified_peer_in_connection_order() {
         .map(SshOptions::from)
         .chain(std::iter::once(fixture.options.clone()));
     assert_eq!(route.jump_hosts.len(), 2);
-    for (peer, expected) in route
+    let expected_host_keys = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp521"];
+    for (index, (peer, expected)) in route
         .jump_hosts
         .iter()
         .chain([&route.destination])
         .zip(expected)
+        .enumerate()
     {
         assert_eq!(
             (&peer.host, &peer.user, peer.port),
@@ -447,6 +478,11 @@ async fn inspection_reports_each_verified_peer_in_connection_order() {
         );
         assert_eq!(Some(&peer.key_fingerprint), expected.host_key.as_ref());
         assert_eq!(peer.host_key_alias, expected.host_key_alias);
+        let algorithms = peer.initial_algorithms.as_ref().unwrap();
+        assert_eq!(algorithms.key_exchange, INSPECTION_KEX[index].as_ref());
+        assert_eq!(algorithms.host_key, expected_host_keys[index]);
+        assert_eq!(algorithms.cipher, INSPECTION_CIPHERS[index].as_ref());
+        assert_eq!(algorithms.strict_key_exchange, index != 0);
     }
 }
 
@@ -543,7 +579,9 @@ async fn refused_forward_stops_before_the_next_ssh_handshake() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_key_exchange_expires_and_closes_a_direct_or_forwarded_stream() {
     for stalled in [0, 1, 2] {
-        let mut fixture = Fixture::start_route(None, Some(stalled)).await.unwrap();
+        let mut fixture = Fixture::start_route(None, Some(stalled), false)
+            .await
+            .unwrap();
         let seconds = Some(1.try_into().unwrap());
         if let Some(hop) = fixture.options.proxy_jump.get_mut(stalled) {
             hop.connect_timeout_seconds = seconds;

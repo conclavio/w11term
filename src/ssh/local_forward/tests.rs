@@ -55,11 +55,11 @@ async fn peer() -> Result<(ConnectionShare, mpsc::UnboundedReceiver<Offer>)> {
             .await?
             .await
     });
-    let (mut handle, fingerprint) =
+    let (mut handle, verified) =
         transport::key_exchange(&options, None, None, client, None).await?;
     transport::authenticate(&mut handle, &options, None, &mut None).await?;
     Ok((
-        ConnectionShare::new(handle, options, None, fingerprint, None),
+        ConnectionShare::new(handle, options, None, verified, None),
         pending,
     ))
 }

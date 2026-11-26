@@ -88,11 +88,19 @@ try {
     $null = Wait-Until 'the verified SSH key and destination match the control reply' {
         $route = (Inspect).ssh
         $destination = $route.destination
+        $algorithms = $destination.initial_algorithms
+        $strictKex = if ($algorithms.strict_key_exchange) { 'On' } else { 'Off' }
         $destination.host -ceq $peer.host -and $destination.user -ceq $peer.user -and
             $destination.port -eq $peer.port -and $destination.key_fingerprint -ceq $peer.host_key -and
+            $algorithms.host_key -ceq 'ssh-ed25519' -and $algorithms.cipher -and $algorithms.key_exchange -and
+            $algorithms.strict_key_exchange -is [bool] -and
             @($route.jump_hosts).Count -eq 0 -and
             (Find-Element "Destination   $($peer.user)@$($peer.host):$($peer.port)") -and
-            (Find-Element "Host key   $($peer.host_key)")
+            (Find-Element "Host key   $($peer.host_key)") -and
+            (Find-Element "Key exchange   $($algorithms.key_exchange)") -and
+            (Find-Element "Host-key algorithm   ssh-ed25519") -and
+            (Find-Element "Cipher   $($algorithms.cipher)") -and
+            (Find-Element "Strict key exchange   $strictKex")
     }
     Set-NativeExpansion 'Verified SSH route' $false
     $null = Wait-Until 'inspector geometry and resize mode match the CLI' {

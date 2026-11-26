@@ -1,5 +1,6 @@
 use super::durability::{LifecycleError, Program};
 use super::game_resume;
+use super::negotiation::{InitialSshAlgorithms, VerifiedHandshake};
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use super::{ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT};
 use crate::{
@@ -145,10 +146,16 @@ pub(crate) struct Handler {
     options: SshOptions,
     prompts: Option<Prompts>,
     known_hosts: std::path::PathBuf,
-    fingerprint: Arc<std::sync::OnceLock<String>>,
+    presented_host: Arc<OnceLock<PresentedHost>>,
+    initial_algorithms: Arc<OnceLock<russh::Names>>,
     durable_peer: Option<String>,
     handshake_clock: watch::Sender<Option<Instant>>,
     pause_trust_deadline: bool,
+}
+
+struct PresentedHost {
+    fingerprint: String,
+    certificate: bool,
 }
 
 // OpenSSH uses a host-key alias verbatim, even for a connection on another
@@ -193,6 +200,17 @@ impl Handler {
 }
 impl client::Handler for Handler {
     type Error = anyhow::Error;
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        names: &russh::Names,
+        _: &mut client::Session,
+    ) -> Result<()> {
+        self.initial_algorithms.get_or_init(|| names.clone());
+        Ok(())
+    }
+
     async fn check_server_key(&mut self, presented: &PublicKeyOrCertificate) -> Result<bool> {
         let key = presented.public_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
@@ -204,7 +222,13 @@ impl client::Handler for Handler {
             return Err(stop("SSH host key differs from the saved durable session"));
         }
         ensure!(
-            self.fingerprint.get_or_init(|| fingerprint.clone()) == &fingerprint,
+            self.presented_host
+                .get_or_init(|| PresentedHost {
+                    fingerprint: fingerprint.clone(),
+                    certificate: presented.certificate().is_some(),
+                })
+                .fingerprint
+                == fingerprint,
             Permanent("SSH peer changed its host key during this connection".into())
         );
         match self.known(presented) {
@@ -489,7 +513,7 @@ async fn connect(
             .connect_timeout_seconds
             .map(|seconds| now + Duration::from_secs(seconds.get().into()));
         let open_deadline = deadline.unwrap_or_else(|| now + Duration::from_secs(15));
-        let (mut handle, fingerprint) = if let Some(hop) = &upstream {
+        let (mut handle, verified) = if let Some(hop) = &upstream {
             report(ConnectionStep::OpeningJumpChannel).await?;
             let handle = hop.handle();
             let channel = tokio::time::timeout_at(
@@ -541,11 +565,7 @@ async fn connect(
             .await
             .with_context(|| format!("SSH authentication for {address}"))?;
         upstream = Some(ConnectionShare::new(
-            handle,
-            endpoint,
-            prompts,
-            fingerprint,
-            upstream,
+            handle, endpoint, prompts, verified, upstream,
         ));
     }
     upstream.context("missing SSH destination")
@@ -577,7 +597,7 @@ pub(super) async fn key_exchange(
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     deadline: Option<Instant>,
-) -> Result<(client::Handle<Handler>, String)> {
+) -> Result<(client::Handle<Handler>, VerifiedHandshake)> {
     let known_hosts = match prompts.and_then(Prompts::known_hosts) {
         Some(path) => std::path::PathBuf::from(path),
         None => {
@@ -609,7 +629,8 @@ pub(super) async fn key_exchange(
         keepalive_max: options.keepalive.max_unanswered.get() as usize,
         ..Default::default()
     });
-    let fingerprint = Arc::new(std::sync::OnceLock::new());
+    let presented_host = Arc::new(OnceLock::new());
+    let initial_algorithms = Arc::new(OnceLock::new());
     let (handshake_clock, mut clock) = watch::channel(Some(
         deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(300)),
     ));
@@ -621,7 +642,8 @@ pub(super) async fn key_exchange(
             options: options.clone(),
             prompts: prompts.cloned(),
             known_hosts,
-            fingerprint: fingerprint.clone(),
+            presented_host: presented_host.clone(),
+            initial_algorithms: initial_algorithms.clone(),
             durable_peer: durable_peer.map(str::to_owned),
             handshake_clock,
             pause_trust_deadline: deadline.is_some(),
@@ -633,12 +655,17 @@ pub(super) async fn key_exchange(
         () = handshake_deadline::expired(&mut clock) => anyhow::bail!("SSH handshake timed out"),
     };
     let _ = complete.send(());
+    let host = presented_host
+        .get()
+        .context("SSH peer did not supply an authenticated host key")?;
     Ok((
         session,
-        fingerprint
-            .get()
-            .context("SSH peer did not supply an authenticated host key")?
-            .clone(),
+        VerifiedHandshake {
+            fingerprint: host.fingerprint.clone(),
+            initial_algorithms: initial_algorithms
+                .get()
+                .map(|names| InitialSshAlgorithms::read(names, host.certificate)),
+        },
     ))
 }
 fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOptions) {
