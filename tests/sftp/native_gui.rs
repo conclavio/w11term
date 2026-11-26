@@ -766,6 +766,41 @@ async fn native_profile_order_survives_restart_and_launches_the_selected_backend
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches the native new-tab profiles and revalidates the offered SSH endpoint"]
+async fn native_profile_finder_matches_address_and_opens_ssh_and_powershell() {
+    let (Source::Ssh(ssh), _remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    for number in 1..=18 {
+        let label = format!("Fleet {number:02}");
+        profiles.insert(
+            label,
+            json!({"host":format!("fleet-{number:02}.invalid"),"user":"ops","auth":"none"}),
+        );
+    }
+    profiles.insert("Fleet North".into(), serde_json::to_value(ssh).unwrap());
+    profiles.insert(
+        "Palette PowerShell".into(),
+        json!({"backend":"local","executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}),
+    );
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":profiles})).unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("profile-finder-ui.ps1", state.path());
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        1,
+        "only the selected SSH shell"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "verifies per-profile scrollback retention across a live SSH tab and two PowerShell processes"]
 async fn native_profile_scrollback_limits_apply_to_new_panes_and_preserve_live_history() {
     let mut history = String::new();

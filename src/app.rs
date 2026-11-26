@@ -3699,13 +3699,7 @@ impl TerminalApp {
                     )
                 }),
             );
-        let plus = title_tools::button("New tab")
-            .content(FontIcon::new().glyph("\u{e710}"))
-            // Reactor 0.100 cannot currently nest a Menu owner under a Tooltip wrapper.
-            .menu(Menu::new(
-                self.profile_items(),
-                context.callback(Message::ProfileMenu),
-            ));
+        let plus = title_tools::new_tab_button(self.profile_items(), context);
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
@@ -3777,18 +3771,17 @@ impl TerminalApp {
     }
 
     fn profile_items(&self) -> Vec<MenuItem> {
-        let mut menu: Vec<_> = self
-            .catalog
-            .profile_order
-            .iter()
-            .map(|name| {
-                if let Some(ssh) = self.catalog.profiles.get(name) {
-                    MenuItem::item(format!("profile:{name}"), profile_label(name, ssh))
-                } else {
-                    MenuItem::item(format!("local:{name}"), format!("{name} · Local"))
-                }
-            })
-            .collect();
+        let mut menu = vec![
+            MenuItem::item("find-profile", command_palette::FIND_PROFILE_LABEL),
+            MenuItem::separator("profile-search-end"),
+        ];
+        menu.extend(self.catalog.profile_order.iter().map(|name| {
+            if let Some(ssh) = self.catalog.profiles.get(name) {
+                MenuItem::item(format!("profile:{name}"), profile_label(name, ssh))
+            } else {
+                MenuItem::item(format!("local:{name}"), format!("{name} · Local"))
+            }
+        }));
         if self.profile_error.is_some() {
             menu.push(MenuItem::disabled("error", "Could not load profiles"));
         }
@@ -6506,7 +6499,9 @@ impl Component for TerminalApp {
                 }
             },
             Message::ProfileMenu(label) => {
-                if label == NEW_PROFILE {
+                if label == command_palette::FIND_PROFILE_LABEL {
+                    self.open_profile_search(context);
+                } else if label == NEW_PROFILE {
                     self.utility(false, context);
                 } else if label == quick_connect::LABEL {
                     self.open_quick_connect(context);
@@ -6583,9 +6578,9 @@ impl Component for TerminalApp {
                 self.refresh_notification_visibility();
                 self.refresh_remote_clipboard_focus();
                 self.header.borrow_mut().take();
-                self.refresh_open_commands();
                 self.caret_interval = crate::cursor_blink::system_interval();
                 self.refresh_profiles();
+                self.refresh_open_commands();
                 for entry in self.tabs.entries() {
                     if let Page::Terminal(live) = &entry.value.page
                         && let Some(shares) = &live.folder_sharing

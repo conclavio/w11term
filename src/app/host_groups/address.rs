@@ -1,7 +1,7 @@
 use std::net::Ipv6Addr;
 use w11term::options::SshOptions;
 
-pub(super) fn display(user: &str, host: &str, port: u16) -> String {
+pub(in crate::app) fn display(user: &str, host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("{user}@[{host}]:{port}")
     } else {

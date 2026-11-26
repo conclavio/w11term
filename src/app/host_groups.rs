@@ -51,6 +51,7 @@ mod save_command;
 mod saved;
 mod transfer;
 
+pub(super) use address::display as ssh_address;
 pub(super) use live_output::displayed_line;
 pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffer};
 pub(super) use reconnect::FailedLogin;

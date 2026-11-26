@@ -632,6 +632,13 @@ impl TerminalApp {
         self.start_picker(Mode::Commands(command_palette::Search::Tabs), ctx);
     }
 
+    pub(super) fn open_profile_search(&mut self, ctx: &ComponentContext<Self>) {
+        if self.picker.is_none() {
+            self.start_picker(Mode::Commands(command_palette::Search::Profiles), ctx);
+            self.restore_picker_focus_after_menu(ctx);
+        }
+    }
+
     pub(super) fn open_bookmark_search(
         &mut self,
         origin: clipboard_paste::Origin,
@@ -809,6 +816,13 @@ impl TerminalApp {
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
+            Mode::Commands(command_palette::Search::Profiles) => {
+                if self.profile_error.is_some() {
+                    Vec::new()
+                } else {
+                    command_palette::profile_search_rows(&self.catalog, query)
+                }
+            }
             Mode::Commands(command_palette::Search::Bookmarks(origin, screen)) => {
                 self.bookmark_rows(origin, screen, query)
             }
@@ -853,6 +867,10 @@ impl TerminalApp {
             return;
         }
         // A profile, pane, selection, or remote connection can change while the palette is open.
+        if picker.mode == Mode::Commands(command_palette::Search::Profiles) {
+            self.refresh_profiles();
+        }
+        let Some(picker) = &self.picker else { return };
         let rows = self.picker_command_rows(picker.mode, &picker.query);
         if rows.iter().any(|r| r.id == id && r.enabled) {
             self.close_picker(ctx);
@@ -902,6 +920,10 @@ impl TerminalApp {
             return;
         }
         self.update(Message::Shortcut(shortcut), ctx);
+        self.restore_picker_focus_after_menu(ctx);
+    }
+
+    fn restore_picker_focus_after_menu(&self, ctx: &ComponentContext<Self>) {
         if let Some(picker) = &self.picker {
             let launch = picker.launch.clone();
             // WinUI's MenuFlyout restores focus to its owner when it closes.
@@ -961,7 +983,10 @@ impl TerminalApp {
             self.finish_switcher(false, ctx);
         }
         let (matches, commands) = if mode.has_commands() {
-            if mode == Mode::Commands(command_palette::Search::Window) {
+            if matches!(
+                mode,
+                Mode::Commands(command_palette::Search::Window | command_palette::Search::Profiles)
+            ) {
                 self.refresh_profiles();
             }
             if matches!(

@@ -69,6 +69,45 @@ pub(super) fn below(text: impl Into<String>) -> Tooltip {
     Tooltip::text(text).placement(TooltipPlacement::Bottom)
 }
 
+pub(super) fn new_tab_button(items: Vec<MenuItem>, ctx: &ViewContext<TerminalApp>) -> View {
+    View::component::<NewTabMenu>(NewTabInput {
+        items,
+        sender: ctx.sender(),
+    })
+}
+
+struct NewTabMenu(LocalSender<Message>);
+
+#[derive(Clone)]
+struct NewTabInput {
+    items: Vec<MenuItem>,
+    sender: LocalSender<Message>,
+}
+
+impl PartialEq for NewTabInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
+impl Component for NewTabMenu {
+    type Input = NewTabInput;
+    type Message = ();
+
+    fn create(input: &NewTabInput, _: &ComponentContext<Self>) -> Self {
+        Self(input.sender.clone())
+    }
+
+    fn view(&self, input: &NewTabInput, _: &mut ViewContext<Self>) -> View {
+        button("New tab")
+            .content(FontIcon::new().glyph("\u{e710}"))
+            .menu(Menu::new(
+                input.items.clone(),
+                self.0.callback(Message::ProfileMenu),
+            ))
+    }
+}
+
 impl TerminalApp {
     pub(super) fn scrollback_find_item(&self) -> MenuItem {
         self.binding_menu_enabled(

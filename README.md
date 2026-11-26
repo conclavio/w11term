@@ -71,6 +71,8 @@ Results show the text present when you searched. Use **Refresh** to include late
 
 The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. The title-bar icons toggle SFTP files in an SSH pane, open **Pane layout**, open scrollback Find, and open the command palette or Attention inbox. When tabs crowd the title bar, **Terminal tools** groups SFTP, pane layout, Find, and the command palette beside the inbox. **More** (the ellipsis) includes those commands alongside Workspaces, SSH host groups, SFTP transfers, Attention inbox, and Settings.
 
+Choose **+ → Find profile…** to search launchable profiles by name or SSH address, including the username and port. Search words can appear in any order. Press Enter to open the selected profile in a new tab or Escape to return without opening anything. Local shell profiles appear alongside SSH profiles. **Find profile…** is also available in the command palette.
+
 To reorder the selected tab, drag it or use **Move tab left** or **Move tab right** in **More** or the command palette. Both actions can be assigned shortcuts under **Settings → Keyboard**. Moving a tab keeps the same pane focused. Numbered tab shortcuts follow the new order. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Choose **More → Find tab…** or search for **Find tab** in the command palette. Search this window by tab title or position, including SSH groups and utility tabs beyond the visible strip. Use Up and Down to choose a match, Enter to switch and Escape to keep your current tab. Assign a shortcut for **Find tab** under **Settings → Keyboard**.

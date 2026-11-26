@@ -5,11 +5,13 @@ use w11term::terminal::BookmarkScreen;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
+pub(super) const FIND_PROFILE_LABEL: &str = "Find profile…";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Search {
     Window,
     Tabs,
+    Profiles,
     GroupLibrary(TabId),
     GroupRecent(TabId),
     GroupRuns(TabId),
@@ -22,6 +24,7 @@ impl Search {
         match self {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
+            Self::Profiles => "Search profiles",
             Self::Bookmarks(..) => "Search scrollback bookmarks",
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
@@ -48,6 +51,7 @@ impl Search {
             }
             Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
+            Self::Profiles => "No matching profiles",
             Self::Bookmarks(..) if query.is_empty() => "No retained scrollback bookmarks",
             Self::Bookmarks(..) => "No matching scrollback bookmarks",
             _ => "No matching commands",
@@ -115,6 +119,7 @@ pub enum CommandId {
     OpenExplorer(Option<directory_split::Origin>),
     CopyCurrentDirectory(Option<directory_split::Origin>),
     Profile(String),
+    LaunchProfile(String, Option<String>),
     Shortcut(Shortcut),
 }
 
@@ -178,6 +183,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                     CommandId::Profile(_)
                         if key != "new-profile".into()
                             && key != "quick-connect".into()
+                            && key != "find-profile".into()
                             && key != "lab".into() =>
                     {
                         (format!("New tab with {label}"), String::new())
@@ -231,6 +237,38 @@ fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
         )
     });
     rows
+}
+
+pub(super) fn profile_search_rows(catalog: &Profiles, query: &str) -> Vec<Row> {
+    let query = query.trim().to_lowercase();
+    let words: Vec<_> = query.split_whitespace().collect();
+    let mut matches = Vec::new();
+    for name in &catalog.profile_order {
+        let endpoint = catalog
+            .profiles
+            .get(name)
+            .map(|ssh| host_groups::ssh_address(&ssh.user, &ssh.host, ssh.port));
+        let details = endpoint.as_deref().unwrap_or("Local");
+        let lower_name = name.to_lowercase();
+        let lower_details = details.to_lowercase();
+        if words
+            .iter()
+            .all(|word| lower_name.contains(word) || lower_details.contains(word))
+        {
+            let rank = (lower_name != query, !lower_name.starts_with(&query));
+            matches.push((
+                rank,
+                Row {
+                    label: format!("{name} · {details}"),
+                    id: CommandId::LaunchProfile(name.clone(), endpoint),
+                    chord: String::new(),
+                    enabled: true,
+                },
+            ));
+        }
+    }
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, row)| row).collect()
 }
 
 impl TerminalApp {
@@ -850,6 +888,12 @@ impl TerminalApp {
                 attention::set_long_commands(origin, enabled)
             }
             CommandId::Profile(label) => Message::ProfileMenu(label),
+            CommandId::LaunchProfile(name, _) => {
+                if let Some(source) = self.catalog.source(&name) {
+                    self.open(name.clone(), source, Some(name), ctx);
+                }
+                return;
+            }
             CommandId::Menu(label) => tab_menu_message(label),
             CommandId::MoveTabToExistingWindow(group, window) => {
                 Message::MoveTabToExistingWindow(group, window)
@@ -885,6 +929,7 @@ pub(super) fn view(
     let trimming = if matches!(
         mode,
         Search::Tabs
+            | Search::Profiles
             | Search::GroupRecent(_)
             | Search::GroupRuns(_)
             | Search::WindowGroupRuns(_)
@@ -900,7 +945,11 @@ pub(super) fn view(
             TextBox::new()
                 .element_ref(input)
                 .text(query)
-                .placeholder_text(search_label)
+                .placeholder_text(if mode == Search::Profiles {
+                    "Search by profile name or SSH address"
+                } else {
+                    search_label
+                })
                 .automation_name(search_label)
                 .on_text_changed(ctx.callback(Message::PickerQuery)),
             Button::new()
@@ -908,6 +957,7 @@ pub(super) fn view(
                 .style(ButtonStyle::Subtle)
                 .automation_name(match mode {
                     Search::Tabs => "Close tab search",
+                    Search::Profiles => "Close profile search",
                     Search::Bookmarks(..) => "Close bookmark search",
                     _ => "Close command palette",
                 })
@@ -953,7 +1003,13 @@ pub(super) fn view(
                 app.picker
                     .as_ref()
                     .and_then(|picker| picker.bookmark_status(app))
-                    .unwrap_or_else(|| mode.empty(query)),
+                    .unwrap_or_else(|| {
+                        if mode == Search::Profiles && app.profile_error.is_some() {
+                            "Could not load profiles"
+                        } else {
+                            mode.empty(query)
+                        }
+                    }),
             ),
         ));
     } else if rows.len() > page {
@@ -965,10 +1021,10 @@ pub(super) fn view(
                 .spacing(8.0)
                 .children((
                     Button::new()
-                        .automation_name(if mode == Search::Tabs {
-                            "Previous tabs"
-                        } else {
-                            "Previous commands"
+                        .automation_name(match mode {
+                            Search::Tabs => "Previous tabs",
+                            Search::Profiles => "Previous profiles",
+                            _ => "Previous commands",
                         })
                         .is_enabled(first > 0)
                         .on_click(ctx.callback(move |_| {
@@ -979,10 +1035,10 @@ pub(super) fn view(
                         .vertical_alignment(VerticalAlignment::Center)
                         .text(format!("{}–{last} of {}", first + 1, rows.len())),
                     Button::new()
-                        .automation_name(if mode == Search::Tabs {
-                            "Next tabs"
-                        } else {
-                            "Next commands"
+                        .automation_name(match mode {
+                            Search::Tabs => "Next tabs",
+                            Search::Profiles => "Next profiles",
+                            _ => "Next commands",
                         })
                         .is_enabled(last < rows.len())
                         .on_click(ctx.callback(move |_| {
@@ -1004,6 +1060,52 @@ pub(super) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_search_keeps_catalog_order_and_matches_names_and_addresses() {
+        let mut catalog = Profiles::default();
+        catalog.local.insert(
+            "Terminal lab".into(),
+            serde_json::from_value(serde_json::json!({"executable": "powershell.exe"})).unwrap(),
+        );
+        let ssh = serde_json::from_value::<SshOptions>(serde_json::json!({
+            "host": "2001:db8::1", "port": 6789, "user": "ops", "auth": "none"
+        }))
+        .unwrap();
+        catalog.profiles.insert("West lab".into(), ssh.clone());
+        catalog
+            .profiles
+            .insert("West    lab".into(), SshOptions { port: 6792, ..ssh });
+        catalog.profile_order = ["Terminal lab", "West    lab", "West lab"]
+            .map(String::from)
+            .into();
+
+        let labels = |query| {
+            profile_search_rows(&catalog, query)
+                .into_iter()
+                .map(|row| row.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(""),
+            [
+                "Terminal lab · Local",
+                "West    lab · ops@[2001:db8::1]:6792",
+                "West lab · ops@[2001:db8::1]:6789",
+            ]
+        );
+        assert_eq!(labels("LOCAL LAB"), ["Terminal lab · Local"]);
+        assert_eq!(
+            labels("6789 WEST OPS"),
+            ["West lab · ops@[2001:db8::1]:6789"]
+        );
+        assert_eq!(labels("west lab")[0], "West lab · ops@[2001:db8::1]:6789");
+        assert!(labels("west east").is_empty());
+        assert_eq!(
+            profile_search_rows(&catalog, "6792")[0].id,
+            CommandId::LaunchProfile("West    lab".into(), Some("ops@[2001:db8::1]:6792".into()))
+        );
+    }
 
     #[test]
     fn select_all_menu_and_palette_share_the_configured_chord() {
