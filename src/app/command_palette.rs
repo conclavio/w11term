@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 use w11term::terminal::BookmarkScreen;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
+pub(super) const FIND_WINDOW_LABEL: &str = "Find window…";
 pub(super) const FIND_CLOSED_TAB_LABEL: &str = "Recently closed tabs…";
 pub(super) const FIND_COMMAND_HISTORY_LABEL: &str = "Find command history…";
 pub(super) const FIND_RUNNING_COMMANDS_LABEL: &str = "Find running commands…";
@@ -22,6 +23,7 @@ pub enum ProfileDestination {
 pub(super) enum Search {
     Window,
     Tabs,
+    Windows,
     ClosedTabs,
     CommandHistory,
     RunningCommands,
@@ -42,6 +44,7 @@ impl Search {
         match self {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
+            Self::Windows => "Search windows",
             Self::ClosedTabs => "Search closed tabs",
             Self::CommandHistory => "Search commands across panes",
             Self::RunningCommands => "Search running commands",
@@ -79,6 +82,7 @@ impl Search {
             }
             Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
+            Self::Windows => "No matching windows",
             Self::ClosedTabs if query.trim().is_empty() => "No recently closed tab layouts",
             Self::ClosedTabs => "No matching closed tabs",
             Self::CommandHistory if query.trim().is_empty() => {
@@ -140,6 +144,7 @@ pub enum CommandId {
     SearchWindowGroupRuns(WindowRunScope),
     WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(u64, TabId),
+    FocusWindow(u64),
     FocusRunningCommand(u64, w11term::events::RunningCommandTarget),
     OpenWindowCommand(
         u64,
@@ -319,8 +324,8 @@ pub(super) fn profile_search_rows(
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SearchTab {
-    group: TabId,
-    title: String,
+    pub(super) group: TabId,
+    pub(super) title: String,
 }
 
 fn search_tabs(
@@ -975,6 +980,9 @@ impl TerminalApp {
             CommandId::FocusTab(window, group) => {
                 return self.request_window_tab(window, group, ctx);
             }
+            CommandId::FocusWindow(window) => {
+                return self.request_window_result(window, tab_windows::SearchTarget::Window);
+            }
             CommandId::FocusRunningCommand(pane, target) => {
                 self.focus_running_command(pane, target, ctx);
                 return;
@@ -1120,9 +1128,11 @@ pub(super) fn view(
     let page = ((app.window_height - search_height) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
     let search_label = mode.placeholder();
+    let window_details = mode == Search::Windows;
     let trimming = if matches!(
         mode,
         Search::Tabs
+            | Search::Windows
             | Search::ClosedTabs
             | Search::CommandHistory
             | Search::RunningCommands
@@ -1154,6 +1164,7 @@ pub(super) fn view(
                 .style(ButtonStyle::Subtle)
                 .automation_name(match mode {
                     Search::Tabs => "Close tab search",
+                    Search::Windows => "Close window search",
                     Search::CommandHistory => "Close command history search",
                     Search::RunningCommands
                         if running
@@ -1190,13 +1201,24 @@ pub(super) fn view(
             .on_click(ctx.callback(move |_| Message::PaletteChoose(id.clone())))
             .content(
                 Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto])
+                    .columns(if window_details {
+                        [GridLength::Star(3.0), GridLength::Star(2.0)]
+                    } else {
+                        [GridLength::STAR, GridLength::Auto]
+                    })
                     .children((
                         TextBlock::new()
                             .text(&row.label)
                             .text_trimming(trimming)
                             .horizontal_alignment(HorizontalAlignment::Left),
-                        TextBlock::new().grid_column(1).text(&row.chord),
+                        TextBlock::new()
+                            .grid_column(1)
+                            .text(&row.chord)
+                            .text_trimming(if window_details {
+                                TextTrimming::CharacterEllipsis
+                            } else {
+                                TextTrimming::None
+                            }),
                     )),
             );
         results.push(KeyedView::new(index, button));
@@ -1232,6 +1254,7 @@ pub(super) fn view(
                     Button::new()
                         .automation_name(match mode {
                             Search::Tabs => "Previous tabs",
+                            Search::Windows => "Previous windows",
                             Search::Profiles(_) => "Previous profiles",
                             _ => "Previous commands",
                         })
@@ -1246,6 +1269,7 @@ pub(super) fn view(
                     Button::new()
                         .automation_name(match mode {
                             Search::Tabs => "Next tabs",
+                            Search::Windows => "Next windows",
                             Search::Profiles(_) => "Next profiles",
                             _ => "Next commands",
                         })

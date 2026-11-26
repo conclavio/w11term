@@ -243,6 +243,7 @@ pub enum Shortcut {
     CommandPalette,
     PanePicker,
     FindTab,
+    FindWindow,
     FindClosedTab,
     FindCommandHistory,
     FindAllPanes,
@@ -1881,6 +1882,7 @@ impl State {
                         Shortcut::CommandPalette
                             | Shortcut::PanePicker
                             | Shortcut::FindTab
+                            | Shortcut::FindWindow
                             | Shortcut::FindClosedTab
                             | Shortcut::FindCommandHistory
                             | Shortcut::FindAllPanes
@@ -1890,6 +1892,7 @@ impl State {
                             Shortcut::FindCommandHistory => PickerStage::CommandHistory,
                             Shortcut::CommandPalette
                             | Shortcut::FindTab
+                            | Shortcut::FindWindow
                             | Shortcut::FindClosedTab => PickerStage::Commands,
                             _ => PickerStage::Search,
                         });
@@ -2230,6 +2233,7 @@ impl From<Action> for Shortcut {
             Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
             Action::FindTab => Self::FindTab,
+            Action::FindWindow => Self::FindWindow,
             Action::FindClosedTab => Self::FindClosedTab,
             Action::FindCommandHistory => Self::FindCommandHistory,
             Action::Find => Self::Find,

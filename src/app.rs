@@ -1108,6 +1108,7 @@ fn tab_menu_message(label: String) -> Message {
         title_tools::FIND_SCROLLBACK => Message::Shortcut(Shortcut::Find),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         command_palette::FIND_TAB_LABEL => Message::Shortcut(Shortcut::FindTab),
+        command_palette::FIND_WINDOW_LABEL => Message::Shortcut(Shortcut::FindWindow),
         command_palette::FIND_CLOSED_TAB_LABEL => Message::Shortcut(Shortcut::FindClosedTab),
         command_palette::FIND_COMMAND_HISTORY_LABEL => {
             Message::Shortcut(Shortcut::FindCommandHistory)
@@ -4066,6 +4067,7 @@ impl TerminalApp {
                 Message::Shortcut(
                     shortcut @ (Shortcut::PanePicker
                     | Shortcut::FindTab
+                    | Shortcut::FindWindow
                     | Shortcut::FindClosedTab
                     | Shortcut::FindCommandHistory
                     | Shortcut::FindAllPanes
@@ -4441,6 +4443,11 @@ impl TerminalApp {
                 "find-tab",
                 command_palette::FIND_TAB_LABEL,
                 KeyAction::FindTab,
+            ),
+            self.binding_menu(
+                "find-window",
+                command_palette::FIND_WINDOW_LABEL,
+                KeyAction::FindWindow,
             ),
             self.binding_menu(
                 "find-all-panes",
@@ -7014,6 +7021,7 @@ impl Component for TerminalApp {
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
                 Shortcut::FindTab => self.open_tab_search(context),
+                Shortcut::FindWindow => self.open_window_picker(context),
                 Shortcut::FindClosedTab => self.open_closed_tab_search(context),
                 Shortcut::FindCommandHistory => self.open_window_command_history(context),
                 Shortcut::FindAllPanes => self.open_text_picker(context),

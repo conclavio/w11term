@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -107,6 +107,25 @@ function Open-TabSearch([IntPtr]$Hwnd, [string]$Query, [string]$Result) {
     }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
     $null = Wait-Until "tab search result '$Result'" { Find-Here $Hwnd $Result }
+}
+
+function Open-WindowSearch([IntPtr]$Hwnd, [string]$Query, [string]$Result) {
+    Use-Window $Hwnd
+    $window = $Hwnd
+    Press-Key 0x70 # F1, fixture Find window shortcut
+    $field = Wait-PickerEditor 'Search windows' "F1 for '$Query'"
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+    $null = Wait-Until "window search result '$Result'" { Find-Here $Hwnd $Result }
+}
+
+function Set-FixtureWindowName([IntPtr]$Hwnd, [string]$Name) {
+    Run-WindowCommand $Hwnd ('Rename window' + [char]0x2026)
+    $field = Wait-Until 'window name editor' { Find-Here $Hwnd 'Window name' }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Name)
+    Invoke-Button (Wait-Until 'enabled Save for window name' {
+        $button = Find-Here $Hwnd 'Save'
+        if ($button -and $button.Current.IsEnabled) { $button }
+    })
 }
 
 function Open-CrossWindowPaneSearch([IntPtr]$Hwnd, [string]$Query, [string]$Match) {
@@ -538,19 +557,61 @@ try {
         Close-FixtureWindow $destination
         $null = Wait-Until 'the sibling HWND closes' { [TabFixtureWindows]::OwnedBy($app.Id) -notcontains $destination }
         $last = $origin
+    } elseif ($FirstClose -eq 'WindowSearch') {
+        $separator = " $([char]0xb7) "
+        Set-FixtureWindowName $destination 'Production Fleet'
+        $null = Wait-Until 'the name dialog closes after saving' {
+            [TabFixtureWindows]::Title($destination) -ceq "w11term${separator}Production Fleet${separator}Cockpit tools"
+        }
+        Run-WindowCommand $destination ('New tab with Destination PowerShell' + $separator + 'Local')
+        $helper = Wait-Until 'the destination has a separate active PowerShell tab' {
+            (Control @('list')).sessions | Where-Object {
+                $_.label -eq 'Destination PowerShell' -and $_.window_id -eq $newOwner -and $_.active
+            }
+        }
+        Expect-Text $helper.id 'PS '
+        $background = (Control @('list')).sessions | Where-Object id -eq $ssh.id
+        Use-Window $origin
+        $null = [TabFixtureWindows]::ShowWindowAsync($destination, 7)
+        $null = Wait-Until 'inactive destination window minimizes' { [TabFixtureWindows]::IsIconic($destination) }
+        $result = "Window ${newOwner}${separator}Production Fleet    Destination PowerShell"
+        Open-WindowSearch $origin 'fleet destination' $result
+        $window = $origin
+        Press-Key 27
+        $null = Wait-Until 'Escape dismisses Find window' { !(Find-Here $origin 'Search windows') }
+        Expect-Focus $origin $anchor.id 'Escape leaves the original window active'
+        if (![TabFixtureWindows]::IsIconic($destination)) { throw 'Escape restored the destination window' }
+
+        Open-WindowSearch $origin 'Production Fleet' $result
+        Press-Key 13
+        Expect-Focus $destination $helper.id 'Find window restores the last active PowerShell tab'
+        if ([TabFixtureWindows]::IsIconic($destination)) { throw 'The destination did not restore' }
+        $hidden = (Control @('list')).sessions | Where-Object id -eq $ssh.id
+        if ($hidden.visible -or $hidden.tab_id -ne $background.tab_id -or
+            $hidden.connection_generation -ne $background.connection_generation) {
+            throw 'Window activation switched to or changed the background SSH tab'
+        }
+
+        Open-WindowSearch $origin "Window $newOwner" $result
+        $null = Control @('close-pane','--pane',"$($helper.id)")
+        $null = Wait-Until 'the open window picker shows the new active tab' {
+            Find-Here $origin "Window ${newOwner}${separator}Production Fleet    Cockpit tools"
+        }
+        Close-FixtureWindow $destination
+        $null = Wait-Until 'closed windows disappear from the existing picker' {
+            Find-Here $origin 'No matching windows'
+        }
+        $window = $origin
+        Press-Key 27
+        Expect-Focus $origin $anchor.id 'Closing a listed window leaves source focus intact'
+        $last = $origin
     } elseif ($FirstClose -eq 'WindowName') {
         $separator = " $([char]0xb7) "
         $name = 'Production Fleet'
         $rename = 'Rename window' + [char]0x2026
         $defaultTitle = "w11term${separator}Cockpit tools"
-        Run-WindowCommand $destination $rename
-        $field = Wait-Until 'window name editor' { Find-Here $destination 'Window name' }
         $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
-        $field.GetCurrentPattern($valuePattern).SetValue($name)
-        Invoke-Button (Wait-Until 'enabled Save for window name' {
-            $button = Find-Here $destination 'Save'
-            if ($button -and $button.Current.IsEnabled) { $button }
-        })
+        Set-FixtureWindowName $destination $name
         $null = Wait-Until 'native window title includes name and active tab' {
             [TabFixtureWindows]::Title($destination) -ceq "w11term${separator}${name}${separator}Cockpit tools"
         }

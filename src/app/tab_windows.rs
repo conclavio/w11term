@@ -34,6 +34,7 @@ struct WindowEndpoint {
     sender: LocalSender<Message>,
     outgoing: Weak<Transfer>,
     name: Option<TabTitle>,
+    active_group: Option<TabId>,
     tabs: Rc<[command_palette::SearchTab]>,
     panes: Rc<[pane_picker::SearchPane]>,
     search: Option<(SearchScope, std::sync::Weak<()>)>,
@@ -53,6 +54,7 @@ pub(super) enum SearchScope {
 }
 
 pub enum SearchTarget {
+    Window,
     Tab(TabId),
     Pane(u64),
 }
@@ -85,6 +87,48 @@ pub(super) fn window_query(query: &str) -> Option<(Option<u64>, String)> {
         }
     }
     Some((window_filter, words.join(" ")))
+}
+
+fn search_windows<'a>(
+    query: &str,
+    source: u64,
+    windows: impl IntoIterator<Item = (u64, Option<&'a TabTitle>, &'a str)>,
+) -> Vec<command_palette::Row> {
+    let Some((filter, query)) = window_query(query) else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    for (window, name, active_title) in windows {
+        if filter.is_some_and(|id| id != window) {
+            continue;
+        }
+        let label = window_label(window, name);
+        let label_lower = label.to_lowercase();
+        let title_lower = active_title.to_lowercase();
+        if !query
+            .split_whitespace()
+            .all(|word| label_lower.contains(word) || title_lower.contains(word))
+        {
+            continue;
+        }
+        let current = window == source;
+        let exact_name = name.is_some_and(|name| name.as_str().to_lowercase() == query);
+        matches.push((
+            (!exact_name, title_lower != query, current),
+            command_palette::Row {
+                id: command_palette::CommandId::FocusWindow(window),
+                label,
+                chord: if current {
+                    format!("{active_title} · Current")
+                } else {
+                    active_title.to_owned()
+                },
+                enabled: true,
+            },
+        ));
+    }
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, row)| row).collect()
 }
 
 thread_local! {
@@ -350,6 +394,7 @@ impl TerminalApp {
                                 sender: ctx.sender(),
                                 outgoing: Weak::new(),
                                 name: self.window_name.clone(),
+                                active_group: self.tabs.active_group_id(),
                                 tabs: self
                                     .tab_search_entries(
                                         self.appearance
@@ -440,15 +485,34 @@ impl TerminalApp {
         });
     }
 
+    pub(super) fn window_search_rows(&self, query: &str) -> Vec<command_palette::Row> {
+        WINDOWS.with_borrow(|windows| {
+            let choices = windows
+                .iter()
+                .filter(|(_, endpoint)| unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool())
+                .map(|(&window, endpoint)| {
+                    let title = endpoint
+                        .tabs
+                        .iter()
+                        .find(|tab| Some(tab.group) == endpoint.active_group)
+                        .map_or("Terminal", |tab| tab.title.as_str());
+                    (window, endpoint.name.as_ref(), title)
+                });
+            search_windows(query, self.registry.window_id(), choices)
+        })
+    }
+
     pub(super) fn publish_tab_search_entries(&self, follow_titles: bool) {
         let source = self.registry.window_id();
         let entries = self.tab_search_entries(follow_titles);
+        let active_group = self.tabs.active_group_id();
         let Some(subscribers) = WINDOWS.with_borrow_mut(|windows| {
             let endpoint = windows.get_mut(&source)?;
-            if endpoint.tabs.as_ref() == entries {
+            if endpoint.tabs.as_ref() == entries && endpoint.active_group == active_group {
                 return None;
             }
             endpoint.tabs = entries.into();
+            endpoint.active_group = active_group;
             Some(search_subscribers(windows, source, SearchScope::Tabs))
         }) else {
             return;
@@ -576,6 +640,13 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         let entry = match target {
+            SearchTarget::Window => {
+                if let Some(hwnd) = self.keyboard.hwnd() {
+                    foreground(hwnd);
+                    return;
+                }
+                None
+            }
             SearchTarget::Tab(group) => tab_title::switcher_leaf(&self.tabs.headers(), group),
             SearchTarget::Pane(pane) => self.tab_for_pane(pane),
         };
@@ -595,6 +666,7 @@ impl TerminalApp {
             }
             Some(_) => "The other window is busy. Try again after its current action finishes.",
             None => match target {
+                SearchTarget::Window => "That window is no longer available.",
                 SearchTarget::Tab(_) => "That tab has closed or moved to another window.",
                 SearchTarget::Pane(_) => "That pane has closed or moved to another window.",
             },
@@ -1142,6 +1214,34 @@ impl Drop for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_picker_combines_names_and_active_titles_and_keeps_window_ids_exact() {
+        use command_palette::CommandId;
+
+        let name = TabTitle::try_from("Production Fleet".to_string()).unwrap();
+        let windows = [
+            (1, Some(&name), "Local console"),
+            (2, Some(&name), "Build logs"),
+            (12, None, "Build logs"),
+        ];
+        let rows = search_windows("fleet BUILD", 1, windows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, CommandId::FocusWindow(2));
+        assert_eq!(rows[0].label, "Window 2 · Production Fleet");
+        assert_eq!(rows[0].chord, "Build logs");
+
+        let rows = search_windows("window 2 build", 1, windows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, CommandId::FocusWindow(2));
+        assert!(search_windows("window 2 window 12", 1, windows).is_empty());
+
+        let rows = search_windows("production fleet", 1, windows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, CommandId::FocusWindow(2));
+        assert_eq!(rows[1].id, CommandId::FocusWindow(1));
+        assert_eq!(rows[1].chord, "Local console · Current");
+    }
 
     #[test]
     fn existing_window_menu_routes_by_id_and_binds_the_selected_tab() {
