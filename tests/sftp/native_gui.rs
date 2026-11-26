@@ -864,6 +864,7 @@ async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
     let mut packets = serde_json::Map::new();
     let mut expected = Vec::new();
     for (witness, prefix, completion) in [
+        ("preview-update", "", ""),
         ("first-complete", "", "\x1b]133;D;17\x07"),
         ("not-rearmed", start, "\x1b]133;D;0\x07"),
         ("cancel-complete", start, "\x1b]133;D;9\x07"),

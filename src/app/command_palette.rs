@@ -1020,10 +1020,18 @@ pub(super) fn view(
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let narrow_history = app.width < 520.0;
+    let running = app
+        .picker
+        .as_ref()
+        .filter(|_| mode == Search::RunningCommands);
     let search_height = if mode == Search::CommandHistory {
         if narrow_history { 264.0 } else { 232.0 }
     } else if mode == Search::RunningCommands {
-        200.0
+        if running.is_some_and(pane_picker::Picker::running_output_open) {
+            352.0
+        } else {
+            244.0
+        }
     } else {
         156.0
     };
@@ -1169,13 +1177,11 @@ pub(super) fn view(
     });
     let history_export =
         history.map_or_else(View::empty, |picker| picker.history_export_button(app, ctx));
-    let running_command_watch = app
-        .picker
-        .as_ref()
-        .filter(|_| mode == Search::RunningCommands)
-        .map_or_else(View::empty, |picker| {
-            picker.running_command_watch_button(app, ctx)
-        });
+    let running_command_watch = running.map_or_else(View::empty, |picker| {
+        picker.running_command_watch_button(app, ctx)
+    });
+    let running_output =
+        running.map_or_else(View::empty, |picker| picker.running_output_view(app, ctx));
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
@@ -1183,6 +1189,7 @@ pub(super) fn view(
             StackPanel::new().spacing(4.0).keyed_children(results),
             history_export,
             running_command_watch,
+            running_output,
         )),
         (app.width - 32.0).clamp(1.0, 660.0),
     )

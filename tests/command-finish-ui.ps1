@@ -66,6 +66,35 @@ try {
     Wait-PickerEditor 'Search running commands' 'the background SSH command picker'
     $field = Find-Element 'Search running commands' ([System.Windows.Automation.ControlType]::Edit)
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('build')
+    $preview = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'recent-command-output')
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $null = Wait-Until 'output preview action' { Find-Element 'Show recent command output' }
+    Press-Key 0x78 # F9 opens the running output preview
+    $null = Wait-Until 'preview is open' { Find-Element 'Hide recent command output' }
+    try {
+        $null = Wait-Until 'recent SSH command output appears from the background pane' {
+            $text = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $preview)
+            $text -and ($text.Current.Name -split '\r?\n') -ccontains 'command-started'
+        }
+    } catch {
+        $visible = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+            ForEach-Object { "$($_.Current.AutomationId)=$($_.Current.Name)" } | Select-Object -First 45
+        throw "$_ Controls: $($visible -join ', ')"
+    }
+    Send-PeerOutput 'preview-update'
+    $null = Wait-Until 'new output appears in the same preview without changing panes' {
+        $text = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $preview)
+        if ($text) {
+            $lines = $text.Current.Name -split '\r?\n'
+            $lines -ccontains 'command-started' -and $lines[-1] -ceq 'preview-update'
+        }
+    }
+    Wait-Focus $local
+    Invoke-Button (Wait-Until 'hide the running output preview' { Find-Element 'Hide recent command output' })
+    $null = Wait-Until 'closing the preview removes the output text' {
+        !$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $preview)
+    }
     $armSelected = 'Notify when selected command finishes'
     $cancelSelected = 'Cancel selected command notification'
     Invoke-Button (Wait-Until 'arm the selected SSH command' { Find-Element $armSelected })

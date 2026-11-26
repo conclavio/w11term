@@ -45,6 +45,16 @@ impl LiveCommandOutput<'_> {
     /// Offer completed logical lines once. The current line can still be
     /// rewritten by the shell, so offer it only when the command finishes.
     pub fn read(&self, cursor: &mut LiveOutputCursor) -> LiveOutputBatch {
+        self.read_window(cursor, BATCH_ROWS)
+    }
+
+    /// Inspect recent screen rows, including the current unfinished line.
+    pub(crate) fn recent(mut self) -> LiveOutputBatch {
+        self.finishing = true;
+        self.read_window(&mut LiveOutputCursor::default(), 6)
+    }
+
+    fn read_window(&self, cursor: &mut LiveOutputCursor, row_limit: usize) -> LiveOutputBatch {
         let mut batch = LiveOutputBatch::default();
         let screen = self.screen;
         let (end_row, end_col) = self.end;
@@ -69,7 +79,7 @@ impl LiveCommandOutput<'_> {
         if (row, col) > (screen.phys_to_stable_row_index(end_row), end_col) {
             return batch;
         }
-        let floor = end_row.saturating_sub(BATCH_ROWS - 1);
+        let floor = end_row.saturating_sub(row_limit - 1);
         let (first, col) = match screen.stable_row_to_phys(row) {
             Some(first) if first >= floor => (first, col),
             _ => {

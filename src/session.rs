@@ -76,6 +76,10 @@ pub enum Command {
     DescribePane(tokio::sync::oneshot::Sender<PaneDescription>),
     Inspect(bool),
     WatchRunningCommand(RunningCommandTarget, bool),
+    ReadRunningOutput(
+        RunningCommandTarget,
+        tokio::sync::oneshot::Sender<RunningCommandOutput>,
+    ),
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<PaneInspection>),
     Replay {
@@ -377,6 +381,14 @@ fn has_cell_pixels(size: TerminalSize) -> bool {
         && size.rows > 0
         && size.pixel_width >= size.cols
         && size.pixel_height >= size.rows
+}
+
+#[derive(Debug)]
+pub enum RunningCommandOutput {
+    Unavailable,
+    Updating,
+    AlternateScreen,
+    Text { text: String, earlier_omitted: bool },
 }
 
 impl Session {
@@ -1445,6 +1457,14 @@ async fn run(
                         }
                         Ok(())
                     }
+                    Some(Command::ReadRunningOutput(target, reply)) => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(read_running_output(
+                                &terminal, &events, connection_generation, target,
+                            ));
+                        }
+                        Ok(())
+                    }
                     Some(Command::ReadModes(reply)) => {
                         if !reply.is_closed() {
                             let (inspection, _) = PaneInspection::read(
@@ -1898,6 +1918,45 @@ async fn run(
     }
 }
 
+fn read_running_output(
+    terminal: &wezterm_term::TerminalState,
+    events: &crate::events::Events,
+    generation: u64,
+    target: RunningCommandTarget,
+) -> RunningCommandOutput {
+    use RunningCommandOutput::*;
+    if events.shell_generation() != Some(generation)
+        || terminal
+            .running_command()
+            .is_none_or(|command| RunningCommandTarget::new(generation, &command) != target)
+    {
+        return Unavailable;
+    }
+    if terminal.synchronized_output() {
+        return Updating;
+    }
+    if terminal.is_alt_screen_active() {
+        return AlternateScreen;
+    }
+    let Some(batch) = terminal.recent_running_command_output() else {
+        return Unavailable;
+    };
+    let mut text = String::new();
+    for (index, line) in batch.lines.iter().enumerate() {
+        if index != 0 {
+            text.push('\n');
+        }
+        text.push_str(&line.text);
+        if line.shortened {
+            text.push('…');
+        }
+    }
+    Text {
+        text,
+        earlier_omitted: batch.gap,
+    }
+}
+
 fn send_notification_reply(
     writer: &mpsc::UnboundedSender<TransportInput>,
     generation: u64,
@@ -2117,6 +2176,50 @@ mod failure_tests {
         ssh.durable = false;
         ssh.player.rustmush = true;
         assert!(!direct_ssh_shell(&Source::Ssh(ssh), false, None));
+    }
+
+    #[test]
+    fn running_output_reads_only_the_selected_capture_and_bounds_the_tail() {
+        use RunningCommandOutput::{AlternateScreen, Text, Unavailable, Updating};
+        let (writer, _) = mpsc::unbounded_channel();
+        let mut terminal = terminal::create(
+            TerminalSize {
+                cols: 12,
+                rows: 4,
+                ..Default::default()
+            },
+            writer,
+        );
+        let events = crate::events::Events::default();
+        events.command_stream(Some(8));
+        terminal.advance_bytes(b"$ build\r\n\x1b]133;C\x07abcdefghijklmno\r\npartial");
+        let target = RunningCommandTarget::new(8, &terminal.running_command().unwrap());
+        let read =
+            |terminal: &wezterm_term::Terminal| read_running_output(terminal, &events, 8, target);
+        assert!(matches!(
+            read(&terminal),
+            Text { text, earlier_omitted: false } if text == "abcdefghijklmno\npartial"
+        ));
+
+        terminal.advance_bytes(b"\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\nlast");
+        assert!(matches!(
+            read(&terminal),
+            Text { text, earlier_omitted: true } if text == "3\n4\n5\n6\n7\nlast"
+        ));
+        terminal.advance_bytes(b"\x1b[?2026h-new");
+        assert!(matches!(read(&terminal), Updating));
+        terminal.advance_bytes(b"\x1b[?2026l");
+        assert!(matches!(read(&terminal), Text { text, .. } if text.ends_with("last-new")));
+
+        terminal.advance_bytes(b"\x1b[?1049hTUI");
+        assert!(matches!(read(&terminal), AlternateScreen));
+        terminal.advance_bytes(b"\x1b[?1049l");
+        assert!(matches!(read(&terminal), Text { text, .. } if text.ends_with("last-new")));
+        events.command_stream(Some(9));
+        assert!(matches!(read(&terminal), Unavailable));
+        events.command_stream(Some(8));
+        terminal.advance_bytes(b"\x1b]133;D;0\x07\x1b]133;C\x07other");
+        assert!(matches!(read(&terminal), Unavailable));
     }
 
     #[test]

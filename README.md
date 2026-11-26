@@ -691,6 +691,8 @@ When shell integration reports a command start, the inspector shows the running 
 
 Choose **Find running commands…** from More or the command palette to see active shell captures across the window, longest-running first. Search by command, starting directory, pane name, profile, or SSH address. **Enter** focuses the source pane, and **Esc** returns to the original pane. The list refreshes while open and removes completed or disconnected commands.
 
+Choose **Show recent command output** or press **F9** to preview up to six terminal rows from the highlighted command, including its current unfinished line. The preview updates about once a second and labels omitted rows. It leaves focus in your current pane and pauses during synchronized updates. Alternate-screen applications can be viewed in their source pane.
+
 Highlight a result and choose **Notify when selected command finishes** to watch it while keeping your current pane. The Attention inbox opens the capture from that notification. Choose **Cancel selected command notification** to disarm it. **F8** toggles the watch for the highlighted result. The watch ends if the selected capture is replaced or its session disconnects.
 
 For an SSH pane, the inspector shows the connection state and the current step and endpoint during login or reconnection. If the connection ends during a failed step, the inspector keeps the step and error visible. Once connected, expand **Verified SSH route** to see the destination and each jump host with its verified SHA256 host-key fingerprint and any configured host-key alias. Each peer shows the initial key exchange, host-key algorithm, cipher, and whether strict key exchange was negotiated. The route disappears when the authenticated connection ends.

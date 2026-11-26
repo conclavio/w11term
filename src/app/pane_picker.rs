@@ -255,6 +255,7 @@ pub(super) struct Picker {
     window_history: window_history::Search,
     selected: usize,
     preview: Option<Preview>,
+    running_output: Option<running_commands::OutputPreview>,
     _running_timer: Option<crate::ui_timer::RetryTimer>,
 }
 
@@ -1102,6 +1103,7 @@ impl TerminalApp {
             window_history: window_history::Search::default(),
             selected,
             preview: None,
+            running_output: None,
             _running_timer: running_timer,
         });
         if let Some(previous) = previous {
@@ -1161,6 +1163,7 @@ impl TerminalApp {
             picker.commands = rows;
             picker.query = query;
             picker.selected = 0;
+            self.refresh_running_command_output(false);
             return;
         }
         let matches = Picker::filter(self.picker_choices(picker.mode), &query);

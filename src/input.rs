@@ -251,6 +251,7 @@ pub enum Shortcut {
     PickerHistoryOption(HistoryPickerOption),
     PickerSaveHistory,
     PickerWatchRunningCommand,
+    PickerRunningOutput,
     PickerPlace(Direction),
     KeyboardHints,
     HintKey(u32),
@@ -1692,6 +1693,9 @@ impl State {
                     }
                     (PickerStage::RunningCommands, 0x77) if modifiers().is_empty() => {
                         Shortcut::PickerWatchRunningCommand
+                    }
+                    (PickerStage::RunningCommands, 0x78) if modifiers().is_empty() => {
+                        Shortcut::PickerRunningOutput
                     }
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),

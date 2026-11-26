@@ -6971,9 +6971,11 @@ impl Component for TerminalApp {
                 Shortcut::PickerHistoryOption(option) => self.cycle_window_history(option, context),
                 Shortcut::PickerSaveHistory => self.save_window_history(context),
                 Shortcut::PickerWatchRunningCommand => self.toggle_selected_running_command_watch(),
+                Shortcut::PickerRunningOutput => self.toggle_running_command_output(),
                 Shortcut::PickerMove(delta) => {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);
+                        self.refresh_running_command_output(false);
                         self.sync_picker_preview(context);
                         self.announce_text_selection();
                     }

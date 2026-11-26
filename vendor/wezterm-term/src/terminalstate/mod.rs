@@ -1107,6 +1107,19 @@ impl TerminalState {
         })
     }
 
+    /// Read a bounded sample of primary-screen output without consuming the capture.
+    pub fn recent_running_command_output(&self) -> Option<crate::LiveOutputBatch> {
+        self.command_started?;
+        if self.is_alt_screen_active() || self.capturing_shell_input {
+            return None;
+        }
+        Some(
+            self.screen
+                .live_command_output(self.cursor.y, self.shell_column(), false)?
+                .recent(),
+        )
+    }
+
     fn shell_column(&self) -> usize {
         if self.wrap_next {
             self.screen().physical_cols

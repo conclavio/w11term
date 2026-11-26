@@ -1,6 +1,91 @@
 use super::*;
 use command_palette::{CommandId, Row, Search};
-use w11term::events::RunningCommandTarget;
+use tokio::sync::oneshot::{self, error::TryRecvError};
+use w11term::{events::RunningCommandTarget, session::RunningCommandOutput};
+
+#[derive(Default)]
+pub(super) struct OutputPreview {
+    target: Option<(u64, RunningCommandTarget)>,
+    pending: Option<oneshot::Receiver<RunningCommandOutput>>,
+    output: Option<RunningCommandOutput>,
+}
+
+impl OutputPreview {
+    fn sample(
+        &mut self,
+        target: (u64, RunningCommandTarget),
+        input: &tokio::sync::mpsc::UnboundedSender<Command>,
+        tick: bool,
+    ) {
+        if self.target != Some(target) {
+            *self = Self {
+                target: Some(target),
+                ..Self::default()
+            };
+        } else if !tick {
+            return;
+        }
+        if let Some(pending) = &mut self.pending {
+            match pending.try_recv() {
+                Ok(RunningCommandOutput::Updating)
+                    if matches!(self.output, Some(RunningCommandOutput::Text { .. })) => {}
+                Ok(reply) => self.output = Some(reply),
+                Err(TryRecvError::Closed) => self.output = Some(RunningCommandOutput::Unavailable),
+                Err(TryRecvError::Empty) => return,
+            }
+        }
+        let (reply, receiver) = oneshot::channel();
+        if input
+            .send(Command::ReadRunningOutput(target.1, reply))
+            .is_ok()
+        {
+            self.pending = Some(receiver);
+        } else {
+            self.pending = None;
+            self.output = Some(RunningCommandOutput::Unavailable);
+        }
+    }
+
+    fn view(&self) -> View {
+        use RunningCommandOutput::*;
+        let status = match &self.output {
+            None => "Reading command output…",
+            Some(Unavailable) => "Command output is unavailable.",
+            Some(Updating) => "Waiting for a synchronized update…",
+            Some(AlternateScreen) => "This command is using the alternate screen.",
+            Some(Text {
+                text,
+                earlier_omitted: true,
+            }) if text.is_empty() => "Earlier command output is outside the preview.",
+            Some(Text { text, .. }) if text.is_empty() => "No command output yet.",
+            Some(Text {
+                text,
+                earlier_omitted,
+            }) => {
+                let heading = if *earlier_omitted {
+                    "Recent command output · Earlier rows omitted"
+                } else {
+                    "Recent command output"
+                };
+                return StackPanel::new().spacing(4.0).children((
+                    TextBlock::new().text(heading),
+                    ScrollViewer::new()
+                        .max_height(88.0)
+                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .content(
+                            TextBlock::new()
+                                .automation_id("recent-command-output")
+                                .text(text)
+                                .text_wrapping(TextWrapping::NoWrap)
+                                .is_text_selection_enabled(true),
+                        ),
+                ));
+            }
+        };
+        TextBlock::new().text(status).into()
+    }
+}
 
 impl Picker {
     fn selected_running_command(&self) -> Option<(u64, RunningCommandTarget)> {
@@ -44,6 +129,38 @@ impl Picker {
             }))
             .content(format!("{label}  (F8)"))
     }
+
+    pub(in crate::app) fn running_output_open(&self) -> bool {
+        self.running_output.is_some()
+    }
+
+    pub(in crate::app) fn running_output_view(
+        &self,
+        app: &TerminalApp,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
+        let target = self
+            .selected_running_command()
+            .filter(|&(pane, capture)| app.running_command_session(pane, capture).is_some());
+        let output = self.running_output.as_ref();
+        if target.is_none() && output.is_none() {
+            return View::empty();
+        }
+        let label = if output.is_some() {
+            "Hide recent command output"
+        } else {
+            "Show recent command output"
+        };
+        StackPanel::new().spacing(4.0).children((
+            Button::new()
+                .automation_name(label)
+                .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerRunningOutput)))
+                .content(format!("{label}  (F9)")),
+            output
+                .filter(|output| target.is_some() && output.target == target)
+                .map_or_else(View::empty, OutputPreview::view),
+        ))
+    }
 }
 
 impl TerminalApp {
@@ -57,6 +174,45 @@ impl TerminalApp {
                 && Arc::ptr_eq(&picker.launch, launch)
         }) {
             self.refresh_open_commands();
+            self.refresh_running_command_output(true);
+        }
+    }
+
+    pub(in crate::app) fn toggle_running_command_output(&mut self) {
+        if let Some(picker) = &mut self.picker
+            && picker.mode == Mode::Commands(Search::RunningCommands)
+        {
+            picker.running_output = if picker.running_output.is_some() {
+                None
+            } else if picker.selected_running_command().is_some() {
+                Some(OutputPreview::default())
+            } else {
+                return;
+            };
+            self.refresh_running_command_output(false);
+        }
+    }
+
+    pub(in crate::app) fn refresh_running_command_output(&mut self, tick: bool) {
+        let Some(picker) = self.picker.as_ref().filter(|p| p.running_output_open()) else {
+            return;
+        };
+        let target = picker.selected_running_command();
+        let request = target.and_then(|(pane, capture)| {
+            let (_, session) = self.running_command_session(pane, capture)?;
+            Some(((pane, capture), session.input.clone()))
+        });
+        let output = self
+            .picker
+            .as_mut()
+            .unwrap()
+            .running_output
+            .as_mut()
+            .unwrap();
+        if let Some((target, input)) = request {
+            output.sample(target, &input, tick);
+        } else {
+            *output = OutputPreview::default();
         }
     }
 
