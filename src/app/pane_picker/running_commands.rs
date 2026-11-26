@@ -1,6 +1,51 @@
 use super::*;
 use command_palette::{CommandId, Row, Search};
-use std::time::Instant;
+use w11term::events::RunningCommandTarget;
+
+impl Picker {
+    fn selected_running_command(&self) -> Option<(u64, RunningCommandTarget)> {
+        if self.mode != Mode::Commands(Search::RunningCommands) {
+            return None;
+        }
+        match self.commands.get(self.selected)?.id {
+            CommandId::FocusRunningCommand(pane, target) => Some((pane, target)),
+            _ => None,
+        }
+    }
+
+    fn running_command_watch_action(
+        &self,
+        app: &TerminalApp,
+    ) -> Option<(u64, RunningCommandTarget, bool)> {
+        let (pane, target) = self.selected_running_command()?;
+        let (_, session) = app.running_command_session(pane, target)?;
+        let watching = session.events.running_command_watch(target.generation)?;
+        Some((pane, target, !watching))
+    }
+
+    pub(in crate::app) fn running_command_watch_button(
+        &self,
+        app: &TerminalApp,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
+        let Some((pane, target, arm)) = self.running_command_watch_action(app) else {
+            return View::empty();
+        };
+        let launch = Arc::clone(&self.launch);
+        let label = if arm {
+            "Notify when selected command finishes"
+        } else {
+            "Cancel selected command notification"
+        };
+        Button::new()
+            .automation_name(label)
+            .on_click(ctx.callback(move |_| {
+                Message::WatchRunningCommand(Arc::clone(&launch), pane, target, arm)
+            }))
+            .content(format!("{label}  (F8)"))
+            .into()
+    }
+}
 
 impl TerminalApp {
     pub(in crate::app) fn open_running_commands(&mut self, ctx: &ComponentContext<Self>) {
@@ -64,7 +109,10 @@ impl TerminalApp {
             rows.push((
                 (started, pane),
                 Row {
-                    id: CommandId::FocusRunningCommand(pane, generation, running.id, started),
+                    id: CommandId::FocusRunningCommand(
+                        pane,
+                        RunningCommandTarget::new(generation, &running),
+                    ),
                     label: format!("{command} · {source}"),
                     chord: format!("{} s", running.elapsed_ms() / 1000),
                     enabled: true,
@@ -75,26 +123,52 @@ impl TerminalApp {
         rows.into_iter().map(|(_, row)| row).collect()
     }
 
+    fn running_command_session(
+        &self,
+        pane: u64,
+        target: RunningCommandTarget,
+    ) -> Option<(TabId, &Session)> {
+        let id = self.tab_for_pane(pane)?;
+        let Page::Terminal(live) = &self.tabs.get(id)?.page else {
+            return None;
+        };
+        let (generation, running) = live.session.running_command_snapshot()?;
+        (RunningCommandTarget::new(generation, &running) == target).then_some((id, &live.session))
+    }
+
+    pub(in crate::app) fn watch_selected_running_command(
+        &self,
+        launch: &Arc<()>,
+        pane: u64,
+        target: RunningCommandTarget,
+        armed: bool,
+    ) {
+        if self.picker.as_ref().is_some_and(|picker| {
+            Arc::ptr_eq(&picker.launch, launch)
+                && picker.selected_running_command() == Some((pane, target))
+        }) && let Some((_, session)) = self.running_command_session(pane, target)
+        {
+            let _ = session
+                .input
+                .send(Command::WatchRunningCommand(target, armed));
+        }
+    }
+
+    pub(in crate::app) fn toggle_selected_running_command_watch(&self) {
+        if let Some(picker) = &self.picker
+            && let Some((pane, target, arm)) = picker.running_command_watch_action(self)
+        {
+            self.watch_selected_running_command(&picker.launch, pane, target, arm);
+        }
+    }
+
     pub(in crate::app) fn focus_running_command(
         &mut self,
         pane: u64,
-        generation: u64,
-        command: u64,
-        started: Instant,
+        target: RunningCommandTarget,
         ctx: &ComponentContext<Self>,
     ) {
-        let Some(id) = self.tab_for_pane(pane) else {
-            return;
-        };
-        let Some(Page::Terminal(live)) = self.tabs.get(id).map(|tab| &tab.page) else {
-            return;
-        };
-        if live
-            .session
-            .running_command_snapshot()
-            .is_some_and(|(current, running)| {
-                current == generation && running.id == command && running.started_at() == started
-            })
+        if let Some((id, _)) = self.running_command_session(pane, target)
             && self.tabs.select(id)
         {
             self.sync_selection(ctx);

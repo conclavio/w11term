@@ -99,6 +99,23 @@ pub struct CommandLink {
     pub id: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunningCommandTarget {
+    pub generation: u64,
+    id: u64,
+    started: Instant,
+}
+
+impl RunningCommandTarget {
+    pub fn new(generation: u64, command: &wezterm_term::RunningCommand) -> Self {
+        Self {
+            generation,
+            id: command.id,
+            started: command.started_at(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SshConnectionPhase {
     Queued,
@@ -178,10 +195,16 @@ struct State {
 #[derive(Debug)]
 struct CommandWatch {
     generation: u64,
-    armed: bool,
+    armed: Option<ManualCommandWatch>,
     running: Option<RunningCommand>,
     prompt: ShellPrompt,
     saw_markers: bool,
+}
+
+#[derive(Debug)]
+enum ManualCommandWatch {
+    CurrentOrNext,
+    Running(RunningCommandTarget),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +226,7 @@ impl CommandWatch {
     fn new(generation: u64) -> Self {
         Self {
             generation,
-            armed: false,
+            armed: None,
             running: None,
             prompt: ShellPrompt::Unverified,
             saw_markers: false,
@@ -232,7 +255,9 @@ fn application_id(aid: Option<&str>) -> Option<[u8; 32]> {
 
 impl State {
     fn watch_state(&self) -> Option<bool> {
-        self.command_watch.as_ref().map(|watch| watch.armed)
+        self.command_watch
+            .as_ref()
+            .map(|watch| watch.armed.is_some())
     }
 
     fn refresh_watch(&self, previous: Option<bool>) {
@@ -724,9 +749,42 @@ impl Events {
         let Some(watch) = &mut state.command_watch else {
             return false;
         };
-        watch.armed = armed;
+        watch.armed = armed.then_some(ManualCommandWatch::CurrentOrNext);
         state.refresh_watch(previous);
         true
+    }
+
+    /// The pane can watch this capture if its semantic start is unambiguous.
+    pub fn running_command_watch(&self, generation: u64) -> Option<bool> {
+        let state = self.state.lock().unwrap();
+        let watch = state.command_watch.as_ref().filter(|watch| {
+            watch.generation == generation && watch.running.as_ref().is_some_and(|run| run.linkable)
+        })?;
+        Some(watch.armed.is_some())
+    }
+
+    // The session worker has just checked the target against its terminal parser.
+    pub(crate) fn set_running_command_watch(&self, target: RunningCommandTarget, armed: bool) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        if let Some(watch) = &mut state.command_watch
+            && watch.generation == target.generation
+            && watch.running.as_ref().is_some_and(|run| run.linkable)
+        {
+            watch.armed = armed.then_some(ManualCommandWatch::Running(target));
+            state.refresh_watch(previous);
+        }
+    }
+
+    pub(crate) fn retain_running_command_watch(&self, running: Option<RunningCommandTarget>) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        if let Some(watch) = &mut state.command_watch
+            && matches!(watch.armed, Some(ManualCommandWatch::Running(target)) if Some(target) != running)
+        {
+            watch.armed = None;
+            state.refresh_watch(previous);
+        }
     }
 
     pub(crate) fn command_stream(&self, generation: Option<u64>) {
@@ -851,6 +909,9 @@ impl Events {
         }
         let (aid, exit_code) = match marker {
             MarkEndOfInputAndStartOfOutput { aid, .. } => {
+                if matches!(watch.armed, Some(ManualCommandWatch::Running(_))) {
+                    watch.armed = None;
+                }
                 if let Some(running) = &mut watch.running {
                     // The terminal's output capture restarts at each C marker.
                     // Retain the original watch, but its output is now ambiguous.
@@ -862,6 +923,7 @@ impl Events {
                         linkable: true,
                     });
                 }
+                state.refresh_watch(previous);
                 return;
             }
             CommandStatus { status, aid } => (aid, *status),
@@ -872,6 +934,9 @@ impl Events {
             // abandons the previous unqualified command. It cannot prove success.
             MarkEndOfPromptAndStartOfInputUntilNextMarker
             | MarkEndOfPromptAndStartOfInputUntilEndOfLine => {
+                if matches!(watch.armed, Some(ManualCommandWatch::Running(_))) {
+                    watch.armed = None;
+                }
                 if watch
                     .running
                     .as_ref()
@@ -909,7 +974,12 @@ impl Events {
         let elapsed = now.saturating_duration_since(running.started);
         let automatic = notify_long_commands && elapsed >= LONG_COMMAND_THRESHOLD;
         watch.running = None;
-        let manual = std::mem::take(&mut watch.armed);
+        let manual = match watch.armed.take() {
+            Some(ManualCommandWatch::Running(target)) => command
+                .is_some_and(|link| link.generation == target.generation && link.id == target.id),
+            Some(ManualCommandWatch::CurrentOrNext) => true,
+            None => false,
+        };
         if manual || automatic {
             let data = if automatic {
                 serde_json::json!({"exit_code":exit_code,"duration_ms":elapsed.as_millis() as u64})
@@ -917,6 +987,8 @@ impl Events {
                 serde_json::json!({"exit_code":exit_code})
             };
             self.append(state, "command-finished", data, command);
+        } else {
+            state.refresh_watch(previous);
         }
     }
 
@@ -1736,6 +1808,87 @@ mod tests {
         assert!(missed.lost);
         assert!(missed.events.is_empty());
         assert_eq!(missed.next, scanned.next);
+    }
+
+    #[test]
+    fn selected_running_command_watch_links_only_its_capture_and_fires_once() {
+        use wezterm_term::FinalTermSemanticPrompt::{
+            CommandStatus, MarkEndOfInputAndStartOfOutput,
+        };
+        let events = Events::default();
+        let start = MarkEndOfInputAndStartOfOutput {
+            aid: None,
+            command: None,
+        };
+        let end = CommandStatus {
+            aid: None,
+            status: Some(7),
+        };
+        let now = Instant::now();
+        let target = RunningCommandTarget {
+            generation: 1,
+            id: 3,
+            started: now,
+        };
+        events.command_stream(Some(1));
+        events.semantic_prompt_at(&start, None, now);
+        events.set_running_command_watch(target, true);
+        assert_eq!(events.running_command_watch(1), Some(true));
+        events.semantic_prompt_at(&end, Some(3), now);
+        events.semantic_prompt_at(&start, None, now);
+        events.semantic_prompt_at(&end, Some(4), now);
+        let batch = events.since(0);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "command-finished");
+        assert_eq!(batch.events[0].data, serde_json::json!({"exit_code":7}));
+        assert_eq!(
+            batch.events[0].command,
+            Some(CommandLink {
+                generation: 1,
+                id: 3
+            })
+        );
+    }
+
+    #[test]
+    fn selected_running_command_watch_clears_on_replacement_or_disconnect() {
+        use wezterm_term::FinalTermSemanticPrompt::{
+            CommandStatus, MarkEndOfInputAndStartOfOutput,
+        };
+        let events = Events::default();
+        let start = MarkEndOfInputAndStartOfOutput {
+            aid: None,
+            command: None,
+        };
+        let end = CommandStatus {
+            aid: None,
+            status: Some(0),
+        };
+        let now = Instant::now();
+        let target = RunningCommandTarget {
+            generation: 1,
+            id: 3,
+            started: now,
+        };
+        events.command_stream(Some(1));
+        events.semantic_prompt_at(&start, None, now);
+        events.set_running_command_watch(target, true);
+        assert_eq!(events.command_watch(), Some(true));
+        events.semantic_prompt_at(&start, None, now);
+        assert_eq!(events.command_watch(), Some(false));
+        // A second C reuses the capture ID. It must never inherit the alert.
+        events.semantic_prompt_at(&end, Some(3), now);
+
+        events.semantic_prompt_at(&start, None, now);
+        events.set_running_command_watch(target, true);
+        assert_eq!(events.command_watch(), Some(true));
+        events.command_stream(None);
+        events.command_stream(Some(2));
+        events.semantic_prompt_at(&start, None, now);
+        events.set_running_command_watch(target, true);
+        assert_eq!(events.command_watch(), Some(false));
+        events.semantic_prompt_at(&end, Some(3), now);
+        assert!(events.since(0).events.is_empty());
     }
 
     #[test]

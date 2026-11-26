@@ -1374,6 +1374,7 @@ pub enum Message {
     PickerQuery(String),
     OpenRunningCommands,
     RunningCommandsTick(Arc<()>),
+    WatchRunningCommand(Arc<()>, u64, w11term::events::RunningCommandTarget, bool),
     WindowHistory(pane_picker::WindowHistoryAction),
     PaneText(pane_picker::TextAction),
     PickerHover(u64),
@@ -5691,6 +5692,7 @@ impl Component for TerminalApp {
                 )
                 | Message::PickerQuery(..)
                 | Message::RunningCommandsTick(..)
+                | Message::WatchRunningCommand(..)
                 | Message::WindowHistory(..)
                 | Message::Discovery(
                     session_browser::Action::Query(..) | session_browser::Action::Focus(..)
@@ -5947,6 +5949,9 @@ impl Component for TerminalApp {
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::OpenRunningCommands => self.open_running_commands(context),
             Message::RunningCommandsTick(launch) => self.refresh_running_commands(&launch),
+            Message::WatchRunningCommand(launch, pane, target, armed) => {
+                self.watch_selected_running_command(&launch, pane, target, armed);
+            }
             Message::WindowHistory(action) => self.window_history_action(action, context),
             Message::PaneText(action) => self.pane_text_action(action, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
@@ -6965,6 +6970,7 @@ impl Component for TerminalApp {
                 Shortcut::PickerCancel => self.close_picker(context),
                 Shortcut::PickerHistoryOption(option) => self.cycle_window_history(option, context),
                 Shortcut::PickerSaveHistory => self.save_window_history(context),
+                Shortcut::PickerWatchRunningCommand => self.toggle_selected_running_command_watch(),
                 Shortcut::PickerMove(delta) => {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);

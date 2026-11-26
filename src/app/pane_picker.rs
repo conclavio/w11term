@@ -1113,6 +1113,9 @@ impl TerminalApp {
         self.sync_picker_preview(ctx);
         self.keyboard.set_picker(Some(match mode {
             Mode::Commands(command_palette::Search::CommandHistory) => PickerStage::CommandHistory,
+            Mode::Commands(command_palette::Search::RunningCommands) => {
+                PickerStage::RunningCommands
+            }
             Mode::Commands(_) => PickerStage::Commands,
             _ => PickerStage::Search,
         }));

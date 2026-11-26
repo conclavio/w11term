@@ -1,7 +1,7 @@
 use crate::{
     clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     demo,
-    events::ShellPrompt,
+    events::{RunningCommandTarget, ShellPrompt},
     options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
@@ -75,6 +75,7 @@ pub enum Command {
     Frames(tokio::sync::oneshot::Sender<FrameStore>),
     DescribePane(tokio::sync::oneshot::Sender<PaneDescription>),
     Inspect(bool),
+    WatchRunningCommand(RunningCommandTarget, bool),
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<PaneInspection>),
     Replay {
@@ -1035,6 +1036,11 @@ async fn run(
                 .running_command()
                 .map(|command| (connection_generation, command));
             if running != published_running {
+                events.retain_running_command_watch(
+                    running.as_ref().map(|(generation, command)| {
+                        RunningCommandTarget::new(*generation, command)
+                    }),
+                );
                 live_frames.set_running_command(running.clone());
                 published_running = running;
             }
@@ -1431,6 +1437,14 @@ async fn run(
                         if !enabled { frames.set_inspection(None); }
                         Ok(())
                     },
+                    Some(Command::WatchRunningCommand(target, armed)) => {
+                        if terminal.running_command().is_some_and(|command| {
+                            target == RunningCommandTarget::new(connection_generation, &command)
+                        }) {
+                            events.set_running_command_watch(target, armed);
+                        }
+                        Ok(())
+                    }
                     Some(Command::ReadModes(reply)) => {
                         if !reply.is_closed() {
                             let (inspection, _) = PaneInspection::read(

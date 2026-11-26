@@ -38,6 +38,7 @@ pub enum PickerStage {
     Search,
     Commands,
     CommandHistory,
+    RunningCommands,
     Placement,
 }
 
@@ -249,6 +250,7 @@ pub enum Shortcut {
     PickerCancel,
     PickerHistoryOption(HistoryPickerOption),
     PickerSaveHistory,
+    PickerWatchRunningCommand,
     PickerPlace(Direction),
     KeyboardHints,
     HintKey(u32),
@@ -1645,23 +1647,35 @@ impl State {
                 let repeat = message.lParam.0 & (1 << 30) != 0;
                 let action = match (stage, vk) {
                     (_, 0x1b) => Shortcut::PickerCancel,
-                    (PickerStage::Commands | PickerStage::CommandHistory, 0x09) => {
-                        Shortcut::PickerMove(if modifiers().contains(KeyModifiers::SHIFT) {
-                            -1
-                        } else {
-                            1
-                        })
-                    }
                     (
-                        PickerStage::Search | PickerStage::Commands | PickerStage::CommandHistory,
+                        PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
+                        0x09,
+                    ) => Shortcut::PickerMove(if modifiers().contains(KeyModifiers::SHIFT) {
+                        -1
+                    } else {
+                        1
+                    }),
+                    (
+                        PickerStage::Search
+                        | PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
                         0x0d,
                     ) => Shortcut::PickerAccept,
                     (
-                        PickerStage::Search | PickerStage::Commands | PickerStage::CommandHistory,
+                        PickerStage::Search
+                        | PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
                         0x26,
                     ) => Shortcut::PickerMove(-1),
                     (
-                        PickerStage::Search | PickerStage::Commands | PickerStage::CommandHistory,
+                        PickerStage::Search
+                        | PickerStage::Commands
+                        | PickerStage::CommandHistory
+                        | PickerStage::RunningCommands,
                         0x28,
                     ) => Shortcut::PickerMove(1),
                     (PickerStage::CommandHistory, 0x76) if modifiers().is_empty() => {
@@ -1675,6 +1689,9 @@ impl State {
                     }
                     (PickerStage::CommandHistory, 0x53) if modifiers() == KeyModifiers::CTRL => {
                         Shortcut::PickerSaveHistory
+                    }
+                    (PickerStage::RunningCommands, 0x77) if modifiers().is_empty() => {
+                        Shortcut::PickerWatchRunningCommand
                     }
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),

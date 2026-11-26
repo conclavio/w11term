@@ -234,6 +234,11 @@ try {
             Where-Object { $_.Current.Name.StartsWith($diagnostic) -and $_.Current.Name -match '    [0-9]+ s$' } |
             Select-Object -First 1
     }
+    Click 'Notify when selected command finishes'
+    $null = Wait-Until 'the background PowerShell notification is armed' {
+        Find-Element 'Cancel selected command notification'
+    }
+    $beforeFinish = (Control @('events','--pane',"$pane",'--since','0','--timeout','0')).journal.next
     [IO.File]::WriteAllText($env:W11TERM_HISTORY_INSPECT_GATE, 'finish')
     $null = Wait-Until 'PowerShell completes the inspected capture' {
         $m = Control @('inspect','--pane',"$pane")
@@ -243,9 +248,21 @@ try {
     $null = Wait-Until 'completion removes the result from the open running command picker' {
         Find-Element 'No matching running commands'
     }
+    $journal = (Control @('events','--pane',"$pane",'--since',"$beforeFinish",'--timeout','0')).journal
+    $finished = @($journal.events | Where-Object kind -CEQ 'command-finished')
+    if ($finished.Count -ne 1 -or $journal.lost) { throw 'Expected exactly one PowerShell completion notification' }
     Press-Key 0x1b
     $null = Wait-Until 'Escape closes the running command picker' { !(Find-Element 'Search running commands') }
     Wait-Focus $remote
+    Click 'Tab menu'
+    Invoke-Button (Wait-Until 'Attention inbox menu item' {
+        Find-Element 'Attention inbox' ([System.Windows.Automation.ControlType]::MenuItem)
+    })
+    $view = "View command $($running.id) for $label, pane $pane"
+    Click $view
+    $null = Wait-Until 'the PowerShell notification opens the same capture' {
+        Find-Element ("Selected, $diagnostic" + ' ' + [char]0xb7 + ' exit 0')
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

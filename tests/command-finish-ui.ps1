@@ -56,12 +56,26 @@ try {
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','command-started')
     $since = (Control @('events','--pane',"$remote",'--since','0','--timeout','0')).journal.next
-    Run-Palette $arm
     Run-Palette "New tab with Palette PowerShell $dot Local"
     $local = Wait-Until 'new PowerShell pane' { ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id }
     Wait-Focus $local
     $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')
     $shellPid = Read-ActiveShellPid 'shell-before'
+
+    Run-Palette ('Find running commands' + [char]0x2026)
+    Wait-PickerEditor 'Search running commands' 'the background SSH command picker'
+    $field = Find-Element 'Search running commands' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('build')
+    $armSelected = 'Notify when selected command finishes'
+    $cancelSelected = 'Cancel selected command notification'
+    Invoke-Button (Wait-Until 'arm the selected SSH command' { Find-Element $armSelected })
+    Invoke-Button (Wait-Until 'cancel the selected SSH command notification' { Find-Element $cancelSelected })
+    $null = Wait-Until 'can rearm the same SSH command' { Find-Element $armSelected }
+    Press-Key 0x77 # F8 arms the highlighted command
+    $null = Wait-Until 'the SSH notification is armed again' { Find-Element $cancelSelected }
+    Press-Key 0x1b
+    $null = Wait-Until 'close the notification picker' { !(Find-Element 'Search running commands') }
+    Wait-Focus $local
 
     Send-PeerOutput 'first-complete'
     $null = Wait-Until 'completion badge while PowerShell is active' { Find-Element 'Attention inbox, 1 unread' }

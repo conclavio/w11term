@@ -134,7 +134,7 @@ pub enum CommandId {
     SearchWindowGroupRuns(WindowRunScope),
     WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(TabId),
-    FocusRunningCommand(u64, u64, u64, std::time::Instant),
+    FocusRunningCommand(u64, w11term::events::RunningCommandTarget),
     OpenWindowCommand(
         u64,
         w11term::events::CommandLink,
@@ -890,8 +890,8 @@ impl TerminalApp {
                 return;
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
-            CommandId::FocusRunningCommand(pane, generation, command, started) => {
-                self.focus_running_command(pane, generation, command, started, ctx);
+            CommandId::FocusRunningCommand(pane, target) => {
+                self.focus_running_command(pane, target, ctx);
                 return;
             }
             CommandId::OpenWindowCommand(pane, link, hit) => {
@@ -1022,6 +1022,8 @@ pub(super) fn view(
     let narrow_history = app.width < 520.0;
     let search_height = if mode == Search::CommandHistory {
         if narrow_history { 264.0 } else { 232.0 }
+    } else if mode == Search::RunningCommands {
+        200.0
     } else {
         156.0
     };
@@ -1167,12 +1169,20 @@ pub(super) fn view(
     });
     let history_export =
         history.map_or_else(View::empty, |picker| picker.history_export_button(app, ctx));
+    let running_command_watch = app
+        .picker
+        .as_ref()
+        .filter(|_| mode == Search::RunningCommands)
+        .map_or_else(View::empty, |picker| {
+            picker.running_command_watch_button(app, ctx)
+        });
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
             history_controls,
             StackPanel::new().spacing(4.0).keyed_children(results),
             history_export,
+            running_command_watch,
         )),
         (app.width - 32.0).clamp(1.0, 660.0),
     )
