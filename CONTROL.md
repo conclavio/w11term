@@ -681,6 +681,18 @@ bytes. `lost=true` reports eviction. Events include `bell`, `title`, `notificati
 audible playback; inspect the `sound` outcome. See [the game protocol](docs/game-client-protocol.md).
 The CLI allows the requested wait timeout plus 15 seconds for these replies.
 
+Use `--kind KIND` to wait for an exact, case-sensitive kind. For example, after
+saving the pane's current `journal.next` and triggering a bell, run
+`events --pane 1 --since 42 --kind bell --timeout 15`. Unrelated events do not
+complete the wait. Use `--kind sound` and check `data.outcome` for `played`
+when playback is what the test needs to verify. With no match at the deadline,
+the reply has an empty `journal.events` array. An unread history gap returns
+`lost=true` immediately, with any matching retained events.
+
+The cursor always follows the full pane journal and advances past skipped
+events. Keep separate cursors if you also need to read those skipped kinds.
+Unfiltered calls keep their existing behavior.
+
 For SSH panes the reply also includes `ssh_connection`, an object with a
 `phase` of `queued`, `connecting`, `connected`, `reconnecting`, `disconnected`,
 `stopped`, or `failed`. Reconnecting includes an `attempt` number for an
@@ -781,7 +793,7 @@ if ($exitReply.ok -and $null -ne $exitReply.result.restart_token) {
 {"verb":"wait-for-text","pane":1,"connection_generation":2,"after_frame":35,"screenshot_path":"C:\\tests\\ready.png","pattern":"ready","timeout_seconds":15}
 {"verb":"resize","pane":1,"cols":170,"rows":48}
 {"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
-{"verb":"events","pane":1,"since":42,"timeout_seconds":30}
+{"verb":"events","pane":1,"since":42,"kind":"bell","timeout_seconds":30}
 {"verb":"wait-pane-exit","pane":1,"after_exit_token":1,"timeout_seconds":30}
 {"verb":"restart","pane":1,"exit_token":1}
 ```

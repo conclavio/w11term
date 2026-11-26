@@ -1106,6 +1106,43 @@ mod tests {
     }
 
     #[test]
+    fn events_accepts_one_exact_optional_kind() {
+        let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
+        let (_, request) = parse_args(&[
+            "events",
+            "--pane",
+            "7",
+            "--since",
+            "42",
+            "--kind",
+            "bell",
+            "--timeout",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::Events { pane: 7, since: 42, kind: Some(kind), timeout_seconds: 5 }
+                if kind == "bell"
+        ));
+        let (_, unfiltered) = parse_args(&["events", "--pane", "7"]).unwrap();
+        assert!(
+            serde_json::to_value(unfiltered)
+                .unwrap()
+                .get("kind")
+                .is_none()
+        );
+        for args in [
+            &["events", "--pane", "7", "--kind"][..],
+            &["events", "--pane", "7", "--kind", ""],
+            &["events", "--pane", "7", "--kind", "bell", "--kind", "sound"],
+            &["wait-for-text", "--pane", "7", "--kind", "bell", "ready"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn wait_for_text_resolves_its_optional_screenshot_path() {
         let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
         let (_, request) = parse_args(&[

@@ -101,6 +101,8 @@ pub enum Request {
         pane: u64,
         #[serde(default)]
         since: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
         #[serde(default)]
         timeout_seconds: u64,
     },
@@ -697,19 +699,24 @@ impl Registry {
             Request::Events {
                 pane,
                 since,
+                kind,
                 timeout_seconds,
             } => {
+                ensure!(
+                    kind.as_ref().is_none_or(|kind| !kind.is_empty()),
+                    "event kind is empty"
+                );
                 ensure!(
                     timeout_seconds <= 3600,
                     "events timeout must be 0..=3600 seconds"
                 );
                 let events = Self::pane_events(&self.pane(pane)?).await?;
                 ensure!(
-                    since <= events.since(0).next,
+                    since <= events.cursor(),
                     "event cursor is ahead of this pane; check the instance/pane identity"
                 );
                 let journal = events
-                    .wait(since, Duration::from_secs(timeout_seconds))
+                    .wait_kind(since, Duration::from_secs(timeout_seconds), kind.as_deref())
                     .await;
                 let connection = events.connection_snapshot();
                 let mut result =

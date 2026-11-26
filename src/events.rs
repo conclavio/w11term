@@ -1109,14 +1109,25 @@ impl Events {
             state.events.pop_front();
         }
     }
+    pub(crate) fn cursor(&self) -> u64 {
+        self.state.lock().unwrap().next
+    }
+
     pub fn since(&self, cursor: u64) -> Batch {
+        self.since_kind(cursor, None)
+    }
+
+    fn since_kind(&self, cursor: u64, kind: Option<&str>) -> Batch {
         let state = self.state.lock().unwrap();
         let oldest = state.events.front().map_or(state.next + 1, |e| e.sequence);
+        let start = state
+            .events
+            .partition_point(|event| event.sequence <= cursor);
         Batch {
             events: state
                 .events
-                .iter()
-                .filter(|e| e.sequence > cursor)
+                .range(start..)
+                .filter(|event| kind.is_none_or(|kind| event.kind == kind))
                 .cloned()
                 .collect(),
             next: state.next,
@@ -1124,18 +1135,31 @@ impl Events {
             lost: cursor < oldest.saturating_sub(1),
         }
     }
-    pub async fn wait(&self, cursor: u64, timeout: std::time::Duration) -> Batch {
+
+    pub async fn wait(&self, cursor: u64, timeout: Duration) -> Batch {
+        self.wait_kind(cursor, timeout, None).await
+    }
+
+    pub(crate) async fn wait_kind(
+        &self,
+        mut cursor: u64,
+        timeout: Duration,
+        kind: Option<&str>,
+    ) -> Batch {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let batch = self.since(cursor);
-            if !batch.events.is_empty() || batch.lost {
+            let batch = self.since_kind(cursor, kind);
+            if !batch.events.is_empty() || batch.lost || tokio::time::Instant::now() >= deadline {
                 return batch;
             }
+            // Unmatched entries were already examined. Their later eviction
+            // must not look like unread history was lost.
+            cursor = cursor.max(batch.next);
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                return self.since(cursor);
+                return self.since_kind(cursor, kind);
             }
         }
     }
@@ -1589,6 +1613,68 @@ mod tests {
         assert_eq!(b.events.len(), CAPACITY);
         assert_eq!(b.oldest, 2);
         assert!(e.since(b.next).events.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn event_kind_wait_skips_unrelated_output_and_returns_matching_entries_in_order() {
+        use std::{future::poll_fn, task::Poll};
+
+        let events = Events::default();
+        events.push("title", Value::Null);
+        let wait = events.wait_kind(0, Duration::from_secs(1), Some("bell"));
+        tokio::pin!(wait);
+        assert!(poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await);
+        events.push("notification", Value::Null);
+        assert!(poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await);
+        events.push("bell", Value::Null);
+        events.push("title", Value::Null);
+        events.push("bell", Value::Null);
+        let batch = wait.await;
+        assert!(!batch.lost);
+        assert_eq!(batch.oldest, 1);
+        assert_eq!(batch.next, 5);
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [3, 5]
+        );
+
+        events.push("notification", Value::Null);
+        let timeout = events
+            .wait_kind(batch.next, Duration::from_secs(1), Some("bell"))
+            .await;
+        assert!(timeout.events.is_empty());
+        assert!(!timeout.lost);
+        assert_eq!(timeout.next, 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn event_kind_wait_reports_unread_evictions_only() {
+        use std::{future::poll_fn, task::Poll};
+
+        let events = Events::default();
+        events.push("title", Value::Null);
+        let wait = events.wait_kind(0, Duration::from_secs(1), Some("bell"));
+        tokio::pin!(wait);
+        assert!(poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await);
+        for _ in 1..CAPACITY {
+            events.push("title", Value::Null);
+        }
+        events.push("bell", Value::Null);
+        let scanned = wait.await;
+        assert!(!scanned.lost);
+        assert_eq!(scanned.oldest, 2);
+        assert_eq!(scanned.events[0].sequence, CAPACITY as u64 + 1);
+
+        let missed = events
+            .wait_kind(0, Duration::from_secs(1), Some("sound"))
+            .await;
+        assert!(missed.lost);
+        assert!(missed.events.is_empty());
+        assert_eq!(missed.next, scanned.next);
     }
 
     #[test]
