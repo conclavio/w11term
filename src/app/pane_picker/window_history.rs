@@ -1,6 +1,17 @@
 use super::*;
 use command_history::{HistoryOrder, ORDER_OPTIONS, STATUS_OPTIONS, WindowHistoryOptions};
 use w11term::control::CommandStatus;
+use w11term::events::CommandLink;
+
+type Selection = (u64, CommandLink);
+
+#[derive(Clone)]
+pub(in crate::app) struct WindowHistoryReturn {
+    origin: Option<TabId>,
+    pub(super) query: String,
+    pub(super) options: WindowHistoryOptions,
+    pub(super) selection: Selection,
+}
 
 pub enum Action {
     Edit(Arc<()>, Edit),
@@ -13,7 +24,10 @@ pub enum Edit {
     IncludeOutput(bool),
 }
 
-pub struct Report(Vec<command_palette::Row>);
+pub struct Report {
+    rows: Vec<command_palette::Row>,
+    selection: Option<Selection>,
+}
 
 #[derive(Default)]
 pub(super) struct Search {
@@ -40,6 +54,25 @@ impl Drop for Search {
 }
 
 impl Picker {
+    fn set_window_history_rows(
+        &mut self,
+        rows: Vec<command_palette::Row>,
+        selection: Option<Selection>,
+    ) {
+        self.selected = selection
+            .and_then(|(pane, link)| {
+                rows.iter().position(|row| {
+                    matches!(
+                        row.id,
+                        command_palette::CommandId::OpenWindowCommand(candidate_pane, candidate, _)
+                            if candidate_pane == pane && candidate == link
+                    )
+                })
+            })
+            .unwrap_or(0);
+        self.commands = rows;
+    }
+
     pub(super) fn uses_history_output(&self) -> bool {
         self.mode == Mode::Commands(command_palette::Search::CommandHistory)
             && self.window_history.options.include_output
@@ -122,6 +155,42 @@ impl Picker {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn window_history_return(
+        &self,
+        selection: Selection,
+    ) -> Option<WindowHistoryReturn> {
+        let picker = self.picker.as_ref().filter(|picker| {
+            picker.mode == Mode::Commands(command_palette::Search::CommandHistory)
+        })?;
+        Some(WindowHistoryReturn {
+            origin: self.tabs.active_id(),
+            query: picker.query.clone(),
+            options: picker.window_history.options,
+            selection,
+        })
+    }
+
+    pub(in crate::app) fn restore_window_history(
+        &mut self,
+        saved: WindowHistoryReturn,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.picker.is_some() {
+            return;
+        }
+        if let Some(origin) = saved.origin
+            && self.tabs.select(origin)
+        {
+            self.sync_selection(ctx);
+            self.activate(ctx);
+        }
+        self.start_picker_from(
+            Mode::Commands(command_palette::Search::CommandHistory),
+            Some(saved),
+            ctx,
+        );
+    }
+
     pub(in crate::app) fn window_history_action(
         &mut self,
         action: Action,
@@ -143,7 +212,7 @@ impl TerminalApp {
                     Edit::IncludeOutput(include) => options.include_output = include,
                 }
                 if previous != *options {
-                    self.search_window_history(ctx);
+                    self.search_window_history(None, ctx);
                 }
             }
             Action::Ready(request, rows)
@@ -158,8 +227,9 @@ impl TerminalApp {
                 picker.window_history.status = rows
                     .is_none()
                     .then_some("Could not search command output. Edit the query to try again.");
-                picker.commands = rows.map(|report| report.0).unwrap_or_default();
-                picker.selected = 0;
+                if let Some(report) = rows {
+                    picker.set_window_history_rows(report.rows, report.selection);
+                }
             }
             _ => {}
         }
@@ -192,7 +262,11 @@ impl TerminalApp {
         self.window_history_action(Action::Edit(picker.launch.clone(), edit), ctx);
     }
 
-    pub(super) fn search_window_history(&mut self, ctx: &ComponentContext<Self>) {
+    pub(super) fn search_window_history(
+        &mut self,
+        selection: Option<Selection>,
+        ctx: &ComponentContext<Self>,
+    ) {
         let Some(picker) = self.picker.as_ref() else {
             return;
         };
@@ -204,8 +278,9 @@ impl TerminalApp {
         picker.window_history.cancel();
         picker.selected = 0;
         if !search_output {
-            picker.commands =
+            let rows =
                 command_history::window_history_rows(candidates, None, options.order, || false);
+            picker.set_window_history_rows(rows, selection);
             return;
         }
         picker.commands.clear();
@@ -221,7 +296,7 @@ impl TerminalApp {
                     options.order,
                     || cancel.is_cancelled(),
                 );
-                Message::WindowHistory(Action::Ready(request, Some(Report(rows))))
+                Message::WindowHistory(Action::Ready(request, Some(Report { rows, selection })))
             },
             rejected,
         ));

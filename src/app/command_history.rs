@@ -22,6 +22,7 @@ pub(super) struct HistoryPage {
     selected: Option<(u64, u64)>, // Connection generation and command id.
     search: HistorySearch,
     output_hit: Option<(CommandLink, Range<usize>)>,
+    window_search: Option<Box<pane_picker::WindowHistoryReturn>>,
     status: CommandStatus,
     order: HistoryOrder,
     feedback: String,
@@ -70,6 +71,7 @@ pub enum HistoryAction {
     Save((u64, u64)),
     CancelSave((u64, u64)),
     Return,
+    ReturnToWindowSearch,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -615,7 +617,7 @@ impl TerminalApp {
         target: Option<w11term::events::CommandLink>,
         ctx: &ComponentContext<Self>,
     ) -> bool {
-        self.open_command_history_preview(pane, target, None, ctx)
+        self.open_command_history_preview(pane, target, None, None, ctx)
     }
 
     pub(super) fn open_command_history_preview(
@@ -623,6 +625,7 @@ impl TerminalApp {
         pane: u64,
         target: Option<CommandLink>,
         output_hit: Option<Range<usize>>,
+        window_search: Option<pane_picker::WindowHistoryReturn>,
         ctx: &ComponentContext<Self>,
     ) -> bool {
         let Some(source) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) else {
@@ -649,6 +652,7 @@ impl TerminalApp {
             selected,
             search,
             output_hit: target.zip(output_hit),
+            window_search: window_search.map(Box::new),
             status: CommandStatus::All,
             order: HistoryOrder::Newest,
             feedback: String::new(),
@@ -748,6 +752,12 @@ impl TerminalApp {
             self.history_compare(id, pane, request, ctx);
             return;
         }
+        if matches!(action, HistoryAction::ReturnToWindowSearch) {
+            if let Some(saved) = history.window_search.as_deref().cloned() {
+                self.restore_window_history(saved, ctx);
+            }
+            return;
+        }
         let Some(frame) = self.history_frame(pane) else {
             return;
         };
@@ -772,7 +782,7 @@ impl TerminalApp {
             page.output_hit = None;
         }
         match action {
-            HistoryAction::Compare(_) => unreachable!(),
+            HistoryAction::Compare(_) | HistoryAction::ReturnToWindowSearch => unreachable!(),
             HistoryAction::Search(query) => {
                 page.search.needle = query.to_lowercase();
                 page.search.query = query;
@@ -940,15 +950,35 @@ impl TerminalApp {
         if let Some(comparison) = &page.comparison {
             return self.history_comparison_view(page.pane, comparison, ctx);
         }
-        let Some(frame) = self.history_frame(page.pane) else {
-            return TextBlock::new()
-                .margin(16.0)
-                .text("The source pane has closed")
-                .into();
-        };
-        let generation = frame.connection_generation;
         let pane = page.pane;
         let action = move |request| Message::History(Action::InPane(pane, request));
+        let page_heading = Grid::new()
+            .grid_column_span(2)
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(8.0)
+            .children((
+                TextBlock::new()
+                    .font_size(24.0)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .text(format!("Command history · Pane {pane}")),
+                if page.window_search.is_some() {
+                    Button::new()
+                        .grid_column(1)
+                        .on_click(
+                            ctx.callback(move |_| action(HistoryAction::ReturnToWindowSearch)),
+                        )
+                        .content("Back to search results")
+                } else {
+                    View::empty()
+                },
+            ));
+        let Some(frame) = self.history_frame(page.pane) else {
+            return StackPanel::new().margin(16.0).spacing(8.0).children((
+                page_heading,
+                TextBlock::new().text("The source pane has closed"),
+            ));
+        };
+        let generation = frame.connection_generation;
         let selected = selected_command(&frame, page.selected)
             .filter(|entry| page.search.includes(&frame, entry, page.status));
         let matches = history_matches(&frame, &page.search, page.status, page.order);
@@ -1110,10 +1140,7 @@ impl TerminalApp {
             ])
             .columns([GridLength::Star(1.0), GridLength::Star(2.0)])
             .children((
-                TextBlock::new()
-                    .grid_column_span(2)
-                    .font_size(24.0)
-                    .text(format!("Command history · Pane {}", page.pane)),
+                page_heading,
                 StackPanel::new()
                     .grid_row(1)
                     .grid_column_span(2)

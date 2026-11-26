@@ -4,6 +4,7 @@ mod text_search;
 mod window_history;
 pub use text_search::Action as TextAction;
 pub use window_history::Action as WindowHistoryAction;
+pub(super) use window_history::WindowHistoryReturn;
 pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
 
 struct Preview {
@@ -909,16 +910,14 @@ impl TerminalApp {
                     .history_frame(*pane)
                     .is_some_and(|frame| frame.has_command(*link))
             {
-                self.close_picker(ctx);
                 self.run_palette_command(id, ctx);
             } else {
-                self.search_window_history(ctx);
+                self.search_window_history(None, ctx);
             }
             return;
         }
         let rows = self.picker_command_rows(picker.mode, &picker.query);
         if rows.iter().any(|r| r.id == id && r.enabled) {
-            self.close_picker(ctx);
             self.run_palette_command(id, ctx);
         } else if let Some(picker) = &mut self.picker {
             picker.commands = rows;
@@ -1019,6 +1018,15 @@ impl TerminalApp {
     }
 
     fn start_picker(&mut self, mode: Mode, ctx: &ComponentContext<Self>) {
+        self.start_picker_from(mode, None, ctx);
+    }
+
+    fn start_picker_from(
+        &mut self,
+        mode: Mode,
+        previous: Option<WindowHistoryReturn>,
+        ctx: &ComponentContext<Self>,
+    ) {
         self.close_copy_mode();
         self.close_hints();
         if self.picker.is_some() {
@@ -1027,7 +1035,9 @@ impl TerminalApp {
         if self.switcher.is_some() {
             self.finish_switcher(false, ctx);
         }
-        let (matches, commands) = if mode.has_commands() {
+        let (matches, commands) = if previous.is_some() {
+            (vec![], vec![])
+        } else if mode.has_commands() {
             if matches!(
                 mode,
                 Mode::Commands(
@@ -1076,6 +1086,12 @@ impl TerminalApp {
             selected,
             preview: None,
         });
+        if let Some(previous) = previous {
+            let picker = self.picker.as_mut().unwrap();
+            picker.query = previous.query;
+            picker.window_history.options = previous.options;
+            self.search_window_history(Some(previous.selection), ctx);
+        }
         self.sync_picker_preview(ctx);
         self.keyboard.set_picker(Some(match mode {
             Mode::Commands(command_palette::Search::CommandHistory) => PickerStage::CommandHistory,
@@ -1115,7 +1131,7 @@ impl TerminalApp {
             && picker.window_history.options.include_output
         {
             self.picker.as_mut().unwrap().query = query;
-            self.search_window_history(ctx);
+            self.search_window_history(None, ctx);
             return;
         }
         if picker.mode.has_commands() {

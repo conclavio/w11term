@@ -77,6 +77,8 @@ try {
         $detail -and $detail.Current.Name -ceq $expected
     }
 
+    Invoke-Button (Wait-Until 'return to the SSH pane' { Find-Element 'Return to pane' $button })
+    Wait-Focus $pane
     Run-Palette ('Find command history' + [char]0x2026)
     Wait-PickerEditor 'Search commands across panes' 'window command history'
     $ssh = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.'palette-ssh'
@@ -107,8 +109,31 @@ try {
             (Find-Element "$unknownRow    Duration unavailable" $button -Visible) -and
             !(Find-Element "$quickRow    $quickDuration" $button)
     }
+    Press-Key 0x28
     Press-Key 0x0d
-    $null = Wait-Until 'Enter opens the filtered and sorted capture' { Find-Element $slowLabel $button }
+    $selectedUnknown = "Selected, Command $($unknown.id)${dot}exit 9"
+    $null = Wait-Until 'Enter opens the second filtered capture' { Find-Element $selectedUnknown $button -Visible }
+    Invoke-Button (Wait-Until 'return to search results' { Find-Element 'Back to search results' $button })
+    Wait-PickerEditor 'Search commands across panes' 'the restored history search'
+    $null = Wait-Until 'both earlier failure results are shown again' {
+        (Find-Element $slowWithDuration $button -Visible) -and
+            (Find-Element "$unknownRow    Duration unavailable" $button -Visible)
+    }
+    Press-Key 0x0d
+    $null = Wait-Until 'Enter opens the restored second selection without another move' {
+        !(Find-Element 'Search commands across panes') -and (Find-Element $selectedUnknown $button -Visible)
+    }
+    $null = Control @('close-pane','--pane',"$pane")
+    $null = Wait-Until 'the open history reports that its source closed' {
+        Find-Element 'The source pane has closed'
+    }
+    Invoke-Button (Wait-Until 'a closed source still offers search navigation' {
+        Find-Element 'Back to search results' $button
+    })
+    Wait-PickerEditor 'Search commands across panes' 'search without the closed pane'
+    $null = Wait-Until 'restored search leaves out captures from the closed pane' {
+        (Find-Element 'No retained commands in this window') -and !(Find-Element $unknownRow $button)
+    }
 } finally {
     [IO.File]::Delete($gate)
     Close-FixtureApp $app

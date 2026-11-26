@@ -146,6 +146,8 @@ try {
         Find-Element 'No matching commands in this window'
     }
     Press-Key 0x78 # F9 includes retained command output
+    Press-Key 0x76 # F7 filters to Failed
+    Press-Key 0x77 # F8 uses duration order
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $buttons = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -165,8 +167,25 @@ try {
             Where-Object { $_.Current.Name.StartsWith([string][char]0x2026) -and $_.Current.Name.Contains('remote result [42]') } |
             Select-Object -First 1
     }
-    Click 'Return to pane'
-    Wait-Focus $remote
+    Click 'Back to search results'
+    Wait-PickerEditor $picker 'the reopened window history'
+    $null = Wait-Until 'return restores the output query, filter, and order' {
+        $field = Find-Element $picker ([System.Windows.Automation.ControlType]::Edit)
+        $scope = Find-Element 'Include retained command output' ([System.Windows.Automation.ControlType]::CheckBox)
+        $status = Find-Element 'Window command status' ([System.Windows.Automation.ControlType]::ComboBox)
+        $order = Find-Element 'Window command order' ([System.Windows.Automation.ControlType]::ComboBox)
+        $selection = [System.Windows.Automation.SelectionPattern]::Pattern
+        if (!$field -or !$scope -or !$status -or !$order) { return }
+        $statuses = @($status.GetCurrentPattern($selection).Current.GetSelection())
+        $orders = @($order.GetCurrentPattern($selection).Current.GetSelection())
+        $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq 'REMOTE RESULT [42]' -and
+            $scope.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On' -and
+            $statuses.Count -eq 1 -and $statuses[0].Current.Name -ceq 'Failed' -and
+            $orders.Count -eq 1 -and $orders[0].Current.Name -ceq 'Slowest first'
+    }
+    Press-Key 0x1b
+    $null = Wait-Until 'Escape closes the restored history search' { !(Find-Element $picker) }
+    Wait-Focus $pane
 
     Run-Palette $find
     Wait-PickerEditor $picker 'the window history input'

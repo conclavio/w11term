@@ -829,6 +829,13 @@ impl TerminalApp {
     }
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
+        let history_search = match &id {
+            CommandId::OpenWindowCommand(pane, link, _) => {
+                self.window_history_return((*pane, *link))
+            }
+            _ => None,
+        };
+        self.close_picker(ctx);
         let message = match id {
             CommandId::RenamePane(target) => tab_title::show_pane(target),
             CommandId::SaveLiveProfile(origin) => live_profile::open(origin),
@@ -876,7 +883,7 @@ impl TerminalApp {
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
             CommandId::OpenWindowCommand(pane, link, hit) => {
-                if !self.open_command_history_preview(pane, Some(link), hit, ctx) {
+                if !self.open_command_history_preview(pane, Some(link), hit, history_search, ctx) {
                     self.window_error =
                         Some("That command is no longer retained in its source pane.".into());
                 }
