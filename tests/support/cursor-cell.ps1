@@ -18,15 +18,26 @@ public static class CursorCellProbe {
         finally { SetThreadDpiAwarenessContext(prior); }
     }
     public static int[] ReadPixels(IntPtr window, IntPtr foreground, int x, int y, int width, int height) {
+        return ReadPixels(window, foreground, x, y, width, height, false);
+    }
+    public static int[] TryReadPixels(IntPtr window, int x, int y, int width, int height) {
+        return ReadPixels(window, window, x, y, width, height, true);
+    }
+    static int[] ReadPixels(IntPtr window, IntPtr foreground, int x, int y, int width, int height, bool allowObscured) {
         if (width < 1 || width > 64 || height < 1 || height > 128)
             throw new ArgumentOutOfRangeException("cell dimensions");
         IntPtr prior = SetThreadDpiAwarenessContext(new IntPtr(-4));
         try {
-            if (GetForegroundWindow() != foreground) throw new InvalidOperationException("Fixture lost foreground");
+            if (GetForegroundWindow() != foreground) {
+                if (allowObscured) return null;
+                throw new InvalidOperationException("Fixture lost foreground");
+            }
             foreach (int col in new[] { x, x + width - 1 })
                 foreach (int row in new[] { y, y + height - 1 })
-                    if (GetAncestor(WindowFromPoint(new Point(col, row)), 2) != window)
+                    if (GetAncestor(WindowFromPoint(new Point(col, row)), 2) != window) {
+                        if (allowObscured) return null;
                         throw new InvalidOperationException("Fixture cursor cell is obscured");
+                    }
             using (var image = new Bitmap(width, height)) {
                 using (var g = Graphics.FromImage(image))
                     g.CopyFromScreen(x, y, 0, 0, image.Size, CopyPixelOperation.SourceCopy);
