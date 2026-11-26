@@ -906,10 +906,11 @@ async fn native_powershell_shell_integration_records_history_and_completion() {
     .unwrap();
     let encoded =
         percent_encoding::utf8_percent_encode(&command, percent_encoding::NON_ALPHANUMERIC);
+    let padding = "background log line\r\n".repeat(480);
     fs::write(
         remote.path().join("copy-history.vt"),
         format!(
-            "\x1b]7;file://127.0.0.1/remote%20history%20start\x07\x1b]133;A\x07$ \x1b]133;B\x07short display\r\n\x1b]133;C;cmdline_url={encoded}\x07remote history result\r\n\x1b]7;file://127.0.0.1/changed\x07\x1b]133;D;8\x07"
+            "\x1b]7;file://127.0.0.1/remote%20history%20start\x07\x1b]133;A\x07$ \x1b]133;B\x07short display\r\n\x1b]133;C;cmdline_url={encoded}\x07{padding}remote result [42]\r\n\x1b]7;file://127.0.0.1/changed\x07\x1b]133;D;8\x07history ready\r\n"
         ),
     )
     .unwrap();

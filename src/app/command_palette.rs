@@ -127,7 +127,11 @@ pub enum CommandId {
     SearchWindowGroupRuns(WindowRunScope),
     WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(TabId),
-    OpenWindowCommand(u64, w11term::events::CommandLink),
+    OpenWindowCommand(
+        u64,
+        w11term::events::CommandLink,
+        Option<std::ops::Range<usize>>,
+    ),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
     ManageRecipientSets(TabId, String),
@@ -871,8 +875,8 @@ impl TerminalApp {
                 return;
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
-            CommandId::OpenWindowCommand(pane, link) => {
-                if !self.open_command_history(pane, Some(link), ctx) {
+            CommandId::OpenWindowCommand(pane, link, hit) => {
+                if !self.open_command_history_preview(pane, Some(link), hit, ctx) {
                     self.window_error =
                         Some("That command is no longer retained in its source pane.".into());
                 }
@@ -996,7 +1000,12 @@ pub(super) fn view(
     app: &TerminalApp,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
-    let page = ((app.window_height - 156.0) / 40.0).clamp(1.0, 10.0) as usize;
+    let search_height = if mode == Search::CommandHistory {
+        188.0
+    } else {
+        156.0
+    };
+    let page = ((app.window_height - search_height) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
     let search_label = mode.placeholder();
     let trimming = if matches!(
@@ -1077,7 +1086,11 @@ pub(super) fn view(
             TextBlock::new().text(
                 app.picker
                     .as_ref()
-                    .and_then(|picker| picker.bookmark_status(app))
+                    .and_then(|picker| {
+                        picker
+                            .history_output_status()
+                            .or_else(|| picker.bookmark_status(app))
+                    })
                     .unwrap_or_else(|| {
                         if mode.is_profiles() && app.profile_error.is_some() {
                             "Could not load profiles"
@@ -1123,9 +1136,15 @@ pub(super) fn view(
                 )),
         ));
     }
+    let include_output = app
+        .picker
+        .as_ref()
+        .filter(|_| mode == Search::CommandHistory)
+        .map_or_else(View::empty, |picker| picker.history_output_option(ctx));
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
+            include_output,
             StackPanel::new().spacing(4.0).keyed_children(results),
         )),
         (app.width - 32.0).clamp(1.0, 660.0),

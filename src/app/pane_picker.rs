@@ -1,6 +1,8 @@
 use super::*;
 use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
+mod history_output;
 mod text_search;
+pub use history_output::Action as HistoryOutputAction;
 pub use text_search::Action as TextAction;
 pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
 
@@ -248,6 +250,7 @@ pub(super) struct Picker {
     commands: Vec<command_palette::Row>,
     bookmarks: Option<Result<Vec<BookmarkEntry>, &'static str>>,
     text: text_search::Results,
+    history_output: history_output::Search,
     selected: usize,
     preview: Option<Preview>,
 }
@@ -866,6 +869,9 @@ impl TerminalApp {
         let Some(picker) = self.picker.as_ref().filter(|p| p.mode.has_commands()) else {
             return;
         };
+        if picker.uses_history_output() {
+            return;
+        }
         let commands = self.picker_command_rows(picker.mode, &picker.query);
         let selected = picker
             .commands
@@ -891,6 +897,19 @@ impl TerminalApp {
             self.refresh_profiles();
         }
         let Some(picker) = &self.picker else { return };
+        if picker.uses_history_output() {
+            if let command_palette::CommandId::OpenWindowCommand(pane, link, _) = &id
+                && self
+                    .history_frame(*pane)
+                    .is_some_and(|frame| frame.has_command(*link))
+            {
+                self.close_picker(ctx);
+                self.run_palette_command(id, ctx);
+            } else {
+                self.search_history_output(ctx);
+            }
+            return;
+        }
         let rows = self.picker_command_rows(picker.mode, &picker.query);
         if rows.iter().any(|r| r.id == id && r.enabled) {
             self.close_picker(ctx);
@@ -1047,6 +1066,7 @@ impl TerminalApp {
             commands,
             bookmarks: None,
             text: text_search::Results::default(),
+            history_output: history_output::Search::default(),
             selected,
             preview: None,
         });
@@ -1083,6 +1103,13 @@ impl TerminalApp {
     pub(super) fn filter_picker(&mut self, query: String, ctx: &ComponentContext<Self>) {
         let Some(picker) = &self.picker else { return };
         if picker.placement().is_some() || picker.query == query || picker.mode == Mode::Text {
+            return;
+        }
+        if picker.mode == Mode::Commands(command_palette::Search::CommandHistory)
+            && picker.history_output.included
+        {
+            self.picker.as_mut().unwrap().query = query;
+            self.search_history_output(ctx);
             return;
         }
         if picker.mode.has_commands() {

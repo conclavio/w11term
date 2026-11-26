@@ -1370,6 +1370,7 @@ pub enum Message {
     InspectSshRoute(u64, bool),
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
+    HistoryOutput(pane_picker::HistoryOutputAction),
     PaneText(pane_picker::TextAction),
     PickerHover(u64),
     PickerFrame(u64, u64),
@@ -5681,6 +5682,7 @@ impl Component for TerminalApp {
                     saved_commands::Edit::Name(_) | saved_commands::Edit::Text(_)
                 )
                 | Message::PickerQuery(..)
+                | Message::HistoryOutput(..)
                 | Message::Discovery(
                     session_browser::Action::Query(..) | session_browser::Action::Focus(..)
                 )
@@ -5932,6 +5934,7 @@ impl Component for TerminalApp {
             Message::HostGroup(action) => self.handle_host_group(action, context),
             Message::PaletteChoose(id) => self.choose_command(id, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
+            Message::HistoryOutput(action) => self.history_output_action(action, context),
             Message::PaneText(action) => self.pane_text_action(action, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),

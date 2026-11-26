@@ -21,6 +21,7 @@ pub(super) struct HistoryPage {
     pane: u64,
     selected: Option<(u64, u64)>, // Connection generation and command id.
     search: HistorySearch,
+    output_hit: Option<(CommandLink, Range<usize>)>,
     status: CommandStatus,
     order: HistoryOrder,
     feedback: String,
@@ -129,10 +130,7 @@ struct OutputMatches {
 impl HistorySearch {
     fn update_matcher(&mut self) {
         self.matcher = if self.include_output && !self.query.is_empty() {
-            RegexBuilder::new(&regex::escape(&self.query))
-                .case_insensitive(true)
-                .build()
-                .ok()
+            output_matcher(&self.query)
         } else {
             None
         };
@@ -162,6 +160,86 @@ impl HistorySearch {
             && (command_text_matches(entry, &self.needle)
                 || self.output_match(frame, entry.id).is_some())
     }
+}
+
+fn output_matcher(query: &str) -> Option<Regex> {
+    RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+pub(super) struct WindowCapture {
+    pane: u64,
+    generation: u64,
+    source: Arc<str>,
+    command: Arc<CompletedCommand>,
+    fields_match: bool,
+}
+
+pub(super) fn window_history_rows(
+    captures: Vec<WindowCapture>,
+    output_query: Option<&str>,
+    cancelled: impl Fn() -> bool,
+) -> Vec<command_palette::Row> {
+    let matcher = output_query.and_then(output_matcher);
+    let mut rows = Vec::new();
+    for capture in captures {
+        if cancelled() {
+            return Vec::new();
+        }
+        let command = &capture.command;
+        let output_match = matcher.as_ref().and_then(|matcher| {
+            let output = command.output.as_deref().ok()?;
+            Some((output, matcher.find(output)?.range()))
+        });
+        if !capture.fields_match && output_match.is_none() {
+            continue;
+        }
+        let pane = capture.pane;
+        let link = CommandLink {
+            generation: capture.generation,
+            id: command.id,
+        };
+        let mut label = format!(
+            "{} · {} · {}",
+            capture.source,
+            command_status(command),
+            command_name(command),
+        );
+        if let Some((output, hit)) = &output_match {
+            label = format!("{} · {label}", output_excerpt(output, hit));
+        }
+        rows.push((
+            Reverse((command.finished_at, pane, command.id)),
+            command_palette::Row {
+                id: command_palette::CommandId::OpenWindowCommand(
+                    pane,
+                    link,
+                    output_match.map(|(_, hit)| hit),
+                ),
+                label,
+                chord: String::new(),
+                enabled: true,
+            },
+        ));
+    }
+    rows.sort_unstable_by_key(|(order, _)| *order);
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+fn output_excerpt(output: &str, hit: &Range<usize>) -> String {
+    let start = output.ceil_char_boundary(hit.start.saturating_sub(24));
+    let end = output.floor_char_boundary(output.len().min(hit.start + 64));
+    let excerpt = output[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{}{excerpt}{}",
+        if start > 0 { "…" } else { "" },
+        if end < output.len() { "…" } else { "" }
+    )
 }
 
 fn command_text_matches(entry: &CompletedCommand, needle: &str) -> bool {
@@ -346,8 +424,16 @@ impl TerminalApp {
     }
 
     pub(super) fn window_command_history_rows(&self, query: &str) -> Vec<command_palette::Row> {
+        window_history_rows(self.window_command_captures(query, false), None, || false)
+    }
+
+    pub(super) fn window_command_captures(
+        &self,
+        query: &str,
+        include_output: bool,
+    ) -> Vec<WindowCapture> {
         let needle = query.trim().to_lowercase();
-        let mut rows = Vec::new();
+        let mut captures = Vec::new();
         for tab in self.tabs.entries().iter().map(|entry| &entry.value) {
             let Page::Terminal(live) = &tab.page else {
                 continue;
@@ -368,34 +454,25 @@ impl TerminalApp {
                 || tab
                     .profile_name()
                     .is_some_and(|name| name.to_lowercase().contains(&needle));
+            let source: Arc<str> = source.into();
             let frame = live.session.frames.load();
-            for command in frame.command_history.iter().filter(|command| {
-                source_matches
+            for command in frame.command_history.iter() {
+                let fields_match = source_matches
                     || command_text_matches(command, &needle)
                     || command_directory(&live.source, command)
-                        .is_some_and(|path| path.display().to_lowercase().contains(&needle))
-            }) {
-                let link = CommandLink {
-                    generation: frame.connection_generation,
-                    id: command.id,
-                };
-                rows.push((
-                    Reverse((command.finished_at, pane, command.id)),
-                    command_palette::Row {
-                        id: command_palette::CommandId::OpenWindowCommand(pane, link),
-                        label: format!(
-                            "{source} · {} · {}",
-                            command_status(command),
-                            command_name(command)
-                        ),
-                        chord: String::new(),
-                        enabled: true,
-                    },
-                ));
+                        .is_some_and(|path| path.display().to_lowercase().contains(&needle));
+                if fields_match || (include_output && command.output.is_ok()) {
+                    captures.push(WindowCapture {
+                        pane,
+                        generation: frame.connection_generation,
+                        source: Arc::clone(&source),
+                        command: Arc::clone(command),
+                        fields_match,
+                    });
+                }
             }
         }
-        rows.sort_unstable_by_key(|(order, _)| *order);
-        rows.into_iter().map(|(_, row)| row).collect()
+        captures
     }
 
     fn history_directory(
@@ -507,6 +584,16 @@ impl TerminalApp {
         target: Option<w11term::events::CommandLink>,
         ctx: &ComponentContext<Self>,
     ) -> bool {
+        self.open_command_history_preview(pane, target, None, ctx)
+    }
+
+    pub(super) fn open_command_history_preview(
+        &mut self,
+        pane: u64,
+        target: Option<CommandLink>,
+        output_hit: Option<Range<usize>>,
+        ctx: &ComponentContext<Self>,
+    ) -> bool {
         let Some(source) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) else {
             return false;
         };
@@ -530,6 +617,7 @@ impl TerminalApp {
             pane,
             selected,
             search,
+            output_hit: target.zip(output_hit),
             status: CommandStatus::All,
             order: HistoryOrder::Newest,
             feedback: String::new(),
@@ -643,6 +731,15 @@ impl TerminalApp {
             return;
         }
         page.feedback.clear();
+        if matches!(
+            action,
+            HistoryAction::Search(_)
+                | HistoryAction::IncludeOutput(_)
+                | HistoryAction::Refresh
+                | HistoryAction::Select(..)
+        ) {
+            page.output_hit = None;
+        }
         match action {
             HistoryAction::Compare(_) => unreachable!(),
             HistoryAction::Search(query) => {
@@ -865,7 +962,13 @@ impl TerminalApp {
                     ),
             )
         });
-        let preview_hit = selected.and_then(|entry| page.search.output_match(&frame, entry.id));
+        let preview_hit = selected.and_then(|entry| {
+            page.search.output_match(&frame, entry.id).or_else(|| {
+                page.output_hit.as_ref().and_then(|(link, range)| {
+                    (link.generation == generation && link.id == entry.id).then(|| range.clone())
+                })
+            })
+        });
         // Mount a fresh native scroll surface when the matching context moves.
         let preview_key = selected.zip(preview_hit.as_ref()).map_or_else(
             || "output".to_owned(),

@@ -138,6 +138,38 @@ try {
     Wait-Focus $pane
 
     Run-Palette $find
+    Wait-PickerEditor $picker 'the window output search input'
+    $field = Find-Element $picker ([System.Windows.Automation.ControlType]::Edit)
+    $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    $value.SetValue('REMOTE RESULT [42]')
+    $null = Wait-Until 'default history search excludes output' {
+        Find-Element 'No matching commands in this window'
+    }
+    $box = Find-Element 'Include retained command output' ([System.Windows.Automation.ControlType]::CheckBox)
+    $box.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $buttons = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)
+    $null = Wait-Until 'case-insensitive literal matches show a remote output excerpt' {
+        $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons) |
+            Where-Object { $_.Current.Name.Contains('remote result [42]') -and $_.Current.Name.Contains('palette-ssh') } |
+            Select-Object -First 1
+    }
+    $field.SetFocus()
+    Press-Key 0x0d
+    $null = Wait-Until 'history preview opens after the first 8 KiB at the output match' {
+        $text = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Text)
+        $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
+            Where-Object { $_.Current.Name.StartsWith([string][char]0x2026) -and $_.Current.Name.Contains('remote result [42]') } |
+            Select-Object -First 1
+    }
+    Click 'Return to pane'
+    Wait-Focus $remote
+
+    Run-Palette $find
     Wait-PickerEditor $picker 'the window history input'
     $catalog = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
     $ssh = $catalog.profiles.'palette-ssh'
