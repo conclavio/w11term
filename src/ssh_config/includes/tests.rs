@@ -160,7 +160,6 @@ fn unusable_public_identity_files_disable_only_the_affected_aliases() {
             "certificate",
             "OpenSSH certificate is not a plain public IdentityFile",
         ),
-        ("paired", "requires a private IdentityFile"),
         ("network", "expected a local drive path"),
     ] {
         let entry = report
@@ -189,6 +188,18 @@ fn unusable_public_identity_files_disable_only_the_affected_aliases() {
     assert_eq!(
         imported_private.options.as_ref().unwrap().authentication,
         Authentication::identity(private, None)
+    );
+    let paired = report
+        .aliases
+        .iter()
+        .find(|entry| entry.name == "paired")
+        .unwrap();
+    assert_eq!(
+        paired.options.as_ref().unwrap().authentication,
+        Authentication::agent_certificate(
+            files.home().join("other-cert.pub"),
+            Some(AgentFingerprint::for_key(key.public_key()))
+        )
     );
 }
 

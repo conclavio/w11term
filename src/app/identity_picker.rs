@@ -5,9 +5,25 @@ use std::path::{Path, PathBuf};
 pub enum Kind {
     PrivateKey,
     UserCertificate,
+    AgentCertificate,
 }
 
 impl Kind {
+    pub(super) fn certificate(authentication: usize) -> Option<Self> {
+        match authentication {
+            PRIVATE_KEY_AUTH => Some(Self::UserCertificate),
+            AGENT_CERTIFICATE_AUTH => Some(Self::AgentCertificate),
+            _ => None,
+        }
+    }
+
+    pub(super) fn available(self, authentication: usize) -> bool {
+        match self {
+            Self::PrivateKey => authentication == PRIVATE_KEY_AUTH,
+            _ => Self::certificate(authentication) == Some(self),
+        }
+    }
+
     pub(super) fn field<'a>(
         self,
         identity: &'a mut String,
@@ -15,7 +31,7 @@ impl Kind {
     ) -> &'a mut String {
         match self {
             Self::PrivateKey => identity,
-            Self::UserCertificate => certificate,
+            Self::UserCertificate | Self::AgentCertificate => certificate,
         }
     }
 }
@@ -69,6 +85,10 @@ pub(super) fn field(
             "User certificate file (optional)",
             "Browse for user certificate",
         ),
+        Target::Endpoint(_, Kind::AgentCertificate) => (
+            "Agent user certificate file",
+            "Browse for agent user certificate",
+        ),
         Target::Jump {
             kind: Kind::PrivateKey,
             ..
@@ -83,6 +103,13 @@ pub(super) fn field(
             "Jump host user certificate file (optional)",
             "Browse for jump host user certificate",
         ),
+        Target::Jump {
+            kind: Kind::AgentCertificate,
+            ..
+        } => (
+            "Jump host agent user certificate file",
+            "Browse for jump host agent user certificate",
+        ),
     };
     StackPanel::new().spacing(5.0).children((
         TextBlock::new().text(label),
@@ -94,7 +121,9 @@ pub(super) fn field(
                     .text(value)
                     .placeholder_text(match target.kind() {
                         Kind::PrivateKey => "C:\\path\\to\\key or a path beside profiles.json",
-                        Kind::UserCertificate => "C:\\path\\to\\id-cert.pub",
+                        Kind::UserCertificate | Kind::AgentCertificate => {
+                            "C:\\path\\to\\id-cert.pub"
+                        }
                     })
                     .automation_name(label)
                     .on_text_changed(on_changed),
@@ -117,7 +146,7 @@ impl TerminalApp {
         match &mut self.tabs.get_mut(id)?.page {
             Page::NewProfile(draft) => match target {
                 Target::Endpoint(_, kind)
-                    if draft.authentication == PRIVATE_KEY_AUTH && !draft.generating =>
+                    if kind.available(draft.authentication) && !draft.generating =>
                 {
                     Some(Field {
                         value: kind.field(&mut draft.identity, &mut draft.certificate),
@@ -137,7 +166,7 @@ impl TerminalApp {
             },
             Page::QuickConnect(draft)
                 if matches!(target, Target::Endpoint(..))
-                    && draft.authentication == PRIVATE_KEY_AUTH =>
+                    && target.kind().available(draft.authentication) =>
             {
                 Some(Field {
                     value: target
@@ -184,7 +213,7 @@ impl TerminalApp {
                                 owner,
                                 file_picker::Purpose::SshIdentity {
                                     current,
-                                    certificate: target.kind() == Kind::UserCertificate,
+                                    certificate: target.kind() != Kind::PrivateKey,
                                 },
                             )
                             .map(|chosen| chosen.map(|file| file.path))

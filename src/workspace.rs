@@ -135,20 +135,12 @@ impl SavedSource {
             (Source::Ssh(_), Some(name)) => Self::SavedProfile(name.into()),
             (Source::Ssh(options), None) => {
                 let mut options = options.clone();
-                for auth in options.authentications_mut() {
-                    let Authentication::Identity {
-                        identity,
-                        certificate,
-                    } = auth
-                    else {
-                        continue;
-                    };
-                    for path in std::iter::once(identity.as_mut())
-                        .chain(certificate.iter_mut().map(Box::as_mut))
-                    {
-                        ensure!(!path.as_os_str().is_empty(), "Empty SSH credential path");
-                        *path = std::path::absolute(&*path)?;
-                    }
+                for path in options
+                    .authentications_mut()
+                    .flat_map(Authentication::credential_paths_mut)
+                {
+                    ensure!(!path.as_os_str().is_empty(), "Empty SSH credential path");
+                    *path = std::path::absolute(&*path)?;
                 }
                 if let Some(path) = &mut options.player.device_key {
                     ensure!(!path.as_os_str().is_empty(), "Empty device key path");
@@ -221,16 +213,12 @@ impl SavedSource {
                 for auth in std::iter::once(&options.authentication)
                     .chain(options.proxy_jump.iter().map(|hop| &hop.authentication))
                 {
-                    let Authentication::Identity {
-                        identity,
-                        certificate,
-                    } = auth
-                    else {
-                        continue;
-                    };
-                    ensure!(identity.is_absolute(), "Expected an absolute identity path");
                     ensure!(
-                        certificate.as_ref().is_none_or(|path| path.is_absolute()),
+                        auth.identity_path().is_none_or(Path::is_absolute),
+                        "Expected an absolute identity path"
+                    );
+                    ensure!(
+                        auth.certificate_path().is_none_or(Path::is_absolute),
                         "Expected an absolute SSH user certificate path"
                     );
                 }
@@ -1171,6 +1159,19 @@ mod tests {
             panic!()
         };
         assert_eq!(*identity, std::path::absolute("keys/dev").unwrap());
+        let mut options = ssh("dev.example");
+        let pin = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .unwrap();
+        options.authentication = Authentication::agent_certificate("keys/dev-cert.pub", Some(pin));
+        let saved = SavedSource::capture(&Source::Ssh(options), None).unwrap();
+        let Source::Ssh(options) = saved.resolve(&BTreeMap::new()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            options.authentication.certificate_path(),
+            Some(std::path::absolute("keys/dev-cert.pub").unwrap().as_path())
+        );
         assert!(SavedSource::capture(&Source::Replay("some-capture.vt".into()), None).is_ok());
     }
 }

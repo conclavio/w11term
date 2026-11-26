@@ -2,18 +2,18 @@ use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::negotiation::{InitialSshAlgorithms, VerifiedHandshake};
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
-use super::{ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT};
+use super::{ConnectionProgress, ConnectionStep, SESSION_SETUP_TIMEOUT, agent};
 use crate::{
     events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
-    options::{Authentication, SshOptions},
+    options::{AgentFingerprint, Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
 };
 use anyhow::{Context, Result, ensure};
 use russh::{
-    client,
+    AgentAuthError, client,
     keys::{
-        HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
+        Certificate, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate,
         ssh_key::{Kdf, certificate::CertType},
     },
 };
@@ -644,6 +644,30 @@ async fn finish_public_key_authentication(
     }
 }
 
+fn load_user_certificate(path: &Path) -> Result<Certificate> {
+    let mut cert = russh::keys::load_openssh_certificate(path).map_err(|error| {
+        stop(format!(
+            "reading SSH user certificate {}: {error}",
+            path.display()
+        ))
+    })?;
+    ensure!(
+        cert.cert_type() == CertType::User,
+        Permanent("the SSH certificate must be a user certificate".into())
+    );
+    // The text comment is absent from a certificate advertised by an agent.
+    cert.set_comment("");
+    Ok(cert)
+}
+
+async fn open_authentication_agent() -> Result<agent::WindowsAgent> {
+    agent::connect().await.map_err(|error| {
+        stop(format!(
+            "{error:#}. Choose a device key or password if the agent is unavailable."
+        ))
+    })
+}
+
 pub(super) async fn authenticate(
     session: &mut client::Handle<Handler>,
     options: &SshOptions,
@@ -662,17 +686,7 @@ pub(super) async fn authenticate(
             let (key, remember) =
                 identity_key(identity, prompts, &mut credentials.unlocked_identity).await?;
             let (result, rejection) = if let Some(path) = certificate {
-                let cert =
-                    russh::keys::load_openssh_certificate(path.as_path()).map_err(|error| {
-                        stop(format!(
-                            "reading SSH user certificate {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                ensure!(
-                    cert.cert_type() == CertType::User,
-                    Permanent("the SSH certificate must be a user certificate".into())
-                );
+                let cert = load_user_certificate(path)?;
                 ensure!(
                     cert.public_key() == key.public_key().key_data(),
                     Permanent("the SSH user certificate does not match the private key".into())
@@ -704,21 +718,61 @@ pub(super) async fn authenticate(
                 });
             }
         }
+        Authentication::AgentCertificate {
+            certificate,
+            agent_fingerprint,
+        } => {
+            let certificate = load_user_certificate(certificate)?;
+            let public = PublicKey::new(certificate.public_key().clone(), "");
+            let actual_fingerprint = AgentFingerprint::for_key(&public);
+            ensure!(
+                agent_fingerprint
+                    .as_ref()
+                    .is_none_or(|pinned| *pinned == actual_fingerprint),
+                Permanent("the SSH user certificate does not match the selected agent key".into())
+            );
+            let hash = session.best_supported_rsa_hash().await?.flatten();
+            let mut agent = open_authentication_agent().await?;
+            let identities = agent.request_identities().await?;
+            let mut signer = agent::CertificateSigner::matching(
+                &mut agent,
+                &identities,
+                &certificate,
+            )
+            .ok_or_else(|| {
+                stop(format!(
+                    "Windows SSH agent does not hold the key for the SSH user certificate ({})",
+                    actual_fingerprint.as_str()
+                ))
+            })?;
+            let result = session
+                .authenticate_certificate_with(&options.user, certificate, hash, &mut signer)
+                .await
+                .map_err(|error| match error {
+                    AgentAuthError::Key(_) => stop(format!(
+                        "Windows SSH agent could not sign for the SSH user certificate: {error}"
+                    )),
+                    _ => error.into(),
+                })?;
+            finish_public_key_authentication(
+                session,
+                options,
+                prompts,
+                result,
+                "the server rejected the SSH user certificate",
+            )
+            .await?;
+        }
         Authentication::Agent | Authentication::AgentKey { .. } => {
             use russh::keys::agent::AgentIdentity;
 
             let hash = session.best_supported_rsa_hash().await?.flatten();
-            let mut agent = super::agent::connect().await.map_err(|e| {
-                stop(format!(
-                    "{e:#}. Choose a device key or password if the agent is unavailable."
-                ))
-            })?;
+            let mut agent = open_authentication_agent().await?;
             let identities = agent.request_identities().await?;
             if let Authentication::AgentKey { agent_fingerprint } = &options.authentication {
                 let Some(key) = identities.into_iter().find_map(|identity| match identity {
                     AgentIdentity::PublicKey { key, .. }
-                        if crate::options::AgentFingerprint::for_key(&key)
-                            == *agent_fingerprint =>
+                        if AgentFingerprint::for_key(&key) == *agent_fingerprint =>
                     {
                         Some(key)
                     }

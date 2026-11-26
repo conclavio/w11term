@@ -181,38 +181,48 @@ pub(super) fn view(
                 )),
             ),
         ];
+    use identity_picker::{Kind, Target};
     if draft.authentication == PRIVATE_KEY_AUTH {
-        use identity_picker::{Kind, Target};
-        fields.extend([
-            KeyedView::new(
-                "identity",
-                identity_picker::field(
-                    Target::Endpoint(id, Kind::PrivateKey),
-                    &draft.identity,
-                    can_browse,
-                    context
-                        .callback(move |value| Message::QuickConnect(Action::Identity(id, value))),
-                    context,
-                ),
+        fields.push(KeyedView::new(
+            "identity",
+            identity_picker::field(
+                Target::Endpoint(id, Kind::PrivateKey),
+                &draft.identity,
+                can_browse,
+                context.callback(move |value| Message::QuickConnect(Action::Identity(id, value))),
+                context,
             ),
-            KeyedView::new(
-                "certificate",
-                identity_picker::field(
-                    Target::Endpoint(id, Kind::UserCertificate),
-                    &draft.certificate,
-                    can_browse,
-                    context.callback(move |value| {
-                        Message::QuickConnect(Action::Certificate(id, value))
-                    }),
-                    context,
-                ),
+        ));
+    }
+    if let Some(kind) = Kind::certificate(draft.authentication) {
+        fields.push(KeyedView::new(
+            "certificate",
+            identity_picker::field(
+                Target::Endpoint(id, kind),
+                &draft.certificate,
+                can_browse,
+                context
+                    .callback(move |value| Message::QuickConnect(Action::Certificate(id, value))),
+                context,
             ),
-        ]);
-    } else if draft.authentication == SPECIFIC_AGENT_KEY_AUTH {
+        ));
+    }
+    if draft.authentication == SPECIFIC_AGENT_KEY_AUTH {
         fields.push(KeyedView::new(
             "agent-key",
             agent_key_picker::field(
                 "SSH agent key fingerprint",
+                &draft.agent_fingerprint,
+                context.callback(move |value| {
+                    Message::QuickConnect(Action::AgentFingerprint(id, value))
+                }),
+            ),
+        ));
+    } else if draft.authentication == AGENT_CERTIFICATE_AUTH {
+        fields.push(KeyedView::new(
+            "agent-certificate-pin",
+            agent_key_picker::optional_pin(
+                "Agent key fingerprint (optional)",
                 &draft.agent_fingerprint,
                 context.callback(move |value| {
                     Message::QuickConnect(Action::AgentFingerprint(id, value))

@@ -200,43 +200,51 @@ impl Draft {
                     })),
             )),
         ];
+        use identity_picker::{Kind, Target};
         if self.authentication == PRIVATE_KEY_AUTH {
-            use identity_picker::{Kind, Target};
-            fields.extend([
-                identity_picker::field(
-                    Target::Jump {
-                        tab: id,
-                        edit,
-                        kind: Kind::PrivateKey,
-                    },
-                    &self.identity,
-                    can_browse,
-                    context.callback(move |value| {
-                        Message::ProfileJump(id, Edit::Text(Field::Identity, value))
-                    }),
-                    context,
-                ),
-                identity_picker::field(
-                    Target::Jump {
-                        tab: id,
-                        edit,
-                        kind: Kind::UserCertificate,
-                    },
-                    &self.certificate,
-                    can_browse,
-                    context.callback(move |value| {
-                        Message::ProfileJump(id, Edit::Text(Field::Certificate, value))
-                    }),
-                    context,
-                ),
-            ]);
-        } else if self.authentication == SPECIFIC_AGENT_KEY_AUTH {
+            fields.push(identity_picker::field(
+                Target::Jump {
+                    tab: id,
+                    edit,
+                    kind: Kind::PrivateKey,
+                },
+                &self.identity,
+                can_browse,
+                context.callback(move |value| {
+                    Message::ProfileJump(id, Edit::Text(Field::Identity, value))
+                }),
+                context,
+            ));
+        }
+        if let Some(kind) = Kind::certificate(self.authentication) {
+            fields.push(identity_picker::field(
+                Target::Jump {
+                    tab: id,
+                    edit,
+                    kind,
+                },
+                &self.certificate,
+                can_browse,
+                context.callback(move |value| {
+                    Message::ProfileJump(id, Edit::Text(Field::Certificate, value))
+                }),
+                context,
+            ));
+        }
+        if self.authentication == SPECIFIC_AGENT_KEY_AUTH {
             fields.push(agent_key_picker::field(
                 "Jump host agent key fingerprint",
                 &self.agent_fingerprint,
                 context.callback(move |value| {
                     Message::ProfileJump(id, Edit::Text(Field::AgentFingerprint, value))
                 }),
+            ));
+        } else if self.authentication == AGENT_CERTIFICATE_AUTH {
+            fields.push(text_box(
+                Field::AgentFingerprint,
+                "Jump host agent key fingerprint (optional)",
+                &self.agent_fingerprint,
+                "Use the certificate's key when blank",
             ));
         }
         fields.extend([
@@ -304,7 +312,7 @@ impl Editor {
     ) -> Option<(&mut String, &mut Option<String>)> {
         let draft = self.pending.as_mut()?;
         let field = kind.field(&mut draft.identity, &mut draft.certificate);
-        (self.edit == edit && draft.authentication == PRIVATE_KEY_AUTH)
+        (self.edit == edit && kind.available(draft.authentication))
             .then_some((field, &mut draft.error))
     }
 

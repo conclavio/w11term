@@ -942,32 +942,22 @@ impl ProfileStore {
             {
                 replace_share_epoch(object);
             }
-            use crate::options::Authentication::Identity;
-            let (keep_identity, keep_certificate) = match (
-                expected.map(|previous| &previous.authentication),
-                &options.authentication,
-            ) {
-                (
-                    Some(Identity {
-                        identity: old_identity,
-                        certificate: old_certificate,
-                    }),
-                    Identity {
-                        identity,
-                        certificate,
-                    },
-                ) => (
-                    identity == old_identity,
-                    certificate.is_some() && certificate == old_certificate,
-                ),
-                _ => (false, false),
-            };
+            let old_authentication = expected.map(|previous| &previous.authentication);
+            let identity = options.authentication.identity_path();
+            let certificate = options.authentication.certificate_path();
+            let keep_identity = identity.is_some()
+                && old_authentication.and_then(crate::options::Authentication::identity_path)
+                    == identity;
+            let keep_certificate = certificate.is_some()
+                && old_authentication.and_then(crate::options::Authentication::certificate_path)
+                    == certificate;
             if !keep_identity {
                 object.remove("identity");
             }
             if !keep_certificate {
                 object.remove("certificate");
             }
+            object.remove("agent_fingerprint");
             let keep_route =
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
             let keep_forwards =
@@ -2336,6 +2326,38 @@ mod edit_tests {
         let profile = &saved["profiles"]["pilot"];
         assert!(profile.get("identity").is_none());
         assert!(profile.get("certificate").is_none());
+    }
+
+    #[test]
+    fn saving_an_agent_certificate_preserves_a_relative_path_and_clears_its_removed_pin() {
+        const KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"profiles":{"pilot":{
+                "host":"localhost","user":"pilot","auth":"agent-certificate",
+                "certificate":"keys/login-cert.pub","agent_fingerprint":KEY
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let original = store.load().unwrap().remove("pilot").unwrap();
+        let absolute = dir.path().join("keys/login-cert.pub");
+        assert_eq!(
+            original.authentication,
+            Authentication::agent_certificate(&absolute, Some(KEY.parse().unwrap()))
+        );
+        let mut changed = original.clone();
+        changed.authentication = Authentication::agent_certificate(absolute, None);
+        store.edit("pilot", "pilot", &changed, &original).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let profile = &saved["profiles"]["pilot"];
+        assert_eq!(profile["auth"], "agent-certificate");
+        assert_eq!(profile["certificate"], "keys/login-cert.pub");
+        assert!(profile.get("agent_fingerprint").is_none());
     }
 
     #[test]

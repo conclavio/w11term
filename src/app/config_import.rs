@@ -140,6 +140,17 @@ pub(super) fn endpoint(
         Authentication::AgentKey { agent_fingerprint } => {
             format!("SSH agent key {}", agent_fingerprint.as_str())
         }
+        Authentication::AgentCertificate {
+            certificate,
+            agent_fingerprint,
+        } => {
+            let mut label = format!("SSH agent with user certificate {}", certificate.display());
+            if let Some(fingerprint) = agent_fingerprint {
+                use std::fmt::Write;
+                let _ = write!(label, " for key {}", fingerprint.as_str());
+            }
+            label
+        }
         Authentication::Identity {
             identity,
             certificate,

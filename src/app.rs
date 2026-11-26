@@ -706,13 +706,15 @@ impl ProfileDraft {
 
 const PRIVATE_KEY_AUTH: usize = 1;
 const SPECIFIC_AGENT_KEY_AUTH: usize = 5;
-const SSH_AUTH_LABELS: [&str; 6] = [
+const AGENT_CERTIFICATE_AUTH: usize = 6;
+const SSH_AUTH_LABELS: [&str; 7] = [
     "Windows SSH agent",
     "Private key file",
     "None (keyless server)",
     "Password",
     "Keyboard-interactive (password / MFA)",
     "Specific SSH agent key",
+    "SSH agent with user certificate",
 ];
 
 fn parse_ssh_address(host: &str, user: &str, port: &str) -> anyhow::Result<(String, String, u16)> {
@@ -767,6 +769,18 @@ fn ssh_auth_fields(authentication: &Authentication) -> (usize, String, String, S
             String::new(),
             agent_fingerprint.as_str().into(),
         ),
+        Authentication::AgentCertificate {
+            certificate,
+            agent_fingerprint,
+        } => (
+            AGENT_CERTIFICATE_AUTH,
+            String::new(),
+            certificate.to_string_lossy().into_owned(),
+            agent_fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.as_str().to_owned())
+                .unwrap_or_default(),
+        ),
         Authentication::Identity {
             identity,
             certificate,
@@ -807,6 +821,20 @@ fn ssh_authentication(
         SPECIFIC_AGENT_KEY_AUTH => Authentication::AgentKey {
             agent_fingerprint: agent_fingerprint.parse()?,
         },
+        AGENT_CERTIFICATE_AUTH => {
+            let certificate = certificate.trim();
+            let fingerprint = agent_fingerprint.trim();
+            anyhow::ensure!(
+                !certificate.is_empty(),
+                "Enter the SSH user certificate file path"
+            );
+            Authentication::agent_certificate(
+                certificate,
+                (!fingerprint.is_empty())
+                    .then(|| fingerprint.parse())
+                    .transpose()?,
+            )
+        }
         _ => Authentication::Agent,
     })
 }
@@ -4943,28 +4971,35 @@ impl TerminalApp {
                     .on_selection_changed(context.callback(move |v| Message::Auth(id, v))),
             )),
         );
+        use identity_picker::{Kind, Target};
+        let can_browse = self.identity_picker.is_none() && !draft.generating;
         if draft.authentication == PRIVATE_KEY_AUTH {
-            use identity_picker::{Kind, Target};
-            let can_browse = self.identity_picker.is_none() && !draft.generating;
-            fields.extend([
-                identity_picker::field(
-                    Target::Endpoint(id, Kind::PrivateKey),
-                    &draft.identity,
-                    can_browse,
-                    context.callback(move |value| Message::Edit(id, Field::Identity, value)),
-                    context,
-                ),
-                identity_picker::field(
-                    Target::Endpoint(id, Kind::UserCertificate),
-                    &draft.certificate,
-                    can_browse,
-                    context.callback(move |value| Message::Edit(id, Field::Certificate, value)),
-                    context,
-                ),
-            ]);
-        } else if draft.authentication == SPECIFIC_AGENT_KEY_AUTH {
+            fields.push(identity_picker::field(
+                Target::Endpoint(id, Kind::PrivateKey),
+                &draft.identity,
+                can_browse,
+                context.callback(move |value| Message::Edit(id, Field::Identity, value)),
+                context,
+            ));
+        }
+        if let Some(kind) = Kind::certificate(draft.authentication) {
+            fields.push(identity_picker::field(
+                Target::Endpoint(id, kind),
+                &draft.certificate,
+                can_browse,
+                context.callback(move |value| Message::Edit(id, Field::Certificate, value)),
+                context,
+            ));
+        }
+        if draft.authentication == SPECIFIC_AGENT_KEY_AUTH {
             fields.push(agent_key_picker::field(
                 "SSH agent key fingerprint",
+                &draft.agent_fingerprint,
+                context.callback(move |value| Message::Edit(id, Field::AgentFingerprint, value)),
+            ));
+        } else if draft.authentication == AGENT_CERTIFICATE_AUTH {
+            fields.push(agent_key_picker::optional_pin(
+                "Agent key fingerprint (optional)",
                 &draft.agent_fingerprint,
                 context.callback(move |value| Message::Edit(id, Field::AgentFingerprint, value)),
             ));
@@ -8982,6 +9017,17 @@ mod profile_ui_tests {
                         .parse()
                         .unwrap(),
                 },
+            ),
+            (
+                AGENT_CERTIFICATE_AUTH,
+                Authentication::agent_certificate(
+                    "user-cert.pub",
+                    Some(
+                        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                            .parse()
+                            .unwrap(),
+                    ),
+                ),
             ),
         ] {
             let options = SshOptions {

@@ -30,6 +30,17 @@ pub(super) fn field(label: &'static str, fingerprint: &str, on_changed: Callback
     })
 }
 
+pub(super) fn optional_pin(label: &str, fingerprint: &str, on_changed: Callback<String>) -> View {
+    StackPanel::new().spacing(5.0).children((
+        TextBlock::new().text(label),
+        TextBox::new()
+            .automation_name(label)
+            .placeholder_text("Use the certificate's key when blank")
+            .text(fingerprint)
+            .on_text_changed(on_changed),
+    ))
+}
+
 impl Component for Picker {
     type Input = Input;
     type Message = Action;

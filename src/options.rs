@@ -140,6 +140,11 @@ pub enum Authentication {
     AgentKey {
         agent_fingerprint: AgentFingerprint,
     },
+    AgentCertificate {
+        certificate: Box<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_fingerprint: Option<AgentFingerprint>,
+    },
     None,
     Identity {
         identity: Box<PathBuf>,
@@ -194,6 +199,43 @@ impl Authentication {
             identity: Box::new(identity.into()),
             certificate: certificate.map(Box::new),
         }
+    }
+
+    pub fn agent_certificate(
+        certificate: impl Into<PathBuf>,
+        agent_fingerprint: Option<AgentFingerprint>,
+    ) -> Self {
+        Self::AgentCertificate {
+            certificate: Box::new(certificate.into()),
+            agent_fingerprint,
+        }
+    }
+
+    pub(crate) fn identity_path(&self) -> Option<&Path> {
+        match self {
+            Self::Identity { identity, .. } => Some(identity.as_path()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn certificate_path(&self) -> Option<&Path> {
+        match self {
+            Self::Identity { certificate, .. } => certificate.as_deref().map(PathBuf::as_path),
+            Self::AgentCertificate { certificate, .. } => Some(certificate.as_path()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn credential_paths_mut(&mut self) -> impl Iterator<Item = &mut PathBuf> {
+        let (identity, certificate) = match self {
+            Self::Identity {
+                identity,
+                certificate,
+            } => (Some(identity.as_mut()), certificate.as_deref_mut()),
+            Self::AgentCertificate { certificate, .. } => (None, Some(certificate.as_mut())),
+            _ => (None, None),
+        };
+        identity.into_iter().chain(certificate)
     }
 }
 
@@ -474,19 +516,12 @@ impl SshOptions {
         {
             *key = base.join(&*key);
         }
-        for auth in self.authentications_mut() {
-            if let Authentication::Identity {
-                identity,
-                certificate,
-            } = auth
-            {
-                for path in std::iter::once(identity.as_mut())
-                    .chain(certificate.iter_mut().map(Box::as_mut))
-                {
-                    if path.is_relative() {
-                        *path = base.join(&*path);
-                    }
-                }
+        for path in self
+            .authentications_mut()
+            .flat_map(Authentication::credential_paths_mut)
+        {
+            if path.is_relative() {
+                *path = base.join(&*path);
             }
         }
         Ok(())
@@ -497,19 +532,16 @@ impl SshOptions {
         for auth in std::iter::once(&self.authentication)
             .chain(self.proxy_jump.iter().map(|hop| &hop.authentication))
         {
-            if let Authentication::Identity {
-                identity,
-                certificate,
-            } = auth
-            {
-                ensure!(!identity.as_os_str().is_empty(), "identity path is empty");
-                ensure!(
-                    certificate
-                        .as_ref()
-                        .is_none_or(|path| !path.as_os_str().is_empty()),
-                    "SSH user certificate path is empty"
-                );
-            }
+            ensure!(
+                auth.identity_path()
+                    .is_none_or(|path| !path.as_os_str().is_empty()),
+                "identity path is empty"
+            );
+            ensure!(
+                auth.certificate_path()
+                    .is_none_or(|path| !path.as_os_str().is_empty()),
+                "SSH user certificate path is empty"
+            );
         }
         ensure!(
             self.proxy_jump.len() <= MAX_JUMPS,
@@ -959,7 +991,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY [--certificate FILE] | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -1073,6 +1105,7 @@ impl Options {
                             Authentication::None => "none",
                             Authentication::Agent => "agent",
                             Authentication::AgentKey { .. } => "agent-key",
+                            Authentication::AgentCertificate { .. } => "agent-certificate",
                             Authentication::Identity { .. } => "identity",
                             Authentication::Password => "password",
                             Authentication::KeyboardInteractive => "keyboard-interactive",
@@ -1118,10 +1151,22 @@ impl Options {
                 ssh.authentication = authentication;
             }
             if let Some(path) = certificate {
-                let Authentication::Identity { certificate, .. } = &mut ssh.authentication else {
-                    bail!("--certificate requires private-key file authentication");
-                };
-                *certificate = Some(Box::new(path));
+                match &mut ssh.authentication {
+                    Authentication::Identity { certificate, .. } => {
+                        *certificate = Some(Box::new(path))
+                    }
+                    Authentication::AgentCertificate { certificate, .. } => **certificate = path,
+                    Authentication::Agent => {
+                        ssh.authentication = Authentication::agent_certificate(path, None);
+                    }
+                    Authentication::AgentKey { agent_fingerprint } => {
+                        ssh.authentication = Authentication::agent_certificate(
+                            path,
+                            Some(agent_fingerprint.clone()),
+                        );
+                    }
+                    _ => bail!("--certificate requires private-key or SSH agent authentication"),
+                }
             }
             if let Some(host_key) = host_key {
                 ssh.host_key = Some(host_key);
@@ -1322,11 +1367,7 @@ mod tests {
             };
             assert_eq!(ssh.authentication, expected);
         }
-        for extra in [
-            ["--auth", "agent"],
-            ["--identity", "id"],
-            ["--certificate", "id-cert.pub"],
-        ] {
+        for extra in [["--auth", "agent"], ["--identity", "id"]] {
             assert!(
                 parse(&[
                     "ssh",
@@ -1339,6 +1380,24 @@ mod tests {
                 .is_err()
             );
         }
+        let Source::Ssh(ssh) = parse(&[
+            "ssh",
+            "pilot@localhost",
+            "--agent-key",
+            KEY,
+            "--certificate",
+            "id-cert.pub",
+        ])
+        .unwrap()
+        .unwrap()
+        .source
+        else {
+            panic!("expected SSH");
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::agent_certificate("id-cert.pub", Some(KEY.parse().unwrap()))
+        );
         assert!(parse(&["--demo", "--agent-key", KEY]).is_err());
     }
 
@@ -1402,7 +1461,28 @@ mod tests {
             ssh.authentication,
             Authentication::identity("unrelated", None)
         );
-        assert!(parse(&["ssh", "pilot@localhost", "--certificate", "cert.pub"]).is_err());
+        let Source::Ssh(ssh) = parse(&["ssh", "pilot@localhost", "--certificate", "cert.pub"])
+            .unwrap()
+            .unwrap()
+            .source
+        else {
+            panic!("expected SSH");
+        };
+        assert_eq!(
+            ssh.authentication,
+            Authentication::agent_certificate("cert.pub", None)
+        );
+        assert!(
+            parse(&[
+                "ssh",
+                "pilot@localhost",
+                "--auth",
+                "password",
+                "--certificate",
+                "cert.pub"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

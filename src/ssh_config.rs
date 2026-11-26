@@ -528,30 +528,28 @@ impl Config<'_> {
             host_key_alias.as_deref().unwrap_or(alias),
             "IdentityFile",
         )?;
-        configured(scalars.get("identitiesonly").copied(), "no", |value| {
-            ensure!(
-                value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("no"),
-                "IdentitiesOnly requires yes or no"
-            );
-            ensure!(
-                identity.is_some() || !value.eq_ignore_ascii_case("yes"),
-                "IdentitiesOnly yes requires an explicit identity file"
-            );
-            Ok(())
-        })?;
         let certificate = self.credential_file(
             certificates,
             &tokens,
             host_key_alias.as_deref().unwrap_or(alias),
             "CertificateFile",
         )?;
-        ensure!(
-            certificate.is_none() || identity.is_some(),
-            "CertificateFile import requires an explicit IdentityFile for the matching private key"
-        );
-        let authentication = match identity {
-            Some(identity) => self.identity_authentication(identity, certificate)?,
-            None => Authentication::Agent,
+        configured(scalars.get("identitiesonly").copied(), "no", |value| {
+            ensure!(
+                value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("no"),
+                "IdentitiesOnly requires yes or no"
+            );
+            ensure!(
+                identity.is_some() || certificate.is_some() || !value.eq_ignore_ascii_case("yes"),
+                "IdentitiesOnly yes requires an explicit IdentityFile or CertificateFile"
+            );
+            Ok(())
+        })?;
+        let certificate = certificate.map(|file| file.path);
+        let authentication = match (identity, certificate) {
+            (Some(identity), certificate) => self.identity_authentication(identity, certificate)?,
+            (None, Some(certificate)) => Authentication::agent_certificate(certificate, None),
+            (None, None) => Authentication::Agent,
         };
         Ok((
             JumpHost {
@@ -571,7 +569,7 @@ impl Config<'_> {
     fn identity_authentication(
         &self,
         identity: CredentialFile,
-        certificate: Option<CredentialFile>,
+        certificate: Option<PathBuf>,
     ) -> Result<Authentication> {
         let mut cache = self.identity_fingerprints.borrow_mut();
         let fingerprint = cache.entry(identity.path.clone()).or_insert_with(|| {
@@ -586,19 +584,14 @@ impl Config<'_> {
             ),
         };
         if let Some(agent_fingerprint) = agent_fingerprint {
-            if let Some(certificate) = certificate {
-                bail!(
-                    "{}: importing CertificateFile requires a private IdentityFile, but {} is public",
-                    certificate.source,
-                    identity.path.display()
-                );
-            }
-            return Ok(Authentication::AgentKey { agent_fingerprint });
+            return Ok(match certificate {
+                Some(certificate) => {
+                    Authentication::agent_certificate(certificate, Some(agent_fingerprint))
+                }
+                None => Authentication::AgentKey { agent_fingerprint },
+            });
         }
-        Ok(Authentication::identity(
-            identity.path,
-            certificate.map(|file| file.path),
-        ))
+        Ok(Authentication::identity(identity.path, certificate))
     }
 
     fn credential_file(
@@ -741,7 +734,7 @@ mod tests {
             .unwrap()
     }
     #[test]
-    fn certificate_import_rejects_multiple_files_or_no_matching_identity_option() {
+    fn certificate_import_allows_an_agent_certificate_but_rejects_multiple_files() {
         let report = parse_config(
             r#"
             Host multiple
@@ -750,23 +743,25 @@ mod tests {
                 CertificateFile ~/second-cert.pub
             Host agent-only
                 CertificateFile ~/id-cert.pub
+                IdentitiesOnly yes
         "#,
         );
-        for (name, diagnostic) in [
-            ("multiple", "multiple CertificateFile"),
-            ("agent-only", "requires an explicit IdentityFile"),
-        ] {
-            let entry = alias(&report, name);
-            assert!(entry.options.is_none());
-            assert!(
-                entry
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.contains(diagnostic)),
-                "{:?}",
-                entry.warnings
-            );
-        }
+        let entry = alias(&report, "multiple");
+        assert!(entry.options.is_none());
+        assert!(
+            entry
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("multiple CertificateFile"))
+        );
+        let imported = alias(&report, "agent-only").options.as_ref().unwrap();
+        assert_eq!(
+            imported.authentication,
+            Authentication::agent_certificate(
+                Path::new(r"C:\Users\pilot").join("id-cert.pub"),
+                None
+            )
+        );
     }
 
     #[test]
