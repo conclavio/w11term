@@ -511,6 +511,7 @@ pub mod public {
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct Button {
         is_enabled: Property<bool>,
+        padding: Property<Thickness>,
         horizontal_content_alignment: Property<HorizontalAlignment>,
         vertical_content_alignment: Property<VerticalAlignment>,
         resource_overrides: Property<ResourceOverrides>,
@@ -527,6 +528,15 @@ pub mod public {
         }
         pub fn element_ref(mut self, reference: &ElementRef<Self>) -> Self {
             self.reference = Some(reference.binding());
+            self
+        }
+        pub fn padding(mut self, value: impl Into<Thickness>) -> Self {
+            let value = value.into();
+            assert!(
+                value.is_finite_non_negative(),
+                "Button Padding must contain finite non-negative values"
+            );
+            self.padding = Property::Set(value);
             self
         }
         pub fn is_enabled(mut self, value: impl Into<Option<bool>>) -> Self {
@@ -2325,6 +2335,7 @@ pub mod public {
     pub struct ToggleButton {
         is_checked: Property<bool>,
         is_enabled: Property<bool>,
+        padding: Property<Thickness>,
         on_is_checked_changed: Option<Callback<bool>>,
         reference: Option<NativeElementRef>,
         element_state: Option<std::rc::Rc<ElementState>>,
@@ -2341,6 +2352,15 @@ pub mod public {
         pub fn is_checked(mut self, value: impl Into<Option<bool>>) -> Self {
             let value = value.into();
             self.is_checked = Property::from(value);
+            self
+        }
+        pub fn padding(mut self, value: impl Into<Thickness>) -> Self {
+            let value = value.into();
+            assert!(
+                value.is_finite_non_negative(),
+                "ToggleButton Padding must contain finite non-negative values"
+            );
+            self.padding = Property::Set(value);
             self
         }
         pub fn is_enabled(mut self, value: impl Into<Option<bool>>) -> Self {
@@ -6458,6 +6478,7 @@ pub mod public {
                     let value = std::rc::Rc::unwrap_or_clone(value);
                     let Button {
                         is_enabled,
+                        padding,
                         horizontal_content_alignment,
                         vertical_content_alignment,
                         resource_overrides,
@@ -6472,6 +6493,7 @@ pub mod public {
                         kind: MountedKind::Button,
                         props: MountedProps::Button(std::rc::Rc::new(ButtonMountedProps {
                             is_enabled,
+                            padding,
                             horizontal_content_alignment,
                             vertical_content_alignment,
                             resource_overrides,
@@ -7014,6 +7036,7 @@ pub mod public {
                     let ToggleButton {
                         is_checked,
                         is_enabled,
+                        padding,
                         on_is_checked_changed,
                         reference,
                         element_state,
@@ -7025,6 +7048,7 @@ pub mod public {
                             ToggleButtonMountedProps {
                                 is_checked,
                                 is_enabled,
+                                padding,
                                 on_is_checked_changed,
                             },
                         )),
@@ -9475,6 +9499,13 @@ impl MountedPropsExt for MountedProps {
             }
             Self::Button(values) => {
                 visit(
+                    PropertyId::ButtonPadding,
+                    match &values.padding {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::Thickness(value)),
+                    },
+                );
+                visit(
                     PropertyId::ButtonIsEnabled,
                     match &values.is_enabled {
                         Property::Inherited => None,
@@ -10180,6 +10211,13 @@ impl MountedPropsExt for MountedProps {
                     match &values.is_checked {
                         Property::Inherited => None,
                         Property::Set(value) => Some(PropertyValueRef::Bool(*value)),
+                    },
+                );
+                visit(
+                    PropertyId::ToggleButtonPadding,
+                    match &values.padding {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::Thickness(value)),
                     },
                 );
                 visit(
@@ -12667,6 +12705,7 @@ impl PartialEq for TextBlockMountedProps {
 #[derive(Clone, Debug)]
 pub(crate) struct ButtonMountedProps {
     is_enabled: Property<bool>,
+    padding: Property<Thickness>,
     horizontal_content_alignment: Property<HorizontalAlignment>,
     vertical_content_alignment: Property<VerticalAlignment>,
     resource_overrides: Property<ResourceOverrides>,
@@ -12677,6 +12716,7 @@ pub(crate) struct ButtonMountedProps {
 impl PartialEq for ButtonMountedProps {
     fn eq(&self, other: &Self) -> bool {
         true && self.is_enabled == other.is_enabled
+            && self.padding == other.padding
             && self.horizontal_content_alignment == other.horizontal_content_alignment
             && self.vertical_content_alignment == other.vertical_content_alignment
             && self.resource_overrides == other.resource_overrides
@@ -13024,12 +13064,14 @@ impl PartialEq for CheckBoxMountedProps {
 pub(crate) struct ToggleButtonMountedProps {
     is_checked: Property<bool>,
     is_enabled: Property<bool>,
+    padding: Property<Thickness>,
     on_is_checked_changed: Option<Callback<bool>>,
 }
 impl PartialEq for ToggleButtonMountedProps {
     fn eq(&self, other: &Self) -> bool {
         true && self.is_checked == other.is_checked
             && self.is_enabled == other.is_enabled
+            && self.padding == other.padding
             && self.on_is_checked_changed == other.on_is_checked_changed
     }
 }
@@ -13882,6 +13924,7 @@ pub enum PropertyId {
     TextBlockTextTrimming,
     TextBlockForeground,
     ButtonIsEnabled,
+    ButtonPadding,
     ButtonHorizontalContentAlignment,
     ButtonVerticalContentAlignment,
     ButtonResources,
@@ -13974,6 +14017,7 @@ pub enum PropertyId {
     CheckBoxIsEnabled,
     ToggleButtonIsChecked,
     ToggleButtonIsEnabled,
+    ToggleButtonPadding,
     RadioButtonGroupName,
     RadioButtonIsChecked,
     RadioButtonIsEnabled,
@@ -14849,6 +14893,17 @@ const TEXT_BLOCK_PROPERTIES: &[PropertyDescriptor] = &[
 const TEXT_BLOCK_EVENTS: &[EventDescriptor] = &[];
 const TEXT_BLOCK_SLOTS: &[SlotDescriptor] = &[];
 const BUTTON_PROPERTIES: &[PropertyDescriptor] = &[
+    PropertyDescriptor {
+        id: PropertyId::ButtonPadding,
+        name: "Padding",
+        field: "padding",
+        value: "Thickness",
+        interface: "Microsoft.UI.Xaml.Controls.IControl",
+        clearable: true,
+        feedback: None,
+        feedback_contract: None,
+        observes_feedback: false,
+    },
     PropertyDescriptor {
         id: PropertyId::ButtonIsEnabled,
         name: "IsEnabled",
@@ -16274,6 +16329,17 @@ const TOGGLE_BUTTON_PROPERTIES: &[PropertyDescriptor] = &[
         feedback: Some("IsCheckedChanged"),
         feedback_contract: Some("synchronous_exact"),
         observes_feedback: true,
+    },
+    PropertyDescriptor {
+        id: PropertyId::ToggleButtonPadding,
+        name: "Padding",
+        field: "padding",
+        value: "Thickness",
+        interface: "Microsoft.UI.Xaml.Controls.IControl",
+        clearable: true,
+        feedback: None,
+        feedback_contract: None,
+        observes_feedback: false,
     },
     PropertyDescriptor {
         id: PropertyId::ToggleButtonIsEnabled,

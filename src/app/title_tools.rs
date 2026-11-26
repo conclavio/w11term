@@ -53,6 +53,9 @@ impl Layout {
 pub(super) fn button(name: &str) -> Button {
     Button::new()
         .style(ButtonStyle::Subtle)
+        .padding(0.0)
+        .horizontal_content_alignment(HorizontalAlignment::Center)
+        .vertical_content_alignment(VerticalAlignment::Center)
         .width(BUTTON_WIDTH)
         .height(36.0)
         .automation_name(name)
@@ -79,6 +82,7 @@ impl TerminalApp {
         let ssh = live.filter(|live| matches!(live.source, Source::Ssh(_)));
         let pane = ssh.map(|live| live.session.pane_id);
         let files = ToggleButton::new()
+            .padding(0.0)
             .width(BUTTON_WIDTH)
             .height(36.0)
             .automation_name("Toggle SFTP file drawer")

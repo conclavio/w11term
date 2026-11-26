@@ -3,6 +3,19 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TitlePixels {
+    [StructLayout(LayoutKind.Sequential)] public struct Rect {
+        public int Left, Top, Right, Bottom;
+    }
+    [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr window, IntPtr target, uint flags);
+}
+'@
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -25,6 +38,43 @@ function Click([string]$Name, [System.Windows.Automation.ControlType]$Type = $bu
     }
 }
 
+function Get-TitleInk($Element) {
+    $bounds = $Element.Current.BoundingRectangle
+    $origin = New-Object TitlePixels+Rect
+    $previous = [TitlePixels]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    try {
+        if (![TitlePixels]::GetWindowRect($window, [ref]$origin)) { throw 'Could not read physical window bounds' }
+        $bitmap = [Drawing.Bitmap]::new(($origin.Right-$origin.Left), ($origin.Bottom-$origin.Top))
+        try {
+            $graphics = [Drawing.Graphics]::FromImage($bitmap)
+            try {
+                $hdc = $graphics.GetHdc()
+                try {
+                    if (![TitlePixels]::PrintWindow($window, $hdc, 2)) { throw 'Could not capture the title bar' }
+                } finally { $graphics.ReleaseHdc($hdc) }
+            } finally { $graphics.Dispose() }
+            $left = [int][Math]::Floor($bounds.Left - $origin.Left + $bounds.Width * 0.12)
+            $right = [int][Math]::Ceiling($bounds.Right - $origin.Left - $bounds.Width * 0.12)
+            $top = [int][Math]::Floor($bounds.Top - $origin.Top + $bounds.Height * 0.12)
+            $bottom = [int][Math]::Ceiling($bounds.Bottom - $origin.Top - $bounds.Height * 0.12)
+            $minX = $right
+            $minY = $bottom
+            $maxX = $left-1
+            $maxY = $top-1
+            for ($x = $left; $x -lt $right; $x++) {
+                for ($y = $top; $y -lt $bottom; $y++) {
+                    $pixel = $bitmap.GetPixel($x, $y)
+                    if ($pixel.R -lt 160 -or $pixel.G -lt 160 -or $pixel.B -lt 160) { continue }
+                    $minX = [Math]::Min($minX, $x)
+                    $maxX = [Math]::Max($maxX, $x)
+                    $minY = [Math]::Min($minY, $y)
+                    $maxY = [Math]::Max($maxY, $y)
+                }
+            }
+            return @{ Width = $maxX-$minX+1; Height = $maxY-$minY+1; ButtonWidth = $bounds.Width }
+        } finally { $bitmap.Dispose() }
+    } finally { $null = [TitlePixels]::SetThreadDpiAwarenessContext($previous) }
+}
 function Title-Files {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $id = [System.Windows.Automation.PropertyCondition]::new(
@@ -48,6 +98,14 @@ try {
     $null = Wait-Until 'control manifest' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
+    $newTab = Wait-Until 'visible New tab toolbar button' { Find-Element 'New tab' $button -Visible }
+    $ink = Get-TitleInk $newTab
+    # The plus uses equally long strokes. Native button padding used to cut off
+    # one arm, leaving a narrow, visibly asymmetric glyph at 150% scaling.
+    if ($ink.Height -lt $ink.ButtonWidth * 0.30 -or
+        $ink.Width -lt $ink.Height * 0.80 -or $ink.Width -gt $ink.Height * 1.20) {
+        throw "The title-bar plus is clipped. Ink=$($ink.Width)x$($ink.Height) button=$($ink.ButtonWidth)"
+    }
     (Wait-FilesToggle 'Off').Toggle()
     $null = Wait-FilesToggle 'On'
     $null = Wait-Until 'remote folder listing from title bar' { Find-Element 'title-tools.txt' }
