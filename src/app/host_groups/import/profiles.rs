@@ -1,8 +1,6 @@
 use super::*;
 use crate::app::host_groups::filter::PROFILE_PAGE_SIZE;
 
-const LABEL: &str = "Add saved profiles…";
-
 pub enum Change {
     Filter(String),
     Page(usize),
@@ -21,14 +19,6 @@ struct Entry {
     name: String,
     ssh: SshOptions,
     address: String,
-}
-
-pub(in crate::app::host_groups) fn button(id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
-    Button::new()
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(super::super::Action::Import(id, Action::PickSaved))
-        }))
-        .content(LABEL)
 }
 
 impl Picker {

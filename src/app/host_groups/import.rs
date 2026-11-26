@@ -8,10 +8,9 @@ mod profiles;
 mod ranges;
 mod review;
 mod save_group;
-pub(super) use profiles::button as saved_profiles_button;
 use review::{Approval, Review};
 
-const LABEL: &str = "Import host list…";
+pub(super) const LABEL: &str = "Import host list…";
 
 #[derive(Default)]
 pub(super) struct State {
@@ -115,14 +114,6 @@ impl State {
             Ok(None) => {}
             Err(error) => draft.error = Some(format!("Could not open the host list. {error}")),
         }
-    }
-
-    pub(super) fn button(id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
-        Button::new()
-            .on_click(
-                ctx.callback(move |_| Message::HostGroup(super::Action::Import(id, Action::Begin))),
-            )
-            .content(LABEL)
     }
 
     pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> Option<View> {

@@ -113,7 +113,7 @@ try {
     (Wait-Until 'tab menu' { Find-Element 'Tab menu' $button }).SetFocus()
     Click 'Tab menu'
     Click 'SSH host group' $menu
-    Click $label
+    Invoke-NativeMenuAction 'Saved group actions' $label
     (Text-Field 'Default SSH user').SetValue('test')
     $null = Wait-Until 'default user is set' { (Text-Field 'Default SSH user').Current.Value -ceq 'test' }
     $typed = 'test@keep.example:22'
@@ -179,7 +179,7 @@ try {
     $originalDirect = (Control @('list')).sessions | Where-Object id -eq $directPane
 
     Run-Palette 'SSH host group'
-    Click $label
+    Invoke-NativeMenuAction 'Saved group actions' $label
     (Text-Field 'SSH host list').SetValue((@('West', $direct, 'East') -join [Environment]::NewLine))
     Keyless
     Click 'Preview hosts'
@@ -225,7 +225,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$eastPane",'--timeout','15','ready')
     if ([IO.File]::ReadAllText($profiles) -cne $before) { throw 'Import changed the saved SSH profiles' }
 
-    Click $label
+    Invoke-NativeMenuAction 'Saved group actions' $label
     (Text-Field 'SSH host list').SetValue((@('West', $direct) -join [Environment]::NewLine))
     Keyless
     Click 'Preview hosts'

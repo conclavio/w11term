@@ -346,7 +346,7 @@ try {
     Expect-Field 'Host filter' 'east'
 
     Choose-SavedGroup 'Fleet West'
-    Click 'Open in new tab'
+    Invoke-NativeMenuAction 'Saved group actions' 'Open in new tab'
     Wait-Tab $westTab
     $west = (Session 'West').id
     $westName = Target-Label 'West' $west
@@ -578,7 +578,7 @@ try {
 
     Choose-SavedGroup 'Fleet Mixed'
     $reuse = 'Review group launch' + [char]0x2026
-    Click $reuse
+    Invoke-NativeMenuAction 'Saved group actions' $reuse
     $null = Wait-Until 'review offers to reuse East and open North' {
         (Find-Element "Review SSH group${dot}Fleet Mixed") -and
             (Find-Element "1 to reuse${dot}1 to open")
@@ -624,10 +624,10 @@ try {
     Click 'Include all available'
     $null = Wait-Until 'both available hosts are included again' { Find-Element "1 to reuse${dot}1 to open" }
     Click 'Cancel'
-    $null = Wait-Until 'cancelling the launch review returns to the group' { Find-Element $reuse $button }
+    $null = Wait-Until 'cancelling the launch review returns to the group' { Find-Element 'Saved group actions' $button }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'Cancelling the review opened a session' }
 
-    Click $reuse
+    Invoke-NativeMenuAction 'Saved group actions' $reuse
     Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
     $original = [IO.File]::ReadAllBytes($profiles)
     $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
@@ -791,7 +791,7 @@ try {
 
     Select-Tab $westTab
     Choose-SavedGroup 'Fleet East'
-    Click $reuse
+    Invoke-NativeMenuAction 'Saved group actions' $reuse
     Choose-Option 'Connection for West' 'Open a new SSH pane'
     Choose-Option 'Launch recipient set' 'Canaries'
     $null = Wait-CheckBox 'Include profile East' On
@@ -923,7 +923,7 @@ try {
     (Field 'Host filter').SetValue('east')
     Expect-Field 'Host filter' 'east'
     $addProfiles = 'Add saved profiles' + [char]0x2026
-    Click $addProfiles
+    Invoke-NativeMenuAction 'Saved group actions' $addProfiles
     (Field 'Find saved SSH profiles').SetValue('WEST')
     $null = Wait-CheckBox 'Add SSH profile West' Off
     Click 'Check matches'

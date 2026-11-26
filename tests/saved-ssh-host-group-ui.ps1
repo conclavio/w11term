@@ -114,6 +114,11 @@ function Close-GroupWindow {
 try {
     Launch-Window
     Open-GroupPage
+    $null = Wait-Until 'first group uses the New group button and keeps imports accessible' {
+        (Find-Element 'New group' $button -Visible) -and
+            (Find-Element 'Saved group actions' $button -Visible) -and
+            !(Find-Element 'Open group' $button)
+    }
     Click 'New group'
     Name-Group 'Fleet'
     $null = Wait-Until 'the first catalog page is bounded' { Find-Element "0 selected${dot}32 matches${dot}Page 1 of 2" }
@@ -158,11 +163,22 @@ try {
     $null = Wait-Until 'both members appear in the saved order' { Find-Element 'West, East' }
     if (((Catalog).ssh_host_groups.Fleet -join ',') -cne 'West,East') { throw 'Both members were not saved in the reviewed order' }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Saving opened terminal sessions' }
+    $null = Wait-Until 'the saved group selector and Open group stay on the toolbar' {
+        (Find-Element 'Saved SSH groups' ([System.Windows.Automation.ControlType]::ComboBox) -Visible) -and
+            (Find-Element 'Open group' $button -Visible) -and (Find-Element 'Saved group actions' $button -Visible)
+    }
+    Invoke-NativeMenuAction 'Saved group actions' 'New group'
+    $null = Wait-Until 'another group can be created without replacing the saved group' {
+        $name = Find-Element 'SSH group name' $edit
+        $name -and $name.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq ''
+    }
+    Click 'Cancel'
+    $null = Wait-Until 'cancelling returns to the existing group' { Find-Element 'West, East' }
     $original = [IO.File]::ReadAllBytes($profiles)
     $catalog = Catalog
     $hostList = "test@127.0.0.1:$($catalog.profiles.West.port)`ntest@127.0.0.1:$($catalog.profiles.East.port)`n"
     $hostFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-hosts.txt'
-    Click ('Export saved group hosts' + [char]0x2026)
+    Invoke-NativeMenuAction 'Saved group actions' ('Export saved group hosts' + [char]0x2026)
     $null = Wait-Until 'saved host list preview' { Find-Element 'SSH host list preview' }
     Click ('Save host list' + [char]0x2026)
     $dialog = Wait-Until 'saved-group host list save dialog' { Find-OwnedDialog 'Save SSH host list' }
@@ -283,12 +299,12 @@ try {
     }
 
     $duplicate = 'Duplicate group' + [char]0x2026
-    Click $duplicate
+    Invoke-NativeMenuAction 'Saved group actions' $duplicate
     $null = Wait-Until 'the copy review names the source' { Find-Element 'Copy from Fleet' }
     Click 'Cancel'
-    $null = Wait-Until 'the copy review closes on cancel' { Find-Element $duplicate $button }
+    $null = Wait-Until 'the copy review closes on cancel' { Find-Element 'Saved group actions' $button }
     if ((Catalog).ssh_host_groups.PSObject.Properties.Name.Count -ne 1) { throw 'Cancel changed the groups' }
-    Click $duplicate
+    Invoke-NativeMenuAction 'Saved group actions' $duplicate
     $nameField = Wait-Until 'new group name field' { Find-Element 'New SSH group name' $edit }
     $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Fleet')
     Click 'Save copy'
@@ -306,11 +322,11 @@ try {
             $saved.ssh_host_group_defaults.'Fleet copy'.command_interval -ceq '2s'
     }
     if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Copying the group opened SSH panes' }
-    Click 'Edit group'
+    Invoke-NativeMenuAction 'Saved group actions' 'Edit group'
     Click 'Delete group'
     Click 'Confirm delete group'
     $null = Wait-Until 'the copy is deleted and the original remains' {
-        (Find-Element 'Edit group' $button) -and ((Catalog).ssh_host_groups.Fleet -join ',') -ceq 'West,East' -and
+        (Find-Element 'Open group' $button) -and ((Catalog).ssh_host_groups.Fleet -join ',') -ceq 'West,East' -and
             -not ((Catalog).ssh_host_groups.'Fleet copy')
     }
 
@@ -318,7 +334,7 @@ try {
     $definitionCatalog | Add-Member -NotePropertyName ssh_recipient_sets -NotePropertyValue @{ Fleet = @{ Canary = @('East','West') } }
     [IO.File]::WriteAllText($profiles, ($definitionCatalog | ConvertTo-Json -Depth 30))
     $definitionFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group.json'
-    Click ('Export group definition' + [char]0x2026)
+    Invoke-NativeMenuAction 'Saved group actions' ('Export group definition' + [char]0x2026)
     $dialog = Wait-Until 'group definition save dialog' { Find-OwnedDialog 'Save SSH group definition' }
     $null = Wait-Until 'save the group definition' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'the versioned group definition is exported' { Test-Path -LiteralPath $definitionFile }
@@ -331,7 +347,7 @@ try {
         throw 'The group file did not preserve its portable definition'
     }
 
-    Click ('Import group definition' + [char]0x2026)
+    Invoke-NativeMenuAction 'Saved group actions' ('Import group definition' + [char]0x2026)
     $dialog = Wait-Until 'group definition open dialog' { Find-OwnedDialog 'Open SSH group definition' }
     $null = Wait-Until 'the group definition path is entered' {
         [FixtureDialog]::SetFilename($dialog, $definitionFile, '')
@@ -396,14 +412,14 @@ try {
     $restored.profiles.PSObject.Properties.Remove('West Local')
     $restored.profiles | Add-Member -NotePropertyName 'West' -NotePropertyValue $definitionCatalog.profiles.West
     [IO.File]::WriteAllText($profiles, ($restored | ConvertTo-Json -Depth 30))
-    Click 'Edit group'
+    Invoke-NativeMenuAction 'Saved group actions' 'Edit group'
     Click 'Delete group'
     Click 'Confirm delete group'
     $null = Wait-Until 'the imported group is removed while the source remains' {
-        (Find-Element 'Edit group' $button) -and -not ((Catalog).ssh_host_groups.'Portable Fleet')
+        (Find-Element 'Open group' $button) -and -not ((Catalog).ssh_host_groups.'Portable Fleet')
     }
 
-    Click 'Edit group'
+    Invoke-NativeMenuAction 'Saved group actions' 'Edit group'
     $null = Wait-CheckBox 'Group member East' On
     Filter-GroupProfiles 'west'
     (Wait-CheckBox 'Group member West' On).Toggle()
@@ -414,7 +430,7 @@ try {
     Dismiss-PaletteError 'Finish editing the SSH group before opening another group.' 3
     $null = Wait-CheckBox 'Group member West' Off
     Click 'Save group'
-    $null = Wait-Until 'group editor closes after rename' { Find-Element 'Edit group' $button }
+    $null = Wait-Until 'group editor closes after rename' { Find-Element 'Open group' $button }
     $groups = (Catalog).ssh_host_groups
     if ($groups.Fleet -or ($groups.'East only' -join ',') -cne 'East') {
         throw 'The renamed group has the wrong saved membership'
@@ -424,7 +440,7 @@ try {
         $defaults.'East only'.command_interval -cne '2s') {
         throw 'Roster defaults did not follow the group rename'
     }
-    Click 'Edit group'
+    Invoke-NativeMenuAction 'Saved group actions' 'Edit group'
     Click 'Delete group'
     Click 'Confirm delete group'
     $null = Wait-Until 'group editor closes after delete' { Find-Element 'New group' $button }

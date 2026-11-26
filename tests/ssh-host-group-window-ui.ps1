@@ -43,9 +43,7 @@ try {
     foreach ($pane in ($origin | Where-Object label -in 'East','West')) {
         $null = Control @('wait-for-text','--pane',"$($pane.id)",'--timeout','15','ready')
     }
-    Invoke-Button (Wait-Until 'the saved group window action' {
-        Find-Element 'Open group in new window' ([System.Windows.Automation.ControlType]::Button)
-    })
+    Invoke-NativeMenuAction 'Saved group actions' 'Open group in new window'
     $childHwnd = Wait-Until 'a second top-level window in the same process' {
         [FixtureDialog]::Windows($app.Id) | Where-Object {
             $_ -ne $originHwnd -and [FixtureDialog]::GetWindow($_, 4) -eq [IntPtr]::Zero
@@ -131,7 +129,7 @@ try {
     Close-TestWindow $subsetHwnd
     $window = $originHwnd
     $null = Wait-Until 'closing the reviewed window restores the unchanged source roster' {
-        (Find-Element 'Open group in new window' $button) -and
+        (Find-Element 'Saved group actions' $button) -and
             !(Find-Element 'Find launch profiles' ([System.Windows.Automation.ControlType]::Edit)) -and
             (@((Control @('list')).sessions).id | Sort-Object) -join ',' -ceq (($origin.id | Sort-Object) -join ',')
     }

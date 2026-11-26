@@ -114,7 +114,7 @@ function Check-BulkReconnect($Initial) {
 }
 function Check-HostListImport {
     Run-Palette 'New SSH group tab' -Enter
-    Click-Button ('Import host list' + [char]0x2026)
+    Invoke-NativeMenuAction 'Saved group actions' ('Import host list' + [char]0x2026)
     $field = Wait-Until 'the host list editor' {
         $item = Find-Element 'SSH host list' $edit
         if ($item -and $item.Current.IsEnabled) { $item }
@@ -135,7 +135,7 @@ function Check-HostListImport {
     Finish-QueuedLogins $limits 'connecting'
 }
 function Check-SavedProfileDefault {
-    Click-Button ('Add saved profiles' + [char]0x2026)
+    Invoke-NativeMenuAction 'Saved group actions' ('Add saved profiles' + [char]0x2026)
     (Wait-CheckBox 'Add SSH profile Imported East' Off).Toggle()
     $null = Wait-CheckBox 'Add SSH profile Imported East' On
     Click-Button 'Review selected profiles'

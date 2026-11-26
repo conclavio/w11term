@@ -1047,28 +1047,6 @@ fn manage_set_view(
         ))
 }
 
-pub(super) fn button(
-    id: TabId,
-    name: &str,
-    profiles: &[String],
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    let name = name.to_owned();
-    let profiles = profiles.to_vec();
-    Button::new()
-        .is_enabled(!profiles.is_empty())
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(super::Action::Reuse(
-                id,
-                Action::Open {
-                    name: name.clone(),
-                    profiles: profiles.clone(),
-                },
-            ))
-        }))
-        .content(LABEL)
-}
-
 impl TerminalApp {
     pub(super) fn review_host_group_from_palette(
         &mut self,

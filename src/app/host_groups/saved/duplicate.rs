@@ -84,18 +84,6 @@ impl Draft {
     }
 }
 
-pub(super) fn button(tab: TabId, source: &str, ctx: &ViewContext<TerminalApp>) -> View {
-    let source = source.to_owned();
-    Button::new()
-        .on_click(ctx.callback(move |_| {
-            Message::HostGroup(HostAction::Saved(
-                tab,
-                super::Action::Duplicate(Action::Open(source.clone())),
-            ))
-        }))
-        .content("Duplicate group…")
-}
-
 impl TerminalApp {
     pub(super) fn handle_duplicate_group(&mut self, tab: TabId, action: Action) {
         let (source, name) = match action {
