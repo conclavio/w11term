@@ -180,6 +180,7 @@ struct Choice {
     tab_number: usize,
     pane_number: usize,
     window: Option<u64>,
+    window_name: Option<w11term::tabs::TabTitle>,
 }
 
 impl Choice {
@@ -192,6 +193,12 @@ impl Choice {
             .chain(self.pane_name.iter())
             .chain(self.profile.iter())
             .chain(self.tab_title.iter())
+            .map(String::as_str)
+            .chain(
+                self.window_name
+                    .as_ref()
+                    .map(w11term::tabs::TabTitle::as_str),
+            )
             .filter_map(|field| {
                 let field = field.to_lowercase();
                 if field == query {
@@ -227,8 +234,15 @@ impl Choice {
         }
         let pane = format!("Tab {} / pane {}", self.tab_number, self.pane_number);
         let title = fields.join("  ·  ");
-        match self.window {
-            Some(window) => format!("{title}  ·  Window {window}  ·  {pane}"),
+        let window = self
+            .window
+            .map(|id| tab_windows::window_label(id, self.window_name.as_ref()));
+        match window.as_deref().or(self
+            .window_name
+            .as_ref()
+            .map(w11term::tabs::TabTitle::as_str))
+        {
+            Some(window) => format!("{title}  ·  {window}  ·  {pane}"),
             None => format!("{title}  ·  {pane}"),
         }
     }
@@ -270,9 +284,10 @@ impl SearchPane {
         self.source.clone()
     }
 
-    fn row(&self, window: Option<u64>) -> Choice {
+    fn row(&self, window: Option<u64>, window_name: Option<&w11term::tabs::TabTitle>) -> Choice {
         let mut row = self.choice.clone();
         row.window = window;
+        row.window_name = window_name.cloned();
         row.title = self.source.frames.load().title.clone();
         row
     }
@@ -686,6 +701,7 @@ impl TerminalApp {
                                 tab_number: tab + 1,
                                 pane_number: pane + 1,
                                 window: None,
+                                window_name: None,
                             },
                             source: PreviewSource::from_live(live),
                         });
@@ -708,7 +724,7 @@ impl TerminalApp {
             let choices = self
                 .local_pane_search_entries(mode)
                 .iter()
-                .map(|entry| entry.row(None))
+                .map(|entry| entry.row(None, None))
                 .collect();
             return Picker::filter(choices, query);
         }
@@ -727,12 +743,21 @@ impl TerminalApp {
             choices.extend(
                 self.local_pane_search_entries(mode)
                     .iter()
-                    .map(|entry| entry.row(None)),
+                    .map(|entry| entry.row(None, self.window_name.as_ref())),
             );
         }
-        for (window, entries) in self.sibling_pane_search_entries() {
+        for tab_windows::WindowEntries {
+            window,
+            name,
+            entries,
+        } in self.sibling_pane_search_entries()
+        {
             if allowed(window) {
-                choices.extend(entries.iter().map(|entry| entry.row(Some(window))));
+                choices.extend(
+                    entries
+                        .iter()
+                        .map(|entry| entry.row(Some(window), name.as_ref())),
+                );
             }
         }
         Picker::filter(choices, window_filter.map_or(query, |_| stripped.as_str()))
@@ -1583,6 +1608,7 @@ mod tests {
             tab_number: 1,
             pane_number: 1,
             window: None,
+            window_name: None,
         }
     }
     #[test]

@@ -64,6 +64,12 @@ async fn native_move_split_pane_to_a_new_window() {
     run("PaneWindow", b"ssh-stays/ssh-moved/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "names one native window, finds its live tabs and panes, and restores the default title"]
+async fn native_named_window_is_searchable_and_can_restore_the_default_title() {
+    run("WindowName", b"ssh-probe/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =

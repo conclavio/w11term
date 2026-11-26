@@ -317,7 +317,7 @@ pub(super) fn profile_search_rows(
     matches.into_iter().map(|(_, row)| row).collect()
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct SearchTab {
     group: TabId,
     title: String,
@@ -327,23 +327,33 @@ fn search_tabs(
     query: &str,
     source: u64,
     active: Option<TabId>,
-    windows: impl IntoIterator<Item = (u64, Rc<[SearchTab]>)>,
+    windows: impl IntoIterator<Item = tab_windows::WindowEntries<SearchTab>>,
 ) -> Vec<Row> {
     let Some((window_filter, query)) = tab_windows::window_query(query) else {
         return Vec::new();
     };
     let mut matches = Vec::new();
-    for (window, entries) in windows {
+    for tab_windows::WindowEntries {
+        window,
+        name,
+        entries,
+    } in windows
+    {
         if window_filter.is_some_and(|id| id != window) {
             continue;
         }
         let sibling = window != source;
+        let window_label =
+            (sibling || name.is_some()).then(|| tab_windows::window_label(window, name.as_ref()));
+        let name_query = name.as_ref().map(|name| name.as_str().to_lowercase());
         for (index, tab) in entries.iter().enumerate() {
             let title = tab.title.to_lowercase();
             let position = format!("Tab {}", index + 1);
             let position_query = position.to_lowercase();
             let terms = format!("{title} {position_query}");
-            if query.split_whitespace().all(|word| terms.contains(word)) {
+            if query.split_whitespace().all(|word| {
+                terms.contains(word) || name_query.as_ref().is_some_and(|name| name.contains(word))
+            }) {
                 let rank = (
                     title != query,
                     position_query != query,
@@ -355,12 +365,14 @@ fn search_tabs(
                     Row {
                         id: CommandId::FocusTab(window, tab.group),
                         label: tab.title.clone(),
-                        chord: if sibling {
-                            format!("Window {window} · {position}")
-                        } else if Some(tab.group) == active {
-                            format!("{position} · Current")
-                        } else {
-                            position
+                        chord: match (
+                            window_label.as_deref(),
+                            !sibling && Some(tab.group) == active,
+                        ) {
+                            (Some(label), true) => format!("{label} · {position} · Current"),
+                            (Some(label), false) => format!("{label} · {position}"),
+                            (None, true) => format!("{position} · Current"),
+                            (None, false) => position,
                         },
                         enabled: true,
                     },
@@ -407,7 +419,11 @@ impl TerminalApp {
             .interaction
             .application_tab_titles;
         let source = self.registry.window_id();
-        let local = (source, self.tab_search_entries(follow_titles).into());
+        let local = tab_windows::WindowEntries {
+            window: source,
+            name: self.window_name.clone(),
+            entries: self.tab_search_entries(follow_titles).into(),
+        };
         search_tabs(
             query,
             source,
@@ -1275,10 +1291,22 @@ mod tests {
             group,
             title: title.into(),
         };
-        let windows: [(u64, Rc<[SearchTab]>); 3] = [
-            (1, [tab(8, "Build")].into()),
-            (2, [tab(9, "Other"), tab(10, "Build")].into()),
-            (12, [tab(11, "Build")].into()),
+        let windows = [
+            tab_windows::WindowEntries {
+                window: 1,
+                name: None,
+                entries: [tab(8, "Build")].into(),
+            },
+            tab_windows::WindowEntries {
+                window: 2,
+                name: None,
+                entries: [tab(9, "Other"), tab(10, "Build")].into(),
+            },
+            tab_windows::WindowEntries {
+                window: 12,
+                name: Some("West Coast".to_owned().try_into().unwrap()),
+                entries: [tab(11, "Build")].into(),
+            },
         ];
 
         let all = search_tabs("build", 1, Some(8), windows.clone());
@@ -1292,6 +1320,11 @@ mod tests {
         );
         assert_eq!(all[0].chord, "Tab 1 · Current");
         assert_eq!(all[1].chord, "Window 2 · Tab 2");
+        assert_eq!(all[2].chord, "Window 12 · West Coast · Tab 1");
+
+        let named = search_tabs("Coast BUILD", 1, Some(8), windows.clone());
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].id, CommandId::FocusTab(12, 11));
 
         let selected = search_tabs("  BUILD  window 2  tab 2  ", 1, Some(8), windows);
         assert_eq!(selected.len(), 1);

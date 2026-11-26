@@ -3,9 +3,11 @@ use std::{borrow::Cow, collections::BTreeSet};
 use w11term::tabs::TabTitle;
 
 pub(super) const RENAME_PANE: &str = "Rename focused pane…";
+pub(super) const RENAME_WINDOW: &str = "Rename window…";
 
 pub enum Action {
     Show,
+    ShowWindow,
     ShowGroup(TabId),
     ShowPane(u64, TabId),
     SaveProfile(clipboard_paste::Origin),
@@ -21,6 +23,7 @@ pub(super) fn show_pane(target: Option<(u64, TabId)>) -> Message {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
+    Window,
     Group(TabId),
     Pane { pane: u64, group: TabId },
     Profile(clipboard_paste::Origin),
@@ -29,6 +32,7 @@ enum Target {
 impl Target {
     fn matches_focus(self, actual_pane: u64, actual_group: TabId) -> bool {
         match self {
+            Self::Window => true,
             Self::Group(group) => group == actual_group,
             Self::Pane { pane, group } => pane == actual_pane && group == actual_group,
             Self::Profile(origin) => origin.pane == actual_pane && origin.group == actual_group,
@@ -51,7 +55,7 @@ impl Target {
                     live.pane_name = title;
                 }
             }
-            Self::Profile(_) => unreachable!("profile edits use the profile store"),
+            Self::Window | Self::Profile(_) => unreachable!("target is outside the tab layout"),
         }
     }
 }
@@ -81,6 +85,11 @@ impl Editor {
     pub(super) fn view(&self, ctx: &ViewContext<TerminalApp>) -> View {
         let serial = self.serial;
         let (heading, label, placeholder) = match self.target {
+            Target::Window => (
+                "Rename window",
+                "Window name",
+                "Use the default window title",
+            ),
             Target::Group(_) => ("Rename tab", "Tab name", "Use the default tab title"),
             Target::Pane { .. } => (
                 "Rename focused pane",
@@ -196,6 +205,20 @@ impl TerminalApp {
     }
 
     fn show_title_editor(&mut self, target: Target) {
+        let blocked = |live: &LiveTab| {
+            live.session.frames.load().prompt.is_some()
+                || live.session.prompts.current().is_some()
+                || live.files.entry_dialog_open()
+        };
+        if self.clipboard.is_open()
+            || matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(active)) if blocked(active))
+        {
+            return;
+        }
+        if target == Target::Window {
+            self.present_title_editor(target, self.window_name.clone());
+            return;
+        }
         let id = match target {
             Target::Group(group) => switcher_leaf(&self.tabs.headers(), group),
             _ => self.tabs.active_id(),
@@ -211,36 +234,34 @@ impl TerminalApp {
             return;
         };
         let group = self.tabs.group_id(id).expect("pane has a tab");
-        let blocked = |live: &LiveTab| {
-            live.session.frames.load().prompt.is_some()
-                || live.session.prompts.current().is_some()
-                || live.files.entry_dialog_open()
-        };
         if !target.matches_focus(live.session.pane_id, group)
             || matches!(target, Target::Profile(origin) if self.saveable_ssh_origin() != Some(origin))
             || blocked(live)
-            || (self.tabs.active_id() != Some(id)
-                && matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(active)) if blocked(active)))
-            || self.clipboard.is_open()
         {
             return;
         }
+        let title = match target {
+            Target::Pane { .. } => live.pane_name.as_ref(),
+            Target::Group(_) => self.tabs.title_for(id),
+            Target::Window | Target::Profile(_) => None,
+        };
+        self.present_title_editor(target, title.cloned());
+    }
+
+    fn present_title_editor(&mut self, target: Target, title: Option<TabTitle>) {
         if let Some(editor) = &mut self.title_editor {
             // WinUI can accept another menu click after hiding the dialog but
             // before delivering Closed. Finish the original edit first.
             editor.reopen = Some(target);
             return;
         }
-        let title = match target {
-            Target::Pane { .. } => live.pane_name.as_ref(),
-            Target::Group(_) => self.tabs.title_for(id),
-            Target::Profile(_) => None,
-        };
         self.name_edit_serial = self.name_edit_serial.wrapping_add(1);
         self.title_editor = Some(Editor {
             target,
             serial: self.name_edit_serial,
-            text: title.map_or_else(String::new, |t| t.as_str().to_owned()),
+            text: title
+                .as_ref()
+                .map_or_else(String::new, |t| t.as_str().to_owned()),
             has_title: title.is_some(),
             reopen: None,
             error: None,
@@ -250,6 +271,7 @@ impl TerminalApp {
 
     pub(super) fn edit_tab_title(&mut self, action: Action, context: &ComponentContext<Self>) {
         match action {
+            Action::ShowWindow => self.show_title_editor(Target::Window),
             Action::Show => {
                 if let Some(group) = self.tabs.active_group_id() {
                     self.show_title_editor(Target::Group(group));
@@ -290,9 +312,13 @@ impl TerminalApp {
                     ContentDialogResult::Secondary => Some(None),
                     _ => None,
                 } {
-                    editor.target.apply(&mut self.tabs, title);
-                    self.header.borrow_mut().take();
-                    self.publish_panes();
+                    if editor.target == Target::Window {
+                        self.rename_window(title);
+                    } else {
+                        editor.target.apply(&mut self.tabs, title);
+                        self.header.borrow_mut().take();
+                        self.publish_panes();
+                    }
                 }
                 self.keyboard.set_modal(false);
                 if let Some(id) = self.tabs.active_id() {
