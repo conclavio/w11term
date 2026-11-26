@@ -56,6 +56,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "stop-ssh-attempt"
             | "retry-ssh-now"
             | "disconnect-ssh-shell"
+            | "wait-ssh-connected"
             | "list-commands"
             | "get-command"
             | "inspect"
@@ -865,6 +866,45 @@ mod tests {
             "inspect --pane 1 --all-panes",
             "inspect --pane 1 extra",
             "inspect --pane 2 --stdin",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn single_pane_ssh_wait_accepts_a_generation_floor_and_valid_timeout() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 9 wait-ssh-connected --pane 7").unwrap(),
+            (
+                Some(9),
+                Request::WaitSshConnected {
+                    pane: 7,
+                    after_generation: 0,
+                    timeout_seconds: 30
+                }
+            )
+        ));
+        assert!(matches!(
+            parse_line("wait-ssh-connected --pane 7 --after-generation 4 --timeout 15").unwrap(),
+            (
+                None,
+                Request::WaitSshConnected {
+                    pane: 7,
+                    after_generation: 4,
+                    timeout_seconds: 15
+                }
+            )
+        ));
+        for line in [
+            "wait-ssh-connected",
+            "wait-ssh-connected --pane 0",
+            "wait-ssh-connected --pane 7 --pane 8",
+            "wait-ssh-connected --pane 7 --after-generation -1",
+            "wait-ssh-connected --pane 7 --after-generation 1 --after-generation 2",
+            "wait-ssh-connected --pane 7 --timeout 0",
+            "wait-ssh-connected --pane 7 --timeout 3601",
+            "wait-ssh-connected --pane 7 --timeout 4 --timeout 5",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
         }

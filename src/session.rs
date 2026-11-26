@@ -1008,7 +1008,7 @@ async fn run(
             if restartable {
                 events.pane_exited(launch_id, ssh_phase);
             } else if let Some(phase) = ssh_phase {
-                events.set_ssh_connection_phase(phase);
+                events.end_ssh_connection(phase);
             }
         }
         let mut inspected_transport = if inspecting {
@@ -1810,7 +1810,7 @@ async fn run(
                             events.command_stream(live_commands.then_some(generation));
                             events.notification_stream(interactive.then_some(generation));
                             if is_ssh {
-                                events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connected);
+                                events.set_ssh_connected(generation);
                             }
                         }
                     }

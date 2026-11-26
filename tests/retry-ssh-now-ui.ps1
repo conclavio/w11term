@@ -40,14 +40,22 @@ try {
     $ssh = Wait-Until 'original SSH pane' { (Control @('list')).sessions | Where-Object label -eq 'palette-ssh' }
     $remote = $ssh.id
     $tabId = $ssh.tab_id
+    $initialConnection = Control @('wait-ssh-connected','--pane',"$remote",'--timeout','15')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
     $generation = (Get-RemotePane).connection_generation
+    if ($initialConnection.pane -ne $remote -or $initialConnection.connection_generation -ne $generation -or $generation -eq 0) {
+        throw 'The initial wait did not report the established SSH generation'
+    }
     $null = Control @('send-text','--pane',"$remote",'--no-paste','before-retry/')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','before-retry/')
     Run-Palette 'Split right with Palette PowerShell'
     $local = Wait-Until 'PowerShell split' { ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id }
     $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')
     Wait-Focus $local
+    $wrongPane = & $Cli --pid $app.Id wait-ssh-connected --pane $local --timeout 15 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $wrongPane.ok -or $wrongPane.error -notmatch 'does not use SSH') {
+        throw 'A PowerShell pane passed the SSH connection wait'
+    }
     [IO.File]::WriteAllText($drop,'')
     [IO.File]::Delete($initial)
 
@@ -78,14 +86,22 @@ try {
     Wait-RetryAccepted $menu.ssh_retry_token
 
     $palette = Wait-Retry 5
+    $waitLog = Join-Path $State 'ssh-wait.json'
+    $waiter = Start-Process -FilePath $Cli -ArgumentList @('--pid',"$($app.Id)",'wait-ssh-connected','--pane',"$remote",'--after-generation',"$generation",'--timeout','30') -WindowStyle Hidden -PassThru -RedirectStandardOutput $waitLog
+    # Keep the process handle so Windows PowerShell can read the exit code later.
+    $null = $waiter.Handle
     [IO.File]::Delete($drop)
     Run-Palette $retryAction
     Wait-RetryAccepted $palette.ssh_retry_token
-    $ready = Wait-Until 'replacement shell in the original pane' {
-        $pane = Get-RemotePane
-        if ($pane.ssh_connection.phase -ceq 'connected' -and $pane.connection_generation -gt $generation) { $pane }
+    if (!$waiter.WaitForExit(15000)) { throw 'The SSH wait did not settle after reconnect' }
+    $connected = Get-Content -LiteralPath $waitLog -Raw | ConvertFrom-Json
+    if ($waiter.ExitCode -ne 0 -or !$connected.ok -or $connected.result.pane -ne $remote -or
+        $connected.result.connection_generation -le $generation) {
+        throw "The SSH wait failed. Exit=$($waiter.ExitCode), pane=$remote, previous=$generation, reply=$($connected | ConvertTo-Json -Compress)"
     }
-    if ($ready.tab_id -ne $tabId -or $ready.ssh_retry_token -or $ready.ssh_attempt_token) { throw 'Unexpected state of the restored pane' }
+    $ready = Get-RemotePane
+    if ($ready.tab_id -ne $tabId -or $ready.ssh_retry_token -or $ready.ssh_attempt_token -or
+        $ready.connection_generation -ne $connected.result.connection_generation) { throw 'Unexpected state of the restored pane' }
     Reject-Retry $palette.ssh_retry_token
     Wait-RetryAccepted $background.ssh_retry_token
     $output = Join-Path $State 'ssh-history.txt'
@@ -98,5 +114,9 @@ try {
 } catch {
     throw "$_ at $($_.ScriptStackTrace)"
 } finally {
+    if ($waiter) {
+        if (!$waiter.HasExited) { $waiter.Kill(); $waiter.WaitForExit() }
+        $waiter.Dispose()
+    }
     Close-FixtureApp $app
 }

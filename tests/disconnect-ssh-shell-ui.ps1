@@ -91,6 +91,10 @@ try {
     Run-Palette $action
     Close-Review 'Disconnect shell'
     Wait-Disconnected $original
+    $ended = & $Cli --pid $app.Id wait-ssh-connected --pane $remote --timeout 3 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $ended.ok -or $ended.error -notmatch 'SSH pane is disconnected') {
+        throw 'The SSH wait did not report the settled disconnect'
+    }
     Run-Palette 'Restart exited pane'
     $second = Wait-Ready $original
 

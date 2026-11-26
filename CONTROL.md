@@ -622,6 +622,23 @@ the current window grid. Replies return `pane`, `cols`, `rows`, and `active`. Ne
 tabs may still be connecting or awaiting a native trust/authentication prompt;
 scripts can inspect `list`. No command starts a new GUI process.
 
+`wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]`
+waits until an existing SSH pane reports a successful connection. The reply
+contains `pane` and `connection_generation`. An already connected pane returns
+immediately unless its generation is at or below `--after-generation`.
+For an automatic reconnect or a manual `restart`, use the previous generation
+from the same pane. A settled disconnect, a failed or stopped login, or a closed
+pane returns an error. A pending login or scheduled retry can continue until the
+timeout, which defaults to 30 seconds and accepts 1–3600 seconds. Use
+`wait-for-text` separately when a script needs a specific remote shell prompt.
+
+```powershell
+& $ctl --pid 12345 wait-ssh-connected --pane 2 --after-generation 1 --timeout 60
+```
+
+The same pipe request is
+`{"verb":"wait-ssh-connected","pane":2,"after_generation":1,"timeout_seconds":60}`.
+
 `events` returns `{"pane":1,"journal":{"events":[...],"next":42,"oldest":1,"lost":false},"restart_token":null}`.
 Each event has `sequence`, Unix `timestamp_ms`, `kind`, and JSON `data`. Use the
 returned `next` for the next request. `--timeout` long-polls until an event arrives

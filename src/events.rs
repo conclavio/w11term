@@ -132,6 +132,8 @@ struct State {
     next_prompt: u64,
     notify_long_commands: bool,
     ssh_connection_phase: Option<SshConnectionPhase>,
+    ssh_connection_generation: u64,
+    ssh_connection_ended: bool,
     ssh_attempts: ssh_attempt::Attempts,
     restart_token: Option<u64>,
     restart_closed: bool,
@@ -338,6 +340,26 @@ impl Events {
         }
     }
 
+    pub(crate) fn set_ssh_connected(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        let generation_changed = state.ssh_connection_generation != generation;
+        state.ssh_connection_generation = generation;
+        let phase_changed = Self::record_ssh_phase(&mut state, SshConnectionPhase::Connected);
+        drop(state);
+        if generation_changed || phase_changed {
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// Publish the final phase for an SSH worker that cannot restart in place.
+    pub(crate) fn end_ssh_connection(&self, phase: SshConnectionPhase) {
+        let mut state = self.state.lock().unwrap();
+        state.ssh_connection_ended = true;
+        Self::record_ssh_phase(&mut state, phase);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
     fn record_ssh_phase(state: &mut State, phase: SshConnectionPhase) -> bool {
         if state.ssh_connection_phase.as_ref() == Some(&phase) {
             return false;
@@ -425,7 +447,7 @@ impl Events {
         if expected_exit.is_some() && state.restart_token != expected_exit {
             return false;
         }
-        state.restart_closed = true;
+        let closed = !std::mem::replace(&mut state.restart_closed, true);
         let changed = state.ssh_connection_phase.is_some()
             && Self::record_ssh_phase(&mut state, SshConnectionPhase::Disconnected);
         if state.restart_token.take().is_some()
@@ -434,7 +456,7 @@ impl Events {
             inbox.refresh();
         }
         drop(state);
-        if changed {
+        if closed || changed {
             self.changed.notify_waiters();
         }
         true
@@ -1223,7 +1245,7 @@ mod tests {
                 ..Default::default()
             }
         );
-        events.set_ssh_connection_phase(Connected);
+        events.set_ssh_connected(1);
         events.set_ssh_connection_phase(Disconnected);
         events.pane_exited(8, Some(Failed("fixture failure".into())));
         let changes: Vec<_> = events

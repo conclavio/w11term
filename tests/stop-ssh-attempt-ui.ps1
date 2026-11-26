@@ -61,6 +61,10 @@ try {
     Invoke-Button (Get-NativeMenuAction 'Tab menu' $stop -Submenu 'Panes')
     Wait-Stopped
     Reject-Stop $first
+    $stopped = & $Cli --pid $app.Id wait-ssh-connected --pane $remote --timeout 3 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $stopped.ok -or $stopped.error -notmatch 'connection attempt stopped') {
+        throw 'SSH connection wait did not report the stopped login'
+    }
 
     [IO.File]::Delete($held)
     [IO.File]::Delete($hold)
@@ -97,9 +101,9 @@ try {
     [IO.File]::Delete($hold)
     Pick 'palette-ssh' $remote
     Run-Palette 'Restart exited pane'
-    $null = Wait-Until 'a fresh SSH session in the original pane' {
-        $p = Get-RemotePane
-        $p.connection_generation -gt $generation -and $p.ssh_connection.phase -ceq 'connected'
+    $connected = Control @('wait-ssh-connected','--pane',"$remote",'--after-generation',"$generation",'--timeout','15')
+    if ($connected.pane -ne $remote -or $connected.connection_generation -le $generation) {
+        throw 'SSH connection wait did not report the fresh login in the original pane'
     }
     Reject-Stop $third
     $output = Join-Path $State 'ssh-history.txt'

@@ -69,6 +69,13 @@ pub enum Request {
         pane: u64,
         connection_generation: std::num::NonZeroU64,
     },
+    WaitSshConnected {
+        pane: u64,
+        #[serde(default)]
+        after_generation: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     WaitForText {
         pane: u64,
         pattern: String,
@@ -627,6 +634,24 @@ impl Registry {
                 Ok(
                     json!({"pane":pane,"connection_generation":connection_generation,"accepted":true}),
                 )
+            }
+            Request::WaitSshConnected {
+                pane,
+                after_generation,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "wait timeout must be 1..=3600 seconds"
+                );
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+                let generation = tokio::select! {
+                    result = events.wait_ssh_connected(after_generation, deadline) => result?,
+                    _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                };
+                Ok(json!({"pane":pane,"connection_generation":generation}))
             }
             Request::Events {
                 pane,
@@ -1313,6 +1338,7 @@ async fn serve(
                 let pool = if matches!(
                     r,
                     Request::WaitForText { .. }
+                        | Request::WaitSshConnected { .. }
                         | Request::WaitSftpTransfer { .. }
                         | Request::WaitSshGroupRun { .. }
                         | Request::WaitSshGroupApproval { .. }
@@ -1659,6 +1685,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,
             Request::WaitForText {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshConnected {
                 timeout_seconds, ..
             }
             | Request::WaitSftpTransfer {

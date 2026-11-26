@@ -168,6 +168,38 @@ impl Events {
         }
     }
 
+    pub(crate) async fn wait_ssh_connected(
+        &self,
+        after_generation: u64,
+        deadline: Instant,
+    ) -> anyhow::Result<u64> {
+        use SshConnectionPhase::*;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                anyhow::ensure!(!state.restart_closed, "pane is closed");
+                let generation = state.ssh_connection_generation;
+                match state.ssh_connection_phase.as_ref() {
+                    None => anyhow::bail!("pane does not use SSH"),
+                    Some(Connected) if generation > after_generation => return Ok(generation),
+                    Some(Failed(reason)) => anyhow::bail!("SSH connection failed: {reason}"),
+                    Some(Stopped) => anyhow::bail!("SSH connection attempt stopped"),
+                    Some(Disconnected)
+                        if state.restart_token.is_some() || state.ssh_connection_ended =>
+                    {
+                        anyhow::bail!("SSH pane is disconnected");
+                    }
+                    _ => {}
+                }
+            }
+            anyhow::ensure!(Instant::now() < deadline, "wait-ssh-connected timed out");
+            let _ = tokio::time::timeout_at(deadline, changed).await;
+        }
+    }
+
     pub fn watch_ssh_attempt(&self, id: PendingSshAttempt) -> Option<SshAttemptCompletion> {
         let state = self.state.lock().unwrap();
         let attempt = state
@@ -455,5 +487,59 @@ mod tests {
         events.pane_exited(2, Some(SshConnectionPhase::Failed("later failure".into())));
         assert_eq!(events.failed_ssh_restart_token(first_id), None);
         assert_eq!(events.failed_ssh_restart_token(second_id), Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_ignores_the_previous_generation_and_transient_disconnect() {
+        use SshConnectionPhase::*;
+        use std::time::Duration;
+
+        let events = Events::default();
+        events.set_ssh_connected(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(events.wait_ssh_connected(0, deadline).await.unwrap(), 1);
+        let reconnect = async {
+            for phase in [Disconnected, Reconnecting { attempt: Some(1) }] {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                events.set_ssh_connection_phase(phase);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            events.set_ssh_connected(2);
+        };
+        let (result, ()) = tokio::join!(events.wait_ssh_connected(1, deadline), reconnect);
+        assert_eq!(result.unwrap(), 2);
+        let result = events.wait_ssh_connected(2, deadline).await.unwrap_err();
+        assert_eq!(result.to_string(), "wait-ssh-connected timed out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_wakes_when_a_disconnect_settles_or_the_pane_closes() {
+        use SshConnectionPhase::*;
+        use std::time::Duration;
+
+        for (closed, expected) in [
+            (false, "SSH pane is disconnected"),
+            (true, "pane is closed"),
+        ] {
+            let events = Events::default();
+            events.set_ssh_connection_phase(Disconnected);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let end = async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if closed {
+                    events.close_restart();
+                } else {
+                    events.end_ssh_connection(Disconnected);
+                }
+            };
+            let (result, ()) = tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    events.wait_ssh_connected(0, deadline)
+                ),
+                end
+            );
+            assert_eq!(result.unwrap().unwrap_err().to_string(), expected);
+        }
     }
 }
