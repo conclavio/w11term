@@ -77,8 +77,8 @@ pub enum Command {
     Inspect(bool),
     WatchRunningCommand(RunningCommandTarget, bool),
     ReadRunningOutput(
-        RunningCommandTarget,
-        tokio::sync::oneshot::Sender<RunningCommandOutput>,
+        u64,
+        tokio::sync::oneshot::Sender<Result<RunningCommandSample, &'static str>>,
     ),
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<PaneInspection>),
@@ -383,12 +383,26 @@ fn has_cell_pixels(size: TerminalSize) -> bool {
         && size.pixel_height >= size.rows
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
+pub struct RunningCommandSample {
+    pub id: u64,
+    pub start_token: u64,
+    pub connection_generation: u64,
+    #[serde(flatten)]
+    pub output: RunningCommandOutput,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
 pub enum RunningCommandOutput {
     Unavailable,
     Updating,
     AlternateScreen,
-    Text { text: String, earlier_omitted: bool },
+    #[serde(rename = "ready")]
+    Text {
+        text: String,
+        earlier_omitted: bool,
+    },
 }
 
 impl Session {
@@ -1457,10 +1471,10 @@ async fn run(
                         }
                         Ok(())
                     }
-                    Some(Command::ReadRunningOutput(target, reply)) => {
+                    Some(Command::ReadRunningOutput(start_token, reply)) => {
                         if !reply.is_closed() {
                             let _ = reply.send(read_running_output(
-                                &terminal, &events, connection_generation, target,
+                                &terminal, &events, connection_generation, start_token,
                             ));
                         }
                         Ok(())
@@ -1922,16 +1936,23 @@ fn read_running_output(
     terminal: &wezterm_term::TerminalState,
     events: &crate::events::Events,
     generation: u64,
-    target: RunningCommandTarget,
-) -> RunningCommandOutput {
+    start_token: u64,
+) -> Result<RunningCommandSample, &'static str> {
+    let running = terminal
+        .running_command()
+        .filter(|command| command.start_token == start_token)
+        .filter(|_| events.shell_generation() == Some(generation))
+        .ok_or("that command capture is no longer running in this pane")?;
+    Ok(RunningCommandSample {
+        id: running.id,
+        start_token,
+        connection_generation: generation,
+        output: sample_running_output(terminal),
+    })
+}
+
+fn sample_running_output(terminal: &wezterm_term::TerminalState) -> RunningCommandOutput {
     use RunningCommandOutput::*;
-    if events.shell_generation() != Some(generation)
-        || terminal
-            .running_command()
-            .is_none_or(|command| RunningCommandTarget::new(generation, &command) != target)
-    {
-        return Unavailable;
-    }
     if terminal.synchronized_output() {
         return Updating;
     }
@@ -2180,7 +2201,7 @@ mod failure_tests {
 
     #[test]
     fn running_output_reads_only_the_selected_capture_and_bounds_the_tail() {
-        use RunningCommandOutput::{AlternateScreen, Text, Unavailable, Updating};
+        use RunningCommandOutput::{AlternateScreen, Text, Updating};
         let (writer, _) = mpsc::unbounded_channel();
         let mut terminal = terminal::create(
             TerminalSize {
@@ -2193,33 +2214,44 @@ mod failure_tests {
         let events = crate::events::Events::default();
         events.command_stream(Some(8));
         terminal.advance_bytes(b"$ build\r\n\x1b]133;C\x07abcdefghijklmno\r\npartial");
-        let target = RunningCommandTarget::new(8, &terminal.running_command().unwrap());
-        let read =
-            |terminal: &wezterm_term::Terminal| read_running_output(terminal, &events, 8, target);
+        let start_token = terminal.running_command().unwrap().start_token;
+        let read = |terminal: &wezterm_term::Terminal| {
+            read_running_output(terminal, &events, 8, start_token).map(|sample| sample.output)
+        };
         assert!(matches!(
             read(&terminal),
-            Text { text, earlier_omitted: false } if text == "abcdefghijklmno\npartial"
+            Ok(Text { text, earlier_omitted: false }) if text == "abcdefghijklmno\npartial"
         ));
 
         terminal.advance_bytes(b"\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\nlast");
         assert!(matches!(
             read(&terminal),
-            Text { text, earlier_omitted: true } if text == "3\n4\n5\n6\n7\nlast"
+            Ok(Text { text, earlier_omitted: true }) if text == "3\n4\n5\n6\n7\nlast"
         ));
         terminal.advance_bytes(b"\x1b[?2026h-new");
-        assert!(matches!(read(&terminal), Updating));
+        assert!(matches!(read(&terminal), Ok(Updating)));
         terminal.advance_bytes(b"\x1b[?2026l");
-        assert!(matches!(read(&terminal), Text { text, .. } if text.ends_with("last-new")));
+        assert!(matches!(read(&terminal), Ok(Text { text, .. }) if text.ends_with("last-new")));
 
         terminal.advance_bytes(b"\x1b[?1049hTUI");
-        assert!(matches!(read(&terminal), AlternateScreen));
+        assert!(matches!(read(&terminal), Ok(AlternateScreen)));
         terminal.advance_bytes(b"\x1b[?1049l");
-        assert!(matches!(read(&terminal), Text { text, .. } if text.ends_with("last-new")));
+        assert!(matches!(read(&terminal), Ok(Text { text, .. }) if text.ends_with("last-new")));
         events.command_stream(Some(9));
-        assert!(matches!(read(&terminal), Unavailable));
+        assert!(read(&terminal).is_err());
         events.command_stream(Some(8));
+        let old_id = terminal.running_command().unwrap().id;
+        terminal.advance_bytes(b"\x1b]133;C\x07replacement");
+        let replacement = terminal.running_command().unwrap();
+        assert_eq!(replacement.id, old_id);
+        assert_ne!(replacement.start_token, start_token);
+        assert!(read(&terminal).is_err());
+        assert!(matches!(
+            read_running_output(&terminal, &events, 8, replacement.start_token).unwrap().output,
+            Text { text, .. } if text == "replacement"
+        ));
         terminal.advance_bytes(b"\x1b]133;D;0\x07\x1b]133;C\x07other");
-        assert!(matches!(read(&terminal), Unavailable));
+        assert!(read(&terminal).is_err());
     }
 
     #[test]

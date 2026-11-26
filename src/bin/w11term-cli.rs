@@ -68,6 +68,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "close-pane"
             | "list-commands"
             | "get-command"
+            | "get-running-output"
             | "wait-command"
             | "inspect"
             | "playback"
@@ -907,6 +908,34 @@ mod tests {
             "inspect --pane 1 --all-panes",
             "inspect --pane 1 extra",
             "inspect --pane 2 --stdin",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn running_output_requires_an_exact_positive_start_token_and_pane() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (pid, request) =
+            parse_line("--pid 42 get-running-output --pane 8 --start-token 27").unwrap();
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(pid, Some(42));
+        assert_eq!(
+            json,
+            serde_json::json!({"verb":"get-running-output","pane":8,"start_token":27})
+        );
+        assert!(matches!(
+            serde_json::from_value(json).unwrap(),
+            Request::GetRunningOutput { pane: 8, start_token } if start_token.get() == 27
+        ));
+        for line in [
+            "get-running-output --pane 8",
+            "get-running-output --start-token 27",
+            "get-running-output --pane 0 --start-token 27",
+            "get-running-output --pane 8 --start-token 0",
+            "get-running-output --pane 8 --start-token -1",
+            "get-running-output --pane 8 --start-token 27 --start-token 28",
+            "get-running-output --pane 8 --pane 9 --start-token 27",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
         }

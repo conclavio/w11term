@@ -1,12 +1,15 @@
 use super::*;
 use command_palette::{CommandId, Row, Search};
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use w11term::{events::RunningCommandTarget, session::RunningCommandOutput};
+use w11term::{
+    events::RunningCommandTarget,
+    session::{RunningCommandOutput, RunningCommandSample},
+};
 
 #[derive(Default)]
 pub(super) struct OutputPreview {
     target: Option<(u64, RunningCommandTarget)>,
-    pending: Option<oneshot::Receiver<RunningCommandOutput>>,
+    pending: Option<oneshot::Receiver<Result<RunningCommandSample, &'static str>>>,
     output: Option<RunningCommandOutput>,
 }
 
@@ -27,16 +30,20 @@ impl OutputPreview {
         }
         if let Some(pending) = &mut self.pending {
             match pending.try_recv() {
-                Ok(RunningCommandOutput::Updating)
-                    if matches!(self.output, Some(RunningCommandOutput::Text { .. })) => {}
-                Ok(reply) => self.output = Some(reply),
-                Err(TryRecvError::Closed) => self.output = Some(RunningCommandOutput::Unavailable),
+                Ok(Ok(RunningCommandSample {
+                    output: RunningCommandOutput::Updating,
+                    ..
+                })) if matches!(self.output, Some(RunningCommandOutput::Text { .. })) => {}
+                Ok(Ok(reply)) => self.output = Some(reply.output),
+                Ok(Err(_)) | Err(TryRecvError::Closed) => {
+                    self.output = Some(RunningCommandOutput::Unavailable);
+                }
                 Err(TryRecvError::Empty) => return,
             }
         }
         let (reply, receiver) = oneshot::channel();
         if input
-            .send(Command::ReadRunningOutput(target.1, reply))
+            .send(Command::ReadRunningOutput(target.1.start_token, reply))
             .is_ok()
         {
             self.pending = Some(receiver);

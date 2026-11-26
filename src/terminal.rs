@@ -1908,7 +1908,8 @@ mod tests {
         assert_eq!(
             batch.events[0].data,
             serde_json::json!({
-                "id": history.id, "connection_generation": 2, "started_unix_ms": first.started_unix_ms,
+                "id": history.id, "connection_generation": 2, "start_token": first.start_token,
+                "started_unix_ms": first.started_unix_ms,
             })
         );
     }
@@ -1946,6 +1947,7 @@ mod tests {
         let named = term.running_command().unwrap();
         assert_eq!(named.command.as_deref(), Some("build all"));
         assert_eq!(named.id, started.id);
+        assert_eq!(named.start_token, started.start_token);
         assert_eq!(named.started_unix_ms, started.started_unix_ms);
 
         term.advance_bytes(b"\x1b]633;A\x07");

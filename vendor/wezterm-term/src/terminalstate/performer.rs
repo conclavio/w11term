@@ -1120,10 +1120,10 @@ impl Performer<'_> {
                 )
                 .then_some((state.next_command_id, state.command_label.as_deref()));
                 handler.semantic_prompt(&marker, started, completed);
-                if let (false, Some((id, _)), Some(clock)) =
+                if let (false, Some((id, _)), Some(start)) =
                     (was_running, started, state.command_started)
                 {
-                    handler.shell_command_started(id, clock.unix_ms);
+                    handler.shell_command_started(id, start.token, start.clock.unix_ms);
                 }
             }
         }

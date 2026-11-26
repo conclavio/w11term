@@ -103,7 +103,7 @@ pub struct CommandLink {
 pub struct RunningCommandTarget {
     pub generation: u64,
     id: u64,
-    started: Instant,
+    pub start_token: u64,
 }
 
 impl RunningCommandTarget {
@@ -111,7 +111,7 @@ impl RunningCommandTarget {
         Self {
             generation,
             id: command.id,
-            started: command.started_at(),
+            start_token: command.start_token,
         }
     }
 }
@@ -809,7 +809,7 @@ impl Events {
         state.refresh_watch(previous);
     }
 
-    pub(crate) fn shell_command_started(&self, id: u64, started_unix_ms: u64) {
+    pub(crate) fn shell_command_started(&self, id: u64, start_token: u64, started_unix_ms: u64) {
         let state = self.state.lock().unwrap();
         let Some(watch) = &state.command_watch else {
             return;
@@ -817,6 +817,7 @@ impl Events {
         let data = serde_json::json!({
             "id": id,
             "connection_generation": watch.generation,
+            "start_token": start_token,
             "started_unix_ms": started_unix_ms,
         });
         self.append(state, "command-started", data, None);
@@ -1828,7 +1829,7 @@ mod tests {
         let target = RunningCommandTarget {
             generation: 1,
             id: 3,
-            started: now,
+            start_token: 1,
         };
         events.command_stream(Some(1));
         events.semantic_prompt_at(&start, None, now);
@@ -1868,7 +1869,7 @@ mod tests {
         let target = RunningCommandTarget {
             generation: 1,
             id: 3,
-            started: now,
+            start_token: 1,
         };
         events.command_stream(Some(1));
         events.semantic_prompt_at(&start, None, now);

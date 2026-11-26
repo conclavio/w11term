@@ -108,7 +108,7 @@ pub trait AlertHandler: Send + Sync {
     ) {
     }
     /// The first output start marker for the current primary-screen command.
-    fn shell_command_started(&mut self, _id: u64, _started_unix_ms: u64) {}
+    fn shell_command_started(&mut self, _id: u64, _start_token: u64, _started_unix_ms: u64) {}
     /// A shell may report the command line after marking the start of its output.
     fn shell_command_line(&mut self, _id: u64, _label: Option<&str>) {}
     fn live_shell_output(

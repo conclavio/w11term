@@ -41,6 +41,15 @@ function Report-CommandStart([string]$Line) {
     $encoded = [Uri]::EscapeDataString($Line)
     Set-RemoteModes "$esc]133;C;cmdline_url=$encoded$bell"
 }
+function Read-RunningOutput([long]$Token) {
+    Control @('get-running-output','--pane',"$remote",'--start-token',"$Token")
+}
+function Assert-StaleOutput([long]$Pane, [long]$Token) {
+    $reply = & $Cli --pid $app.Id get-running-output --pane "$Pane" --start-token "$Token" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $reply.ok -or $reply.error -notmatch 'no longer running') {
+        throw "Expected stale command output to be rejected in pane ${Pane}: $($reply | ConvertTo-Json -Compress)"
+    }
+}
 function Type-Line([string]$Line) {
     foreach ($ch in $Line.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     Press-Key 13
@@ -129,7 +138,7 @@ try {
     Report-CommandStart 'compile fixture'
     $running = Wait-Until 'native and CLI inspector show the started command and directory' {
         $r = (Inspect).running_command
-        if ($r.id -gt 0 -and $r.command -ceq 'compile fixture' -and
+        if ($r.id -gt 0 -and $r.start_token -gt 0 -and $r.command -ceq 'compile fixture' -and
             $r.reported_directory -ceq $folder -and $r.started_unix_ms -gt 0 -and $r.elapsed_ms -ge 0 -and
             (Find-Element 'Running command   compile fixture') -and (Find-Element "Starting directory   $folder")) { $r }
     }
@@ -148,6 +157,10 @@ try {
         $m.alternate_screen -and $m.running_command.id -eq $running.id -and
             $m.running_command.reported_directory -ceq $folder -and (Find-Element 'Running command   compile fixture')
     }
+    $alternate = Read-RunningOutput $running.start_token
+    if ($alternate.state -cne 'alternate-screen' -or $alternate.PSObject.Properties['text']) {
+        throw 'Running output exposed alternate-screen text'
+    }
     Set-RemoteModes "$esc[?1049l$esc]133;D;17$bell"
     $null = Wait-Until 'finish clears the readout and retains the same command identity' {
         $m = Inspect
@@ -156,6 +169,7 @@ try {
             $list.commands[0].id -eq $running.id -and $list.commands[0].exit_code -eq 17 -and
             $list.commands[0].started_unix_ms -eq $running.started_unix_ms
     }
+    Assert-StaleOutput $remote $running.start_token
     Invoke-Button (Wait-Until 'close inspector' { Find-Element 'Close terminal inspector' $button })
     $null = Wait-Until 'GUI inspection closed before inspecting the hidden tab' { !(Find-Element 'Close terminal inspector') }
 
@@ -195,7 +209,7 @@ try {
     $started = $starts.events[0].data
     if ($starts.lost -or $starts.events.Count -ne 1 -or $started.id -lt 1 -or
         $started.connection_generation -ne $initial.connection_generation -or
-        $started.started_unix_ms -le 0 -or @($started.PSObject.Properties).Count -ne 3) {
+        $started.start_token -le 0 -or $started.started_unix_ms -le 0 -or @($started.PSObject.Properties).Count -ne 4) {
         throw "Unexpected metadata for quick command start: $($starts | ConvertTo-Json -Depth 5 -Compress)"
     }
     $record = Control @('wait-command','--pane',"$remote",'--after-id',"$($started.id - 1)",
@@ -208,10 +222,31 @@ try {
     Type-Line 'if ($inspectPid -eq $PID) { "local-inspect-" + "still-live" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-still-live')
     if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains('local-inspect')) { throw 'PowerShell input landed in SSH' }
+    $cursor = (Control @('events','--pane',"$remote")).journal.next
     Report-CommandStart 'interrupted fixture'
-    $null = Wait-Until 'the source reports a running command while PowerShell is active' {
-        (Inspect).running_command.command -ceq 'interrupted fixture'
+    Set-RemoteModes 'original-preview'
+    $first = ((Control @('events','--pane',"$remote",'--since',"$cursor",'--kind','command-started','--timeout','5')).journal.events)[0].data
+    $null = Wait-Until 'a command-started token reads the background shell output' {
+        $sample = Read-RunningOutput $first.start_token
+        $sample.pane -eq $remote -and $sample.id -eq $first.id -and $sample.start_token -eq $first.start_token -and
+            $sample.connection_generation -eq $first.connection_generation -and $sample.state -ceq 'ready' -and
+            $sample.earlier_omitted -eq $false -and $sample.text -clike '*original-preview*'
     }
+    Assert-StaleOutput $localPane $first.start_token
+    Report-CommandStart 'interrupted fixture'
+    Set-RemoteModes 'replacement-preview'
+    $replacement = Wait-Until 'inspect reports a fresh token even when the history ID is reused' {
+        $r = (Inspect).running_command
+        if ($r.id -eq $first.id -and $r.start_token -gt 0 -and $r.start_token -ne $first.start_token) { $r }
+    }
+    Assert-StaleOutput $remote $first.start_token
+    $null = Wait-Until 'the replacement token reads only its own output' {
+        $sample = Read-RunningOutput $replacement.start_token
+        $sample.state -ceq 'ready' -and $sample.text -clike '*replacement-preview*' -and
+            $sample.text -cnotlike '*original-preview*'
+    }
+    Wait-Focus $localPane
+    if ($foreground -ne $window -and [FixtureMessages]::GetForegroundWindow() -eq $window) { throw 'Running output activated the fixture window' }
     Invoke-NativeMenuAction 'Tab menu' ('Find running commands' + [char]0x2026)
     Wait-PickerEditor 'Search running commands' 'the running command picker'
     $field = Find-Element 'Search running commands' ([System.Windows.Automation.ControlType]::Edit)
@@ -239,6 +274,7 @@ try {
             $m.ssh_connection.phase -ceq 'failed' -and $m.ssh_connection.reason -and
             (Find-Element 'SSH connection   Failed') -and (Find-Element $m.ssh_connection.reason)
     }
+    Assert-StaleOutput $remote $replacement.start_token
 } catch {
     $failure = $_.Exception.Message
     try {

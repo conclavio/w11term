@@ -339,6 +339,7 @@ pub struct CompletedCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunningCommand {
     pub id: u64,
+    pub start_token: u64,
     pub command: Option<Arc<str>>,
     pub reported_directory: Option<Arc<str>>,
     pub started_unix_ms: u64,
@@ -366,6 +367,23 @@ pub struct CommandTiming {
 struct CommandClock {
     monotonic: std::time::Instant,
     unix_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CommandStart {
+    clock: CommandClock,
+    token: u64,
+}
+
+impl CommandStart {
+    fn now() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        Self {
+            clock: CommandClock::now(),
+            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl CommandClock {
@@ -555,7 +573,7 @@ pub struct TerminalState {
     track_primary_prints: bool,
     last_primary_print: Option<PrimaryPrint>,
     command_label: Option<Arc<str>>,
-    command_started: Option<CommandClock>,
+    command_started: Option<CommandStart>,
     command_directory: Option<Arc<str>>,
     vscode_command: VscodeCommand,
 
@@ -1100,10 +1118,11 @@ impl TerminalState {
         let start = self.command_started?;
         Some(RunningCommand {
             id: self.next_command_id,
+            start_token: start.token,
             command: self.command_label.clone(),
             reported_directory: self.command_directory.clone(),
-            started_unix_ms: start.unix_ms,
-            started_at: start.monotonic,
+            started_unix_ms: start.clock.unix_ms,
+            started_at: start.clock.monotonic,
         })
     }
 
@@ -1160,7 +1179,7 @@ impl TerminalState {
 
     fn begin_command_output(&mut self, reported_command: Option<String>) {
         if !self.is_alt_screen_active() {
-            self.command_started = Some(CommandClock::now());
+            self.command_started = Some(CommandStart::now());
             self.command_directory = self
                 .current_dir
                 .as_ref()
@@ -1202,7 +1221,7 @@ impl TerminalState {
     fn finish_command_output(&mut self, exit_code: Option<i32>) {
         if !self.is_alt_screen_active() {
             let finished = CommandClock::now();
-            let timing = finished.timing(self.command_started.take());
+            let timing = finished.timing(self.command_started.take().map(|start| start.clock));
             if self.capturing_shell_input {
                 self.screen.command_start = None;
                 self.capturing_shell_input = false;

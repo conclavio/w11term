@@ -133,7 +133,7 @@ if ($modes.in_band_resize) { 'This pane has subscribed to resize reports.' }
 The reply includes `pane`, `connection_generation`, `cols`, `rows`, `pixel_width`, `pixel_height` and `dpi`. Pixel dimensions describe the drawable text area. An unavailable measurement is zero. The booleans `alternate_screen`, `bracketed_paste`, `synchronized_output` and `in_band_resize` reflect the modes at the time of the read.
 
 For a live shell that emits supported integration markers, `running_command`
-appears after the command start marker. It contains `id`, `command`,
+appears after the command start marker. It contains `id`, `start_token`, `command`,
 `reported_directory`, `started_unix_ms`, and `elapsed_ms`. The command line
 and initial directory can be `null`. Elapsed time uses the local monotonic
 clock. The command remains visible through alternate-screen programs and the
@@ -154,6 +154,38 @@ While the pane has an active SSH transport, `inspect` reports `ssh_transport` wi
 `mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
 When xterm modified-key reporting or its alternate format is enabled, `keyboard.modify_other_keys` is the active level from 0 through 3 and `keyboard.format_other_keys` is `xterm-27` or `csi-u`.
+
+## Running command output
+
+`get-running-output --pane ID --start-token TOKEN` reads a bounded sample from
+one active command. Take the token from `inspect.result.running_command.start_token`
+or from the same pane's `command-started` event. The token is valid only for that
+capture in the running w11term process. A capture can reuse its history ID after
+an abandoned or repeated start marker. A new start has a new token. Use
+`inspect` to find the current token after a replacement.
+
+```powershell
+$inspection = & $ctl --pid 12345 inspect --pane $pane | ConvertFrom-Json
+$token = $inspection.result.running_command.start_token
+if ($inspection.ok -and $token) {
+    & $ctl --pid 12345 get-running-output --pane $pane --start-token $token
+}
+```
+
+The reply includes `pane`, `id`, `connection_generation`, `start_token`, and
+`state`. With `state: "ready"`, `text` contains up to six primary-screen rows
+joined with LF, including the current unfinished line. An empty string means
+there is no text in the sample. `earlier_omitted` marks rows outside the sample,
+and a trailing ellipsis marks a shortened line. `"updating"` indicates an
+uncommitted synchronized update. `"alternate-screen"` indicates that an
+application is using the alternate screen. `"unavailable"` indicates that
+the active capture's output range could not be located. Those three states
+omit `text`. A finished, replaced, wrong-pane, or disconnected token returns
+an error. Use `get-command` for a completed capture's retained output.
+
+The read preserves focus and scroll position, including on background and
+read-only panes. The equivalent pipe request is
+`{"verb":"get-running-output","pane":2,"start_token":27}`.
 
 ## Completed shell commands
 
@@ -841,7 +873,7 @@ place and skips automatic reconnect. Other shells on the same authenticated
 transport can continue.
 
 A live shell's integration start marker adds a `command-started` event to the pane's
-journal. Its data contains `id`, `connection_generation`, and
+journal. Its data contains `id`, `connection_generation`, `start_token`, and
 `started_unix_ms` from the first observed start. Wait for it with
 `events --pane ID --since CURSOR --kind command-started --timeout SECONDS`.
 The journal records starts even when a command starts and finishes in one

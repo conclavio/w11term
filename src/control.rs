@@ -287,6 +287,10 @@ pub enum Request {
     Inspect {
         pane: u64,
     },
+    GetRunningOutput {
+        pane: u64,
+        start_token: std::num::NonZeroU64,
+    },
     Playback {
         pane: u64,
         #[serde(default)]
@@ -1238,6 +1242,21 @@ impl Registry {
                     .await
             }
             Request::ListCommands { pane, status } => self.list_commands(pane, status).await,
+            Request::GetRunningOutput { pane, start_token } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::ReadRunningOutput(start_token.get(), reply))
+                    .context("pane is closed")?;
+                let sample = tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("reading running command output timed out")?
+                    .context("pane closed before reading running command output")?
+                    .map_err(anyhow::Error::msg)?;
+                let mut result = serde_json::to_value(sample)?;
+                result["pane"] = pane.into();
+                Ok(result)
+            }
             Request::GetCommand {
                 pane,
                 id,
@@ -1296,6 +1315,7 @@ impl Registry {
                 if let Some(command) = inspection.running_command {
                     report["running_command"] = json!({
                         "id": command.id,
+                        "start_token": command.start_token,
                         "command": command.command.as_deref(),
                         "reported_directory": command.reported_directory.as_deref(),
                         "started_unix_ms": command.started_unix_ms,

@@ -693,6 +693,8 @@ Choose **Find running commands…** from More or the command palette to see acti
 
 Choose **Show recent command output** or press **F9** to preview up to six terminal rows from the highlighted command, including its current unfinished line. The preview updates about once a second and labels omitted rows. It leaves focus in your current pane and pauses during synchronized updates. Alternate-screen applications can be viewed in their source pane.
 
+Scripts can read the same sample with `w11term-cli get-running-output` using the command's `start_token` from `inspect` or the `command-started` event. [Running command output](CONTROL.md#running-command-output)
+
 Highlight a result and choose **Notify when selected command finishes** to watch it while keeping your current pane. The Attention inbox opens the capture from that notification. Choose **Cancel selected command notification** to disarm it. **F8** toggles the watch for the highlighted result. The watch ends if the selected capture is replaced or its session disconnects.
 
 For an SSH pane, the inspector shows the connection state and the current step and endpoint during login or reconnection. If the connection ends during a failed step, the inspector keeps the step and error visible. Once connected, expand **Verified SSH route** to see the destination and each jump host with its verified SHA256 host-key fingerprint and any configured host-key alias. Each peer shows the initial key exchange, host-key algorithm, cipher, and whether strict key exchange was negotiated. The route disappears when the authenticated connection ends.
