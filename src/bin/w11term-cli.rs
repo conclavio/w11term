@@ -71,6 +71,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "focus-pane"
             | "zoom-pane"
             | "get-tab-layout"
+            | "resize-split"
             | "list-commands"
             | "get-command"
             | "get-running-output"
@@ -369,6 +370,31 @@ mod tests {
             "open --profile desk --window 0",
             "open --profile desk --window 1 --window 2",
             "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn sets_a_percentage_for_two_distinct_panes() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (pid, request) =
+            parse_line("--pid 3 resize-split --pane 42 --target-pane 57 --percent 62.5").unwrap();
+        assert_eq!(pid, Some(3));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"resize-split","pane":42,"target_pane":57,"percent":62.5})
+        );
+        for invalid in [
+            "resize-split --pane 1 --target-pane 2",
+            "resize-split --pane 1 --percent 50",
+            "resize-split --pane 1 --target-pane 1 --percent 50",
+            "resize-split --pane 1 --target-pane 0 --percent 50",
+            "resize-split --pane 1 --target-pane 2 --percent 50 --percent 60",
+            "resize-split --pane 1 --target-pane 2 --percent 0",
+            "resize-split --pane 1 --target-pane 2 --percent 100",
+            "resize-split --pane 1 --target-pane 2 --percent NaN",
+            "resize-split --pane 1 --target-pane 2 --percent inf",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

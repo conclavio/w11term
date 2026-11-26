@@ -101,6 +101,12 @@ The `layout` array starts at index 0. A node of kind `pane` contains a live pane
 
 Direct pipe clients can send `{"verb":"get-tab-layout","pane":42}`.
 
+`resize-split --pane ID --target-pane ID --percent N` sets the divider where the two panes' paths first diverge. The branch containing `--pane` gets `N` percent of that split's usable width or height and the opposite branch gets the rest. Decimal percentages between 0 and 100 are accepted when both branches have room for at least one cell per pane. Child divider weights stay in place.
+
+The two panes must share a measured, unzoomed split in their window's selected tab. The command also works in a background window and keeps desktop focus and pane selection in place. The reply includes both pane IDs, `window_id`, `tab_id`, `axis`, the requested `percent`, the first child's resulting `ratio`, and `changed`. An identical weight returns `changed: false`. The reply confirms the layout edit. Use `list` to read subsequent measured cell sizes.
+
+Direct pipe clients can send `{"verb":"resize-split","pane":42,"target_pane":57,"percent":62.5}`.
+
 ```powershell
 # Literal UTF-8, including a carriage return supplied by PowerShell.
 & $ctl --pid 12345 send-text --pane $pane --no-paste "BOARD`r"

@@ -1002,6 +1002,76 @@ impl TerminalApp {
         })
     }
 
+    pub(super) fn control_resize_split(
+        &mut self,
+        pane: u64,
+        target_pane: u64,
+        percent: f64,
+    ) -> anyhow::Result<serde_json::Value> {
+        let entry = self
+            .tab_for_pane(pane)
+            .with_context(|| format!("unknown pane {pane}"))?;
+        let tab_id = self.tabs.group_id(entry).context("the pane has no tab")?;
+        let other = self
+            .tab_for_pane(target_pane)
+            .filter(|other| self.tabs.group_id(*other) == Some(tab_id))
+            .context("Both panes must belong to the same tab")?;
+        anyhow::ensure!(
+            self.tabs.active_group_id() == Some(tab_id) && !self.tabs.zoomed(),
+            "Select and unzoom the split tab before resizing its divider"
+        );
+        anyhow::ensure!(
+            self.incoming.is_none() && self.outgoing.is_none(),
+            "This window is busy moving a tab or pane"
+        );
+        let layout = self.tabs.active_layout().context("the tab is closed")?;
+        let (path, divider, second_side) = layout
+            .divider_between(entry, other)
+            .context("The two panes do not share a split")?;
+        let Layout::Split {
+            axis,
+            ratio: old_ratio,
+            ..
+        } = divider
+        else {
+            unreachable!()
+        };
+        let axis = *axis;
+        let first_percent = if second_side {
+            100.0 - percent
+        } else {
+            percent
+        };
+        let ratio = first_percent / 100.0;
+        let changed = ratio != *old_ratio;
+        if changed {
+            let scale = self
+                .split_scale()
+                .context("The split is still being measured")?;
+            let fits = layout
+                .split_ratio_fits(&path, ratio, DIVIDER * f64::from(scale), |pane, axis| {
+                    self.measured_extent(pane, axis, scale)
+                })
+                .context("The split is still being measured")?;
+            anyhow::ensure!(
+                fits,
+                "The requested percentage does not leave room for a cell in every pane"
+            );
+            let affected = divider.leaves();
+            anyhow::ensure!(
+                self.tabs.set_ratio(&path, ratio),
+                "The split is no longer available"
+            );
+            self.rotation_hover = None;
+            self.panes_rearranged(affected);
+            self.header.borrow_mut().take();
+        }
+        Ok(serde_json::json!({
+            "pane": pane, "target_pane": target_pane, "window_id": self.registry.window_id(),
+            "tab_id": tab_id, "axis": axis, "percent": percent, "ratio": ratio, "changed": changed,
+        }))
+    }
+
     pub(super) fn keyboard_resize(&mut self, direction: Direction) {
         if self.tabs.zoomed() {
             return;

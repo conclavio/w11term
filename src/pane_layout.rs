@@ -124,6 +124,95 @@ impl Layout {
         Some(node)
     }
 
+    fn leaf_path(&self, pane: u64, path: &mut Vec<bool>) -> bool {
+        match self {
+            Self::Leaf(id) => *id == pane,
+            Self::Split { first, second, .. } => {
+                for (side, child) in [(false, first), (true, second)] {
+                    path.push(side);
+                    if child.leaf_path(pane, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+                false
+            }
+        }
+    }
+
+    fn node_at(&self, path: &[bool]) -> Option<&Self> {
+        let mut node = self;
+        for &second_child in path {
+            let Self::Split { first, second, .. } = node else {
+                return None;
+            };
+            node = if second_child { second } else { first };
+        }
+        Some(node)
+    }
+
+    /// Find the split where the two panes first diverge. The flag reports
+    /// whether the requested pane is on the second side of this divider.
+    pub fn divider_between(&self, pane: u64, other: u64) -> Option<(Vec<bool>, &Self, bool)> {
+        let mut path = Vec::new();
+        let mut other_path = Vec::new();
+        if !self.leaf_path(pane, &mut path) || !self.leaf_path(other, &mut other_path) {
+            return None;
+        }
+        let depth = path.iter().zip(&other_path).position(|(a, b)| a != b)?;
+        let second_side = path[depth];
+        path.truncate(depth);
+        let divider = self.node_at(&path)?;
+        Some((path, divider, second_side))
+    }
+
+    /// Check an exact divider weight against the current outer extent and each
+    /// leaf's minimum. Project the latest ancestor weights in case their
+    /// WinUI measurements have yet to catch up with a preceding resize.
+    pub fn split_ratio_fits(
+        &self,
+        path: &[bool],
+        ratio: f64,
+        divider: f64,
+        mut measure: impl FnMut(u64, Axis) -> Option<(f64, f64)>,
+    ) -> Option<bool> {
+        let Self::Split {
+            axis,
+            first,
+            second,
+            ..
+        } = self.node_at(path)?
+        else {
+            return None;
+        };
+        if !(ratio > 0.0 && ratio < 1.0 && divider.is_finite() && divider >= 0.0) {
+            return Some(false);
+        }
+        let axis = *axis;
+        let (mut span, _) = self.axis_extents(axis, divider, &mut measure)?;
+        let mut node = self;
+        for &second_side in path {
+            let Self::Split {
+                axis: ancestor_axis,
+                ratio,
+                first,
+                second,
+            } = node
+            else {
+                return None;
+            };
+            if *ancestor_axis == axis {
+                let fraction = if second_side { 1.0 - ratio } else { *ratio };
+                span = ((span - divider.ceil()) * fraction).floor();
+            }
+            node = if second_side { second } else { first };
+        }
+        let available = span - divider.ceil();
+        let (_, a) = first.axis_extents(axis, divider, &mut measure)?;
+        let (_, b) = second.axis_extents(axis, divider, &mut measure)?;
+        Some((available * ratio).floor() >= a && (available * (1.0 - ratio)).floor() >= b)
+    }
+
     /// Check the proposed axis of the focused leaf's immediate split. Measurements are
     /// physical pixels: each leaf supplies its current outer extent and its one-cell minimum
     /// on that axis. The existing ratios are applied without adjusting any nested divider.
@@ -153,55 +242,56 @@ impl Layout {
             Axis::Rows => Axis::Columns,
         };
 
-        // Each star-sized child can round down to a whole display pixel. Round its required
-        // parent span up before applying the next ancestor's ratio.
-        fn divided_minimum(a: f64, b: f64, ratio: f64, divider: f64) -> f64 {
-            if ratio > 0.0 && ratio < 1.0 {
-                (a / ratio).max(b / (1.0 - ratio)).ceil() + divider.ceil()
-            } else {
-                f64::INFINITY
-            }
-        }
-        fn extents(
-            node: &Layout,
-            across: Axis,
-            divider: f64,
-            measure: &mut impl FnMut(u64, Axis) -> Option<(f64, f64)>,
-        ) -> Option<(f64, f64)> {
-            match node {
-                Layout::Leaf(id) => {
-                    let (current, minimum) = measure(*id, across)?;
-                    (current.is_finite() && current > 0.0 && minimum.is_finite() && minimum > 0.0)
-                        .then_some((current.floor(), minimum.ceil()))
-                }
-                Layout::Split {
-                    axis,
-                    ratio,
-                    first,
-                    second,
-                } => {
-                    let (a, min_a) = extents(first, across, divider, measure)?;
-                    let (b, min_b) = extents(second, across, divider, measure)?;
-                    Some(if *axis == across {
-                        (
-                            a + divider.floor() + b,
-                            divided_minimum(min_a, min_b, *ratio, divider),
-                        )
-                    } else {
-                        // These extents normally match. Prefer the smaller one if the two
-                        // canvases have reported different stages of a window resize.
-                        (a.min(b), min_a.max(min_b))
-                    })
-                }
-            }
-        }
-        let Some((a, min_a)) = extents(first, across, divider, &mut measure) else {
+        let Some((a, min_a)) = first.axis_extents(across, divider, &mut measure) else {
             return false;
         };
-        let Some((b, min_b)) = extents(second, across, divider, &mut measure) else {
+        let Some((b, min_b)) = second.axis_extents(across, divider, &mut measure) else {
             return false;
         };
-        divided_minimum(min_a, min_b, *ratio, divider) <= a.min(b)
+        Self::divided_minimum(min_a, min_b, *ratio, divider) <= a.min(b)
+    }
+
+    // Each star-sized child can round down to a whole display pixel. Round its required
+    // parent span up before applying the next ancestor's ratio.
+    fn divided_minimum(a: f64, b: f64, ratio: f64, divider: f64) -> f64 {
+        if ratio > 0.0 && ratio < 1.0 {
+            (a / ratio).max(b / (1.0 - ratio)).ceil() + divider.ceil()
+        } else {
+            f64::INFINITY
+        }
+    }
+    fn axis_extents(
+        &self,
+        across: Axis,
+        divider: f64,
+        measure: &mut impl FnMut(u64, Axis) -> Option<(f64, f64)>,
+    ) -> Option<(f64, f64)> {
+        match self {
+            Layout::Leaf(id) => {
+                let (current, minimum) = measure(*id, across)?;
+                (current.is_finite() && current > 0.0 && minimum.is_finite() && minimum > 0.0)
+                    .then_some((current.floor(), minimum.ceil()))
+            }
+            Layout::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (a, min_a) = first.axis_extents(across, divider, measure)?;
+                let (b, min_b) = second.axis_extents(across, divider, measure)?;
+                Some(if *axis == across {
+                    (
+                        a + divider.floor() + b,
+                        Self::divided_minimum(min_a, min_b, *ratio, divider),
+                    )
+                } else {
+                    // These extents normally match. Prefer the smaller one if the two
+                    // canvases have reported different stages of a window resize.
+                    (a.min(b), min_a.max(min_b))
+                })
+            }
+        }
     }
 
     /// Closest divider that changes this leaf's extent on the given axis.
@@ -420,6 +510,70 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pane_pair_resolves_its_lowest_shared_divider_and_side() {
+        let mut layout = Layout::Leaf(1);
+        assert!(layout.split(1, 2, Axis::Columns));
+        assert!(layout.split(2, 3, Axis::Rows));
+        assert!(layout.split(3, 4, Axis::Columns));
+        let (path, divider, second) = layout.divider_between(1, 4).unwrap();
+        assert!(path.is_empty() && !second);
+        assert_eq!(divider, &layout);
+        let (path, divider, second) = layout.divider_between(4, 2).unwrap();
+        assert_eq!(path, [true]);
+        assert!(second);
+        assert!(matches!(
+            divider,
+            Layout::Split {
+                axis: Axis::Rows,
+                ..
+            }
+        ));
+        let (path, _, second) = layout.divider_between(4, 3).unwrap();
+        assert_eq!(path, [true, true]);
+        assert!(second);
+        assert!(layout.divider_between(4, 4).is_none());
+        assert!(layout.divider_between(4, 99).is_none());
+    }
+
+    #[test]
+    fn exact_divider_resize_honors_ancestor_weights_and_nested_cell_minima() {
+        let mut layout = Layout::Leaf(1);
+        assert!(layout.split(1, 2, Axis::Columns));
+        assert!(layout.split(2, 3, Axis::Columns));
+        assert!(layout.split(3, 4, Axis::Rows));
+        let measure = |pane, axis| {
+            Some(match (axis, pane) {
+                (Axis::Columns, 1) => (300.0, 40.0),
+                (Axis::Columns, 2) => (150.0, 80.0),
+                (Axis::Columns, _) => (150.0, 60.0),
+                (Axis::Rows, 1 | 2) => (400.0, 40.0),
+                (Axis::Rows, _) => (197.0, 40.0),
+            })
+        };
+        assert_eq!(layout.split_ratio_fits(&[], 0.8, 6.0, measure), Some(false));
+        assert_eq!(layout.split_ratio_fits(&[], 0.6, 6.0, measure), Some(true));
+        assert_eq!(
+            layout.split_ratio_fits(&[true], 0.75, 6.0, measure),
+            Some(true)
+        );
+        assert!(layout.set_ratio(&[], 0.7));
+        // The old measurements have yet to reflect the new outer weight.
+        assert_eq!(
+            layout.split_ratio_fits(&[true], 0.75, 6.0, measure),
+            Some(false)
+        );
+        assert_eq!(
+            layout.split_ratio_fits(&[true], 0.55, 6.0, measure),
+            Some(true)
+        );
+        assert_eq!(
+            layout.split_ratio_fits(&[true, true], 0.75, 6.0, measure),
+            Some(true)
+        );
+        assert_eq!(layout.split_ratio_fits(&[], 0.5, 6.0, |_, _| None), None);
+    }
 
     #[test]
     fn rotation_size_preserves_an_asymmetric_ratio_and_checks_both_measured_extents() {

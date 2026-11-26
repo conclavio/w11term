@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -697,6 +697,87 @@ function Test-ExplicitControlWindow {
         throw 'An explicit open against a closed window did not return the expected error'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'A closed-window request fell back to the original window' }
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlResizeSplit {
+    Expect-Focus $origin $ssh.id 'SSH is focused before resizing its split' -PrepareWindow
+    $originalRows = ((Control @('list')).sessions | Where-Object id -eq $ssh.id).rows
+    $below = Control @('split-pane','--pane',"$($ssh.id)",'--profile','Destination PowerShell','--axis','rows')
+    $null = Wait-Until 'the new nested split has measured both rows' {
+        $sessions = (Control @('list')).sessions
+        $top = $sessions | Where-Object id -eq $ssh.id
+        $bottom = $sessions | Where-Object id -eq $below.pane
+        $top.rows -lt $originalRows -and $bottom.visible -and [Math]::Abs($bottom.rows - $top.rows) -le 1
+    }
+
+    $columns = @('resize-split','--pane',"$($moved.id)",'--target-pane',"$($ssh.id)",'--percent','40')
+    $resize = Control $columns
+    if (!$resize.changed -or $resize.axis -cne 'columns' -or $resize.percent -ne 40 -or
+        $resize.ratio -ne 0.6 -or $resize.tab_id -ne $ssh.tab_id -or $resize.window_id -ne $ssh.window_id) {
+        throw 'The left and right branches did not receive the intended weights'
+    }
+    if ((Control $columns).changed) { throw 'An identical percentage reported a change' }
+    $rows = @('resize-split','--pane',"$($below.pane)",'--target-pane',"$($ssh.id)",'--percent','62.5')
+    $resize = Control $rows
+    if (!$resize.changed -or $resize.axis -cne 'rows' -or $resize.ratio -ne 0.375) {
+        throw 'The nested row split did not apply its second-side percentage'
+    }
+    $null = Wait-Until 'both native dividers resize their terminal grids' {
+        $sessions = (Control @('list')).sessions
+        $top = $sessions | Where-Object id -eq $ssh.id
+        $bottom = $sessions | Where-Object id -eq $below.pane
+        $right = $sessions | Where-Object id -eq $moved.id
+        $top.cols -gt $right.cols -and $bottom.cols -eq $top.cols -and $bottom.rows -gt $top.rows
+    }
+
+    $failed = & $Cli --pid $app.Id resize-split --pane "$($ssh.id)" --target-pane "$($anchor.id)" --percent 50 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -cne 'Both panes must belong to the same tab') {
+        throw 'The command tried to resize panes in distinct tabs'
+    }
+    $failed = & $Cli --pid $app.Id resize-split --pane "$($ssh.id)" --target-pane "$($below.pane)" --percent 0.01 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*does not leave room for a cell*') {
+        throw 'The command accepted a percentage that leaves a terminal too little room'
+    }
+    $null = Control @('zoom-pane','--pane',"$($ssh.id)",'--on')
+    $failed = & $Cli --pid $app.Id @columns | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*unzoom*') { throw 'The command tried to resize a zoomed split' }
+    $null = Control @('zoom-pane','--pane',"$($ssh.id)",'--off')
+    $null = Control @('focus-pane','--pane',"$($anchor.id)")
+    $failed = & $Cli --pid $app.Id @columns | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*Select and unzoom*') { throw 'The command tried to resize a hidden tab' }
+    $layout = Control @('get-tab-layout','--pane',"$($ssh.id)")
+    if ($layout.layout[0].ratio -ne 0.6 -or $layout.layout[$layout.layout[0].first].ratio -ne 0.375) {
+        throw 'A rejected resize changed a divider'
+    }
+    $null = Control @('focus-pane','--pane',"$($ssh.id)")
+
+    $child = Control @('open','--profile','Destination PowerShell','--new-window')
+    $childHwnd = Wait-DetachedWindow $origin
+    Expect-Text $child.pane 'PS '
+    $childCols = ((Control @('list')).sessions | Where-Object id -eq $child.pane).cols
+    $sibling = Control @('split-pane','--pane',"$($child.pane)",'--profile','Destination PowerShell','--axis','columns')
+    $null = Wait-Until 'sibling window split has measured its columns' {
+        $sessions = (Control @('list')).sessions
+        $left = $sessions | Where-Object id -eq $child.pane
+        $right = $sessions | Where-Object id -eq $sibling.pane
+        $left.cols -lt $childCols -and $right.visible -and [Math]::Abs($right.cols - $left.cols) -le 1
+    }
+    $resize = Control @('resize-split','--pane',"$($child.pane)",'--target-pane',"$($sibling.pane)",'--percent','65')
+    if (!$resize.changed -or $resize.window_id -ne $child.window_id) { throw 'The divider was not resized in the correct window' }
+    $null = Wait-Until 'the background resize updates both PowerShell grids' {
+        $sessions = (Control @('list')).sessions
+        $left = $sessions | Where-Object id -eq $child.pane
+        $right = $sessions | Where-Object id -eq $sibling.pane
+        $left.cols -gt $right.cols -and !$left.active -and !$right.active
+    }
+    Expect-Focus $origin $ssh.id 'Resizing both windows keeps the original keyboard focus'
+    # The full PID and nonce can wrap on the now-narrower PowerShell pane.
+    Send-Line $moved.id ('"same-shell=" + (("$PID/" + $global:WindowNonce) -ceq "' + $localIdentity + '")')
+    Expect-Text $moved.id 'same-shell=True'
+    Type-In $origin 'resized-layout/'
+    Expect-Text $ssh.id 'resized-layout/'
+    Close-FixtureWindow $childHwnd
     Close-FixtureWindow $origin
 }
 
@@ -1711,7 +1792,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -1721,6 +1802,7 @@ try {
             'CliMove' { Test-ControlMove }
             'CliPaneView' { Test-ControlPaneView }
             'CliLayout' { Test-ControlTabLayout }
+            'CliResizeSplit' { Test-ControlResizeSplit }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

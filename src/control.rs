@@ -149,6 +149,11 @@ pub enum Request {
     GetTabLayout {
         pane: u64,
     },
+    ResizeSplit {
+        pane: u64,
+        target_pane: u64,
+        percent: f64,
+    },
     Sftp {
         pane: u64,
         #[serde(default = "sftp_default_timeout")]
@@ -540,6 +545,12 @@ pub enum UiRequest {
         pane: u64,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    ResizeSplit {
+        pane: u64,
+        target_pane: u64,
+        percent: f64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Resize {
         pane: u64,
         cols: usize,
@@ -556,6 +567,7 @@ impl UiRequest {
             | Self::MovePane { reply, .. }
             | Self::SelectPaneView { reply, .. }
             | Self::GetTabLayout { reply, .. }
+            | Self::ResizeSplit { reply, .. }
             | Self::Resize { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             | Self::ListSshGroups { reply }
@@ -598,7 +610,8 @@ impl UiRequest {
             | Self::SplitPane { pane, .. }
             | Self::MovePane { pane, .. }
             | Self::SelectPaneView { pane, .. }
-            | Self::GetTabLayout { pane, .. } => Some(*pane),
+            | Self::GetTabLayout { pane, .. }
+            | Self::ResizeSplit { pane, .. } => Some(*pane),
             Self::CancelSftpTransfer { transfer_id, .. } => Some(transfer_id.pane),
             _ => None,
         }
@@ -612,6 +625,7 @@ impl UiRequest {
             | Self::MovePane { reply, .. }
             | Self::SelectPaneView { reply, .. }
             | Self::GetTabLayout { reply, .. }
+            | Self::ResizeSplit { reply, .. }
             | Self::CancelSftpTransfer { reply, .. }
             if reply.is_closed()
         )
@@ -835,6 +849,32 @@ impl Registry {
                 tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("reading the tab layout timed out")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::ResizeSplit {
+                pane,
+                target_pane,
+                percent,
+            } => {
+                validate_split_percent(percent)?;
+                ensure!(
+                    pane != target_pane,
+                    "choose two different panes in the same tab"
+                );
+                let (reply, response) = oneshot::channel();
+                self.post_pane_request(
+                    pane,
+                    UiRequest::ResizeSplit {
+                        pane,
+                        target_pane,
+                        percent,
+                        reply,
+                    },
+                );
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("split resize timed out; use get-tab-layout to check its divider")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }
@@ -1749,6 +1789,14 @@ async fn save_screenshot(
         Ok(json!({"path": path, "width": width, "height": height}))
     })
     .await?
+}
+
+pub fn validate_split_percent(percent: f64) -> Result<()> {
+    ensure!(
+        percent > 0.0 && percent < 100.0,
+        "split percentage must be greater than 0 and less than 100"
+    );
+    Ok(())
 }
 
 fn validate_grid(cols: usize, rows: usize) -> Result<()> {

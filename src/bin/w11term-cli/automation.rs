@@ -2,11 +2,11 @@ use super::{Invocation, SuccessCheck};
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{
     CommandOutputFile, CommandStatus, Request, SshGroupExpectedOutput, SshGroupQueueAction,
-    SshGroupReportFormat, validate_group_panes, validate_group_submission,
+    SshGroupReportFormat, validate_group_panes, validate_group_submission, validate_split_percent,
 };
 use w11term::pane_layout::{Axis, Direction};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] get-running-output --pane ID --start-token TOKEN\nw11term-cli [--pid PID] interrupt-command --pane ID --start-token TOKEN\nw11term-cli [--pid PID] wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] [--connection-generation N] [--after-frame N] [--screenshot PATH] [--] TEXT\nw11term-cli [--pid PID] wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]\nw11term-cli [--pid PID] wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--kind KIND] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--window ID] [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] open --profile NAME --new-window [--cols N --rows N]\nw11term-cli [--pid PID] close-pane --pane ID\nw11term-cli [--pid PID] split-pane --pane ID --profile NAME --axis columns|rows [--activate]\nw11term-cli [--pid PID] move-pane --pane ID --target-pane ID --direction left|right|up|down [--activate]\nw11term-cli [--pid PID] focus-pane --pane ID\nw11term-cli [--pid PID] zoom-pane --pane ID (--on | --off)\nw11term-cli [--pid PID] get-tab-layout --pane ID\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --after-id ID --connection-generation N [--timeout SECONDS] [--command TEXT] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --start-token TOKEN [--timeout SECONDS] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN\nw11term-cli [--pid PID] stop-ssh-attempt --pane ID --attempt-token TOKEN\nw11term-cli [--pid PID] retry-ssh-now --pane ID --retry-token TOKEN\nw11term-cli [--pid PID] disconnect-ssh-shell --pane ID --connection-generation N";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] get-running-output --pane ID --start-token TOKEN\nw11term-cli [--pid PID] interrupt-command --pane ID --start-token TOKEN\nw11term-cli [--pid PID] wait-running-output --pane ID --start-token TOKEN [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] [--connection-generation N] [--after-frame N] [--screenshot PATH] [--] TEXT\nw11term-cli [--pid PID] wait-ssh-connected --pane ID [--after-generation N] [--timeout SECONDS]\nw11term-cli [--pid PID] wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--kind KIND] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--window ID] [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] open --profile NAME --new-window [--cols N --rows N]\nw11term-cli [--pid PID] close-pane --pane ID\nw11term-cli [--pid PID] split-pane --pane ID --profile NAME --axis columns|rows [--activate]\nw11term-cli [--pid PID] move-pane --pane ID --target-pane ID --direction left|right|up|down [--activate]\nw11term-cli [--pid PID] focus-pane --pane ID\nw11term-cli [--pid PID] zoom-pane --pane ID (--on | --off)\nw11term-cli [--pid PID] get-tab-layout --pane ID\nw11term-cli [--pid PID] resize-split --pane ID --target-pane ID --percent N\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --after-id ID --connection-generation N [--timeout SECONDS] [--command TEXT] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] wait-command --pane ID --start-token TOKEN [--timeout SECONDS] [--require-success] [--output-file PATH [--overwrite]]\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--on-failure stop|continue] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] get-ssh-group-retry-plan --window ID --tab ID --run ID\nw11term-cli [--pid PID] retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN\nw11term-cli [--pid PID] stop-ssh-attempt --pane ID --attempt-token TOKEN\nw11term-cli [--pid PID] retry-ssh-now --pane ID --retry-token TOKEN\nw11term-cli [--pid PID] disconnect-ssh-shell --pane ID --connection-generation N";
 pub(super) fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -68,6 +68,7 @@ pub(super) fn parse(
     let mut target_pane = None;
     let mut direction = None;
     let mut zoom = None;
+    let mut percent = None;
     let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
@@ -95,6 +96,7 @@ pub(super) fn parse(
                             | "focus-pane"
                             | "zoom-pane"
                             | "get-tab-layout"
+                            | "resize-split"
                             | "ssh-group-queue"
                             | "interrupt-ssh-group-command"
                             | "interrupt-command"
@@ -180,7 +182,7 @@ pub(super) fn parse(
                     _ => bail!("--axis requires columns or rows"),
                 });
             }
-            "--target-pane" if verb == "move-pane" => {
+            "--target-pane" if matches!(verb, "move-pane" | "resize-split") => {
                 ensure!(target_pane.is_none(), "specify --target-pane only once");
                 target_pane = Some(value(&mut args)?.parse()?);
             }
@@ -197,6 +199,12 @@ pub(super) fn parse(
             "--on" | "--off" if verb == "zoom-pane" => {
                 ensure!(zoom.is_none(), "specify exactly one of --on or --off");
                 zoom = Some(arg == "--on");
+            }
+            "--percent" if verb == "resize-split" => {
+                ensure!(percent.is_none(), "specify --percent only once");
+                let size = value(&mut args)?.parse()?;
+                validate_split_percent(size)?;
+                percent = Some(size);
             }
             "--name" if matches!(verb, "open-ssh-group" | "open-workspace") => {
                 ensure!(name.is_none(), "specify --name only once");
@@ -570,6 +578,23 @@ pub(super) fn parse(
                 .filter(|id| *id > 0)
                 .context("provide a positive --pane ID")?,
         },
+        "resize-split" => {
+            let pane = pane
+                .filter(|id| *id > 0)
+                .context("provide a positive --pane ID")?;
+            let target_pane = target_pane
+                .filter(|id| *id > 0)
+                .context("provide a positive --target-pane ID")?;
+            ensure!(
+                pane != target_pane,
+                "choose two different panes in the same tab"
+            );
+            Request::ResizeSplit {
+                pane,
+                target_pane,
+                percent: percent.context("--percent is required")?,
+            }
+        }
         "resize" => Request::Resize {
             pane: pane.context("--pane is required")?,
             cols: cols.context("--cols is required")?,

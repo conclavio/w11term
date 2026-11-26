@@ -6886,6 +6886,17 @@ impl Component for TerminalApp {
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
+            Message::Control(w11term::control::UiRequest::ResizeSplit {
+                pane,
+                target_pane,
+                percent,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = self.control_resize_split(pane, target_pane, percent);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::Resize {
                 pane,
                 cols,

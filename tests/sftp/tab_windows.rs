@@ -176,6 +176,12 @@ async fn native_cli_reads_exact_live_tab_layouts() {
     run("CliLayout", b"layout-ssh/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "resizes nested and background splits with live SSH and PowerShell panes, preserving focus"]
+async fn native_cli_resizes_live_split_dividers() {
+    run("CliResizeSplit", b"resized-layout/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
