@@ -140,6 +140,15 @@ fn crypt(data: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>> {
     }
 }
 pub fn load(path: &Path) -> Result<PrivateKey> {
+    let key = read_identity(path)?;
+    ensure!(
+        !key.is_encrypted(),
+        "OpenSSH identity requires a passphrase"
+    );
+    Ok(key)
+}
+
+pub(crate) fn read_identity(path: &Path) -> Result<PrivateKey> {
     let bytes = Zeroizing::new(
         std::fs::read(path).with_context(|| format!("reading identity {}", path.display()))?,
     );
@@ -147,8 +156,17 @@ pub fn load(path: &Path) -> Result<PrivateKey> {
         let plain = crypt(encrypted, false)?;
         Ok(PrivateKey::from_openssh(plain.as_slice())?)
     } else {
-        russh::keys::load_secret_key(path, None)
-            .context("loading OpenSSH identity (use the agent for passphrase-protected keys)")
+        let text = std::str::from_utf8(&bytes).context("the SSH identity is not valid text")?;
+        match russh::keys::decode_secret_key(text, None) {
+            Err(russh::keys::Error::KeyIsEncrypted)
+                if text
+                    .trim_start()
+                    .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") =>
+            {
+                PrivateKey::from_openssh(text.trim()).context("reading encrypted OpenSSH identity")
+            }
+            result => result.context("loading SSH identity"),
+        }
     }
 }
 pub fn generate(profile: &str) -> Result<DeviceKey> {

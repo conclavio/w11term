@@ -1281,6 +1281,38 @@ fn recording_burst(host: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "unlocks an encrypted OpenSSH key with the native masked prompt"]
+async fn native_encrypted_ssh_identity_can_retry_cancel_and_unlock() {
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
+
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    fs::write(
+        remote.path().join("authorized-key"),
+        key.public_key().to_openssh().unwrap(),
+    )
+    .unwrap();
+    let identity = state.path().join("fixture-key.ed25519");
+    let encrypted = key
+        .encrypt(&mut rand::rng(), "ui-fixture-passphrase")
+        .unwrap();
+    fs::write(
+        &identity,
+        encrypted.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    ssh.authentication = Authentication::Identity { identity };
+    ssh.player.reconnect = false;
+
+    drive_mixed_gui("ssh-identity-passphrase-ui.ps1", &ssh, state.path());
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reviews two real SSH prompts from a named native host group"]
 async fn native_ssh_host_group_opens_filtered_authentication_prompts() {
     let state = tempfile::tempdir().unwrap();

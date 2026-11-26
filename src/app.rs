@@ -1598,6 +1598,9 @@ impl TerminalApp {
                     ..challenges.len())
                     .map(|_| zeroize::Zeroizing::new(String::new()))
                     .collect(),
+                Some(w11term::prompts::Question::IdentityPassphrase { .. }) => {
+                    vec![zeroize::Zeroizing::new(String::new())]
+                }
                 _ => Vec::new(),
             };
             tab.prompt_id = prompt_id;
@@ -1711,6 +1714,30 @@ impl TerminalApp {
                     });
                 }
                 (if name.is_empty(){"SSH authentication".into()}else{name.clone()},"Sign in",children)
+            }
+            Question::IdentityPassphrase { identity, retry } => {
+                let instructions = if *retry {
+                    "Could not unlock this key. Try the passphrase again."
+                } else {
+                    "Enter the passphrase to unlock this private key on this device."
+                };
+                let value = tab.answers.first().map_or("", |value| value.as_str());
+                let field = PasswordBox::new()
+                    .password(value)
+                    .automation_name("Key passphrase")
+                    .password_reveal_mode(PasswordRevealMode::Hidden)
+                    .on_password_changed(context.callback(move |value| {
+                        Message::PromptEdit(id, prompt_id, 0, value)
+                    }));
+                (
+                    "Unlock SSH private key".into(),
+                    "Unlock",
+                    vec![
+                        TextBlock::new().text(identity).text_wrapping(TextWrapping::Wrap).into(),
+                        TextBlock::new().text(instructions).text_wrapping(TextWrapping::Wrap).into(),
+                        field.into(),
+                    ],
+                )
             }
         };
         ContentDialog::new()
@@ -6276,9 +6303,18 @@ impl Component for TerminalApp {
                             Some(w11term::prompts::Question::HostKey { .. }) => {
                                 w11term::prompts::Answer::Trust(true)
                             }
-                            _ => w11term::prompts::Answer::Authentication(std::mem::take(
-                                &mut tab.answers,
-                            )),
+                            Some(w11term::prompts::Question::IdentityPassphrase { .. }) => {
+                                tab.answers.pop().map_or(
+                                    w11term::prompts::Answer::Cancel,
+                                    w11term::prompts::Answer::IdentityPassphrase,
+                                )
+                            }
+                            Some(w11term::prompts::Question::Authentication { .. }) => {
+                                w11term::prompts::Answer::Authentication(std::mem::take(
+                                    &mut tab.answers,
+                                ))
+                            }
+                            None => w11term::prompts::Answer::Cancel,
                         }
                     } else {
                         w11term::prompts::Answer::Cancel

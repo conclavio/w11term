@@ -12,9 +12,10 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use russh::{
     client,
-    keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
+    keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate, ssh_key::Kdf},
 };
 use std::{
+    path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -74,6 +75,29 @@ fn ceil_seconds(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn headless_encrypted_identity_reports_the_unlock_requirement() {
+        use russh::keys::{Algorithm, ssh_key::LineEnding};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .unwrap()
+            .encrypt(&mut rand::rng(), "fixture passphrase")
+            .unwrap();
+        std::fs::write(
+            file.path(),
+            key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let error = identity_key(file.path(), None).await.unwrap_err();
+        assert!(error.is::<Permanent>());
+        assert!(
+            error
+                .to_string()
+                .contains("requires the GUI or an unlocked SSH agent")
+        );
+    }
 
     #[tokio::test]
     async fn an_expired_reconnect_deadline_leaves_a_ready_shell_running() {
@@ -293,6 +317,57 @@ impl client::Handler for Handler {
         Ok(true)
     }
 }
+async fn identity_key(identity: &Path, prompts: Option<&Prompts>) -> Result<PrivateKey> {
+    let key = crate::keys::read_identity(identity).map_err(|error| {
+        stop(format!(
+            "loading identity {}: {error:#}",
+            identity.display()
+        ))
+    })?;
+    if !key.is_encrypted() {
+        return Ok(key);
+    }
+    // Each pane owns its runtime and joins its worker on close. Keep local
+    // decryption work bounded, including when a key file's KDF is malformed.
+    ensure!(
+        matches!(
+            key.kdf(),
+            Kdf::Bcrypt {
+                rounds: 1..=1024,
+                ..
+            }
+        ),
+        Permanent("OpenSSH key must use 1 to 1024 bcrypt rounds for local unlock".into())
+    );
+    let prompts = prompts.ok_or_else(|| {
+        stop("encrypted OpenSSH identity requires the GUI or an unlocked SSH agent")
+    })?;
+    let key = Arc::new(key);
+    for attempt in 0..3 {
+        let answer = prompts
+            .ask(Question::IdentityPassphrase {
+                identity: identity.to_string_lossy().into_owned(),
+                retry: attempt > 0,
+            })
+            .await
+            .map_err(|error| stop(error.to_string()))?;
+        let Answer::IdentityPassphrase(passphrase) = answer else {
+            return Err(stop("SSH identity unlock cancelled"));
+        };
+        let encrypted = key.clone();
+        let decrypted =
+            tokio::task::spawn_blocking(move || encrypted.decrypt(passphrase.as_bytes()))
+                .await
+                .map_err(|_| stop("SSH identity unlock worker failed"))?;
+        if let Ok(key) = decrypted {
+            return Ok(key);
+        }
+    }
+    Err(stop(
+        "could not unlock the OpenSSH private key after three attempts",
+    ))
+}
+
 pub(super) async fn authenticate(
     session: &mut client::Handle<Handler>,
     options: &SshOptions,
@@ -306,8 +381,7 @@ pub(super) async fn authenticate(
         ),
         Authentication::Identity { identity } => {
             let hash = session.best_supported_rsa_hash().await?.flatten();
-            let key = crate::keys::load(identity)
-                .map_err(|e| stop(format!("loading identity {}: {e:#}", identity.display())))?;
+            let key = identity_key(identity, prompts).await?;
             ensure!(
                 session
                     .authenticate_publickey(

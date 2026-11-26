@@ -1054,7 +1054,7 @@ impl TerminalApp {
                 let state = if let Some(prompt) = live.session.prompts.current() {
                     match prompt.question {
                         Question::HostKey { .. } => TargetState::HostKey(prompt.id),
-                        Question::Authentication { .. } => {
+                        Question::Authentication { .. } | Question::IdentityPassphrase { .. } => {
                             TargetState::Authentication(Some(prompt.id))
                         }
                     }

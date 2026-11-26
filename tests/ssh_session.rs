@@ -10,6 +10,7 @@ use w11term::{
     clipboard::RemoteClipboardPolicy,
     control::{self, Pane, Registry, Request},
     options::{Authentication, Source, SshOptions},
+    prompts::{Answer, Question},
     session::{Command, Session},
 };
 use wezterm_term::{KeyCode, KeyModifiers, TerminalSize};
@@ -174,27 +175,48 @@ impl server::Handler for Peer {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_pty_roundtrip_queries_input_and_resize() {
-    roundtrip(false, None, RemoteClipboardPolicy::AnyPane).await;
+    roundtrip(false, None, RemoteClipboardPolicy::AnyPane, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyless_ssh_roundtrip_without_an_agent() {
-    roundtrip(true, Some("xterm-sixel"), RemoteClipboardPolicy::Disabled).await;
+    roundtrip(
+        true,
+        Some("xterm-sixel"),
+        RemoteClipboardPolicy::Disabled,
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_openssh_key_retries_locally_and_authenticates_the_ssh_shell() {
+    roundtrip(
+        false,
+        None,
+        RemoteClipboardPolicy::Disabled,
+        Some("fixture-only key passphrase"),
+    )
+    .await;
 }
 
 async fn roundtrip(
     allow_none: bool,
     terminal_type: Option<&str>,
     clipboard_policy: RemoteClipboardPolicy,
+    passphrase: Option<&str>,
 ) {
     tokio::time::timeout(Duration::from_secs(10), async {
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let key_file = tempfile::NamedTempFile::new().unwrap();
+        let key = passphrase.map_or_else(
+            || identity.clone(),
+            |passphrase| identity.encrypt(&mut rand::rng(), passphrase).unwrap(),
+        );
         std::fs::write(
             key_file.path(),
-            identity
-                .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
                 .unwrap()
                 .as_bytes(),
         )
@@ -262,6 +284,28 @@ async fn roundtrip(
             initial_size,
             clipboard_policy,
         );
+        if let Some(passphrase) = passphrase {
+            for (retry, value) in [(false, "wrong passphrase"), (true, passphrase)] {
+                let question = loop {
+                    if let Some(prompt) = session.prompts.current()
+                        && matches!(
+                            prompt.question,
+                            Question::IdentityPassphrase { retry: actual, .. } if actual == retry
+                        )
+                    {
+                        break prompt;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(session.frames.load().connection_generation, 0);
+                assert!(observed.try_recv().is_err());
+                assert!(!serde_json::to_string(&question).unwrap().contains(passphrase));
+                session
+                    .prompts
+                    .answer(question.id, Answer::IdentityPassphrase(value.to_owned().into()))
+                    .unwrap();
+            }
+        }
         assert_eq!(
             next(&mut observed, &session).await,
             Observed::Pty(
