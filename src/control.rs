@@ -88,6 +88,8 @@ pub enum Request {
         pattern: String,
         #[serde(default)]
         regex: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_generation: Option<std::num::NonZeroU64>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
@@ -724,6 +726,7 @@ impl Registry {
                 pattern,
                 regex,
                 timeout_seconds,
+                connection_generation,
             } => {
                 ensure!(
                     (1..=3600).contains(&timeout_seconds),
@@ -742,6 +745,12 @@ impl Registry {
                     None
                 };
                 let target = self.pane(pane)?;
+                let expected = connection_generation.map(std::num::NonZeroU64::get);
+                let scope = if let Some(generation) = expected {
+                    Some((generation, Self::pane_events(&target).await?))
+                } else {
+                    None
+                };
                 let (reply, response) = oneshot::channel();
                 target
                     .input
@@ -749,28 +758,57 @@ impl Registry {
                     .context("pane is closed")?;
                 let frames = tokio::time::timeout(TIMEOUT, response).await??;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
-                loop {
-                    let frame = frames.load();
-                    let generation = frame.generation;
-                    let text = frame
-                        .rows
-                        .iter()
-                        .map(|line| line.as_str().trim_end_matches(' ').to_owned())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if matcher
-                        .as_ref()
-                        .map_or_else(|| text.contains(&pattern), |r| r.is_match(&text))
-                    {
-                        return Ok(
-                            json!({"pane":pane,"matched":true,"generation":frame.generation,"cols":frame.cols,"rows":frame.rows.len(),"text":text}),
+                let wait = async {
+                    loop {
+                        let frame = frames.load();
+                        if expected
+                            .is_none_or(|generation| frame.connection_generation == generation)
+                        {
+                            let text = frame
+                                .rows
+                                .iter()
+                                .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if matcher
+                                .as_ref()
+                                .map_or_else(|| text.contains(&pattern), |r| r.is_match(&text))
+                            {
+                                return Ok((frame, text));
+                            }
+                        }
+                        ensure!(
+                            frames.changed(frame.generation, deadline).await,
+                            "wait-for-text timed out without a match"
                         );
                     }
-                    ensure!(
-                        frames.changed(generation, deadline).await,
-                        "wait-for-text timed out without a match"
-                    );
+                };
+                const STALE: &str =
+                    "The pane connection changed or is no longer active; no match was accepted";
+                let (frame, text) = if let Some((generation, events)) = scope {
+                    let result = tokio::select! {
+                        biased;
+                        _ = events.terminal_connection_changed(generation) => anyhow::bail!(STALE),
+                        _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                        result = wait => result?,
+                    };
+                    ensure!(events.terminal_connection_is(generation), STALE);
+                    result
+                } else {
+                    wait.await?
+                };
+                let mut result = json!({
+                    "pane": pane,
+                    "matched": true,
+                    "generation": frame.generation,
+                    "cols": frame.cols,
+                    "rows": frame.rows.len(),
+                    "text": text,
+                });
+                if let Some(generation) = expected {
+                    result["connection_generation"] = generation.into();
                 }
+                Ok(result)
             }
             Request::Sftp {
                 pane,

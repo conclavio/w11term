@@ -160,7 +160,14 @@ try {
     if ($written.pane -ne $local -or $written.connection_generation -ne $current -or $written.bytes_written -ne $wire.Length) {
         throw 'Scoped PowerShell write did not acknowledge the replacement process'
     }
-    Wait-Text $local 'new-shell-True'
+    $match = Control @('wait-for-text','--pane',"$local",'--connection-generation',"$current",'--timeout','15','new-shell-True')
+    if ($match.pane -ne $local -or $match.connection_generation -ne $current -or !$match.matched) {
+        throw 'The screen match did not report the replacement PowerShell generation'
+    }
+    $staleWait = & $Cli --pid $app.Id wait-for-text --pane $local --connection-generation $originalPs.connection_generation --timeout 3 'new-shell-True' | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $staleWait.ok -or $staleWait.error -notmatch 'connection changed|no longer active') {
+        throw 'The previous PowerShell generation could match the replacement screen'
+    }
     if ((Control @('get-text','--pane',"$local")).text.Contains('stale-scope')) {
         throw 'A stale write reached the replacement PowerShell process'
     }

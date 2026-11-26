@@ -183,6 +183,7 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
                 pane: 1,
                 pattern: "new picture".into(),
                 regex: false,
+                connection_generation: None,
                 timeout_seconds: 1,
             },
             screenshot,

@@ -116,6 +116,7 @@ async fn scrollback_regex_is_case_configurable_and_reports_incomplete_results() 
                 pane: 1,
                 pattern: "search-ready".into(),
                 regex: false,
+                connection_generation: None,
                 timeout_seconds: 5,
             },
             capture.clone(),
@@ -169,6 +170,7 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
                 pane: 1,
                 pattern: pattern.into(),
                 regex,
+                connection_generation: None,
                 timeout_seconds: 1,
             },
             capture.clone(),
@@ -243,6 +245,7 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
                     pane: 1,
                     pattern: "capacity-marker".into(),
                     regex: false,
+                    connection_generation: None,
                     timeout_seconds: 10,
                 },
             )

@@ -148,7 +148,7 @@ struct State {
     next_prompt: u64,
     notify_long_commands: bool,
     ssh_connection_phase: Option<SshConnectionPhase>,
-    ssh_connection_generation: u64,
+    connected_generation: Option<u64>,
     pane_process: PaneProcessState,
     ssh_attempts: ssh_attempt::Attempts,
     restart_token: Option<u64>,
@@ -356,11 +356,14 @@ impl Events {
         }
     }
 
-    pub(crate) fn set_ssh_connected(&self, generation: u64) {
+    pub(crate) fn terminal_connected(&self, generation: u64, ssh: bool) {
         let mut state = self.state.lock().unwrap();
-        let generation_changed = state.ssh_connection_generation != generation;
-        state.ssh_connection_generation = generation;
-        let phase_changed = Self::record_ssh_phase(&mut state, SshConnectionPhase::Connected);
+        if state.restart_closed {
+            return;
+        }
+        let generation_changed = state.connected_generation.replace(generation) != Some(generation);
+        let phase_changed =
+            ssh && Self::record_ssh_phase(&mut state, SshConnectionPhase::Connected);
         drop(state);
         if generation_changed || phase_changed {
             self.changed.notify_waiters();
@@ -368,8 +371,10 @@ impl Events {
     }
 
     fn record_ssh_phase(state: &mut State, phase: SshConnectionPhase) -> bool {
+        let invalidated =
+            phase != SshConnectionPhase::Connected && state.connected_generation.take().is_some();
         if state.ssh_connection_phase.as_ref() == Some(&phase) {
-            return false;
+            return invalidated;
         }
         let data = phase.as_json();
         state.ssh_connection_phase = Some(phase);
@@ -428,6 +433,22 @@ impl Events {
         self.state.lock().unwrap().pane_process = PaneProcessState::Running;
     }
 
+    pub(crate) fn terminal_connection_is(&self, expected: u64) -> bool {
+        self.state.lock().unwrap().connected_generation == Some(expected)
+    }
+
+    pub(crate) async fn terminal_connection_changed(&self, expected: u64) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.terminal_connection_is(expected) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(crate) fn pane_exited(
         &self,
         token: u64,
@@ -439,6 +460,7 @@ impl Events {
             return;
         }
         state.pane_process = PaneProcessState::Exited(token);
+        state.connected_generation = None;
         state.restart_token = restartable.then_some(token);
         if let Some(phase) = ssh_phase {
             Self::record_ssh_phase(&mut state, phase);
@@ -510,6 +532,7 @@ impl Events {
             return false;
         }
         let closed = !std::mem::replace(&mut state.restart_closed, true);
+        state.connected_generation = None;
         let changed = state.ssh_connection_phase.is_some()
             && Self::record_ssh_phase(&mut state, SshConnectionPhase::Disconnected);
         if state.restart_token.take().is_some()
@@ -1307,7 +1330,7 @@ mod tests {
                 ..Default::default()
             }
         );
-        events.set_ssh_connected(1);
+        events.terminal_connected(1, true);
         events.set_ssh_connection_phase(Disconnected);
         events.pane_exited(8, Some(Failed("fixture failure".into())), true);
         let changes: Vec<_> = events
@@ -1332,13 +1355,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn terminal_connection_watch_wakes_on_ssh_loss_and_local_exit() {
+        use tokio::time::{sleep, timeout};
+
+        for ssh in [false, true] {
+            let events = Events::default();
+            events.track_pane_process();
+            events.terminal_connected(1, ssh);
+            let ended = async {
+                sleep(Duration::from_secs(1)).await;
+                assert!(events.terminal_connection_is(1));
+                if ssh {
+                    events.set_ssh_connection_phase(SshConnectionPhase::Disconnected);
+                } else {
+                    events.pane_exited(1, None, true);
+                }
+            };
+            let (disconnected, ()) = tokio::join!(
+                timeout(
+                    Duration::from_secs(2),
+                    events.terminal_connection_changed(1)
+                ),
+                ended
+            );
+            disconnected.unwrap();
+            assert!(!events.terminal_connection_is(1));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pane_exit_wait_returns_the_current_exit_and_follows_the_next_run() {
         use SshConnectionPhase::*;
         use tokio::time::{Instant, sleep};
 
         let events = Events::default();
         events.track_pane_process();
-        events.set_ssh_connected(1);
+        events.terminal_connected(1, true);
         let deadline = Instant::now() + Duration::from_secs(10);
         let first_exit = async {
             sleep(Duration::from_secs(1)).await;
@@ -1363,7 +1415,7 @@ mod tests {
             sleep(Duration::from_secs(1)).await;
             events.restart_exited(&commands, 1).unwrap();
             assert!(events.restart_token().is_none());
-            events.set_ssh_connected(3);
+            events.terminal_connected(3, true);
             sleep(Duration::from_secs(1)).await;
             events.pane_exited(2, Some(Disconnected), true);
         };

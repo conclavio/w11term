@@ -181,7 +181,7 @@ impl Events {
             {
                 let state = self.state.lock().unwrap();
                 anyhow::ensure!(!state.restart_closed, "pane is closed");
-                let generation = state.ssh_connection_generation;
+                let generation = state.connected_generation.unwrap_or_default();
                 match state.ssh_connection_phase.as_ref() {
                     None => anyhow::bail!("pane does not use SSH"),
                     Some(Connected) if generation > after_generation => return Ok(generation),
@@ -503,7 +503,7 @@ mod tests {
         use std::time::Duration;
 
         let events = Events::default();
-        events.set_ssh_connected(1);
+        events.terminal_connected(1, true);
         let deadline = Instant::now() + Duration::from_secs(10);
         assert_eq!(events.wait_ssh_connected(0, deadline).await.unwrap(), 1);
         let reconnect = async {
@@ -512,7 +512,7 @@ mod tests {
                 events.set_ssh_connection_phase(phase);
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
-            events.set_ssh_connected(2);
+            events.terminal_connected(2, true);
         };
         let (result, ()) = tokio::join!(events.wait_ssh_connected(1, deadline), reconnect);
         assert_eq!(result.unwrap(), 2);

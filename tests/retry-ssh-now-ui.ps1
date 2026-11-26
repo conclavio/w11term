@@ -56,11 +56,20 @@ try {
     if ($LASTEXITCODE -ne 1 -or $wrongPane.ok -or $wrongPane.error -notmatch 'does not use SSH') {
         throw 'A PowerShell pane passed the SSH connection wait'
     }
+    $marker = 'scoped-after-retry/'
+    $oldWaitLog = Join-Path $State 'old-screen-wait.json'
+    $oldScreenWaiter = Start-Process -FilePath $Cli -ArgumentList @('--pid',"$($app.Id)",'wait-for-text','--pane',"$remote",'--connection-generation',"$generation",'--timeout','30',$marker) -WindowStyle Hidden -PassThru -RedirectStandardOutput $oldWaitLog
+    $null = $oldScreenWaiter.Handle
     [IO.File]::WriteAllText($drop,'')
     [IO.File]::Delete($initial)
 
     # Let the short initial waits run normally. The retry controls need time for cross-process UI automation.
     $background = Wait-Retry 3
+    if (!$oldScreenWaiter.WaitForExit(2000)) { throw 'The scoped text wait survived the loss of its SSH generation' }
+    $oldScreen = Get-Content -LiteralPath $oldWaitLog -Raw | ConvertFrom-Json
+    if ($oldScreenWaiter.ExitCode -ne 1 -or $oldScreen.ok -or $oldScreen.error -notmatch 'connection changed|no longer active') {
+        throw "Unexpected result for the disconnected text wait: $($oldScreen | ConvertTo-Json -Compress)"
+    }
     $inspection = Control @('inspect','--pane',"$remote")
     if ($inspection.ssh_connection.phase -cne 'reconnecting' -or
         $inspection.ssh_connection.attempt -ne 3 -or $inspection.ssh_progress -or $inspection.ssh) {
@@ -107,12 +116,14 @@ try {
         throw 'The previous SSH generation could still send input'
     }
     $current = $connected.result.connection_generation
-    $marker = 'scoped-after-retry/'
     $written = Control @('send-text','--pane',"$remote",'--no-paste','--connection-generation',"$current",$marker)
     if ($written.pane -ne $remote -or $written.connection_generation -ne $current -or $written.bytes_written -ne $marker.Length) {
         throw 'Scoped SSH write did not acknowledge the replacement generation'
     }
-    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15',$marker)
+    $match = Control @('wait-for-text','--pane',"$remote",'--connection-generation',"$current",'--timeout','15',$marker)
+    if ($match.pane -ne $remote -or $match.connection_generation -ne $current -or !$match.matched) {
+        throw 'The screen match did not report the replacement SSH generation'
+    }
     Reject-Retry $palette.ssh_retry_token
     Wait-RetryAccepted $background.ssh_retry_token
     $output = Join-Path $State 'ssh-history.txt'
@@ -125,6 +136,10 @@ try {
 } catch {
     throw "$_ at $($_.ScriptStackTrace)"
 } finally {
+    if ($oldScreenWaiter) {
+        if (!$oldScreenWaiter.HasExited) { $oldScreenWaiter.Kill(); $null = $oldScreenWaiter.WaitForExit(5000) }
+        $oldScreenWaiter.Dispose()
+    }
     if ($waiter) {
         if (!$waiter.HasExited) { $waiter.Kill(); $waiter.WaitForExit() }
         $waiter.Dispose()

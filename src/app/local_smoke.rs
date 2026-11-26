@@ -19,6 +19,7 @@ async fn raw(pane: u64, bytes: &[u8]) -> Result<()> {
 async fn seen(pane: u64, marker: &str) -> Result<()> {
     split_control(Request::WaitForText {
         pane,
+        connection_generation: None,
         pattern: marker.into(),
         regex: false,
         timeout_seconds: 15,

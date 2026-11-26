@@ -1839,9 +1839,7 @@ async fn run(
                             phase = Phase::Running;
                             events.command_stream(live_commands.then_some(generation));
                             events.notification_stream(interactive.then_some(generation));
-                            if is_ssh {
-                                events.set_ssh_connected(generation);
-                            }
+                            events.terminal_connected(generation, is_ssh);
                         }
                     }
                 }

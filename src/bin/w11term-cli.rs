@@ -1056,6 +1056,32 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_text_accepts_an_optional_positive_connection_generation() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        let (_, request) =
+            parse_line("wait-for-text --pane 7 --connection-generation 4 --regex ready").unwrap();
+        assert!(matches!(
+            request,
+            Request::WaitForText { pane: 7, connection_generation: Some(generation), regex: true, .. }
+                if generation.get() == 4
+        ));
+        let (_, unscoped) = parse_line("wait-for-text --pane 7 ready").unwrap();
+        assert!(
+            serde_json::to_value(unscoped)
+                .unwrap()
+                .get("connection_generation")
+                .is_none()
+        );
+        for line in [
+            "wait-for-text --pane 7 --connection-generation 0 ready",
+            "wait-for-text --pane 7 --connection-generation 1 --connection-generation 2 ready",
+            "find-text --pane 7 --connection-generation 4 ready",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
     fn raw_bytes_and_required_options() {
         let p = |a: &[&str]| parse(a.iter().map(|s| s.to_string()));
         let (

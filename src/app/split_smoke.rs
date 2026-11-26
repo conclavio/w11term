@@ -239,6 +239,7 @@ async fn check_split_control(
             .await?;
             split_control(Request::WaitForText {
                 pane,
+                connection_generation: None,
                 pattern: marker.into(),
                 regex: false,
                 timeout_seconds: 5,

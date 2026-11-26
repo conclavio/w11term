@@ -611,6 +611,17 @@ Success returns `pane`, `matched`, `generation`, `cols`, `rows`, and matching sc
 `text`. It observes screen state, not every transient byte that may have appeared
 between snapshots.
 
+Pass `--connection-generation N` to match frames from a particular live SSH
+session or local process. Use the generation from `list` or
+`wait-ssh-connected` with the same process and pane ID. A scoped wait fails as
+soon as that connection ends or changes. On success, the reply includes
+`connection_generation` as well as the frame's `generation`. Use the regular
+unscoped wait to observe a pane across reconnects or to read its final screen.
+
+```powershell
+& $ctl --pid 12345 wait-for-text --pane $pane --connection-generation 2 --regex 'fps=\d+'
+```
+
 `resize` accepts the launch grid ranges. In a visible split it adjusts available dividers to reach the requested cell grid. Unzoom the focused pane before resizing it. A dimension fixed by the tab bounds, or a grid that leaves too little space for a sibling, produces a geometry error. The command keeps keyboard focus on its current pane.
 
 For a single pane it resizes an active pane's window or a
@@ -753,6 +764,7 @@ if ($exitReply.ok -and $null -ne $exitReply.result.restart_token) {
 
 ```json
 {"verb":"wait-for-text","pane":1,"pattern":"fps=\\d+","regex":true,"timeout_seconds":15}
+{"verb":"wait-for-text","pane":1,"connection_generation":2,"pattern":"ready","timeout_seconds":15}
 {"verb":"resize","pane":1,"cols":170,"rows":48}
 {"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
 {"verb":"events","pane":1,"since":42,"timeout_seconds":30}
