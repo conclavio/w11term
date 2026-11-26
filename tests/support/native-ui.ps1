@@ -240,6 +240,11 @@ function Get-RunAction([string]$Name) {
 }
 function Invoke-RunAction([string]$Name) {
     Invoke-Button (Get-RunAction $Name)
+    $menu = [System.Windows.Automation.ControlType]::MenuItem
+    $alwaysPresent = 'Compare results' + [char]0x2026
+    $null = Wait-Until "the run actions flyout closes after '$Name'" {
+        !(Find-Element $alwaysPresent $menu -Visible)
+    }
 }
 function Close-NativeMenu([string]$ItemName) {
     $null = Press-FocusedKey 27

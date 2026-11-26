@@ -38,7 +38,10 @@ function Tail-Scroll {
     }
 }
 function Count-Reads {
-    ([regex]::Matches([IO.File]::ReadAllText($trace), '(?m)^OPEN /shell directory/engine[.]log')).Count
+    ([regex]::Matches((Read-TransferTrace), '(?m)^OPEN /shell directory/engine[.]log')).Count
+}
+function Read-TransferTrace {
+    $utf8.GetString((Read-PeerTrace $traceReader))
 }
 function Assert-NoNewReads {
     $before = Count-Reads
@@ -51,6 +54,7 @@ function Assert-NoNewReads {
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
+    $traceReader = Open-PeerTraceReader $trace
     $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $pane = (Control @('list')).sessions[0]
@@ -84,14 +88,14 @@ try {
 
     [IO.File]::WriteAllBytes($gate, [byte[]]@())
     $null = Wait-Until 'read in flight on the loopback SFTP channel' {
-        [IO.File]::ReadAllText($trace).TrimEnd() -match 'READ [1-9][0-9]*$'
+        (Read-TransferTrace).TrimEnd() -match 'READ [1-9][0-9]*$'
     }
     [IO.File]::AppendAllText($log, "held line$([char]10)", $utf8)
     Click 'Pause follow'
     $null = Wait-Until 'following is paused' { Find-Element 'Follow tail' $button }
     [IO.File]::Delete($gate)
     $null = Wait-Until 'cancelled read closed its SFTP handle' {
-        [IO.File]::ReadAllText($trace).TrimEnd().EndsWith('CLOSE')
+        (Read-TransferTrace).TrimEnd().EndsWith('CLOSE')
     }
     Assert-NoNewReads
     Wait-Tail 'live line'
@@ -112,10 +116,11 @@ try {
     Click 'Close tail'
     $null = Wait-Until 'tail dialog closed' { !(Find-Element 'Close tail' $button) }
     Assert-NoNewReads
-    if ([IO.File]::ReadAllText($trace).Contains('WRITE')) { throw 'Tail sent an SFTP write' }
+    if ((Read-TransferTrace).Contains('WRITE')) { throw 'Tail sent an SFTP write' }
 } catch {
     throw "$($_.Exception.Message)$([char]10)$($_.ScriptStackTrace)"
 } finally {
+    if ($traceReader) { $traceReader.Dispose() }
     [IO.File]::Delete($gate)
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

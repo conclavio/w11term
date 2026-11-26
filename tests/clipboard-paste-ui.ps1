@@ -79,6 +79,10 @@ function Fence([string]$Text) {
     $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64',[Convert]::ToBase64String($utf8.GetBytes($Text)))
     Expect-Bytes $Text
 }
+function Terminal-Marker([string]$Text) {
+    foreach ($char in $Text.ToCharArray()) { Post-Key 0x102 ([uint32]$char) }
+    Expect-Bytes $Text
+}
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" { $b = Find-Element $Name $button; if ($b -and $b.Current.IsEnabled) { $b } })
 }
@@ -92,11 +96,10 @@ function Start-Paste([string]$Route) {
     }
     $raw = $Route -in 'Raw','CtrlAltV'
     $name = if ($raw) { 'Paste raw (no bracketed paste)' } else { 'Paste' }
-    Click 'Tab menu'
-    Invoke-Button (Wait-Until "caret action '$name'" {
-        $item = Find-Element $name ([System.Windows.Automation.ControlType]::MenuItem)
-        if ($item -and $item.Current.IsEnabled) { $item }
-    })
+    Invoke-NativeMenuAction 'Tab menu' $name
+    $null = Wait-Until 'the paste flyout closes' {
+        !(Find-Element 'Settings' ([System.Windows.Automation.ControlType]::MenuItem) -Visible)
+    }
 }
 function Wait-Prompt([string]$Primary, [string]$Reason) {
     $notice = switch ($Reason) {
@@ -113,6 +116,19 @@ function Wait-Prompt([string]$Primary, [string]$Reason) {
 function Wait-NoPrompt {
     $null = Wait-Until 'paste confirmation dismissed' { !(Find-Element 'Confirm paste') }
 }
+function Wait-TerminalInput {
+    Wait-NoPrompt
+    # The dialog can disappear from UI Automation before WinUI delivers Closed
+    # and restores the terminal key handler. Probe it with a local shortcut.
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    $null = Wait-Until 'terminal shortcuts restored after paste confirmation' {
+        if (Find-Element 'Search commands' $edit) { return $true }
+        Press-Key 0x76
+    }
+    $null = Wait-PickerEditor 'Search commands' 'terminal input probe'
+    Press-Key 27
+    $null = Wait-Until 'terminal input probe closed' { !(Find-Element 'Search commands' $edit) }
+}
 function Finish-ObsoletePrompt($OldButton) {
     if (Find-Element 'Confirm paste') {
         try { if ($OldButton.Current.IsEnabled) { Invoke-Button $OldButton } }
@@ -125,6 +141,12 @@ function Choose-Setting([string]$Name) {
         Find-Element $Name ([System.Windows.Automation.ControlType]::RadioButton)
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+}
+function Read-InteractionSettings {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($env:W11TERM_SETTINGS_PATH, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $reader = [IO.StreamReader]::new($stream)
+    try { ($reader.ReadToEnd() | ConvertFrom-Json).interaction } finally { $reader.Dispose() }
 }
 function Back-ToSsh {
     $tab = Wait-Until 'SSH terminal tab' { Find-Element 'palette-ssh' ([System.Windows.Automation.ControlType]::TabItem) }
@@ -147,8 +169,8 @@ try {
     Start-Paste 'CtrlV'
     Wait-Prompt 'Paste' 'multiple lines'
     Click 'Cancel'
-    Wait-NoPrompt
-    Fence 'after-cancel/'
+    Wait-TerminalInput
+    Terminal-Marker 'after-cancel/'
     Start-Paste 'CtrlV'
     Wait-Prompt 'Paste' 'multiple lines'
     Set-FixtureClipboard 'discard-replacement'
@@ -181,20 +203,20 @@ try {
     Start-Paste 'Raw'
     Wait-Prompt 'Paste raw' '5,120'
     Click 'Cancel'
-    Wait-NoPrompt
-    Fence 'after-large/'
+    Wait-TerminalInput
+    Terminal-Marker 'after-large/'
 
     Run-Palette 'Settings'
     Choose-Setting 'Always'
     $null = Wait-Until 'saved Always multiline preference' {
-        (Get-Content $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).interaction.multiLinePasteWarning -ceq 'always'
+        (Read-InteractionSettings).multiLinePasteWarning -ceq 'always'
     }
     Back-ToSsh
     Set-FixtureClipboard $wrapped
     Start-Paste 'Normal'
     Wait-Prompt 'Paste' 'multiple lines'
     Click 'Cancel'
-    Wait-NoPrompt
+    Wait-TerminalInput
 
     # A reconnect may close the dialog immediately or invalidate its ticket
     # on acceptance. Either path must leave the new transport untouched.
@@ -227,9 +249,12 @@ try {
     $condition = [System.Windows.Automation.AndCondition]::new($byName,$canToggle)
     $toggle = Wait-Until 'large paste warning switch' { $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$condition) }
     $toggle.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+    $null = Wait-Until 'saved large paste warning is off' {
+        (Read-InteractionSettings).largePasteWarning -eq $false
+    }
     Choose-Setting 'Never'
     $null = Wait-Until 'both warning preferences saved' {
-        $settings = (Get-Content $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json).interaction
+        $settings = Read-InteractionSettings
         $settings.multiLinePasteWarning -ceq 'never' -and $settings.largePasteWarning -eq $false
     }
     Back-ToSsh

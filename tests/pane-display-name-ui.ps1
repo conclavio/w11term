@@ -27,8 +27,9 @@ function Menu-Route([string[]]$Path) {
     Click 'Tab menu'
     $menu = [System.Windows.Automation.ControlType]::MenuItem
     foreach ($name in $Path) {
-        $item = Wait-Until "visible and enabled menu item '$name'" {
-            $entry = Find-Element $name $menu -Visible
+        $item = Wait-Until "enabled menu item '$name'" {
+            # Long native submenus expose invokable entries outside their scroll viewport.
+            $entry = Find-Element $name $menu -Visible:($name -ceq $Path[0])
             if ($entry -and $entry.Current.IsEnabled) { $entry }
         }
         if ($name -ceq $Path[-1]) { Invoke-Button $item }

@@ -956,6 +956,7 @@ try {
             $report.Contains("$eastName${dot}Sent to SSH channel") -and
             $report.Contains('east-report-tail') -and !$report.Contains($westName)) { $report }
     }
+    $null = Wait-Until 'shown results copy is published' { Find-Element 'Copied shown results' }
     Invoke-RunAction ('Save shown results' + [char]0x2026)
     $dialog = Wait-Until 'shown group text Save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
     $null = Wait-Until 'save the shown group text report' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -2035,6 +2036,7 @@ try {
         $text -and $text.Contains("Expected output${dot}$expectedLine") -and
             $text.Contains("  Expected output matched`r`n") -and $text.Contains("  Expected output missing`r`n")
     }
+    $null = Wait-Until 'the full results copy is published' { Find-Element 'Copied results' }
     $expectedJson = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'output check.json'
     Invoke-RunAction ('Save results as JSON' + [char]0x2026)
     $dialog = Wait-Until 'owned expected output JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
