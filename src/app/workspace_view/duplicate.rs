@@ -72,9 +72,14 @@ pub(in crate::app) struct ClosedTab {
     pub(in crate::app) title: String,
     search_text: String,
     layout: w11term::tabs::TabLayoutRecipe<NewShell>,
+    opening: Option<Arc<()>>,
 }
 
 impl ClosedTab {
+    pub(in crate::app) fn is_opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
     pub(in crate::app) fn matches(&self, query: &str) -> bool {
         query
             .split_whitespace()
@@ -95,6 +100,36 @@ pub(in crate::app) struct ClosedPane {
 }
 
 pub(in crate::app) struct PreparedTabLayout(TabLayoutRecipe<NewShell>);
+
+pub(in crate::app) struct ClosedTabWindow {
+    group: TabId,
+    token: Arc<()>,
+    source: LocalSender<Message>,
+    published: Cell<bool>,
+}
+
+impl ClosedTabWindow {
+    pub(in crate::app) fn published(&self) {
+        self.published.set(true);
+        self.source.send(Message::ClosedTabWindowFinished(
+            self.group,
+            self.token.clone(),
+            true,
+        ));
+    }
+}
+
+impl Drop for ClosedTabWindow {
+    fn drop(&mut self) {
+        if !self.published.get() {
+            self.source.send(Message::ClosedTabWindowFinished(
+                self.group,
+                self.token.clone(),
+                false,
+            ));
+        }
+    }
+}
 
 #[derive(Clone)]
 struct NewShell {
@@ -256,6 +291,7 @@ impl TerminalApp {
             title,
             search_text,
             layout,
+            opening: None,
         });
     }
 
@@ -278,7 +314,7 @@ impl TerminalApp {
         let Some(index) = self
             .closed_tabs
             .iter()
-            .position(|closed| closed.group == group)
+            .position(|closed| closed.group == group && !closed.is_opening())
         else {
             return Ok(());
         };
@@ -296,6 +332,73 @@ impl TerminalApp {
         self.sync_selection(context);
         self.activate(context);
         Ok(())
+    }
+
+    pub(in crate::app) fn reopen_closed_tab_in_window(
+        &mut self,
+        group: TabId,
+        context: &ComponentContext<Self>,
+    ) {
+        self.window_error = self
+            .try_reopen_closed_tab_in_window(group, context)
+            .err()
+            .map(|error| format!("Couldn’t reopen tab layout in a new window. {error:#}"));
+    }
+
+    fn try_reopen_closed_tab_in_window(
+        &mut self,
+        group: TabId,
+        context: &ComponentContext<Self>,
+    ) -> Result<()> {
+        let Some(index) = self
+            .closed_tabs
+            .iter()
+            .position(|closed| closed.group == group && !closed.is_opening())
+        else {
+            return Ok(());
+        };
+        let catalog = self.store.catalog().ok();
+        let layout = self.closed_tabs[index]
+            .layout
+            .try_map_panes(|shell| shell.clone().prepare(catalog.as_ref()))?;
+        let token = Arc::new(());
+        self.open_child_window(
+            tab_windows::ChildLaunch::Tab {
+                layout: Box::new(PreparedTabLayout(layout)),
+                reopening: Some(Rc::new(ClosedTabWindow {
+                    group,
+                    token: token.clone(),
+                    source: context.sender(),
+                    published: Cell::new(false),
+                })),
+            },
+            context,
+        )?;
+        self.closed_tabs[index].opening = Some(token);
+        Ok(())
+    }
+
+    pub(in crate::app) fn finish_closed_tab_window(
+        &mut self,
+        group: TabId,
+        token: &Arc<()>,
+        opened: bool,
+    ) {
+        if let Some(index) = self.closed_tabs.iter().position(|closed| {
+            closed.group == group
+                && closed
+                    .opening
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, token))
+        }) {
+            if opened {
+                self.closed_tabs.remove(index);
+            } else {
+                self.closed_tabs[index].opening = None;
+                self.window_error = Some("The new window could not be opened. The layout is still in Recently closed tabs.".into());
+            }
+            self.refresh_open_commands();
+        }
     }
 
     pub(in crate::app) fn can_duplicate_tab_layout(&self, group: TabId) -> Result<()> {
@@ -340,7 +443,10 @@ impl TerminalApp {
                     .capture_group(group, prepare)?
                     .context("The original tab was closed")?;
                 self.open_child_window(
-                    tab_windows::ChildLaunch::Tab(Box::new(PreparedTabLayout(layout))),
+                    tab_windows::ChildLaunch::Tab {
+                        layout: Box::new(PreparedTabLayout(layout)),
+                        reopening: None,
+                    },
                     context,
                 )?;
             }

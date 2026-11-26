@@ -161,6 +161,18 @@ pub struct DetachedPane<T> {
 }
 
 impl<P> TabLayoutRecipe<P> {
+    pub fn try_map_panes<L, E>(
+        &self,
+        prepare: impl FnMut(&P) -> Result<L, E>,
+    ) -> Result<TabLayoutRecipe<L>, E> {
+        Ok(TabLayoutRecipe {
+            index: self.index,
+            group: self.group.clone(),
+            panes: self.panes.iter().map(prepare).collect::<Result<_, _>>()?,
+            strip: self.strip.clone(),
+        })
+    }
+
     pub fn panes(&self) -> &[P] {
         &self.panes
     }
@@ -1424,6 +1436,25 @@ mod tests {
         assert_eq!(failed, Err("working directory no longer exists"));
         assert_eq!(tabs.active_id(), Some(after));
         assert_eq!(tabs.headers().len(), 2);
+
+        let rejected = recipe.try_map_panes(|&(profile, _)| match profile {
+            "PowerShell" => Err("working directory no longer exists"),
+            _ => Ok(profile),
+        });
+        assert!(matches!(
+            rejected,
+            Err("working directory no longer exists")
+        ));
+        let prepared = recipe.try_map_panes(|pane| Ok::<_, ()>(*pane)).unwrap();
+        let mut child = Tabs::default();
+        child
+            .reopen_group(&prepared, |pane| Ok::<_, ()>(*pane), |pane| pane)
+            .unwrap();
+        assert_eq!(child.active(), Some(&("SSH", true)));
+        assert_eq!(child.headers().len(), 1);
+        assert_eq!(child.title_for(child.active_id().unwrap()), Some(&title));
+        assert!(child.zoomed());
+        assert_eq!(tabs.active_id(), Some(after));
 
         let reopened = tabs
             .reopen_group(

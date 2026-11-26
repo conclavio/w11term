@@ -403,8 +403,12 @@ impl TerminalApp {
             .map(|tab| Row {
                 id: CommandId::ReopenTabFromHistory(tab.group),
                 label: tab.title.clone(),
-                chord: tab.detail(),
-                enabled: true,
+                chord: if tab.is_opening() {
+                    format!("{} · Opening", tab.detail())
+                } else {
+                    tab.detail()
+                },
+                enabled: !tab.is_opening(),
             })
             .collect()
     }
@@ -718,7 +722,11 @@ impl TerminalApp {
                     row.enabled = self.can_detach_pane_to_window();
                 }
                 Shortcut::ReopenClosedTab => {
-                    let closed = self.closed_tabs.back().map(|tab| tab.group);
+                    let closed = self
+                        .closed_tabs
+                        .back()
+                        .filter(|tab| !tab.is_opening())
+                        .map(|tab| tab.group);
                     row.enabled = closed.is_some();
                     row.id = CommandId::ReopenClosedTab(closed);
                 }
@@ -1142,6 +1150,8 @@ pub(super) fn view(
         if narrow_history { 264.0 } else { 232.0 }
     } else if mode == Search::RunningCommands {
         running.map_or(296.0, pane_picker::Picker::running_controls_height)
+    } else if mode == Search::ClosedTabs && !rows.is_empty() {
+        196.0
     } else {
         156.0
     };
@@ -1314,11 +1324,27 @@ pub(super) fn view(
     let running_controls = running.map_or_else(View::empty, |picker| {
         picker.running_command_controls(app, ctx)
     });
+    let reopen_window = if mode == Search::ClosedTabs && !rows.is_empty() {
+        let group = app
+            .picker
+            .as_ref()
+            .and_then(pane_picker::Picker::selected_closed_tab);
+        Button::new()
+            .automation_name("Reopen in new window")
+            .is_enabled(group.is_some())
+            .on_click(ctx.callback(move |_| {
+                group.map_or(Message::ControlIdle, Message::PickerReopenTabInWindow)
+            }))
+            .content("Reopen in new window  Ctrl+Enter")
+    } else {
+        View::empty()
+    };
     pane_picker::Picker::overlay(
         StackPanel::new().spacing(6.0).children((
             search,
             history_controls,
             StackPanel::new().spacing(4.0).keyed_children(results),
+            reopen_window,
             history_export,
             running_controls,
         )),

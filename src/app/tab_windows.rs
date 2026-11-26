@@ -231,9 +231,15 @@ pub(super) struct NewWindow {
 }
 
 pub(super) enum ChildLaunch {
-    Profile { name: String, source: Box<Source> },
+    Profile {
+        name: String,
+        source: Box<Source>,
+    },
     Group(host_groups::WindowGroup),
-    Tab(Box<workspace_view::PreparedTabLayout>),
+    Tab {
+        layout: Box<workspace_view::PreparedTabLayout>,
+        reopening: Option<Rc<workspace_view::ClosedTabWindow>>,
+    },
 }
 
 pub(super) struct ChildWindow {
@@ -426,6 +432,9 @@ impl TerminalApp {
                     windows_changed();
                     if let Some(opening) = self.opening.take() {
                         opening.published();
+                    }
+                    if let Some(reopening) = self.reopening_tab_window.take() {
+                        reopening.published();
                     }
                     if let Some(offer) = &self.incoming {
                         if offer.phase.get() != TransferPhase::Opening

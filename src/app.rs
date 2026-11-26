@@ -1284,6 +1284,7 @@ pub struct TerminalApp {
     _control: Arc<Server>,
     window_launch: w11term::options::Options,
     opening: Option<Rc<crate::workspace_window::Opening>>,
+    reopening_tab_window: Option<Rc<workspace_view::ClosedTabWindow>>,
     incoming: Option<Rc<tab_windows::Transfer>>,
     outgoing: Option<Rc<tab_windows::Transfer>>,
     window_timer: Option<crate::ui_timer::RetryTimer>,
@@ -1439,6 +1440,8 @@ pub enum Message {
     MoveTabToExistingWindow(Option<TabId>, u64),
     DuplicateTabLayout(TabId, DuplicateTabDestination),
     ReopenClosedTab(Option<TabId>),
+    PickerReopenTabInWindow(TabId),
+    ClosedTabWindowFinished(TabId, Arc<()>, bool),
     ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
     SetTabPinned(TabId, bool),
@@ -4430,7 +4433,7 @@ impl TerminalApp {
                 "reopen_closed_tab",
                 KeyAction::ReopenClosedTab.binding().label,
                 KeyAction::ReopenClosedTab,
-                !self.closed_tabs.is_empty(),
+                self.closed_tabs.back().is_some_and(|tab| !tab.is_opening()),
             ),
             self.binding_menu_enabled(
                 "find-closed-tab",
@@ -5610,6 +5613,7 @@ impl Component for TerminalApp {
             _control: control,
             window_launch: options.clone(),
             opening: opening.clone(),
+            reopening_tab_window: None,
             incoming: input.transfer.clone(),
             outgoing: None,
             window_timer: None,
@@ -5693,7 +5697,10 @@ impl Component for TerminalApp {
                     context,
                 );
             }
-            Some(tab_windows::ChildLaunch::Tab(layout)) => app.start_prepared_tab(layout, context),
+            Some(tab_windows::ChildLaunch::Tab { layout, reopening }) => {
+                app.reopening_tab_window = reopening.clone();
+                app.start_prepared_tab(layout, context);
+            }
             None => app.activate(context),
         }
         app.watch_control(context);
@@ -5957,6 +5964,12 @@ impl Component for TerminalApp {
                 }
             }
             Message::ReopenClosedTab(None) => {}
+            Message::PickerReopenTabInWindow(group) => {
+                self.choose_closed_tab_window(group, context);
+            }
+            Message::ClosedTabWindowFinished(group, token, opened) => {
+                self.finish_closed_tab_window(group, &token, opened);
+            }
             Message::ReopenClosedPane(Some(id)) => {
                 self.window_error = self
                     .reopen_closed_pane(id, context)
@@ -7074,6 +7087,12 @@ impl Component for TerminalApp {
                 Shortcut::KeyboardHints => self.open_hints(),
                 Shortcut::HintKey(key) => self.hint_key(key, context),
                 Shortcut::PickerAccept => self.accept_picker(context),
+                Shortcut::PickerReopenTabInWindow => {
+                    if let Some(group) = self.picker.as_ref().and_then(|p| p.selected_closed_tab())
+                    {
+                        self.choose_closed_tab_window(group, context);
+                    }
+                }
                 Shortcut::PickerCancel => {
                     if self.cancel_running_interrupt_review() {
                         self.focus_picker_input(0, context);

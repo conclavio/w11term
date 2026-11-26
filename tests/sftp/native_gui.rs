@@ -2642,6 +2642,17 @@ async fn native_recently_closed_tabs_reopens_the_selected_layout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "restores a recently closed SSH and PowerShell layout in a separate native window"]
+async fn native_recently_closed_tab_reopens_in_a_new_window() {
+    check_mixed_tab_layout(
+        "reopen-closed-tab-window-ui.ps1",
+        b"original-window/history-window/",
+        2,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "restores a single PowerShell pane beside a live SSH shell after closing the split"]
 async fn native_reopen_closed_pane_keeps_the_neighboring_ssh_session() {
     check_mixed_tab_layout(
