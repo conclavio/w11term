@@ -61,6 +61,14 @@ function Wait-CommandDraft([string]$Text) {
         ) -and $provider.Current.Value -ceq $Text
     }
 }
+function Set-GroupReadiness([bool]$Required) {
+    $label = 'Require all recipients ready'
+    $before, $after = if ($Required) { 'Off','On' } else { 'On','Off' }
+    Set-NativeExpansion 'Dispatch settings' $true
+    (Wait-CheckBox $label $before).Toggle()
+    $null = Wait-CheckBox $label $after
+    Set-NativeExpansion 'Dispatch settings' $false
+}
 function Submit([string]$Text, [string]$ButtonName) {
     # Observe the invalid draft first so an enabled control belongs to the new
     # command after the queued UI Automation text edit reaches the app.
@@ -1334,12 +1342,8 @@ try {
     Submit 'while-reconnecting' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Prompt unverified"
-    $requireReady = 'Require all recipients ready'
     $sendRecordedOption = 'Send and record' + [char]0x2026
-    Set-NativeExpansion 'Dispatch settings' $true
-    (Wait-CheckBox $requireReady Off).Toggle()
-    $null = Wait-CheckBox $requireReady On
-    Set-NativeExpansion 'Dispatch settings' $false
+    Set-GroupReadiness $true
     (Command-Editor).SetValue('after-reconnect')
     $null = Wait-Until 'send waits for the unverified checked host' {
         $send = Find-Element 'Send to 2 hosts' $button
@@ -1374,10 +1378,7 @@ try {
         Find-Element "Pane $west${dot}Last command${dot}Exit 17${dot}west-accepted after-reconnect"
     }
     (Wait-CheckBox $showLastOutput On).Toggle()
-    Set-NativeExpansion 'Dispatch settings' $true
-    (Wait-CheckBox $requireReady On).Toggle()
-    $null = Wait-CheckBox $requireReady Off
-    Set-NativeExpansion 'Dispatch settings' $false
+    Set-GroupReadiness $false
     $null = Wait-Until 'finished results cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
@@ -1470,6 +1471,10 @@ try {
     Outcome $westName 'Exit 17'
     $null = Wait-Until 'submission clears the restore action' { !(Find-Element 'Restore draft' $button) }
     (Command-Editor).SetValue('draft before library')
+    $null = Wait-Until 'the edited draft has reached the command toolbar' {
+        $send = Find-Element 'Send to 1 host' $button
+        $send -and $send.Current.IsEnabled
+    }
     $libraryButton = 'Saved commands' + [char]0x2026
     $saved = "Load group command${dot}Fleet health"
     Invoke-NativeMenuAction 'Command library' $libraryButton
@@ -1922,7 +1927,7 @@ try {
         }
     }
     if ([IO.File]::ReadAllText($burstPath) -cne $beforeCollision) { throw 'The existing recording was modified' }
-    (Wait-CheckBox $requireReady Off).Toggle()
+    Set-GroupReadiness $true
     Select-ComboValue $hostStateFilter 'Ready'
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
@@ -1939,7 +1944,7 @@ try {
         throw 'A stale review was presented as a recorded submission'
     }
     Select-ComboValue $hostStateFilter 'All host states'
-    (Wait-CheckBox $requireReady On).Toggle()
+    Set-GroupReadiness $false
     Pane-Status $west "Connected$($dot)Alternate screen"
     (Command-Editor).SetValue('record-one')
     Invoke-NativeMenuAction 'Send options' $sendRecorded

@@ -21,7 +21,7 @@ pub(super) fn composer(
             offer,
             send_label,
             enabled,
-            save_draft: page.command_save.draft_to_save(&page.draft),
+            can_save: page.command_save.can_save(&page.draft),
             restore_draft: page.previous_draft.is_some(),
         },
     })
@@ -49,7 +49,7 @@ struct Controls {
     offer: CommandOffer,
     send_label: String,
     enabled: bool,
-    save_draft: Option<Arc<str>>,
+    can_save: bool,
     restore_draft: bool,
 }
 
@@ -94,7 +94,11 @@ impl Toolbar {
             .orientation(Orientation::Horizontal)
             .spacing(4.0)
             .children((
-                library(id, controls.save_draft.clone(), sender),
+                View::component::<CommandLibrary>(LibraryInput {
+                    sender: sender.clone(),
+                    id,
+                    can_save: controls.can_save,
+                }),
                 send,
                 send_options(id, controls.offer.clone(), controls.enabled, sender),
             ));
@@ -114,46 +118,68 @@ impl Toolbar {
     }
 }
 
-fn library(id: TabId, draft: Option<Arc<str>>, sender: &LocalSender<Message>) -> View {
-    let can_save = draft.is_some();
-    let recall = sender.clone();
-    title_tools::button("Command library")
-        .key_accelerators(KeyAccelerators::new([KeyAccelerator::new(
-            AcceleratorKey::R,
-            AcceleratorModifiers::Control,
-            move || {
-                recall.send(Message::HostGroup(Action::OpenRecentCommands(id)));
-            },
-        )]))
-        .content(
-            FontIcon::new()
-                .glyph("\u{e81c}")
-                .tooltip_with(title_tools::below(
-                    "Command library · Ctrl+R for recent commands",
-                )),
-        )
-        .menu(Menu::new(
-            [
-                MenuItem::item("recent", RECENT),
-                MenuItem::item("saved", SAVED),
-                MenuItem::separator("save-current"),
-                command_menu_item("save", SAVE, can_save),
-            ],
-            sender.callback(move |label: String| {
-                let action = match label.as_str() {
-                    RECENT => Action::OpenRecentCommands(id),
-                    SAVED => Action::OpenSavedCommands(id),
-                    SAVE => match &draft {
-                        Some(text) => {
-                            Action::SaveCommand(id, save_command::Action::Begin(text.clone()))
-                        }
-                        None => return Message::ControlIdle,
-                    },
-                    _ => return Message::ControlIdle,
-                };
-                Message::HostGroup(action)
-            }),
-        ))
+struct CommandLibrary(LocalSender<Message>);
+
+#[derive(Clone)]
+struct LibraryInput {
+    sender: LocalSender<Message>,
+    id: TabId,
+    can_save: bool,
+}
+
+impl PartialEq for LibraryInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.can_save == other.can_save
+    }
+}
+
+// History and saved commands depend only on the tab and whether Save is
+// available. The naming form captures the current draft when it opens.
+impl Component for CommandLibrary {
+    type Input = LibraryInput;
+    type Message = ();
+
+    fn create(input: &LibraryInput, _: &ComponentContext<Self>) -> Self {
+        Self(input.sender.clone())
+    }
+
+    fn view(&self, input: &LibraryInput, _: &mut ViewContext<Self>) -> View {
+        let LibraryInput { id, can_save, .. } = *input;
+        let sender = &self.0;
+        let recall = sender.clone();
+        title_tools::button("Command library")
+            .key_accelerators(KeyAccelerators::new([KeyAccelerator::new(
+                AcceleratorKey::R,
+                AcceleratorModifiers::Control,
+                move || {
+                    recall.send(Message::HostGroup(Action::OpenRecentCommands(id)));
+                },
+            )]))
+            .content(
+                FontIcon::new()
+                    .glyph("\u{e81c}")
+                    .tooltip_with(title_tools::below(
+                        "Command library · Ctrl+R for recent commands",
+                    )),
+            )
+            .menu(Menu::new(
+                [
+                    MenuItem::item("recent", RECENT),
+                    MenuItem::item("saved", SAVED),
+                    MenuItem::separator("save-current"),
+                    command_menu_item("save", SAVE, can_save),
+                ],
+                sender.callback(move |label: String| {
+                    let action = match label.as_str() {
+                        RECENT => Action::OpenRecentCommands(id),
+                        SAVED => Action::OpenSavedCommands(id),
+                        SAVE if can_save => Action::SaveCommand(id, save_command::Action::Begin),
+                        _ => return Message::ControlIdle,
+                    };
+                    Message::HostGroup(action)
+                }),
+            ))
+    }
 }
 
 fn send_options(
