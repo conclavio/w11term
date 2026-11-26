@@ -104,6 +104,7 @@ mod sftp_transfers;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
 mod tab_colors;
+mod tab_header_menu;
 mod tab_title;
 mod tab_windows;
 mod taskbar;
@@ -1283,6 +1284,7 @@ pub struct TerminalApp {
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
+    tab_header_callbacks: RefCell<BTreeMap<TabId, Callback<String>>>,
     caret_menu_binding: Rc<RefCell<Option<CaretMenuBinding>>>,
     frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
@@ -1414,6 +1416,7 @@ pub enum Message {
     ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
     SetTabPinned(TabId, bool),
+    TabHeaderMenu(TabId, String),
     SetTabColor(TabId, Option<TabColor>),
     CloseTabs(bulk_tab_close::Offer),
     WindowTick,
@@ -4129,7 +4132,11 @@ impl TerminalApp {
                 .fold(wezterm_term::Progress::None, taskbar::most_important);
             self.taskbar.borrow_mut().show(hwnd, state);
         }
-        let layout = title_tools::Layout::new(self.width, self.tabs.headers().len());
+        let headers = self.tabs.headers();
+        let layout = title_tools::Layout::new(self.width, headers.len());
+        self.tab_header_callbacks
+            .borrow_mut()
+            .retain(|group, _| self.tabs.group_layout(*group).is_some());
         let tab_strip = TabView::new()
             .height(44.0)
             .width(layout.tab_width)
@@ -4160,7 +4167,7 @@ impl TerminalApp {
             })
             .collection_slot(
                 TabViewSlot::TabItems,
-                self.tabs.headers().into_iter().map(|tab| {
+                headers.into_iter().map(|tab| {
                     let group = tab.group_id();
                     let pinned = self.tabs.group_is_pinned(group);
                     let title = self.tab_label(tab.id, application_titles);
@@ -4196,7 +4203,8 @@ impl TerminalApp {
                                     .max_width(420.0)
                                     .text_wrapping(TextWrapping::Wrap)
                                     .text(tooltip),
-                            )),
+                            ))
+                            .menu(self.tab_header_menu(group, &tab.value.page, context)),
                     )
                 }),
             );
@@ -4239,27 +4247,22 @@ impl TerminalApp {
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
             .slots([
+                // WinUI delivers pointer events throughout its left header.
+                SlotView::new(TitleBarSlot::LeftHeader, tab_strip),
                 SlotView::new(
                     TitleBarSlot::Content,
-                    Grid::new()
-                        // Keep the tabs left aligned within the space beside the native RightHeader.
-                        .width(layout.content_width)
-                        .columns([GridLength::Auto, GridLength::STAR])
-                        .children((
-                            tab_strip,
-                            Border::new().grid_column(1).content(
-                                self.recording_indicator().map_or_else(
-                                    || Border::new().into(),
-                                    |message| -> View {
-                                        TextBlock::new()
-                                            .vertical_alignment(VerticalAlignment::Center)
-                                            .automation_name(&message)
-                                            .text(&message)
-                                            .text_trimming(TextTrimming::CharacterEllipsis)
-                                            .tooltip_with(title_tools::below(message))
-                                    },
-                                ),
-                            ),
+                    Border::new()
+                        .width(layout.content_width - layout.tab_width)
+                        .content(self.recording_indicator().map_or_else(
+                            View::empty,
+                            |message| -> View {
+                                TextBlock::new()
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .automation_name(&message)
+                                    .text(&message)
+                                    .text_trimming(TextTrimming::CharacterEllipsis)
+                                    .tooltip_with(title_tools::below(message))
+                            },
                         )),
                 ),
                 SlotView::new(TitleBarSlot::RightHeader, right_header),
@@ -4520,11 +4523,13 @@ impl TerminalApp {
         command_menu_item(key, description, enabled)
     }
     fn duplicate_tab_item(&self) -> MenuItem {
+        self.duplicate_tab_item_for(self.tabs.active_group_id())
+    }
+
+    fn duplicate_tab_item_for(&self, group: Option<TabId>) -> MenuItem {
         let action = KeyAction::DuplicateTabLayout;
         let binding = action.binding();
-        match self
-            .tabs
-            .active_group_id()
+        match group
             .context("Select a terminal tab")
             .and_then(|group| self.can_duplicate_tab_layout(group))
         {
@@ -5559,6 +5564,7 @@ impl Component for TerminalApp {
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
+            tab_header_callbacks: RefCell::default(),
             caret_menu_binding,
             folder_panel_timer: None,
             forward_watch: None,
@@ -5853,10 +5859,9 @@ impl Component for TerminalApp {
                 }
             }
             Message::DuplicateTabLayout(group) => {
-                self.window_error = self
-                    .duplicate_tab_layout(group, context)
-                    .err()
-                    .map(|error| format!("Couldn’t duplicate tab layout. {error:#}"));
+                if self.tabs.active_group_id() == Some(group) {
+                    self.duplicate_tab_from_menu(group, context);
+                }
             }
             Message::ReopenClosedTab(Some(group)) => {
                 self.window_error = self
@@ -5881,13 +5886,11 @@ impl Component for TerminalApp {
                 }
             }
             Message::SetTabPinned(group, pinned) => {
-                if self.active_terminal_group() == Some(group)
-                    && self.tabs.set_group_pinned(group, pinned)
-                {
-                    self.sync_selection(context);
-                    self.refresh_open_commands();
+                if self.active_terminal_group() == Some(group) {
+                    self.set_tab_pinned(group, pinned, context);
                 }
             }
+            Message::TabHeaderMenu(group, label) => self.tab_header_action(group, &label, context),
             Message::SetTabColor(group, color) => {
                 if self.active_terminal_group() == Some(group)
                     && self.tabs.set_group_color(group, color)

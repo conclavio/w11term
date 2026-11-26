@@ -357,6 +357,8 @@ Click a pane to focus it, drag a divider to resize, or zoom one pane and restore
 
 Choose **More → Pin tab** or use the command palette to keep a terminal tab on the left of the strip. A pushpin marks the tab and its close button disappears. **Close tab** and **Close pane** leave it open when the action would close the whole tab. You can still close an individual split, move the live tab to another window, or close the window itself. Choose **Unpin tab** to restore the tab’s close button. Saved workspaces remember pins.
 
+Right-click a tab header to rename it, set its color, pin or unpin it, duplicate its layout, or close it. Rename, color, pin and close can operate on a background tab while your current pane stays selected. Duplicating opens and selects the new tab.
+
 Choose **Close other tabs** or **Close tabs to the right** from the More menu or command palette. Both preserve the selected tab and all pinned tabs. Closed terminal layouts enter the usual reopen history, with the rightmost eligible tab reopening first.
 
 Choose **More → Duplicate tab layout** to open a fresh copy near the current tab. It keeps the tab name, pane arrangement, divider positions, focused pane, zoom and read-only input locks. Each SSH pane makes an independent login, and each local shell starts a new process. The original tab keeps its jobs and scrollback. A configured local or SSH starting directory carries over. Copies start unpinned. You can assign **Duplicate tab layout** a shortcut in Settings.

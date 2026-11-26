@@ -18221,6 +18221,18 @@ impl windows_core::RuntimeType for ITitleBar {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl ITitleBar {
+    pub(crate) fn SetLeftHeader<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<UIElement>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetLeftHeader)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetTitle(&self, value: &str) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetTitle)(
@@ -18371,7 +18383,10 @@ pub struct ITitleBar_Vtbl {
     IconSource: usize,
     SetIconSource: usize,
     LeftHeader: usize,
-    SetLeftHeader: usize,
+    pub SetLeftHeader: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     Content: usize,
     pub SetContent: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -18425,6 +18440,29 @@ pub struct ITitleBarFactory_Vtbl {
         *mut *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ITitleBar2,
+    ITitleBar2_Vtbl,
+    0x55533ac5_80bf_5b29_8be9_4fadb734db0a
+);
+impl ITitleBar2 {
+    pub(crate) fn RecomputeDragRegions(&self) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).RecomputeDragRegions)(
+                windows_core::Interface::as_raw(self),
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ITitleBar2_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    AutoRefreshDragRegions: usize,
+    SetAutoRefreshDragRegions: usize,
+    pub RecomputeDragRegions:
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ITitleBarStatics,
@@ -19028,6 +19066,18 @@ impl windows_core::RuntimeType for IUIElement {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IUIElement {
+    pub(crate) fn SetContextFlyout<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<FlyoutBase>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetContextFlyout)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetAllowDrop(&self, value: bool) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetAllowDrop)(
@@ -19581,7 +19631,10 @@ pub struct IUIElement_Vtbl {
     SetManipulationMode: usize,
     PointerCaptures: usize,
     ContextFlyout: usize,
-    SetContextFlyout: usize,
+    pub SetContextFlyout: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CompositeMode: usize,
     SetCompositeMode: usize,
     Lights: usize,

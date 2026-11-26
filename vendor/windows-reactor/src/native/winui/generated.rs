@@ -3865,6 +3865,10 @@ pub fn set_slot(
                 .SetRightHeader(None::<&UIElement>)
                 .map_err(native_error),
         },
+        (Handle::TitleBar(control), SlotId::TitleBarLeftHeader) => match child {
+            Some(child) => control.SetLeftHeader(child).map_err(native_error),
+            None => control.SetLeftHeader(None::<&UIElement>).map_err(native_error),
+        },
         (Handle::NavigationView(control), SlotId::NavigationViewContent) => {
             let control = control.cast::<IContentControl>().map_err(native_error)?;
             match child {

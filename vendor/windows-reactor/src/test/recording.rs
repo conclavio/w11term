@@ -977,6 +977,7 @@ impl RecordingRuntime {
                     OwnedMenuKind::ButtonFlyout => MountedKind::Button,
                     OwnedMenuKind::DropDownButtonFlyout => MountedKind::DropDownButton,
                     OwnedMenuKind::MenuBarItem => MountedKind::MenuBarItem,
+                    OwnedMenuKind::TabViewItemContext => MountedKind::TabViewItem,
                 };
                 if target_kind != Some(expected) {
                     return Err(RuntimeError::UnsupportedKind);

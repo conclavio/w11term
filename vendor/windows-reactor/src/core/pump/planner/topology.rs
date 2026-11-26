@@ -532,6 +532,7 @@ impl<R: NativeRuntime> Pump<R> {
                         OwnedMenuKind::DropDownButtonFlyout
                     }
                     NodeKind::Native(MountedKind::MenuBarItem) => OwnedMenuKind::MenuBarItem,
+                    NodeKind::Native(MountedKind::TabViewItem) => OwnedMenuKind::TabViewItemContext,
                     _ => return Err(PumpError::StructureUnsupported),
                 };
                 tree.set_kind(owner, NodeKind::Menu(kind));

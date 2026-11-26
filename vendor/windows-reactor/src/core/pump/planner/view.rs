@@ -437,6 +437,7 @@ impl<R: NativeRuntime> Pump<R> {
                     return Err(PumpError::StructureUnsupported);
                 };
                 let current_target = *current_target;
+                let previous_target = Self::native_root(tree, current_target)?;
                 let current_target = Self::reconcile_planned_view(
                     tree,
                     current_target,
@@ -452,8 +453,16 @@ impl<R: NativeRuntime> Pump<R> {
                         OwnedMenuKind::DropDownButtonFlyout
                     }
                     NodeKind::Native(MountedKind::MenuBarItem) => OwnedMenuKind::MenuBarItem,
+                    NodeKind::Native(MountedKind::TabViewItem) => OwnedMenuKind::TabViewItemContext,
                     _ => return Err(PumpError::StructureUnsupported),
                 };
+                if kind == OwnedMenuKind::TabViewItemContext
+                    && previous_target == target
+                    && tree.owned_menu(node) == menu.items
+                    && tree.owned_callback(node) == &menu.on_click
+                {
+                    return Ok(node);
+                }
                 tree.set_kind(node, NodeKind::Menu(kind));
                 validate_menu_items(&menu.items)?;
                 let revision = tree.update_menu(node, menu.clone());
@@ -2029,6 +2038,7 @@ impl<R: NativeRuntime> Pump<R> {
                         OwnedMenuKind::DropDownButtonFlyout
                     }
                     NodeKind::Native(MountedKind::MenuBarItem) => OwnedMenuKind::MenuBarItem,
+                    NodeKind::Native(MountedKind::TabViewItem) => OwnedMenuKind::TabViewItemContext,
                     _ => return Err(PumpError::StructureUnsupported),
                 };
                 tree.set_kind(node, NodeKind::Menu(kind));
