@@ -236,6 +236,7 @@ pub(super) enum ChildLaunch {
         source: Box<Source>,
     },
     Group(host_groups::WindowGroup),
+    Workspace(Rc<crate::workspace_window::Opening>),
     Tab {
         layout: Box<workspace_view::PreparedTabLayout>,
         reopening: Option<Rc<workspace_view::ClosedTabWindow>>,
@@ -264,10 +265,10 @@ impl Drop for ChildWindow {
 }
 
 impl TerminalApp {
-    fn reserve_child_window(&self) -> anyhow::Result<NewWindow> {
+    fn reserve_child_window(&self, workspace: Option<String>) -> anyhow::Result<NewWindow> {
         let id = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
         Ok(NewWindow {
-            registry: self.registry.register_window(id, None)?,
+            registry: self.registry.register_window(id, workspace)?,
             server: self._control.clone(),
         })
     }
@@ -285,7 +286,11 @@ impl TerminalApp {
         launch: ChildLaunch,
         ctx: &ComponentContext<Self>,
     ) -> anyhow::Result<()> {
-        let window = self.reserve_child_window()?;
+        let workspace = match &launch {
+            ChildLaunch::Workspace(opening) => Some(opening.key.clone()),
+            _ => None,
+        };
+        let window = self.reserve_child_window(workspace)?;
         let launch = WindowLaunch {
             options: self.window_launch.clone(),
             opening: None,
@@ -863,7 +868,7 @@ impl TerminalApp {
             };
             (destination, None, Some(target))
         } else {
-            let new_window = match self.reserve_child_window() {
+            let new_window = match self.reserve_child_window(None) {
                 Ok(window) => window,
                 Err(error) => {
                     self.window_error = Some(format!("Opening another window: {error}"));

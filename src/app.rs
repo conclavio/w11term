@@ -5366,9 +5366,15 @@ impl Component for TerminalApp {
 
     fn create(input: &Self::Input, context: &ComponentContext<Self>) -> Self {
         let options = &input.options;
-        let opening = &input.opening;
         let moving = input.transfer.is_some();
         let child = input.child.as_ref();
+        let opening = input
+            .opening
+            .clone()
+            .or_else(|| match child.map(|child| &child.launch) {
+                Some(tab_windows::ChildLaunch::Workspace(opening)) => Some(opening.clone()),
+                _ => None,
+            });
         let child_window = moving || child.is_some();
         let sender = context.sender();
         let clipboard = clipboard_paste::State::default();
@@ -5701,10 +5707,10 @@ impl Component for TerminalApp {
                 app.reopening_tab_window = reopening.clone();
                 app.start_prepared_tab(layout, context);
             }
-            None => app.activate(context),
+            Some(tab_windows::ChildLaunch::Workspace(_)) | None => app.activate(context),
         }
         app.watch_control(context);
-        if child.is_none() {
+        if child.is_none() || opening.is_some() {
             app.sync_selection(context);
         }
         #[cfg(feature = "ui-smoke")]

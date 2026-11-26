@@ -88,6 +88,12 @@ async fn native_duplicate_tab_layout_in_a_new_window_starts_fresh_sessions() {
     run("DuplicateWindow", b"source-layout/copy-window/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a saved workspace in a second native window in the same instance"]
+async fn native_saved_workspace_opens_in_a_new_window() {
+    run("WorkspaceWindow", b"workspace-copy/original-workspace/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =
@@ -135,15 +141,21 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         "shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}})
     };
     let leaf = |slot, source: Value| json!({"type":"leaf","slot":slot,"source":source});
-    let workspace = json!({"active_tab": usize::from(first_close == "Context"),"tabs":[
+    let workspace = json!({"active_tab": usize::from(matches!(first_close, "Context" | "WorkspaceWindow")),"tabs":[
         {"title":"Cockpit tools","focused":1,"layout":{"type":"split","axis":"columns","ratio":0.375,
             "first":leaf(1,json!({"kind":"saved_profile","value":"window-ssh"})),
             "second":leaf(2,local("Moved PowerShell"))}},
         {"focused":3,"layout":leaf(3,local("Source PowerShell"))}
     ]});
+    let mut workspaces = json!({"two-windows":workspace});
+    if first_close == "WorkspaceWindow" {
+        workspaces["broken-copy"] = json!({"active_tab":0,"tabs":[
+            {"focused":1,"layout":leaf(1,json!({"kind":"saved_profile","value":"missing-window-profile"}))}
+        ]});
+    }
     fs::write(
         data.join("workspaces.json"),
-        serde_json::to_vec(&json!({"version":1,"workspaces":{"two-windows":workspace}})).unwrap(),
+        serde_json::to_vec(&json!({"version":1,"workspaces":workspaces})).unwrap(),
     )
     .unwrap();
     let result = std::process::Command::new("powershell.exe")
@@ -169,7 +181,10 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
         fs::read_to_string(state.path().join("gui.log")).unwrap_or_default(),
         fs::read_to_string(&trace).unwrap_or_default()
     );
-    let expected_ssh = 1 + usize::from(matches!(first_close, "ProfileWindow" | "DuplicateWindow"));
+    let expected_ssh = 1 + usize::from(matches!(
+        first_close,
+        "ProfileWindow" | "DuplicateWindow" | "WorkspaceWindow"
+    ));
     assert_eq!(
         transports.load(Ordering::Relaxed),
         expected_ssh,
