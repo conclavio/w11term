@@ -70,6 +70,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "move-pane"
             | "focus-pane"
             | "zoom-pane"
+            | "get-tab-layout"
             | "list-commands"
             | "get-command"
             | "get-running-output"
@@ -368,6 +369,27 @@ mod tests {
             "open --profile desk --window 0",
             "open --profile desk --window 1 --window 2",
             "open --profile desk --tab 1",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn reads_the_layout_of_one_exact_pane() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (pid, request) = parse_line("--pid 3 get-tab-layout --pane 42").unwrap();
+        assert_eq!(pid, Some(3));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"get-tab-layout","pane":42})
+        );
+        for invalid in [
+            "get-tab-layout",
+            "get-tab-layout --pane 0",
+            "get-tab-layout --pane 1 --pane 2",
+            "get-tab-layout --pane 1 --activate",
+            "get-tab-layout --window 1",
+            "get-tab-layout --pane 1 trailing",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

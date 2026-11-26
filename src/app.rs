@@ -3599,6 +3599,58 @@ impl TerminalApp {
         }))
     }
 
+    fn control_tab_layout(&self, pane: u64) -> anyhow::Result<serde_json::Value> {
+        use serde_json::json;
+        use w11term::pane_layout::Layout;
+
+        let entry = self
+            .tab_for_pane(pane)
+            .with_context(|| format!("unknown pane {pane}"))?;
+        let tab_id = self.tabs.group_id(entry).context("the pane has no tab")?;
+        let layout = self
+            .tabs
+            .group_layout(tab_id)
+            .context("the tab is closed")?;
+        let pane_id = |entry| {
+            self.tabs
+                .get(entry)
+                .and_then(AppTab::pane_id)
+                .context("the tab layout refers to a missing terminal pane")
+        };
+        let focused = self
+            .tabs
+            .group_focus(tab_id)
+            .context("the tab has no selection")?;
+
+        // Flat child indices keep the wire format usable regardless of split depth.
+        let mut pending = vec![layout];
+        let mut nodes = Vec::new();
+        while let Some(&node) = pending.get(nodes.len()) {
+            nodes.push(match node {
+                Layout::Leaf(entry) => json!({ "kind": "pane", "pane": pane_id(*entry)? }),
+                Layout::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                } => {
+                    let first_index = pending.len();
+                    pending.extend([first.as_ref(), second.as_ref()]);
+                    json!({ "kind": "split", "axis": axis, "ratio": ratio,
+                        "first": first_index, "second": first_index + 1 })
+                }
+            });
+        }
+        Ok(json!({
+            "window_id": self.registry.window_id(),
+            "tab_id": tab_id,
+            "focused_pane": pane_id(focused)?,
+            "selected": self.tabs.active_group_id() == Some(tab_id),
+            "zoomed": self.tabs.group_zoomed(tab_id),
+            "layout": nodes,
+        }))
+    }
+
     fn split_pane(
         &mut self,
         axis: Axis,
@@ -6825,6 +6877,12 @@ impl Component for TerminalApp {
             Message::Control(w11term::control::UiRequest::SelectPaneView { pane, zoom, reply }) => {
                 if !reply.is_closed() {
                     let result = self.control_select_pane_view(pane, zoom, context);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
+            Message::Control(w11term::control::UiRequest::GetTabLayout { pane, reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_tab_layout(pane);
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }

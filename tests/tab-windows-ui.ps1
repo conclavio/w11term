@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -697,6 +697,75 @@ function Test-ExplicitControlWindow {
         throw 'An explicit open against a closed window did not return the expected error'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'A closed-window request fell back to the original window' }
+    Close-FixtureWindow $origin
+}
+
+function Test-ControlTabLayout {
+    Expect-Focus $origin $ssh.id 'SSH is selected before reading tab layouts' -PrepareWindow
+    $below = Control @('split-pane','--pane',"$($ssh.id)",'--profile','Destination PowerShell','--axis','rows')
+    $source = Control @('get-tab-layout','--pane',"$($ssh.id)")
+    $nodes = $source.layout
+    $root = $nodes[0]
+    $left = $nodes[$root.first]
+    if ($source.window_id -ne $ssh.window_id -or $source.tab_id -ne $ssh.tab_id -or
+        !$source.selected -or $source.zoomed -or $source.focused_pane -ne $ssh.id -or
+        $nodes.Count -ne 5 -or $root.kind -cne 'split' -or $root.axis -cne 'columns' -or $root.ratio -ne 0.375 -or
+        $left.kind -cne 'split' -or $left.axis -cne 'rows' -or $left.ratio -ne 0.5 -or
+        $nodes[$root.second].pane -ne $moved.id -or $nodes[$left.first].pane -ne $ssh.id -or
+        $nodes[$left.second].pane -ne $below.pane -or @($nodes | Where-Object kind -ceq 'pane').Count -ne 3) {
+        throw "Unexpected nested live layout: $($source | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    $same = Control @('get-tab-layout','--pane',"$($below.pane)")
+    if (($same | ConvertTo-Json -Depth 8 -Compress) -cne ($source | ConvertTo-Json -Depth 8 -Compress)) {
+        throw 'Querying a sibling returned a different tab snapshot'
+    }
+
+    $anchorLayout = Control @('get-tab-layout','--pane',"$($anchor.id)")
+    if ($anchorLayout.tab_id -ne $anchor.tab_id -or $anchorLayout.selected -or $anchorLayout.zoomed -or
+        $anchorLayout.focused_pane -ne $anchor.id -or $anchorLayout.layout.Count -ne 1 -or
+        $anchorLayout.layout[0].kind -cne 'pane' -or $anchorLayout.layout[0].pane -ne $anchor.id) {
+        throw 'The hidden single-pane tab did not have its own layout and selection'
+    }
+    Expect-Focus $origin $ssh.id 'Reading a hidden tab does not select it'
+
+    $null = Control @('zoom-pane','--pane',"$($moved.id)",'--on')
+    $null = Control @('focus-pane','--pane',"$($anchor.id)")
+    $hidden = Control @('get-tab-layout','--pane',"$($ssh.id)")
+    if ($hidden.selected -or !$hidden.zoomed -or $hidden.focused_pane -ne $moved.id -or
+        ($hidden.layout | ConvertTo-Json -Depth 8 -Compress) -cne ($nodes | ConvertTo-Json -Depth 8 -Compress)) {
+        throw 'A hidden and zoomed tab lost its original tree or remembered pane'
+    }
+    Expect-Focus $origin $anchor.id 'Reading the zoomed tab leaves the anchor pane selected'
+    $null = Control @('zoom-pane','--pane',"$($ssh.id)",'--off')
+    $null = Control @('focus-pane','--pane',"$($ssh.id)")
+
+    $child = Control @('open','--profile','Destination PowerShell','--new-window')
+    $childHwnd = Wait-DetachedWindow $origin
+    $null = Control @('move-pane','--pane',"$($moved.id)",'--target-pane',"$($child.pane)",'--direction','down')
+    $destination = Control @('get-tab-layout','--pane',"$($moved.id)")
+    $childRoot = $destination.layout[0]
+    if ($destination.window_id -ne $child.window_id -or !$destination.selected -or
+        $destination.focused_pane -ne $child.pane -or $destination.tab_id -eq $source.tab_id -or
+        $destination.layout.Count -ne 3 -or $childRoot.axis -cne 'rows' -or
+        $destination.layout[$childRoot.first].pane -ne $child.pane -or
+        $destination.layout[$childRoot.second].pane -ne $moved.id) {
+        throw 'The live pane layout was not read from its new window after the move'
+    }
+    $remaining = Control @('get-tab-layout','--pane',"$($ssh.id)")
+    if ($remaining.tab_id -ne $source.tab_id -or $remaining.focused_pane -ne $ssh.id -or
+        $remaining.layout.Count -ne 3 -or $remaining.layout[0].axis -cne 'rows' -or
+        $remaining.layout[$remaining.layout[0].second].pane -ne $below.pane -or
+        (Shell-State $moved.id 'layoutShell') -ne $localIdentity) {
+        throw 'Moving the shell did not preserve the surviving tree and session'
+    }
+    $missing = & $Cli --pid $app.Id get-tab-layout --pane 999999 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $missing.ok -or $missing.error -cne 'unknown pane 999999') {
+        throw 'Reading a missing pane did not fail cleanly'
+    }
+    Expect-Focus $origin $ssh.id 'Reading the sibling window layout preserves desktop focus'
+    Type-In $origin 'layout-ssh/'
+    Expect-Text $ssh.id 'layout-ssh/'
+    Close-FixtureWindow $childHwnd
     Close-FixtureWindow $origin
 }
 
@@ -1642,7 +1711,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -1651,6 +1720,7 @@ try {
             'CliSplit' { Test-ControlSplit }
             'CliMove' { Test-ControlMove }
             'CliPaneView' { Test-ControlPaneView }
+            'CliLayout' { Test-ControlTabLayout }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

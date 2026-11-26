@@ -360,6 +360,12 @@ impl<T> Tabs<T> {
             .find(|g| g.id == group)
             .map(|g| &g.layout)
     }
+    pub fn group_focus(&self, group: TabId) -> Option<TabId> {
+        self.groups
+            .iter()
+            .find(|g| g.id == group)
+            .map(|g| g.focused)
+    }
     pub fn zoomed(&self) -> bool {
         self.active_group.is_some_and(|id| self.group_zoomed(id))
     }
