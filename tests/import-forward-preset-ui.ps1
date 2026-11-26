@@ -65,6 +65,13 @@ function Select-Keyless {
         Find-Element 'None (keyless server)' ([System.Windows.Automation.ControlType]::ListItem)
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'keyless authentication selected in the profile editor' {
+        $current = Find-Element 'Authentication' ([System.Windows.Automation.ControlType]::ComboBox)
+        if ($current) {
+            $selected = $current.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            $selected.Count -eq 1 -and $selected[0].Current.Name -ceq 'None (keyless server)'
+        }
+    }
 }
 function Saved-Profile { ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.$aliasName }
 function Assert-OnlyPair {
@@ -127,10 +134,16 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Click "Edit profile $aliasName"
             Select-Keyless
             (Field 'Host fingerprint').SetValue($fingerprint)
+            $null = Wait-Until 'the editor displays the fixture host fingerprint' {
+                (Field 'Host fingerprint').Current.Value -ceq $fingerprint
+            }
             Click 'Save profile changes'
-            $null = Wait-Until 'pinned keyless profile saved' {
-                $saved = Saved-Profile
-                $saved.auth -ceq 'none' -and $saved.host_key -ceq $fingerprint
+            # Await commit feedback before opening the catalog. ReadAllText can
+            # otherwise deny delete sharing while the editor replaces that file.
+            $null = Wait-Until 'keyless profile save completed' { Find-Element 'Changes saved.' $text }
+            $saved = Saved-Profile
+            if ($saved.auth -cne 'none' -or $saved.host_key -cne $fingerprint) {
+                throw "The editor saved the wrong authentication or fingerprint for $aliasName"
             }
             Assert-OnlyPair
 
