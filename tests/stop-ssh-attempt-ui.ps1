@@ -26,11 +26,11 @@ function Wait-Attempt {
     return $pane.ssh_attempt_token
 }
 function Wait-Stopped([uint64]$LastGeneration = 0) {
-    $pane = Wait-Until 'SSH attempt stopped and original pane can restart' {
-        $p = Get-RemotePane
-        if ($p.ssh_connection.phase -ceq 'stopped' -and $p.restart_token) { $p }
-    }
-    if ($pane.ssh_attempt_token -or $pane.connection_generation -ne $LastGeneration -or $pane.tab_id -ne $originalTab) {
+    $stopped = Control @('wait-pane-exit','--pane',"$remote",'--timeout','15')
+    $pane = Get-RemotePane
+    if ($stopped.pane -ne $remote -or !$stopped.restart_token -or
+        $stopped.restart_token -ne $pane.restart_token -or $stopped.ssh_connection.phase -cne 'stopped' -or
+        $pane.ssh_attempt_token -or $pane.connection_generation -ne $LastGeneration -or $pane.tab_id -ne $originalTab) {
         throw "Stopping an attempt changed the tab or last established generation, or left a pending token: $($pane | ConvertTo-Json -Compress)"
     }
 }

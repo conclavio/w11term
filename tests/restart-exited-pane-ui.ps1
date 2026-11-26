@@ -99,7 +99,10 @@ try {
     Wait-Text $remote 'before SSH exit'
     if ((Control @('get-text','--pane',"$remote")).text.Contains('archived SSH')) { throw 'Expected retained SSH history above the viewport' }
     $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64','BA==')
-    $exitToken = Wait-Until 'orderly remote session exit' { (Control @('events','--pane',"$remote")).restart_token }
+    $sshExit = Control @('wait-pane-exit','--pane',"$remote",'--timeout','15')
+    if ($sshExit.pane -ne $remote -or !$sshExit.restart_token -or $sshExit.exit_token -ne $sshExit.restart_token -or
+        $sshExit.ssh_connection.phase -cne 'disconnected') { throw 'Incorrect result for the SSH exit' }
+    $exitToken = $sshExit.restart_token
     Wait-Focus $local
     Choose-Pane 'palette-ssh' $remote
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
@@ -130,10 +133,17 @@ try {
     Type-Line '"neighbor-value-" + $restartValue'
     Wait-Text $local 'neighbor-value-4021'
     Assert-LiveRestartDisabled $local
+    $waitLog = Join-Path $State 'local-exit-wait.json'
+    $waiter = Start-Process -FilePath $Cli -ArgumentList @('--pid',"$($app.Id)",'wait-pane-exit','--pane',"$local",'--timeout','20') -WindowStyle Hidden -PassThru -RedirectStandardOutput $waitLog
+    $null = $waiter.Handle
     Type-Line 'exit 37'
-    $null = Wait-Until 'PowerShell process exit' {
-        (Control @('get-text','--pane',"$local")).status -eq 'Local process exited with code 37' -and
-            (Control @('events','--pane',"$local")).restart_token
+    if (!$waiter.WaitForExit(15000)) { throw 'The PowerShell exit wait did not finish' }
+    $localExit = Get-Content -LiteralPath $waitLog -Raw | ConvertFrom-Json
+    if ($waiter.ExitCode -ne 0 -or !$localExit.ok -or $localExit.result.pane -ne $local -or
+        !$localExit.result.restart_token -or $localExit.result.exit_token -ne $localExit.result.restart_token -or
+        $localExit.result.ssh_connection -or
+        (Control @('get-text','--pane',"$local")).status -cne 'Local process exited with code 37') {
+        throw "Incorrect result for the PowerShell exit: $($localExit | ConvertTo-Json -Compress)"
     }
     Run-Palette $restart
     Wait-NextGeneration $originalPs
@@ -150,6 +160,10 @@ try {
     Type-Text '-neighbor-alive'
     Wait-Text $remote '-neighbor-alive'
 } finally {
+    if ($waiter) {
+        if (!$waiter.HasExited) { $waiter.Kill(); $null = $waiter.WaitForExit(5000) }
+        $waiter.Dispose()
+    }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

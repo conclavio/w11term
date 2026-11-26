@@ -113,6 +113,22 @@ pub struct Batch {
     pub oldest: u64,
     pub lost: bool,
 }
+
+#[derive(Debug, Default)]
+enum PaneProcessState {
+    #[default]
+    Unavailable,
+    Running,
+    Exited(u64),
+}
+
+#[derive(Debug)]
+pub(crate) struct PaneExit {
+    pub exit_token: u64,
+    pub restart_token: Option<u64>,
+    pub ssh_connection: Option<SshConnectionPhase>,
+}
+
 #[derive(Debug, Default)]
 struct State {
     next: u64,
@@ -133,7 +149,7 @@ struct State {
     notify_long_commands: bool,
     ssh_connection_phase: Option<SshConnectionPhase>,
     ssh_connection_generation: u64,
-    ssh_connection_ended: bool,
+    pane_process: PaneProcessState,
     ssh_attempts: ssh_attempt::Attempts,
     restart_token: Option<u64>,
     restart_closed: bool,
@@ -351,15 +367,6 @@ impl Events {
         }
     }
 
-    /// Publish the final phase for an SSH worker that cannot restart in place.
-    pub(crate) fn end_ssh_connection(&self, phase: SshConnectionPhase) {
-        let mut state = self.state.lock().unwrap();
-        state.ssh_connection_ended = true;
-        Self::record_ssh_phase(&mut state, phase);
-        drop(state);
-        self.changed.notify_waiters();
-    }
-
     fn record_ssh_phase(state: &mut State, phase: SshConnectionPhase) -> bool {
         if state.ssh_connection_phase.as_ref() == Some(&phase) {
             return false;
@@ -401,27 +408,45 @@ impl Events {
                 login_permits,
             },
         ));
-        let changed = sent.is_ok()
-            && state.ssh_connection_phase.is_some()
-            && Self::record_ssh_phase(&mut state, phase);
+        if sent.is_ok() {
+            state.pane_process = PaneProcessState::Running;
+            if state.ssh_connection_phase.is_some() {
+                Self::record_ssh_phase(&mut state, phase);
+            }
+        }
         if let Some((_, _, inbox)) = &state.inbox {
             inbox.refresh();
         }
         drop(state);
-        if changed {
+        if sent.is_ok() {
             self.changed.notify_waiters();
         }
         sent.map_err(|_| anyhow::anyhow!("The terminal pane has closed"))
     }
 
-    pub(crate) fn pane_exited(&self, token: u64, ssh_phase: Option<SshConnectionPhase>) {
+    pub(crate) fn track_pane_process(&self) {
+        self.state.lock().unwrap().pane_process = PaneProcessState::Running;
+    }
+
+    pub(crate) fn pane_exited(
+        &self,
+        token: u64,
+        ssh_phase: Option<SshConnectionPhase>,
+        restartable: bool,
+    ) {
         let mut state = self.state.lock().unwrap();
         if state.restart_closed {
             return;
         }
-        state.restart_token = Some(token);
+        state.pane_process = PaneProcessState::Exited(token);
+        state.restart_token = restartable.then_some(token);
         if let Some(phase) = ssh_phase {
             Self::record_ssh_phase(&mut state, phase);
+        }
+        if !restartable {
+            drop(state);
+            self.changed.notify_waiters();
+            return;
         }
         if let Some((_, _, inbox)) = &state.inbox {
             inbox.refresh();
@@ -436,6 +461,43 @@ impl Events {
 
     pub(crate) fn close_restart(&self) {
         self.disable_restart(None);
+    }
+
+    pub(crate) async fn wait_pane_exit(
+        &self,
+        after_exit_token: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<PaneExit> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                ensure!(!state.restart_closed, "pane is closed");
+                match state.pane_process {
+                    PaneProcessState::Unavailable => {
+                        anyhow::bail!("pane does not run an SSH session or local program")
+                    }
+                    PaneProcessState::Exited(token) if token > after_exit_token => {
+                        return Ok(PaneExit {
+                            exit_token: token,
+                            restart_token: state.restart_token,
+                            ssh_connection: state.ssh_connection_phase.clone(),
+                        });
+                    }
+                    PaneProcessState::Exited(_) if state.restart_token.is_none() => {
+                        anyhow::bail!("pane has ended and cannot restart")
+                    }
+                    _ => {}
+                }
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "wait-pane-exit timed out"
+            );
+            let _ = tokio::time::timeout_at(deadline, changed).await;
+        }
     }
 
     pub(crate) fn close_if_exited(&self, token: u64) -> bool {
@@ -1190,7 +1252,7 @@ mod tests {
         use SshConnectionPhase::*;
         let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
         let events = Events::default();
-        events.pane_exited(4, Some(Stopped));
+        events.pane_exited(4, Some(Stopped), true);
 
         assert!(!events.close_if_exited(3));
         assert!(events.restart_exited(&commands, 4).is_ok());
@@ -1200,11 +1262,11 @@ mod tests {
             Ok(crate::session::Command::RestartExited(_))
         ));
 
-        events.pane_exited(5, Some(Stopped));
+        events.pane_exited(5, Some(Stopped), true);
         assert!(events.close_if_exited(5));
         assert!(events.restart_exited(&commands, 5).is_err());
         assert!(received.try_recv().is_err());
-        events.pane_exited(6, Some(Stopped));
+        events.pane_exited(6, Some(Stopped), true);
         assert_eq!(
             events.connection_snapshot(),
             SshConnectionSnapshot {
@@ -1226,7 +1288,7 @@ mod tests {
         events.set_ssh_connection_phase(Connecting);
         events.set_ssh_connection_phase(Connecting);
         events.set_ssh_connection_phase(Reconnecting { attempt: Some(2) });
-        events.pane_exited(7, Some(Stopped));
+        events.pane_exited(7, Some(Stopped), true);
         assert_eq!(
             events.connection_snapshot(),
             SshConnectionSnapshot {
@@ -1247,7 +1309,7 @@ mod tests {
         );
         events.set_ssh_connected(1);
         events.set_ssh_connection_phase(Disconnected);
-        events.pane_exited(8, Some(Failed("fixture failure".into())));
+        events.pane_exited(8, Some(Failed("fixture failure".into())), true);
         let changes: Vec<_> = events
             .since(0)
             .events
@@ -1266,6 +1328,94 @@ mod tests {
                 json!({"phase":"disconnected"}),
                 json!({"phase":"failed","reason":"fixture failure"}),
             ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pane_exit_wait_returns_the_current_exit_and_follows_the_next_run() {
+        use SshConnectionPhase::*;
+        use tokio::time::{Instant, sleep};
+
+        let events = Events::default();
+        events.track_pane_process();
+        events.set_ssh_connected(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let first_exit = async {
+            sleep(Duration::from_secs(1)).await;
+            events.set_ssh_connection_phase(Disconnected);
+            sleep(Duration::from_secs(1)).await;
+            events.set_ssh_connection_phase(Reconnecting { attempt: Some(1) });
+            sleep(Duration::from_secs(1)).await;
+            events.pane_exited(1, Some(Stopped), true);
+        };
+        let (exit, ()) = tokio::join!(events.wait_pane_exit(0, deadline), first_exit);
+        let exit = exit.unwrap();
+        assert_eq!(exit.exit_token, 1);
+        assert_eq!(exit.restart_token, Some(1));
+        assert_eq!(exit.ssh_connection, Some(Stopped));
+        assert_eq!(
+            events.wait_pane_exit(0, deadline).await.unwrap().exit_token,
+            1
+        );
+
+        let (commands, _worker) = tokio::sync::mpsc::unbounded_channel();
+        let next_exit = async {
+            sleep(Duration::from_secs(1)).await;
+            events.restart_exited(&commands, 1).unwrap();
+            assert!(events.restart_token().is_none());
+            events.set_ssh_connected(3);
+            sleep(Duration::from_secs(1)).await;
+            events.pane_exited(2, Some(Disconnected), true);
+        };
+        let (exit, ()) = tokio::join!(events.wait_pane_exit(1, deadline), next_exit);
+        assert_eq!(exit.unwrap().restart_token, Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pane_exit_wait_handles_nonrestartable_exits_and_unavailable_panes() {
+        use tokio::time::Instant;
+
+        let events = Events::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(events.wait_pane_exit(0, deadline).await.is_err());
+        events.track_pane_process();
+        assert_eq!(
+            events
+                .wait_pane_exit(0, deadline)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "wait-pane-exit timed out"
+        );
+
+        events.pane_exited(
+            1,
+            Some(SshConnectionPhase::Failed("remote command ended".into())),
+            false,
+        );
+        let exit = events.wait_pane_exit(0, deadline).await.unwrap();
+        assert_eq!(exit.exit_token, 1);
+        assert_eq!(exit.restart_token, None);
+        assert!(matches!(
+            exit.ssh_connection,
+            Some(SshConnectionPhase::Failed(_))
+        ));
+        assert_eq!(
+            events
+                .wait_pane_exit(1, deadline)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "pane has ended and cannot restart"
+        );
+        events.close_restart();
+        assert_eq!(
+            events
+                .wait_pane_exit(0, deadline)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "pane is closed"
         );
     }
 

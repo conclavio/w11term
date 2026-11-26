@@ -1,4 +1,4 @@
-use super::{EventLinks, Events, SshConnectionPhase, State};
+use super::{EventLinks, Events, PaneProcessState, SshConnectionPhase, State};
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroU64,
@@ -188,7 +188,7 @@ impl Events {
                     Some(Failed(reason)) => anyhow::bail!("SSH connection failed: {reason}"),
                     Some(Stopped) => anyhow::bail!("SSH connection attempt stopped"),
                     Some(Disconnected)
-                        if state.restart_token.is_some() || state.ssh_connection_ended =>
+                        if matches!(state.pane_process, PaneProcessState::Exited(_)) =>
                     {
                         anyhow::bail!("SSH pane is disconnected");
                     }
@@ -476,7 +476,11 @@ mod tests {
         let (first, _stop) = events.begin_ssh_attempt();
         let first_id = events.pending_ssh_attempt().unwrap();
         assert!(first.finish(SshAttemptOutcome::Failed("first failure".into())));
-        events.pane_exited(1, Some(SshConnectionPhase::Failed("first failure".into())));
+        events.pane_exited(
+            1,
+            Some(SshConnectionPhase::Failed("first failure".into())),
+            true,
+        );
         assert_eq!(events.failed_ssh_restart_token(first_id), Some(1));
         events.restart_exited(&commands, 1).unwrap();
         assert_eq!(events.failed_ssh_restart_token(first_id), None);
@@ -484,7 +488,11 @@ mod tests {
         let (second, _stop) = events.begin_ssh_attempt();
         let second_id = events.pending_ssh_attempt().unwrap();
         assert!(second.finish(SshAttemptOutcome::Failed("later failure".into())));
-        events.pane_exited(2, Some(SshConnectionPhase::Failed("later failure".into())));
+        events.pane_exited(
+            2,
+            Some(SshConnectionPhase::Failed("later failure".into())),
+            true,
+        );
         assert_eq!(events.failed_ssh_restart_token(first_id), None);
         assert_eq!(events.failed_ssh_restart_token(second_id), Some(2));
     }
@@ -529,7 +537,7 @@ mod tests {
                 if closed {
                     events.close_restart();
                 } else {
-                    events.end_ssh_connection(Disconnected);
+                    events.pane_exited(1, Some(Disconnected), false);
                 }
             };
             let (result, ()) = tokio::join!(

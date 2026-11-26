@@ -643,6 +643,9 @@ impl Session {
             _ => None,
         };
         let events = crate::events::Events::with_group_prompt_pattern(group_prompt_pattern);
+        if matches!(source, Source::Ssh(_) | Source::Local(_)) {
+            events.track_pane_process();
+        }
         if matches!(source, Source::Ssh(_)) {
             let phase = if launch_gate.is_some() {
                 crate::events::SshConnectionPhase::Queued
@@ -1005,11 +1008,7 @@ async fn run(
                     .take()
                     .unwrap_or(crate::events::SshConnectionPhase::Disconnected)
             });
-            if restartable {
-                events.pane_exited(launch_id, ssh_phase);
-            } else if let Some(phase) = ssh_phase {
-                events.end_ssh_connection(phase);
-            }
+            events.pane_exited(launch_id, ssh_phase, restartable);
         }
         let mut inspected_transport = if inspecting {
             let (inspection, transport) = PaneInspection::read(

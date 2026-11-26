@@ -57,6 +57,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "retry-ssh-now"
             | "disconnect-ssh-shell"
             | "wait-ssh-connected"
+            | "wait-pane-exit"
             | "list-commands"
             | "get-command"
             | "inspect"
@@ -905,6 +906,43 @@ mod tests {
             "wait-ssh-connected --pane 7 --timeout 0",
             "wait-ssh-connected --pane 7 --timeout 3601",
             "wait-ssh-connected --pane 7 --timeout 4 --timeout 5",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn pane_exit_wait_accepts_only_its_scoped_options() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 9 wait-pane-exit --pane 7").unwrap(),
+            (
+                Some(9),
+                Request::WaitPaneExit {
+                    pane: 7,
+                    after_exit_token: 0,
+                    timeout_seconds: 30
+                }
+            )
+        ));
+        assert!(matches!(
+            parse_line("wait-pane-exit --pane 7 --after-exit-token 4 --timeout 60").unwrap(),
+            (
+                None,
+                Request::WaitPaneExit {
+                    pane: 7,
+                    after_exit_token: 4,
+                    timeout_seconds: 60
+                }
+            )
+        ));
+        for line in [
+            "wait-pane-exit",
+            "wait-pane-exit --pane 7 --after-exit-token -1",
+            "wait-pane-exit --pane 7 --after-exit-token 1 --after-exit-token 2",
+            "wait-pane-exit --pane 7 --after-generation 1",
+            "wait-pane-exit --pane 7 --timeout 3601",
+            "wait-ssh-connected --pane 7 --after-exit-token 1",
         ] {
             assert!(parse_line(line).is_err(), "{line}");
         }

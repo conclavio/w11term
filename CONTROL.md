@@ -698,8 +698,8 @@ To end a connected direct SSH shell, use the `connection_generation` from
 
 The reply includes `pane`, `connection_generation`, and `accepted: true`.
 The pane journals `ssh-disconnect-requested` with that generation. Wait for
-its `restart_token` before starting a fresh shell. A stale generation is
-rejected. Deliberate disconnect leaves the pane, scrollback, and focus in
+its `restart_token` with `wait-pane-exit` before starting a fresh shell. A
+stale generation is rejected. Deliberate disconnect leaves the pane, scrollback, and focus in
 place and skips automatic reconnect. Other shells on the same authenticated
 transport can continue.
 
@@ -722,13 +722,25 @@ When a direct SSH shell or local program finishes, a restartable pane emits
 events result identifies its current exit, even if the event has aged out.
 Use that token with the same process and pane ID to restart the program in
 place. Each exit can be claimed once. Live and reconnecting panes have a
-null token. The restart reply acknowledges the request. Use `list` to observe
-the new connection generation or `wait-for-text` for an application prompt.
+null token. The restart reply acknowledges the request. Use
+`wait-ssh-connected` for the new SSH generation or `wait-for-text` for an
+application prompt.
+
+`wait-pane-exit --pane ID [--after-exit-token N] [--timeout SECONDS]` waits for
+an SSH session or local program to end and publish its final screen.
+The reply contains `pane`, `exit_token`, and `restart_token`, plus the final
+`ssh_connection` phase for SSH panes. A `null` restart token means the
+program cannot restart in that pane. An already ended pane returns immediately
+unless its exit token is at or below `--after-exit-token`. That option lets
+scripts wait for a later exit after a restart. Automatic SSH retries keep the
+wait pending. Replay and demo panes, closed panes, and a request for a newer
+exit from a pane that cannot restart return errors. The timeout defaults to
+30 seconds and accepts 1–3600 seconds.
 
 ```powershell
-$state = (& $ctl --pid 12345 events --pane $pane | ConvertFrom-Json).result
-if ($null -ne $state.restart_token) {
-    & $ctl --pid 12345 restart --pane $pane --exit-token $state.restart_token
+$exitReply = & $ctl --pid 12345 wait-pane-exit --pane $pane --timeout 60 | ConvertFrom-Json
+if ($exitReply.ok -and $null -ne $exitReply.result.restart_token) {
+    & $ctl --pid 12345 restart --pane $pane --exit-token $exitReply.result.restart_token
 }
 ```
 
@@ -737,6 +749,7 @@ if ($null -ne $state.restart_token) {
 {"verb":"resize","pane":1,"cols":170,"rows":48}
 {"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
 {"verb":"events","pane":1,"since":42,"timeout_seconds":30}
+{"verb":"wait-pane-exit","pane":1,"after_exit_token":1,"timeout_seconds":30}
 {"verb":"restart","pane":1,"exit_token":1}
 ```
 

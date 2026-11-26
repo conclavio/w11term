@@ -1551,25 +1551,27 @@ async fn lost_workspace_exec_reply_does_not_dispatch_command_again() {
     let command = "make deploy";
     let startup = w11term::workspace::SshStartup::new(&ssh, String::new(), command.into()).unwrap();
     let session = Session::start_workspace_ssh(ssh, Default::default(), false, startup);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !session
-            .frames
-            .load()
-            .status
-            .contains("Workspace command interrupted")
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "Expected final interruption status, got {:?}; channels {}, recorded {:?}",
-            session.frames.load().status,
-            opens.load(Ordering::Relaxed),
-            fs::read_to_string(&trace)
+    let exit = registry(&session)
+        .execute(
+            Request::WaitPaneExit {
+                pane: 1,
+                after_exit_token: 0,
+                timeout_seconds: 10,
+            },
+            Arc::new(|_, _, _| unreachable!()),
         )
-    });
+        .await
+        .unwrap();
+    assert_eq!(exit["pane"], 1);
+    assert_eq!(exit["exit_token"], 1);
+    assert_eq!(exit["restart_token"], Value::Null);
+    assert!(exit["ssh_connection"].is_object(), "{exit}");
+    let frame = session.frames.load();
+    assert!(
+        frame.status.contains("Workspace command interrupted"),
+        "exit wait returned before the final screen: {:?}",
+        frame.status
+    );
     assert_eq!(opens.load(Ordering::Relaxed), 1);
     assert_eq!(fs::read(trace).unwrap(), command.as_bytes());
     drop(session);

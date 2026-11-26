@@ -76,6 +76,13 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    WaitPaneExit {
+        pane: u64,
+        #[serde(default)]
+        after_exit_token: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     WaitForText {
         pane: u64,
         pattern: String,
@@ -652,6 +659,32 @@ impl Registry {
                     _ = target.input.closed() => anyhow::bail!("pane is closed"),
                 };
                 Ok(json!({"pane":pane,"connection_generation":generation}))
+            }
+            Request::WaitPaneExit {
+                pane,
+                after_exit_token,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "wait timeout must be 1..=3600 seconds"
+                );
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+                let exit = tokio::select! {
+                    result = events.wait_pane_exit(after_exit_token, deadline) => result?,
+                    _ = target.input.closed() => anyhow::bail!("pane is closed"),
+                };
+                let mut result = json!({
+                    "pane": pane,
+                    "exit_token": exit.exit_token,
+                    "restart_token": exit.restart_token,
+                });
+                if let Some(phase) = exit.ssh_connection {
+                    result["ssh_connection"] = phase.as_json();
+                }
+                Ok(result)
             }
             Request::Events {
                 pane,
@@ -1339,6 +1372,7 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitSshConnected { .. }
+                        | Request::WaitPaneExit { .. }
                         | Request::WaitSftpTransfer { .. }
                         | Request::WaitSshGroupRun { .. }
                         | Request::WaitSshGroupApproval { .. }
@@ -1688,6 +1722,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitSshConnected {
+                timeout_seconds, ..
+            }
+            | Request::WaitPaneExit {
                 timeout_seconds, ..
             }
             | Request::WaitSftpTransfer {
