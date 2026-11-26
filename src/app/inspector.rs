@@ -28,7 +28,7 @@ struct PointerReadout {
 }
 
 // Keep remote labels to one short line of plain text.
-fn target_label(uri: &str) -> String {
+pub(super) fn target_label(uri: &str) -> String {
     let mut chars = uri.chars().map(|c| match c {
         '\u{061c}'
         | '\u{200e}'

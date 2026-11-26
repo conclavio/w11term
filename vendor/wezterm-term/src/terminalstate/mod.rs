@@ -346,6 +346,10 @@ pub struct RunningCommand {
 }
 
 impl RunningCommand {
+    pub fn started_at(&self) -> std::time::Instant {
+        self.started_at
+    }
+
     pub fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
     }

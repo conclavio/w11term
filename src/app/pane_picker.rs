@@ -1,5 +1,6 @@
 use super::*;
 use w11term::terminal::{BookmarkEntry, BookmarkScreen, FrameStore, Snapshot};
+mod running_commands;
 mod text_search;
 mod window_history;
 pub use text_search::Action as TextAction;
@@ -254,6 +255,7 @@ pub(super) struct Picker {
     window_history: window_history::Search,
     selected: usize,
     preview: Option<Preview>,
+    _running_timer: Option<crate::ui_timer::RetryTimer>,
 }
 
 impl Picker {
@@ -837,6 +839,9 @@ impl TerminalApp {
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
+            Mode::Commands(command_palette::Search::RunningCommands) => {
+                self.running_command_rows(query)
+            }
             Mode::Commands(command_palette::Search::CommandHistory) => {
                 let options = self
                     .picker
@@ -1072,9 +1077,21 @@ impl TerminalApp {
         let selected = selected_tab
             .or_else(|| matches.iter().position(|row| Some(row.pane) == active))
             .unwrap_or(0);
+        let launch = Arc::new(());
+        let running_timer = if mode == Mode::Commands(command_palette::Search::RunningCommands) {
+            let sender = ctx.sender();
+            let launch = launch.clone();
+            crate::ui_timer::RetryTimer::with_next_delay(1000, move || {
+                sender.send(Message::RunningCommandsTick(launch.clone()));
+                1000
+            })
+            .ok()
+        } else {
+            None
+        };
         self.picker = Some(Picker {
             mode,
-            launch: Arc::new(()),
+            launch,
             input: ElementRef::new(),
             default_side: ElementRef::new(),
             query: String::new(),
@@ -1085,6 +1102,7 @@ impl TerminalApp {
             window_history: window_history::Search::default(),
             selected,
             preview: None,
+            _running_timer: running_timer,
         });
         if let Some(previous) = previous {
             let picker = self.picker.as_mut().unwrap();

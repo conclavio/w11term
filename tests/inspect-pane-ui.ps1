@@ -208,12 +208,25 @@ try {
     Type-Line 'if ($inspectPid -eq $PID) { "local-inspect-" + "still-live" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-still-live')
     if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains('local-inspect')) { throw 'PowerShell input landed in SSH' }
-    Picker-Query 'palette-ssh'
+    Report-CommandStart 'interrupted fixture'
+    $null = Wait-Until 'the source reports a running command while PowerShell is active' {
+        (Inspect).running_command.command -ceq 'interrupted fixture'
+    }
+    Invoke-NativeMenuAction 'Tab menu' ('Find running commands' + [char]0x2026)
+    Wait-PickerEditor 'Search running commands' 'the running command picker'
+    $field = Find-Element 'Search running commands' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('INTERRUPTED FIXTURE')
+    $buttons = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
+    $null = Wait-Until 'the running SSH command appears by its reported name' {
+        $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons) |
+            Where-Object { $_.Current.Name.StartsWith('interrupted fixture') -and $_.Current.Name.Contains('palette-ssh') } |
+            Select-Object -First 1
+    }
     Press-Key 13
     Wait-Focus $remote
     Invoke-NativeMenuAction 'Tab menu' 'Terminal inspector: Off'
     $null = Wait-Until 'the SSH route appears when reopening the inspector' { Get-NativeExpander 'Verified SSH route' }
-    Report-CommandStart 'interrupted fixture'
     $null = Wait-Until 'the unfinished command is visible before disconnect' {
         (Inspect).running_command.command -ceq 'interrupted fixture' -and (Find-Element 'Running command   interrupted fixture')
     }

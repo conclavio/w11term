@@ -384,6 +384,14 @@ impl Session {
         self.live_frames.load()
     }
 
+    pub fn running_command_snapshot(&self) -> Option<(u64, wezterm_term::RunningCommand)> {
+        let (generation, command) = self.live_frames.running_command()?;
+        if self.events.shell_generation() != Some(generation) {
+            return None;
+        }
+        Some((generation, command))
+    }
+
     pub fn restart_exited(&self, token: u64) -> anyhow::Result<()> {
         self.events.restart_exited(&self.input, token)
     }
@@ -923,6 +931,7 @@ async fn run(
     let mut connection_generation = 0;
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let mut inspecting = false;
+    let mut published_running = None;
     let mut replay_label = None;
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
@@ -1020,6 +1029,15 @@ async fn run(
                     .unwrap_or(crate::events::SshConnectionPhase::Disconnected)
             });
             events.pane_exited(launch_id, ssh_phase, restartable);
+        }
+        if live_commands {
+            let running = terminal
+                .running_command()
+                .map(|command| (connection_generation, command));
+            if running != published_running {
+                live_frames.set_running_command(running.clone());
+                published_running = running;
+            }
         }
         let mut inspected_transport = if inspecting {
             let (inspection, transport) = PaneInspection::read(

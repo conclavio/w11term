@@ -1119,6 +1119,7 @@ pub struct FrameStore(Arc<(Mutex<ViewState>, Condvar, tokio::sync::Notify)>);
 struct ViewState {
     frame: Arc<Snapshot>,
     inspection: Option<crate::session::PaneInspection>,
+    running_command: Option<(u64, wezterm_term::RunningCommand)>,
     inbox: Option<WindowInbox>,
 }
 
@@ -1135,6 +1136,7 @@ impl FrameStore {
             Mutex::new(ViewState {
                 frame: Arc::new(frame),
                 inspection: None,
+                running_command: None,
                 inbox: None,
             }),
             Condvar::new(),
@@ -1189,6 +1191,12 @@ impl FrameStore {
     }
     pub fn inspection(&self) -> Option<crate::session::PaneInspection> {
         self.0.0.lock().unwrap().inspection.clone()
+    }
+    pub(crate) fn running_command(&self) -> Option<(u64, wezterm_term::RunningCommand)> {
+        self.0.0.lock().unwrap().running_command.clone()
+    }
+    pub(crate) fn set_running_command(&self, command: Option<(u64, wezterm_term::RunningCommand)>) {
+        self.0.0.lock().unwrap().running_command = command;
     }
     pub(crate) fn set_inspection(&self, inspection: Option<crate::session::PaneInspection>) {
         let mut state = self.0.0.lock().unwrap();

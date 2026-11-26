@@ -1108,6 +1108,7 @@ fn tab_menu_message(label: String) -> Message {
         command_palette::FIND_COMMAND_HISTORY_LABEL => {
             Message::Shortcut(Shortcut::FindCommandHistory)
         }
+        command_palette::FIND_RUNNING_COMMANDS_LABEL => Message::OpenRunningCommands,
         pane_picker::FIND_TEXT_LABEL => Message::Shortcut(Shortcut::FindAllPanes),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Select all terminal text" => Message::Shortcut(Shortcut::SelectAll),
@@ -1371,6 +1372,8 @@ pub enum Message {
     InspectSshRoute(u64, bool),
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
+    OpenRunningCommands,
+    RunningCommandsTick(Arc<()>),
     WindowHistory(pane_picker::WindowHistoryAction),
     PaneText(pane_picker::TextAction),
     PickerHover(u64),
@@ -4419,6 +4422,10 @@ impl TerminalApp {
                 command_palette::FIND_COMMAND_HISTORY_LABEL,
                 KeyAction::FindCommandHistory,
             ),
+            MenuItem::item(
+                "find-running-commands",
+                command_palette::FIND_RUNNING_COMMANDS_LABEL,
+            ),
             MenuItem::item("new-ssh-group-tab", host_groups::NEW_TAB_LABEL),
             recordings.menu(),
             workspace_startup,
@@ -5683,6 +5690,7 @@ impl Component for TerminalApp {
                     saved_commands::Edit::Name(_) | saved_commands::Edit::Text(_)
                 )
                 | Message::PickerQuery(..)
+                | Message::RunningCommandsTick(..)
                 | Message::WindowHistory(..)
                 | Message::Discovery(
                     session_browser::Action::Query(..) | session_browser::Action::Focus(..)
@@ -5937,6 +5945,8 @@ impl Component for TerminalApp {
             Message::HostGroup(action) => self.handle_host_group(action, context),
             Message::PaletteChoose(id) => self.choose_command(id, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
+            Message::OpenRunningCommands => self.open_running_commands(context),
+            Message::RunningCommandsTick(launch) => self.refresh_running_commands(&launch),
             Message::WindowHistory(action) => self.window_history_action(action, context),
             Message::PaneText(action) => self.pane_text_action(action, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),

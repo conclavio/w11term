@@ -689,6 +689,8 @@ Choose **More → Terminal inspector** to see the focused pane’s cell grid, te
 
 When shell integration reports a command start, the inspector shows the running command, its starting directory when available, and a live elapsed time. The control reply supplies the full shell-reported command line and its capture ID. When the command finishes, look up that ID in command history.
 
+Choose **Find running commands…** from More or the command palette to see active shell captures across the window, longest-running first. Search by command, starting directory, pane name, profile, or SSH address. **Enter** focuses the source pane, and **Esc** returns to the original pane. The list refreshes while open and removes completed or disconnected commands.
+
 For an SSH pane, the inspector shows the connection state and the current step and endpoint during login or reconnection. If the connection ends during a failed step, the inspector keeps the step and error visible. Once connected, expand **Verified SSH route** to see the destination and each jump host with its verified SHA256 host-key fingerprint and any configured host-key alias. Each peer shows the initial key exchange, host-key algorithm, cipher, and whether strict key exchange was negotiated. The route disappears when the authenticated connection ends.
 
 For each peer, the same view shows the sign-in method the server accepted. For public-key sign-in it includes the user key fingerprint, whether it came from a key file or agent, and the issuing CA fingerprint for a user certificate. It also shows any completed password or keyboard-interactive steps after the key. Scripts can read the same details from `w11term-cli inspect`. [Control reply fields](CONTROL.md#waiting-geometry-tabs-and-events)

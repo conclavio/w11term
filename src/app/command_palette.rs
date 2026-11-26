@@ -5,6 +5,7 @@ use w11term::terminal::BookmarkScreen;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
 pub(super) const FIND_COMMAND_HISTORY_LABEL: &str = "Find command history…";
+pub(super) const FIND_RUNNING_COMMANDS_LABEL: &str = "Find running commands…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
 pub(super) const FIND_PROFILE_LABEL: &str = "Find profile…";
 pub(super) const SPLIT_RIGHT_PROFILE_LABEL: &str = "Find profile to split right…";
@@ -21,6 +22,7 @@ pub(super) enum Search {
     Window,
     Tabs,
     CommandHistory,
+    RunningCommands,
     Profiles(ProfileDestination),
     GroupLibrary(TabId),
     GroupRecent(TabId),
@@ -39,6 +41,7 @@ impl Search {
             Self::Window => "Search commands",
             Self::Tabs => "Search tabs",
             Self::CommandHistory => "Search commands across panes",
+            Self::RunningCommands => "Search running commands",
             Self::Profiles(ProfileDestination::Tab) => "Search profiles",
             Self::Profiles(ProfileDestination::Split {
                 axis: Axis::Columns,
@@ -77,6 +80,10 @@ impl Search {
                 "No retained commands in this window"
             }
             Self::CommandHistory => "No matching commands in this window",
+            Self::RunningCommands if query.trim().is_empty() => {
+                "No running shell commands in this window"
+            }
+            Self::RunningCommands => "No matching running commands",
             Self::Profiles(_) => "No matching profiles",
             Self::Bookmarks(..) if query.is_empty() => "No retained scrollback bookmarks",
             Self::Bookmarks(..) => "No matching scrollback bookmarks",
@@ -127,6 +134,7 @@ pub enum CommandId {
     SearchWindowGroupRuns(WindowRunScope),
     WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(TabId),
+    FocusRunningCommand(u64, u64, u64, std::time::Instant),
     OpenWindowCommand(
         u64,
         w11term::events::CommandLink,
@@ -882,6 +890,10 @@ impl TerminalApp {
                 return;
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
+            CommandId::FocusRunningCommand(pane, generation, command, started) => {
+                self.focus_running_command(pane, generation, command, started, ctx);
+                return;
+            }
             CommandId::OpenWindowCommand(pane, link, hit) => {
                 if !self.open_command_history_preview(pane, Some(link), hit, history_search, ctx) {
                     self.window_error =
@@ -1020,6 +1032,7 @@ pub(super) fn view(
         mode,
         Search::Tabs
             | Search::CommandHistory
+            | Search::RunningCommands
             | Search::Profiles(_)
             | Search::GroupRecent(_)
             | Search::GroupRuns(_)
@@ -1049,6 +1062,7 @@ pub(super) fn view(
                 .automation_name(match mode {
                     Search::Tabs => "Close tab search",
                     Search::CommandHistory => "Close command history search",
+                    Search::RunningCommands => "Close running command search",
                     Search::Profiles(_) => "Close profile search",
                     Search::Bookmarks(..) => "Close bookmark search",
                     _ => "Close command palette",

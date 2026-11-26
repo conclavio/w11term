@@ -225,12 +225,27 @@ try {
         }
     }
     Wait-Focus $remote
+    Run-Palette ('Find running commands' + [char]0x2026)
+    Wait-PickerEditor 'Search running commands' 'the running command picker'
+    $field = Find-Element 'Search running commands' ([System.Windows.Automation.ControlType]::Edit)
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('HISTORY_INSPECT_GATE')
+    $null = Wait-Until 'the background PowerShell command appears with elapsed time' {
+        $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons) |
+            Where-Object { $_.Current.Name.StartsWith($diagnostic) -and $_.Current.Name -match '    [0-9]+ s$' } |
+            Select-Object -First 1
+    }
     [IO.File]::WriteAllText($env:W11TERM_HISTORY_INSPECT_GATE, 'finish')
     $null = Wait-Until 'PowerShell completes the inspected capture' {
         $m = Control @('inspect','--pane',"$pane")
         $h = Control @('list-commands','--pane',"$pane")
         !$m.running_command -and $h.commands[0].id -eq $running.id -and $h.commands[0].command -ceq $diagnostic
     }
+    $null = Wait-Until 'completion removes the result from the open running command picker' {
+        Find-Element 'No matching running commands'
+    }
+    Press-Key 0x1b
+    $null = Wait-Until 'Escape closes the running command picker' { !(Find-Element 'Search running commands') }
+    Wait-Focus $remote
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
