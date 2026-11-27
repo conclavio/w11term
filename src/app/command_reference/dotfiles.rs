@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use w11term::events::DotfileSyncStatus;
 use w11term::sftp::{DotfileBundle, DotfileShell, validate_zdotdir};
 
+mod comparison;
 mod history;
+use comparison::{Comparison, code_details};
 
 pub enum Action {
     Open(ToolPane),
@@ -28,6 +30,7 @@ pub struct Review {
     directories_to_create: Vec<String>,
     files: Vec<Edit>,
     supports_atomic_replace: bool,
+    fragment_changes: Comparison,
     review: String,
 }
 
@@ -37,6 +40,9 @@ struct Edit {
     action: String,
     before_sha256: Option<String>,
     after_sha256: Option<String>,
+    hook: Option<String>,
+    #[serde(default)]
+    add_newline_before_hook: bool,
 }
 
 impl Edit {
@@ -107,7 +113,23 @@ impl Review {
                     edit.path
                 ),
             ));
+            if matches!(edit.action.as_str(), "create" | "append-hook")
+                && let Some(hook) = &edit.hook
+            {
+                if edit.add_newline_before_hook {
+                    fields.push(detail(
+                        format!("hook-newline-{index}"),
+                        format!("A newline will be added before the hook in {}", edit.path),
+                    ));
+                }
+                fields.push(code_details(
+                    format!("startup-hook-{index}"),
+                    &format!("Startup hook · {}", edit.path),
+                    hook,
+                ));
+            }
         }
+        self.fragment_changes.describe(fields);
     }
 }
 
@@ -277,9 +299,10 @@ impl Installer {
                 || Action::Preview,
             ),
         ));
+        let mut footer = Vec::with_capacity(2);
         if let Some(review) = &self.review {
             review.describe(&mut fields);
-            fields.push(KeyedView::new(
+            footer.push(KeyedView::new(
                 "apply",
                 button("Apply reviewed dotfiles", ready && review.ready(), || {
                     Action::Apply
@@ -308,18 +331,33 @@ impl Installer {
         }) {
             fields.push(detail("status", status));
         }
-        fields.push(KeyedView::new(
+        footer.push(KeyedView::new(
             "back",
             button("Back to command reference", !self.applying(), || {
                 Action::Close
             }),
         ));
-        ScrollViewer::new().content(
-            StackPanel::new()
-                .margin(12.0)
-                .spacing(8.0)
-                .keyed_children(fields),
-        )
+        Grid::new()
+            .rows([GridLength::Star(1.0), GridLength::Auto])
+            .keyed_children([
+                KeyedView::new(
+                    "review",
+                    ScrollViewer::new().grid_row(0).content(
+                        StackPanel::new()
+                            .margin(12.0)
+                            .spacing(8.0)
+                            .keyed_children(fields),
+                    ),
+                ),
+                KeyedView::new(
+                    "actions",
+                    StackPanel::new()
+                        .grid_row(1)
+                        .margin(12.0)
+                        .spacing(8.0)
+                        .keyed_children(footer),
+                ),
+            ])
     }
 }
 

@@ -1264,6 +1264,8 @@ Direct pipe clients send
 
 From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle, Bash or Zsh, and an optional startup directory for Zsh. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
 
+Expand **Environment fragment changes** or **Prompt fragment changes** to review the lines that will be added and removed. Expand a proposed **Startup hook** to see the generated block in context of its target path. The review omits unrelated startup-file contents. If the active managed fragments cannot be verified, the review identifies that condition and shows the proposed lines. A verified active fragment that changes after review makes the confirmation stale.
+
 `sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
 
 Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
@@ -1291,6 +1293,8 @@ In `result.sftp`, `directories_to_create` names missing managed directories and 
 Pass the returned `review` token to apply on the same pane with the same bundle, shell and optional `--zdotdir`. If either the plan or the SFTP connection changed, preview again. Apply checks for conflicts and atomic replacement support before writing. It stages fragments in a directory named for `bundle_sha256` under `~/.config/w11term/dotfiles/`, installs the startup hooks, then switches the shell’s active bundle with a single file rename. New shells use that version. A failed activation can leave staged files, which a fresh preview can reuse. Older bundle directories are retained.
 
 Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_files`. An unchanged bundle returns an empty list. A missing fragment becomes an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields. Use `"op":"apply-dotfiles"` plus the returned `"review"` for the reviewed installation.
+
+Install and switch previews include `fragment_changes`. Its `baseline` is `verified`, `inactive`, or `unavailable`, and each entry in `fragments` includes its `role` and complete managed `before` and `after` text. A null side has no verified text for that state. An empty string is an empty managed fragment. Disable previews have null proposed text, and resuming a held version shows matching before and after text.
 
 ### Restore or disable SSH dotfiles
 

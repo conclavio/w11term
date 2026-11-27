@@ -335,6 +335,8 @@ The SSH dotfiles editor can create a bundle locally or revise an existing bundle
 
 For an already connected SSH pane, **More → Command reference → Apply SSH dotfiles** reviews and applies a bundle on that connection. The review shows the target home, managed files, startup hooks, and conflicts. Open a new shell to use the installed fragments. [Reviewed dotfile installation](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
+Install and version reviews show which lines change in the managed environment and prompt fragments. The install review also shows the generated startup hooks it will add. [Dotfile content review](../CONTROL.md#preview-and-apply-ssh-dotfiles)
+
 **Dotfile versions** lists the active and retained versions for Bash or Zsh. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 
 From that pane, **More → Command reference** shows both login sync results for the current connection. **Apply SSH dotfiles** shows the reason when dotfiles sync was skipped or unconfirmed. The command manual can show the managed launcher path. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)

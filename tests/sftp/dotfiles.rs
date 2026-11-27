@@ -78,6 +78,16 @@ async fn preview_dotfiles_preserves_existing_startup_files_and_reports_hook_drif
     assert_eq!(plan["home"], "/");
     assert_eq!(plan["shell"], "bash");
     assert_eq!(plan["supports_atomic_replace"], true);
+    assert_eq!(
+        plan["fragment_changes"],
+        json!({
+            "baseline": "inactive",
+            "fragments": [
+                {"role": "environment", "before": null, "after": "export PROJECT=local\n"},
+                {"role": "prompt", "before": null, "after": "PS1='managed> '\n"},
+            ]
+        })
+    );
     let id = plan["bundle_sha256"].as_str().unwrap();
     let version_dir = format!(".config/w11term/dotfiles/bash-{id}");
     assert_eq!(
@@ -99,12 +109,14 @@ async fn preview_dotfiles_preserves_existing_startup_files_and_reports_hook_drif
     let login = file(&plan, "/.bash_profile");
     let login_hook = login["hook"].as_str().unwrap();
     assert_eq!(login["action"], "append-hook");
+    assert_eq!(login["add_newline_before_hook"], true);
     assert_eq!(
         login["after_sha256"],
         digest(&format!("source ~/.bashrc\n{login_hook}"))
     );
     let rc = file(&plan, "/.bashrc");
     let rc_hook = rc["hook"].as_str().unwrap();
+    assert!(rc.get("add_newline_before_hook").is_none());
     assert!(rc_hook.contains("case $- in *i*)"));
     assert!(rc_hook.contains("/prompt.sh\""));
     assert!(rc_hook.contains("bash-current"));
@@ -269,12 +281,49 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     );
 
     let no_changes = guarded_job(&pane, None, preview("first")).await.unwrap();
+    let prompt_delta = &no_changes["fragment_changes"]["fragments"][1];
+    assert_eq!(no_changes["fragment_changes"]["baseline"], "verified");
+    assert_eq!(prompt_delta["before"], prompt_delta["after"]);
     let checked = guarded_job(&pane, None, apply("first", &no_changes))
         .await
         .unwrap();
     assert_eq!(checked["changed_files"], json!([]));
 
     let second = guarded_job(&pane, None, preview("second")).await.unwrap();
+    assert_eq!(
+        second["fragment_changes"]["fragments"][1],
+        json!({"role": "prompt", "before": "PS1='first> '\n", "after": "PS1='second> '\n"})
+    );
+    let first_prompt = version.join("prompt.sh");
+    fs::write(&first_prompt, "# edited outside w11term\n").unwrap();
+    let error = guarded_job(&pane, None, apply("second", &second))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    let without_baseline = guarded_job(&pane, None, preview("second")).await.unwrap();
+    assert_eq!(
+        without_baseline["fragment_changes"]["baseline"],
+        "unavailable"
+    );
+    assert!(without_baseline["fragment_changes"]["fragments"][1]["before"].is_null());
+    assert_eq!(
+        without_baseline["fragment_changes"]["fragments"][1]["after"],
+        "PS1='second> '\n"
+    );
+    assert!(
+        !without_baseline
+            .to_string()
+            .contains("edited outside w11term")
+    );
+    assert!(
+        !managed
+            .join(format!(
+                "bash-{}",
+                second["bundle_sha256"].as_str().unwrap()
+            ))
+            .exists()
+    );
+    fs::write(&first_prompt, "PS1='first> '\n").unwrap();
     fs::write(root.join("deny-editor-rename"), []).unwrap();
     let error = guarded_job(&pane, None, apply("second", &second))
         .await
@@ -316,10 +365,13 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     assert_eq!(restore["bundle_sha256"], id);
     assert_eq!(restore["selector"]["action"], "replace");
     assert_eq!(
+        restore["fragment_changes"]["fragments"][1],
+        json!({"role": "prompt", "before": "PS1='second> '\n", "after": "PS1='first> '\n"})
+    );
+    assert_eq!(
         fs::read_to_string(&selector).unwrap(),
         format!("{new_id}\n")
     );
-    let first_prompt = version.join("prompt.sh");
     fs::write(&first_prompt, "PS1='drift> '\n").unwrap();
     let error = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
         .await
@@ -332,6 +384,10 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     fs::write(&first_prompt, "PS1='first> '\n").unwrap();
 
     let disable = guarded_job(&pane, None, switch(None, None)).await.unwrap();
+    assert_eq!(
+        disable["fragment_changes"]["fragments"][1],
+        json!({"role": "prompt", "before": "PS1='second> '\n", "after": null})
+    );
     let disabled = guarded_job(&pane, None, switch(None, Some(&disable)))
         .await
         .unwrap();
@@ -352,6 +408,8 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         .await
         .unwrap();
     assert!(restore["active_bundle_sha256"].is_null());
+    assert_eq!(restore["fragment_changes"]["baseline"], "inactive");
+    assert!(restore["fragment_changes"]["fragments"][1]["before"].is_null());
     let restored = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
         .await
         .unwrap();
@@ -378,6 +436,10 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     assert_eq!(reviewed["active_bundle_sha256"], id);
     assert_eq!(reviewed["bundle_sha256"], id);
     assert_eq!(reviewed["selector"]["action"], "replace");
+    assert_eq!(
+        reviewed["fragment_changes"]["fragments"][1],
+        json!({"role": "prompt", "before": "PS1='first> '\n", "after": "PS1='first> '\n"})
+    );
     assert_eq!(
         fs::read_to_string(&selector).unwrap(),
         format!("{id}\nmanual\n")

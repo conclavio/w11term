@@ -31,6 +31,26 @@ function Wait-Review {
         (Find-Element $target) -and (Find-Element 'SFTP home /') -and $apply -and $apply.Current.IsEnabled
     }
 }
+function Expand-ReviewDetail([string]$Name) {
+    $search = @{ scroll = $null }
+    try {
+        $null = Wait-Until "visible '$Name' details" {
+            $element = Find-Element $Name $button
+            if ($element -and !$element.Current.IsOffscreen) { return $element }
+            Move-NativeControlIntoView $element $search
+        }
+        Set-NativeExpansion $Name $true
+    } catch {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $controls = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition) | Where-Object {
+                $_.Current.Name -like '*hook*' -or $_.Current.Name -like '*fragment*'
+            } | ForEach-Object {
+                "$($_.Current.ControlType.ProgrammaticName) [$($_.Current.Name)] offscreen=$($_.Current.IsOffscreen) expand=$($_.GetSupportedPatterns().ProgrammaticName -contains 'ExpandCollapsePatternIdentifiers.Pattern')"
+            }
+        throw "$_ Review controls $($controls -join ' | ')"
+    }
+}
 function Select-RetainedDotfile([int]$Pane, [string]$Id) {
     $report = (Control @('sftp','--pane',"$Pane",'list-dotfile-versions','--shell','bash')).sftp
     $version = $report.versions | Where-Object bundle_sha256 -ceq $Id
@@ -89,6 +109,16 @@ try {
         !(Find-Element "Create${dot}/.profile") -or [IO.Directory]::Exists($remoteStore)) {
         throw 'The read-only review did not describe the actual startup changes'
     }
+    Expand-ReviewDetail "Startup hook${dot}/.bashrc"
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'first review shows the new hook and added prompt line' {
+        $labels = Get-NativeTextLabels
+        ($labels | Where-Object { $_.Contains('# >>> w11term dotfiles >>>') -and $_.Contains('bash-current') }) -and
+            ($labels | Where-Object { $_.Contains("Added line 1${dot}PS1='reviewed> '") })
+    }
+    if (Get-NativeTextLabels | Where-Object { $_.Contains('# keep my local shell settings') }) {
+        throw 'The dotfiles review exposed unrelated startup-file contents'
+    }
     $null = Control @('focus-pane','--pane',"$localPane")
     Wait-Focus $localPane
     $null = Wait-Until 'the other pane cannot apply this review' {
@@ -137,6 +167,12 @@ try {
     Write-Bundle 'second'
     Click 'Review dotfiles changes'
     Wait-Review
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'install review compares the active and proposed prompt lines' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains("Removed line 1${dot}PS1='verified> '") -and $_.Contains("Added line 1${dot}PS1='second> '")
+        }
+    }
     Click 'Apply reviewed dotfiles'
     $null = Wait-Until 'a second version is active' { Find-Element "Dotfiles applied${dot}3 files changed" }
     $second = [IO.File]::ReadAllText($selectorPath).Trim()
@@ -149,6 +185,12 @@ try {
     $null = Wait-Until 'restore reviews the before and after versions' {
         (Find-Element "Reviewed active version $second") -and (Find-Element "Restore version $first") -and
             (Find-Element 'This choice pauses automatic dotfile sync on reconnect.')
+    }
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'restore review shows the inverse prompt changes' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains("Removed line 1${dot}PS1='second> '") -and $_.Contains("Added line 1${dot}PS1='verified> '")
+        }
     }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
@@ -188,6 +230,12 @@ try {
     $null = Wait-Until 'disable confirmation stays visible in the short window' {
         (Find-Element 'Disable managed dotfiles for new shells') -and
             (Find-Element 'Disable reviewed dotfiles' $button -Visible)
+    }
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'disable review shows the prompt that will stop loading' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains("Removed line 1${dot}PS1='verified> '") -and !$_.Contains('Added line')
+        }
     }
     Click 'Disable reviewed dotfiles'
     $null = Wait-Until 'history shows disabled dotfiles' { Find-Element 'Managed dotfiles disabled' }

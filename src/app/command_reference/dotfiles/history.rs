@@ -9,6 +9,7 @@ pub enum Action {
     ReviewDisable,
     ReviewResume,
     Apply,
+    Reviewed(Arc<()>, Result<Box<SwitchReview>, String>),
     Completed(Arc<()>, Result<serde_json::Value, String>),
     Back,
 }
@@ -17,16 +18,17 @@ pub enum Action {
 pub(super) struct Panel {
     listing: Option<DotfileVersions>,
     selected: Option<usize>,
-    review: Option<SwitchReview>,
+    review: Option<Box<SwitchReview>>,
 }
 
 #[derive(Deserialize)]
-struct SwitchReview {
+pub struct SwitchReview {
     home: String,
     target: DotfileTarget,
     active_bundle_sha256: Option<String>,
     selector: Edit,
     supports_atomic_replace: bool,
+    fragment_changes: Comparison,
     review: String,
 }
 
@@ -229,6 +231,7 @@ impl Panel {
                     review.selector.path
                 ),
             ));
+            review.fragment_changes.describe(&mut fields);
             footer.push(KeyedView::new(
                 "apply-switch",
                 button(
@@ -394,11 +397,18 @@ impl TerminalApp {
                         },
                     ))
                 }
+                Action::Reviewed(ticket, result) => {
+                    if installer.finish(&ticket, Work::ReviewSwitch) {
+                        match result {
+                            Ok(review) => installer.history.as_mut().unwrap().review = Some(review),
+                            Err(error) => installer.status = Some(error),
+                        }
+                    }
+                    None
+                }
                 Action::Completed(ticket, result) => {
-                    let Some((
-                        _,
-                        work @ (Work::ListVersions | Work::ReviewSwitch | Work::SwitchVersion),
-                    )) = installer.pending.as_ref()
+                    let Some((_, work @ (Work::ListVersions | Work::SwitchVersion))) =
+                        installer.pending.as_ref()
                     else {
                         return;
                     };
@@ -410,10 +420,6 @@ impl TerminalApp {
                     match work {
                         Work::ListVersions => match decode(result) {
                             Ok(listing) => history.listing = Some(listing),
-                            Err(error) => installer.status = Some(error),
-                        },
-                        Work::ReviewSwitch => match decode(result) {
-                            Ok(review) => history.review = Some(review),
                             Err(error) => installer.status = Some(error),
                         },
                         Work::SwitchVersion => match decode::<Switched>(result) {
@@ -472,10 +478,17 @@ impl Installer {
             self.review = None;
         }
         let ticket = self.begin(work);
-        let rejected = send(Action::Completed(
+        let complete = move |ticket, result| {
+            if work == Work::ReviewSwitch {
+                send(Action::Reviewed(ticket, decode(result)))
+            } else {
+                send(Action::Completed(ticket, result))
+            }
+        };
+        let rejected = complete(
             ticket.clone(),
             Err("Dotfile version worker unavailable".into()),
-        ));
+        );
         ctx.spawn_background_with_rejection(
             move |scope| {
                 let result = if scope.is_cancelled() {
@@ -483,7 +496,7 @@ impl Installer {
                 } else {
                     run_pane_sftp_job(input, target, operation, Duration::from_secs(30), None)
                 };
-                send(Action::Completed(ticket, result))
+                complete(ticket, result)
             },
             rejected,
         );
