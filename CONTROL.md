@@ -1391,6 +1391,8 @@ $plan = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools
 
 Installation verifies the uploaded files over SFTP and publishes the version under `~/.local/share/w11term/tools/<name>/versions/<sha256>/`. It adds launchers to the bundle's `bin_directory`, preserving entries already owned by the account. Add that directory to the shell's `PATH` if the preview reports it missing. Keep the bin directory fixed across versions of one named bundle. The installer reuses a verified copy when the requested version is already present and copies unchanged tools from the active version when building a new one. The `previous_bundle_sha256` in an update reply identifies the version to restore.
 
+For a retained version, w11term can calculate the hashes on the verified SSH host using `head` and `sha256sum`. It checks the manifest and file metadata through SFTP and falls back to hashing the bytes over SFTP when the remote checksum command is unavailable.
+
 ```powershell
 $restore = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-rollback my-tools $previousSha256 | ConvertFrom-Json).result.sftp
 & $ctl --pid 12345 sftp --pane $pane rollback-tool-bundle my-tools $previousSha256 --review $restore.review

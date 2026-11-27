@@ -241,6 +241,22 @@ impl server::Handler for Peer {
         command: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if let Some(args) = std::str::from_utf8(command).ok().and_then(|command| {
+            command
+                .split_once("' w11term-tools-sha256 ")
+                .map(|(_, args)| args)
+        }) {
+            let Some(report) = utilities::tool_digest_report(&self.root, args)? else {
+                s.channel_failure(c)?;
+                return Ok(());
+            };
+            s.channel_success(c)?;
+            s.data(c, report.into_bytes())?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
         if command.starts_with(b"/bin/sh -c 'exec 9<")
             && self.root.join("utility-probe-response").is_file()
         {

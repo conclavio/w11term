@@ -1,6 +1,8 @@
 use super::*;
 use russh::ChannelMsg;
 
+mod remote_digest;
+
 const MANIFEST: &str = ".w11term-manifest.json";
 const MANIFEST_LIMIT: text_preview::PreviewLimit = text_preview::PreviewLimit {
     bytes: MAX_MANIFEST,
@@ -280,7 +282,7 @@ impl Engine {
             self.check_launchers(&plan.home, store, &plan.release).await?;
             let version_path = format!("{store}/versions/{id}");
             let (uploaded, copied_tools) = if self.utility_lstat(&version_path).await?.is_some() {
-                self.verify_utility_release(store, &plan.release.name, plan.release.architecture, id).await?;
+                self.verify_utility_release(session, store, &plan.release.name, plan.release.architecture, id).await?;
                 (false, Vec::new())
             } else {
                 let copied = self.stage_utility_release(plan, id).await?;
@@ -325,7 +327,7 @@ impl Engine {
         );
         let selector = self.utility_selector_state(&store, &plan).await?;
         let release = self
-            .verify_utility_release(&store, &name, host.architecture, &id)
+            .verify_utility_release(session, &store, &name, host.architecture, &id)
             .await?;
         let bin = self
             .utility_directories(&home, &release.bin_directory)
@@ -359,7 +361,7 @@ impl Engine {
         self.check_entry_parent(&store).await?;
         with_lock(session, &store, async {
             self.check_selector(&store, &selector).await?;
-            self.verify_utility_release(&store, &name, host.architecture, &id)
+            self.verify_utility_release(session, &store, &name, host.architecture, &id)
                 .await?;
             self.create_launchers(&home, &store, &release, &bin).await?;
             let changed = self
@@ -524,6 +526,7 @@ impl Engine {
 
     async fn verify_utility_release(
         &self,
+        session: &Ssh,
         store: &str,
         name: &str,
         architecture: UtilityArchitecture,
@@ -533,9 +536,14 @@ impl Engine {
             .utility_release_manifest(store, name, Some(architecture), id)
             .await?;
         let directory = format!("{store}/versions/{id}");
-        for tool in &release.tools {
-            self.verify_tool_file(&format!("{directory}/{}", tool.name), tool)
-                .await?;
+        if !self
+            .verify_release_over_ssh(session, &directory, &release)
+            .await?
+        {
+            for tool in &release.tools {
+                self.verify_tool_file(&format!("{directory}/{}", tool.name), tool)
+                    .await?;
+            }
         }
         Ok(release)
     }
@@ -577,11 +585,7 @@ impl Engine {
     }
 
     async fn verify_tool_file(&self, path: &str, tool: &StoredTool) -> Result<()> {
-        let attrs = self.raw.lstat(path).await?.attrs;
-        ensure!(
-            valid_tool_permissions(&attrs),
-            "Managed executable permissions changed at {path}"
-        );
+        self.tool_file_attrs(path).await?;
         let actual = self
             .remote_sha256(path, Some(tool.bytes), None, true)
             .await?;
@@ -590,6 +594,15 @@ impl Engine {
             "Managed executable contents changed at {path}"
         );
         Ok(())
+    }
+
+    async fn tool_file_attrs(&self, path: &str) -> Result<FileAttributes> {
+        let attrs = self.raw.lstat(path).await?.attrs;
+        ensure!(
+            valid_tool_permissions(&attrs),
+            "Managed executable permissions changed at {path}"
+        );
+        Ok(attrs)
     }
 
     async fn create_utility_directories(&self, plan: &DirectoryPlan) -> Result<()> {

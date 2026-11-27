@@ -220,12 +220,23 @@ impl Host {
 }
 
 async fn probe(session: &russh::client::Handle<crate::ssh::Handler>) -> Result<Host> {
+    let (bytes, _) = tool_exec_report(session, PROBE, Duration::from_secs(8))
+        .await
+        .context("Running the remote Linux compatibility probe")?;
+    Host::parse(&bytes)
+}
+
+async fn tool_exec_report(
+    session: &russh::client::Handle<crate::ssh::Handler>,
+    command: &str,
+    timeout: Duration,
+) -> Result<(Vec<u8>, usize)> {
     use russh::ChannelMsg;
 
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(timeout, async {
         let mut pending = PendingChannel(Some(session.channel_open_session().await?));
         let channel = pending.0.as_mut().expect("opened channel");
-        channel.exec(true, PROBE).await?;
+        channel.exec(true, command).await?;
         let mut bytes = Vec::new();
         let mut stderr = 0;
         let mut exited = None;
@@ -235,7 +246,7 @@ async fn probe(session: &russh::client::Handle<crate::ssh::Handler>) -> Result<H
                 Some(ChannelMsg::Data { data }) => {
                     ensure!(
                         bytes.len() + data.len() <= MAX_PROBE,
-                        "Remote tool probe output exceeded 16 KiB"
+                        "Remote tool command output exceeded 16 KiB"
                     );
                     bytes.extend_from_slice(&data);
                 }
@@ -243,10 +254,10 @@ async fn probe(session: &russh::client::Handle<crate::ssh::Handler>) -> Result<H
                     stderr += data.len();
                     ensure!(
                         stderr <= MAX_PROBE,
-                        "Remote tool probe error output exceeded 16 KiB"
+                        "Remote tool command error output exceeded 16 KiB"
                     );
                 }
-                Some(ChannelMsg::Failure) => bail!("Server refused the SSH host probe"),
+                Some(ChannelMsg::Failure) => bail!("Server refused the SSH tool command"),
                 Some(ChannelMsg::ExitStatus { exit_status }) => exited = Some(exit_status),
                 Some(ChannelMsg::Eof) => eof = true,
                 Some(ChannelMsg::Close) | None => break,
@@ -258,12 +269,12 @@ async fn probe(session: &russh::client::Handle<crate::ssh::Handler>) -> Result<H
         }
         ensure!(
             exited == Some(0),
-            "Remote Linux compatibility probe did not exit successfully"
+            "Remote tool command did not exit successfully"
         );
-        Host::parse(&bytes)
+        Ok((bytes, stderr))
     })
     .await
-    .context("Remote Linux compatibility probe timed out")?
+    .context("Remote tool command timed out")?
 }
 
 #[derive(Default, Serialize)]

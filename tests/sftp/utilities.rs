@@ -1,5 +1,6 @@
 use super::*;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use w11term::sftp::{
     Operation, UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityDownload, UtilityTool,
 };
@@ -25,6 +26,47 @@ fn probe_response(root: &std::path::Path, arch: &str, home: &str, path: &str) {
         format!("SSH banner\nw11term-tools-v1\nLinux\n{arch}\n{home}\n{path}\nglibc 2.36\n"),
     )
     .unwrap();
+}
+
+pub(super) fn tool_digest_report(
+    root: &std::path::Path,
+    args: &str,
+) -> anyhow::Result<Option<String>> {
+    let mode = fs::read_to_string(root.join("utility-digest-mode")).unwrap_or_default();
+    if mode.is_empty() || mode == "refused" {
+        return Ok(None);
+    }
+    if mode == "malformed" {
+        return Ok(Some("w11term-tools-sha256-v1\npartial result\n".into()));
+    }
+    let unquote = |token: &str| -> String {
+        token
+            .strip_prefix('\'')
+            .unwrap()
+            .strip_suffix('\'')
+            .unwrap()
+            .to_owned()
+    };
+    // This fixture uses a home and tool names without any embedded spaces or quotes.
+    let mut args = args.split_ascii_whitespace();
+    let directory = unquote(args.next().unwrap());
+    assert!(directory.starts_with("/.local/share/w11term/tools/"));
+    let directory = root.join(directory.trim_start_matches('/'));
+    let mut report = String::from("fixture banner\nw11term-tools-sha256-v1\n");
+    while let Some(file) = args.next() {
+        let file = unquote(file);
+        let limit: u64 = args.next().unwrap().parse()?;
+        let mut bytes = Vec::new();
+        fs::File::open(directory.join(&file))?
+            .take(limit)
+            .read_to_end(&mut bytes)?;
+        if mode == "different-manifest" && file == ".w11term-manifest.json" {
+            writeln!(report, "{:064x}", 0)?;
+        } else {
+            writeln!(report, "{}", tool_sha256(&bytes))?;
+        }
+    }
+    Ok(Some(report))
 }
 
 // Minimal ELF programs for Linux x86-64 and AArch64 that exit with status 0.
@@ -65,6 +107,20 @@ fn executable(architecture: UtilityArchitecture, interpreter: Option<&str>) -> V
     bytes
 }
 
+fn sftp_opened_tool(trace: &std::path::Path) -> bool {
+    fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .any(|line| line.starts_with("OPEN ") && line.ends_with("/rg"))
+}
+
+fn tool_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn build(
     directory: &std::path::Path,
     filename: &str,
@@ -76,10 +132,7 @@ fn build(
     UtilityBuild {
         architecture,
         path,
-        sha256: Sha256::digest(&content)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
+        sha256: tool_sha256(&content),
         release: None,
         download: None,
     }
@@ -298,6 +351,70 @@ async fn utility_install_uses_a_verified_download_cache_without_network() {
         .join(release)
         .join("rg");
     assert_eq!(fs::read(installed_path).unwrap(), bytes);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_tool_verification_uses_server_hashes_with_sftp_fallback() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "x86_64", "/", "/usr/bin:/.local/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let trace = remote.join("transfer-trace");
+    let mode = remote.join("utility-digest-mode");
+    let mut bytes = executable(UtilityArchitecture::X86_64, None);
+    bytes.resize(128 * 1024, 0);
+    let operation = || {
+        preview(vec![build(
+            local.path(),
+            "rg",
+            UtilityArchitecture::X86_64,
+            bytes.clone(),
+        )])
+    };
+    let preview = guarded_job(&pane, None, operation()).await.unwrap();
+    guarded_job(&pane, None, apply(operation(), &preview))
+        .await
+        .unwrap();
+    let reviewed = guarded_job(&pane, None, operation()).await.unwrap();
+    let installed_path = remote
+        .join(
+            reviewed["version_directory"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches('/'),
+        )
+        .join("rg");
+    for (behavior, expects_read) in [
+        ("valid", false),
+        ("refused", true),
+        ("malformed", true),
+        ("different-manifest", true),
+    ] {
+        fs::write(&mode, behavior).unwrap();
+        fs::write(&trace, []).unwrap();
+        let checked = guarded_job(&pane, None, apply(operation(), &reviewed))
+            .await
+            .unwrap();
+        assert_eq!(checked["uploaded"], false);
+        assert_eq!(checked["changed"], false);
+        assert_eq!(sftp_opened_tool(&trace), expects_read, "{behavior}");
+    }
+
+    fs::write(&mode, "valid").unwrap();
+    fs::write(&trace, []).unwrap();
+    let mut changed = bytes.clone();
+    changed[255] = 17;
+    fs::write(&installed_path, changed).unwrap();
+    let error = guarded_job(&pane, None, apply(operation(), &reviewed))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("Managed executable contents changed"),
+        "{error}"
+    );
+    assert!(!sftp_opened_tool(&trace));
     server.abort();
 }
 
@@ -754,8 +871,15 @@ async fn tool_sync_skips_scope_changes_and_preserves_edited_startup_hooks() {
         .unwrap()
         .replace("export PATH", "export PATH # user edit");
     fs::write(&path, &changed).unwrap();
+    fs::write(root.join("utility-digest-mode"), "valid").unwrap();
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
     let pane = connect_tools(&options);
     wait_tool_login(&pane, 1, "current", Some("skipped")).await;
+    assert!(
+        !sftp_opened_tool(&trace),
+        "repeat login should keep the bytes on the remote host"
+    );
     assert_eq!(fs::read_to_string(path).unwrap(), changed);
 
     let zdotdir = root.join("config/zsh");
