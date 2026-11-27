@@ -103,13 +103,17 @@ impl TimelineComparison {
     }
 
     pub fn occupied_interval(&self, side: usize, index: usize) -> Option<Range<i128>> {
+        if self.buckets.get(index)?.observation(side)?.packets == 0 {
+            return None;
+        }
+        self.source_interval(side, index)
+    }
+
+    pub fn source_interval(&self, side: usize, index: usize) -> Option<Range<i128>> {
         let origin = [self.before_origin_unix_ns, self.after_origin_unix_ns]
             .get(side)
             .copied()
             .flatten()?;
-        if self.buckets.get(index)?.observation(side)?.packets == 0 {
-            return None;
-        }
         let interval = self.offset_interval(index)?;
         Some(origin + interval.start..origin + interval.end)
     }

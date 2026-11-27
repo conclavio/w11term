@@ -38,7 +38,8 @@ pub use triage::packet_capture::{
     ConversationEndpoints as PacketConversationEndpoints, LocalCapture as LocalPacketCapture,
     Plan as PacketCapturePlan, ip_protocol_label, open_capture_conversation_in_wireshark,
     open_capture_conversation_interval_in_wireshark, open_capture_in_wireshark,
-    open_capture_interval_in_wireshark, open_capture_transport_in_wireshark,
+    open_capture_interval_in_wireshark, open_capture_pair_in_wireshark,
+    open_capture_transport_in_wireshark,
 };
 pub use triage::syscall_capture::{Capture as SyscallCapture, Plan as SyscallCapturePlan};
 pub use triage::{

@@ -448,8 +448,7 @@ pub fn open_capture_conversation_in_wireshark(
     a: IpAddr,
     b: IpAddr,
 ) -> Result<u32> {
-    let filter = wireshark_conversation_filter(a, b)?;
-    launch_wireshark(path, executable, Some(&filter))
+    open_capture_pair_in_wireshark(path, executable, ConversationEndpoints::Ip { a, b }, None)
 }
 
 pub fn open_capture_conversation_interval_in_wireshark(
@@ -459,8 +458,12 @@ pub fn open_capture_conversation_interval_in_wireshark(
     b: IpAddr,
     interval: Range<i128>,
 ) -> Result<u32> {
-    let filter = wireshark_conversation_interval_filter(a, b, interval)?;
-    launch_wireshark(path, executable, Some(&filter))
+    open_capture_pair_in_wireshark(
+        path,
+        executable,
+        ConversationEndpoints::Ip { a, b },
+        Some(interval),
+    )
 }
 
 pub fn open_capture_transport_in_wireshark(
@@ -470,18 +473,41 @@ pub fn open_capture_transport_in_wireshark(
     a: SocketAddr,
     b: SocketAddr,
 ) -> Result<u32> {
-    let filter = wireshark_transport_filter(protocol, a, b)?;
+    open_capture_pair_in_wireshark(
+        path,
+        executable,
+        ConversationEndpoints::Transport { protocol, a, b },
+        None,
+    )
+}
+
+pub fn open_capture_pair_in_wireshark(
+    path: &Path,
+    executable: &Path,
+    endpoints: ConversationEndpoints,
+    interval: Option<Range<i128>>,
+) -> Result<u32> {
+    let filter = wireshark_pair_filter(endpoints, interval)?;
     launch_wireshark(path, executable, Some(&filter))
 }
 
-fn wireshark_conversation_interval_filter(
-    a: IpAddr,
-    b: IpAddr,
-    interval: Range<i128>,
+fn wireshark_pair_filter(
+    endpoints: ConversationEndpoints,
+    interval: Option<Range<i128>>,
 ) -> Result<String> {
-    let conversation = wireshark_conversation_filter(a, b)?;
-    let interval = wireshark_interval_filter(interval)?;
-    Ok(format!("({conversation}) && ({interval})"))
+    let conversation = match endpoints {
+        ConversationEndpoints::Ip { a, b } => wireshark_conversation_filter(a, b),
+        ConversationEndpoints::Transport { protocol, a, b } => {
+            wireshark_transport_filter(protocol, a, b)
+        }
+    }?;
+    match interval {
+        Some(interval) => Ok(format!(
+            "({conversation}) && ({})",
+            wireshark_interval_filter(interval)?
+        )),
+        None => Ok(conversation),
+    }
 }
 
 // Wireshark numbers layers separately for IPv4 and IPv6. The prefix consumes
@@ -938,7 +964,11 @@ mod tests {
         let a = "192.0.2.1".parse().unwrap();
         let b = "192.0.2.2".parse().unwrap();
         assert_eq!(
-            wireshark_conversation_interval_filter(a, b, 1_966_080_000..2_097_152_000).unwrap(),
+            wireshark_pair_filter(
+                ConversationEndpoints::Ip { a, b },
+                Some(1_966_080_000..2_097_152_000)
+            )
+            .unwrap(),
             concat!(
                 r#"(frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip(?::|$)" && "#,
                 "((ip.src#1 == 192.0.2.1 && ip.dst#1 == 192.0.2.2) || ",
@@ -946,7 +976,26 @@ mod tests {
                 r#"(frame.time >= "1970-01-01T00:00:01.966080000Z" && frame.time < "1970-01-01T00:00:02.097152000Z")"#,
             )
         );
-        assert!(wireshark_conversation_interval_filter(a, b, 0..0).is_err());
+        assert!(wireshark_pair_filter(ConversationEndpoints::Ip { a, b }, Some(0..0)).is_err());
+    }
+
+    #[test]
+    fn wireshark_limits_both_directions_of_an_exact_transport_pair_to_the_interval() {
+        let endpoints = ConversationEndpoints::Transport {
+            protocol: 17,
+            a: "192.0.2.1:49152".parse().unwrap(),
+            b: "192.0.2.2:443".parse().unwrap(),
+        };
+        assert_eq!(
+            wireshark_pair_filter(endpoints, Some(-1..1)).unwrap(),
+            concat!(
+                r#"(frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip:udp(?::|$)" && "#,
+                "((ip.src#1 == 192.0.2.1 && udp.srcport#1 == 49152 && ip.dst#1 == 192.0.2.2 && udp.dstport#1 == 443) || ",
+                "(ip.src#1 == 192.0.2.2 && udp.srcport#1 == 443 && ip.dst#1 == 192.0.2.1 && udp.dstport#1 == 49152))) && ",
+                r#"(frame.time >= "1969-12-31T23:59:59.999999999Z" && frame.time < "1970-01-01T00:00:00.000000001Z")"#,
+            ),
+        );
+        assert!(wireshark_pair_filter(endpoints, Some(1..1)).is_err());
     }
 
     #[test]

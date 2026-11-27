@@ -9,6 +9,14 @@ impl Comparison {
             .or_else(|| self.model.timeline.as_ref()?.peak_index())
     }
 
+    pub(super) fn selected_timeline_label(&self) -> Option<String> {
+        self.model
+            .timeline
+            .as_ref()?
+            .offset_interval(self.selected_timeline_interval()?)
+            .map(interval_label)
+    }
+
     pub(super) fn timeline_view(
         &self,
         idle: bool,
@@ -20,13 +28,7 @@ impl Comparison {
             let selected = self.selected_timeline_interval()?;
             let intervals: Vec<_> = (0..timeline.buckets.len())
                 .filter_map(|index| timeline.offset_interval(index))
-                .map(|interval| {
-                    format!(
-                        "{} to {} s",
-                        signed_seconds(interval.start),
-                        signed_seconds(interval.end),
-                    )
-                })
+                .map(interval_label)
                 .collect();
             let peak = timeline
                 .buckets
@@ -163,6 +165,14 @@ impl Comparison {
                 ]),
         ))
     }
+}
+
+fn interval_label(interval: Range<i128>) -> String {
+    format!(
+        "{} to {} s",
+        signed_seconds(interval.start),
+        signed_seconds(interval.end),
+    )
 }
 
 fn signed_seconds(ns: i128) -> String {

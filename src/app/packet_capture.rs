@@ -1,6 +1,5 @@
 use super::*;
 use std::{
-    net::{IpAddr, SocketAddr},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -8,10 +7,9 @@ use w11term::{
     control::PacketCaptureOptions,
     ssh::{
         CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureComparison,
-        PacketCaptureInterfaces, PacketCapturePlan, ip_protocol_label,
-        open_capture_conversation_in_wireshark, open_capture_conversation_interval_in_wireshark,
+        PacketCaptureInterfaces, PacketCapturePlan, PacketConversationEndpoints, ip_protocol_label,
         open_capture_in_wireshark, open_capture_interval_in_wireshark,
-        open_capture_transport_in_wireshark,
+        open_capture_pair_in_wireshark,
     },
 };
 
@@ -87,8 +85,7 @@ enum FileChoice {
 
 enum WiresharkFilter {
     Interval(Range<i128>),
-    Conversation(IpAddr, IpAddr, Option<Range<i128>>),
-    Transport(u8, SocketAddr, SocketAddr),
+    Conversation(PacketConversationEndpoints, Option<Range<i128>>),
 }
 
 enum LoadedCapture {
@@ -267,6 +264,33 @@ impl Panel {
         self.selected_conversation = None;
         self.limit_conversation_interval = false;
         self.activity = None;
+    }
+
+    fn conversation_interval_checkbox(
+        &self,
+        capture: &LocalPacketCapture,
+        label: &str,
+        idle: bool,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> Option<KeyedView> {
+        let timeline = capture.summary.timeline.as_ref()?;
+        let start = timeline.start_unix_ns()?;
+        let interval = timeline.selected_interval(self.timeline_interval)?;
+        let path = capture.path.clone();
+        Some(KeyedView::new(
+            "conversation-interval",
+            CheckBox::new()
+                .is_checked(self.limit_conversation_interval)
+                .is_enabled(idle)
+                .on_is_checked_changed(ctx.callback(move |checked| {
+                    message(Action::LimitConversationInterval(path.clone(), checked))
+                }))
+                .content(format!(
+                    "{label} · +{} to +{} s",
+                    seconds_text(interval.start.abs_diff(start)),
+                    seconds_text(interval.end.abs_diff(start))
+                )),
+        ))
     }
 
     fn view(
@@ -793,30 +817,12 @@ impl Panel {
                         text("rank-order", "Ranked by captured bytes"),
                         KeyedView::new("ranked-conversations", list),
                     ]);
-                    if let Some(timeline) = &summary.timeline
-                        && let Some(start) = timeline.start_unix_ns()
-                        && let Some(interval) = timeline.selected_interval(self.timeline_interval)
-                    {
-                        let scope_path = capture.path.clone();
-                        let label = format!(
-                            "Limit to timeline interval · +{} to +{} s",
-                            seconds_text(interval.start.abs_diff(start)),
-                            seconds_text(interval.end.abs_diff(start))
-                        );
-                        rows.push(KeyedView::new(
-                            "conversation-interval",
-                            CheckBox::new()
-                                .is_checked(self.limit_conversation_interval)
-                                .is_enabled(idle)
-                                .on_is_checked_changed(ctx.callback(move |checked| {
-                                    message(Action::LimitConversationInterval(
-                                        scope_path.clone(),
-                                        checked,
-                                    ))
-                                }))
-                                .content(label),
-                        ));
-                    }
+                    rows.extend(self.conversation_interval_checkbox(
+                        capture,
+                        "Limit to timeline interval",
+                        idle,
+                        ctx,
+                    ));
                     rows.push(KeyedView::new(
                         "open-conversation",
                         Button::new()
@@ -870,8 +876,7 @@ impl Panel {
                     if !transport.top.is_empty() {
                         let select_path = capture.path.clone();
                         let open_path = capture.path.clone();
-                        rows.extend([
-                            KeyedView::new(
+                        rows.push(KeyedView::new(
                                 "transport-pairs",
                                 ListView::new()
                                     .automation_name("TCP and UDP port pairs by captured bytes")
@@ -901,17 +906,22 @@ impl Panel {
                                             )
                                         }),
                                     ),
-                            ),
-                            KeyedView::new(
-                                "open-transport-pair",
-                                Button::new()
-                                    .is_enabled(idle && self.selected_transport_conversation.is_some())
-                                    .on_click(ctx.callback(move |_| {
-                                        message(Action::OpenTransportConversation(open_path.clone()))
-                                    }))
-                                    .content("Open port pair in Wireshark"),
-                            ),
-                        ]);
+                        ));
+                        rows.extend(self.conversation_interval_checkbox(
+                            capture,
+                            "Limit port pair to timeline interval",
+                            idle,
+                            ctx,
+                        ));
+                        rows.push(KeyedView::new(
+                            "open-transport-pair",
+                            Button::new()
+                                .is_enabled(idle && self.selected_transport_conversation.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    message(Action::OpenTransportConversation(open_path.clone()))
+                                }))
+                                .content("Open port pair in Wireshark"),
+                        ));
                     }
                 }
                 files.push(KeyedView::new(
@@ -1348,13 +1358,40 @@ impl TerminalApp {
                         };
                         Some(WiresharkFilter::Interval(interval))
                     }
-                    (Action::OpenConversation(path), LoadedCapture::Local(local))
-                        if panel.conversations_expanded && local.path == path =>
-                    {
-                        let Some(pair) = panel
-                            .selected_conversation
-                            .and_then(|index| local.summary.conversations.top.get(index))
-                        else {
+                    (
+                        action @ (Action::OpenConversation(_)
+                        | Action::OpenTransportConversation(_)),
+                        LoadedCapture::Local(local),
+                    ) => {
+                        let endpoints = match action {
+                            Action::OpenConversation(path)
+                                if panel.conversations_expanded && local.path == path =>
+                            {
+                                panel
+                                    .selected_conversation
+                                    .and_then(|index| local.summary.conversations.top.get(index))
+                                    .map(|pair| PacketConversationEndpoints::Ip {
+                                        a: pair.a,
+                                        b: pair.b,
+                                    })
+                            }
+                            Action::OpenTransportConversation(path)
+                                if panel.transport_conversations_expanded && local.path == path =>
+                            {
+                                panel
+                                    .selected_transport_conversation
+                                    .and_then(|index| {
+                                        local.summary.transport_conversations.top.get(index)
+                                    })
+                                    .map(|pair| PacketConversationEndpoints::Transport {
+                                        protocol: pair.protocol,
+                                        a: pair.a,
+                                        b: pair.b,
+                                    })
+                            }
+                            _ => None,
+                        };
+                        let Some(endpoints) = endpoints else {
                             return;
                         };
                         let interval = if panel.limit_conversation_interval {
@@ -1369,18 +1406,7 @@ impl TerminalApp {
                         } else {
                             None
                         };
-                        Some(WiresharkFilter::Conversation(pair.a, pair.b, interval))
-                    }
-                    (Action::OpenTransportConversation(path), LoadedCapture::Local(local))
-                        if panel.transport_conversations_expanded && local.path == path =>
-                    {
-                        let Some(pair) = panel
-                            .selected_transport_conversation
-                            .and_then(|index| local.summary.transport_conversations.top.get(index))
-                        else {
-                            return;
-                        };
-                        Some(WiresharkFilter::Transport(pair.protocol, pair.a, pair.b))
+                        Some(WiresharkFilter::Conversation(endpoints, interval))
                     }
                     _ => return,
                 };
@@ -1408,20 +1434,8 @@ impl TerminalApp {
                 Some(WiresharkFilter::Interval(interval)) => {
                     open_capture_interval_in_wireshark(&capture, &executable, interval)
                 }
-                Some(WiresharkFilter::Conversation(a, b, None)) => {
-                    open_capture_conversation_in_wireshark(&capture, &executable, a, b)
-                }
-                Some(WiresharkFilter::Conversation(a, b, Some(interval))) => {
-                    open_capture_conversation_interval_in_wireshark(
-                        &capture,
-                        &executable,
-                        a,
-                        b,
-                        interval,
-                    )
-                }
-                Some(WiresharkFilter::Transport(protocol, a, b)) => {
-                    open_capture_transport_in_wireshark(&capture, &executable, protocol, a, b)
+                Some(WiresharkFilter::Conversation(endpoints, interval)) => {
+                    open_capture_pair_in_wireshark(&capture, &executable, endpoints, interval)
                 }
             }?;
             Ok(Some(Outcome::Opened))

@@ -1,5 +1,5 @@
 use super::*;
-use w11term::ssh::{PacketConversationChange, PacketConversationEndpoints};
+use w11term::ssh::PacketConversationChange;
 
 mod search;
 mod timeline;
@@ -35,14 +35,26 @@ impl ConversationView {
 pub enum Change {
     View(ConversationView),
     Filter(String),
-    Page { list: u64, page: usize },
-    Pair { list: u64, row: Option<usize> },
+    Page {
+        list: u64,
+        page: usize,
+    },
+    Pair {
+        list: u64,
+        row: Option<usize>,
+    },
     Source(usize),
     ProtocolsExpanded(bool),
     TimelineExpanded(bool),
     TimelineInterval(usize),
     OpenTimelineInterval(usize, usize),
-    Open { list: u64, row: Option<usize> },
+    LimitElapsedInterval(bool),
+    Open {
+        list: u64,
+        row: Option<usize>,
+        source: usize,
+        elapsed: Option<usize>,
+    },
     Export,
 }
 
@@ -60,6 +72,7 @@ pub(super) struct Comparison {
     protocols_expanded: bool,
     timeline_expanded: bool,
     timeline_interval: Option<usize>,
+    limit_elapsed_interval: bool,
 }
 
 impl Comparison {
@@ -78,6 +91,7 @@ impl Comparison {
             protocols_expanded: false,
             timeline_expanded: false,
             timeline_interval: None,
+            limit_elapsed_interval: false,
         }
     }
 
@@ -140,6 +154,21 @@ impl Comparison {
         self.list_generation = self.list_generation.wrapping_add(1);
     }
 
+    fn elapsed_scope(&self) -> Option<usize> {
+        if self.limit_elapsed_interval {
+            self.selected_timeline_interval()
+        } else {
+            None
+        }
+    }
+
+    fn source_interval(&self, source: usize, elapsed: usize) -> Option<Range<i128>> {
+        self.model
+            .timeline
+            .as_ref()?
+            .source_interval(source, elapsed)
+    }
+
     pub(super) fn export_model(&self, revision: &Arc<()>) -> Option<Arc<PacketCaptureComparison>> {
         Arc::ptr_eq(revision, &self.revision).then(|| Arc::clone(&self.model))
     }
@@ -176,6 +205,11 @@ impl Comparison {
             Change::Source(source) if source < self.paths.len() => self.source = source,
             Change::ProtocolsExpanded(expanded) => self.protocols_expanded = expanded,
             Change::TimelineExpanded(expanded) => self.timeline_expanded = expanded,
+            Change::LimitElapsedInterval(limit)
+                if !limit || self.selected_timeline_interval().is_some() =>
+            {
+                self.limit_elapsed_interval = limit;
+            }
             Change::TimelineInterval(index) if self.timeline_expanded => {
                 if self
                     .model
@@ -200,17 +234,25 @@ impl Comparison {
                     WiresharkFilter::Interval(interval),
                 ));
             }
-            Change::Open { list, row } if list == self.list_generation && row == self.selected => {
+            Change::Open {
+                list,
+                row,
+                source,
+                elapsed,
+            } if list == self.list_generation
+                && row == self.selected
+                && source == self.source
+                && elapsed == self.elapsed_scope() =>
+            {
                 let pair = self.row(start + row?)?;
-                let filter = match pair.endpoints {
-                    PacketConversationEndpoints::Ip { a, b } => {
-                        WiresharkFilter::Conversation(a, b, None)
-                    }
-                    PacketConversationEndpoints::Transport { protocol, a, b } => {
-                        WiresharkFilter::Transport(protocol, a, b)
-                    }
+                let interval = match elapsed {
+                    Some(elapsed) => Some(self.source_interval(source, elapsed)?),
+                    None => None,
                 };
-                return Some((self.paths[self.source].clone(), filter));
+                return Some((
+                    self.paths[source].clone(),
+                    WiresharkFilter::Conversation(pair.endpoints, interval),
+                ));
             }
             _ => (),
         }
@@ -543,11 +585,43 @@ impl Comparison {
                             })
                         })),
                 ),
+            ]);
+            if let Some(label) = self.selected_timeline_label() {
+                let revision = Arc::clone(&self.revision);
+                fields.push(KeyedView::new(
+                    "elapsed-conversation-scope",
+                    CheckBox::new()
+                        .is_enabled(idle)
+                        .is_checked(self.limit_elapsed_interval)
+                        .on_is_checked_changed(ctx.callback(move |checked| {
+                            message(Action::Comparison(
+                                revision.clone(),
+                                Change::LimitElapsedInterval(checked),
+                            ))
+                        }))
+                        .content(format!("Limit to elapsed interval · {label}")),
+                ));
+            }
+            let elapsed = self.elapsed_scope();
+            let can_scope =
+                elapsed.is_none_or(|elapsed| self.source_interval(self.source, elapsed).is_some());
+            if !can_scope {
+                fields.push(text(
+                    "no-elapsed-origin",
+                    "The selected capture has no timestamped records to align the interval.",
+                ));
+            }
+            fields.extend([
                 KeyedView::new(
                     "open-conversation",
                     Button::new()
-                        .is_enabled(idle && self.selected.is_some())
-                        .on_click(action(Change::Open { list, row: self.selected }))
+                        .is_enabled(idle && self.selected.is_some() && can_scope)
+                        .on_click(action(Change::Open {
+                            list,
+                            row: self.selected,
+                            source: self.source,
+                            elapsed,
+                        }))
                         .content("Open conversation in Wireshark"),
                 ),
                 KeyedView::new(

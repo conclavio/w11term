@@ -10,6 +10,7 @@ $conversationCapture = Join-Path $State 'IP conversations.pcap'
 $slowerCapture = Join-Path $State 'IP conversations spaced out.pcap'
 $protocolCapture = Join-Path $State 'IP protocols.pcap'
 $manyPortsCapture = Join-Path $State 'Fifteen UDP conversations.pcap'
+$emptyCapture = Join-Path $State 'Empty capture.pcap'
 $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
@@ -129,6 +130,7 @@ foreach ($port in 50001..50015) {
     $manyPortsFrames.Add($frame)
 }
 Write-CaptureFixture $manyPortsCapture 101 ($manyPortsFrames.ToArray())
+Write-CaptureFixture $emptyCapture 101 ([byte[][]]@())
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
 using System.IO;
@@ -222,6 +224,16 @@ function Select-ComparisonConversationType([string]$Name) {
     $type.SetFocus()
     $type.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $item = Wait-Until "conversation type '$Name' is selectable" {
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+}
+
+function Select-ComparisonCaptureSide([string]$Name) {
+    $source = Wait-CaptureCombo 'Capture to open in Wireshark'
+    $source.SetFocus()
+    $source.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $item = Wait-Until "capture side '$Name' is selectable" {
         Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
     }
     $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
@@ -416,13 +428,7 @@ try {
         $filterPath = $olderCapture + '.filter'
         [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $ipv4Filter
     }
-    $source = Wait-CaptureCombo 'Capture to open in Wireshark'
-    $source.SetFocus()
-    $source.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $before = Wait-Until 'Before is selectable as the Wireshark source' {
-        Find-Element 'Before capture' ([System.Windows.Automation.ControlType]::ListItem)
-    }
-    $before.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-ComparisonCaptureSide 'Before capture'
     Remove-Item -LiteralPath ($conversationCapture + '.filter') -ErrorAction Stop
     Click 'Open conversation in Wireshark'
     $null = Wait-Until 'the same filter is sent to the original Before capture' {
@@ -506,6 +512,28 @@ try {
         $openBefore -and !$openBefore.Current.IsEnabled -and $openAfter -and !$openAfter.Current.IsEnabled
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    $row = Wait-Until 'a conversation can be selected with the timeline collapsed' {
+        Find-Element "192.0.2.1 $bothDirections 192.0.2.2" ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $elapsedLabel = "Limit to elapsed interval${dot}+0.262144 to +0.524288 s"
+    (Wait-CheckBox $elapsedLabel ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox $elapsedLabel ([System.Windows.Automation.ToggleState]::On)
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until 'the IP pair opens in the selected empty interval on the After clock' {
+        $filterPath = $slowerCapture + '.filter'
+        $expected = "($ipv4Filter) && " +
+            '(frame.time >= "1970-01-01T00:00:02.262144000Z" && frame.time < "1970-01-01T00:00:02.524288000Z")'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $expected
+    }
+    Select-ComparisonCaptureSide 'Before capture'
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until 'the same IP pair and elapsed interval open on the Before clock' {
+        $filterPath = $conversationCapture + '.filter'
+        $expected = "($ipv4Filter) && " +
+            '(frame.time >= "1970-01-01T00:00:01.262144000Z" && frame.time < "1970-01-01T00:00:01.524288000Z")'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $expected
+    }
     Click 'Back to capture'
     Select-Capture $partialCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'partial comparison preserves the issue and withholds capture deltas' {
@@ -578,6 +606,16 @@ try {
             [IO.File]::Exists($transportFilterPath) -and [IO.File]::ReadAllText($transportFilterPath) -ceq $expected
         }
     }
+    $scopeLabel = "Limit port pair to timeline interval${dot}+0.000 to +0.131072 s"
+    (Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::On)
+    Click 'Open port pair in Wireshark'
+    $limited = "($expected) && " +
+        '(frame.time >= "1970-01-01T00:00:00.917504000Z" && frame.time < "1970-01-01T00:00:01.048576000Z")'
+    $null = Wait-Until 'the standalone UDP pair can open with the timeline interval' {
+        [IO.File]::ReadAllText($transportFilterPath) -ceq $limited
+    }
+    (Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::On)).Toggle()
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'
     $expander = Open-PacketSection 'comparison-ip-protocols'
@@ -605,13 +643,7 @@ try {
         $filterPath = $olderCapture + '.filter'
         [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $tcpPortFilter
     }
-    $source = Wait-CaptureCombo 'Capture to open in Wireshark'
-    $source.SetFocus()
-    $source.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $before = Wait-Until 'Before is selectable for the compared transport pair' {
-        Find-Element 'Before capture' ([System.Windows.Automation.ControlType]::ListItem)
-    }
-    $before.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-ComparisonCaptureSide 'Before capture'
     Click 'Open conversation in Wireshark'
     $null = Wait-Until 'the Before capture opens with the same TCP pair filter' {
         [IO.File]::Exists($transportFilterPath) -and [IO.File]::ReadAllText($transportFilterPath) -ceq $tcpPortFilter
@@ -638,6 +670,15 @@ try {
         $filterPath = $olderCapture + '.filter'
         [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $expected
     }
+    $elapsedLabel = "Limit to elapsed interval${dot}+0.000 to +0.262144 s"
+    (Wait-CheckBox $elapsedLabel ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-CheckBox $elapsedLabel ([System.Windows.Automation.ToggleState]::On)
+    Click 'Open conversation in Wireshark'
+    $limited = "($expected) && " +
+        '(frame.time >= "1970-01-01T00:00:01.000000000Z" && frame.time < "1970-01-01T00:00:01.262144000Z")'
+    $null = Wait-Until 'Wireshark receives the filtered UDP pair and its elapsed bounds' {
+        [IO.File]::ReadAllText($olderCapture + '.filter') -ceq $limited
+    }
     Set-Field 'Filter conversations' 'udp 50014'
     $null = Wait-Until 'a new filter clears selection even when it finds one row again' {
         $open = Find-Element 'Open conversation in Wireshark' $button
@@ -650,6 +691,24 @@ try {
     Click 'Clear conversation filter'
     $null = Wait-Until 'clearing the filter restores the first page' {
         (Find-Element 'Page 1 of 2') -and !(Find-Element 'Clear conversation filter' $button)
+    }
+    Click 'Back to capture'
+    Select-Capture $emptyCapture $compareCaptureLabel 'Choose after packet capture'
+    $row = Wait-Until 'an IP pair is selectable with an untimed After capture' {
+        Find-Element "192.0.2.1 $bothDirections 192.0.2.2" ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    (Wait-CheckBox $elapsedLabel ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Wait-Until 'elapsed filtering is unavailable for a capture without a timestamp origin' {
+        $open = Find-Element 'Open conversation in Wireshark' $button
+        (Find-Element 'The selected capture has no timestamped records to align the interval.') -and
+            $open -and !$open.Current.IsEnabled -and ![IO.File]::Exists($emptyCapture + '.filter')
+    }
+    (Wait-CheckBox $elapsedLabel ([System.Windows.Automation.ToggleState]::On)).Toggle()
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until 'clearing the interval allows the whole untimed capture to open again' {
+        $filterPath = $emptyCapture + '.filter'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $ipv4Filter
     }
     Click 'Back to capture'
     Click 'Return to diagnostics overview'
