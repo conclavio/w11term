@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use w11term::ssh::{CaptureStop, TriagePlan, TriageReport, TriageResource, TriageSampleStatus};
 
 pub(super) const LABEL: &str = "Linux performance triage";
+mod compare;
 mod processes;
 use flame_graph::Connection;
 
@@ -16,6 +17,9 @@ pub enum Action {
     Stop(Arc<()>),
     OpenReport,
     SaveReport,
+    CompareReport,
+    BackFromComparison,
+    ComparisonChange(Arc<TriageReport>, usize),
     Sample(usize),
     Resource(usize),
     Finding(usize),
@@ -31,11 +35,18 @@ pub enum Outcome {
         source: Option<Connection>,
     },
     Saved(PathBuf),
+    Compared(Box<compare::Comparison>),
 }
 
 enum Content {
-    Review { pane: u64, plan: Box<TriagePlan> },
-    Report(Arc<TriageReport>),
+    Review {
+        pane: u64,
+        plan: Box<TriagePlan>,
+    },
+    Report {
+        report: Arc<TriageReport>,
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Default)]
@@ -43,6 +54,7 @@ pub(super) struct Panel {
     pub(super) open: bool,
     pub(super) activity: Option<diagnostics::Activity>,
     content: Option<Content>,
+    comparison: Option<compare::Comparison>,
     sample: usize,
     resource: TriageResource,
     evidence_line: Option<usize>,
@@ -50,7 +62,7 @@ pub(super) struct Panel {
     pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
     progress_timer: Option<crate::ui_timer::RetryTimer>,
-    path: Option<PathBuf>,
+    last_path: Option<PathBuf>,
     profile_source: Option<Connection>,
     busy_processes: Vec<processes::Process>,
 }
@@ -118,28 +130,31 @@ impl Panel {
                 .on_click(send(action))
                 .content(label)
         };
-        let mut fields = vec![
-            KeyedView::new(
-                "files",
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        button("Open report", idle, || Action::OpenReport),
-                        button(
-                            "Save report",
-                            idle && matches!(self.content, Some(Content::Report(_))),
-                            || Action::SaveReport,
-                        ),
-                    )),
-            ),
-            KeyedView::new(
-                "review",
-                button("Review selected SSH pane", idle && active.is_some(), || {
-                    Action::Review
-                }),
-            ),
-        ];
+        let mut fields = Vec::new();
+        if self.comparison.is_none() {
+            fields.extend([
+                KeyedView::new(
+                    "files",
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            button("Open report", idle, || Action::OpenReport),
+                            button(
+                                "Save report",
+                                idle && matches!(self.content, Some(Content::Report { .. })),
+                                || Action::SaveReport,
+                            ),
+                        )),
+                ),
+                KeyedView::new(
+                    "review",
+                    button("Review selected SSH pane", idle && active.is_some(), || {
+                        Action::Review
+                    }),
+                ),
+            ]);
+        }
         if let Some(status) = &self.status {
             fields.push(detail("status", display_output(status)));
         }
@@ -160,8 +175,9 @@ impl Panel {
                     .content("Stop and keep report"),
             ));
         }
-        match &self.content {
-            Some(Content::Review { pane, plan }) => {
+        match (&self.comparison, &self.content) {
+            (Some(comparison), _) => fields.extend(comparison.fields(ctx)),
+            (None, Some(Content::Review { pane, plan })) => {
                 let ready = active
                     == Some(Connection {
                         pane: *pane,
@@ -194,14 +210,20 @@ impl Panel {
                     ));
                 }
             }
-            Some(Content::Report(report)) => self.report_view(report, active, &mut fields, ctx),
-            None if self.status.is_none() => {
+            (None, Some(Content::Report { report, .. })) => {
+                fields.push(KeyedView::new(
+                    "compare-report",
+                    button("Compare reports", idle, || Action::CompareReport),
+                ));
+                self.report_view(report, active, &mut fields, ctx);
+            }
+            (None, None) if self.status.is_none() => {
                 fields.push(detail(
                     "empty",
                     "Select a connected Linux SSH pane or open a saved report.",
                 ));
             }
-            None => (),
+            (None, None) => (),
         }
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -442,7 +464,11 @@ impl TerminalApp {
 
     pub(super) fn with_triage(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let active = self.profile_connection();
-        let width = (self.width * 0.4).clamp(265.0, 520.0);
+        let width = if self.triage.comparison.is_some() {
+            (self.width * 0.67).clamp(265.0, 1000.0)
+        } else {
+            (self.width * 0.4).clamp(265.0, 520.0)
+        };
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
             .keyed_children([
@@ -460,7 +486,8 @@ impl TerminalApp {
     pub(super) fn triage_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         if matches!(action, Action::OpenRouter) {
             if self.triage.pending.is_none()
-                && let Some(Content::Report(report)) = &self.triage.content
+                && self.triage.comparison.is_none()
+                && let Some(Content::Report { report, .. }) = &self.triage.content
             {
                 let report = report.clone();
                 self.review_triage_with_openrouter(&report, Some(self.triage.sample), ctx);
@@ -470,6 +497,7 @@ impl TerminalApp {
         if let Action::Profile(pid) = action {
             if let Some(source) = self.triage.profile_source
                 && self.triage.pending.is_none()
+                && self.triage.comparison.is_none()
                 && self
                     .triage
                     .busy_processes
@@ -488,7 +516,7 @@ impl TerminalApp {
             }
         }
         if matches!(action, Action::Open | Action::Review) {
-            if self.triage.pending.is_some() {
+            if self.triage.pending.is_some() || self.triage.comparison.is_some() {
                 return;
             }
             let target = self
@@ -596,8 +624,8 @@ impl TerminalApp {
                     panel.status = Some("Stop requested. Waiting for collected samples…".into());
                 }
             }
-            Action::Sample(index) => {
-                if let Some(Content::Report(report)) = &panel.content
+            Action::Sample(index) if panel.comparison.is_none() => {
+                if let Some(Content::Report { report, .. }) = &panel.content
                     && index < report.collection.samples.len()
                     && index != panel.sample
                 {
@@ -605,13 +633,13 @@ impl TerminalApp {
                     panel.evidence_line = None;
                 }
             }
-            Action::Resource(index) => {
+            Action::Resource(index) if panel.comparison.is_none() => {
                 if let Some(resource) = TriageResource::ALL.get(index) {
                     panel.resource = *resource;
                 }
             }
-            Action::Finding(index) => {
-                if let Some(Content::Report(report)) = &panel.content
+            Action::Finding(index) if panel.comparison.is_none() => {
+                if let Some(Content::Report { report, .. }) = &panel.content
                     && let Some(finding) = report.findings.get(index)
                     && let Some(sample) = report
                         .collection
@@ -623,24 +651,36 @@ impl TerminalApp {
                     panel.evidence_line = finding.stdout_line;
                 }
             }
-            Action::OpenReport | Action::SaveReport if panel.pending.is_none() => {
+            Action::BackFromComparison => panel.comparison = None,
+            Action::ComparisonChange(marker, index) => {
+                if let Some(comparison) = &mut panel.comparison {
+                    comparison.select(&marker, index);
+                }
+            }
+            Action::OpenReport | Action::SaveReport | Action::CompareReport
+                if panel.pending.is_none() && panel.comparison.is_none() =>
+            {
                 let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
                     return;
                 };
-                let report = if matches!(action, Action::SaveReport) {
-                    let Some(Content::Report(report)) = &panel.content else {
+                let compare = matches!(action, Action::CompareReport);
+                let save = matches!(action, Action::SaveReport);
+                let report = if save || compare {
+                    let Some(Content::Report { report, path }) = &panel.content else {
                         return;
                     };
-                    Some(report.clone())
+                    Some((report.clone(), path.clone()))
                 } else {
                     None
                 };
                 let path = panel
-                    .path
+                    .last_path
                     .clone()
                     .unwrap_or_else(|| self.store.path().into());
-                let purpose = if report.is_some() {
+                let purpose = if save {
                     file_picker::Purpose::SaveTriageReport(path)
+                } else if compare {
+                    file_picker::Purpose::CompareTriageReport(path)
                 } else {
                     file_picker::Purpose::OpenTriageReport(path)
                 };
@@ -659,7 +699,14 @@ impl TerminalApp {
                                 return Ok(None);
                             }
                             Ok(Some(match report {
-                                Some(report) => {
+                                Some((before, before_path)) if compare => {
+                                    let after = Arc::new(TriageReport::load(&file.path)?);
+                                    Outcome::Compared(Box::new(compare::Comparison::new(
+                                        [before, after],
+                                        [before_path, Some(file.path)],
+                                    )))
+                                }
+                                Some((report, _)) => {
                                     report.save(&file.path)?;
                                     Outcome::Saved(file.path)
                                 }
@@ -702,22 +749,28 @@ impl TerminalApp {
                         path,
                         source,
                     })) => {
-                        if let Some(path) = path {
+                        if let Some(path) = &path {
                             panel.activity = None;
                             panel.status = Some("Opened Linux triage report".into());
-                            panel.path = Some(path);
+                            panel.last_path = Some(path.clone());
                         }
                         panel.busy_processes =
                             source.map_or_else(Vec::new, |_| processes::busy_processes(&report));
                         panel.profile_source = source;
-                        panel.content = Some(Content::Report(report));
+                        panel.content = Some(Content::Report { report, path });
                         panel.sample = 0;
                         panel.resource = TriageResource::default();
                         panel.evidence_line = None;
                     }
                     Ok(Some(Outcome::Saved(path))) => {
-                        panel.path = Some(path);
+                        if let Some(Content::Report { path: source, .. }) = &mut panel.content {
+                            *source = Some(path.clone());
+                        }
+                        panel.last_path = Some(path);
                         panel.status = Some("Saved Linux triage report".into());
+                    }
+                    Ok(Some(Outcome::Compared(comparison))) => {
+                        panel.comparison = Some(*comparison);
                     }
                     Ok(None) => (),
                     Err(error) => panel.status = Some(error),

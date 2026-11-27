@@ -59,6 +59,7 @@ pub(super) enum Purpose {
     StartRecording,
     OpenRecording,
     OpenTriageReport(PathBuf),
+    CompareTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
     SaveCpuProfile(PathBuf),
     OpenPacketCapture(PathBuf),
@@ -224,6 +225,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
                 | Purpose::OpenTriageReport(_)
+                | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
                 | Purpose::WiresharkExecutable(_)
                 | Purpose::OpenSyscallTrace(_)
@@ -369,7 +371,9 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::OpenTriageReport(ref current) | Purpose::SaveTriageReport(ref current) => {
+            Purpose::OpenTriageReport(ref current)
+            | Purpose::CompareTriageReport(ref current)
+            | Purpose::SaveTriageReport(ref current) => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
                     pszName: w!("Linux triage reports"),
@@ -377,8 +381,15 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }])?;
                 dialog.SetDefaultExtension(w!("json"))?;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
-                if matches!(&purpose, Purpose::OpenTriageReport(_)) {
-                    dialog.SetTitle(w!("Open Linux triage report"))?;
+                if matches!(
+                    &purpose,
+                    Purpose::OpenTriageReport(_) | Purpose::CompareTriageReport(_)
+                ) {
+                    dialog.SetTitle(if matches!(&purpose, Purpose::CompareTriageReport(_)) {
+                        w!("Choose after triage report")
+                    } else {
+                        w!("Open Linux triage report")
+                    })?;
                     options |= FOS_FILEMUSTEXIST;
                 } else {
                     dialog.SetTitle(w!("Save Linux triage report"))?;

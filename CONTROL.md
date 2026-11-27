@@ -1516,6 +1516,8 @@ In the Windows app, open **More → Diagnostics → Linux performance triage** o
 
 Findings summarize observed CPU activity and runnable tasks, available memory and swapping, disk activity and queueing, network traffic and TCP errors, and kernel-log evidence. Peaks use the collected interval rows and exclude the first vmstat row and sar averages. Missing or denied samples appear under their resource. The same findings are saved in the JSON report and can be derived when opening an earlier capture. [Linux performance checklist](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf) · [iostat metrics](https://github.com/sysstat/sysstat/blob/master/man/iostat.in) · [sar metrics](https://github.com/sysstat/sysstat/blob/master/man/sar.in)
 
+Choose **Compare reports** to use the displayed report as **Before** and open a saved JSON report as **After**. The offline view shows changes in check status, sampling commands, and reported observations. Choose a change to see the two values and their source output lines or excerpts. Numeric deltas require matching sampling commands and complete output on both sides. Disk and interface deltas also require the same recorded endpoint and device name. **Back to report** restores the original sample selection.
+
 Review the verified SSH endpoint, fixed sample commands and limits, then pass the reviewed connection generation when collecting. Choose a new Windows file for the report.
 
 ```powershell

@@ -9,6 +9,7 @@ $expandPattern = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
 $selectPattern = [System.Windows.Automation.SelectionItemPattern]::Pattern
 $dot = ' ' + [char]0xb7 + ' '
 $report = Join-Path $State 'captured.json'
+$afterReport = Join-Path $State 'after triage.json'
 $command = [IO.File]::ReadAllText((Join-Path $State 'triage-command-path'))
 
 function Click([string]$Name) {
@@ -46,6 +47,13 @@ function Show-CpuEvidence {
     $null = Wait-Until 'finding opens the exact live vmstat row' {
         (Find-Element "Evidence${dot}vmstat output line 3") -and (Find-Element '3 0 0 8 40 12 46 1 1')
     }
+}
+
+function Select-TriageChange([string]$Name) {
+    $change = Wait-Until "triage change '$Name'" {
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $change.GetCurrentPattern($selectPattern).Select()
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -112,6 +120,38 @@ try {
         (Find-Element 'Opened Linux triage report') -and (Find-Element 'Stopped by request')
     }
     Show-CpuEvidence
+    Show-KernelCheck
+    $saved.collection.samples[1].status = 'ok'
+    $saved.collection.samples[1].exit_status = 0
+    $saved.collection.samples[1].stdout.text = '[Mon] system started'
+    $saved.collection.samples[1].stderr.text = ''
+    $vmstat = $saved.collection.samples | Where-Object id -eq 'vmstat'
+    $vmstat.stdout.text = $vmstat.stdout.text.Replace('3 0 0 8 40 12 46 1 1','3 0 0 8 70 14 14 1 1')
+    ($saved.target.probes | Where-Object id -eq 'mpstat').sampling = 'Updated interval sampling'
+    [IO.File]::WriteAllText($afterReport, ($saved | ConvertTo-Json -Depth 16))
+    Click 'Compare reports'
+    $open = Wait-Until 'owned after report dialog' { Find-OwnedDialog 'Choose after triage report' }
+    $null = Wait-Until 'enter the after report path' { [FixtureDialog]::SetFilename($open, $afterReport, '') }
+    $null = Wait-Until 'compare from the native dialog' { [FixtureDialog]::ClickButton($open, 1) }
+    $null = Wait-Until 'both source reports and the coverage change' {
+        (Find-Element "Before${dot}captured.json") -and
+        (Find-Element "After${dot}after triage.json") -and
+        (Find-Element "Before${dot}Permission denied${dot}Exit 1") -and
+        (Find-Element "After${dot}OK${dot}Exit 0") -and
+        (Find-Element 'Operation not permitted')
+    }
+    Select-TriageChange 'mpstat check or sampling changed'
+    $null = Wait-Until 'sampling changes are visible with the probe commands' {
+        (Find-Element 'Updated interval sampling') -and (Find-Element "After${dot}Utility missing${dot}Exit 127")
+    }
+    Select-TriageChange "Peak CPU busy${dot}+32.0 pp"
+    $null = Wait-Until 'paired CPU values with the original interval lines' {
+        (Find-Element "Before${dot}52% user + system") -and
+        (Find-Element "After${dot}84% user + system") -and
+        (Find-Element '3 0 0 8 40 12 46 1 1') -and
+        (Find-Element '3 0 0 8 70 14 14 1 1')
+    }
+    Click 'Back to report'
     Show-KernelCheck
     Click ('Review report with OpenRouter' + [char]0x2026)
     try {

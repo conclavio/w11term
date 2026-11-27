@@ -41,6 +41,69 @@ pub struct Finding {
     pub sample_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout_line: Option<usize>,
+    #[serde(skip)]
+    measurement: Option<Measurement>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Percent,
+    Tasks,
+    Mebibytes,
+    KibibytesPerSecond,
+    Queue,
+    Milliseconds,
+    EventsPerSecond,
+}
+
+struct Measurement {
+    amount: f64,
+    unit: Unit,
+    subject: Option<String>,
+}
+
+impl Measurement {
+    fn new(amount: f64, unit: Unit) -> Self {
+        Self {
+            amount,
+            unit,
+            subject: None,
+        }
+    }
+
+    fn on(mut self, subject: &str) -> Self {
+        self.subject = Some(subject.to_owned());
+        self
+    }
+}
+
+impl Finding {
+    /// Compare quantities extracted by the same probe and recipe.
+    pub fn change_from(&self, before: &Self, same_target: bool) -> Option<String> {
+        if self.label != before.label || self.sample_id != before.sample_id {
+            return None;
+        }
+        let after = self.measurement.as_ref()?;
+        let before = before.measurement.as_ref()?;
+        if after.unit != before.unit
+            || after.subject != before.subject
+            || (after.subject.is_some() && !same_target)
+        {
+            return None;
+        }
+        let difference = after.amount - before.amount;
+        let (unit, precision) = match after.unit {
+            Unit::Percent => (" pp", 1),
+            Unit::Tasks => (" tasks", 0),
+            Unit::Mebibytes => (" MiB", 0),
+            Unit::KibibytesPerSecond => (" KiB/s", 2),
+            Unit::Queue => ("", 2),
+            Unit::Milliseconds => (" ms", 2),
+            Unit::EventsPerSecond => ("/s", 2),
+        };
+        let threshold = 0.5 * 10_f64.powi(-(precision as i32));
+        (difference.abs() >= threshold).then(|| format!("{difference:+.precision$}{unit}"))
+    }
 }
 
 pub(super) fn summarize(collection: &Collection) -> Vec<Finding> {
@@ -108,7 +171,21 @@ fn add(
         value: value.into(),
         sample_id: sample.id.clone(),
         stdout_line,
+        measurement: None,
     });
+}
+
+fn add_measurement(
+    summary: &mut Vec<Finding>,
+    resource: Resource,
+    sample: &Sample,
+    line: usize,
+    label: &str,
+    display: String,
+    measurement: Measurement,
+) {
+    add(summary, resource, sample, Some(line), label, display);
+    summary.last_mut().expect("just added finding").measurement = Some(measurement);
 }
 
 fn lines(sample: &Sample) -> impl Iterator<Item = (usize, &str)> {
@@ -239,34 +316,37 @@ fn vmstat(sample: &Sample, summary: &mut Vec<Finding>) {
         let value = row.value("us")? + row.value("sy")?;
         (value <= 100.0).then_some(value)
     }) {
-        add(
+        add_measurement(
             summary,
             Resource::Cpu,
             sample,
-            Some(row.line),
+            row.line,
             "Peak CPU busy",
             format!("{value:.0}% user + system"),
+            Measurement::new(value, Unit::Percent),
         );
     }
     if let Some((row, value)) = peak(live, |row| row.value("r")) {
-        add(
+        add_measurement(
             summary,
             Resource::Cpu,
             sample,
-            Some(row.line),
+            row.line,
             "Peak runnable tasks",
             format!("{value:.0}"),
+            Measurement::new(value, Unit::Tasks),
         );
     }
     for (column, title) in [("si", "Peak swap in"), ("so", "Peak swap out")] {
         if let Some((row, value)) = peak(live, |row| row.value(column)) {
-            add(
+            add_measurement(
                 summary,
                 Resource::Memory,
                 sample,
-                Some(row.line),
+                row.line,
                 title,
                 format!("{value:.0} KiB/s"),
+                Measurement::new(value, Unit::KibibytesPerSecond),
             );
         }
     }
@@ -296,13 +376,14 @@ fn memory(sample: &Sample, summary: &mut Vec<Finding>) {
         (total != 0 && available <= total).then_some((line, total, available))
     })();
     if let Some((line, total, available)) = evidence {
-        add(
+        add_measurement(
             summary,
             Resource::Memory,
             sample,
-            Some(line),
+            line,
             "Available memory",
             format!("{available} of {total} MiB"),
+            Measurement::new(available as f64, Unit::Mebibytes),
         );
     } else {
         add(
@@ -319,25 +400,27 @@ fn memory(sample: &Sample, summary: &mut Vec<Finding>) {
 fn disk(sample: &Sample, summary: &mut Vec<Finding>) {
     let rows = rows(sample, Table::Device);
     if let Some((row, value)) = peak(&rows, |row| row.value("%util")) {
-        add(
+        add_measurement(
             summary,
             Resource::Disk,
             sample,
-            Some(row.line),
+            row.line,
             "Peak device busy time",
             format!("{value:.1}% on {}", row.cells[0]),
+            Measurement::new(value, Unit::Percent).on(row.cells[0]),
         );
     }
     if let Some((row, value)) = peak(&rows, |row| {
         row.value("aqu-sz").or_else(|| row.value("avgqu-sz"))
     }) {
-        add(
+        add_measurement(
             summary,
             Resource::Disk,
             sample,
-            Some(row.line),
+            row.line,
             "Peak average disk queue",
             format!("{value:.2} on {}", row.cells[0]),
+            Measurement::new(value, Unit::Queue).on(row.cells[0]),
         );
     }
     if let Some((row, value)) = peak(&rows, |row| {
@@ -346,13 +429,14 @@ fn disk(sample: &Sample, summary: &mut Vec<Finding>) {
             .filter_map(|name| row.value(name))
             .reduce(f64::max)
     }) {
-        add(
+        add_measurement(
             summary,
             Resource::Disk,
             sample,
-            Some(row.line),
+            row.line,
             "Peak average I/O latency",
             format!("{value:.2} ms on {}", row.cells[0]),
+            Measurement::new(value, Unit::Milliseconds).on(row.cells[0]),
         );
     }
     if rows.is_empty() {
@@ -374,13 +458,14 @@ fn interfaces(sample: &Sample, summary: &mut Vec<Finding>) {
         value.is_finite().then_some(value)
     };
     if let Some((row, value)) = peak(&rows, traffic) {
-        add(
+        add_measurement(
             summary,
             Resource::Network,
             sample,
-            Some(row.line),
+            row.line,
             "Peak interface traffic",
             format!("{value:.1} KiB/s RX + TX on {}", row.cells[0]),
+            Measurement::new(value, Unit::KibibytesPerSecond).on(row.cells[0]),
         );
     } else {
         add(
@@ -401,13 +486,14 @@ fn tcp(sample: &Sample, summary: &mut Vec<Finding>) {
         ("isegerr/s", "Peak TCP input errors"),
     ] {
         if let Some((row, value)) = peak(&rows, |row| row.value(column)) {
-            add(
+            add_measurement(
                 summary,
                 Resource::Network,
                 sample,
-                Some(row.line),
+                row.line,
                 label,
                 format!("{value:.2}/s"),
+                Measurement::new(value, Unit::EventsPerSecond),
             );
         }
     }
@@ -605,6 +691,33 @@ mod tests {
         assert_eq!(
             finding(&findings, "free coverage").value,
             "Available memory column unavailable"
+        );
+    }
+
+    #[test]
+    fn numeric_changes_keep_units_and_restrict_device_metrics_to_the_same_subject() {
+        let device = |name, busy| {
+            collect(vec![sample(
+                "iostat",
+                &format!("Device r/s %util\n{name} 3 {busy}\n"),
+            )])
+        };
+        let first = device("sda", 20);
+        let second = device("sda", 75);
+        let other = device("sdb", 75);
+        let first = finding(&first, "Peak device busy time");
+        let second = finding(&second, "Peak device busy time");
+        let other = finding(&other, "Peak device busy time");
+        assert_eq!(second.change_from(first, true).as_deref(), Some("+55.0 pp"));
+        assert_eq!(first.change_from(second, true).as_deref(), Some("-55.0 pp"));
+        assert_eq!(first.change_from(first, true), None);
+        assert_eq!(second.change_from(first, false), None);
+        assert_eq!(other.change_from(first, true), None);
+        assert!(
+            serde_json::to_value(first)
+                .unwrap()
+                .get("measurement")
+                .is_none()
         );
     }
 }
