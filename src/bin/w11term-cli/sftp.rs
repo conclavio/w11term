@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use w11term::{
     control::Request,
     sftp::{
-        Attributes, DEFAULT_TIMEOUT, DotfileBundle, DotfileShell, EntryKind, FileSizeRange,
-        FilenameFilter, ModifiedDateRange, Operation, normalize_sha256, validate_zdotdir,
+        Attributes, DEFAULT_TIMEOUT, DotfileBundle, DotfileShell, DotfileTarget, EntryKind,
+        FileSizeRange, FilenameFilter, ModifiedDateRange, Operation, normalize_sha256,
+        validate_zdotdir,
     },
 };
 
@@ -26,6 +27,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   sha256 PATH [--max-bytes N]\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  preview-dotfiles-switch SHA256|disabled --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
+  switch-dotfiles SHA256|disabled --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -309,7 +312,7 @@ pub fn parse(
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
             }
         }
-        "preview-dotfiles" | "apply-dotfiles" => {
+        "preview-dotfiles" | "apply-dotfiles" | "preview-dotfiles-switch" | "switch-dotfiles" => {
             let shell = match opts.remove("--shell").as_deref() {
                 Some("bash") => DotfileShell::Bash,
                 Some("zsh") => DotfileShell::Zsh,
@@ -317,24 +320,40 @@ pub fn parse(
             };
             let zdotdir = opts.remove("--zdotdir");
             validate_zdotdir(shell, zdotdir.as_deref())?;
-            if command == "apply-dotfiles" {
+            if matches!(command.as_str(), "apply-dotfiles" | "switch-dotfiles") {
                 let review = opts
                     .remove("--review")
                     .context("--review is required. Preview the bundle first.")?;
                 fields.insert("review".into(), json!(normalize_sha256(&review)?));
             }
-            let manifest = path()?;
-            let bytes = super::read_limited(
-                std::fs::File::open(&manifest)
-                    .with_context(|| format!("Opening dotfiles bundle {manifest}"))?,
-            )?;
-            let bundle: DotfileBundle =
-                serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
-                    .context("Reading the dotfiles bundle JSON")?;
-            bundle.validate(shell)?;
             fields.insert("shell".into(), json!(shell));
-            fields.insert("bundle".into(), json!(bundle));
             fields.insert("zdotdir".into(), json!(zdotdir));
+            if matches!(
+                command.as_str(),
+                "preview-dotfiles-switch" | "switch-dotfiles"
+            ) {
+                let value = path()?;
+                let target = if value == "disabled" {
+                    DotfileTarget::Disabled
+                } else {
+                    DotfileTarget::Bundle {
+                        sha256: normalize_sha256(&value)?,
+                    }
+                };
+                fields.insert("op".into(), json!("switch-dotfiles"));
+                fields.insert("target".into(), json!(target));
+            } else {
+                let manifest = path()?;
+                let bytes = super::read_limited(
+                    std::fs::File::open(&manifest)
+                        .with_context(|| format!("Opening dotfiles bundle {manifest}"))?,
+                )?;
+                let bundle: DotfileBundle =
+                    serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
+                        .context("Reading the dotfiles bundle JSON")?;
+                bundle.validate(shell)?;
+                fields.insert("bundle".into(), json!(bundle));
+            }
         }
         "opendir" | "stat" | "lstat" | "setstat" | "mkdir" | "remove-file" | "remove-dir"
         | "realpath" | "readlink" | "statvfs" | "expand-path" | "open" => {
@@ -503,6 +522,87 @@ mod tests {
             } if review == token
         ));
         assert!(p(&["--pane", "2", "apply-dotfiles", path, "--shell", "zsh"]).is_err());
+    }
+
+    #[test]
+    fn switches_dotfiles_only_with_a_reviewed_bundle_or_disable_request() {
+        let id = "a".repeat(64);
+        let token = "b".repeat(64);
+        let (_, preview) = p(&[
+            "--pane",
+            "2",
+            "preview-dotfiles-switch",
+            &id,
+            "--shell",
+            "bash",
+        ])
+        .unwrap();
+        assert!(matches!(
+            preview,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::SwitchDotfiles {
+                    target: DotfileTarget::Bundle { sha256 }, review: None, ..
+                },
+                ..
+            } if sha256 == id
+        ));
+        let (_, disable) = p(&[
+            "--pane",
+            "2",
+            "switch-dotfiles",
+            "disabled",
+            "--shell",
+            "zsh",
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(
+            disable,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::SwitchDotfiles {
+                    target: DotfileTarget::Disabled, shell: DotfileShell::Zsh, review: Some(review), ..
+                },
+                ..
+            } if review == token
+        ));
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "switch-dotfiles",
+                "disabled",
+                "--shell",
+                "bash"
+            ])
+            .is_err()
+        );
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "preview-dotfiles-switch",
+                "../bundle",
+                "--shell",
+                "bash"
+            ])
+            .is_err()
+        );
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "preview-dotfiles-switch",
+                &id,
+                "--shell",
+                "bash",
+                "--review",
+                &token
+            ])
+            .is_err()
+        );
     }
 
     #[test]

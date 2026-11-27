@@ -1290,6 +1290,21 @@ Pass the returned `review` token to apply on the same pane with the same bundle,
 
 Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_files`. An unchanged bundle returns an empty list. A missing fragment becomes an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields. Use `"op":"apply-dotfiles"` plus the returned `"review"` for the reviewed installation.
 
+### Restore or disable SSH dotfiles
+
+Use `preview-dotfiles-switch SHA256|disabled --shell bash|zsh` to review a switch on the pane's SFTP connection. Use an earlier `bundle_sha256` from apply, or find the shell's retained version directories under `~/.config/w11term/dotfiles/`. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
+
+```powershell
+$preview = & $ctl --pid 12345 sftp --pane $pane preview-dotfiles-switch $previousBundle --shell bash | ConvertFrom-Json
+$preview.result.sftp
+# Review the currently active and proposed bundles.
+& $ctl --pid 12345 sftp --pane $pane switch-dotfiles $previousBundle --shell bash --review $preview.result.sftp.review
+```
+
+Use the same two commands with `disabled` to stop loading managed dotfiles in new shells. Switching only changes the selector. The startup hooks and retained files stay available for the next review. Restoring checks that the retained fragments match their bundle hash and that both startup hooks are installed. A stale token or edited fragment prevents activation. The reply reports `shell`, `home`, the selected `bundle_sha256` or null, and `changed`.
+
+Direct pipe clients use `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. Include the returned `"review"` to publish the switch.
+
 ### Run SFTP operations
 
 ```powershell

@@ -28,7 +28,7 @@ use tokio::{
 mod atomic_upload;
 mod directory;
 mod dotfiles;
-pub use dotfiles::{DotfileBundle, DotfileShell, validate_zdotdir};
+pub use dotfiles::{DotfileBundle, DotfileShell, DotfileTarget, validate_zdotdir};
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
 mod group_upload;
@@ -234,6 +234,14 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
         review: String,
+    },
+    SwitchDotfiles {
+        target: DotfileTarget,
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
     },
     /// Explicit Save from the editor. An absent original requests a new file.
     #[serde(skip)]
@@ -939,6 +947,9 @@ pub(crate) async fn run(
                 Operation::ApplyDotfiles { .. } => JobStage::Checking(
                     "Dotfiles installation did not finish. Preview again to check the active bundle.",
                 ),
+                Operation::SwitchDotfiles { .. } => JobStage::Checking(
+                    "Dotfiles switch did not finish. Preview again to check the active bundle.",
+                ),
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
                 Operation::PreviewImage { .. } => {
                     JobStage::Checking("Image preview did not finish")
@@ -1611,6 +1622,15 @@ impl Engine {
                 review,
             } => {
                 self.apply_dotfiles(bundle, shell, zdotdir.as_deref(), &review, stage)
+                    .await?
+            }
+            SwitchDotfiles {
+                target,
+                shell,
+                zdotdir,
+                review,
+            } => {
+                self.switch_dotfiles(target, shell, zdotdir.as_deref(), review.as_deref(), stage)
                     .await?
             }
             PreviewImage { path } => self.read_preview_image(&path, cancel).await?,

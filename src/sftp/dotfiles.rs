@@ -1,6 +1,8 @@
 use super::*;
 
 const DIRECTORY: &str = ".config/w11term/dotfiles";
+const PARENTS: [&str; 3] = [".config", ".config/w11term", DIRECTORY];
+const DISABLED: &str = "disabled\n";
 const BEGIN: &str = "# >>> w11term dotfiles >>>";
 const END: &str = "# <<< w11term dotfiles <<<";
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
@@ -10,6 +12,13 @@ const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
 pub enum DotfileShell {
     Bash,
     Zsh,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DotfileTarget {
+    Bundle { sha256: String },
+    Disabled,
 }
 
 impl DotfileShell {
@@ -116,6 +125,10 @@ impl Edit {
         self.before != self.after
     }
 
+    fn active_version(&self) -> Option<&str> {
+        self.before.as_deref().and_then(selector_version)
+    }
+
     fn report(&self) -> Value {
         let hash = |text: &str| digest_hex(Sha256::new_with_prefix(text));
         let mut report = json!({
@@ -146,19 +159,16 @@ impl Plan {
         self.files.iter().chain(std::iter::once(&self.selector))
     }
 
-    fn report(&self, review_scope: u128) -> Result<Value> {
-        let mut report = json!({
+    fn report(&self) -> Value {
+        json!({
             "shell": self.shell,
             "home": self.home,
             "bundle_sha256": self.id,
+            "active_bundle_sha256": self.selector.active_version(),
             "directories_to_create": self.create,
             "files": self.edits().map(Edit::report).collect::<Vec<_>>(),
             "supports_atomic_replace": self.atomic_replace,
-        });
-        let mut digest = Sha256::new_with_prefix(review_scope.to_le_bytes());
-        digest.update(serde_json::to_vec(&report)?);
-        report["review"] = json!(digest_hex(digest));
-        Ok(report)
+        })
     }
 }
 
@@ -258,9 +268,9 @@ impl Engine {
         shell: DotfileShell,
         zdotdir: Option<&str>,
     ) -> Result<Value> {
-        self.dotfiles_plan(&bundle, shell, zdotdir)
-            .await?
-            .report(self.dotfiles_review_scope)
+        let mut report = self.dotfiles_plan(&bundle, shell, zdotdir).await?.report();
+        report["review"] = json!(self.dotfiles_review(&report)?);
+        Ok(report)
     }
 
     pub(super) async fn apply_dotfiles(
@@ -271,12 +281,8 @@ impl Engine {
         review: &str,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        let review = normalize_sha256(review).context("Invalid dotfiles review token")?;
         let plan = self.dotfiles_plan(&bundle, shell, zdotdir).await?;
-        ensure!(
-            plan.report(self.dotfiles_review_scope)?["review"] == review,
-            "The dotfiles review is stale or belongs to another SFTP connection. Preview again."
-        );
+        self.check_dotfiles_review(review, &plan.report())?;
         for edit in plan.edits() {
             ensure!(
                 edit.after.is_some(),
@@ -338,6 +344,136 @@ impl Engine {
         )
     }
 
+    pub(super) async fn switch_dotfiles(
+        &self,
+        target: DotfileTarget,
+        shell: DotfileShell,
+        zdotdir: Option<&str>,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        validate_zdotdir(shell, zdotdir)?;
+        let id = match target {
+            DotfileTarget::Bundle { sha256 } => Some(normalize_sha256(&sha256)?),
+            DotfileTarget::Disabled => None,
+        };
+        let home = self.dotfile_home().await?;
+        for relative in PARENTS {
+            let path = under_home(&home, relative);
+            ensure!(
+                self.dotfile_directory_exists(&path).await?,
+                "Managed dotfiles directory is missing: {path}"
+            );
+        }
+        let files = match &id {
+            Some(id) => {
+                self.verified_dotfile_version(&home, shell, zdotdir, id)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let desired = id
+            .as_ref()
+            .map_or_else(|| DISABLED.to_owned(), |id| format!("{id}\n"));
+        let selector = self.dotfile_selector(&home, shell, desired).await?;
+        let atomic_replace = self.extension(editor::POSIX_RENAME, "1").is_ok();
+        let mut report = json!({
+            "operation": "switch-dotfiles",
+            "shell": shell,
+            "home": home,
+            "bundle_sha256": id,
+            "active_bundle_sha256": selector.active_version(),
+            "selector": selector.report(),
+            "files": files,
+            "supports_atomic_replace": atomic_replace,
+        });
+        let Some(review) = review else {
+            report["review"] = json!(self.dotfiles_review(&report)?);
+            return Ok(report);
+        };
+        self.check_dotfiles_review(review, &report)?;
+        ensure!(
+            selector.action != "selector-conflict",
+            "Resolve the dotfiles conflict at {}",
+            selector.path
+        );
+        let changed = selector.changed();
+        if changed {
+            ensure!(
+                selector.before.is_none() || atomic_replace,
+                "The server cannot atomically replace {}",
+                selector.path
+            );
+            self.write_dotfile(&selector, stage).await?;
+        }
+        Ok(json!({"shell": shell, "home": home, "bundle_sha256": id, "changed": changed}))
+    }
+
+    async fn verified_dotfile_version(
+        &self,
+        home: &str,
+        shell: DotfileShell,
+        zdotdir: Option<&str>,
+        id: &str,
+    ) -> Result<Vec<Value>> {
+        let directory = under_home(home, &version_directory(shell, id));
+        ensure!(
+            self.dotfile_directory_exists(&directory).await?,
+            "Retained dotfiles bundle not found: {id}"
+        );
+        let read = |role| {
+            let path = format!("{directory}/{role}.sh");
+            async move {
+                let contents = self
+                    .dotfile_text(&path)
+                    .await?
+                    .with_context(|| format!("Retained dotfile is missing: {path}"))?;
+                ensure!(
+                    contents.len() <= MAX_FRAGMENT_BYTES + 1,
+                    "Retained dotfile exceeds its size limit: {path}"
+                );
+                Ok::<_, anyhow::Error>((path, contents))
+            }
+        };
+        let (environment_path, environment) = read("environment").await?;
+        let (prompt_path, prompt) = read("prompt").await?;
+        ensure!(
+            bundle_id(&environment, &prompt) == id,
+            "Retained dotfiles do not match bundle {id}"
+        );
+        let hooks = self.dotfile_hooks(home, shell, zdotdir).await?;
+        for hook in &hooks {
+            ensure!(
+                hook.action == "unchanged",
+                "Install or repair the managed startup hook at {} before restoring a bundle",
+                hook.path
+            );
+        }
+        let mut files = Vec::with_capacity(4);
+        for (path, contents) in [(environment_path, environment), (prompt_path, prompt)] {
+            files.push(
+                Edit::new(path, "unchanged", Some(contents.clone()), Some(contents)).report(),
+            );
+        }
+        files.extend(hooks.iter().map(Edit::report));
+        Ok(files)
+    }
+
+    fn dotfiles_review(&self, report: &Value) -> Result<String> {
+        let mut digest = Sha256::new_with_prefix(self.dotfiles_review_scope.to_le_bytes());
+        digest.update(serde_json::to_vec(report)?);
+        Ok(digest_hex(digest))
+    }
+
+    fn check_dotfiles_review(&self, token: &str, report: &Value) -> Result<()> {
+        let token = normalize_sha256(token).context("Invalid dotfiles review token")?;
+        ensure!(
+            self.dotfiles_review(report)? == token,
+            "The dotfiles review is stale or belongs to another SFTP connection. Preview again."
+        );
+        Ok(())
+    }
+
     async fn write_dotfile(&self, edit: &Edit, stage: &mut JobStage) -> Result<()> {
         self.check_entry_parent(remote_parent(&edit.path)?).await?;
         self.save_text(
@@ -360,12 +496,43 @@ impl Engine {
         validate_zdotdir(shell, zdotdir)?;
         let environment = payload(bundle.environment.as_deref());
         let prompt = payload(bundle.prompt(shell));
-        let mut digest = Sha256::new_with_prefix(b"w11term-dotfiles-v1\0");
-        digest.update((environment.len() as u64).to_le_bytes());
-        digest.update(environment.as_bytes());
-        digest.update(prompt.as_bytes());
-        let id = digest_hex(digest);
-        let version_directory = format!("{DIRECTORY}/{}-{id}", shell.name());
+        let id = bundle_id(&environment, &prompt);
+        let version_directory = version_directory(shell, &id);
+        let home = self.dotfile_home().await?;
+        let mut directories_to_create = Vec::new();
+        for relative in PARENTS.into_iter().chain([version_directory.as_str()]) {
+            let path = under_home(&home, relative);
+            if !self.dotfile_directory_exists(&path).await? {
+                directories_to_create.push(path);
+            }
+        }
+        let mut files = Vec::with_capacity(4);
+        for (role, desired) in [("environment", environment), ("prompt", prompt)] {
+            let path = under_home(&home, &format!("{version_directory}/{role}.sh"));
+            let original = self.dotfile_text(&path).await?;
+            let (action, after) = match original.as_deref() {
+                None => ("create", Some(desired)),
+                Some(text) if text == desired => ("unchanged", Some(desired)),
+                Some(_) => ("payload-conflict", None),
+            };
+            files.push(Edit::new(path, action, original, after));
+        }
+        files.extend(self.dotfile_hooks(&home, shell, zdotdir).await?);
+        let selector = self
+            .dotfile_selector(&home, shell, format!("{id}\n"))
+            .await?;
+        Ok(Plan {
+            home,
+            id,
+            create: directories_to_create,
+            files,
+            selector,
+            shell,
+            atomic_replace: self.extension(editor::POSIX_RENAME, "1").is_ok(),
+        })
+    }
+
+    async fn dotfile_home(&self) -> Result<String> {
         let homes = self.raw.realpath(".").await?.files;
         let [home] = homes.as_slice() else {
             bail!("SFTP did not resolve the remote home directory to one path");
@@ -376,15 +543,16 @@ impl Engine {
                 && (home == "/" || home.strip_prefix('/').is_some_and(relative_path)),
             "SFTP did not return an absolute remote home directory"
         );
+        Ok(home.to_owned())
+    }
+
+    async fn dotfile_hooks(
+        &self,
+        home: &str,
+        shell: DotfileShell,
+        zdotdir: Option<&str>,
+    ) -> Result<[Edit; 2]> {
         let home_prefix = home.trim_end_matches('/');
-        let under_home = |relative: &str| format!("{home_prefix}/{relative}");
-        let mut directories_to_create = Vec::new();
-        for relative in [".config", ".config/w11term", DIRECTORY, &version_directory] {
-            let path = under_home(relative);
-            if !self.dotfile_directory_exists(&path).await? {
-                directories_to_create.push(path);
-            }
-        }
         let startup_dir = if let Some(relative) = zdotdir {
             let mut path = home_prefix.to_owned();
             for part in relative.split('/') {
@@ -420,44 +588,28 @@ impl Engine {
         };
         let rc = startup(&format!(".{}rc", shell.name()));
         let rc_original = self.dotfile_text(&rc).await?;
-        let mut files = Vec::with_capacity(4);
-        for (role, desired) in [("environment", environment), ("prompt", prompt)] {
-            let path = under_home(&format!("{version_directory}/{role}.sh"));
-            let original = self.dotfile_text(&path).await?;
-            let (action, after) = match original.as_deref() {
-                None => ("create", Some(desired)),
-                Some(text) if text == desired => ("unchanged", Some(desired)),
-                Some(_) => ("payload-conflict", None),
-            };
-            files.push(Edit::new(path, action, original, after));
-        }
-        files.push(hook_change(
-            login,
-            login_original,
-            hook_text(shell, Hook::Login),
-        ));
-        files.push(hook_change(
-            rc,
-            rc_original,
-            hook_text(shell, Hook::Interactive),
-        ));
-        let path = under_home(&format!("{DIRECTORY}/{}-current", shell.name()));
+        Ok([
+            hook_change(login, login_original, hook_text(shell, Hook::Login)),
+            hook_change(rc, rc_original, hook_text(shell, Hook::Interactive)),
+        ])
+    }
+
+    async fn dotfile_selector(
+        &self,
+        home: &str,
+        shell: DotfileShell,
+        desired: String,
+    ) -> Result<Edit> {
+        let path = under_home(home, &format!("{DIRECTORY}/{}-current", shell.name()));
         let before = self.dotfile_text(&path).await?;
-        let desired = format!("{id}\n");
-        let selector = match before.as_deref() {
+        Ok(match before.as_deref() {
+            None if desired == DISABLED => Edit::new(path, "unchanged", None, None),
             None => Edit::new(path, "create", None, Some(desired)),
             Some(text) if text == desired => Edit::new(path, "unchanged", before, Some(desired)),
-            Some(text) if valid_selector(text) => Edit::new(path, "replace", before, Some(desired)),
+            Some(text) if text == DISABLED || selector_version(text).is_some() => {
+                Edit::new(path, "replace", before, Some(desired))
+            }
             Some(_) => Edit::new(path, "selector-conflict", before, None),
-        };
-        Ok(Plan {
-            home: home.to_owned(),
-            id,
-            create: directories_to_create,
-            files,
-            selector,
-            shell,
-            atomic_replace: self.extension(editor::POSIX_RENAME, "1").is_ok(),
         })
     }
 
@@ -489,13 +641,29 @@ impl Engine {
     }
 }
 
-fn valid_selector(text: &str) -> bool {
-    text.strip_suffix('\n').is_some_and(|line| {
+fn selector_version(text: &str) -> Option<&str> {
+    text.strip_suffix('\n').filter(|line| {
         line.len() == 64
             && line
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+fn bundle_id(environment: &str, prompt: &str) -> String {
+    let mut digest = Sha256::new_with_prefix(b"w11term-dotfiles-v1\0");
+    digest.update((environment.len() as u64).to_le_bytes());
+    digest.update(environment.as_bytes());
+    digest.update(prompt.as_bytes());
+    digest_hex(digest)
+}
+
+fn version_directory(shell: DotfileShell, id: &str) -> String {
+    format!("{DIRECTORY}/{}-{id}", shell.name())
+}
+
+fn under_home(home: &str, relative: &str) -> String {
+    format!("{}/{relative}", home.trim_end_matches('/'))
 }
 
 fn remote_parent(path: &str) -> Result<&str> {

@@ -1,6 +1,6 @@
 use super::*;
 use sha2::{Digest, Sha256};
-use w11term::sftp::{DotfileBundle, DotfileShell, Operation};
+use w11term::sftp::{DotfileBundle, DotfileShell, DotfileTarget, Operation};
 
 fn bundle(shell: DotfileShell, zdotdir: Option<&str>) -> Operation {
     Operation::PreviewDotfiles {
@@ -25,6 +25,17 @@ fn apply(prompt: &str, plan: &Value) -> Operation {
         shell: DotfileShell::Bash,
         zdotdir: None,
         review: plan["review"].as_str().unwrap().to_owned(),
+    }
+}
+
+fn switch(id: Option<&str>, preview: Option<&Value>) -> Operation {
+    Operation::SwitchDotfiles {
+        target: id.map_or(DotfileTarget::Disabled, |id| DotfileTarget::Bundle {
+            sha256: id.into(),
+        }),
+        shell: DotfileShell::Bash,
+        zdotdir: None,
+        review: preview.map(|plan| plan["review"].as_str().unwrap().into()),
     }
 }
 
@@ -231,6 +242,7 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         fs::read_to_string(version.join("prompt.sh")).unwrap(),
         "PS1='first> '\n"
     );
+
     let installed = fs::read_to_string(&startup).unwrap();
     assert!(installed.starts_with("# corrected Bash configuration\n"));
     assert_eq!(
@@ -266,6 +278,62 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     assert_eq!(fs::read_to_string(&startup).unwrap(), installed);
     assert_eq!(
         fs::read_to_string(version.join("prompt.sh")).unwrap(),
+        "PS1='first> '\n"
+    );
+    let restore = guarded_job(&pane, None, switch(Some(id), None))
+        .await
+        .unwrap();
+    assert_eq!(restore["active_bundle_sha256"], new_id);
+    assert_eq!(restore["bundle_sha256"], id);
+    assert_eq!(restore["selector"]["action"], "replace");
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        format!("{new_id}\n")
+    );
+    let first_prompt = version.join("prompt.sh");
+    fs::write(&first_prompt, "PS1='drift> '\n").unwrap();
+    let error = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("do not match bundle"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        format!("{new_id}\n")
+    );
+    fs::write(&first_prompt, "PS1='first> '\n").unwrap();
+
+    let disable = guarded_job(&pane, None, switch(None, None)).await.unwrap();
+    let disabled = guarded_job(&pane, None, switch(None, Some(&disable)))
+        .await
+        .unwrap();
+    assert_eq!(disabled["changed"], true);
+    assert!(disabled["bundle_sha256"].is_null());
+    assert_eq!(fs::read_to_string(&selector).unwrap(), "disabled\n");
+    let error = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    assert_eq!(fs::read_to_string(&selector).unwrap(), "disabled\n");
+
+    let restore = guarded_job(&pane, None, switch(Some(id), None))
+        .await
+        .unwrap();
+    assert!(restore["active_bundle_sha256"].is_null());
+    let restored = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
+        .await
+        .unwrap();
+    assert_eq!(restored["changed"], true);
+    assert_eq!(fs::read_to_string(&selector).unwrap(), format!("{id}\n"));
+    let repeat = guarded_job(&pane, None, switch(Some(id), None))
+        .await
+        .unwrap();
+    let repeated = guarded_job(&pane, None, switch(Some(id), Some(&repeat)))
+        .await
+        .unwrap();
+    assert_eq!(repeated["changed"], false);
+    assert_eq!(fs::read_to_string(&startup).unwrap(), installed);
+    assert_eq!(
+        fs::read_to_string(&first_prompt).unwrap(),
         "PS1='first> '\n"
     );
     assert_eq!(opens.load(Ordering::Relaxed), 2);
