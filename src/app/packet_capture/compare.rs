@@ -35,34 +35,29 @@ impl ConversationView {
 pub enum Change {
     View(ConversationView),
     Filter(String),
-    Page {
-        list: u64,
-        page: usize,
-    },
-    Pair {
-        list: u64,
-        row: Option<usize>,
-    },
+    Page { list: u64, page: usize },
+    Pair { list: u64, row: Option<usize> },
     Source(usize),
     ProtocolsExpanded(bool),
     TimelineExpanded(bool),
     TimelineInterval(usize),
-    TimelineEnd {
-        first: usize,
-        last: usize,
-    },
+    TimelineEnd { first: usize, last: usize },
     OpenTimelineInterval(usize, RangeInclusive<usize>),
     SaveTimelineExcerpt(usize, RangeInclusive<usize>),
     CompareElapsed(RangeInclusive<usize>),
     CompareWholeCaptures,
     LimitElapsedInterval(bool),
-    Open {
-        list: u64,
-        row: Option<usize>,
-        source: usize,
-        elapsed: Option<RangeInclusive<usize>>,
-    },
+    Open(ConversationSelection),
+    SaveConversationExcerpt(ConversationSelection),
     Export,
+}
+
+#[derive(Clone)]
+pub struct ConversationSelection {
+    list: u64,
+    row: Option<usize>,
+    source: usize,
+    elapsed: Option<RangeInclusive<usize>>,
 }
 
 pub(super) struct Comparison {
@@ -253,6 +248,42 @@ impl Comparison {
         Arc::ptr_eq(revision, &self.revision).then(|| Arc::clone(self.visible_model()))
     }
 
+    fn requested_pair(
+        &self,
+        revision: &Arc<()>,
+        selection: &ConversationSelection,
+    ) -> Option<(PathBuf, PacketConversationEndpoints, Option<Range<i128>>)> {
+        if !Arc::ptr_eq(revision, &self.revision)
+            || selection.list != self.list_generation
+            || selection.row != self.selected
+            || selection.source != self.source
+            || selection.elapsed != self.elapsed_scope()
+        {
+            return None;
+        }
+        let pair = self.row(self.page * ROWS_PER_PAGE + selection.row?)?;
+        let bounds = match &selection.elapsed {
+            Some(range) => Some(self.source_interval(selection.source, range.clone())?),
+            None => None,
+        };
+        Some((
+            self.paths.get(selection.source)?.clone(),
+            pair.endpoints,
+            bounds,
+        ))
+    }
+
+    pub(super) fn pair_excerpt_job(
+        &self,
+        revision: &Arc<()>,
+        selection: &ConversationSelection,
+    ) -> Option<impl FnOnce() -> anyhow::Result<PacketCaptureExcerptPlan> + use<>> {
+        let (path, endpoints, bounds) = self.requested_pair(revision, selection)?;
+        let model = Arc::clone(&self.model);
+        let source = selection.source;
+        Some(move || model.prepare_conversation_excerpt(source, path, endpoints, bounds))
+    }
+
     pub(super) fn update(
         &mut self,
         revision: &Arc<()>,
@@ -335,25 +366,9 @@ impl Comparison {
                     WiresharkFilter::Interval(interval),
                 ));
             }
-            Change::Open {
-                list,
-                row,
-                source,
-                elapsed,
-            } if list == self.list_generation
-                && row == self.selected
-                && source == self.source
-                && elapsed == self.elapsed_scope() =>
-            {
-                let pair = self.row(start + row?)?;
-                let interval = match elapsed {
-                    Some(elapsed) => Some(self.source_interval(source, elapsed)?),
-                    None => None,
-                };
-                return Some((
-                    self.paths[source].clone(),
-                    WiresharkFilter::Conversation(pair.endpoints, interval),
-                ));
+            Change::Open(selection) => {
+                let (path, endpoints, bounds) = self.requested_pair(revision, &selection)?;
+                return Some((path, WiresharkFilter::Conversation(endpoints, bounds)));
             }
             _ => (),
         }
@@ -751,18 +766,27 @@ impl Comparison {
                     "The selected capture has no timestamped records to align the interval.",
                 ));
             }
+            let selection = ConversationSelection {
+                list,
+                row: self.selected,
+                source: self.source,
+                elapsed,
+            };
+            let can_open = idle && self.selected.is_some() && can_scope;
             fields.extend([
                 KeyedView::new(
                     "open-conversation",
                     Button::new()
-                        .is_enabled(idle && self.selected.is_some() && can_scope)
-                        .on_click(action(Change::Open {
-                            list,
-                            row: self.selected,
-                            source: self.source,
-                            elapsed,
-                        }))
+                        .is_enabled(can_open)
+                        .on_click(action(Change::Open(selection.clone())))
                         .content("Open conversation in Wireshark"),
+                ),
+                KeyedView::new(
+                    "save-conversation-excerpt",
+                    Button::new()
+                        .is_enabled(can_open)
+                        .on_click(action(Change::SaveConversationExcerpt(selection)))
+                        .content("Save conversation excerpt…"),
                 ),
                 KeyedView::new(
                     "choose-wireshark",

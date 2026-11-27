@@ -26,17 +26,15 @@ fn compare(directory: &Path, before: &str, after: &str, options: &[&str]) -> Out
 }
 
 fn clip(directory: &Path, input: &str, elapsed: &str, destination: &str) -> Output {
+    clip_with(directory, input, destination, &["--elapsed-ns", elapsed])
+}
+
+fn clip_with(directory: &Path, input: &str, destination: &str, options: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
         .current_dir(directory)
         .env_remove("LOCALAPPDATA")
-        .args([
-            "clip-packet-capture",
-            input,
-            "--elapsed-ns",
-            elapsed,
-            "--output-file",
-            destination,
-        ])
+        .args(["clip-packet-capture", input, "--output-file", destination])
+        .args(options)
         .output()
         .unwrap()
 }
@@ -243,6 +241,86 @@ fn saves_exact_classic_records_inside_the_elapsed_bounds_without_replacing_files
     assert!(!partial.status.success());
     assert!(!root.join("failed.pcap").exists());
     assert_eq!(fs::read(root.join("original.pcap")).unwrap(), source);
+}
+
+#[test]
+fn saves_bidirectional_conversations_and_uses_the_source_clock_for_combined_filters() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut unrelated = raw_transport_packet(17, 49152, false);
+    unrelated[19] = 3;
+    let forward = raw_transport_packet(17, 49152, false);
+    let reverse = raw_transport_packet(17, 49152, true);
+    let tcp = raw_transport_packet(6, 49152, false);
+    let other_port = raw_transport_packet(17, 49153, false);
+    let src = raw_capture_at([
+        (10, 0, &unrelated),
+        (11, 0, &forward),
+        (11, 500_000, &tcp),
+        (12, 0, &reverse),
+        (12, 500_000, &other_port),
+        (13, 1_000_000, &forward),
+    ]);
+    fs::write(root.join("source.pcap"), src).unwrap();
+    let pair = ["--udp-pair", "192.0.2.2:443,192.0.2.1:49152"];
+    let output = clip_with(root, "source.pcap", "pair.pcap", &pair);
+    assert!(output.status.success(), "{output:?}");
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["result"]["packets"], 3);
+    assert_eq!(
+        fs::read(root.join("pair.pcap")).unwrap(),
+        raw_capture_at([
+            (11, 0, &forward),
+            (12, 0, &reverse),
+            (13, 1_000_000, &forward),
+        ])
+    );
+    let output = clip_with(
+        root,
+        "source.pcap",
+        "window.pcap",
+        &[pair[0], pair[1], "--elapsed-ns", "1000000000:2000000000"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(root.join("window.pcap")).unwrap(),
+        raw_capture_at([(11, 0, &forward)])
+    );
+
+    let output = clip_with(
+        root,
+        "source.pcap",
+        "ip.pcap",
+        &["--ip-pair", "192.0.2.1,192.0.2.2"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(root.join("ip.pcap")).unwrap(),
+        raw_capture_at([
+            (11, 0, &forward),
+            (11, 500_000, &tcp),
+            (12, 0, &reverse),
+            (12, 500_000, &other_port),
+            (13, 1_000_000, &forward),
+        ])
+    );
+
+    let empty = clip_with(
+        root,
+        "source.pcap",
+        "empty.pcap",
+        &["--tcp-pair", pair[1], "--elapsed-ns", "0:1"],
+    );
+    assert!(!empty.status.success());
+    assert!(!root.join("empty.pcap").exists());
+    let invalid = clip_with(
+        root,
+        "source.pcap",
+        "invalid.pcap",
+        &["--ip-pair", "192.0.2.1,::1"],
+    );
+    assert!(!invalid.status.success());
+    assert!(!root.join("invalid.pcap").exists());
 }
 
 #[test]

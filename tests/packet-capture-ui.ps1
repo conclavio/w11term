@@ -617,6 +617,19 @@ try {
         (Find-Element 'IP conversation changes 1') -and
         (Find-Element "2001:db8::1 $bothDirections 2001:db8::2")
     }
+    $row = Wait-Until 'the scoped IPv6 conversation can be selected for saving' {
+        Find-Element "2001:db8::1 $bothDirections 2001:db8::2" ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $conversationExcerpt = Join-Path $State 'before scoped ipv6.pcap'
+    Save-CaptureExcerpt ('Save conversation excerpt' + [char]0x2026) $conversationExcerpt
+    $cliConversation = Join-Path $State 'before scoped ipv6 cli.pcap'
+    $result = & $Cli clip-packet-capture $conversationCapture --ip-pair '2001:db8::1,2001:db8::2' --elapsed-ns '786432000:3145728000' --output-file $cliConversation | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $result.result.packets -ne 1 -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($conversationExcerpt)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliConversation))) {
+        throw 'The saved conversation excerpt differs from the scoped CLI selection'
+    }
     $rangeBase = Join-Path $State 'elapsed range comparison'
     Save-PacketComparison $rangeBase -Json
     $rangePath = "$rangeBase.json"
@@ -710,6 +723,15 @@ try {
         [IO.File]::ReadAllText($transportFilterPath) -ceq $limited
     }
     (Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::On)).Toggle()
+    $null = Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::Off)
+    $udpExcerpt = Join-Path $State 'selected UDP pair.pcap'
+    Save-CaptureExcerpt ('Save port pair excerpt' + [char]0x2026) $udpExcerpt
+    $report = & $Cli inspect-packet-capture $udpExcerpt | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$report.complete -or $report.packets -ne 1 -or
+        $report.transport_conversations.top[0].protocol -ne 17 -or
+        $report.transport_conversations.top[0].a -cne '192.0.2.1:49152') {
+        throw 'The standalone excerpt did not preserve just the selected UDP pair'
+    }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'
     $expander = Open-PacketSection 'comparison-ip-protocols'

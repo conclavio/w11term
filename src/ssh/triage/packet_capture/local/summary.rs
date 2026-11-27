@@ -8,7 +8,7 @@ use std::{
 };
 
 mod conversations;
-mod ip;
+pub(super) mod ip;
 pub(super) mod pcapng;
 mod protocols;
 mod timeline;

@@ -161,6 +161,20 @@ impl CaptureComparison {
         CaptureExcerptPlan::absolute(path, bounds, stamp)
     }
 
+    pub fn prepare_conversation_excerpt(
+        &self,
+        source: usize,
+        path: PathBuf,
+        endpoints: ConversationEndpoints,
+        bounds: Option<Range<i128>>,
+    ) -> Result<CaptureExcerptPlan> {
+        let stamp = *self
+            .source_stamps
+            .get(source)
+            .context("Choose the Before or After capture")?;
+        CaptureExcerptPlan::conversation_absolute(path, endpoints, bounds, stamp)
+    }
+
     pub fn rescan_elapsed(&self, paths: [PathBuf; 2], offsets: Range<i128>) -> Result<Self> {
         Self::scan_elapsed(paths, offsets, self.source_stamps.map(Some))
     }

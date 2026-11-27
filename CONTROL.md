@@ -1539,6 +1539,8 @@ Choose **Compare selected interval** in **Elapsed packet timeline** to recompute
 
 Choose **Save capture excerpt…** in a saved capture's timeline, or **Save Before excerpt…** or **Save After excerpt…** in an elapsed comparison. The new capture preserves selected packet bytes, order, and original timestamps in PCAP or PCAPNG. PCAPNG retains the interface definitions needed by those packets and omits capture-wide statistics, comments, decryption-secret blocks, and unrelated metadata. The writer scans the source within the usual record limits and publishes a new file only when the scan succeeds and packets match. For a scripted export, use `clip-packet-capture FILE --elapsed-ns START:END --output-file PATH`. The signed nanosecond bounds are relative to the first timestamped record, include the start, and exclude the end. [PCAPNG format](https://www.ietf.org/archive/id/draft-ietf-opsawg-pcapng-06.html)
 
+Select a conversation and choose **Save conversation excerpt…** or **Save port pair excerpt…** to save both directions of that pair. A comparison uses the selected Before or After source. The export honors an active time limit or the current elapsed comparison window. An IP pair uses the outer IP addresses. A TCP or UDP pair also requires the recorded transport header to contain both ports. Add `--ip-pair A,B`, `--tcp-pair A:PORT,B:PORT`, or `--udp-pair A:PORT,B:PORT` to `clip-packet-capture`. Use brackets around IPv6 addresses with ports. Omit `--elapsed-ns` to select the pair across the whole source, including matching records without usable timestamps.
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

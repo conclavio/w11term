@@ -9,7 +9,7 @@ use std::{
 use w11term::control::{PacketCaptureOptions, Reply, Request};
 use w11term::ssh::{
     LocalPacketCapture, PacketCaptureComparison, PacketCaptureExcerptPlan,
-    open_capture_in_wireshark,
+    PacketConversationEndpoints, open_capture_in_wireshark,
 };
 
 pub(super) const HELP: &str = concat!(
@@ -31,8 +31,10 @@ pub(super) const COMPARE_HELP: &str = concat!(
     "[--format json|text] [--output-file PATH]",
 );
 pub(super) const CLIP_VERB: &str = "clip-packet-capture";
-pub(super) const CLIP_HELP: &str =
-    "w11term-cli clip-packet-capture FILE --elapsed-ns START:END --output-file PATH";
+pub(super) const CLIP_HELP: &str = concat!(
+    "w11term-cli clip-packet-capture FILE [--elapsed-ns START:END] ",
+    "[--ip-pair A,B | --tcp-pair A:PORT,B:PORT | --udp-pair A:PORT,B:PORT] --output-file PATH",
+);
 
 pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
@@ -81,19 +83,40 @@ pub(super) fn clip_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
     let input = args.next().context("provide the source capture file")?;
     let options = report_options(CLIP_VERB, args)?;
-    let bounds = parse_elapsed(
-        options
-            .elapsed_ns
-            .context("provide --elapsed-ns START:END")?,
-    )?;
+    let bounds = options.elapsed_ns.map(parse_elapsed).transpose()?;
     let output = options.output_file.context("provide --output-file PATH")?;
-    let excerpt = PacketCaptureExcerptPlan::elapsed(path::absolute(input)?, bounds)?
-        .save(path::absolute(output)?)?;
+    let source = path::absolute(input)?;
+    let plan = if let Some((kind, pair)) = options.pair {
+        PacketCaptureExcerptPlan::conversation(source, parse_clip_pair(kind, pair)?, bounds)?
+    } else {
+        PacketCaptureExcerptPlan::elapsed(
+            source,
+            bounds.context("provide --elapsed-ns START:END or a conversation pair")?,
+        )?
+    };
+    let excerpt = plan.save(path::absolute(output)?)?;
     let reply = Reply::from_result(Ok(serde_json::to_value(excerpt)?));
     serde_json::to_writer(&mut *stdout, &reply)?;
     writeln!(stdout)?;
     stdout.flush()?;
     Ok(())
+}
+
+fn parse_clip_pair(kind: &str, value: &str) -> Result<PacketConversationEndpoints> {
+    let (a, b) = value
+        .split_once(',')
+        .context("Separate the two endpoints with a comma")?;
+    if kind == "--ip-pair" {
+        return Ok(PacketConversationEndpoints::Ip {
+            a: a.parse().context("Invalid first IP address")?,
+            b: b.parse().context("Invalid second IP address")?,
+        });
+    }
+    Ok(PacketConversationEndpoints::Transport {
+        protocol: if kind == "--tcp-pair" { 6 } else { 17 },
+        a: a.parse().context("Invalid first IP and port endpoint")?,
+        b: b.parse().context("Invalid second IP and port endpoint")?,
+    })
 }
 
 fn parse_elapsed(value: &str) -> Result<Range<i128>> {
@@ -111,6 +134,7 @@ struct ReportOptions<'a> {
     format: Option<&'a str>,
     output_file: Option<&'a str>,
     elapsed_ns: Option<&'a str>,
+    pair: Option<(&'a str, &'a str)>,
 }
 
 fn report_options<'a>(
@@ -119,6 +143,14 @@ fn report_options<'a>(
 ) -> Result<ReportOptions<'a>> {
     let mut options = ReportOptions::default();
     while let Some(flag) = args.next() {
+        if verb == CLIP_VERB && matches!(flag.as_str(), "--ip-pair" | "--tcp-pair" | "--udp-pair") {
+            ensure!(options.pair.is_none(), "Specify only one conversation pair");
+            let pair = args
+                .next()
+                .with_context(|| format!("{flag} requires two endpoints"))?;
+            options.pair = Some((flag.as_str(), pair.as_str()));
+            continue;
+        }
         let target = match flag.as_str() {
             "--format" if verb == COMPARE_VERB => &mut options.format,
             "--elapsed-ns" if matches!(verb, COMPARE_VERB | CLIP_VERB) => &mut options.elapsed_ns,

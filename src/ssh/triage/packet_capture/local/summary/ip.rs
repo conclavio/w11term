@@ -1,15 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-pub(super) const PREFIX_BYTES: usize = 256;
+pub(in crate::ssh::triage::packet_capture::local) const PREFIX_BYTES: usize = 256;
 const IPV4: u16 = 0x0800;
 const IPV6: u16 = 0x86dd;
 pub(super) const TCP: u8 = 6;
 pub(super) const UDP: u8 = 17;
 const MAX_IPV6_EXTENSIONS: usize = 16;
 
-pub(super) type Addresses = (IpAddr, IpAddr);
+pub(in crate::ssh::triage::packet_capture::local) type Addresses = (IpAddr, IpAddr);
 
-pub(super) struct Packet {
+pub(in crate::ssh::triage::packet_capture::local) struct Packet {
     pub addresses: Addresses,
     pub protocol: Option<u8>,
     pub tcp_flags: Option<u8>,
@@ -43,7 +43,10 @@ impl Packet {
     }
 }
 
-pub(super) fn decode(link_type: u16, prefix: &[u8]) -> Option<Packet> {
+pub(in crate::ssh::triage::packet_capture::local) fn decode(
+    link_type: u16,
+    prefix: &[u8],
+) -> Option<Packet> {
     let (protocol, ip) = match link_type {
         1 => (be16(prefix.get(12..14)?)?, prefix.get(14..)?), // Ethernet
         113 => (be16(prefix.get(14..16)?)?, prefix.get(16..)?), // Linux cooked v1

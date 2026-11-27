@@ -1,4 +1,4 @@
-use super::{Entry, Interface, Order, SECTION, walk};
+use super::{Entry, Interface, Order, SECTION, ip, walk};
 use anyhow::{Context, Result};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -6,7 +6,7 @@ pub(in crate::ssh::triage::packet_capture::local) fn write_excerpt(
     source: &mut (impl Read + Seek),
     bytes: u64,
     output: &mut impl Write,
-    mut selected: impl FnMut(i128) -> bool,
+    mut selected: impl FnMut(Option<i128>, Option<&ip::Packet>) -> bool,
 ) -> Result<u32> {
     let mut section = None;
     let mut interfaces = Vec::new();
@@ -24,10 +24,10 @@ pub(in crate::ssh::triage::packet_capture::local) fn write_excerpt(
                 interface,
                 captured,
                 original,
-                timestamp: Some(timestamp),
-                ticks: Some(ticks),
-                ..
-            } if selected(timestamp) => {
+                timestamp,
+                ticks,
+                decoded,
+            } if selected(timestamp, decoded.as_ref()) => {
                 let order = section.context("Missing excerpt section")?;
                 if written_interfaces == 0 {
                     write_section(output, order)?;
@@ -38,20 +38,31 @@ pub(in crate::ssh::triage::packet_capture::local) fn write_excerpt(
                 }
 
                 let padded = u64::from(captured).next_multiple_of(4);
-                let length =
-                    u32::try_from(32 + padded).context("The excerpt packet is too large")?;
-                for field in [
-                    6,
-                    length,
-                    interface as u32,
-                    (ticks >> 32) as u32,
-                    ticks as u32,
-                    captured,
-                    original,
-                ] {
-                    output.write_all(&encode32(order, field))?;
-                }
-                source.seek(SeekFrom::Start(block.start + 28))?;
+                let (length, payload_offset) = if let Some(ticks) = ticks {
+                    let length =
+                        u32::try_from(32 + padded).context("The excerpt packet is too large")?;
+                    write_fields(
+                        output,
+                        order,
+                        [
+                            6,
+                            length,
+                            interface as u32,
+                            (ticks >> 32) as u32,
+                            ticks as u32,
+                            captured,
+                            original,
+                        ],
+                    )?;
+                    (length, 28)
+                } else {
+                    // A simple packet has no timestamp and uses the section's first interface.
+                    let length =
+                        u32::try_from(16 + padded).context("The excerpt packet is too large")?;
+                    write_fields(output, order, [3, length, original])?;
+                    (length, 12)
+                };
+                source.seek(SeekFrom::Start(block.start + payload_offset))?;
                 let copied = io::copy(&mut (&mut *source).take(u64::from(captured)), output)?;
                 anyhow::ensure!(
                     copied == u64::from(captured),
@@ -126,10 +137,59 @@ fn encode32(order: Order, value: u32) -> [u8; 4] {
     }
 }
 
+fn write_fields<const N: usize>(
+    output: &mut impl Write,
+    order: Order,
+    fields: [u32; N],
+) -> io::Result<()> {
+    for field in fields {
+        output.write_all(&encode32(order, field))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn preserves_simple_packets_without_inventing_timestamps() {
+        let mut source = Vec::new();
+        write_section(&mut source, Order::Little).unwrap();
+        write_fields(&mut source, Order::Little, [1, 20, 101, 128, 20]).unwrap();
+        write_fields(&mut source, Order::Little, [3, 20, 4, 0x44434241, 20]).unwrap();
+        let mut output = Vec::new();
+        let size = source.len() as u64;
+        assert_eq!(
+            write_excerpt(&mut Cursor::new(source), size, &mut output, |time, _| time
+                .is_none())
+            .unwrap(),
+            1
+        );
+        let bytes = output.len() as u64;
+        let mut packets = 0;
+        walk(&mut Cursor::new(&output), bytes, |_, block, entry| {
+            if let Entry::Packet {
+                captured,
+                original,
+                ticks,
+                timestamp,
+                ..
+            } = entry
+            {
+                assert_eq!((captured, original, ticks, timestamp), (4, 4, None, None));
+                assert_eq!(
+                    &output[block.start as usize + 12..block.start as usize + 16],
+                    b"ABCD"
+                );
+                packets += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(packets, 1);
+    }
 
     #[test]
     fn retains_packet_ticks_and_interface_clock_in_a_mixed_endian_source() {
@@ -160,8 +220,8 @@ mod tests {
         let mut output = Vec::new();
         let size = source.len() as u64;
         assert_eq!(
-            write_excerpt(&mut Cursor::new(&source), size, &mut output, |ns| {
-                (234_567_890..234_567_891).contains(&ns)
+            write_excerpt(&mut Cursor::new(&source), size, &mut output, |ns, _| {
+                ns.is_some_and(|ns| (234_567_890..234_567_891).contains(&ns))
             })
             .unwrap(),
             1

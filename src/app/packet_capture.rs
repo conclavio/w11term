@@ -56,9 +56,14 @@ pub enum Action {
     OpenWireshark,
     OpenTimelineInterval(PathBuf),
     SaveTimelineExcerpt(PathBuf),
-    OpenConversation(PathBuf),
-    OpenTransportConversation(PathBuf),
+    Conversation(PathBuf, compare::ConversationView, PairDestination),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
+}
+
+#[derive(Clone, Copy)]
+pub enum PairDestination {
+    Wireshark,
+    Excerpt,
 }
 
 pub enum Outcome {
@@ -782,6 +787,7 @@ impl Panel {
                 if !conversations.top.is_empty() {
                     let select_path = capture.path.clone();
                     let open_path = capture.path.clone();
+                    let excerpt_path = capture.path.clone();
                     let list = ListView::new()
                         .automation_name("IP conversations by captured bytes")
                         .max_height(280.0)
@@ -835,9 +841,26 @@ impl Panel {
                         Button::new()
                             .is_enabled(idle && self.selected_conversation.is_some())
                             .on_click(ctx.callback(move |_| {
-                                message(Action::OpenConversation(open_path.clone()))
+                                message(Action::Conversation(
+                                    open_path.clone(),
+                                    compare::ConversationView::Ip,
+                                    PairDestination::Wireshark,
+                                ))
                             }))
                             .content("Open conversation in Wireshark"),
+                    ));
+                    rows.push(KeyedView::new(
+                        "save-conversation-excerpt",
+                        Button::new()
+                            .is_enabled(idle && self.selected_conversation.is_some())
+                            .on_click(ctx.callback(move |_| {
+                                message(Action::Conversation(
+                                    excerpt_path.clone(),
+                                    compare::ConversationView::Ip,
+                                    PairDestination::Excerpt,
+                                ))
+                            }))
+                            .content("Save conversation excerpt…"),
                     ));
                 }
                 files.push(KeyedView::new(
@@ -883,6 +906,7 @@ impl Panel {
                     if !transport.top.is_empty() {
                         let select_path = capture.path.clone();
                         let open_path = capture.path.clone();
+                        let excerpt_path = capture.path.clone();
                         rows.push(KeyedView::new(
                                 "transport-pairs",
                                 ListView::new()
@@ -925,9 +949,26 @@ impl Panel {
                             Button::new()
                                 .is_enabled(idle && self.selected_transport_conversation.is_some())
                                 .on_click(ctx.callback(move |_| {
-                                    message(Action::OpenTransportConversation(open_path.clone()))
+                                    message(Action::Conversation(
+                                        open_path.clone(),
+                                        compare::ConversationView::Transport,
+                                        PairDestination::Wireshark,
+                                    ))
                                 }))
                                 .content("Open port pair in Wireshark"),
+                        ));
+                        rows.push(KeyedView::new(
+                            "save-port-pair-excerpt",
+                            Button::new()
+                                .is_enabled(idle && self.selected_transport_conversation.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    message(Action::Conversation(
+                                        excerpt_path.clone(),
+                                        compare::ConversationView::Transport,
+                                        PairDestination::Excerpt,
+                                    ))
+                                }))
+                                .content("Save port pair excerpt…"),
                         ));
                     }
                 }
@@ -1361,6 +1402,16 @@ impl TerminalApp {
                 };
                 self.save_capture_excerpt(move || model.prepare_excerpt(side, path, bounds), ctx);
             }
+            Action::Comparison(revision, compare::Change::SaveConversationExcerpt(selection)) => {
+                let Some(prepare) = panel
+                    .comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.pair_excerpt_job(&revision, &selection))
+                else {
+                    return;
+                };
+                self.save_capture_excerpt(prepare, ctx);
+            }
             Action::Comparison(revision, change) => {
                 if let Some((capture, filter)) = panel
                     .comparison
@@ -1390,10 +1441,10 @@ impl TerminalApp {
                 let capture = Arc::clone(capture);
                 self.save_capture_excerpt(move || capture.prepare_excerpt(bounds), ctx);
             }
-            Action::OpenWireshark
-            | Action::OpenTimelineInterval(..)
-            | Action::OpenConversation(_)
-            | Action::OpenTransportConversation(_) => {
+            Action::Conversation(path, view, destination) => {
+                self.local_conversation(&path, view, destination, ctx);
+            }
+            Action::OpenWireshark | Action::OpenTimelineInterval(..) => {
                 let Some(capture) = &panel.loaded else { return };
                 let filter = match (action, capture) {
                     (Action::OpenWireshark, _) => None,
@@ -1407,62 +1458,74 @@ impl TerminalApp {
                         };
                         Some(WiresharkFilter::Interval(interval))
                     }
-                    (
-                        action @ (Action::OpenConversation(_)
-                        | Action::OpenTransportConversation(_)),
-                        LoadedCapture::Local(local),
-                    ) => {
-                        let endpoints = match action {
-                            Action::OpenConversation(path)
-                                if panel.conversations_expanded && local.path == path =>
-                            {
-                                panel
-                                    .selected_conversation
-                                    .and_then(|index| local.summary.conversations.top.get(index))
-                                    .map(|pair| PacketConversationEndpoints::Ip {
-                                        a: pair.a,
-                                        b: pair.b,
-                                    })
-                            }
-                            Action::OpenTransportConversation(path)
-                                if panel.transport_conversations_expanded && local.path == path =>
-                            {
-                                panel
-                                    .selected_transport_conversation
-                                    .and_then(|index| {
-                                        local.summary.transport_conversations.top.get(index)
-                                    })
-                                    .map(|pair| PacketConversationEndpoints::Transport {
-                                        protocol: pair.protocol,
-                                        a: pair.a,
-                                        b: pair.b,
-                                    })
-                            }
-                            _ => None,
-                        };
-                        let Some(endpoints) = endpoints else {
-                            return;
-                        };
-                        let interval = if panel.limit_conversation_interval {
-                            let Some(interval) =
-                                local.summary.timeline.as_ref().and_then(|timeline| {
-                                    timeline.selected_interval(panel.timeline_interval)
-                                })
-                            else {
-                                return;
-                            };
-                            Some(interval)
-                        } else {
-                            None
-                        };
-                        Some(WiresharkFilter::Conversation(endpoints, interval))
-                    }
                     _ => return,
                 };
                 let capture = capture.path().to_owned();
                 self.open_packet_viewer(capture, filter, ctx);
             }
             _ => (),
+        }
+    }
+
+    fn local_conversation(
+        &mut self,
+        path: &Path,
+        view: compare::ConversationView,
+        destination: PairDestination,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let panel = &self.packet_capture;
+        let Some(LoadedCapture::Local(local)) = &panel.loaded else {
+            return;
+        };
+        if panel.comparison.is_some() || local.path != path {
+            return;
+        }
+        let endpoints = match view {
+            compare::ConversationView::Ip if panel.conversations_expanded => panel
+                .selected_conversation
+                .and_then(|index| local.summary.conversations.top.get(index))
+                .map(|pair| PacketConversationEndpoints::Ip {
+                    a: pair.a,
+                    b: pair.b,
+                }),
+            compare::ConversationView::Transport if panel.transport_conversations_expanded => panel
+                .selected_transport_conversation
+                .and_then(|index| local.summary.transport_conversations.top.get(index))
+                .map(|pair| PacketConversationEndpoints::Transport {
+                    protocol: pair.protocol,
+                    a: pair.a,
+                    b: pair.b,
+                }),
+            _ => None,
+        };
+        let Some(endpoints) = endpoints else { return };
+        let interval = if panel.limit_conversation_interval {
+            let Some(interval) = local
+                .summary
+                .timeline
+                .as_ref()
+                .and_then(|timeline| timeline.selected_interval(panel.timeline_interval))
+            else {
+                return;
+            };
+            Some(interval)
+        } else {
+            None
+        };
+        match destination {
+            PairDestination::Wireshark => self.open_packet_viewer(
+                local.path.clone(),
+                Some(WiresharkFilter::Conversation(endpoints, interval)),
+                ctx,
+            ),
+            PairDestination::Excerpt => {
+                let local = Arc::clone(local);
+                self.save_capture_excerpt(
+                    move || local.prepare_conversation_excerpt(endpoints, interval),
+                    ctx,
+                );
+            }
         }
     }
 
