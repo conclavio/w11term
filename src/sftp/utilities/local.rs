@@ -1,5 +1,5 @@
 use super::*;
-use std::{collections::BTreeMap, io::Write};
+use std::io::Write;
 
 #[derive(Clone, Debug)]
 pub struct LocalUtilityExecutable {
@@ -21,48 +21,91 @@ impl LocalUtilityExecutable {
             sha256,
         })
     }
+
+    fn into_build(self) -> UtilityBuild {
+        UtilityBuild {
+            architecture: self.architecture,
+            path: self.path,
+            sha256: self.sha256,
+            release: None,
+            download: None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct LocalUtilityBundle {
-    tools: BTreeMap<String, Vec<LocalUtilityExecutable>>,
+    tools: Vec<UtilityTool>,
 }
 
 impl LocalUtilityBundle {
+    pub fn from_tools(tools: Vec<UtilityTool>) -> Self {
+        Self { tools }
+    }
+
     pub fn add(&mut self, name: &str, executable: LocalUtilityExecutable) -> Result<()> {
         ensure!(valid_command_name(name), "Invalid command name");
-        ensure!(
-            self.tools.contains_key(name) || self.tools.len() < 16,
-            "A bundle can contain up to 16 commands"
-        );
-        let builds = self.tools.entry(name.to_owned()).or_default();
-        ensure!(
-            !builds
-                .iter()
-                .any(|build| build.architecture == executable.architecture),
-            "This command already has a build for that architecture"
-        );
-        builds.push(executable);
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.name == name) {
+            ensure!(
+                tool.builds.len() < 4,
+                "A command can contain up to 4 builds"
+            );
+            ensure!(
+                !tool.builds.iter().any(|build| {
+                    build.architecture == executable.architecture
+                        && build.sha256.eq_ignore_ascii_case(&executable.sha256)
+                }),
+                "This executable is already pinned for this command"
+            );
+            tool.builds.push(executable.into_build());
+        } else {
+            ensure!(
+                self.tools.len() < 16,
+                "A bundle can contain up to 16 commands"
+            );
+            self.tools.push(UtilityTool {
+                name: name.into(),
+                builds: vec![executable.into_build()],
+            });
+        }
         Ok(())
     }
 
-    pub fn remove(&mut self, name: &str, architecture: UtilityArchitecture) {
-        if let Some(builds) = self.tools.get_mut(name) {
-            builds.retain(|build| build.architecture != architecture);
-            if builds.is_empty() {
-                self.tools.remove(name);
-            }
+    pub fn replace(
+        &mut self,
+        name: &str,
+        index: usize,
+        executable: LocalUtilityExecutable,
+    ) -> Result<()> {
+        let build = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.builds.get_mut(index))
+            .context("The selected build is no longer available")?;
+        ensure!(
+            build.architecture == executable.architecture,
+            "Choose a replacement executable with the same architecture"
+        );
+        *build = executable.into_build();
+        Ok(())
+    }
+
+    pub fn remove(&mut self, name: &str, index: usize) {
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.name == name)
+            && index < tool.builds.len()
+        {
+            tool.builds.remove(index);
         }
+        self.tools.retain(|tool| !tool.builds.is_empty());
     }
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
 
-    pub fn executables(&self) -> impl Iterator<Item = (&str, &LocalUtilityExecutable)> {
-        self.tools
-            .iter()
-            .flat_map(|(name, builds)| builds.iter().map(move |build| (name.as_str(), build)))
+    pub fn tools(&self) -> &[UtilityTool] {
+        &self.tools
     }
 
     pub fn save(&self, destination: &Path, name: &str, bin_directory: &str) -> Result<()> {
@@ -74,23 +117,7 @@ impl LocalUtilityBundle {
             version: 1,
             name: name.into(),
             bin_directory: bin_directory.into(),
-            tools: self
-                .tools
-                .iter()
-                .map(|(name, builds)| UtilityTool {
-                    name: name.clone(),
-                    builds: builds
-                        .iter()
-                        .map(|build| UtilityBuild {
-                            architecture: build.architecture,
-                            path: build.path.clone(),
-                            sha256: build.sha256.clone(),
-                            release: None,
-                            download: None,
-                        })
-                        .collect(),
-                })
-                .collect(),
+            tools: self.tools.clone(),
         };
         bundle.validate()?;
         for build in bundle.tools.iter_mut().flat_map(|tool| &mut tool.builds) {

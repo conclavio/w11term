@@ -32,7 +32,7 @@ pub enum UtilityArchitecture {
     Aarch64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UtilityBundle {
     pub version: u8,
@@ -42,14 +42,14 @@ pub struct UtilityBundle {
     pub tools: Vec<UtilityTool>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UtilityTool {
     pub name: String,
     pub builds: Vec<UtilityBuild>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UtilityBuild {
     pub architecture: UtilityArchitecture,

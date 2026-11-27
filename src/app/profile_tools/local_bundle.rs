@@ -11,16 +11,25 @@ pub enum Field {
 #[derive(Clone)]
 pub enum Action {
     Open,
+    Revise,
+    Loaded(Arc<()>, Result<Box<(PathBuf, UtilityBundle)>, String>),
     Text(Field, String),
     Browse,
+    Replace(String, usize),
     Inspected(
         Arc<()>,
-        Result<Option<(String, LocalUtilityExecutable)>, String>,
+        Result<Option<(PickTarget, LocalUtilityExecutable)>, String>,
     ),
-    Remove(String, UtilityArchitecture),
+    Remove(String, usize),
     Save,
     Saved(Arc<()>, Result<Option<String>, String>),
     Cancel,
+}
+
+#[derive(Clone)]
+pub enum PickTarget {
+    Append(String),
+    Replace(String, usize),
 }
 
 #[derive(Clone)]
@@ -29,6 +38,7 @@ pub(super) struct Editor {
     bin_directory: String,
     command: String,
     bundle: LocalUtilityBundle,
+    source: Option<PathBuf>,
     last_file: PathBuf,
     work: Option<Arc<()>>,
     feedback: Option<String>,
@@ -60,11 +70,36 @@ impl Editor {
                     ),
             ))
         };
-        let mut fields = vec![
-            KeyedView::new("title", TextBlock::new().text("Create an SSH tool bundle")),
+        let revision = self.source.is_some();
+        let mut fields = vec![KeyedView::new(
+            "title",
+            TextBlock::new().text(if revision {
+                "Revise an SSH tool bundle"
+            } else {
+                "Create an SSH tool bundle"
+            }),
+        )];
+        if let Some(source) = &self.source {
+            fields.push(KeyedView::new(
+                "source",
+                TextBlock::new()
+                    .text(source.display().to_string())
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        fields.extend([
             KeyedView::new(
                 "name",
-                field(Field::Name, "New bundle name", &self.name, "my-tools"),
+                field(
+                    Field::Name,
+                    if revision {
+                        "Bundle name"
+                    } else {
+                        "New bundle name"
+                    },
+                    &self.name,
+                    "my-tools",
+                ),
             ),
             KeyedView::new(
                 "bin",
@@ -92,30 +127,54 @@ impl Editor {
                     Action::Browse,
                 ),
             ),
-        ];
-        for (name, build) in self.bundle.executables() {
-            let platform = match build.architecture {
-                UtilityArchitecture::X86_64 => "x86-64",
-                UtilityArchitecture::Aarch64 => "ARM64",
-            };
-            fields.push(KeyedView::new(
-                format!("{name}/{platform}"),
-                StackPanel::new().spacing(4.0).children((
-                    TextBlock::new().text(format!("{name} · {platform}")),
-                    TextBlock::new()
-                        .text(format!(
-                            "{}\nSHA-256 {}",
-                            build.path.display(),
-                            build.sha256
-                        ))
-                        .text_wrapping(TextWrapping::Wrap),
-                    button(
-                        &format!("Remove {name} {platform}"),
-                        idle,
-                        Action::Remove(name.to_owned(), build.architecture),
-                    ),
-                )),
-            ));
+        ]);
+        for tool in self.bundle.tools() {
+            let name = &tool.name;
+            for (index, build) in tool.builds.iter().enumerate() {
+                let platform = match build.architecture {
+                    UtilityArchitecture::X86_64 => "x86-64",
+                    UtilityArchitecture::Aarch64 => "ARM64",
+                };
+                let architecture = if tool
+                    .builds
+                    .iter()
+                    .filter(|other| other.architecture == build.architecture)
+                    .nth(1)
+                    .is_some()
+                {
+                    format!("{platform} build {}", index + 1)
+                } else {
+                    platform.into()
+                };
+                let source = build.download.as_ref().map_or_else(
+                    || build.path.display().to_string(),
+                    |download| download.url().to_owned(),
+                );
+                fields.push(KeyedView::new(
+                    format!("{name}/{index}"),
+                    StackPanel::new().spacing(4.0).children((
+                        TextBlock::new().text(format!("{name} · {architecture}")),
+                        TextBlock::new()
+                            .text(format!("{source}\nSHA-256 {}", build.sha256))
+                            .text_wrapping(TextWrapping::Wrap),
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(8.0)
+                            .children((
+                                button(
+                                    &format!("Replace {name} {architecture}"),
+                                    idle,
+                                    Action::Replace(name.clone(), index),
+                                ),
+                                button(
+                                    &format!("Remove {name} {architecture}"),
+                                    idle,
+                                    Action::Remove(name.clone(), index),
+                                ),
+                            )),
+                    )),
+                ));
+            }
         }
         if let Some(feedback) = &self.feedback {
             fields.push(KeyedView::new(
@@ -129,14 +188,39 @@ impl Editor {
             "actions",
             StackPanel::new().spacing(8.0).children((
                 button(
-                    "Save new tool bundle",
+                    if revision {
+                        "Save bundle revision"
+                    } else {
+                        "Save new tool bundle"
+                    },
                     idle && !self.bundle.is_empty() && !self.name.trim().is_empty(),
                     Action::Save,
                 ),
-                button("Cancel bundle creation", idle, Action::Cancel),
+                button(
+                    if revision {
+                        "Cancel bundle revision"
+                    } else {
+                        "Cancel bundle creation"
+                    },
+                    idle,
+                    Action::Cancel,
+                ),
             )),
         ));
         StackPanel::new().spacing(8.0).keyed_children(fields)
+    }
+
+    fn suggestion(&self) -> String {
+        if let Some(source) = &self.source {
+            let stem = source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| stem.encode_utf16().count() <= 120)
+                .unwrap_or("tools");
+            format!("{stem}-revision.json")
+        } else {
+            "tools.json".into()
+        }
     }
 
     fn begin(&mut self) -> Arc<()> {
@@ -169,12 +253,80 @@ impl super::Editor {
                     bin_directory: ".local/bin".into(),
                     command: String::new(),
                     bundle: LocalUtilityBundle::default(),
+                    source: None,
                     last_file: catalog.into(),
                     work: None,
                     feedback: None,
                 });
             }
             return;
+        }
+        match action {
+            Action::Revise => {
+                if self.work.is_some()
+                    || self.starter.is_some()
+                    || self.local.is_some()
+                    || self.bundle.trim().is_empty()
+                {
+                    return;
+                }
+                let source = catalog
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(self.bundle.trim());
+                let ticket = Arc::new(());
+                self.work = Some(ticket.clone());
+                self.feedback = Some("Loading selected tool bundle…".into());
+                let rejected = message(
+                    id,
+                    Action::Loaded(ticket.clone(), Err("Bundle editor unavailable".into())),
+                );
+                ctx.spawn_background_with_rejection(
+                    move |_| {
+                        let result = UtilityBundle::load(&source)
+                            .map(|bundle| Box::new((source, bundle)))
+                            .map_err(|error| {
+                                format!("Reading the selected tool bundle: {error:#}")
+                            });
+                        message(id, Action::Loaded(ticket, result))
+                    },
+                    rejected,
+                );
+                return;
+            }
+            Action::Loaded(ticket, result) => {
+                if self
+                    .work
+                    .take_if(|work| Arc::ptr_eq(work, &ticket))
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(loaded) => {
+                        let (source, bundle) = *loaded;
+                        let last_file = if ToolBundlePreset::from_managed_path(&source).is_some() {
+                            catalog.into()
+                        } else {
+                            source.clone()
+                        };
+                        self.feedback = None;
+                        self.local = Some(Editor {
+                            name: bundle.name,
+                            bin_directory: bundle.bin_directory,
+                            command: String::new(),
+                            bundle: LocalUtilityBundle::from_tools(bundle.tools),
+                            source: Some(source),
+                            last_file,
+                            work: None,
+                            feedback: None,
+                        });
+                    }
+                    Err(error) => self.feedback = Some(error),
+                }
+                return;
+            }
+            _ => (),
         }
         let Some(local) = &mut self.local else { return };
         match action {
@@ -189,13 +341,19 @@ impl super::Editor {
                     local.feedback = None;
                 }
             }
-            Action::Remove(name, architecture) if local.work.is_none() => {
-                local.bundle.remove(&name, architecture);
+            Action::Remove(name, index) if local.work.is_none() => {
+                local.bundle.remove(&name, index);
                 local.feedback = None;
             }
-            Action::Browse if local.work.is_none() && !local.command.trim().is_empty() => {
+            Action::Browse | Action::Replace(..) if local.work.is_none() => {
                 let Some(owner) = owner else { return };
-                let name = local.command.trim().to_owned();
+                let target = match action {
+                    Action::Replace(name, index) => PickTarget::Replace(name, index),
+                    _ if !local.command.trim().is_empty() => {
+                        PickTarget::Append(local.command.trim().to_owned())
+                    }
+                    _ => return,
+                };
                 let current = local.last_file.clone();
                 let ticket = local.begin();
                 let rejected = message(
@@ -216,7 +374,7 @@ impl super::Editor {
                                 return Ok(None);
                             }
                             let executable = LocalUtilityExecutable::inspect(&file.path)?;
-                            Ok(Some((name, executable)))
+                            Ok(Some((target, executable)))
                         })()
                         .map_err(|error| format!("{error:#}"));
                         message(id, Action::Inspected(ticket, result))
@@ -225,9 +383,15 @@ impl super::Editor {
                 );
             }
             Action::Inspected(ticket, result) if local.finish(&ticket) => match result {
-                Ok(Some((name, executable))) => {
+                Ok(Some((target, executable))) => {
                     local.last_file.clone_from(&executable.path);
-                    if let Err(error) = local.bundle.add(&name, executable) {
+                    let result = match target {
+                        PickTarget::Append(name) => local.bundle.add(&name, executable),
+                        PickTarget::Replace(name, index) => {
+                            local.bundle.replace(&name, index, executable)
+                        }
+                    };
+                    if let Err(error) = result {
                         local.feedback = Some(format!("{error:#}"));
                     }
                 }
@@ -240,6 +404,7 @@ impl super::Editor {
                 let name = local.name.trim().to_owned();
                 let bin_directory = local.bin_directory.trim().to_owned();
                 let current = local.last_file.clone();
+                let suggestion = local.suggestion();
                 let ticket = local.begin();
                 let rejected = message(
                     id,
@@ -250,7 +415,10 @@ impl super::Editor {
                         let result = (|| -> anyhow::Result<_> {
                             let Some(file) = file_picker::pick(
                                 owner,
-                                file_picker::Purpose::SaveToolBundle(current),
+                                file_picker::Purpose::SaveToolBundle {
+                                    current,
+                                    suggestion,
+                                },
                             )?
                             else {
                                 return Ok(None);

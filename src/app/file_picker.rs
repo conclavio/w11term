@@ -25,7 +25,10 @@ pub(super) enum Purpose {
     DotfilesBundle(PathBuf),
     ToolBundle(PathBuf),
     ToolExecutable(PathBuf),
-    SaveToolBundle(PathBuf),
+    SaveToolBundle {
+        current: PathBuf,
+        suggestion: String,
+    },
     OpenSshHostList,
     OpenSshGroupDefinition,
     SshIdentity {
@@ -295,18 +298,24 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::ToolExecutable(ref current) | Purpose::SaveToolBundle(ref current) => {
-                if matches!(&purpose, Purpose::SaveToolBundle(_)) {
-                    dialog.SetTitle(w!("Save new SSH tool bundle"))?;
-                    dialog.SetFileName(w!("tools.json"))?;
-                    dialog.SetDefaultExtension(w!("json"))?;
-                    options &= !FOS_OVERWRITEPROMPT;
-                    options |= FOS_NOTESTFILECREATE;
-                } else {
-                    dialog.SetTitle(w!("Choose a Linux executable"))?;
-                    options |= FOS_FILEMUSTEXIST;
+            Purpose::ToolExecutable(current) => {
+                dialog.SetTitle(w!("Choose a Linux executable"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
                 }
-                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                None
+            }
+            Purpose::SaveToolBundle {
+                current,
+                suggestion,
+            } => {
+                dialog.SetTitle(w!("Save new SSH tool bundle"))?;
+                let wide: Vec<_> = suggestion.encode_utf16().chain(Some(0)).collect();
+                dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
+                dialog.SetDefaultExtension(w!("json"))?;
+                options &= !FOS_OVERWRITEPROMPT;
+                options |= FOS_NOTESTFILECREATE | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);
                 }

@@ -1333,6 +1333,8 @@ In **Settings → Edit profile → SSH tools**, select a preset or pick individu
 
 Choose **Create bundle from local tools** to build a manifest from raw Linux executables on Windows. Give the bundle and each command a name, then pick the local executable. You can add an x86-64 and an ARM64 build under the same command name. w11term detects the architecture and computes the SHA-256 pin. The launcher directory defaults to `.local/bin` under the remote home. Save to a new manifest file, then review and approve it in the profile. Keep the source executables at their saved locations so installation can verify the pins.
 
+Choose **Revise selected tool bundle** to load the current manifest. Add or remove a build, or use **Replace** to pin a new local executable of the same architecture in the same fallback position. A revision keeps the other entries and their existing pins and download sources. **Save bundle revision** writes a separate manifest. Review and approve it, then save the profile to use the revision on connect.
+
 **Linux essentials** includes `rg`, `jq`, `dust`, and `hyperfine`. **Linux admin tools** adds `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. The presets and custom selections share the `linux-essentials` bundle name and `.local/bin` launchers for updates and rollback. Profiles that connect to the same account update the same active set. Omitted launchers become dormant and can be restored by rollback. Linux `x86_64` and `aarch64` are supported. Omit `--architecture` to fetch both. Use manual preview and apply for a first transfer that needs more than the login sync deadline.
 
 ```powershell

@@ -223,6 +223,13 @@ impl Editor {
                     .content("Create bundle from local tools"),
             ),
             KeyedView::new(
+                "revise",
+                Button::new()
+                    .is_enabled(idle && !self.bundle.trim().is_empty())
+                    .on_click(send(Action::Local(local_bundle::Action::Revise)))
+                    .content("Revise selected tool bundle"),
+            ),
+            KeyedView::new(
                 "builtin",
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)

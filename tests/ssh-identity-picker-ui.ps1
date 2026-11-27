@@ -344,6 +344,42 @@ try {
         $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
         $tools.name -ceq 'team-tools' -and [FixtureDialog]::SameFile($created, $tools.bundle)
     }
+    $originalPin = File-Sha256 $created
+    Click 'Revise selected tool bundle'
+    $null = Wait-Until 'both previous builds loaded' {
+        (Find-Element "operator${dot}x86-64") -and (Find-Element "operator${dot}ARM64")
+    }
+    Click 'Replace operator x86-64'
+    $picker = Wait-Until 'owned replacement executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
+    Select-DialogItem $picker 'operator-x64-next'
+    $null = Wait-Until 'accept replacement executable' { [FixtureDialog]::ClickButton($picker, 1) }
+    Click 'Save bundle revision'
+    $picker = Wait-Until 'owned save revision dialog' { Find-OwnedDialog 'Save new SSH tool bundle' }
+    $null = Wait-Until 'save the separate bundle revision' { [FixtureDialog]::ClickButton($picker, 1) }
+    $revision = Join-Path $State 'tools-revision.json'
+    $null = Wait-Until 'revision selected and awaiting review' {
+        $field = Find-Element 'Tool bundle manifest' $edit
+        $approve = Find-Element 'Approve tool sync' $button
+        $field -and $approve -and !$approve.Current.IsEnabled -and
+            [FixtureDialog]::SameFile($revision, $field.GetCurrentPattern($value).Current.Value)
+    }
+    $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+    if (![FixtureDialog]::SameFile($created, $tools.bundle) -or (File-Sha256 $created) -cne $originalPin) {
+        throw 'Saving a revision changed the previously approved manifest or profile'
+    }
+    $revisionBundle = [IO.File]::ReadAllText($revision) | ConvertFrom-Json
+    if ($revisionBundle.tools.builds[0].sha256 -cne (File-Sha256 (Join-Path $State 'operator-x64-next')) -or
+        $revisionBundle.tools.builds[1].sha256 -cne $createdBundle.tools.builds[1].sha256) {
+        throw 'The revision did not replace only the chosen build'
+    }
+    Click 'Review tool bundle'
+    $null = Wait-Until 'new revision reviewed' { Find-Element $review }
+    Click 'Approve tool sync'
+    Click 'Save profile changes'
+    $null = Wait-Until 'revision approval saved' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        [FixtureDialog]::SameFile($revision, $tools.bundle)
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

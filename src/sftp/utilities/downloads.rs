@@ -117,7 +117,7 @@ pub fn builtin_tool_names() -> &'static [String] {
     &NAMES
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "format", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum UtilityDownload {
     Raw {
@@ -136,7 +136,7 @@ pub enum UtilityDownload {
 }
 
 impl UtilityDownload {
-    fn url(&self) -> &str {
+    pub fn url(&self) -> &str {
         match self {
             Self::Raw { url } | Self::TarGz { url, .. } | Self::Zip { url, .. } => url,
         }

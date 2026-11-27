@@ -4071,6 +4071,10 @@ fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
         )
         .unwrap();
     }
+    let mut revision =
+        super::utilities::executable(w11term::sftp::UtilityArchitecture::X86_64, None);
+    revision[255] = 1;
+    fs::write(state.path().join("operator-x64-next"), revision).unwrap();
     drive_gui("ssh-identity-picker-ui.ps1", state.path());
 }
 

@@ -212,6 +212,93 @@ async fn local_tool_bundle_pins_both_architectures_for_reviewed_installation() {
     server.abort();
 }
 
+#[test]
+fn bundle_revision_preserves_pins_downloads_and_build_order() {
+    use UtilityArchitecture::{Aarch64, X86_64};
+    use w11term::sftp::{LocalUtilityBundle, LocalUtilityExecutable};
+
+    let local = tempfile::tempdir().unwrap();
+    let original = local.path().join("original.json");
+    let previous = build(local.path(), "previous", X86_64, executable(X86_64, None));
+    let arm = build(local.path(), "arm", Aarch64, executable(Aarch64, None));
+    let download = json!({
+        "architecture": "x86_64",
+        "release": "https://example.com/releases/v1",
+        "sha256": "a".repeat(64),
+        "download": {
+            "format": "tar-gz",
+            "url": "https://example.com/releases/operator.tar.gz",
+            "member": "operator",
+            "archive_sha256": "b".repeat(64)
+        }
+    });
+    fs::write(
+        &original,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "name": "team",
+            "bin_directory": "bin",
+            "tools": [
+                {"name": "operator", "builds": [
+                    {"architecture": "x86_64", "path": "previous", "sha256": previous.sha256},
+                    download.clone(),
+                    {"architecture": "aarch64", "path": "arm", "sha256": arm.sha256}
+                ]}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let saved_original = fs::read(&original).unwrap();
+    let source = UtilityBundle::load(&original).unwrap();
+    let mut editor = LocalUtilityBundle::from_tools(source.tools);
+    assert!(
+        editor
+            .replace(
+                "operator",
+                0,
+                LocalUtilityExecutable::inspect(&arm.path).unwrap()
+            )
+            .is_err()
+    );
+    assert_eq!(editor.tools()[0].builds[0].sha256, previous.sha256);
+    let mut updated_bytes = executable(X86_64, None);
+    updated_bytes[255] = 1;
+    let updated = build(local.path(), "updated", X86_64, updated_bytes);
+    editor
+        .replace(
+            "operator",
+            0,
+            LocalUtilityExecutable::inspect(&updated.path).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        editor
+            .save(&original, &source.name, &source.bin_directory)
+            .is_err()
+    );
+    assert_eq!(fs::read(&original).unwrap(), saved_original);
+
+    let folder = local.path().join("elsewhere");
+    fs::create_dir(&folder).unwrap();
+    let revision = folder.join("revised.json");
+    editor
+        .save(&revision, &source.name, &source.bin_directory)
+        .unwrap();
+    let revised = UtilityBundle::load(&revision).unwrap();
+    let builds = &revised.tools[0].builds;
+    assert_eq!(revised.name, source.name);
+    assert_eq!(revised.bin_directory, source.bin_directory);
+    assert_eq!(builds[0].sha256, updated.sha256);
+    assert_eq!(builds[0].path, updated.path);
+    assert_eq!(serde_json::to_value(&builds[1]).unwrap(), download);
+    assert_eq!(builds[2].path, arm.path);
+    assert_eq!(builds[2].sha256, arm.sha256);
+    editor.remove("operator", 1);
+    assert_eq!(editor.tools()[0].builds.len(), 2);
+    assert_eq!(editor.tools()[0].builds[1].sha256, arm.sha256);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn utility_preview_resolves_linux_builds_and_preserves_a_user_command() {
     use UtilityArchitecture::{Aarch64, X86_64};
