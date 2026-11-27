@@ -2,8 +2,11 @@
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $dot = ' ' + [char]0xb7 + ' '
+$dropFixture = Join-Path $State 'diagnostic-drop.json'
+$env:W11TERM_TEST_DIAGNOSTIC_DROP = $dropFixture
 [IO.File]::WriteAllText($profiles, '{"startup_profile":"Startup shell","profiles":{"Startup shell":{"backend":"local","executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}}')
 [IO.File]::WriteAllText((Join-Path $State 'saved CPU.folded'), "worker;main 5`n")
 [IO.File]::WriteAllText((Join-Path $State 'baseline CPU.folded'), "worker;main 5`n")
@@ -142,6 +145,33 @@ try {
     }
     Invoke-Button (Find-Element 'Back to working trace' $button)
     $null = Wait-Until 'the working side reopens as a merged trace' { Find-Element 'Files merged by epoch timestamp' }
+    Close-Artifact
+
+    Open-Artifact @('--open-cpu-profile','"saved CPU.folded"') 'CPU flame graph'
+    $null = Wait-Until 'saved CPU profile is ready before returning to the overview' { Find-Element '5 samples' }
+    Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
+    $browse = Wait-Until 'open a diagnostic directly from the overview' {
+        Find-Element ('Open saved diagnostic' + [char]0x2026) $button
+    }
+    Invoke-Button $browse
+    $picker = Wait-Until 'owned diagnostic picker' { Find-OwnedDialog 'Open saved diagnostic' }
+    $packetPath = Join-Path $State 'saved packets.pcap'
+    $null = Wait-Until 'enter the packet capture in the diagnostic picker' { [FixtureDialog]::SetFilename($picker, $packetPath, '') }
+    $null = Wait-Until 'accept the generic diagnostic chooser' { [FixtureDialog]::ClickButton($picker, 1) }
+    $null = Wait-Until 'the generic picker routes a packet capture' { Find-Element "PCAP${dot}24 bytes" }
+    Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
+
+    $mixedPaths = @($packetPath, (Join-Path $State 'saved CPU.folded'))
+    [IO.File]::WriteAllText($dropFixture, (ConvertTo-Json -InputObject $mixedPaths))
+    $target = Wait-Until 'drop target in Diagnostics overview' { Find-Element 'Drop fixture diagnostic' $button }
+    Invoke-Button $target
+    $null = Wait-Until 'a mixed drop is rejected in the overview' {
+        Find-Element 'Choose one diagnostic or the matching parts of one split syscall trace: Select one combined trace or matching NAME.PID files'
+    }
+    $splitPaths = @((Join-Path $State 'split trace.301'), (Join-Path $State 'split trace.300'))
+    [IO.File]::WriteAllText($dropFixture, (ConvertTo-Json -InputObject $splitPaths))
+    Invoke-Button (Find-Element 'Drop fixture diagnostic' $button)
+    $null = Wait-Until 'the diagnostic drop opens both parts of the trace' { Find-Element 'Files merged by epoch timestamp' }
     Close-Artifact
 
     Open-Artifact @('--open-cpu-profile','"empty CPU.folded"') 'CPU flame graph'

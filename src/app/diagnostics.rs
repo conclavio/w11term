@@ -3,6 +3,8 @@ use std::{cell::RefCell, collections::VecDeque};
 use w11term::diagnostic_history::{Artifact, Entry, Kind, Store};
 use w11term::options::DiagnosticLaunch;
 
+mod files;
+
 pub(super) const LABEL: &str = "Diagnostics overview";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,6 +20,7 @@ pub enum Action {
     Close,
     Recent(Arc<Entry>, RecentAction),
     RecentReady(Result<Vec<Entry>, String>),
+    Files(files::Action),
 }
 
 pub enum RecentAction {
@@ -44,6 +47,7 @@ pub(super) struct Recent {
     edits: VecDeque<Edit>,
     pending: bool,
     status: Option<String>,
+    file_picker: Option<Arc<()>>,
 }
 
 type ControlReply = tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>;
@@ -386,6 +390,9 @@ impl TerminalApp {
 
     pub(super) fn set_diagnostics_drawer(&mut self, drawer: Option<Drawer>) {
         self.diagnostics_open = drawer == Some(Drawer::Overview);
+        if !self.diagnostics_open {
+            self.diagnostics_recent.file_picker = None;
+        }
         self.triage.open = drawer == Some(Drawer::Triage);
         self.flame_graph.open = drawer == Some(Drawer::FlameGraph);
         self.packet_capture.open = drawer == Some(Drawer::PacketCapture);
@@ -400,8 +407,10 @@ impl TerminalApp {
             }
             Action::Close => {
                 self.diagnostics_open = false;
+                self.diagnostics_recent.file_picker = None;
                 self.close_empty_diagnostics_window(ctx);
             }
+            Action::Files(action) => self.diagnostic_files_action(action, ctx),
             Action::Recent(entry, action)
                 if self.diagnostics_open
                     && self
@@ -731,6 +740,7 @@ impl TerminalApp {
                                     .text_wrapping(TextWrapping::Wrap),
                             ))
                             .chain(status)
+                            .chain(self.diagnostics_file_actions(ctx))
                             .chain(baseline)
                             .chain(activity)
                             .chain(pinned)

@@ -1453,6 +1453,8 @@ Open **More → Diagnostics → Diagnostics overview** or search for **Diagnosti
 
 Use **Back** in the triage, flame graph, or packet capture panel to return to the overview. Open saved reports, folded stacks, and syscall traces even when you have no active SSH connection. Each live capture still has its own target review and start action.
 
+In **Diagnostics overview**, choose **Open saved diagnostic…** or drop files into the labelled area. The overview recognizes `.folded`, `.collapsed`, triage `.json`, `.pcap`, `.pcapng`, `.cap`, `.strace`, and split `name.PID` traces. Select one saved file or all the parts of a single split trace. Each viewer validates the file before adding it to recent diagnostics.
+
 Use `w11term.exe` to launch directly into the corresponding offline viewer. Paths can be relative to the working directory or absolute. Repeat `--open-syscall-trace` for all parts of a split trace. A diagnostics-only window uses the full width and starts without opening a terminal or applying the startup profile.
 
 ```powershell

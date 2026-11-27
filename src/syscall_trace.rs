@@ -306,11 +306,7 @@ pub struct Trace {
 
 impl Trace {
     pub fn open(paths: Vec<PathBuf>) -> Result<Self> {
-        ensure!(
-            (1..=MAX_FILES).contains(&paths.len()),
-            "Choose one trace or up to {MAX_FILES} per-process files"
-        );
-        let hints = pid_hints(&paths)?;
+        let hints = file_pids(&paths)?;
         let mut sources = Vec::new();
         let mut remaining = MAX_BYTES;
         for (path, pid) in paths.into_iter().zip(hints) {
@@ -569,7 +565,12 @@ fn pid_suffix(path: &Path) -> Option<(&str, u32)> {
     (pid > 0 && !basename.is_empty()).then_some((basename, pid))
 }
 
-fn pid_hints(paths: &[PathBuf]) -> Result<Vec<Option<u32>>> {
+/// Validate the input file set and return each split trace's PID, if present.
+pub fn file_pids(paths: &[PathBuf]) -> Result<Vec<Option<u32>>> {
+    ensure!(
+        (1..=MAX_FILES).contains(&paths.len()),
+        "Choose one trace or up to {MAX_FILES} per-process files"
+    );
     if let [path] = paths {
         return Ok(vec![pid_suffix(path).map(|(_, pid)| pid)]);
     }

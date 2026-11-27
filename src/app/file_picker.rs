@@ -58,6 +58,7 @@ pub(super) enum Purpose {
     SshGroupDefinition,
     StartRecording,
     OpenRecording,
+    OpenDiagnostic(PathBuf),
     OpenTriageReport(PathBuf),
     CompareTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
@@ -226,6 +227,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFile
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
+                | Purpose::OpenDiagnostic(_)
                 | Purpose::OpenTriageReport(_)
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
@@ -250,7 +252,10 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let dialog: IFileDialog = CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)?;
         let mut options = dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR;
         let confirmed = Rc::new(RefCell::new(None));
-        let multiple = matches!(purpose, Purpose::UploadFiles | Purpose::OpenSyscallTrace(_));
+        let multiple = matches!(
+            purpose,
+            Purpose::UploadFiles | Purpose::OpenDiagnostic(_) | Purpose::OpenSyscallTrace(_)
+        );
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
             Purpose::SaveSyscallTrace(path) => {
@@ -269,8 +274,12 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::OpenSyscallTrace(path) => {
-                dialog.SetTitle(w!("Open syscall trace"))?;
+            Purpose::OpenSyscallTrace(ref path) | Purpose::OpenDiagnostic(ref path) => {
+                dialog.SetTitle(if matches!(purpose, Purpose::OpenDiagnostic(_)) {
+                    w!("Open saved diagnostic")
+                } else {
+                    w!("Open syscall trace")
+                })?;
                 options |= FOS_FILEMUSTEXIST
                     | FOS_PATHMUSTEXIST
                     | FOS_DONTADDTORECENT
