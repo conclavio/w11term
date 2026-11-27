@@ -150,6 +150,8 @@ fn child_options(
         scrollback_lines: pane.scrollback_lines,
         color_scheme,
         local_forwards: pane.local_forwards.clone(),
+        dotfiles: pane.dotfiles.clone(),
+        tool_bundle: pane.tool_bundle.clone(),
         group_prompt: pane.group_prompt.clone(),
         player,
         ..connection.clone()

@@ -38,6 +38,9 @@ struct Link {
     known_hosts: Option<PathBuf>,
     runtime: runtime::Handle,
     forward_channels: Arc<Semaphore>,
+    dotfiles_sync: tokio::sync::Mutex<()>,
+    diagnostic: tokio::sync::Mutex<()>,
+    capture_jobs: super::triage::capture_job::ActiveJobs,
 }
 
 impl Drop for Link {
@@ -105,6 +108,9 @@ impl ConnectionShare {
             known_hosts: prompts.and_then(Prompts::known_hosts).map(PathBuf::from),
             runtime: runtime::Handle::current(),
             forward_channels: Arc::new(Semaphore::new(super::local_forward::MAX_CHANNELS_PER_LINK)),
+            dotfiles_sync: tokio::sync::Mutex::new(()),
+            diagnostic: tokio::sync::Mutex::new(()),
+            capture_jobs: Default::default(),
         }))
     }
     pub fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
@@ -131,6 +137,19 @@ impl ConnectionShare {
     }
     pub(super) fn fingerprint(&self) -> &str {
         &self.0.verified.fingerprint
+    }
+    pub(super) async fn lock_dotfiles_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.dotfiles_sync.lock().await
+    }
+    pub(super) fn try_lock_diagnostic(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        self.0
+            .diagnostic
+            .try_lock()
+            .context("A performance diagnostic is already running on this SSH transport")
+    }
+
+    pub(super) fn capture_jobs(&self) -> &super::triage::capture_job::ActiveJobs {
+        &self.0.capture_jobs
     }
     pub fn options(&self) -> &SshOptions {
         &self.0.options

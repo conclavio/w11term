@@ -9,16 +9,31 @@ use std::{
 use w11term::control::{self, Reply, Request};
 #[path = "w11term-cli/automation.rs"]
 mod automation;
+#[path = "w11term-cli/cpu_profile.rs"]
+mod cpu_profile;
+#[path = "w11term-cli/diagnostics.rs"]
+mod diagnostics;
+#[path = "w11term-cli/offline.rs"]
+mod offline;
+#[path = "w11term-cli/packet_capture.rs"]
+mod packet_capture;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
+#[path = "w11term-cli/syscall_capture.rs"]
+mod syscall_capture;
+#[path = "w11term-cli/tool_bundles.rs"]
+mod tool_bundles;
+#[path = "w11term-cli/triage.rs"]
+mod triage;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] rename-workspace --name OLD --to NEW\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nControl commands without --pid require exactly one live instance. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
     pid: Option<u32>,
     request: Request,
     success_check: Option<SuccessCheck>,
+    wireshark: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -33,6 +48,7 @@ impl Invocation {
             pid,
             request,
             success_check: None,
+            wireshark: None,
         }
     }
 }
@@ -86,12 +102,15 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "interrupt-command"
             | "wait-command"
             | "inspect"
+            | "preview-linux-triage"
+            | "linux-triage"
             | "playback"
             | "list-ssh-groups"
             | "list-saved-ssh-groups"
             | "open-ssh-group"
             | "open-workspace"
             | "get-workspace"
+            | "rename-workspace"
             | "repair-workspace"
             | "save-workspace"
             | "get-ssh-group-roster"
@@ -115,6 +134,51 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                     "invalid options before automation command"
                 );
                 return automation::parse(&arg, args, pid, pane);
+            }
+            "open-diagnostic" if verb.is_none() => {
+                ensure!(
+                    pane.is_none()
+                        && payload.is_none()
+                        && path.is_none()
+                        && !no_paste
+                        && connection_generation.is_none(),
+                    "open-diagnostic accepts --pid before the command"
+                );
+                return Ok(Invocation::new(pid, diagnostics::parse(args)?));
+            }
+            "preview-cpu-profile" | "capture-cpu-profile" if verb.is_none() => {
+                ensure!(
+                    payload.is_none() && path.is_none() && !no_paste,
+                    "invalid options before CPU profile command"
+                );
+                let request = cpu_profile::parse(&arg, args, pane)?;
+                return Ok(Invocation::new(pid, request));
+            }
+            "list-packet-interfaces"
+            | "preview-packet-capture"
+            | "capture-packets"
+            | "stop-packet-capture"
+                if verb.is_none() =>
+            {
+                ensure!(
+                    payload.is_none() && path.is_none() && !no_paste,
+                    "invalid options before packet capture command"
+                );
+                let (request, wireshark) = packet_capture::parse(&arg, args, pane)?;
+                return Ok(Invocation {
+                    wireshark,
+                    ..Invocation::new(pid, request)
+                });
+            }
+            "preview-syscall-capture" | "capture-syscalls" | "stop-syscall-capture"
+                if verb.is_none() =>
+            {
+                ensure!(
+                    payload.is_none() && path.is_none() && !no_paste,
+                    "invalid options before syscall capture command"
+                );
+                return syscall_capture::parse(&arg, args, pane)
+                    .map(|request| Invocation::new(pid, request));
             }
             "sftp" if verb.is_none() => {
                 ensure!(
@@ -239,11 +303,50 @@ fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
 async fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
-        println!("{HELP}\n\n{}\n\n{}", sftp_args::HELP, automation::HELP);
+        println!(
+            "{HELP}\n\n{}\n\n{}\n\n{}",
+            sftp_args::HELP,
+            automation::HELP,
+            tool_bundles::HELP
+        );
+        println!(
+            "\nw11term-cli [--pid PID] preview-linux-triage --pane ID\nw11term-cli [--pid PID] linux-triage --pane ID --connection-generation N --output-file PATH"
+        );
+        println!("{}", triage::COMPARE_HELP);
+        println!("\n{}\n{}", cpu_profile::HELP, cpu_profile::COMPARE_HELP);
+        println!(
+            "\n{}\n{}\n{}\n{}",
+            packet_capture::HELP,
+            packet_capture::INSPECT_HELP,
+            packet_capture::COMPARE_HELP,
+            packet_capture::CLIP_HELP
+        );
+        println!(
+            "\n{}\n{}",
+            syscall_capture::HELP,
+            syscall_capture::COMPARE_HELP
+        );
+        println!("\n{}", diagnostics::HELP);
         return ExitCode::SUCCESS;
     }
+    if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {
+        println!("{}", tool_bundles::HELP);
+        return ExitCode::SUCCESS;
+    }
+    if args == ["open-diagnostic", "--help"] || args == ["open-diagnostic", "-h"] {
+        println!("{}", diagnostics::HELP);
+        return ExitCode::SUCCESS;
+    }
+    if let Some(exit) = offline::run(&args) {
+        return exit;
+    }
     let mut success_check = None;
-    let result = if args == ["instances"] {
+    let result = if args
+        .first()
+        .is_some_and(|command| command == "fetch-tool-bundle")
+    {
+        tool_bundles::run(&args[1..]).map(|result| Reply::from_result(Ok(result)))
+    } else if args == ["instances"] {
         control::discover().await.map(|instances| {
             Reply::from_result(serde_json::to_value(instances).map_err(Into::into))
         })
@@ -278,7 +381,14 @@ async fn main() -> ExitCode {
             }
             Ok(invocation) => {
                 success_check = invocation.success_check;
-                control::call(invocation.pid, &invocation.request).await
+                control::call(invocation.pid, &invocation.request)
+                    .await
+                    .map(|mut reply| {
+                        if let Some(executable) = invocation.wireshark {
+                            packet_capture::open_in_wireshark(&mut reply, executable);
+                        }
+                        reply
+                    })
             }
             Err(e) => Err(e),
         }
@@ -812,6 +922,44 @@ mod tests {
             "get-workspace --name Fleet --new-window",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn renames_an_existing_workspace_in_the_process_catalog() {
+        let (pid, request) = parse(
+            [
+                "--pid",
+                "7",
+                "rename-workspace",
+                "--name",
+                "Fleet Ops",
+                "--to",
+                "Production Ops",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb":"rename-workspace","name":"Fleet Ops","new_name":"Production Ops"
+            })
+        );
+        for invalid in [
+            "rename-workspace --name fleet",
+            "rename-workspace --to ops",
+            "rename-workspace --name fleet --to ops --to other",
+            "rename-workspace --name fleet --name lab --to ops",
+            "rename-workspace --name fleet --to ops --window 1",
+            "rename-workspace --name fleet --to ops --pane 1",
+            "rename-workspace --name fleet --to ops --overwrite",
+        ] {
+            assert!(
+                parse(invalid.split_whitespace().map(str::to_owned)).is_err(),
+                "{invalid}"
+            );
         }
     }
 

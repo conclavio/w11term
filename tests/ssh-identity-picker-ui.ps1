@@ -33,11 +33,46 @@ function Key-Field {
     $field = Wait-Until 'private key path field' { Find-Element 'Private key file' $edit }
     return $field.GetCurrentPattern($value)
 }
+function Set-Field([string]$Name, [string]$Text) {
+    $field = Wait-Until "'$Name' field" { Find-Element $Name $edit }
+    $field.SetFocus()
+    $field = Wait-Until "'$Name' editor focused" {
+        $current = Find-Element $Name $edit -Visible
+        if ($current -and $current.Current.HasKeyboardFocus) { $current }
+    }
+    $field.GetCurrentPattern($value).SetValue($Text)
+    $null = Wait-Until "'$Name' contains the entered value" {
+        (Find-Element $Name $edit).GetCurrentPattern($value).Current.Value -ceq $Text
+    }
+}
 function Wait-Browse {
     $null = Wait-Until 'key picker releases the draft' {
         $control = Find-Element $browseLabel $button
         $control -and $control.Current.IsEnabled
     }
+}
+function File-Sha256([string]$Path) {
+    $hash = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        [BitConverter]::ToString($hash.ComputeHash([IO.File]::ReadAllBytes($Path))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $hash.Dispose()
+    }
+}
+function Select-ToolPreset([string]$Name) {
+    $presets = Wait-Until 'built-in tool preset selector' { Find-Element 'Built-in Linux tool bundle' $combo }
+    $presets.SetFocus()
+    $pattern = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $popup = $presets.GetCurrentPattern($pattern)
+    $popup.Expand()
+    $choice = Wait-Until "visible tool preset '$Name'" { Find-Element $Name $item -Visible }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+function Tool-Check([string]$Name) {
+    $type = [System.Windows.Automation.ControlType]::CheckBox
+    $check = Wait-Until "checkbox for '$Name'" { Find-Element "Include $Name" $type }
+    return $check.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
 }
 function Pick-Key([string]$Name) {
     Click $browseLabel
@@ -90,6 +125,260 @@ try {
     }
     if ([IO.File]::ReadAllText($homeKey) -cne 'test placeholder' -or [IO.File]::ReadAllText($chosen) -cne 'test placeholder') {
         throw 'The key picker changed a selected file'
+    }
+
+    $bundleName = 'Fleet dotfiles.json'
+    $bundle = Join-Path $State $bundleName
+    [IO.File]::WriteAllText($bundle, '{"version":2,"bash":"export EDITOR=vi"}')
+    Set-NativeExpansion 'SSH dotfiles' $true
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'fingerprint required' {
+        Find-Element 'Enter the verified SHA256 host-key fingerprint for this account'
+    }
+    Click 'Browse for dotfiles bundle'
+    $bundleTitle = 'Choose dotfiles bundle'
+    $bundleDialog = Wait-Until 'owned dotfiles bundle picker' { Find-OwnedDialog $bundleTitle }
+    $null = Wait-Until 'enter the full dotfiles manifest path' { [FixtureDialog]::SetFilename($bundleDialog, $bundle, '') }
+    $null = Wait-Until 'select dotfiles bundle' { [FixtureDialog]::ClickButton($bundleDialog, 1) }
+    $null = Wait-Until 'use selected dotfiles bundle' {
+        $field = Find-Element 'Dotfiles bundle' $edit
+        if ($field) { [FixtureDialog]::SameFile($bundle, $field.GetCurrentPattern($value).Current.Value) }
+    }
+    $fingerprint = 'SHA256:' + ('A' * 43)
+    Set-Field 'Remote SFTP home' '/home/test'
+    Set-Field 'Dotfiles host-key fingerprint' $fingerprint
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'unsupported bundle rejected' {
+        Find-Element 'Checking the dotfiles bundle: Unsupported dotfiles bundle version'
+    }
+    [IO.File]::WriteAllText($bundle, '{"version":1,"bash":"export EDITOR=vi"}')
+    Click 'Approve dotfiles sync'
+    $approval = 'Approved for test@example.test:22 ' + [char]0x00b7 + ' /home/test'
+    $null = Wait-Until 'approval for account and home' { Find-Element $approval }
+    Click 'Save profile changes'
+    $null = Wait-Until 'dotfiles approval saved' {
+        $dotfiles = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles
+        $dotfiles.shell -ceq 'bash' -and $dotfiles.host -ceq 'example.test' -and
+            $dotfiles.user -ceq 'test' -and $dotfiles.port -eq 22 -and
+            $dotfiles.home -ceq '/home/test' -and $dotfiles.fingerprint -ceq $fingerprint -and
+            [FixtureDialog]::SameFile($bundle, $dotfiles.bundle)
+    }
+    Click 'Disable dotfiles sync'
+    $null = Wait-Until 'dotfiles sync disabled in the editor' { Find-Element 'Sync off' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'dotfiles approval removed' {
+        !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles)
+    }
+
+    Set-NativeExpansion 'SSH dotfiles' $false
+    Set-NativeExpansion 'SSH tools' $true
+    $toolName = 'Fleet tools.json'
+    $toolBundle = Join-Path $State $toolName
+    [IO.File]::WriteAllText($toolBundle, ('{"version":1,"name":"portable","tools":[{"name":"rg","builds":[{"architecture":"x86_64","path":"rg","sha256":"' + ('a' * 64) + '"}]}]}'))
+    Click 'Browse for tool bundle'
+    $toolDialog = Wait-Until 'owned tool bundle picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
+    $null = Wait-Until 'enter the full tool manifest path' { [FixtureDialog]::SetFilename($toolDialog, $toolBundle, '') }
+    $null = Wait-Until 'choose the tool manifest' { [FixtureDialog]::ClickButton($toolDialog, 1) }
+    $null = Wait-Until 'tool manifest in draft' {
+        $field = Find-Element 'Tool bundle manifest' $edit
+        if ($field) { [FixtureDialog]::SameFile($toolBundle, $field.GetCurrentPattern($value).Current.Value) }
+    }
+    $example = Join-Path $PSScriptRoot '../examples/tool-bundles/essentials.json'
+    $starterDigest = File-Sha256 $example
+    $starterDirectory = Join-Path $env:W11TERM_DATA_DIR "tools/bundles/$starterDigest"
+    $starterManifest = Join-Path $starterDirectory 'linux-essentials.json'
+    $null = [IO.Directory]::CreateDirectory($starterDirectory)
+    [IO.File]::WriteAllText($starterManifest, 'edited starter')
+    Click 'Use Linux essentials'
+    $null = Wait-Until 'edited starter reported without downloading' {
+        Find-Element 'The saved Linux essentials manifest was modified. Browse for that manifest to use your copy, or move it aside and retry.'
+    }
+    $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+    if (![FixtureDialog]::SameFile($toolBundle, $toolField) -or
+        [IO.File]::ReadAllText($starterManifest) -cne 'edited starter') {
+        throw 'Preparing the starter overwrote an existing manifest or changed the draft on failure'
+    }
+    [IO.File]::Delete($starterManifest)
+    Set-Field 'Tool bundle SFTP home' '/home/test'
+    Set-Field 'Tool bundle host-key fingerprint' $fingerprint
+    $pathMode = Wait-Until 'tool PATH selector' { Find-Element 'Tool bundle shell PATH' $combo }
+    $pathMode.SetFocus()
+    $modePopup = $pathMode.GetCurrentPattern($expand)
+    $modePopup.Expand()
+    $bash = Wait-Until 'Bash PATH selection' { Find-Element 'Manage Bash PATH' $item -Visible }
+    $bash.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    if ($modePopup.Current.ExpandCollapseState -eq 'Expanded') { $modePopup.Collapse() }
+    Click 'Review tool bundle'
+    $review = 'portable ' + [char]0x2192 + ' test@example.test:22 ' + [char]0x00b7 + ' /home/test/.local/bin'
+    $null = Wait-Until 'tool bundle and launcher directory reviewed' { Find-Element $review }
+    Click 'Approve tool sync'
+    $null = Wait-Until 'tool sync approved' { Find-Element 'Approved tool bundle: portable' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'tool approvals persisted' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        $tools.name -ceq 'portable' -and $tools.bin_directory -ceq '.local/bin' -and
+            $tools.host -ceq 'example.test' -and $tools.home -ceq '/home/test' -and
+            $tools.fingerprint -ceq $fingerprint -and $tools.add_to_path.shell -ceq 'bash' -and
+            [FixtureDialog]::SameFile($toolBundle, $tools.bundle)
+    }
+    Click 'Disable tool sync'
+    $null = Wait-Until 'tool sync disabled' { Find-Element 'Tool sync off' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'tool approvals removed' {
+        !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle)
+    }
+
+    Select-ToolPreset 'Linux admin tools'
+    $null = Wait-Until 'admin preset selected without modifying the custom bundle' {
+        (Find-Element 'Use Linux admin tools' $button) -and
+            [FixtureDialog]::SameFile($toolBundle, (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value)
+    }
+
+    Select-ToolPreset 'Custom tools'
+    $null = Wait-Until 'empty selection cannot start a download' {
+        $use = Find-Element 'Use selected tools' $button
+        $use -and !$use.Current.IsEnabled
+    }
+    foreach ($tool in @('rg','jq','mdd')) {
+        $check = Tool-Check $tool
+        if ($check.Current.ToggleState -ne 'Off') { throw "Fresh custom selection preselected $tool" }
+        $check.Toggle()
+        $null = Wait-Until "tool '$tool' selected" { (Tool-Check $tool).Current.ToggleState -eq 'On' }
+    }
+    $null = Wait-Until 'three-tool selection enables the download' {
+        (Find-Element 'Use selected tools' $button).Current.IsEnabled
+    }
+    if (![FixtureDialog]::SameFile($toolBundle, (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value)) {
+        throw 'Toggling the catalog selection prematurely changed the manifest'
+    }
+
+    if ($env:W11TERM_VERIFY_STARTER_DOWNLOAD -eq '1') {
+        Click 'Use selected tools'
+        Click 'Cancel tool download'
+        $null = Wait-Until 'starter download cancelled' { Find-Element 'Tool download cancelled' }
+        $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+        if (![FixtureDialog]::SameFile($toolBundle, $toolField)) { throw 'Cancelling changed the selected manifest' }
+
+        Click 'Use selected tools'
+        $null = Wait-Until 'selected builds ready' {
+            Find-Element 'Selected tools are ready. Review the bundle to approve sync.'
+        }
+        $selectedManifest = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+        $starter = [IO.File]::ReadAllText($selectedManifest) | ConvertFrom-Json
+        if (($starter.tools.name -join ',') -cne 'rg,jq,mdd' -or @($starter.tools.builds).Count -ne 6) {
+            throw 'The custom manifest did not contain just the six selected tool builds'
+        }
+        foreach ($build in $starter.tools.builds) {
+            $cached = Join-Path $env:W11TERM_DATA_DIR "tools/cache/v1/$($build.sha256)"
+            if ((File-Sha256 $cached) -cne $build.sha256) {
+                throw "Starter cache did not contain the pinned $($build.architecture) build"
+            }
+        }
+        if (([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle) {
+            throw 'Selecting the starter authorized deployment before review'
+        }
+        $cacheDirectory = Join-Path $env:W11TERM_DATA_DIR 'tools/cache/v1'
+        if ([IO.Directory]::GetFiles($cacheDirectory).Count -ne 6) { throw 'The picker cached an unselected build' }
+        Click 'Review tool bundle'
+        $review = 'linux-essentials ' + [char]0x2192 + ' test@example.test:22 ' + [char]0x00b7 + ' /home/test/.local/bin'
+        $null = Wait-Until 'starter destination reviewed' { Find-Element $review }
+        Click 'Approve tool sync'
+        Click 'Save profile changes'
+        $null = Wait-Until 'starter approval saved' {
+            $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+            $tools.name -ceq 'linux-essentials' -and $tools.add_to_path.shell -ceq 'bash' -and
+                [FixtureDialog]::SameFile($selectedManifest, $tools.bundle)
+        }
+
+        $null = $app.CloseMainWindow()
+        if (!$app.WaitForExit(5000)) { throw 'w11term did not close after saving' }
+        $app.Dispose()
+        $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+        $window = Wait-InputWindow
+        Click 'Tab menu'
+        Click 'Settings' $menu
+        Click 'Edit profile fixture'
+        Set-NativeExpansion 'SSH tools' $true
+        foreach ($tool in @('rg','jq','mdd')) {
+            if ((Tool-Check $tool).Current.ToggleState -ne 'On') { throw "Reopened profile lost $tool" }
+        }
+        if ((Tool-Check 'netwatch').Current.ToggleState -ne 'Off') { throw 'Reopened profile selected an omitted tool' }
+    }
+
+    Click 'Create bundle from local tools'
+    Set-Field 'New bundle name' 'team-tools'
+    Set-Field 'Linux command name' 'operator'
+    $dot = ' ' + [char]0xb7 + ' '
+    foreach ($build in @(@('operator-x64', 'x86-64'), @('operator-arm','ARM64'))) {
+        Click 'Add Linux executable'
+        $picker = Wait-Until 'owned Linux executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
+        Select-DialogItem $picker $build[0]
+        $null = Wait-Until 'accept Linux executable file' { [FixtureDialog]::ClickButton($picker, 1) }
+        $null = Wait-Until "detected $($build[1]) executable" { Find-Element "operator${dot}$($build[1])" }
+    }
+    Click 'Save new tool bundle'
+    $picker = Wait-Until 'owned bundle save dialog' { Find-OwnedDialog 'Save new SSH tool bundle' }
+    $null = Wait-Until 'accept new bundle file' { [FixtureDialog]::ClickButton($picker, 1) }
+    $created = Join-Path $State 'tools.json'
+    $null = Wait-Until 'new manifest selected before review' {
+        $field = Find-Element 'Tool bundle manifest' $edit
+        $field -and [FixtureDialog]::SameFile($created, $field.GetCurrentPattern($value).Current.Value)
+    }
+    $createdBundle = [IO.File]::ReadAllText($created) | ConvertFrom-Json
+    if ($createdBundle.name -cne 'team-tools' -or $createdBundle.tools.name -cne 'operator' -or
+        ($createdBundle.tools.builds.architecture -join ',') -cne 'x86_64,aarch64') {
+        throw 'Created manifest did not contain the named command and both architectures'
+    }
+    foreach ($build in $createdBundle.tools.builds) {
+        $source = if ([IO.Path]::IsPathRooted($build.path)) { $build.path } else { Join-Path $State $build.path }
+        if ((File-Sha256 $source) -cne $build.sha256) {
+            throw 'The saved manifest pin did not match the selected executable'
+        }
+    }
+    Click 'Review tool bundle'
+    $review = 'team-tools ' + [char]0x2192 + " test@example.test:22${dot}/home/test/.local/bin"
+    $null = Wait-Until 'new local bundle was reviewed' { Find-Element $review }
+    Click 'Approve tool sync'
+    Click 'Save profile changes'
+    $null = Wait-Until 'local bundle approval saved to the profile' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        $tools.name -ceq 'team-tools' -and [FixtureDialog]::SameFile($created, $tools.bundle)
+    }
+    $originalPin = File-Sha256 $created
+    Click 'Revise selected tool bundle'
+    $null = Wait-Until 'both previous builds loaded' {
+        (Find-Element "operator${dot}x86-64") -and (Find-Element "operator${dot}ARM64")
+    }
+    Click 'Replace operator x86-64'
+    $picker = Wait-Until 'owned replacement executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
+    Select-DialogItem $picker 'operator-x64-next'
+    $null = Wait-Until 'accept replacement executable' { [FixtureDialog]::ClickButton($picker, 1) }
+    Click 'Save bundle revision'
+    $picker = Wait-Until 'owned save revision dialog' { Find-OwnedDialog 'Save new SSH tool bundle' }
+    $null = Wait-Until 'save the separate bundle revision' { [FixtureDialog]::ClickButton($picker, 1) }
+    $revision = Join-Path $State 'tools-revision.json'
+    $null = Wait-Until 'revision selected and awaiting review' {
+        $field = Find-Element 'Tool bundle manifest' $edit
+        $approve = Find-Element 'Approve tool sync' $button
+        $field -and $approve -and !$approve.Current.IsEnabled -and
+            [FixtureDialog]::SameFile($revision, $field.GetCurrentPattern($value).Current.Value)
+    }
+    $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+    if (![FixtureDialog]::SameFile($created, $tools.bundle) -or (File-Sha256 $created) -cne $originalPin) {
+        throw 'Saving a revision changed the previously approved manifest or profile'
+    }
+    $revisionBundle = [IO.File]::ReadAllText($revision) | ConvertFrom-Json
+    if ($revisionBundle.tools.builds[0].sha256 -cne (File-Sha256 (Join-Path $State 'operator-x64-next')) -or
+        $revisionBundle.tools.builds[1].sha256 -cne $createdBundle.tools.builds[1].sha256) {
+        throw 'The revision did not replace only the chosen build'
+    }
+    Click 'Review tool bundle'
+    $null = Wait-Until 'new revision reviewed' { Find-Element $review }
+    Click 'Approve tool sync'
+    Click 'Save profile changes'
+    $null = Wait-Until 'revision approval saved' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        [FixtureDialog]::SameFile($revision, $tools.bundle)
     }
 } finally {
     if (!$app.HasExited) {

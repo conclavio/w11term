@@ -26,3 +26,6 @@ the mouse and keyboard context-menu gestures. The native TitleBar left
 header accepts the tab strip in a pointer-interactive region. The runtime
 refreshes its drag regions when the strip width changes independently of
 the window.
+
+The TextBox reconciler applies AcceptsReturn before the initial text value
+so WinUI preserves multiline previews.

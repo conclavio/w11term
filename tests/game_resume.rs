@@ -243,6 +243,8 @@ impl Fixture {
                 proxy_jump: vec![],
                 local_forwards: vec![],
                 durable: false,
+                dotfiles: None,
+                tool_bundle: None,
                 group_prompt: None,
                 player: PlayerOptions {
                     rustmush: true,

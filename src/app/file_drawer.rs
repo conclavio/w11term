@@ -3497,6 +3497,21 @@ impl TerminalApp {
         let Source::Ssh(ssh) = &tab.source else {
             return;
         };
+        if visible
+            && (self.command_reference.open
+                || self.diagnostics_open
+                || self.triage.open
+                || self.packet_capture.open)
+            && matches!(action, Toggle | OpenHere | ShowTransfer(_))
+        {
+            self.command_reference.close();
+            self.diagnostics_open = false;
+            self.triage.open = false;
+            self.packet_capture.open = false;
+            if matches!(action, Toggle) && tab.files.open {
+                return;
+            }
+        }
         let session = &tab.session;
         let files = &mut tab.files;
         let download_profile = |generation| {

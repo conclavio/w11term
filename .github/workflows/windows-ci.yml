@@ -169,6 +169,61 @@ jobs:
             python3 tests/shell-directory.py --shell fish
           '
 
+  linux-triage:
+    name: Linux performance triage script
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - *checkout
+      - name: Verify samples, deadline and cleanup with Linux shell utilities
+        run: python3 tests/linux-triage.py
+      - name: Verify CPU profile identity, byte limits, deadline and cleanup
+        run: python3 tests/linux-cpu-profile.py
+      - name: Verify CPU command arguments, exit status and cleanup
+        run: python3 tests/linux-cpu-launch.py
+      - name: Resolve a live CPU hotspot with perf
+        shell: bash
+        run: |
+          previous=$(sysctl -n kernel.perf_event_paranoid)
+          if (( previous > 2 )); then
+            trap 'sudo sysctl -q -w "kernel.perf_event_paranoid=$previous"' EXIT
+            sudo sysctl -q -w kernel.perf_event_paranoid=2
+          fi
+          python3 tests/linux-cpu-profile.py --live
+          python3 tests/linux-cpu-launch.py --live
+
+  linux-packet-capture:
+    name: Linux loopback packet capture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - *checkout
+      - name: Install tcpdump if needed
+        shell: bash
+        run: |
+          if ! command -v tcpdump >/dev/null; then
+            sudo apt-get -o Acquire::Retries=3 update
+            sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends tcpdump
+          fi
+      - name: Verify loopback bytes, scratch budget and disconnect cleanup
+        run: sudo python3 tests/linux-packet-capture.py
+
+  linux-syscall-capture:
+    name: Linux bounded syscall capture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - *checkout
+      - name: Install strace if needed
+        shell: bash
+        run: |
+          if ! command -v strace >/dev/null; then
+            sudo apt-get -o Acquire::Retries=3 update
+            sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends strace
+          fi
+      - name: Verify raw descendants, time and byte caps, Stop and disconnect
+        run: python3 tests/linux-syscall-capture.py
+
   remote-mux:
     name: Stock Linux multiplexers over SSH
     runs-on: ubuntu-24.04

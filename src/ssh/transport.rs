@@ -7,7 +7,10 @@ use super::{
     SshKeySource, VerifiedSshAuthentication, agent,
 };
 use crate::{
-    events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
+    events::{
+        AttemptGuard, Events, RetryWait, SshAttemptOutcome, ToolBundleSyncReport,
+        ToolBundleSyncStatus,
+    },
     options::{AgentFingerprint, AgentPipe, Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
@@ -1537,6 +1540,30 @@ impl Driver {
         }
     }
 }
+async fn wait_login_sync<T>(
+    task: impl Future<Output = T>,
+    input: &mut mpsc::UnboundedReceiver<TransportInput>,
+    size: &mut TerminalSize,
+    options: &mut SshOptions,
+) -> Option<T> {
+    tokio::pin!(task);
+    loop {
+        tokio::select! {
+            biased;
+            message = input.recv() => offline(message?, size, options),
+            result = &mut task => return Some(result),
+        }
+    }
+}
+
+fn login_sync_detail(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(480)
+        .collect()
+}
+
 async fn run_channel(
     mut shell: OpenShell,
     driver: &mut Driver,
@@ -1598,13 +1625,129 @@ async fn run_channel(
             .channel
             .close_game_session_on_drop(shell.link.as_ref().clone());
     }
+    let mut login_notices = Vec::new();
+    let sync_allowed = !managed && sharing.startup.is_none() && !options.player.rustmush;
+    if sync_allowed && let Some(settings) = options.dotfiles.clone() {
+        output
+            .send(Event::Status("Checking SSH dotfiles".into()))
+            .await?;
+        let sync = tokio::time::timeout(Duration::from_secs(10), async {
+            anyhow::ensure!(
+                settings.approves(shell.link.verified_endpoint()),
+                "The profile's dotfiles approval does not match the verified SSH account"
+            );
+            let _guard = shell.link.lock_dotfiles_sync().await;
+            crate::sftp::sync_login_dotfiles(&shell.link.handle(), &settings).await
+        });
+        let Some(result) = wait_login_sync(sync, input, size, options).await else {
+            return Ok(());
+        };
+        match result {
+            Ok(Ok(status)) => {
+                events.push(
+                    "dotfiles-sync",
+                    serde_json::json!({"generation": generation, "status": status}),
+                );
+                if status == "held" {
+                    login_notices.push("Dotfiles sync paused by manual selection".into());
+                }
+            }
+            Ok(Err(error)) => {
+                let detail = login_sync_detail(&error);
+                events.push("dotfiles-sync", serde_json::json!({"generation": generation, "status": "skipped", "detail": detail}));
+                login_notices.push(format!("Dotfiles sync skipped: {detail}"));
+            }
+            Err(_) => {
+                let detail = "Dotfiles sync reached its 10-second deadline. Preview to check the active bundle.";
+                events.push(
+                    "dotfiles-sync",
+                    serde_json::json!({"generation": generation, "status": "unconfirmed", "detail": detail}),
+                );
+                login_notices.push(detail.into());
+            }
+        }
+    }
+    if sync_allowed && let Some(settings) = options.tool_bundle.clone() {
+        output
+            .send(Event::Status("Checking SSH tool bundle".into()))
+            .await?;
+        let sync = tokio::time::timeout(Duration::from_secs(20), async {
+            ensure!(
+                settings.approves(shell.link.verified_endpoint()),
+                "The profile's tool bundle approval does not match the verified SSH account"
+            );
+            // Serialize startup-file edits with dotfiles sync on this connection.
+            let _guard = shell.link.lock_dotfiles_sync().await;
+            crate::sftp::sync_login_tools(&shell.link.handle(), &settings).await
+        });
+        let Some(result) = wait_login_sync(sync, input, size, options).await else {
+            return Ok(());
+        };
+        let mut report = ToolBundleSyncReport {
+            generation,
+            bundle: crate::events::display_field(&settings.name),
+            status: ToolBundleSyncStatus::Skipped,
+            path: None,
+            detail: None,
+        };
+        match result {
+            Ok(Ok(result)) => {
+                report.status = result.status;
+                report.path = result.path;
+                if let Some(error) = result.path_error {
+                    let detail = login_sync_detail(&error);
+                    login_notices.push(format!("Tool PATH skipped: {detail}"));
+                    report.detail = Some(detail);
+                } else if result.status == ToolBundleSyncStatus::Held {
+                    login_notices.push("Tool bundle sync paused by rollback".into());
+                }
+            }
+            Ok(Err(error)) => {
+                let detail = login_sync_detail(&error);
+                login_notices.push(format!("Tool bundle sync skipped: {detail}"));
+                report.detail = Some(detail);
+            }
+            Err(_) => {
+                let detail = "Tool bundle sync reached its 20-second deadline. Preview to check the active bundle.";
+                login_notices.push(detail.into());
+                report.status = ToolBundleSyncStatus::Unconfirmed;
+                report.detail = Some(detail.into());
+            }
+        }
+        events.record_tool_bundle_sync(report);
+    } else if let Some(settings) = &options.tool_bundle {
+        let detail = if managed {
+            "This durable SSH session uses its own shell startup."
+        } else if sharing.startup.is_some() {
+            "This workspace runs a startup command in place of the login shell."
+        } else {
+            "This game profile uses its own shell startup."
+        };
+        events.record_tool_bundle_sync(ToolBundleSyncReport {
+            generation,
+            bundle: crate::events::display_field(&settings.name),
+            status: ToolBundleSyncStatus::NotRun,
+            path: None,
+            detail: Some(detail.into()),
+        });
+    }
     let channel = shell.channel.channel();
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let mut children = tokio::task::JoinSet::new();
+    let approved_tool_path = options
+        .tool_bundle
+        .as_deref()
+        .filter(|settings| {
+            sync_allowed
+                && settings.add_to_path.is_some()
+                && settings.approves(shell.link.verified_endpoint())
+        })
+        .cloned();
     children.spawn(crate::sftp::run(
         shell.link.handle(),
         generation,
+        approved_tool_path,
         sftp_rx,
         cleanup_rx,
     ));
@@ -1801,7 +1944,12 @@ async fn run_channel(
                         program.ready();
                         events.push("connected", serde_json::json!({"generation":generation}));
                         output.send(Event::Connected(generation)).await?;
-                        output.send(Event::Status(format!("{}@{}:{}", options.user, options.host, options.port))).await?;
+                        let mut status = format!("{}@{}:{}", options.user, options.host, options.port);
+                        for notice in login_notices.drain(..) {
+                            status.push_str(" · ");
+                            status.push_str(&notice);
+                        }
+                        output.send(Event::Status(status)).await?;
                     }
                 },
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),
@@ -1867,6 +2015,7 @@ async fn run_herdr_channel(
     jobs.spawn(crate::sftp::run(
         link.handle(),
         generation,
+        None,
         sftp_rx,
         cleanup_rx,
     ));

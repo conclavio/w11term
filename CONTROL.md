@@ -55,6 +55,8 @@ Replies include `window_id`, `tab_id`, the explicit `name` (null after reset), a
 
 Pane leaves include `pane_name`, `font_size`, and a `source` with `kind`, the nullable `profile` name, and `startup` and `durable` flags. The preview omits connection settings, credential and recording paths, launch commands, and durable session identifiers. With `--window`, `profile_check` gives that `window_id` and its `missing_ssh_profiles`. This checks saved SSH profile names against the selected window's catalog. Without a window, `profile_check` is null. Direct pipe clients can send `{"verb":"get-workspace","name":"Fleet Ops","window_id":2}`.
 
+`rename-workspace --name OLD --to NEW` renames a recipe in the saved workspace catalog. The new name must be unused. The layout and workspace identity carry over, so the workspace switcher still recognizes an open window under the new name. The reply gives `old_name` and `name`. The command preserves live sessions and desktop focus. Direct pipe clients can send `{"verb":"rename-workspace","name":"Fleet Ops","new_name":"Production Ops"}`.
+
 `repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]` replaces missing SSH profile references in a saved workspace. Each pair updates every pane that refers to `OLD`. The command checks the selected window's SSH profile catalog and applies the same connection checks as the GUI repair, including for startup commands and durable sessions. All requested replacements are saved together, and the workspace keeps its identity. The reply includes `name`, `window_id`, the `replacements` object keyed by old name, and `updated_panes`. Repair changes the saved recipe while leaving live sessions and desktop focus in place.
 
 Direct pipe clients can send `{"verb":"repair-workspace","window_id":2,"name":"Fleet Ops","replacements":[{"missing":"ops-old","replacement":"ops"}]}`.
@@ -76,6 +78,7 @@ The reply contains `name`, `window_id`, and `tabs` in saved order. Each tab cont
 & $ctl --pid 12345 save-workspace --window 2 --name 'Fleet Ops'
 & $ctl --pid 12345 open-workspace --window 2 --name 'Fleet Ops' --activate
 & $ctl --pid 12345 open-workspace --new-window --name 'Fleet Ops'
+& $ctl --pid 12345 rename-workspace --name 'Fleet Ops' --to 'Production Ops'
 ```
 
 `resize` routes to the window that owns the pane, including after a live tab transfer. Closing one window leaves the process pipe and the remaining windows’ sessions accessible.
@@ -1256,6 +1259,469 @@ Direct pipe clients send
 `{"verb":"list-sftp-transfers","pane":7}` or
 `{"verb":"cancel-sftp-transfer","transfer_id":"7:2:11"}`. To wait, send
 `{"verb":"wait-sftp-transfer","transfer_id":"7:2:11","timeout_seconds":30}`.
+
+### Preview and apply SSH dotfiles
+
+`sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
+
+Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
+
+```json
+{
+  "version": 1,
+  "environment": "export EDITOR=vim\n",
+  "bash": "PS1='ops \\u@\\h> '\n",
+  "zsh": "PROMPT='ops %n@%m> '\n"
+}
+```
+
+```powershell
+$bundle = '.\Fleet dotfiles.json'
+$preview = & $ctl --pid 12345 sftp --pane $pane preview-dotfiles $bundle --shell bash | ConvertFrom-Json
+$preview.result.sftp
+# Review the home, files, and proposed hooks before running apply.
+$review = $preview.result.sftp.review
+& $ctl --pid 12345 sftp --pane $pane apply-dotfiles $bundle --shell bash --review $review
+```
+
+In `result.sftp`, `directories_to_create` names missing managed directories and `files` gives the absolute paths, proposed actions, and before/after SHA-256 hashes. For Bash, the preview selects the first existing login file in the order `.bash_profile`, `.bash_login`, `.profile`, and plans a new `.profile` if none exists. It also previews `.bashrc`. Zsh previews `.zprofile` and `.zshrc`. Startup entries include the exact `hook` block. A changed or duplicated marker block is a `hook-conflict`, and modified version files or selectors get their own conflict status. The `supports_atomic_replace` field reports whether the server offers the OpenSSH atomic replacement extension.
+
+Pass the returned `review` token to apply on the same pane with the same bundle, shell and optional `--zdotdir`. If either the plan or the SFTP connection changed, preview again. Apply checks for conflicts and atomic replacement support before writing. It stages fragments in a directory named for `bundle_sha256` under `~/.config/w11term/dotfiles/`, installs the startup hooks, then switches the shell’s active bundle with a single file rename. New shells use that version. A failed activation can leave staged files, which a fresh preview can reuse. Older bundle directories are retained.
+
+Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_files`. An unchanged bundle returns an empty list. A missing fragment becomes an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields. Use `"op":"apply-dotfiles"` plus the returned `"review"` for the reviewed installation.
+
+### Restore or disable SSH dotfiles
+
+Use `preview-dotfiles-switch SHA256|disabled --shell bash|zsh` to review a switch on the pane's SFTP connection. Use an earlier `bundle_sha256` from apply, or find the shell's retained version directories under `~/.config/w11term/dotfiles/`. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
+
+```powershell
+$preview = & $ctl --pid 12345 sftp --pane $pane preview-dotfiles-switch $previousBundle --shell bash | ConvertFrom-Json
+$preview.result.sftp
+# Review the currently active and proposed bundles.
+& $ctl --pid 12345 sftp --pane $pane switch-dotfiles $previousBundle --shell bash --review $preview.result.sftp.review
+```
+
+Use the same two commands with `disabled` to stop loading managed dotfiles in new shells. Switching only changes the selector. The startup hooks and retained files stay available for the next review. Restoring checks that the retained fragments match their bundle hash and that both startup hooks are installed. A stale token or edited fragment prevents activation. The reply reports `shell`, `home`, the selected `bundle_sha256` or null, and `changed`.
+
+Direct pipe clients use `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. Include the returned `"review"` to publish the switch.
+
+### Sync dotfiles on SSH connect
+
+Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
+
+The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
+
+```json
+{
+  "bundle": "Fleet dotfiles.json",
+  "shell": "bash",
+  "host": "dev.example.net",
+  "user": "operator",
+  "port": 22,
+  "fingerprint": "SHA256:REPLACE_WITH_VERIFIED_HOST_FINGERPRINT",
+  "home": "/home/operator"
+}
+```
+
+On an ordinary SSH shell launch or reconnect, w11term checks that the verified host, account, port, fingerprint, and SFTP home match this approval. It then reads the local bundle and stages updates before requesting the shell. Sync verifies the currently active files and hooks before replacing their selection. The operation has a ten-second deadline, and a skipped or timed-out sync leaves opening the SSH shell available. The pane status and its `dotfiles-sync` event explain the result. Sync applies to ordinary SSH shells. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
+
+A reviewed manual switch holds the chosen bundle on later logins, including when you choose `disabled`. Use a fresh manual preview and `apply-dotfiles` with the bundle you want to return to automatic sync.
+
+### Download a pinned SSH tool bundle
+
+In **Settings → Edit profile → SSH tools**, select a preset or pick individual utilities under **Custom tools**. Choose **Use selected tools** for a custom set. The download runs in the background and selects the prepared manifest when it finishes. Review the host and account, approve sync, and save the profile. Each selection and preset revision has its own local manifest, so earlier approvals keep their pins until you select and approve a new version.
+
+Choose **Create bundle from local tools** to build a manifest from raw Linux executables on Windows. Give the bundle and each command a name, then pick the local executable. You can add an x86-64 and an ARM64 build under the same command name. w11term detects the architecture and computes the SHA-256 pin. The launcher directory defaults to `.local/bin` under the remote home. Save to a new manifest file, then review and approve it in the profile. Keep the source executables at their saved locations so installation can verify the pins.
+
+Choose **Revise selected tool bundle** to load the current manifest. Add or remove a build, or use **Replace** to pin a new local executable of the same architecture in the same fallback position. A revision keeps the other entries and their existing pins and download sources. **Save bundle revision** writes a separate manifest. Review and approve it, then save the profile to use the revision on connect.
+
+**Linux essentials** includes `rg`, `jq`, `dust`, and `hyperfine`. **Linux admin tools** adds `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. The presets and custom selections share the `linux-essentials` bundle name and `.local/bin` launchers for updates and rollback. Profiles that connect to the same account update the same active set. Omitted launchers become dormant and can be restored by rollback. Linux `x86_64` and `aarch64` are supported. Omit `--architecture` to fetch both. Use manual preview and apply for a first transfer that needs more than the login sync deadline.
+
+```powershell
+& $ctl fetch-tool-bundle --example '.\Linux essentials.json'
+& $ctl fetch-tool-bundle '.\Linux essentials.json' --architecture x86_64
+& $ctl fetch-tool-bundle --example '.\Linux admin tools.json' --preset admin
+& $ctl fetch-tool-bundle '.\Linux admin tools.json' --architecture x86_64
+& $ctl fetch-tool-bundle --example '.\My Linux tools.json' --tools 'rg,jq,mdd'
+& $ctl fetch-tool-bundle '.\My Linux tools.json'
+```
+
+Each build in a version-1 manifest can use a `download` object in place of `path`. Set `format` to `raw` for a single executable. For `tar-gz` or `zip`, also set `member` to its path inside the archive and `archive_sha256` to the hash of the complete archive. The build's top-level `sha256` always pins the executable, and the client verifies its Linux ELF architecture before caching it. [Essentials pins](examples/tool-bundles/essentials.json) · [Admin additions](examples/tool-bundles/admin-additions.json)
+
+Fetch the builds on Windows before using the manifest in a preview or SSH profile. w11term caches verified executables by SHA-256 in `%LOCALAPPDATA%\w11term\tools\cache\v1`. Preview and profile sync reverify the cached bytes and use them offline. To update a pin, edit the manifest and run the fetch command again.
+
+### Preview a managed SSH tool bundle
+
+Use a downloaded bundle or keep the Linux executables on Windows and point a version-1 bundle at them. Relative local build paths resolve beside the manifest. Pin the SHA-256 of each executable. Use the optional `release` URL to record its source. Supply an `x86_64` build, an `aarch64` build, or both. The default `bin_directory` is `.local/bin` under the remote home.
+
+```json
+{
+  "version": 1,
+  "name": "my-tools",
+  "tools": [
+    {
+      "name": "rg",
+      "builds": [
+        {
+          "architecture": "x86_64",
+          "path": "linux-x86_64/rg",
+          "sha256": "e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849",
+          "release": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz"
+        },
+        {
+          "architecture": "aarch64",
+          "path": "linux-aarch64/rg",
+          "sha256": "c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a",
+          "release": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz"
+        }
+      ]
+    }
+  ]
+}
+```
+
+```powershell
+& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools.json'
+```
+
+The preview uses the pane's verified SSH connection. A read-only SSH exec probe identifies Linux, architecture, home, and the exec environment's `PATH`. The preview checks the same home over SFTP, verifies local file hashes and ELF headers, and selects the first verified self-contained build for each command. For dynamic builds it reports the interpreter, linked libraries, and glibc requirements it could read, including a missing loader or insufficient glibc when detectable. The report shows planned destinations, directory and launcher conflicts, and executable files found earlier in the probed `PATH`. Interactive shell startup files can change that search order.
+
+### Install or roll back a reviewed SSH tool bundle
+
+From a connected SSH pane, open **More → Command reference → Install SSH tools**. Choose a Windows manifest or use the bundle from the pane's profile. Select **Review bundle** to see the resolved home, architecture, launcher paths, PATH status, and any blocking conflicts. **Install reviewed bundle** applies that review on the same connection. The installation runs alongside the SSH shell and uses the manual SFTP deadline.
+
+Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose an earlier release and select **Review rollback** to verify its binaries and see its commands and launcher paths. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
+
+Review the destinations, PATH status, and selected builds. When the report has `ready: true`, pass its `review` token back to the same pane. The commands below use the default JSON response from `w11term-cli`.
+
+```powershell
+$plan = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools.json' | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane apply-tool-bundle '.\Fleet tools.json' --review $plan.review
+```
+
+Installation verifies the uploaded files over SFTP and publishes the version under `~/.local/share/w11term/tools/<name>/versions/<sha256>/`. It adds launchers to the bundle's `bin_directory`, preserving entries already owned by the account. Add that directory to the shell's `PATH` if the preview reports it missing. Keep the bin directory fixed across versions of one named bundle. The installer reuses a verified copy when the requested version is already present and copies unchanged tools from the active version when building a new one. The `previous_bundle_sha256` in an update reply identifies the version to restore.
+
+For a retained version, w11term can calculate the hashes on the verified SSH host using `head` and `sha256sum`. It checks the manifest and file metadata through SFTP and falls back to hashing the bytes over SFTP when the remote checksum command is unavailable.
+
+```powershell
+$restore = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-rollback my-tools $previousSha256 | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane rollback-tool-bundle my-tools $previousSha256 --review $restore.review
+```
+
+Rollback uses the retained remote files. The client checks their hashes and executable permissions before activating them. Launchers for commands omitted from the active version remain dormant so older versions can restore them. Installation and rollback require the host's `flock` command and SFTP symlinks. Switching an active version requires OpenSSH's atomic rename extension. Run a fresh preview after changing the manifest, moving to another pane or connection, or retrying an interrupted operation.
+
+### Sync a tool bundle on SSH connect
+
+Open **Settings → Edit profile → SSH tools**. Browse for the bundle manifest and enter the remote SFTP home and verified SHA256 host-key fingerprint. A pinned profile fingerprint also works. Select **Manage Bash PATH** or **Manage Zsh PATH** to append the launcher directory after the shell's existing PATH entries. Then select **Review tool bundle**, confirm the account and launcher directory, choose **Approve tool sync**, and save.
+
+Profiles can store the same approval under `tool_bundle`. Paths to local manifests resolve beside the profile catalog. The approved `name` and `bin_directory` come from the manifest and bind later updates to that destination. Use `add_to_path.shell` with `bash` or `zsh`, and optionally `add_to_path.zdotdir` for a Zsh startup directory relative to home.
+
+```json
+{
+  "bundle": "Fleet tools.json",
+  "name": "my-tools",
+  "bin_directory": ".local/bin",
+  "host": "dev.example.net",
+  "user": "operator",
+  "port": 22,
+  "fingerprint": "SHA256:REPLACE_WITH_VERIFIED_HOST_FINGERPRINT",
+  "home": "/home/operator",
+  "add_to_path": { "shell": "bash" }
+}
+```
+
+On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. PATH management appends a marked block to the shell's login and interactive startup files and reports edits to that block for review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
+
+**More → Command reference** shows the last login sync for the selected SSH connection. Open **Install SSH tools** for the PATH result and any error detail. Manual installs and rollbacks show their own results in the installer and version history.
+
+When the login PATH update is skipped, **Review PATH repair** checks the approved startup files over the current SSH connection. The review shows each file and the current and proposed text for any managed block it would replace. **Apply reviewed PATH repair** validates the review and writes the changes for new shells. Replacement requires one complete marker pair and preserves the text around it. Duplicate or incomplete marker pairs require manual correction.
+
+A manual rollback pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+
+```powershell
+$resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-tools $activeSha256 | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane resume-tool-bundle-updates my-tools $activeSha256 --review $resume.review
+```
+
+### Open SSH diagnostics
+
+**Recent files** in **Diagnostics overview** remembers the last 12 Linux triage reports, folded CPU profiles, packet captures, or syscall trace sets opened or saved in the Windows app. The list survives app restarts. Use the file actions menu to **Pin** up to 12 entries in a separate section. **Unpin** moves an entry back to recent files. **Copy path** copies the full Windows path. For split syscall traces, **Copy paths** copies one path per line in the original selection order, and reopening loads the same set. Packet captures reopen in the capture panel, where you can choose **Open in Wireshark**. **Forget** removes the entry from the list and leaves the artifact on disk.
+
+Choose **Use as baseline** on a saved CPU profile, triage report, or syscall trace. Then choose **Compare with baseline** on another entry of the same kind to open the two files directly in their comparison viewer. The baseline is the Before or Working side. The selection stays in the current window until you replace it, choose **Clear baseline**, or remove the entry from the list.
+
+Open **More → Diagnostics → Diagnostics overview** or search for **Diagnostics overview** in the command palette. The overview shows the connected SSH endpoint for the focused pane and updates when you switch panes. Use its entries to open Linux performance triage, CPU flame graph, packet capture, or the syscall trace viewer. The tools retain their direct command-palette entries.
+
+Use **Back** in the triage, flame graph, or packet capture panel to return to the overview. Open saved reports, folded stacks, and syscall traces even when you have no active SSH connection. Each live capture still has its own target review and start action.
+
+In **Diagnostics overview**, choose **Open saved diagnostic…** or drop files into the labelled area. The overview recognizes `.folded`, `.collapsed`, triage `.json`, `.pcap`, `.pcapng`, `.cap`, `.strace`, and split `name.PID` traces. Select one saved file or all the parts of a single split trace. Each viewer validates the file before adding it to recent diagnostics.
+
+Choose **Compare saved diagnostics…** to browse for two CPU profiles, Linux triage reports, packet captures, or syscall traces. Pick the baseline first. It becomes **Before** in a CPU, triage, or packet comparison and **Working** in a syscall comparison. For a split trace, select all the files for that run in its dialog. Cancel either dialog to return to the overview. For files already in **Recent files** or **Pinned files**, choose **Use as baseline** on one file, then **Compare with baseline** on another of the same type.
+
+Use `w11term.exe` to launch directly into the corresponding offline viewer. Paths can be relative to the working directory or absolute. Repeat `--open-syscall-trace` for all parts of a split trace. A diagnostics-only window uses the full width and starts without opening a terminal or applying the startup profile.
+
+```powershell
+.\w11term.exe --open-cpu-profile '.\worker profile.folded'
+.\w11term.exe --open-triage-report '.\linux-triage.json'
+.\w11term.exe --open-packet-capture '.\capture.pcapng'
+.\w11term.exe --open-syscall-trace '.\run.321' --open-syscall-trace '.\run.322'
+```
+
+To start in the comparison view, supply the Before or Working files with the `--open-*` option and the After or Failing files with `--compare-with`. For split syscall traces, repeat the option for each side independently. The viewer adds both sources to recent diagnostics. Use **Back to flame graph**, **Back to report**, **Back to capture**, or **Back to working trace** to return to the baseline.
+
+```powershell
+.\w11term.exe --open-cpu-profile '.\before.folded' --compare-with '.\after.folded'
+.\w11term.exe --open-triage-report '.\before.json' --compare-with '.\after.json'
+.\w11term.exe --open-packet-capture '.\before.pcap' --compare-with '.\after.pcapng'
+.\w11term.exe --open-syscall-trace '.\working.321' --open-syscall-trace '.\working.322' --compare-with '.\failing.411' --compare-with '.\failing.412'
+```
+
+Use `open-diagnostic` to open files in a running instance. Get the target ID with `list-windows`. The control command preserves desktop focus and returns the window ID, artifact kind, and whether it loaded a comparison. A load error produces a failed reply. Repeat `--file` or `--compare-with` for the parts of a split syscall trace.
+
+```powershell
+& $ctl --pid 12345 list-windows
+& $ctl --pid 12345 open-diagnostic --window 1 --kind cpu-profile --file '.\before.folded' --compare-with '.\after.folded'
+& $ctl --pid 12345 open-diagnostic --window 1 --kind packet-capture --file '.\before.pcap' --compare-with '.\after.pcapng'
+```
+
+**Activity** shows jobs started from the app in this window, with the original SSH endpoint, current state, and the latest result still available in each tool. Packet and syscall captures report their stop reason and saved path. Select an activity to return to the running job or its result even after switching panes. Linux performance triage shows the live count of checks that have finished, including checks that returned an error. **Stop and keep report** ends the collection early. The report retains collected output, labels unfinished checks as incomplete, and records that you stopped the collection.
+
+### Capture Linux packets and open Wireshark
+
+In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. **Stop and save** asks the running tcpdump to finish writing its capture, then transfers the verified file. The result reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
+
+Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
+
+Choose **Open capture file…** in the same panel to reopen a local PCAP or PCAPNG file from an earlier session. This works without SSH. The panel shows the format, file size, packet count, captured bytes, truncated packets, and interface link types. The timestamp span uses the earliest and latest timestamps and shows how many packets were timestamped. The scan stops after one million records or blocks and reads only a bounded prefix of each packet. A partial summary shows the reason it stopped. **Open in Wireshark** opens the original file for packet analysis. [PCAP format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcap/) · [PCAPNG format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/) · [Link types](https://www.iana.org/assignments/pcap)
+
+Use `inspect-packet-capture` to read the same summary as schema-version-1 JSON without a running w11term instance. The report records the local filename, numeric link types, and the timestamp span in nanoseconds as a decimal string. A missing span is `null`. An incomplete scan returns the verified prefix with `complete: false` and the reason in `issue`. A file with an invalid capture header returns a nonzero exit code. Use `--output-file` to save the report to a new file and get its absolute path in the CLI reply.
+
+Add `--all-conversations` to include every tracked IP and transport pair, or use `--filter-conversations 'udp 443 192.0.2.0/24'` to search both lists with the same terms as the app. The optional `conversation_results` object contains `ip` and `transport` arrays ranked by captured bytes. A search with no matches returns empty arrays. The existing top-ten arrays and scan coverage remain available in the same report.
+
+Use **Saved capture interfaces** when a capture contains multiple interfaces. Each entry shows the recorded name when available, link type, snap length, packet count, bytes, truncation, and timestamp coverage. The JSON `interface_details` array includes the same breakdown. PCAPNG sections are numbered starting at one, and interface IDs start at zero within each section. A classic PCAP file has one implicit interface with a `null` section. A `null` snap length means the PCAPNG interface has no limit.
+
+If a PCAPNG file records interface statistics, the panel shows the newest timestamped counter snapshot for that interface. These cumulative counters can report packets received, accepted by the filter, delivered, dropped by the interface, or dropped by the OS. The JSON `capture_statistics` object includes the snapshot time as `timestamp_unix_ns`, a decimal nanosecond string. Missing counters are `null`. Each snapshot is reported once, and the packet-record totals still describe the packets stored in the file. [PCAPNG Interface Statistics Block](https://datatracker.ietf.org/doc/html/draft-ietf-opsawg-pcapng-06#section-4.6)
+
+Expand **Packet timeline** to see packet activity across the whole capture, with the peak bucket and its captured bytes. The timeline uses up to 64 equal-width buckets of at least one microsecond, including empty intervals, and counts packets that have usable timestamps. The JSON `timeline` object gives the start and bucket width as decimal nanosecond strings, followed by packet and byte counts for each bucket. Bucket intervals include their start and exclude their end. A capture without usable timestamps has a `null` timeline. The timeline covers the scanned prefix when the report is partial.
+
+Select a populated interval, then choose **Open interval in Wireshark** to open the original capture with a UTC display filter for that interval. The selector starts at the peak bucket. **Open in Wireshark** opens the full capture. [Wireshark display filters](https://www.wireshark.org/docs/man-pages/wireshark-filter.html)
+
+Expand **IP protocols** for packet and captured-byte counts by outer IP protocol. IPv4 uses its protocol field. IPv6 follows supported extension headers within the first 256 captured bytes and counts unresolved protocol chains separately. The panel also reports unclassified records and identified fragments. It counts observed SYN without ACK, SYN-ACK, RST, and FIN flags when the full TCP header is available, including its options. Later fragments contribute protocol counts when the protocol can be identified. The JSON `ip_protocols` object exposes the same data, with numeric protocol keys in `by_number`. The counts describe captured packets and may include retransmissions. [IANA protocol numbers](https://www.iana.org/assignments/protocol-numbers) · [IPv6 extension headers](https://www.rfc-editor.org/rfc/rfc8200.html#section-4) · [TCP header](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.1)
+
+Expand **IP conversations** to browse tracked outer IPv4 or IPv6 address pairs ranked by captured bytes, with totals and bytes in each direction. This works offline with Ethernet (including up to four 802.1Q or 802.1ad tags), Linux cooked v1 and v2, raw IP, and BSD or Npcap loopback captures. Each captured record contributes once, across all interfaces, with the link header included in its recorded byte count. The panel reports packets without classifiable IP headers and packets omitted after the first 4,096 distinct pairs. A tracked pair continues to accumulate traffic after that limit. JSON lists coverage and the top ten pairs under `ip_conversations`, with packet and byte counts in both `a_to_b` and `b_to_a`. [Link types](https://www.iana.org/assignments/pcap)
+
+Expand **TCP and UDP conversations** to browse tracked address-and-port pairs ranked by captured bytes. Each row combines both traffic directions for one protocol and endpoint pair. The scan tracks the first 4,096 distinct transport pairs independently of the IP conversation list. The coverage count includes classified TCP or UDP packets whose port header could not be used, such as later fragments or truncated transport headers. Packet and byte totals include only records with a usable port header. JSON lists coverage and the top ten pairs under `transport_conversations`. [TCP header](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.1) · [UDP header](https://www.rfc-editor.org/rfc/rfc768.html)
+
+Use **Previous** or **Next** to browse ten pairs at a time. **Filter IP conversations** and **Filter port pairs** search every tracked pair in their respective lists. Enter an exact IP address, address prefix, or CIDR. The transport filter also accepts TCP or UDP, ports, and exact address-and-port endpoints. Separate terms with spaces to require all of them. Select any matching row to open it in Wireshark or save its packets as a capture excerpt.
+
+Select a TCP or UDP row and choose **Open port pair in Wireshark** to open the original capture at that protocol and both address-and-port endpoints, in either direction. The filter selects the transport associated with the outer IP header. Wireshark uses its own dissection and reassembly preferences when displaying the packets. [Wireshark layer filters](https://www.wireshark.org/docs/man-pages/wireshark-filter.html#_the_layer_operator)
+
+Select a ranked pair and choose **Open conversation in Wireshark** to open the original capture with both directions of that outer IP pair. The filter uses the layer operator in Wireshark 4.0 or later. [Wireshark layer filters](https://www.wireshark.org/docs/man-pages/wireshark-filter.html#_the_layer_operator) · [Wireshark 4.0 release notes](https://www.wireshark.org/docs/relnotes/wireshark-4.0.0.html)
+
+Turn on **Limit to timeline interval** to apply the selected packet interval as well. The checkbox shows the start and end relative to the timeline start. The interval includes its start and excludes its end. Choose a different interval in **Packet timeline** to change those bounds. The selection remains in effect when the timeline is collapsed. The checkbox starts off for each opened capture.
+
+In **TCP and UDP conversations**, **Limit port pair to timeline interval** controls the same time limit for both conversation views in that capture.
+
+Choose **Compare captures…** to use the displayed capture as **Before** and choose a second PCAP or PCAPNG as **After**. The comparison shows each capture's packet totals, timestamp span, and coverage. It lists changes across all tracked IP pairs, with packet and byte counts in each direction. Deltas subtract **Before** from **After** and describe the two capture windows as recorded. Partial scans withhold deltas, and pairs whose counts could be hidden by a scan or tracking limit show unavailable coverage. Pair counts describe decoded outer IP headers. Non-IP or undecodable packets contribute to capture totals and the unclassified count. **Back to capture** returns to the original summary.
+
+**Average rates over each recorded timestamp span** shows packets and captured bytes per second for each file. Each rate divides the observed total by the time between that file's earliest and latest packet timestamps. A side needs a complete scan, timestamps on every packet, and a positive span. Conversation averages use the same full-file spans, so a pair with identical packet and byte counts can appear if its average rate changed. Transport averages also require usable TCP and UDP port coverage. JSON reports each scope's `average_rates` with `before`, `after`, and the difference when both rates are available. It lists pairs whose counts stayed the same under `rate_only_changes`.
+
+Expand **Elapsed packet timeline** to compare bursts on two charts with the same interval widths and packet-count scale. Each file's first timestamped record marks zero. Out-of-order records can appear at negative offsets. Choose a **Start interval**, then use **Range ends at** to include more consecutive intervals. The charts highlight the range and show the observed packet and byte totals for both files. The charts count timestamped records from the scanned portion. Intervals between a side's occupied buckets can show zero, and intervals outside its occupied span show unavailable coverage. The Before and After Wireshark buttons open the selected range on each file's original clock when that side has packets in it. Text and JSON exports include the aligned intervals. JSON `timeline` gives the two Unix timestamp origins, shared start offset and bucket width as decimal nanosecond strings. Each bucket contains both observations and uses `null` for a side outside its timestamped coverage.
+
+Expand **IP protocol changes** to see which decoded protocols account for changed packet or byte totals. TCP flag observations show counts and decoded-header coverage for each file. TCP flag deltas require complete scans, no unresolved IP protocol chains, and usable headers for every classified TCP packet on both sides. Text and JSON exports include these observations. JSON uses `protocol_changes` and `tcp_flag_comparison`.
+
+Set **Conversation type** to **TCP and UDP ports** to compare changed endpoint pairs across all tracked ports, including changes in traffic direction. Each row identifies its protocol and both endpoints. Deltas require complete scans, resolved IP protocol chains, and usable port headers for all observed TCP and UDP packets on both sides. If the tracking limit leaves a pair's counts unknown, that side and its delta show unavailable coverage. Counts for pairs tracked on both sides remain comparable when the limit is reached. JSON includes these rows under `transport_changes`.
+
+**Filter conversations** searches across all pages in the selected view. Enter an IP address, address prefix, or CIDR, such as `192.0.2.0/24` or `2001:db8::/32`. The transport view also accepts TCP or UDP, an exact port, or an address and port such as `[2001:db8::1]:443`. Separate terms with spaces to require all of them, such as `tcp 443 192.0.2.0/24`. The count shows how many conversations matched. **Clear conversation filter** restores the full list. Exports always include the full comparison.
+
+Choose **Export comparison…** to save a new Text or JSON report. The report includes both capture filenames, totals, scan coverage, and every changed IP and transport pair across all pages. Use `compare-packet-captures BEFORE AFTER [--format json|text] [--output-file PATH]` to produce the same report offline. JSON is the CLI default and represents unavailable counts and deltas as `null`. Each file is subject to the same scan limits as `inspect-packet-capture`.
+
+In the comparison, select a changed IP or transport pair, choose **Before capture** or **After capture**, and choose **Open conversation in Wireshark**. The source defaults to **After capture**. Wireshark opens the selected original file with both directions of the pair, including when the summary reports zero packets or unavailable coverage for that side. A transport row also filters by the protocol and both ports. Use **Choose Wireshark executable…** to select an installation from the comparison view.
+
+Turn on **Limit to elapsed interval** to apply the selected interval from **Elapsed packet timeline** to the conversation. The same elapsed bounds are translated to the chosen file's clock. The checkbox remains active when the timeline is collapsed. A capture without timestamped records cannot open with the interval applied. Clear the checkbox to open the whole conversation. The interval affects Wireshark only, and the comparison and its exports still cover both files in full.
+
+Choose **Compare selected interval** in **Elapsed packet timeline** to recompute the report for the highlighted range. Counts, protocol and conversation changes, and exports use only timestamped packets reached by the scan at or after the start and before the end. Rates divide by the full range's width. A side needs a complete scan, timestamps on every source packet, and a recorded span that covers the range for rates and signed changes. A scoped conversation opens in Wireshark at the report's range. **Compare whole captures** restores the full report. The equivalent CLI option is `compare-packet-captures BEFORE AFTER --elapsed-ns START:END`, using signed integer nanosecond offsets from each file's first timestamped record. JSON includes both offsets, both absolute ranges, and timestamp coverage in `window`.
+
+Choose **Save capture excerpt…** in a saved capture's timeline, or **Save Before excerpt…** or **Save After excerpt…** in an elapsed comparison. The new capture preserves selected packet bytes, order, and original timestamps in PCAP or PCAPNG. PCAPNG retains the interface definitions needed by those packets and omits capture-wide statistics, comments, decryption-secret blocks, and unrelated metadata. The writer scans the source within the usual record limits and publishes a new file only when the scan succeeds and packets match. For a scripted export, use `clip-packet-capture FILE --elapsed-ns START:END --output-file PATH`. The signed nanosecond bounds are relative to the first timestamped record, include the start, and exclude the end. [PCAPNG format](https://www.ietf.org/archive/id/draft-ietf-opsawg-pcapng-06.html)
+
+Select a conversation and choose **Save conversation excerpt…** or **Save port pair excerpt…** to save both directions of that pair. A comparison uses the selected Before or After source. The export honors an active time limit or the current elapsed comparison window. An IP pair uses the outer IP addresses. A TCP or UDP pair also requires the recorded transport header to contain both ports. Add `--ip-pair A,B`, `--tcp-pair A:PORT,B:PORT`, or `--udp-pair A:PORT,B:PORT` to `clip-packet-capture`. Use brackets around IPv6 addresses with ports. Omit `--elapsed-ns` to select the pair across the whole source, including matching records without usable timestamps.
+
+```powershell
+$summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
+$summary.packets
+& $ctl inspect-packet-capture '.\loopback.pcap' --output-file '.\capture-summary.json'
+```
+
+Choose **List capture interfaces** to see the devices that tcpdump reports for the selected SSH connection. Selecting a device fills the editable interface field. You can also type a name directly. From the CLI, `w11term-cli [--pid PID] list-packet-interfaces --pane ID` returns device names, details, and the connection generation. [tcpdump device listing](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)
+
+Use a connected Linux SSH pane and review the interface, literal tcpdump filter, limits, and scratch location. Pass the same capture options and the returned connection generation and review ID to record. The host needs tcpdump, Bash, GNU coreutils, flock, the SSH SFTP subsystem, and permission to capture on the selected interface. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)
+
+```powershell
+$packetOptions = @('--pane', $pane, '--interface', 'lo', '--filter', 'udp port 4096', '--seconds', '10', '--max-mib', '8', '--tmpfs')
+$plan = (& $ctl --pid 12345 preview-packet-capture @packetOptions | ConvertFrom-Json).result.plan
+$plan
+$job = [guid]::NewGuid().ToString('N')
+& $ctl --pid 12345 capture-packets @packetOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --job-id $job --output-file '.\loopback.pcap' --wireshark 'C:\Program Files\Wireshark\Wireshark.exe'
+```
+
+Run `stop-packet-capture --pane ID --connection-generation N --job-id HEX` from a separate prompt to finish the matching capture early. Use the pane, connection generation and job ID from the capture command. Choose a fresh job ID for each run. The stop reply confirms the request, and the original command returns the saved capture and its stop reason. Omit `--job-id` when a script only needs to wait for the automatic packet or time limit.
+
+Defaults are 15 seconds, a 192-byte snap length, a 16 MiB budget, and `/tmp` scratch storage. Use `--tmpfs` to verify a RAM-backed mount, which defaults to `/dev/shm`, or choose a path with `--scratch-directory`. The worker requires 1 MiB of free-space headroom and applies a shared Linux-account capture lease. The effective packet limit is the smaller of `--packet-limit` and the number of maximum-size packet records that fit in the budget. A time limit interrupts tcpdump so it can finish writing and report drops.
+
+Set **Rolling capture files** in the Windows panel or pass `--rotate-files 2..16` to both preview and capture to keep a rolling buffer. The total byte budget is divided into equal per-file limits, with room for a full packet record in every file. On the host, a Python 3.8+ worker reads tcpdump’s classic pcap stream and reuses the oldest slot when the next record would exceed the current file’s limit. The capture can continue until the duration or explicit packet limit is reached. The review shows the slot count and per-file budget.
+
+Windows verifies the hashes, headers, and packet records of the retained files, then saves them in capture order as one `.pcap`. **Stop and save** works with the rolling buffer. The result reports the total packets captured, packets saved and files overwritten. [tcpdump capture output](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in) · [libpcap savefile format](https://github.com/the-tcpdump-group/libpcap/blob/master/pcap-savefile.manfile.in)
+
+SFTP transfers the completed file over the existing SSH connection. w11term checks its size, SHA-256, and packet records before publishing a new local file and reports the packet count, stop reason, and available drop statistics. The private scratch files expire after the transfer lease or are cleaned up after verified receipt. `--wireshark` is optional and launches Wireshark on Windows after saving. If it cannot launch, the reply includes the saved path and the launch error. [Wireshark command-line options](https://www.wireshark.org/docs/wsug_html_chunked/ChCustCommandLine.html)
+
+### Capture Linux syscalls
+
+In the Windows app, open **More → Diagnostics → Syscall trace viewer → Capture over SSH…**. Select a connected SSH pane, enter a Linux executable and its arguments as a JSON array of strings, and choose a working directory, preset and limits. **Review syscall capture** verifies the endpoint and shows the resolved executable and exact strace arguments. **Trace and save…** asks for a new Windows file before starting. **Stop syscall capture** ends the launched command and saves the records collected so far. The viewer opens the verified trace automatically and shows the stop reason.
+
+Use a connected Linux SSH pane with SFTP and a version of strace that supports `--kill-on-exit`. Review the working directory, executable identity, exact arguments, and capture bounds first. `--arg` can be repeated and each value is passed literally. The command runs as the remote SSH account with stdin, stdout, and stderr disconnected from the terminal.
+
+```powershell
+$traceOptions = @('--pane','1','--program','/usr/bin/ls','--arg','-l','--arg','/tmp','--directory','/tmp','--filter','files','--seconds','15','--max-mib','4')
+$plan = (& $ctl --pid 12345 preview-syscall-capture @traceOptions | ConvertFrom-Json).result.plan
+$job = [guid]::NewGuid().ToString('N')
+& $ctl --pid 12345 capture-syscalls @traceOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --job-id $job --output-file '.\example.strace'
+```
+
+From a separate prompt, `stop-syscall-capture --pane 1 --connection-generation GENERATION --job-id JOB` requests an early stop on the matching job. Choose a fresh job ID for each run. Stop, the deadline, and the byte limit terminate the launched command and traced descendants. The result gives the stop reason and reports the command's exit status when it completes on its own. A file that reaches the byte limit can end partway through a record.
+
+The original PID-tagged trace includes per-call timing and decoded descriptor details. One byte budget covers the full stream across descendants. w11term checks the SFTP download's size and SHA-256 before acknowledging remote cleanup and saving a new local file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+
+Open **More → Diagnostics → Syscall trace viewer** to inspect a saved trace offline. Open one combined log or select the files from the same `strace -ff` run together. Names ending in `.PID` identify the process for those split logs. w11term merges files with epoch timestamps. It also merges short runs with ordered time-of-day timestamps that fit in a window under 12 hours. A merge across midnight requires at least one file to show the rollover in its record order. When timestamps are ambiguous or incomplete, the viewer keeps the files in their input order. Capture with `-ttt` to retain dates in longer runs. [strace timestamp formats](https://github.com/strace/strace/blob/master/doc/strace-log-merge.1.in)
+
+For a combined `strace -r` log, the viewer adds up the record deltas to show elapsed time from the first timed record. Resumed calls keep their entry time and contribute their resume delta to subsequent records. A missing delta on a trace event makes subsequent elapsed times unavailable. The viewer uses the absolute clock when both absolute and relative timestamps are present. Split files with relative timestamps alone keep their file order. [strace relative timestamps](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+
+The viewer groups adjacent calls with the same process, syscall, resource, and outcome. Each group shows its count and available call duration. Select a group to review its original records, including the two lines for an unfinished and resumed call. Search by PID, name, resource, or errno, choose a filter, and select **Apply filters**. A missing absolute path is marked when the same process later succeeds on that path with the same syscall. The original error stays visible. w11term reads up to 64 MiB or one million records per selection. Very long lines are clipped in the preview and remain available in the source file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+
+Choose **File descriptors** to follow open files, sockets and pipes. Search by path, `PID 123`, or `FD 4`. Reuse of the same descriptor number produces separate lifetimes. **Show related lifetimes** follows duplicates and inherited copies of the same open file description. Select a lifetime for the original calls that established, used, or closed it, including observed sharing of a descriptor table and close-on-exec. A lifetime first seen after open or still active when the available records end is labelled with the evidence available. Use the all-calls capture preset and retain timestamps when tracing several processes to capture more of these transitions. [Linux clone(2)](https://man7.org/linux/man-pages/man2/clone.2.html) · [Linux close(2)](https://man7.org/linux/man-pages/man2/close.2.html)
+
+Open the working capture and choose **Compare with failing trace…**. The comparison pairs processes by the executable and observed ancestry, then aligns syscall sequences by name and resource. It uses recorded descriptor lifetimes and process relationships to interpret numbers that differ between runs. Select a change to see both original records, the result or count delta, and available timing relative to each run's start. Turn on **Include timing-only changes** to include calls that differ by at least 1 ms and by at least a quarter of the slower duration. Some alignments are marked uncertain when evidence is incomplete or several sequences could match. Use the evidence arrows to see each record inside a repeated group.
+
+Choose **Use selected pair as time zero** to measure from the selected calls. Earlier calls show negative offsets and later calls show positive offsets in their respective runs. A pair needs a reliable match, equal group counts, and usable times on both sides. For example, two epoch-timestamped calls in a run can be compared when its first record has no timestamp. The reference stays fixed while you change the selection, filter, or page. Choose **Use run starts** to reset it.
+
+Enter terms such as `openat ENOENT /tmp/settings` and choose **Apply change filter** to narrow the comparison by syscall, resource, executable, change type, or errno. Searches ignore case. All terms must match the change or its paired evidence. If an errno matches a call inside a repeated group, the viewer opens that pair of original records. Clear the field and apply again to restore all changes allowed by the timing setting.
+
+Choose **Export comparison…**, then choose Text or JSON under **Save as type**. Both formats include all changes that pass the applied filter and timing setting across every results page, with counts, available duration deltas, and source file and line references. If you set a timing reference, both formats include it and the available offsets. Text includes the original lines for the currently selected evidence pair within the viewer's preview limits. JSON uses the CLI schema below and records the evidence pair you are viewing for the selected change.
+
+Use `compare-syscall-traces` to compare saved runs from a script without a GUI or SSH connection. Repeat `--working` or `--failing` to supply each side's `strace -ff` files. The command uses the viewer's normalization and matching, including errno filters and the default of hiding timing-only rows. Add `--include-timing` to include those rows. Use `--anchor WORKING_FILE:LINE,FAILING_FILE:LINE` to choose a reliably aligned pair, including an unchanged call. File positions and line numbers start at 1. File positions follow the order of the arguments for each side. An unfinished and resumed call uses its entry time.
+
+```powershell
+$report = & $ctl compare-syscall-traces --working '.\working.strace' --failing '.\failing.strace' --filter 'openat ENOENT' | ConvertFrom-Json
+$report.changes
+& $ctl compare-syscall-traces --working '.\working.strace' --failing '.\failing.strace' --anchor '1:12,1:15'
+& $ctl compare-syscall-traces --working '.\working.21' --working '.\working.22' --failing '.\failing.77' --failing '.\failing.78' --include-timing --output-file '.\syscall-comparison.json'
+```
+
+The schema-version-1 JSON includes the source file names, merge order, comparison limit status, and all matching changes. Each change contains counts, timing when available, alignment confidence, and the file and line references for the representative evidence pair or the pair matched by the filter. The `representative_working_result` and `representative_failing_result` fields describe the group. Read `working_evidence` and `failing_evidence` for the exact call that matched an errno filter and its `elapsed_ns` from the start of that run. A timing reference adds a top-level `timing_anchor` with the source of each call and a signed `offset_from_anchor_ns` to evidence with usable times. With `--output-file`, the command writes a new report file and returns its path at `result.path`. Errors return a nonzero exit code and a JSON reply on stderr.
+
+### Collect Linux performance triage
+
+In the Windows app, open **More → Diagnostics → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.
+
+Findings summarize observed CPU activity and runnable tasks, available memory and swapping, disk activity and queueing, network traffic and TCP errors, and kernel-log evidence. Peaks use the collected interval rows and exclude the first vmstat row and sar averages. Missing or denied samples appear under their resource. The same findings are saved in the JSON report and can be derived when opening an earlier capture. [Linux performance checklist](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf) · [iostat metrics](https://github.com/sysstat/sysstat/blob/master/man/iostat.in) · [sar metrics](https://github.com/sysstat/sysstat/blob/master/man/sar.in)
+
+Choose **Compare reports** to use the displayed report as **Before** and open a saved JSON report as **After**. The offline view shows changes in check status, sampling commands, and reported observations. Choose a change to see the two values and their source output lines or excerpts. Numeric deltas require matching sampling commands and complete output on both sides. Disk and interface deltas also require the same recorded endpoint and device name. **Back to report** restores the original sample selection.
+
+Choose **Export comparison…**, then choose Text or JSON under **Save as type**. Both formats include all changes, both source names and coverage summaries, and the stored stdout and stderr text for each changed check. Output keeps its source line numbers so you can trace an observation back to either report. The file records whether the SSH endpoints match and uses only the report filenames from disk. JSON uses the same schema as the CLI.
+
+Run `compare-linux-triage` with the before and after report paths to compare offline from a script. The default schema-version-1 JSON includes coverage, check and observation changes, signed numeric deltas with units when the inputs support them, and both source outputs for each changed check. Use `--format text` for the same report the viewer exports.
+
+```powershell
+$comparison = & $ctl compare-linux-triage '.\before.json' '.\after.json' | ConvertFrom-Json
+$comparison.changes
+& $ctl compare-linux-triage '.\before.json' '.\after.json' --format text --output-file '.\comparison.txt'
+```
+
+With `--output-file`, the command saves a new file and returns its path at `result.path`. Errors return a nonzero exit code and a JSON reply on stderr. The command requires no GUI or SSH connection.
+
+Review the verified SSH endpoint, fixed sample commands and limits, then pass the reviewed connection generation when collecting. Choose a new Windows file for the report.
+
+```powershell
+$plan = (& $ctl --pid 12345 preview-linux-triage --pane $pane | ConvertFrom-Json).result.plan
+$plan
+& $ctl --pid 12345 linux-triage --pane $pane --connection-generation $plan.connection_generation --output-file '.\linux-triage.json'
+$report = Get-Content -Raw '.\linux-triage.json' | ConvertFrom-Json
+$report.collection.samples | Select-Object id, status, exit_status
+```
+
+The collector uses a sibling SSH channel with a 60-second client deadline and a 50-second remote collection deadline. It runs the ten checklist probes in parallel with Bash and GNU coreutils, captures up to 16 KiB per command per stream, and uses a private temporary directory. The report keeps the verified endpoint, commands, timing, output, and individual outcomes such as missing utilities or denied kernel logs. It marks streams that reached their byte limit and keeps the original bytes in base64 when they contain invalid UTF-8. [Linux Performance Analysis in 60,000 Milliseconds](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf)
+
+### Review terminal text with OpenRouter
+
+Open **Settings → OpenRouter assistance** to save an API key protected by Windows and enter a model ID. **Refresh model catalog** fetches the public model list. **Save OpenRouter settings** remembers the model and routing preference. Zero Data Retention routing is required by default, and each request asks OpenRouter to exclude providers that collect data. [OpenRouter routing and data collection](https://openrouter.ai/docs/guides/routing/provider-selection) · [Zero Data Retention](https://openrouter.ai/docs/guides/features/zdr)
+
+Open **More → Draft a Bash command with OpenRouter** to describe a task, or select terminal text and choose **Explain selected text with OpenRouter**. To capture a pane without selecting text first, focus it and choose **Explain visible pane with OpenRouter** from **More** or the command palette. This snapshots the text rows then on screen, including a scrolled view, with no offscreen history or images. In a Linux performance report, **Review report with OpenRouter…** starts with local findings and excerpts from the selected sample.
+
+In a triage comparison, **Review comparison with OpenRouter…** drafts an editable preview of the changes, coverage limitations, and paired evidence for the selected row. The default preview leaves out report paths, host addresses, usernames, and host fingerprints from the report headers. It keeps the comparison open beside the review so you can check the output against both sources.
+
+In a syscall comparison, select a change and its evidence pair, then choose **Review comparison with OpenRouter…**. The draft shows the selected outcomes, relative timing and numbered source lines, plus a bounded list of changes within the applied filter. The preview includes normalized remote resource and executable names. Raw syscall lines and local filenames stay in the viewer. Use **Back to syscall viewer** to return to the same comparison.
+
+In a CPU profile comparison, select a stack and choose **Review comparison with OpenRouter…**. The comparison stays beside the draft. The preview includes the two sample totals, the selected stack, and up to ten other stacks ranked by change in sample share within the applied filter. It uses symbol names and sample counts while leaving the local source names in the comparison. The review interprets shifts in sample share as relative measurements.
+
+Edit the preview to remove any details you want to keep local. The preview accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
+
+The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.
+
+### Capture a Linux CPU profile
+
+In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. That list ranks processes by their peak reported interval CPU usage and fills in the PID from the live report. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in)
+
+Choose **Review CPU profile** to check the live process and verified SSH endpoint. Then choose **Record CPU profile** and a new local folded stacks file. Changes to the settings require a fresh review. Recording stays tied to the pane, connection, and process start time from review. The resulting file opens in the flame graph with the unresolved frame count and **Perf output**, when available.
+
+Choose **Stop and save profile** during a recording to finish early and save the collected samples. For an attached PID, the target keeps running. For a profiled command, the remote wrapper stops the workload it started. The viewer and Diagnostics Activity show the stop reason. A requested raw `.perf.data` file uses the same verification and save path as a timed capture.
+
+Select **Keep raw perf recording** during review to save a `.perf.data` file beside the `.folded` file, for either capture target. The PID capture CLI accepts `--perf-data PATH` for a separate destination. w11term streams the raw file over the same SSH channel, checks its byte count and SHA-256, and saves it without replacing an existing file. The raw recording is capped at 32 MiB and can add up to 60 seconds for transfer. A verified raw file is saved even when folded stacks are unavailable.
+
+Open the raw file on Linux with `perf report --stdio -i my-profile.perf.data`. Symbol resolution is best on the recorded host or with its matching binaries and debug symbols. Raw recordings can include process metadata and captured stack data. [perf report](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-report.txt) · [Linux perf data collection](https://docs.kernel.org/admin-guide/perf-security.html)
+
+To profile a fresh run, choose **Launch command** as the target. Enter a Linux executable, an optional absolute working directory, and arguments as a JSON array of strings such as `["--threads", "4", "input file"]`. Relative executable paths resolve from that directory. Bare names use the diagnostic PATH. The directory defaults to the SSH account's home. Review shows the resolved paths and literal arguments before launch.
+
+The executable runs non-interactively in an SSH exec channel. Samples include its child processes, and the time limit stops processes in the workload's process group. The viewer reports the command's exit status or that it reached its time limit. It can open sampled stacks from a timed-out run. Command input and output are disconnected from the terminal, and perf diagnostics appear in **Perf output**. [perf record](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt) · [GNU timeout](https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html)
+
+For CLI capture, choose a running PID on the remote Linux host. Preview the verified SSH endpoint, process name and start time, sampling options, and file and time limits. Use the same options and the returned connection generation and process start ticks when starting the capture.
+
+```powershell
+$sampling = @('--pane', $pane, '--target-pid', 4102, '--seconds', 10, '--frequency', 99, '--call-graph', 'fp')
+$plan = (& $ctl --pid 12345 preview-cpu-profile @sampling | ConvertFrom-Json).result.plan
+$plan
+& $ctl --pid 12345 capture-cpu-profile @sampling --connection-generation $plan.connection_generation --process-start-ticks $plan.process_start_ticks --output-file '.\cpu.folded'
+```
+
+The defaults are 10 seconds, 99 Hz, and frame pointers. Choose 1–30 seconds, 1–199 Hz, or `dwarf` for DWARF unwinding with an 8 KiB stack snapshot. The remote Linux host needs `perf`, Bash, GNU coreutils, and permission to sample the process. w11term samples user-space CPU activity on the selected process and checks that its start time matches before and after recording. It runs under the signed-in SSH account. [perf record](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt) · [Linux perf permissions](https://docs.kernel.org/admin-guide/perf-security.html)
+
+The capture uses a sibling SSH exec channel, with up to 32 MiB for the temporary recording and 4 MiB for the `perf script` output. The worker has a deadline and its private files are removed at completion. w11term folds the captured stacks into a new Windows file and reports the sample count, unresolved frames, and any diagnostics printed by perf, including lost-sample warnings when reported. [perf script](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-script.txt)
+
+#### View and share the flame graph
+
+Open **CPU flame graph** from **More** or the command palette, then choose **Open folded stacks**. The viewer reads local UTF-8 folded stacks from w11term and tools that use the same format. It works offline and accepts files up to 16 MiB.
+
+Width represents samples. Callers are below their callees. Hover for the sample count and share of the full capture, or click a frame to zoom. Use **Up** to return to its caller and **Reset zoom** for the full capture. **Shallower** and **Deeper** move through stacks taller than the panel. Search highlights symbols and counts each matching sample once, even when multiple frames in that stack match. Use **Previous** and **Next** to zoom to matches by sample count. **Export SVG** saves the current branch at every depth to a new file. [CPU flame graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
+
+Choose **Compare profiles** to use the open recording as **Before** and pick a second folded file as **After**. The offline comparison ranks exact call stacks by their change in share of total samples. Each sample contributes to its full recorded stack once. The detail shows both counts, their shares, and the change in percentage points. Use recordings of comparable workloads and sampling configurations to interpret the result. Filter by any symbol in the call chain, or choose **Back to flame graph** to resume the original zoom and search. [Normalizing CPU profiles](https://www.brendangregg.com/blog/2014-11-09/differential-flame-graphs.html)
+
+Select a change and choose **Inspect before flame graph** or **Inspect after flame graph** to open that recording at the selected call path. A graph shows inclusive samples for the frame and its callees. The comparison counts samples that ended at the exact stack. Browse or export the inspected graph, then choose **Back to comparison** to return to the same filtered list and selection.
+
+Choose **Differential flame graph** to view both complete profiles. **After widths** shows the current recording, and **Before widths** reveals paths removed in the current recording. Width represents inclusive samples in the selected recording. Red, blue, and gray show an increase, decrease, or no change in exact-stack sample share from Before to After. Hover or zoom to read the signed change in percentage points. Each width view keeps its own zoom and search, and **Export SVG** preserves the active widths and differential colors.
+
+Choose **Export comparison…** to save a new JSON file. Schema version 1 records both source file names and sample totals, the applied filter, and every matching change in the same order as the viewer across all pages. Each row includes its full stack as an array of original symbols, both sample counts and shares, and the signed change in percentage points.
+
+Scripts can use `compare-cpu-profiles` with the same Before/After order, file size limit, and case-insensitive literal filter. The command requires no running w11term instance or SSH connection. It writes the same JSON report to stdout by default. With `--output-file`, it saves the report to a new file and prints a CLI reply whose `result.path` is the absolute destination. Errors return a nonzero exit code and a JSON error reply on stderr.
+
+```powershell
+$report = & $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --filter 'worker' | ConvertFrom-Json
+$report.changes
+& $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --output-file '.\comparison.json'
+```
+
+Use `--format svg` to draw a full differential flame graph offline. The graph defaults to After widths. Pass `--widths before` to see removed call paths. Both modes use the same colors and sample-share deltas as the Windows viewer. SVG goes to stdout unless you provide `--output-file`. The `--filter` option applies to JSON reports.
+
+```powershell
+& $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --format svg --output-file '.\after.svg'
+& $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --format svg --widths before --output-file '.\before.svg'
+```
 
 ### Run SFTP operations
 

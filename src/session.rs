@@ -74,6 +74,10 @@ pub enum Command {
     Events(tokio::sync::oneshot::Sender<crate::events::Events>),
     Frames(tokio::sync::oneshot::Sender<FrameStore>),
     DescribePane(tokio::sync::oneshot::Sender<PaneDescription>),
+    TriageTarget {
+        generation: Option<std::num::NonZeroU64>,
+        reply: tokio::sync::oneshot::Sender<Result<ssh::TriageTarget, String>>,
+    },
     Inspect(bool),
     WatchRunningCommand(RunningCommandTarget, bool),
     ReadRunningOutput(
@@ -483,6 +487,17 @@ impl Session {
     }
     pub fn ssh_connection_changes(&self) -> tokio::sync::watch::Receiver<()> {
         self.ssh_connection.subscribe()
+    }
+
+    pub fn triage_target(&self) -> anyhow::Result<ssh::TriageTarget> {
+        anyhow::ensure!(
+            !self.player.read().unwrap().rustmush,
+            "Linux performance diagnostics require an SSH pane outside a game session"
+        );
+        let generation = self
+            .ssh_connection_generation()
+            .context("Select a connected Linux SSH pane")?;
+        ssh::TriageTarget::new(&self.ssh_connection, generation)
     }
 
     /// Bind the local listener to this pane's current authenticated SSH shell lifetime.
@@ -1207,6 +1222,7 @@ async fn run(
                         Some(Command::InterruptCommand { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; Ctrl+C was not sent.".into())); continue; }
                         Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
+                        Some(Command::TriageTarget { reply, .. }) => { let _ = reply.send(Err("An active SSH connection is required for Linux performance diagnostics".into())); continue; }
                         Some(Command::NotificationReply(_)) => continue,
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
                         Some(Command::Key {..} | Command::DetailedKey {..} | Command::Composed(_) | Command::Text(_) | Command::Paste(_) | Command::Mouse(_) | Command::MouseLeave { .. }) => continue,
@@ -1494,6 +1510,16 @@ async fn run(
                             connection: events.connection_snapshot(),
                             ssh_transport_id,
                         });
+                        Ok(())
+                    }
+                    Some(Command::TriageTarget { generation, reply }) => {
+                        let result = (|| -> anyhow::Result<_> {
+                            anyhow::ensure!(is_ssh && !player.read().unwrap().rustmush,
+                                "Linux triage requires an SSH pane outside a game session");
+                            let generation = generation.map_or(connection_generation, std::num::NonZeroU64::get);
+                            ssh::TriageTarget::new(&published_ssh, generation)
+                        })();
+                        let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                         Ok(())
                     }
                     Some(Command::Inspect(enabled))=>{

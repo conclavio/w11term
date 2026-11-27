@@ -82,8 +82,13 @@ try {
     $null = Wait-Until 'Escape closes the history search after saving' { !(Find-Element 'Search commands across panes') }
     Wait-Focus $after
     Run-Palette 'Command history'
-    $value = (Search-Control).GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-    $value.SetValue('check result')
+    $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
+    (Search-Control).GetCurrentPattern($valuePattern).SetValue('no-such-captured-command')
+    Wait-ForHistoryText 'the history model applies the nonmatching query' { Find-Element 'No matching commands' }
+    (Search-Control).GetCurrentPattern($valuePattern).SetValue('CHECK result')
+    Wait-ForHistoryText 'the history model restores the capture for the new query' {
+        Find-Element "Selected, check result${dot}exit 0" $button
+    }
     Click 'Compare with reference'
     $selectedHeading = "Selected${dot}History after${dot}Pane $after${dot}Capture $afterCommand${dot}exit 0${dot}check result"
     $removed = "Removed line 2${dot}old result"
@@ -104,9 +109,9 @@ try {
     }
 
     Click 'Back to command history'
-    $null = Wait-Until 'the same search and selection are restored' {
+    Wait-ForHistoryText 'the same search and selection are restored' {
         $field = Find-Element 'Search command history' $edit
-        $field -and $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq 'check result' -and
+        $field -and $field.GetCurrentPattern($valuePattern).Current.Value -ceq 'CHECK result' -and
             (Find-Element "Selected, check result${dot}exit 0" $button)
     }
     $null = Control @('close-pane','--pane',"$before")

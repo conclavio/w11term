@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -27,7 +27,100 @@ struct Peer {
     withheld_session_open: Option<server::ChannelOpenHandle>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
+    posix_entries: text_save::PosixEntries,
     reject: bool,
+}
+
+const PERF_DATA_FIXTURE: &[u8] = b"PERFILE2\0\xff\r\nraw perf fixture\0";
+const SYSCALL_FIXTURE: &[u8] =
+    b"720 1700000000.000001 openat(AT_FDCWD, \"missing\", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000002>\n";
+// Classic little-endian pcap, one captured packet with a four-byte payload.
+const PCAP_FIXTURE: &[u8] = b"\xd4\xc3\xb2\xa1\x02\0\x04\0\0\0\0\0\0\0\0\0\xc0\0\0\0\x01\0\0\0\
+    \x01\0\0\0\0\0\0\0\x04\0\0\0\x04\0\0\0\xab\xcd\xef\x01";
+
+fn packet_ring_segment(slot: u8) -> Vec<u8> {
+    let mut bytes = PCAP_FIXTURE.to_vec();
+    *bytes.last_mut().unwrap() = slot + 10;
+    bytes
+}
+
+fn packet_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn packet_capture_ready(
+    session: &mut server::Session,
+    channel: ChannelId,
+    reason: &str,
+    bad_digest: bool,
+    rolling: bool,
+) -> anyhow::Result<()> {
+    let line = if rolling {
+        let segments = [(1, 1), (2, 0)].map(|(sequence, slot)| {
+            let bytes = packet_ring_segment(slot);
+            json!({"sequence": sequence, "bytes": bytes.len(), "sha256": packet_digest(&bytes)})
+        });
+        let manifest = json!({"packets": 3, "segments": segments});
+        format!("w11term-packet-ring-v1\t{reason}\t{manifest}\n")
+    } else {
+        let sha256 = if bad_digest {
+            "0".repeat(64)
+        } else {
+            packet_digest(PCAP_FIXTURE)
+        };
+        format!(
+            "w11term-packet-ready-v1\t{reason}\t{}\t{sha256}\n",
+            PCAP_FIXTURE.len()
+        )
+    };
+    session.extended_data(
+        channel,
+        1,
+        if rolling {
+            b"3 packets captured\n3 packets received by filter\n0 packets dropped by kernel\n"
+                .to_vec()
+        } else {
+            b"1 packet captured\n2 packets received by filter\n0 packets dropped by kernel\n"
+                .to_vec()
+        },
+    )?;
+    session.data(channel, line.into_bytes())?;
+    Ok(())
+}
+
+fn hold_profile_for_stop(
+    root: &Path,
+    channel: ChannelId,
+    raw: bool,
+    response: &[u8],
+) -> std::io::Result<bool> {
+    if !root.join("profile-wait-for-stop").is_file() {
+        return Ok(false);
+    }
+    let mut payload = Vec::new();
+    if raw {
+        payload.extend_from_slice(perf_data_header().as_bytes());
+        payload.extend_from_slice(PERF_DATA_FIXTURE);
+    }
+    payload.extend_from_slice(response);
+    fs::write(root.join(format!("profile-stop-{channel}")), payload)?;
+    Ok(true)
+}
+
+fn perf_data_header() -> String {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(PERF_DATA_FIXTURE)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "w11term-perf-data-v1\t{}\t{digest}\n",
+        PERF_DATA_FIXTURE.len()
+    )
 }
 
 fn set_fixture_modified(path: &std::path::Path, seconds: u64) -> std::time::SystemTime {
@@ -240,6 +333,274 @@ impl server::Handler for Peer {
         command: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if let Some((_, args)) = std::str::from_utf8(command)
+            .ok()
+            .filter(|command| command.starts_with("/bin/bash -c '# w11term-packet-capture-v1"))
+            .and_then(|command| command.rsplit_once("' w11term-packet-capture "))
+        {
+            s.channel_success(c)?;
+            if args == "interfaces" {
+                s.data(c, b"1.eth0 [Up, Running, Connected]\n2.any (Pseudo-device) [Up, Running]\n3.lo [Up, Running, Loopback]\n".as_slice())?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else if args.starts_with("inspect ") {
+                s.data(
+                    c,
+                    b"w11term-packet-plan-v1\ttmpfs\t12:34\t/dev/shm\n".to_vec(),
+                )?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else {
+                let ring = args.rsplit_once(" w11term-ring-v1 ");
+                let job = ring
+                    .map_or(args, |(prefix, _)| prefix)
+                    .rsplit_once(' ')
+                    .unwrap()
+                    .1
+                    .trim_matches('\'');
+                anyhow::ensure!(
+                    job.len() == 32 && job.bytes().all(|byte| byte.is_ascii_hexdigit())
+                );
+                fs::write(self.root.join("pcap-started"), args)?;
+                let remote = self
+                    .root
+                    .join("dev")
+                    .join("shm")
+                    .join(format!("w11term-pcap-{job}"));
+                fs::create_dir_all(&remote)?;
+                if ring.is_some() {
+                    for slot in 0..2 {
+                        fs::write(
+                            remote.join(format!("segment-{slot}.pcap")),
+                            packet_ring_segment(slot),
+                        )?;
+                    }
+                } else {
+                    fs::write(remote.join("capture.pcap"), PCAP_FIXTURE)?;
+                }
+                fs::write(
+                    self.root.join(format!("pcap-ack-{c}")),
+                    remote.to_str().unwrap(),
+                )?;
+                if !self.root.join("pcap-wait-for-stop").is_file() {
+                    packet_capture_ready(
+                        s,
+                        c,
+                        "packets",
+                        self.root.join("pcap-bad-digest").is_file(),
+                        ring.is_some(),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        if let Some((_, args)) = std::str::from_utf8(command)
+            .ok()
+            .filter(|command| command.starts_with("/bin/bash -c '# w11term-syscall-capture-v1"))
+            .and_then(|command| command.rsplit_once("' w11term-syscall-capture "))
+        {
+            s.channel_success(c)?;
+            if args.starts_with("inspect ") {
+                s.data(
+                    c,
+                    b"w11term-syscall-plan-v1\t/home/test\t/bin/sh\tfixture-identity\n".to_vec(),
+                )?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else {
+                let job = args
+                    .split_ascii_whitespace()
+                    .nth(10)
+                    .unwrap()
+                    .trim_matches('\'');
+                anyhow::ensure!(
+                    job.len() == 32 && job.bytes().all(|byte| byte.is_ascii_hexdigit())
+                );
+                let remote = self.root.join("tmp").join(format!("w11term-strace-{job}"));
+                fs::create_dir_all(&remote)?;
+                fs::write(remote.join("trace.strace"), SYSCALL_FIXTURE)?;
+                fs::write(
+                    self.root.join(format!("syscall-ack-{c}")),
+                    remote.to_str().unwrap(),
+                )?;
+                fs::write(self.root.join("syscall-started"), args)?;
+            }
+            return Ok(());
+        }
+        if command.starts_with(b"/bin/sh -c '# w11term-linux-triage-v1")
+            && let Ok(report) = fs::read(self.root.join("triage-response"))
+        {
+            fs::write(self.root.join("triage-command"), command)?;
+            s.channel_success(c)?;
+            if self.root.join("triage-wait-for-stop").is_file() {
+                fs::write(self.root.join(format!("triage-stop-{c}")), report)?;
+                s.data(
+                    c,
+                    concat!(
+                        "w11term-triage-progress\tuptime\n",
+                        "w11term-triage-progress\tdmesg\n",
+                        "w11term-triage-progress\tvmstat\n",
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                )?;
+                return Ok(());
+            }
+            s.data(c, report)?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
+        if let Ok(command) = std::str::from_utf8(command)
+            && command.starts_with("/bin/sh -c '# w11term-cpu-profile-v1")
+            && command.contains("w11term-cpu-launch-v1")
+        {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let directory = "/tmp/work space";
+            let program = "/tmp/work space/cpu worker";
+            let mut reply = format!(
+                "w11term-cpu-launch-v1\t{}\t{}\n",
+                STANDARD.encode(directory),
+                STANDARD.encode(program),
+            );
+            let argv = r#"'one arg' 'it'\''s $literal' '' '--child'"#;
+            let inspect = format!(" 2 99 fp 32768 4096 '{directory}' './cpu worker' '' '' {argv}");
+            let launch = format!(
+                " 2 99 fp 32768 4096 '{directory}' './cpu worker' '{directory}' '{program}' {argv}"
+            );
+            fs::write(self.root.join("profile-launch-wire"), command)?;
+            s.channel_success(c)?;
+            if command.ends_with(&launch) {
+                fs::write(self.root.join("profile-launched"), [])?;
+                let raw = command.contains(" 74 launch-raw ");
+                let outcome = if self.root.join("profile-wait-for-stop").is_file() {
+                    "stopped\n"
+                } else {
+                    "timeout\n"
+                };
+                reply.push_str(outcome);
+                reply.push_str(concat!(
+                    "42 20.0: cpu-clock:u: ab main (/tmp/work space/cpu worker)\n",
+                    "43 20.1: cpu-clock:u: ac child (/tmp/work space/cpu worker)\n",
+                    "\nw11term-cpu-profile-end\n",
+                ));
+                if hold_profile_for_stop(&self.root, c, raw, reply.as_bytes())? {
+                    return Ok(());
+                }
+                if raw {
+                    s.data(c, perf_data_header().into_bytes())?;
+                    s.data(c, PERF_DATA_FIXTURE.to_vec())?;
+                }
+            } else if !command.ends_with(&inspect) {
+                let tail = command.chars().rev().take(200).collect::<Vec<_>>();
+                let tail: String = tail.into_iter().rev().collect();
+                s.extended_data(
+                    c,
+                    1,
+                    format!("Unexpected reviewed command suffix: {tail}").into_bytes(),
+                )?;
+                s.exit_status_request(c, 2)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
+            }
+            s.data(c, reply.into_bytes())?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
+        if let Some((_, args)) = std::str::from_utf8(command)
+            .ok()
+            .filter(|command| command.starts_with("/bin/sh -c '# w11term-cpu-profile-v1"))
+            .and_then(|command| command.rsplit_once("' "))
+        {
+            let args: Vec<_> = args.split_ascii_whitespace().collect();
+            s.channel_success(c)?;
+            match args.as_slice() {
+                ["4", "inspect", "42", "0", "2", "99", "fp", "32768", "4096"] => {
+                    s.data(c, b"w11term-cpu-profile-v1\t800\td29ya2Vy\n".to_vec())?;
+                    s.exit_status_request(c, 0)?;
+                }
+                [
+                    "14" | "74",
+                    "capture" | "capture-raw",
+                    "42",
+                    "800",
+                    "2",
+                    "99",
+                    "fp",
+                    "32768",
+                    "4096",
+                ] => {
+                    let response = fs::read(self.root.join("profile-response"))?;
+                    fs::write(self.root.join("profile-captured"), [])?;
+                    if hold_profile_for_stop(&self.root, c, args[1] == "capture-raw", &response)? {
+                        return Ok(());
+                    }
+                    if args[1] == "capture-raw" {
+                        s.data(c, perf_data_header().into_bytes())?;
+                        for chunk in PERF_DATA_FIXTURE.chunks(7) {
+                            s.data(c, chunk.to_vec())?;
+                        }
+                    }
+                    s.data(c, response)?;
+                    s.extended_data(c, 1, b"Processed 3 events and lost 1 chunks!\n".to_vec())?;
+                    s.exit_status_request(c, 0)?;
+                }
+                _ => {
+                    s.extended_data(c, 1, b"The target PID was reused.\n".to_vec())?;
+                    s.exit_status_request(c, 2)?;
+                }
+            }
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
+        if let Some(args) = std::str::from_utf8(command).ok().and_then(|command| {
+            command
+                .split_once("' w11term-tools-sha256 ")
+                .map(|(_, args)| args)
+        }) {
+            let Some(report) = utilities::tool_digest_report(&self.root, args)? else {
+                s.channel_failure(c)?;
+                return Ok(());
+            };
+            s.channel_success(c)?;
+            s.data(c, report.into_bytes())?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
+        if command.starts_with(b"/bin/sh -c 'exec 9<")
+            && self.root.join("utility-probe-response").is_file()
+        {
+            s.channel_success(c)?;
+            if self.root.join("hold-utility-lock").is_file() {
+                s.exit_status_request(c, 3)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else {
+                s.data(c, b"w11term-tools-locked-v1\n".as_slice())?;
+            }
+            return Ok(());
+        }
+        if command.starts_with(b"/bin/sh -c 'printf")
+            && let Ok(report) = fs::read(self.root.join("utility-probe-response"))
+        {
+            fs::write(self.root.join("utility-probe-command"), command)?;
+            s.channel_success(c)?;
+            s.data(c, report)?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
         let trace = self.root.join("workspace-exec.bin");
         if !trace.exists() {
             s.channel_failure(c)?;
@@ -290,6 +651,45 @@ impl server::Handler for Peer {
         s.channel_success(c)?;
         if let Some(wire) = &self.wire {
             let _ = wire.send(in_band_resize::Wire::Shell(c, s.handle()));
+        }
+        if self.root.join("dotfiles-shell-probe").is_file() {
+            let managed = self.root.join(".config/w11term/dotfiles");
+            let active = fs::read_to_string(managed.join("bash-current")).unwrap_or_default();
+            let value = active.lines().next().unwrap_or("absent");
+            let ready = if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                // Check the files at the instant of the SSH shell request.
+                let bundle = managed.join(format!("bash-{value}"));
+                bundle.join("prompt.sh").is_file()
+                    && bundle.join("environment.sh").is_file()
+                    && self.root.join(".bashrc").is_file()
+                    && self.root.join(".profile").is_file()
+            } else {
+                value == "disabled"
+            };
+            s.data(
+                c,
+                format!(
+                    "dotfiles-at-shell:{}\r\n",
+                    if ready { value } else { "absent" }
+                )
+                .into_bytes(),
+            )?;
+        }
+        if self.root.join("utility-shell-probe").is_file() {
+            let store = self.root.join(".local/share/w11term/tools/portable");
+            let selector = fs::read_to_string(store.join("current")).unwrap_or_default();
+            let target = selector.lines().nth(1).unwrap_or_default();
+            let id = target.rsplit('/').next().filter(|id| id.len() == 64);
+            let id = id
+                .filter(|id| {
+                    store.join("versions").join(id).join("rg").is_file()
+                        && self.root.join(".local/bin/rg").is_file()
+                })
+                .unwrap_or("absent");
+            let path = fs::read_to_string(self.root.join(".bashrc"))
+                .unwrap_or_default()
+                .contains("w11term tool PATH");
+            s.data(c, format!("tools-at-shell:{id}:{path}\r\n").into_bytes())?;
         }
         s.data(c, b"ready\r\n".as_slice())?;
         #[cfg(feature = "ui-smoke")]
@@ -363,6 +763,90 @@ impl server::Handler for Peer {
         data: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if data == b"stop\n" {
+            let profile = self.root.join(format!("profile-stop-{c}"));
+            if let Ok(report) = fs::read(&profile) {
+                fs::remove_file(profile)?;
+                s.data(c, report)?;
+                s.extended_data(c, 1, b"Processed 3 events and lost 1 chunks!\n".to_vec())?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
+            }
+            let triage = self.root.join(format!("triage-stop-{c}"));
+            if let Ok(report) = fs::read(&triage) {
+                fs::remove_file(triage)?;
+                s.data(c, report)?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
+            }
+        }
+        let capture_marker = self.root.join(format!("pcap-ack-{c}"));
+        if data == b"stop\n"
+            && self.root.join("pcap-wait-for-stop").is_file()
+            && let Ok(remote) = fs::read_to_string(&capture_marker)
+        {
+            fs::write(self.root.join("pcap-stopped"), [])?;
+            packet_capture_ready(
+                s,
+                c,
+                "stopped",
+                false,
+                Path::new(&remote).join("segment-0.pcap").is_file(),
+            )?;
+            return Ok(());
+        }
+        if data == b"verified\n"
+            && let Ok(remote) = fs::read_to_string(&capture_marker)
+        {
+            let remote = PathBuf::from(remote);
+            if remote.join("segment-0.pcap").is_file() {
+                fs::remove_file(remote.join("segment-0.pcap"))?;
+                fs::remove_file(remote.join("segment-1.pcap"))?;
+            } else {
+                fs::remove_file(remote.join("capture.pcap"))?;
+            }
+            fs::remove_dir(remote)?;
+            fs::remove_file(capture_marker)?;
+            fs::write(self.root.join("pcap-verified"), [])?;
+            s.data(c, b"w11term-packet-complete-v1\n".to_vec())?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
+        let syscall_marker = self.root.join(format!("syscall-ack-{c}"));
+        if let Ok(remote) = fs::read_to_string(&syscall_marker) {
+            if data == b"stop\n" {
+                use sha2::{Digest, Sha256};
+                let hash: String = Sha256::digest(SYSCALL_FIXTURE)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                s.data(
+                    c,
+                    format!(
+                        "w11term-syscall-ready-v1\tstopped\t-\t{}\t{hash}\n",
+                        SYSCALL_FIXTURE.len()
+                    )
+                    .into_bytes(),
+                )?;
+            } else if data == b"verified\n" {
+                let remote = PathBuf::from(remote);
+                fs::remove_file(remote.join("trace.strace"))?;
+                fs::remove_dir(remote)?;
+                fs::remove_file(syscall_marker)?;
+                fs::write(self.root.join("syscall-verified"), [])?;
+                s.data(c, b"w11term-syscall-complete-v1\n".to_vec())?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            }
+            return Ok(());
+        }
         if self.channels.contains_key(&c) {
             if let Some(wire) = &self.wire {
                 let _ = wire.send(in_band_resize::Wire::Input(c, data.to_vec()));
@@ -456,6 +940,7 @@ impl server::Handler for Peer {
             ssh: s.handle(),
             handles: HashMap::new(),
             posix: None,
+            posix_entries: self.posix_entries.clone(),
             next: 0,
         };
         tokio::spawn(async move {
@@ -473,6 +958,7 @@ struct Files {
     ssh: server::Handle,
     handles: HashMap<String, Opened>,
     posix: Option<text_save::PosixMetadata>,
+    posix_entries: text_save::PosixEntries,
     next: u64,
 }
 fn status(id: u32) -> Status {
@@ -596,7 +1082,7 @@ impl russh_sftp::server::Handler for Files {
             version
                 .extensions
                 .insert("posix-rename@openssh.com".into(), value);
-            self.posix = Some(Default::default());
+            self.posix = Some(text_save::PosixMetadata::new(self.posix_entries.clone()));
         }
         if self.root.join("small-reads").exists() {
             version
@@ -607,7 +1093,8 @@ impl russh_sftp::server::Handler for Files {
             version.extensions.insert("copy-data".into(), "1".into());
         }
         if let Ok(request) = fs::read_to_string(self.root.join("fixture-permissions")) {
-            self.posix.get_or_insert_with(Default::default);
+            self.posix
+                .get_or_insert_with(|| text_save::PosixMetadata::new(self.posix_entries.clone()));
             if request == "lsetstat" {
                 version
                     .extensions
@@ -825,6 +1312,11 @@ impl russh_sftp::server::Handler for Files {
             return Err(StatusCode::ConnectionLost);
         }
         let mut attrs = entry_attrs(&self.path(&path))?;
+        if self.root.join("utility-probe-response").is_file()
+            && self.utility_fixture_link(&path).is_some()
+        {
+            attrs.permissions = Some(0o120777);
+        }
         if let Some(posix) = &self.posix {
             posix.stat(&path, &mut attrs);
         }
@@ -849,7 +1341,35 @@ impl russh_sftp::server::Handler for Files {
         Ok(Attrs { id, attrs })
     }
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        if self.root.join("utility-probe-response").is_file()
+            && let Some(target) = self.utility_fixture_link(&path)
+        {
+            return Ok(Name {
+                id,
+                files: vec![russh_sftp::protocol::File::dummy(target)],
+            });
+        }
         self.properties_readlink(id, &path)
+    }
+    async fn symlink(
+        &mut self,
+        id: u32,
+        target: String,
+        link: String,
+    ) -> Result<Status, StatusCode> {
+        if !self.root.join("utility-probe-response").is_file() {
+            return Err(StatusCode::OpUnsupported);
+        }
+        let path = self.path(&link);
+        if self.root.join("race-tool-launcher").is_file() && link.ends_with("/bin/rg") {
+            fs::File::create_new(&path)
+                .and_then(|mut file| file.write_all(b"my racing command"))
+                .map_err(io)?;
+        }
+        fs::File::create_new(path)
+            .and_then(|mut file| writeln!(file, "fixture-tool-symlink\n{target}"))
+            .map_err(io)?;
+        Ok(status(id))
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
         if self.root.join("no-fstat").exists() {
@@ -874,6 +1394,13 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        if self.root.join("utility-probe-response").is_file()
+            && let Some(mode) = attrs.permissions
+            && let Some(posix) = &mut self.posix
+        {
+            posix.set_permissions(path, mode);
+            return Ok(status(id));
+        }
         if attrs.permissions.is_some() && self.root.join("fixture-permissions").is_file() {
             self.set_permissions("SETSTAT", path, &attrs)?;
             return Ok(status(id));
@@ -1043,6 +1570,9 @@ impl russh_sftp::server::Handler for Files {
             )
         }
         .map_err(|_| StatusCode::Failure)?;
+        if let Some(posix) = &mut self.posix {
+            posix.renamed(&from, &to);
+        }
         self.hold_response("hold-rename-reply").await;
         if self.root.join("disconnect-after-rename").exists() {
             let _ = self
@@ -1127,6 +1657,7 @@ async fn fixture_with_wire(
     let opens_for_server = opens.clone();
     let server = tokio::spawn(async move {
         let mut peers = tokio::task::JoinSet::new();
+        let posix_entries = text_save::PosixEntries::default();
         for _ in 0..connections {
             let (stream, _) = listener.accept().await.unwrap();
             accepted.fetch_add(1, Ordering::Relaxed);
@@ -1138,6 +1669,7 @@ async fn fixture_with_wire(
                 withheld_session_open: None,
                 root: root_path.clone(),
                 opens: opens_for_server.clone(),
+                posix_entries: posix_entries.clone(),
                 reject,
             };
             let config = config.clone();
@@ -1170,6 +1702,8 @@ async fn fixture_with_wire(
         proxy_jump: Vec::new(),
         local_forwards: Vec::new(),
         durable: false,
+        dotfiles: None,
+        tool_bundle: None,
         group_prompt: None,
         player: Default::default(),
     });
@@ -1504,6 +2038,8 @@ async fn guarded_job(
 mod cancellation;
 #[path = "sftp/checksum.rs"]
 mod checksum;
+#[path = "sftp/dotfiles.rs"]
+mod dotfiles;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
 #[path = "sftp/filesystem_space.rs"]
@@ -1541,6 +2077,8 @@ mod text_preview;
 mod text_save;
 #[path = "sftp/upload_folder.rs"]
 mod upload_folder;
+#[path = "sftp/utilities.rs"]
+mod utilities;
 #[path = "sftp/xterm_other_keys.rs"]
 mod xterm_other_keys;
 
@@ -1735,6 +2273,514 @@ fn registry(session: &Session) -> Registry {
         input: session.input.clone(),
     }]);
     r
+}
+
+const TRIAGE_RESPONSE: &str = concat!(
+    "w11term-linux-triage-v1\t1000\t2000\t124\n",
+    "uptime\t1000\t1010\t0\tdXB0aW1lCg==\t\n",
+    "dmesg\t1000\t1010\t1\t\tT3BlcmF0aW9uIG5vdCBwZXJtaXR0ZWQ=\n",
+    "vmstat\t1000\t2000\t0\tciBiIHNpIHNvIHVzIHN5IGlkIHdhIHN0CjIzIDEgMCAwIDk1IDQgMSAwIDAKMyAwIDAgOCA0MCAxMiA0NiAxIDEK\t\n",
+    "mpstat\t1000\t1010\t127\t\t\n",
+    "pidstat\t1000\t2000\t0\t\t\n",
+    "iostat\t1000\t2000\t0\t\t\n",
+    "free\t1000\t1010\t0\t\t\n",
+    "sar-dev\t1000\t2000\t0\t\t\n",
+    "sar-tcp\t1000\t-\t-\t\t\n",
+    "top\t1000\t1010\t0\t\t\n",
+    "end\n"
+);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_cleanup() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let registry = registry(&pane);
+    let callback: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screenshot"));
+    let options = control::PacketCaptureOptions {
+        interface: "lo".into(),
+        filter: "udp and port 4096".into(),
+        snap_length: 192,
+        seconds: 5,
+        max_mib: 1,
+        packet_limit: Some(1),
+        rotate_files: None,
+        scratch_directory: "/dev/shm".into(),
+        require_tmpfs: true,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewPacketCapture {
+                pane: 1,
+                options: options.clone(),
+            },
+            callback.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    assert_eq!(plan["scratch_filesystem"], "tmpfs");
+    assert_eq!(
+        plan["tcpdump_arguments"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "udp and port 4096"
+    );
+    let generation = plan["connection_generation"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let request = |name: &str, options, job_id| Request::CapturePackets {
+        pane: 1,
+        options,
+        connection_generation: generation,
+        review_id: plan["review_id"].as_str().unwrap().into(),
+        job_id,
+        output_file: local.path().join(name),
+    };
+    let scratch = remote.path().join("dev/shm");
+    let mut changed = options.clone();
+    changed.seconds += 1;
+    let error = registry
+        .execute(request("stale.pcap", changed, None), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Review again"));
+    assert!(!scratch.exists());
+
+    fs::write(remote.path().join("pcap-bad-digest"), []).unwrap();
+    let error = registry
+        .execute(
+            request("corrupt.pcap", options.clone(), None),
+            callback.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("SHA-256 digest"));
+    assert!(!remote.path().join("pcap-verified").exists());
+    assert!(!local.path().join("corrupt.pcap").exists());
+    fs::remove_file(remote.path().join("pcap-bad-digest")).unwrap();
+
+    let result = registry
+        .execute(
+            request("reviewed capture.pcap", options.clone(), None),
+            callback.clone(),
+        )
+        .await
+        .unwrap();
+    let capture = &result["capture"];
+    assert_eq!(capture["bytes"], PCAP_FIXTURE.len());
+    assert_eq!(capture["packets"], 1);
+    assert_eq!(capture["received_by_filter"], 2);
+    assert_eq!(capture["dropped_by_kernel"], 0);
+    assert_eq!(capture["stop_reason"], "packet-limit");
+    assert!(remote.path().join("pcap-verified").exists());
+    assert_eq!(
+        fs::read(local.path().join("reviewed capture.pcap")).unwrap(),
+        PCAP_FIXTURE
+    );
+    let job = "0123456789abcdef0123456789abcdef";
+    let started = remote.path().join("pcap-started");
+    fs::remove_file(&started).unwrap();
+    fs::remove_file(remote.path().join("pcap-verified")).unwrap();
+    fs::write(remote.path().join("pcap-wait-for-stop"), []).unwrap();
+    let stop = |job_id: &str| Request::StopPacketCapture {
+        pane: 1,
+        connection_generation: generation,
+        job_id: job_id.into(),
+    };
+    let capture = registry.execute(
+        request("stopped.pcap", options, Some(job.into())),
+        callback.clone(),
+    );
+    let requested = async {
+        while !started.is_file() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let error = registry
+            .execute(stop("00000000000000000000000000000000"), callback.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No matching running packet capture")
+        );
+        assert!(!remote.path().join("pcap-stopped").exists());
+        registry.execute(stop(job), callback.clone()).await.unwrap()
+    };
+    let (capture, requested) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(capture, requested)
+    })
+    .await
+    .unwrap();
+    assert_eq!(requested["stop_requested"], true);
+    let stopped = capture.unwrap();
+    assert_eq!(stopped["job_id"], job);
+    assert_eq!(stopped["capture"]["stop_reason"], "stopped");
+    assert_eq!(stopped["capture"]["packets"], 1);
+    assert_eq!(
+        fs::read(local.path().join("stopped.pcap")).unwrap(),
+        PCAP_FIXTURE
+    );
+    assert!(remote.path().join("pcap-verified").exists());
+    assert!(registry.execute(stop(job), callback.clone()).await.is_err());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let registry = registry(&pane);
+    let callback: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screenshot"));
+    let options = control::SyscallOptions {
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), "printf '%s' '$literal'".into()],
+        directory: "/home/test".into(),
+        seconds: 30,
+        max_mib: 1,
+        string_size: 128,
+        filter: control::SyscallFilter::Files,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewSyscallCapture {
+                pane: 1,
+                options: options.clone(),
+            },
+            callback.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    assert_eq!(
+        plan["strace_arguments"].as_array().unwrap().last().unwrap(),
+        "printf '%s' '$literal'"
+    );
+    let generation = plan["connection_generation"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let job = "1234567890abcdef1234567890abcdef";
+    let output_file = local.path().join("raw.strace");
+    let request = |options| Request::CaptureSyscalls {
+        pane: 1,
+        options,
+        connection_generation: generation,
+        review_id: plan["review_id"].as_str().unwrap().into(),
+        job_id: job.into(),
+        output_file: output_file.clone(),
+    };
+    let mut changed = options.clone();
+    changed.arguments.push("changed".into());
+    let error = registry
+        .execute(request(changed), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Review again"));
+    let started = remote.path().join("syscall-started");
+    assert!(!started.exists());
+    let stop = |job_id: &str| Request::StopSyscallCapture {
+        pane: 1,
+        connection_generation: generation,
+        job_id: job_id.into(),
+    };
+    let capture = registry.execute(request(options), callback.clone());
+    let stop = async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let error = registry
+            .execute(stop("00000000000000000000000000000000"), callback.clone())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("No matching running syscall capture"));
+        registry.execute(stop(job), callback.clone()).await.unwrap()
+    };
+    let (capture, stopped) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(capture, stop)
+    })
+    .await
+    .unwrap();
+    assert_eq!(stopped["stop_requested"], true);
+    let capture = capture.unwrap();
+    assert_eq!(capture["capture"]["stop_reason"], "stopped");
+    assert_eq!(fs::read(output_file).unwrap(), SYSCALL_FIXTURE);
+    assert!(remote.path().join("syscall-verified").exists());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let profile = remote.path().join("profile-response");
+    let capture: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screen capture"));
+    let registry = registry(&pane);
+    let options = control::CpuProfileOptions {
+        target_pid: 42.try_into().unwrap(),
+        seconds: 2,
+        frequency: 99,
+        call_graph: control::CpuCallGraph::Fp,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewCpuProfile { pane: 1, options },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    let request = |name, perf_data_file| Request::CaptureCpuProfile {
+        pane: 1,
+        options,
+        connection_generation: plan["connection_generation"]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        process_start_ticks: plan["process_start_ticks"].as_u64().unwrap(),
+        output_file: local.path().join(name),
+        perf_data_file: Some(perf_data_file),
+    };
+    let before = opens.load(Ordering::SeqCst);
+    let same = registry
+        .execute(
+            request("run.folded", local.path().join("RUN.FOLDED")),
+            capture.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{same:#}").contains("different destinations"));
+    assert_eq!(opens.load(Ordering::SeqCst), before);
+
+    let preserved = local.path().join("preserved.perf.data");
+    fs::write(
+        &profile,
+        "w11term-cpu-profile-v1\t800\td29ya2Vy\n\nw11term-cpu-profile-end\n",
+    )
+    .unwrap();
+    let error = registry
+        .execute(request("empty.folded", preserved.clone()), capture.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Raw perf recording saved"));
+    assert!(!local.path().join("empty.folded").exists());
+    assert_eq!(fs::read(preserved).unwrap(), PERF_DATA_FIXTURE);
+
+    let raw = local.path().join("run.perf.data");
+    fs::write(&profile, "w11term-cpu-profile-v1\t800\td29ya2Vy\n 42 22.01: cpu-clock:u: ab hot_loop (worker)\n\nw11term-cpu-profile-end\n").unwrap();
+    let captured = registry
+        .execute(request("run.folded", raw.clone()), capture.clone())
+        .await
+        .unwrap();
+    assert_eq!(captured["summary"]["perf_data"]["path"], json!(raw));
+    assert_eq!(
+        captured["summary"]["perf_data"]["bytes"],
+        PERF_DATA_FIXTURE.len()
+    );
+    assert_eq!(fs::read(&raw).unwrap(), PERF_DATA_FIXTURE);
+    assert_eq!(
+        fs::read_to_string(local.path().join("run.folded")).unwrap(),
+        "worker;hot_loop 1\n"
+    );
+    let before = opens.load(Ordering::SeqCst);
+    assert!(
+        registry
+            .execute(request("new.folded", raw.clone()), capture)
+            .await
+            .is_err()
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), before);
+    assert_eq!(fs::read(raw).unwrap(), PERF_DATA_FIXTURE);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cpu_profile_reuses_the_verified_ssh_transport_and_saves_only_complete_stacks() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let destination = local.path().join("profile.folded");
+    let profile_response = remote.path().join("profile-response");
+    let capture: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screen capture"));
+    let registry = registry(&pane);
+    let options = control::CpuProfileOptions {
+        target_pid: 42.try_into().unwrap(),
+        seconds: 2,
+        frequency: 99,
+        call_graph: control::CpuCallGraph::Fp,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewCpuProfile { pane: 1, options },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    assert_eq!(plan["host"], "127.0.0.1");
+    assert_eq!(plan["process_name"], "worker");
+    assert_eq!(plan["event"], "cpu-clock:u");
+    let generation = plan["connection_generation"].as_u64().unwrap();
+    let ticks = plan["process_start_ticks"].as_u64().unwrap();
+    let request = |generation: u64, process_start_ticks| Request::CaptureCpuProfile {
+        pane: 1,
+        options,
+        connection_generation: generation.try_into().unwrap(),
+        process_start_ticks,
+        output_file: destination.clone(),
+        perf_data_file: None,
+    };
+    let prior = opens.load(Ordering::SeqCst);
+    assert!(
+        registry
+            .execute(request(generation + 1, ticks), capture.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), prior);
+    let error = registry
+        .execute(request(generation, ticks + 1), capture.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("target PID was reused"));
+    let partial = concat!(
+        "w11term-cpu-profile-v1\t800\td29ya2Vy\n",
+        " 42 22.01: cpu-clock:u:\n",
+        "\t   deadbeef hot_loop (/tmp/worker)\n",
+        "\t   12ab34cd main (/tmp/worker)\n\n",
+    );
+    fs::write(&profile_response, partial).unwrap();
+    assert!(
+        registry
+            .execute(request(generation, ticks), capture.clone())
+            .await
+            .is_err()
+    );
+    assert!(!destination.exists());
+    fs::write(
+        &profile_response,
+        format!("{partial}\nw11term-cpu-profile-end\n"),
+    )
+    .unwrap();
+    let result = registry
+        .execute(request(generation, ticks), capture.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["profile_path"], json!(destination));
+    assert_eq!(result["summary"]["samples"], 1);
+    assert_eq!(
+        result["summary"]["diagnostics"][0],
+        "Processed 3 events and lost 1 chunks!"
+    );
+    let saved = fs::read_to_string(&destination).unwrap();
+    assert_eq!(saved, "worker;main;hot_loop 1\n");
+    let prior = opens.load(Ordering::SeqCst);
+    assert!(
+        registry
+            .execute(request(generation, ticks), capture)
+            .await
+            .is_err()
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), prior);
+    assert_eq!(fs::read_to_string(&destination).unwrap(), saved);
+    drop(pane);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linux_triage_saves_a_generation_bound_report_without_touching_the_shell() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("triage.json");
+    let capture: control::CapturePng = Arc::new(|_, _, _| unreachable!("triage uses no capture"));
+    let registry = registry(&pane);
+    let preview = registry
+        .execute(
+            Request::LinuxTriage {
+                pane: 1,
+                connection_generation: None,
+                output_file: None,
+            },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["plan"]["probes"].as_array().unwrap().len(), 10);
+    assert_eq!(preview["plan"]["host"], "127.0.0.1");
+    let generation = preview["plan"]["connection_generation"].as_u64().unwrap();
+    assert!(!remote.path().join("triage-command").exists());
+    let request = |generation| Request::LinuxTriage {
+        pane: 1,
+        connection_generation: std::num::NonZeroU64::new(generation),
+        output_file: Some(destination.clone()),
+    };
+    assert!(
+        registry
+            .execute(request(generation + 1), capture.clone())
+            .await
+            .is_err()
+    );
+    assert!(!destination.exists());
+    fs::write(remote.path().join("triage-response"), TRIAGE_RESPONSE).unwrap();
+    let result = registry
+        .execute(request(generation), capture.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["report_path"], json!(destination));
+    let bytes = fs::read(&destination).unwrap();
+    let reopened = w11term::ssh::TriageReport::load(&destination).unwrap();
+    let cpu = reopened
+        .findings
+        .iter()
+        .find(|finding| finding.label == "Peak CPU busy")
+        .unwrap();
+    assert_eq!(cpu.value, "52% user + system");
+    assert_eq!(cpu.stdout_line, Some(3));
+    assert_eq!(
+        reopened.collection.samples[1].stderr.text,
+        "Operation not permitted"
+    );
+    let bad = output.path().join("incomplete.json");
+    let mut incomplete: Value = serde_json::from_slice(&bytes).unwrap();
+    incomplete["collection"]["samples"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    fs::write(&bad, serde_json::to_vec(&incomplete).unwrap()).unwrap();
+    assert!(w11term::ssh::TriageReport::load(&bad).is_err());
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["label"] == "Peak CPU busy" && finding["stdout_line"] == 3 })
+    );
+    let samples = &report["collection"]["samples"];
+    assert_eq!(report["target"], preview["plan"]);
+    assert_eq!(samples[0]["stdout"]["text"], "uptime\n");
+    assert_eq!(samples[1]["status"], "permission-denied");
+    assert_eq!(samples[3]["status"], "missing");
+    assert_eq!(samples[8]["status"], "timed-out");
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one shell and one exec channel"
+    );
+    assert!(
+        registry
+            .execute(request(generation), capture)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

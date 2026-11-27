@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "name": "linux-essentials",
+  "tools": [
+    {
+      "name": "rg",
+      "builds": [
+        {
+          "architecture": "x86_64",
+          "sha256": "e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849",
+          "download": {
+            "format": "tar-gz",
+            "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
+            "member": "ripgrep-15.2.0-x86_64-unknown-linux-musl/rg",
+            "archive_sha256": "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c"
+          }
+        },
+        {
+          "architecture": "aarch64",
+          "sha256": "c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a",
+          "download": {
+            "format": "tar-gz",
+            "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz",
+            "member": "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg",
+            "archive_sha256": "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915"
+          }
+        }
+      ]
+    },
+    {
+      "name": "jq",
+      "builds": [
+        {
+          "architecture": "x86_64",
+          "sha256": "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
+          "download": {
+            "format": "raw",
+            "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64"
+          }
+        },
+        {
+          "architecture": "aarch64",
+          "sha256": "8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309",
+          "download": {
+            "format": "raw",
+            "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dust",
+      "builds": [
+        {
+          "architecture": "x86_64",
+          "sha256": "a7fec1b3e1de5cfa82867da98d8ba250d40306b17edaa0b4197caf6b057f9055",
+          "download": {
+            "format": "tar-gz",
+            "url": "https://github.com/bootandy/dust/releases/download/v1.2.8/dust-v1.2.8-x86_64-unknown-linux-musl.tar.gz",
+            "member": "dust-v1.2.8-x86_64-unknown-linux-musl/dust",
+            "archive_sha256": "4480bb9a3936f23cd9a1d5681618821f7f431ae47af0794be99f2baa5a88a60f"
+          }
+        },
+        {
+          "architecture": "aarch64",
+          "sha256": "2b9dd919abee15b6c7c92cc76bcf046fcbb8213e7b912228a5e8c2fa7cb25c49",
+          "download": {
+            "format": "tar-gz",
+            "url": "https://github.com/bootandy/dust/releases/download/v1.2.8/dust-v1.2.8-aarch64-unknown-linux-musl.tar.gz",
+            "member": "dust-v1.2.8-aarch64-unknown-linux-musl/dust",
+            "archive_sha256": "02140655d64a490e1b1486ae4b55ff797c2e69666e1993cc3c42a2885e169d3c"
+          }
+        }
+      ]
+    },
+    {
+      "name": "hyperfine",
+      "builds": [
+        {
+          "architecture": "x86_64",
+          "sha256": "eaec69afd9cf7edb2ff1f84af0e8f2d47903f2f956301cd42a80b66a3f629296",
+          "download": {
+            "format": "tar-gz",
+            "url": "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-x86_64-unknown-linux-musl.tar.gz",
+            "member": "hyperfine-v2.0.0-x86_64-unknown-linux-musl/hyperfine",
+            "archive_sha256": "38e59087bd65520930a13cf513d8a493b7043741e8ad62349a8a9929eb61bc5c"
+          }
+        },
+        {
+          "architecture": "aarch64",
+          "sha256": "1817d2374db766607bf18992a031638c92b31d53d3cc2328a9a3451b8d12391a",
+          "download": {
+            "format": "tar-gz",
+            "url": "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-aarch64-unknown-linux-musl.tar.gz",
+            "member": "hyperfine-v2.0.0-aarch64-unknown-linux-musl/hyperfine",
+            "archive_sha256": "f0591c2cb8f66f2d2624d23979cf96dc99a67cb935f9925c82b9a4e3ffe5b2e1"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -294,6 +294,8 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
         proxy_jump: Vec::new(),
         local_forwards: Vec::new(),
         durable: false,
+        dotfiles: None,
+        tool_bundle: None,
         group_prompt: None,
         player: Default::default(),
     }

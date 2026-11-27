@@ -1005,6 +1005,10 @@ impl ProfileStore {
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
             let keep_forwards =
                 expected.is_some_and(|previous| previous.local_forwards == options.local_forwards);
+            let keep_dotfiles =
+                expected.is_some_and(|previous| previous.dotfiles == options.dotfiles);
+            let keep_tools =
+                expected.is_some_and(|previous| previous.tool_bundle == options.tool_bundle);
             if options.terminal_type.is_default() {
                 object.remove("terminal_type");
             }
@@ -1038,11 +1042,19 @@ impl ProfileStore {
             if options.group_prompt.is_none() {
                 object.remove("group_prompt");
             }
+            if options.dotfiles.is_none() {
+                object.remove("dotfiles");
+            }
+            if options.tool_bundle.is_none() {
+                object.remove("tool_bundle");
+            }
             for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
                 if (key == "identity" && keep_identity)
                     || (key == "certificate" && keep_certificate)
                     || (key == "proxy_jump" && keep_route)
                     || (key == "local_forwards" && keep_forwards)
+                    || (key == "dotfiles" && keep_dotfiles)
+                    || (key == "tool_bundle" && keep_tools)
                 {
                     continue;
                 }
@@ -1408,6 +1420,8 @@ mod tests {
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             durable: false,
+            dotfiles: None,
+            tool_bundle: None,
             group_prompt: None,
             player: Default::default(),
         };

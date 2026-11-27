@@ -17,6 +17,7 @@ mod inbox;
 mod kitty_notification;
 mod running_output;
 mod ssh_attempt;
+mod tool_bundle;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
@@ -35,6 +36,7 @@ pub(crate) use ssh_attempt::{AttemptGuard, RetryWait, SshConnectionSnapshot};
 pub use ssh_attempt::{
     PendingSshAttempt, PendingSshRetry, SshAttemptCompletion, SshAttemptOutcome,
 };
+pub use tool_bundle::{ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus};
 
 const CAPACITY: usize = 4096;
 const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);
@@ -230,6 +232,7 @@ struct State {
     notify_long_commands: bool,
     ssh_connection_phase: Option<SshConnectionPhase>,
     connected_generation: Option<u64>,
+    tool_bundle_sync: Option<Arc<ToolBundleSyncReport>>,
     pane_process: PaneProcessState,
     ssh_attempts: ssh_attempt::Attempts,
     restart_token: Option<u64>,
@@ -1241,6 +1244,30 @@ impl Events {
         self.append(self.state.lock().unwrap(), kind, data, None);
     }
 
+    pub(crate) fn record_tool_bundle_sync(&self, report: ToolBundleSyncReport) {
+        const KIND: &str = "tool-bundle-sync";
+        let data = (report.status != ToolBundleSyncStatus::NotRun)
+            .then(|| Self::bounded_data(KIND, serde_json::json!(&report)));
+        let mut state = self.state.lock().unwrap();
+        state.tool_bundle_sync = Some(Arc::new(report));
+        if let Some(data) = data {
+            Self::append_locked(&mut state, KIND, data, EventLinks::default());
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// The login outcome is retained independently of the event journal.
+    pub fn tool_bundle_sync(&self, generation: u64) -> Option<Arc<ToolBundleSyncReport>> {
+        self.state
+            .lock()
+            .unwrap()
+            .tool_bundle_sync
+            .as_ref()
+            .filter(|report| report.generation == generation)
+            .cloned()
+    }
+
     pub fn sftp_transfer_finished(
         &self,
         transfer_id: TransferId,
@@ -1469,6 +1496,56 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_sync_report_survives_journal_eviction_and_matches_only_its_connection() {
+        let events = Events::default();
+        events.record_tool_bundle_sync(ToolBundleSyncReport {
+            generation: 1,
+            bundle: "portable".into(),
+            status: ToolBundleSyncStatus::Updated,
+            path: Some(ToolPathSyncStatus::Skipped),
+            detail: Some("Managed PATH conflict".into()),
+        });
+        let event = events.since(0).events.pop().unwrap();
+        assert_eq!(event.kind, "tool-bundle-sync");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "generation": 1, "status": "updated", "path": "skipped", "detail": "Managed PATH conflict",
+            })
+        );
+        for _ in 0..CAPACITY {
+            events.push("title", Value::Null);
+        }
+        assert!(
+            events
+                .since(0)
+                .events
+                .iter()
+                .all(|event| event.kind != "tool-bundle-sync")
+        );
+        assert_eq!(
+            events.tool_bundle_sync(1).unwrap().detail.as_deref(),
+            Some("Managed PATH conflict")
+        );
+        assert!(events.tool_bundle_sync(2).is_none());
+
+        let cursor = events.cursor();
+        events.record_tool_bundle_sync(ToolBundleSyncReport {
+            generation: 2,
+            bundle: "portable".into(),
+            status: ToolBundleSyncStatus::NotRun,
+            path: None,
+            detail: Some("Alternate startup".into()),
+        });
+        assert!(events.tool_bundle_sync(1).is_none());
+        assert_eq!(
+            events.tool_bundle_sync(2).unwrap().status,
+            ToolBundleSyncStatus::NotRun
+        );
+        assert!(events.since(cursor).events.is_empty());
+    }
 
     #[test]
     fn recent_sftp_results_keep_the_latest_transfers_independently_of_other_events() {

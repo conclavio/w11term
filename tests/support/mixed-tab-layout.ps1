@@ -10,10 +10,36 @@ $keymap = @{ shortcuts = @{
 [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($keymap | ConvertTo-Json))
 $button = [System.Windows.Automation.ControlType]::Button
 
+function Choose-DiagnosticFileAction([string]$Filename, [string]$Action) {
+    $triggerName = "File actions for $Filename"
+    Invoke-Button (Get-ScrollableMenuAction $triggerName $Action)
+}
+
 function Sessions { (Control @('list')).sessions }
 function Type-Text([string]$Text) { foreach ($char in $Text.ToCharArray()) { Post-Key 0x102 ([uint32]$char) } }
 function Type-Line([string]$Text) { Type-Text $Text; Press-Key 13 }
 function Wait-Text([int]$Pane, [string]$Text) { $null = Control @('wait-for-text','--pane',"$Pane",'--timeout','15',$Text) }
+function Wait-DiagnosticArtifact([string]$Title, [string]$ExpectedFile, [string]$StopReason = '') {
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $observed = @{ Summary = '(missing)' }
+    try {
+        $null = Wait-Until "diagnostics activity shows '$Title' for the selected file" {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text)) {
+                $summary = $item.Current.Name
+                $lines = $summary -split '\r\n|\n|\r'
+                if ($lines[0] -cne $Title) { continue }
+                $observed.Summary = $summary
+                if ($lines.Count -ge 2 -and (!$StopReason -or $lines -ccontains $StopReason) -and
+                    [FixtureDialog]::SameFile($ExpectedFile, $lines[-1])) { return $true }
+            }
+        }
+    } catch {
+        throw "$_ Expected file [$ExpectedFile]. Last activity [$($observed.Summary)]."
+    }
+}
 function Send-Remote([int]$Pane, [string]$Text) {
     $bytes = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
     $null = Control @('send-text','--pane',"$Pane",'--no-paste','--base64',$bytes)

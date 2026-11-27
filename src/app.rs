@@ -6,6 +6,7 @@ use anyhow::Context as _;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
+    path::Path,
     rc::Rc,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -69,8 +70,10 @@ mod local_profile;
 mod pane_drop;
 mod pane_text_size;
 mod pattern_settings;
+mod profile_dotfiles;
 mod profile_forwards;
 mod profile_jumps;
+mod profile_tools;
 mod saved_commands;
 mod shell_setup;
 mod word_delimiters;
@@ -79,10 +82,13 @@ use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
 mod command_palette;
+mod command_reference;
+mod diagnostics;
 mod directory_split;
 mod disconnect_ssh;
 mod durable_view;
 mod explorer;
+mod flame_graph;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
 mod inspector;
@@ -90,6 +96,8 @@ mod keyboard_copy;
 mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod openrouter_assistance;
+mod packet_capture;
 mod pane_broadcast;
 mod pane_colors;
 mod pane_picker;
@@ -103,6 +111,7 @@ mod session_browser;
 mod sftp_transfers;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
+mod syscall_view;
 mod tab_colors;
 mod tab_header_menu;
 mod tab_title;
@@ -112,6 +121,7 @@ mod text_diff;
 mod text_export;
 mod text_size;
 mod title_tools;
+mod triage;
 mod visual_bell;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
@@ -415,6 +425,8 @@ enum Page {
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
+    SyscallTrace(Box<syscall_view::PageState>),
+    OpenRouter(Box<openrouter_assistance::PageState>),
     Workspaces(workspace_view::WorkspacePage),
     Settings(Option<SettingsEditor>),
     NewProfile(ProfileDraft),
@@ -525,6 +537,8 @@ struct ProfileDraft {
     proxy_jump: Vec<w11term::options::JumpHost>,
     jump_editor: profile_jumps::Editor,
     local_forwards: Vec<w11term::options::LocalForwardPreset>,
+    dotfiles: Box<profile_dotfiles::Editor>,
+    tool_bundle: Box<profile_tools::Editor>,
     forward_editor: profile_forwards::Editor,
     durable: bool,
     saved: bool,
@@ -567,6 +581,8 @@ impl Default for ProfileDraft {
             proxy_jump: Vec::new(),
             jump_editor: Default::default(),
             local_forwards: Vec::new(),
+            dotfiles: Default::default(),
+            tool_bundle: Default::default(),
             forward_editor: Default::default(),
             durable: false,
             saved: false,
@@ -639,6 +655,8 @@ impl ProfileDraft {
             player,
             proxy_jump: self.proxy_jump.clone(),
             local_forwards: self.local_forwards.clone(),
+            dotfiles: self.dotfiles.approval(),
+            tool_bundle: self.tool_bundle.approval(),
             group_prompt: (!self.group_prompt.trim().is_empty())
                 .then(|| self.group_prompt.clone().try_into())
                 .transpose()?,
@@ -666,6 +684,8 @@ impl ProfileDraft {
         Self {
             proxy_jump: options.proxy_jump.clone(),
             local_forwards: options.local_forwards.clone(),
+            dotfiles: Box::new(profile_dotfiles::Editor::new(options.dotfiles.clone())),
+            tool_bundle: Box::new(profile_tools::Editor::new(options.tool_bundle.clone())),
             name,
             durable: options.durable,
             host: options.host.clone(),
@@ -1029,6 +1049,21 @@ fn tab_menu_message(label: String) -> Message {
         .map_or(label.as_str(), |(name, _)| name);
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
+        command_reference::LABEL => Message::CommandReference(command_reference::Action::Open),
+        diagnostics::LABEL => Message::Diagnostics(diagnostics::Action::Open),
+        triage::LABEL => Message::Triage(triage::Action::Open),
+        flame_graph::LABEL => Message::FlameGraph(flame_graph::Action::Open),
+        packet_capture::LABEL => Message::PacketCapture(packet_capture::Action::Open),
+        syscall_view::LABEL => Message::SyscallView(syscall_view::Action::Show),
+        openrouter_assistance::DRAFT => Message::OpenRouter(openrouter_assistance::Action::Show(
+            w11term::openrouter::Task::Draft,
+        )),
+        openrouter_assistance::EXPLAIN => Message::OpenRouter(openrouter_assistance::Action::Show(
+            w11term::openrouter::Task::Explain,
+        )),
+        command_reference::SELECTION => {
+            Message::CommandReference(command_reference::Action::Selection(None))
+        }
         pane_text_size::INCREASE => Message::PaneTextSize(pane_text_size::Change::Increase),
         pane_text_size::DECREASE => Message::PaneTextSize(pane_text_size::Change::Decrease),
         pane_text_size::RESET => Message::PaneTextSize(pane_text_size::Change::Reset),
@@ -1332,6 +1367,13 @@ pub struct TerminalApp {
     fonts: Vec<String>,
     appearance_error: Option<String>,
     saved_commands: w11term::saved_commands::Commands,
+    command_reference: command_reference::Panel,
+    diagnostics_open: bool,
+    diagnostics_recent: diagnostics::Recent,
+    diagnostic_control: diagnostics::ControlOpen,
+    triage: triage::Panel,
+    flame_graph: flame_graph::Panel,
+    packet_capture: packet_capture::Panel,
     dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     rotation_hover: Option<pane_view::RotationHover>,
@@ -1505,6 +1547,8 @@ pub enum Message {
     ProfileMenu(String),
     QuickConnect(quick_connect::Action),
     SshIdentity(identity_picker::Action),
+    ProfileDotfiles(TabId, profile_dotfiles::Action),
+    ProfileTools(TabId, profile_tools::Action),
     MoveProfile(String, isize, Arc<[String]>),
     SetProfilePin(String, bool),
     FilterProfiles(String),
@@ -1514,6 +1558,13 @@ pub enum Message {
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
     SavedCommands(saved_commands::Edit),
+    CommandReference(command_reference::Action),
+    Diagnostics(diagnostics::Action),
+    Triage(triage::Action),
+    FlameGraph(flame_graph::Action),
+    PacketCapture(packet_capture::Action),
+    SyscallView(syscall_view::Action),
+    OpenRouter(openrouter_assistance::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -2614,6 +2665,9 @@ impl TerminalApp {
         let appearance = self.appearance.read().unwrap().clone();
         let mut children:Vec<View>=vec![
             TextBlock::new().text("Settings").font_size(26.0).into(),
+            Button::new().on_click(context.callback(|_| Message::OpenRouter(openrouter_assistance::Action::Show(
+                    w11term::openrouter::Task::Draft,
+                )))).content(openrouter_assistance::LABEL),
             TextBlock::new().text("Terminal font").font_size(18.0).into(),
             ComboBox::new().width(360.0).automation_name("Terminal font")
                 .items_source(self.fonts.iter().cloned())
@@ -4232,6 +4286,14 @@ impl TerminalApp {
         let offered_close_other = close_other_tabs.clone();
         let offered_close_right = close_tabs_right.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
+            command_reference::SELECTION => {
+                Message::CommandReference(command_reference::Action::Selection(paste))
+            }
+            openrouter_assistance::EXPLAIN_VIEWPORT => {
+                paste.map_or(Message::ControlIdle, |origin| {
+                    Message::OpenRouter(openrouter_assistance::Action::ExplainViewport(origin))
+                })
+            }
             label if pane_broadcast::is_label(label) => offered_broadcast
                 .clone()
                 .filter(|action| action.label() == label)
@@ -4684,6 +4746,24 @@ impl TerminalApp {
                 "find-command-history",
                 command_palette::FIND_COMMAND_HISTORY_LABEL,
                 KeyAction::FindCommandHistory,
+            ),
+            MenuItem::item("command-reference", command_reference::LABEL),
+            diagnostics::menu(),
+            MenuItem::item("openrouter-draft", openrouter_assistance::DRAFT),
+            command_menu_item(
+                "openrouter-explain",
+                openrouter_assistance::EXPLAIN,
+                self.active_selection(),
+            ),
+            command_menu_item(
+                "openrouter-explain-viewport",
+                openrouter_assistance::EXPLAIN_VIEWPORT,
+                self.openrouter_viewport().is_some(),
+            ),
+            command_menu_item(
+                "command-reference-selection",
+                command_reference::SELECTION,
+                self.active_selection(),
             ),
             MenuItem::item(
                 "find-running-commands",
@@ -5342,6 +5422,18 @@ impl TerminalApp {
                     ),
             )),
         );
+        fields.push(draft.dotfiles.view(
+            id,
+            draft,
+            self.store.path().parent().unwrap_or(Path::new(".")),
+            context,
+        ));
+        fields.push(draft.tool_bundle.view(
+            id,
+            draft,
+            self.store.path().parent().unwrap_or(Path::new(".")),
+            context,
+        ));
         fields.push(draft.jump_editor.view(
             id,
             &draft.proxy_jump,
@@ -5737,7 +5829,7 @@ impl Component for TerminalApp {
                 osc52,
             )
         } else {
-            if !child_window {
+            if !child_window && options.diagnostic.is_none() {
                 tabs.insert(
                     live_tab_sized(
                         label.clone(),
@@ -5881,6 +5973,13 @@ impl Component for TerminalApp {
             fonts,
             appearance_error,
             saved_commands: Default::default(),
+            command_reference: Default::default(),
+            diagnostics_open: false,
+            diagnostics_recent: diagnostics::Recent::default(),
+            diagnostic_control: diagnostics::ControlOpen::default(),
+            triage: Default::default(),
+            flame_graph: Default::default(),
+            packet_capture: Default::default(),
             dividers: Rc::default(),
             measured_layout: None,
             rotation_hover: None,
@@ -6325,10 +6424,22 @@ impl Component for TerminalApp {
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::PickerFromMenu(shortcut) => self.open_picker_from_menu(shortcut, context),
             Message::SetTitleFiles(pane, open) => {
-                if matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
-                    if live.session.pane_id == pane && live.files.open != open)
+                if let Some(Page::Terminal(live)) = self.tabs.active().map(|tab| &tab.page)
+                    && live.session.pane_id == pane
                 {
-                    self.file_action(FileAction::Toggle, context);
+                    if open {
+                        self.flame_graph.open = false;
+                    }
+                    if (live.files.open
+                        && !self.command_reference.open
+                        && !self.diagnostics_open
+                        && !self.triage.open
+                        && !self.packet_capture.open
+                        && !self.flame_graph.open)
+                        != open
+                    {
+                        self.file_action(FileAction::Toggle, context);
+                    }
                 }
             }
             Message::PickerFocusAfterMenu(launch) => self.focus_picker_after_menu(&launch),
@@ -6849,6 +6960,9 @@ impl Component for TerminalApp {
                     };
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
+            }
+            Message::Control(w11term::control::UiRequest::OpenDiagnostic { launch, reply }) => {
+                self.control_open_diagnostic(launch, reply, context);
             }
             Message::Control(w11term::control::UiRequest::TabAppearance {
                 tab_id,
@@ -7676,6 +7790,8 @@ impl Component for TerminalApp {
             }
             Message::QuickConnect(action) => self.edit_quick_connect(action, context),
             Message::SshIdentity(action) => self.ssh_identity_action(action, context),
+            Message::ProfileDotfiles(id, action) => self.edit_profile_dotfiles(id, action, context),
+            Message::ProfileTools(id, action) => self.edit_profile_tools(id, action, context),
             Message::EditProfile(name) => self.edit_profile(name, context),
             Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
             Message::DeleteProfile(id) => {
@@ -7708,6 +7824,13 @@ impl Component for TerminalApp {
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
+            Message::CommandReference(action) => self.command_reference_action(action, context),
+            Message::Diagnostics(action) => self.diagnostics_action(action, context),
+            Message::Triage(action) => self.triage_action(action, context),
+            Message::FlameGraph(action) => self.flame_graph_action(action, context),
+            Message::PacketCapture(action) => self.packet_capture_action(action, context),
+            Message::SyscallView(action) => self.syscall_view_action(action, context),
+            Message::OpenRouter(action) => self.openrouter_action(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();
@@ -8391,7 +8514,7 @@ impl Component for TerminalApp {
             .interaction
             .application_tab_titles;
         let title = self.tabs.active_id().map_or_else(
-            || std::borrow::Cow::Borrowed("Terminal"),
+            || std::borrow::Cow::Borrowed(self.diagnostics_title().unwrap_or("Terminal")),
             |id| self.tab_label(id, application_titles),
         );
         if self.keyboard.hwnd().is_some() {
@@ -8457,7 +8580,16 @@ impl Component for TerminalApp {
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),
+                Page::SyscallTrace(page) => {
+                    let targets = if page.capture_open() {
+                        self.syscall_capture_targets()
+                    } else {
+                        Vec::new()
+                    };
+                    page.view(id, targets, context)
+                }
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
+                Page::OpenRouter(page) => page.view(id, context),
                 Page::QuickConnect(draft) => {
                     quick_connect::view(id, draft, self.identity_picker.is_none(), context)
                 }
@@ -8467,7 +8599,19 @@ impl Component for TerminalApp {
         } else {
             Border::new().into()
         };
-        let content = self.with_file_drawer(content, context);
+        let content = if self.packet_capture.open {
+            self.with_packet_capture(content, context)
+        } else if self.flame_graph.open {
+            self.with_flame_graph(content, context)
+        } else if self.triage.open {
+            self.with_triage(content, context)
+        } else if self.diagnostics_open {
+            self.with_diagnostics(content, context)
+        } else if self.command_reference.open {
+            self.with_command_reference(content, context)
+        } else {
+            self.with_file_drawer(content, context)
+        };
         let mut views = vec![
             KeyedView::new(
                 "header",
@@ -9688,6 +9832,8 @@ mod profile_ui_tests {
                 authentication,
                 host_key: Some("SHA256:test".into()),
                 host_key_alias: Some("cockpit.example".into()),
+                dotfiles: None,
+                tool_bundle: None,
                 group_prompt: Some("rack-[12]>>".to_owned().try_into().unwrap()),
                 proxy_jump: Vec::new(),
                 local_forwards: Vec::new(),

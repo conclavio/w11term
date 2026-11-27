@@ -233,32 +233,34 @@ function Invoke-SftpEntryAction([string]$Name) {
 function Invoke-NativeMenuAction([string]$Trigger, [string]$Name) {
     Invoke-Button (Get-NativeMenuAction $Trigger $Name)
 }
+function Find-NativeVerticalScroll($Element) {
+    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    $parent = $walker.GetParent($Element)
+    while ($parent -and $parent.Current.ProcessId -eq $app.Id) {
+        $pattern = $null
+        if ($parent.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$pattern) -and
+            $pattern.Current.VerticallyScrollable) {
+            return $pattern
+        }
+        $parent = $walker.GetParent($parent)
+    }
+}
+function Move-NativeControlIntoView($Element, [hashtable]$Search) {
+    if (!$Element -or !$Element.Current.IsEnabled -or !$Element.Current.IsOffscreen) { return }
+    if (!$Search.scroll) {
+        $Search.scroll = Find-NativeVerticalScroll $Element
+        if (!$Search.scroll) { throw "'$($Element.Current.Name)' is offscreen without a scrollable ancestor" }
+        $Search.scroll.SetScrollPercent(-1, 0)
+    } elseif ($Search.scroll.Current.VerticalScrollPercent -lt 100) {
+        $Search.scroll.Scroll([System.Windows.Automation.ScrollAmount]::NoAmount,
+            [System.Windows.Automation.ScrollAmount]::SmallIncrement)
+    }
+}
 function Get-ScrollableMenuAction([string]$TriggerName, [string]$Name, [switch]$VisibleItem) {
     $button = [System.Windows.Automation.ControlType]::Button
-    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
     $search = @{ scroll = $null }
     Get-NativeMenuAction $TriggerName $Name -VisibleItem:$VisibleItem -Reveal {
-        $trigger = Find-Element $TriggerName $button
-        if (!$trigger -or !$trigger.Current.IsEnabled -or !$trigger.Current.IsOffscreen) { return }
-        if ($search.scroll) {
-            if ($search.scroll.Current.VerticalScrollPercent -lt 100) {
-                $search.scroll.Scroll([System.Windows.Automation.ScrollAmount]::NoAmount,
-                    [System.Windows.Automation.ScrollAmount]::SmallIncrement)
-            }
-            return
-        }
-        $parent = $walker.GetParent($trigger)
-        while ($parent -and $parent.Current.ProcessId -eq $app.Id) {
-            $pattern = $null
-            if ($parent.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$pattern) -and
-                $pattern.Current.VerticallyScrollable) {
-                $search.scroll = $pattern
-                $pattern.SetScrollPercent(-1, 0)
-                return
-            }
-            $parent = $walker.GetParent($parent)
-        }
-        throw "'$TriggerName' is offscreen without a scrollable ancestor"
+        Move-NativeControlIntoView (Find-Element $TriggerName $button) $search
     }
 }
 function Get-RunAction([string]$Name) {
@@ -309,7 +311,7 @@ function Set-NativeExpansion([string]$Name, [bool]$Expanded) {
         if ($Expanded) { $options.Expand() } else { $options.Collapse() }
     }
 }
-function Get-TransferDetailLabels {
+function Get-NativeTextLabels {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $kind = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
@@ -319,7 +321,7 @@ function Get-TransferDetailLabels {
 }
 function Test-TransferDestination([string]$Path) {
     $prefix = 'Windows ' + [char]0xb7 + ' '
-    foreach ($name in Get-TransferDetailLabels) {
+    foreach ($name in Get-NativeTextLabels) {
         if ($name.StartsWith($prefix, [StringComparison]::Ordinal) -and
             [FixtureDialog]::SameDestination($Path, $name.Substring($prefix.Length))) {
             return $true

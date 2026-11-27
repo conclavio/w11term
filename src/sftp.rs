@@ -27,6 +27,19 @@ use tokio::{
 
 mod atomic_upload;
 mod directory;
+mod dotfiles;
+mod utilities;
+pub(crate) use dotfiles::sync_login_dotfiles;
+pub use dotfiles::{
+    DotfileBundle, DotfileShell, DotfileTarget, validate_dotfiles_home, validate_zdotdir,
+};
+pub(crate) use utilities::sync_login_tools;
+pub use utilities::{
+    InstalledTool, InstalledTools, LocalUtilityBundle, LocalUtilityExecutable, RetainedToolVersion,
+    ToolBundlePreset, ToolBundleVersions, UtilityArchitecture, UtilityBuild, UtilityBundle,
+    UtilityDownload, UtilityTool, builtin_tool_names, export_builtin_tool_bundle,
+    fetch_tool_bundle, prepare_builtin_tool_bundle,
+};
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
 mod group_upload;
@@ -87,12 +100,62 @@ pub fn normalize_sha256(value: &str) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 
-fn digest_hex(digest: Sha256) -> String {
+pub(crate) fn digest_hex(digest: Sha256) -> String {
     digest
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+pub(crate) async fn stage_diagnostic_download(
+    session: &russh::client::Handle<crate::ssh::Handler>,
+    remote: &str,
+    parent: &Path,
+    length: u64,
+    sha256: &str,
+) -> Result<tempfile::NamedTempFile> {
+    let parent = parent.to_owned();
+    let (staged, file) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let staged = tempfile::NamedTempFile::new_in(parent)?;
+        let file = staged.reopen()?;
+        Ok((staged, file))
+    })
+    .await??;
+    let mut file = tokio::fs::File::from_std(file);
+    let engine = Engine::connect(session).await?;
+    let handle = engine
+        .raw
+        .open(remote, OpenFlags::READ, FileAttributes::empty())
+        .await?
+        .handle;
+    let mut hash = Sha256::new();
+    let copied = engine
+        .read_contents(
+            &handle,
+            &mut file,
+            0,
+            Some((length, "reviewed capture size")),
+            None,
+            |_, bytes| {
+                hash.update(bytes);
+                Ok(())
+            },
+        )
+        .await;
+    let closed = engine.raw.close(handle).await;
+    ensure!(
+        copied? == length,
+        "The SFTP capture did not match its reported length"
+    );
+    closed?;
+    ensure!(
+        digest_hex(hash) == sha256,
+        "The SFTP capture did not match its SHA-256 digest"
+    );
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(staged)
 }
 
 struct DownloadChecks {
@@ -220,6 +283,52 @@ pub enum CopyDestination {
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
     Info,
+    InstalledTools,
+    ToolBundleVersions,
+    #[serde(skip)]
+    ReviewToolPath {
+        review: Option<String>,
+    },
+    PreviewToolBundle {
+        bundle: UtilityBundle,
+    },
+    ApplyToolBundle {
+        bundle: UtilityBundle,
+        review: String,
+    },
+    RollbackToolBundle {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
+    ResumeToolBundleUpdates {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
+    PreviewDotfiles {
+        bundle: DotfileBundle,
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+    },
+    ApplyDotfiles {
+        bundle: DotfileBundle,
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+        review: String,
+    },
+    SwitchDotfiles {
+        target: DotfileTarget,
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     /// Explicit Save from the editor. An absent original requests a new file.
     #[serde(skip)]
     SaveText {
@@ -734,6 +843,7 @@ impl Drop for PendingReply {
 pub(crate) async fn run(
     session: Arc<russh::client::Handle<crate::ssh::Handler>>,
     generation: u64,
+    approved_tool_path: Option<crate::options::ToolSync>,
     mut jobs: mpsc::Receiver<Job>,
     mut cleanup: mpsc::UnboundedReceiver<Job>,
 ) {
@@ -755,6 +865,9 @@ pub(crate) async fn run(
         } = job;
         if expected_generation.is_none() {
             let missing = match operation {
+                Operation::ReviewToolPath { .. } => {
+                    Some("The PATH review needs its original SSH connection")
+                }
                 Operation::SaveText { .. } => Some("The editor needs its original SSH connection"),
                 Operation::RenameEntry { .. } | Operation::CheckRenameBatch { .. } => {
                     Some("Missing SSH connection approval; rename was not started")
@@ -918,6 +1031,32 @@ pub(crate) async fn run(
                 },
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::Get { resume: true, .. } => JobStage::ResumableDownload,
+                Operation::PreviewDotfiles { .. } => {
+                    JobStage::Checking("Dotfiles preview did not finish")
+                }
+                Operation::PreviewToolBundle { .. } => {
+                    JobStage::Checking("Tool bundle preview did not finish")
+                }
+                Operation::InstalledTools => {
+                    JobStage::Checking("Installed tools lookup did not finish")
+                }
+                Operation::ToolBundleVersions => {
+                    JobStage::Checking("Tool history lookup did not finish")
+                }
+                Operation::ReviewToolPath { .. } => JobStage::Checking(
+                    "Tool PATH review did not finish. Review the startup files again.",
+                ),
+                Operation::ApplyToolBundle { .. }
+                | Operation::RollbackToolBundle { .. }
+                | Operation::ResumeToolBundleUpdates { .. } => {
+                    JobStage::Checking("Tool bundle review did not finish")
+                }
+                Operation::ApplyDotfiles { .. } => JobStage::Checking(
+                    "Dotfiles installation did not finish. Preview again to check the active bundle.",
+                ),
+                Operation::SwitchDotfiles { .. } => JobStage::Checking(
+                    "Dotfiles switch did not finish. Preview again to check the active bundle.",
+                ),
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
                 Operation::PreviewImage { .. } => {
                     JobStage::Checking("Image preview did not finish")
@@ -978,6 +1117,8 @@ pub(crate) async fn run(
                 .as_mut()
                 .unwrap()
                 .execute(
+                    &session,
+                    approved_tool_path.as_ref(),
                     operation,
                     progress.as_ref(),
                     cancel.as_ref(),
@@ -1083,6 +1224,7 @@ struct Engine {
     handles: HashMap<u64, Handle>,
     read_size: usize,
     write_size: usize,
+    dotfiles_review_scope: u128,
 }
 // Bare russh Channels do not close on drop. Guard negotiation too, so rejection
 // or cancellation cannot leave unused session channels on a long-lived SSH link.
@@ -1148,6 +1290,7 @@ impl Engine {
             handles: HashMap::new(),
             read_size,
             write_size,
+            dotfiles_review_scope: rand::random(),
         })
     }
     fn extension(&self, name: &str, version: &str) -> Result<()> {
@@ -1422,6 +1565,8 @@ impl Engine {
 
     async fn execute(
         &mut self,
+        session: &russh::client::Handle<crate::ssh::Handler>,
+        approved_tool_path: Option<&crate::options::ToolSync>,
         op: Operation,
         job_progress: Option<&JobProgress>,
         cancel: Option<&TransferCancel>,
@@ -1446,6 +1591,41 @@ impl Engine {
             }
             Info => {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
+            }
+            InstalledTools => serde_json::to_value(self.installed_tools(cancel).await?)?,
+            ToolBundleVersions => serde_json::to_value(self.tool_bundle_versions(cancel).await?)?,
+            ReviewToolPath { review } => {
+                let settings = approved_tool_path
+                    .context("The verified SSH connection has no matching tool PATH approval")?;
+                self.review_tool_path(session, settings, review.as_deref(), stage)
+                    .await?
+            }
+            PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
+            ApplyToolBundle { bundle, review } => {
+                self.apply_utility_bundle(session, bundle, &review, stage)
+                    .await?
+            }
+            RollbackToolBundle {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.rollback_utility_bundle(session, name, bundle_sha256, review.as_deref(), stage)
+                    .await?
+            }
+            ResumeToolBundleUpdates {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.resume_utility_updates(
+                    session,
+                    &name,
+                    &bundle_sha256,
+                    review.as_deref(),
+                    stage,
+                )
+                .await?
             }
             Get {
                 remote,
@@ -1573,6 +1753,32 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            PreviewDotfiles {
+                bundle,
+                shell,
+                zdotdir,
+            } => {
+                self.preview_dotfiles(bundle, shell, zdotdir.as_deref())
+                    .await?
+            }
+            ApplyDotfiles {
+                bundle,
+                shell,
+                zdotdir,
+                review,
+            } => {
+                self.apply_dotfiles(bundle, shell, zdotdir.as_deref(), &review, stage)
+                    .await?
+            }
+            SwitchDotfiles {
+                target,
+                shell,
+                zdotdir,
+                review,
+            } => {
+                self.switch_dotfiles(target, shell, zdotdir.as_deref(), review.as_deref(), stage)
+                    .await?
+            }
             PreviewImage { path } => self.read_preview_image(&path, cancel).await?,
             PreviewTail { path } => {
                 serde_json::to_value(self.read_file_tail(&path, cancel).await?)?

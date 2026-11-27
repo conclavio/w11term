@@ -6,6 +6,8 @@ use drive::{drive_gui, drive_mixed_gui};
 mod agent_key_ui;
 #[path = "mixed_drop_ui.rs"]
 mod mixed_drop_ui;
+#[path = "openrouter_ui.rs"]
+mod openrouter_ui;
 #[path = "recording_ui.rs"]
 mod recording_ui;
 #[path = "replay_controls.rs"]
@@ -21,6 +23,215 @@ mod upload_folder_ui;
 use shared::run_gui;
 #[path = "properties_ui.rs"]
 mod properties_ui;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews a native SSH trace, requests Stop and opens the verified capture"]
+async fn native_syscall_capture_reviews_stops_and_opens_the_verified_trace() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, _, server) =
+        fixture_counting_accepts(false, 1, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let started = remote.path().join("syscall-started");
+    fs::write(
+        state.path().join("syscall-start-marker"),
+        started.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("syscall-capture-ui.ps1", &ssh, state.path());
+    let request = fs::read_to_string(started).unwrap();
+    assert!(request.starts_with("capture 30 1048576 64 'all' '/home/test' '/bin/sh'"));
+    assert!(request.ends_with("'one argument' '$literal' '--flag'"));
+    assert_eq!(
+        fs::read(state.path().join("stopped capture.strace")).unwrap(),
+        SYSCALL_FIXTURE
+    );
+    assert!(remote.path().join("syscall-verified").is_file());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[test]
+#[ignore = "opens combined and per-process strace files and reviews grouped calls offline"]
+fn native_syscall_trace_viewer_groups_calls_and_keeps_original_records() {
+    let state = tempfile::tempdir().unwrap();
+    drive_gui("syscall-trace-view-ui.ps1", state.path());
+}
+
+#[test]
+#[ignore = "starts each saved diagnostics viewer without opening the configured startup profile"]
+fn native_saved_diagnostics_open_directly_without_terminal_panes() {
+    let state = tempfile::tempdir().unwrap();
+    drive_gui("diagnostic-launch-ui.ps1", state.path());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews an SSH packet capture, saves verified bytes and opens a local viewer"]
+async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, _, server) =
+        fixture_counting_accepts(false, 1, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let started = remote.path().join("pcap-started");
+    fs::write(remote.path().join("pcap-wait-for-stop"), []).unwrap();
+    fs::write(
+        state.path().join("pcap-start-marker"),
+        started.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("packet-capture-ui.ps1", &ssh, state.path());
+    let request = fs::read_to_string(started).unwrap();
+    assert!(request.contains("capture 'lo' 192 3 15 1024 yes '/dev/shm' 'udp and dst port 4321'"));
+    assert!(request.contains(" w11term-ring-v1 2 "));
+    assert!(remote.path().join("pcap-stopped").is_file());
+    assert!(remote.path().join("pcap-verified").is_file());
+    let mut expected = packet_ring_segment(1);
+    expected.extend_from_slice(&packet_ring_segment(0)[24..]);
+    assert_eq!(
+        fs::read(state.path().join("reviewed capture.pcap")).unwrap(),
+        expected
+    );
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews and launches a Linux command for CPU profiling from the Windows viewer"]
+async fn native_cpu_launch_reviews_literal_arguments_and_saves_the_stopped_profile() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    fs::write(remote.path().join("profile-wait-for-stop"), []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let marker = remote.path().join("profile-launched");
+    fs::write(state.path().join("launch-marker"), marker.to_str().unwrap()).unwrap();
+    fs::write(
+        state.path().join("launch-wire"),
+        remote.path().join("profile-launch-wire").to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("cpu-launch-ui.ps1", &ssh, state.path());
+    assert!(marker.exists());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "records a reviewed CPU profile from the native Linux triage report"]
+async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let pidstat = STANDARD.encode(concat!(
+        "09:40:00 UID PID %usr %system %guest %wait %CPU CPU Command\n",
+        "09:40:01 1000 42 78.00 2.00 0.00 0.00 80.00 1 worker\n",
+        "09:40:01 1000 80 1.00 0.00 0.00 0.00 1.00 1 helper\n",
+    ));
+    let triage = TRIAGE_RESPONSE.replace(
+        "pidstat\t1000\t2000\t0\t\t",
+        &format!("pidstat\t1000\t2000\t0\t{pidstat}\t"),
+    );
+    fs::write(remote.path().join("triage-response"), triage).unwrap();
+    fs::write(remote.path().join("profile-wait-for-stop"), []).unwrap();
+    fs::write(
+        remote.path().join("profile-response"),
+        concat!(
+            "w11term-cpu-profile-v1\t800\td29ya2Vy\n",
+            "w11term-cpu-profile-stopped-v1\n",
+            " 42 22.01: cpu-clock:u:\n",
+            "\t   deadbeef hot_loop (/tmp/worker)\n",
+            "\t   12ab34cd main (/tmp/worker)\n\n",
+            "\nw11term-cpu-profile-end\n",
+        ),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let captured = remote.path().join("profile-captured");
+    fs::write(
+        state.path().join("capture-marker"),
+        captured.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("capture-cpu-profile-ui.ps1", &ssh, state.path());
+    assert!(captured.exists());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 5);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "captures a CPU profile over SSH and opens and exports it in the native graph viewer"]
+async fn native_cpu_flame_graph_reopens_profiles_offline_and_exports_the_zoom() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let hot_sample = concat!(
+        " 42 22.01: cpu-clock:u:\n",
+        "\t   deadbeef hot_loop (/tmp/worker)\n",
+        "\t   12ab34cd main (/tmp/worker)\n\n",
+    );
+    let cold_sample = " 42 22.02: cpu-clock:u:    aa wait_for_work (/tmp/worker)\n";
+    fs::write(
+        remote.path().join("profile-response"),
+        format!(
+            "w11term-cpu-profile-v1\t800\td29ya2Vy\n{}{}\nw11term-cpu-profile-end\n",
+            hot_sample.repeat(3),
+            cold_sample,
+        ),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("cpu-flame-graph-ui.ps1", &ssh, state.path());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "collects a reviewed SSH triage report and reopens it without an SSH pane"]
+async fn native_linux_triage_reviews_collects_and_reopens_a_report() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let stopped = TRIAGE_RESPONSE.replacen("\t124\n", "\t143\tstopped\n", 1);
+    fs::write(remote.path().join("triage-response"), stopped).unwrap();
+    fs::write(remote.path().join("triage-wait-for-stop"), []).unwrap();
+    let wire = remote.path().join("keyboard-input.bin");
+    fs::write(&wire, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let command = remote.path().join("triage-command");
+    fs::write(
+        state.path().join("triage-command-path"),
+        command.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("linux-triage-ui.ps1", &ssh, state.path());
+    assert!(command.exists());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 2);
+    assert!(fs::read(wire).unwrap().is_empty());
+    server.abort();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits a profile's jump route and authenticates with a browsed key and certificate"]
@@ -2557,6 +2768,32 @@ async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "looks up offline TLDR and installed SSH tool pages and inserts an edited example without submitting it"]
+async fn native_command_reference_follows_powershell_and_ssh() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (source, remote, _, server) = fixture_counting_accepts(false, 2, transports.clone()).await;
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("ssh-wire"), trace.to_str().unwrap()).unwrap();
+    let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
+    drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
+    let shell = fs::read_to_string(remote.path().join(".bashrc")).unwrap();
+    assert!(shell.starts_with("# preserve my shell changes\n"));
+    assert!(shell.ends_with("# trailing user settings\n"));
+    assert!(shell.contains("export PATH"));
+    assert!(!shell.contains("# edited managed block"));
+    assert!(
+        fs::read_to_string(remote.path().join(".local/bin/netwatch"))
+            .unwrap()
+            .ends_with("/portable/current/netwatch\n")
+    );
+    assert_eq!(fs::read(trace).unwrap(), b"ip address");
+    assert_eq!(transports.load(Ordering::Relaxed), 1, "SSH TCP connections");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "inspects live SSH modes and geometry from the CLI while PowerShell keeps input focus"]
 async fn native_inspect_reads_background_ssh_without_disturbing_powershell() {
     let (Source::Ssh(mut ssh), remote, opens, server) = fixture_server(false).await else {
@@ -4032,7 +4269,7 @@ async fn native_saving_an_ssh_profile_keeps_the_original_live_pane() {
 }
 
 #[test]
-#[ignore = "selects SSH key paths through the native file dialog in Quick Connect and a profile"]
+#[ignore = "selects SSH key, dotfiles and tool bundles through native dialogs and saves a profile"]
 fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
     let state = tempfile::tempdir().unwrap();
     fs::write(
@@ -4040,6 +4277,20 @@ fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
         br#"{"profiles":{"fixture":{"host":"example.test","user":"test","auth":"identity","identity":"missing-key-folder/original-key"}}}"#,
     )
     .unwrap();
+    for (name, architecture) in [
+        ("operator-x64", w11term::sftp::UtilityArchitecture::X86_64),
+        ("operator-arm", w11term::sftp::UtilityArchitecture::Aarch64),
+    ] {
+        fs::write(
+            state.path().join(name),
+            super::utilities::executable(architecture, None),
+        )
+        .unwrap();
+    }
+    let mut revision =
+        super::utilities::executable(w11term::sftp::UtilityArchitecture::X86_64, None);
+    revision[255] = 1;
+    fs::write(state.path().join("operator-x64-next"), revision).unwrap();
     drive_gui("ssh-identity-picker-ui.ps1", state.path());
 }
 

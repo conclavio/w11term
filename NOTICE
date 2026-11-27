@@ -25,3 +25,12 @@ placeholder diacritic indices are protocol data derived from Unicode 6.0.
 This project vendors Windows Reactor 0.100.0 from Microsoft windows-rs.
 The upstream MIT and Apache-2.0 license texts and the local cursor backport
 are documented in vendor/windows-reactor/PATCHES.md.
+
+The Command reference embeds the official English tldr-pages archive,
+copyright 2014–present the tldr-pages team and contributors, under the
+Creative Commons Attribution 4.0 International License.
+Source: https://github.com/tldr-pages/tldr/releases/download/v2.3/tldr-pages.en.zip
+Contributors: https://github.com/tldr-pages/tldr/graphs/contributors
+License: https://creativecommons.org/licenses/by/4.0/
+Archive SHA-256: 992d0fda1d1da02982f1f11848f180bb199dc0f450174ba843757e0c67c48fc3
+The bundled archive is unchanged. The app formats the pages for display.

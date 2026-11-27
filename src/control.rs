@@ -1,6 +1,7 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
 use crate::{
-    options::TabColor,
+    diagnostic_history::Artifact,
+    options::{DiagnosticLaunch, TabColor},
     pane_layout::{Axis, Direction},
     session::{Command, PaneDescription},
     tabs::TabTitle,
@@ -35,7 +36,11 @@ mod registry;
 pub(crate) mod security;
 mod sftp_transfers;
 mod ssh_groups;
+mod triage;
 mod workspace_preview;
+pub use crate::ssh::triage::cpu_profile::{CpuCallGraph, CpuProfileOptions};
+pub use crate::ssh::triage::packet_capture::PacketCaptureOptions;
+pub use crate::ssh::triage::syscall_capture::{SyscallFilter, SyscallOptions};
 pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
@@ -46,12 +51,71 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 pub const MAX_SSH_GROUP_OUTPUT_LINES: usize = 128;
 const MAX_LINE: usize = MAX_BYTES * 2;
 const TIMEOUT: Duration = Duration::from_secs(10);
+const DIAGNOSTIC_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 pub type CapturePng =
     Arc<dyn Fn(&Snapshot, TerminalSize, &Path) -> Result<(u32, u32)> + Send + Sync>;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
+    LinuxTriage {
+        pane: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_generation: Option<std::num::NonZeroU64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<PathBuf>,
+    },
+    PreviewCpuProfile {
+        pane: u64,
+        options: CpuProfileOptions,
+    },
+    CaptureCpuProfile {
+        pane: u64,
+        options: CpuProfileOptions,
+        connection_generation: std::num::NonZeroU64,
+        process_start_ticks: u64,
+        output_file: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf_data_file: Option<PathBuf>,
+    },
+    PreviewPacketCapture {
+        pane: u64,
+        options: PacketCaptureOptions,
+    },
+    ListPacketInterfaces {
+        pane: u64,
+    },
+    PreviewSyscallCapture {
+        pane: u64,
+        options: SyscallOptions,
+    },
+    CaptureSyscalls {
+        pane: u64,
+        options: SyscallOptions,
+        connection_generation: std::num::NonZeroU64,
+        review_id: String,
+        job_id: String,
+        output_file: PathBuf,
+    },
+    StopSyscallCapture {
+        pane: u64,
+        connection_generation: std::num::NonZeroU64,
+        job_id: String,
+    },
+    CapturePackets {
+        pane: u64,
+        options: PacketCaptureOptions,
+        connection_generation: std::num::NonZeroU64,
+        review_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+        output_file: PathBuf,
+    },
+    StopPacketCapture {
+        pane: u64,
+        connection_generation: std::num::NonZeroU64,
+        job_id: String,
+    },
     Record {
         pane: u64,
         path: Option<PathBuf>,
@@ -211,6 +275,12 @@ pub enum Request {
     ListTabs {
         window_id: WindowId,
     },
+    OpenDiagnostic {
+        window_id: WindowId,
+        artifact: Artifact,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        compare_with: Vec<PathBuf>,
+    },
     ReorderTabs {
         window_id: WindowId,
         tab_ids: Vec<crate::tabs::TabId>,
@@ -228,6 +298,10 @@ pub enum Request {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_id: Option<WindowId>,
+    },
+    RenameWorkspace {
+        name: String,
+        new_name: String,
     },
     RepairWorkspace {
         window_id: WindowId,
@@ -520,6 +594,10 @@ pub enum UiRequest {
         order: Option<Vec<crate::tabs::TabId>>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    OpenDiagnostic {
+        launch: DiagnosticLaunch,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     TabAppearance {
         tab_id: crate::tabs::TabId,
         change: TabAppearanceChange,
@@ -674,6 +752,7 @@ impl UiRequest {
             | Self::SaveWorkspace { reply, .. }
             | Self::RepairWorkspace { reply, .. }
             | Self::TabOrder { reply, .. }
+            | Self::OpenDiagnostic { reply, .. }
             | Self::TabAppearance { reply, .. }
             | Self::OpenWorkspace { reply, .. }
             | Self::OpenWorkspaceWindow { reply, .. }
@@ -1394,6 +1473,94 @@ impl Registry {
                 }
                 Ok(result)
             }
+            Request::LinuxTriage {
+                pane,
+                connection_generation,
+                output_file,
+            } => {
+                self.linux_triage(pane, connection_generation, output_file)
+                    .await
+            }
+            Request::PreviewCpuProfile { pane, options } => {
+                self.preview_cpu_profile(pane, options).await
+            }
+            Request::PreviewPacketCapture { pane, options } => {
+                self.preview_packet_capture(pane, options).await
+            }
+            Request::ListPacketInterfaces { pane } => self.list_packet_interfaces(pane).await,
+            Request::PreviewSyscallCapture { pane, options } => {
+                self.preview_syscall_capture(pane, options).await
+            }
+            Request::CaptureSyscalls {
+                pane,
+                options,
+                connection_generation,
+                review_id,
+                job_id,
+                output_file,
+            } => {
+                self.capture_syscalls(
+                    pane,
+                    options,
+                    connection_generation,
+                    &review_id,
+                    &job_id,
+                    output_file,
+                )
+                .await
+            }
+            Request::StopSyscallCapture {
+                pane,
+                connection_generation,
+                job_id,
+            } => {
+                self.stop_syscall_capture(pane, connection_generation, &job_id)
+                    .await
+            }
+            Request::CapturePackets {
+                pane,
+                options,
+                connection_generation,
+                review_id,
+                job_id,
+                output_file,
+            } => {
+                self.capture_packets(
+                    pane,
+                    options,
+                    connection_generation,
+                    &review_id,
+                    job_id,
+                    output_file,
+                )
+                .await
+            }
+            Request::StopPacketCapture {
+                pane,
+                connection_generation,
+                job_id,
+            } => {
+                self.stop_packet_capture(pane, connection_generation, &job_id)
+                    .await
+            }
+            Request::CaptureCpuProfile {
+                pane,
+                options,
+                connection_generation,
+                process_start_ticks,
+                output_file,
+                perf_data_file,
+            } => {
+                self.capture_cpu_profile(
+                    pane,
+                    options,
+                    connection_generation,
+                    process_start_ticks,
+                    output_file,
+                    perf_data_file,
+                )
+                .await
+            }
             Request::Sftp {
                 pane,
                 timeout_seconds,
@@ -1633,6 +1800,21 @@ impl Registry {
             }
             Request::ListWindows => Ok(self.list_windows()),
             Request::ListTabs { window_id } => self.tab_order(window_id, None).await,
+            Request::OpenDiagnostic {
+                window_id,
+                artifact,
+                compare_with,
+            } => {
+                let launch = DiagnosticLaunch::from_paths(artifact, compare_with)?;
+                let ui = self.window_ui(window_id)?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::OpenDiagnostic { launch, reply });
+                tokio::time::timeout(DIAGNOSTIC_OPEN_TIMEOUT, response)
+                    .await
+                    .context("open-diagnostic timed out; the viewer may still be loading")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::ReorderTabs { window_id, tab_ids } => {
                 self.tab_order(window_id, Some(tab_ids)).await
             }
@@ -1686,6 +1868,15 @@ impl Registry {
                 Ok(json!({ "workspaces": workspaces }))
             }
             Request::GetWorkspace { name, window_id } => self.get_workspace(&name, window_id).await,
+            Request::RenameWorkspace { name, new_name } => {
+                tokio::task::spawn_blocking(move || {
+                    let store = crate::workspace::WorkspaceStore::open()?;
+                    let expected = store.entry(&name)?;
+                    store.rename(&name, &new_name, &expected)?;
+                    Ok(json!({ "old_name": name, "name": new_name }))
+                })
+                .await?
+            }
             Request::RepairWorkspace {
                 window_id,
                 name,
@@ -2640,6 +2831,20 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
     let mut response = Vec::new();
     tokio::time::timeout(
         Duration::from_secs(match request {
+            Request::OpenDiagnostic { .. } => DIAGNOSTIC_OPEN_TIMEOUT.as_secs() + 5,
+            Request::LinuxTriage { .. } => crate::ssh::triage::DEADLINE.as_secs() + 20,
+            Request::CapturePackets { .. } => crate::ssh::triage::packet_capture::CONTROL_SECONDS,
+            Request::CaptureSyscalls { .. } => crate::ssh::triage::syscall_capture::CONTROL_SECONDS,
+            Request::CaptureCpuProfile {
+                perf_data_file: Some(_),
+                ..
+            } => {
+                crate::ssh::triage::cpu_profile::CONTROL_TIMEOUT_SECONDS
+                    + crate::ssh::PERF_DATA_TRANSFER_SECONDS
+            }
+            Request::PreviewCpuProfile { .. } | Request::CaptureCpuProfile { .. } => {
+                crate::ssh::triage::cpu_profile::CONTROL_TIMEOUT_SECONDS
+            }
             Request::Sftp {
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,

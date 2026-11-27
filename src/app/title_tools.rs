@@ -150,12 +150,13 @@ impl TerminalApp {
             _ => None,
         });
         let ssh = live.filter(|live| matches!(live.source, Source::Ssh(_)));
+        let files_visible = !self.command_reference.open && ssh.is_some_and(|live| live.files.open);
         let tools = StackPanel::new()
             .orientation(Orientation::Horizontal)
             .horizontal_alignment(HorizontalAlignment::Right)
             .spacing(GAP);
         if layout.tools == Tools::Compact {
-            let files_label = if ssh.is_some_and(|live| live.files.open) {
+            let files_label = if files_visible {
                 HIDE_FILES
             } else {
                 SHOW_FILES
@@ -202,7 +203,7 @@ impl TerminalApp {
             .automation_name("Toggle SFTP file drawer")
             .automation_id("w11term-title-files")
             .is_enabled(pane.is_some())
-            .is_checked(ssh.is_some_and(|live| live.files.open))
+            .is_checked(files_visible)
             .on_is_checked_changed(context.callback(move |checked| {
                 pane.map_or(Message::ControlIdle, |id| {
                     Message::SetTitleFiles(id, checked)

@@ -20,6 +20,10 @@ The [Windows folder sharing roadmap](#mount-selected-windows-folders-on-a-linux-
 
 The [SSH host groups roadmap](#ssh-host-groups) covers running the same command across live remote shells from a single Windows tab.
 
+The [SSH diagnostics roadmap](#ssh-diagnostics) covers packet capture, syscall tracing, Linux performance triage, and flame graphs. The [LLM assistance roadmap](#llm-assistance) covers reviewing selected terminal evidence and drafting Bash commands.
+
+The [SSH shell setup](#ssh-shell-setup) brings your dotfiles and command-line tools to a Linux account. The [command reference](#command-reference) puts short manuals beside the terminal.
+
 ## Current capabilities
 
 Each terminal tab has its own session, scrollback, search state and programmable control surface. Scripts can target a background session by ID, write raw bytes, wait for a regex, read committed screen text, capture PNGs and record VT output. The same authenticated SSH connection also supports SFTP. Profiles already support creation, editing and renaming, plus key, agent, password and keyboard-interactive authentication. [Current features](../README.md#tabs-and-profiles) · [Control and SFTP API](../CONTROL.md)
@@ -272,6 +276,82 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 154. **Retry reviewed unsent SSH commands from the CLI.** Resubmit the source command to explicitly named eligible panes and link the new run to each original recipient to prevent duplicate retries.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
+
+## SSH diagnostics
+
+Open **More → Diagnostics** to choose a tool or see the connected endpoint in **Diagnostics overview**. Review the verified host, target interface or binary, output destination, duration, and size limit before starting. Run the tool over a sibling channel on the pane's existing authenticated transport. Send progress and the stop reason to the Windows UI, and transfer finalized artifacts through SFTP. A server-side deadline and cleanup lease bound the job even if Windows disconnects.
+
+The overview's **Activity** list follows jobs started from the app in the current window. It keeps their original SSH endpoint visible when the active pane changes, and each entry opens that tool or the original syscall viewer tab. A finished capture includes its local artifact path and stop reason when available.
+
+### Packet capture and Wireshark
+
+- Choose an interface, an optional capture filter, and a snap length. Review the effective `tcpdump -i IFACE -nn -p -s SNAPLEN -w -` arguments and packet limit before starting. For rolling capture, use the stdout stream and place complete pcap records into a bounded set of private files so the capture keeps tcpdump’s existing privilege handling. Rotate before a record exceeds a file’s budget. Show the number of overwritten files and save the retained packets in capture order. Stop cleanly so tcpdump can flush its output and report packet drops. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in) · [Rolling capture controls](../CONTROL.md#capture-linux-packets-and-open-wireshark)
+- Use a private job directory on disk or an operator-selected, verified `tmpfs` mount. Check available capacity and reserve headroom before starting. Enforce bytes and file-count budgets per capture and across concurrent captures on the host. For RAM-backed capture, use a filesystem quota or a bounded writer with headroom for the final record. Show the reason when the selected location cannot meet the budget and let the operator choose a disk location.
+- Download completed captures to a local staging path. Check the captured size and, when available, a remote checksum before publishing the local file. Open the published capture with the configured Windows Wireshark executable using `-r` and the local path. Keep **Save capture** available when Wireshark is absent. Clean up remote artifacts after a verified transfer or when the retention period expires. [Wireshark command-line options](https://www.wireshark.org/docs/wsug_html_chunked/ChCustCommandLine.html)
+
+### Syscall capture and Windows viewer
+
+- Start a selected binary with explicit arguments and working directory under `strace`. Use `-f -o TRACE` to retain an original, PID-tagged stream across descendants. Its single sink enforces a strict total byte budget while retaining order for per-process views. Support importing separate `-ff` files for traces collected outside w11term. Use `-ttt` for timestamps, `-T` for syscall duration, `-yy` for descriptor details, and a bounded `-s` string length. Stop terminates the command and traced descendants, then saves the collected output. Offer file, process, and network presets and report incomplete output explicitly. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+- Open completed traces or import existing traces into a Windows diagnostics tab. Group repetitive adjacent calls by process, syscall, resource, and outcome. Show counts and elapsed time, and expand groups to the original lines. Promote process transitions, file opens and closes, unusual delays, and errno results. Keep expected fallback errors visible and distinguish them from failures with no successful fallback in the observed trace.
+- Give each open handle a lifetime through `openat`, socket or pipe creation, duplication, inherited handles, and closure. Distinguish a reused descriptor number from the earlier handle. Track shared descriptor tables and close-on-exec. A file view should show which processes opened it, what they did with it, and where each handle was closed. Preserve unknown or incomplete events as such.
+
+### Compare a working run with a failing run
+
+Align the traces by executable and process lineage, then by syscall, resource, and sequence within each process. Map transient PIDs and descriptor numbers to their logical identities. Show added or missing calls, changes in return values or errno, count differences, and the first meaningful divergence. Show timing as elapsed time from run start or a paired event, plus per-call duration deltas. Let users expand uncertain matches and inspect the two original trace lines.
+
+**Packet and syscall ship order.** Start with capture, transfer, cleanup, and Wireshark launch. Add bounded strace capture and offline viewing with handle tracking next. Follow with side-by-side comparison.
+
+**Acceptance.** Capture a known loopback exchange on a Linux fixture and open the verified file in Windows Wireshark. Exercise the RAM budget and disconnect the client mid-capture to verify bounded storage, a stopped job, and cleanup. Trace working and failing runs of the same binary with shifted clocks and different descriptor numbers. Verify the comparison identifies the path of a failed file open, changed result, and relative timing. Include a reused descriptor and a repetitive read loop to check lifecycle tracking and expansion to raw evidence.
+
+### Linux performance triage in 60 seconds
+
+Add **Run 60-second triage** for the selected Linux SSH pane. Capture load and uptime, recent kernel messages, and the CPU, process, memory, disk and network observations from Brendan Gregg and the Netflix Performance Engineering team’s checklist. Run `uptime`, the tail of `dmesg`, interval samples from `vmstat`, per-CPU `mpstat`, `pidstat`, extended `iostat`, a `free` snapshot, both network views from `sar` (`DEV` and `TCP,ETCP`), and a bounded batch-mode `top`. [Linux Performance Analysis in 60,000 Milliseconds](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf)
+
+Give the collection a shared remote deadline and limit concurrency and bytes. Align interval samples to the collection window and distinguish since-boot averages from live measurements. Record each command, sample times, exit status, and raw output. Show missing utilities, permission failures, timeouts, and unreadable samples alongside the successful checks. Summarize utilization, saturation, and errors by resource, with a link from each observation to its evidence. Save and reopen the report on Windows. From a busy process, offer to start a targeted CPU profile.
+
+### CPU profiles and flame graphs
+
+Start with a selected PID and a bounded Linux `perf record` call-stack capture. Let the operator review the verified target, sampling frequency, call-stack mode, and duration. Report perf errors, symbolization, and lost-sample warnings. Run `perf script` on the host and fold its bounded output into a local artifact. Follow with capture of a newly launched command and an option to retain and transfer the raw profile separately. Reuse the diagnostic job’s timeout, storage, and cleanup rules. [CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
+
+Render the folded stacks locally with zoom, symbol search, sample counts, and each frame’s share of samples. Frame width represents sample weight. Keep unresolved frames visible and offer an export for sharing. Ship the triage collector and offline report first, then CPU capture and viewing.
+
+**Acceptance.** Use a Linux fixture with a known CPU hotspot, a missing utility, and a denied kernel-log read. Check that the report distinguishes each outcome and ends within its deadline. Confirm the flame graph finds the hotspot, preserves its callers and counts, and reopens offline on Windows.
+
+## LLM assistance
+
+Add optional Windows-side OpenRouter settings. Store the user’s API key with Windows credential protection, load the model catalog, and let the user choose a model. Show the destination and chosen model before sending, expose available provider privacy controls such as Zero Data Retention routing, and give a clear error when the requested routing policy cannot be met. Show token usage when the service returns it. [OpenRouter model catalog](https://openrouter.ai/docs/api/api-reference/models/get-models) · [OpenRouter data controls](https://openrouter.ai/docs/guides/get-started/sovereign-ai)
+
+- **Explain terminal output.** Start from selected text or the visible pane the user chooses to share. Show an editable preview of the outgoing excerpt and let the user remove secret values or sensitive paths. Keep terminal text and diagnostic artifacts as quoted evidence. Remote output can contain instructions intended for the model, so keep command execution outside the model’s capabilities.
+- **Draft a Bash command.** Accept a description of the task and show the suggested command, its assumptions, and expected effects. Offer copy or insertion into an editable command line. The user decides whether and where to submit it.
+- **Review a performance report.** Send the user-approved summary and excerpts. Ask the model to call out anomalies, link to evidence by command and sample, and identify missing measurements. Keep those comments beside the locally produced report so readers can inspect the supporting numbers.
+
+Ship selection explanation and Bash drafting with a shared request preview, then add optional performance review. Test with a stub provider that captures the exact outbound payload, exercises cancellation and provider errors, and returns shell-looking text. Verify that requests require review and that the response alone never submits a command.
+
+## SSH shell setup
+
+Use a single SSH profile to bring your shell setup and tools to a Linux account. Under **Settings → Edit profile**, configure **SSH dotfiles** for prompt and shell startup fragments and **SSH tools** for your pinned executables. Review and approve each bundle for the remote account. On an ordinary SSH connect or reconnect, w11term syncs the approved dotfiles first and then syncs the tools over SFTP before starting the shell. Each step reports its own outcome. A skipped sync still lets the shell open. [SSH dotfile sync](../CONTROL.md#sync-dotfiles-on-ssh-connect) · [SSH tool sync](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
+
+From that pane, **More → Command reference** shows the tool sync result and the managed launcher path beside its manual. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
+
+**Acceptance.** Use a profile with both bundles enabled on a clean Linux account. At the first prompt, verify that the managed prompt is active and that `command -v` resolves a bundled utility to the expected launcher under `~/.local/bin`. Reconnect and verify both sync results and the same prompt and launcher.
+
+## Command reference
+
+Open **More → Command reference** for a Tealdeer-style side panel. Search by command, subcommand, or task, or look up a command selected in the pane. Task search reads page descriptions and example labels for the chosen platform and common pages. Each page shows common invocations and links to upstream documentation when available. Copy an example or edit its placeholders before inserting it into the active shell. Submitting the command takes a separate Enter in the terminal. [Tealdeer](https://github.com/tealdeer-rs/tealdeer)
+
+English tldr-pages are bundled for offline lookup. The platform defaults to Windows for local shells and Linux for WSL and SSH. Use the platform dropdown for a different remote OS. **Update pages** keeps a usable cache if refreshing fails, and **New private page** adds a local manual for the selected platform. w11term bundles pages for `diskwatch`, `mdd`, and `netwatch` alongside the upstream collection. [tldr-pages client specification](https://github.com/tldr-pages/tldr/blob/main/CLIENT-SPECIFICATION.md)
+
+**Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
+
+## Managed SSH utilities
+
+Open **Settings → Edit profile → SSH tools** to choose a preset, select individual tools, or build a bundle from local Linux executables. **Linux essentials** includes `rg`, `jq`, `dust`, and `hyperfine`. **Linux admin tools** also includes `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. The Windows manifest records the binary’s SHA-256 for each build. Preset manifests also identify the upstream artifacts. [Bundle downloads and presets](../CONTROL.md#download-a-pinned-ssh-tool-bundle)
+
+Use **More → Command reference → Install SSH tools** on a connected pane to review, install, or restore a bundle. The preview selects an x86-64 or ARM64 build for the verified Linux account and shows compatibility information, destinations, and conflicts. The installer transfers and verifies the chosen executables over the existing SFTP connection, then publishes them under the account’s home with launchers in `~/.local/bin` by default. User-owned launchers are preserved. Retained versions support rollback. Selecting an installed command shows its launcher path and bundle name beside the reference page for that pane. [Reviewed install and rollback](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
+With profile approval, a connection can sync a bundle before opening the shell. **Manage Bash PATH** or **Manage Zsh PATH** appends the launcher directory after existing entries so tools already on the account’s `PATH` keep precedence. The command-reference panel shows the sync result and offers PATH repair or resuming updates after a reviewed rollback. [Sync approval and PATH behavior](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
+
+**Acceptance.** Install a small bundle on clean Linux x64 and arm64 fixtures and run the intended commands from the next shell prompt. Exercise an incompatible binary and an existing user-owned command. Verify the selected executable through `PATH`, that repeat sync skips unchanged bytes, and that rollback restores the previous managed version.
 
 ## Subsequent features for RustMUSH
 

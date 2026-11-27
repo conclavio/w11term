@@ -2,13 +2,21 @@ use super::*;
 use w11term::sftp::Operation;
 
 // NTFS backs the bytes; the loopback SFTP server supplies Unix owners and modes.
-#[derive(Default)]
+pub(super) type PosixEntries = Arc<std::sync::Mutex<HashMap<String, (u32, u32, u32)>>>;
+
 pub(super) struct PosixMetadata {
-    attrs: HashMap<String, (u32, u32, u32)>,
+    attrs: PosixEntries,
     handles: HashMap<String, String>,
 }
 
 impl PosixMetadata {
+    pub(super) fn new(attrs: PosixEntries) -> Self {
+        Self {
+            attrs,
+            handles: HashMap::new(),
+        }
+    }
+
     pub(super) fn opened(
         &mut self,
         handle: &str,
@@ -17,7 +25,7 @@ impl PosixMetadata {
         attrs: FileAttributes,
     ) {
         if flags.contains(OpenFlags::CREATE) {
-            self.attrs.insert(
+            self.attrs.lock().unwrap().insert(
                 path.clone(),
                 (1000, 1000, attrs.permissions.unwrap_or(0o666)),
             );
@@ -31,7 +39,13 @@ impl PosixMetadata {
 
     pub(super) fn stat(&self, path: &str, attrs: &mut FileAttributes) {
         if let Some(mode) = attrs.permissions {
-            let (uid, gid, perms) = self.attrs.get(path).copied().unwrap_or((1701, 2048, 0o640));
+            let (uid, gid, perms) = self
+                .attrs
+                .lock()
+                .unwrap()
+                .get(path)
+                .copied()
+                .unwrap_or((1701, 2048, 0o640));
             attrs.permissions = Some((mode & 0o170000) | (perms & 0o7777));
             attrs.uid = Some(uid);
             attrs.gid = Some(gid);
@@ -39,7 +53,28 @@ impl PosixMetadata {
     }
 
     pub(super) fn set_permissions(&mut self, path: String, mode: u32) {
-        self.attrs.entry(path).or_insert((1701, 2048, 0o640)).2 = mode;
+        self.attrs
+            .lock()
+            .unwrap()
+            .entry(path)
+            .or_insert((1701, 2048, 0o640))
+            .2 = mode;
+    }
+
+    pub(super) fn renamed(&mut self, from: &str, to: &str) {
+        let mut moved = Vec::new();
+        let mut attrs = self.attrs.lock().unwrap();
+        attrs.retain(|path, attr| {
+            if let Some(rest) = path.strip_prefix(from)
+                && (rest.is_empty() || rest.starts_with('/'))
+            {
+                moved.push((format!("{to}{rest}"), *attr));
+                false
+            } else {
+                true
+            }
+        });
+        attrs.extend(moved);
     }
 
     pub(super) fn fstat(&self, handle: &str, attrs: &mut FileAttributes) -> Result<(), StatusCode> {
@@ -53,7 +88,8 @@ impl PosixMetadata {
         attrs: &FileAttributes,
     ) -> Result<(), StatusCode> {
         let path = self.handles.get(handle).ok_or(StatusCode::Failure)?;
-        let (uid, gid, mode) = self.attrs.get_mut(path).ok_or(StatusCode::Failure)?;
+        let mut metadata = self.attrs.lock().unwrap();
+        let (uid, gid, mode) = metadata.get_mut(path).ok_or(StatusCode::Failure)?;
         if let (Some(user), Some(group)) = (attrs.uid, attrs.gid) {
             *uid = user;
             *gid = group;
@@ -80,9 +116,7 @@ impl Files {
         }
         fs::rename(self.path(&from), self.path(&to)).map_err(io)?;
         let posix = self.posix.as_mut().ok_or(StatusCode::OpUnsupported)?;
-        if let Some(metadata) = posix.attrs.remove(&from) {
-            posix.attrs.insert(to, metadata);
-        }
+        posix.renamed(&from, &to);
         Ok(Packet::Status(status(id)))
     }
 }
