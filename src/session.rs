@@ -489,6 +489,17 @@ impl Session {
         self.ssh_connection.subscribe()
     }
 
+    pub fn triage_target(&self) -> anyhow::Result<ssh::TriageTarget> {
+        anyhow::ensure!(
+            !self.player.read().unwrap().rustmush,
+            "Linux triage requires an SSH pane outside a game session"
+        );
+        let generation = self
+            .ssh_connection_generation()
+            .context("Select a connected Linux SSH pane")?;
+        ssh::TriageTarget::new(&self.ssh_connection, generation)
+    }
+
     /// Bind the local listener to this pane's current authenticated SSH shell lifetime.
     pub fn start_local_forward(
         &self,

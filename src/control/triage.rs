@@ -1,4 +1,5 @@
 use super::*;
+use crate::ssh::TriageReport;
 use std::num::NonZeroU64;
 
 impl Registry {
@@ -27,33 +28,10 @@ impl Registry {
         let Some(path) = output_file else {
             return Ok(json!({ "pane": pane, "plan": target.preview() }));
         };
-        ensure!(
-            path.is_absolute() && path.file_name().is_some(),
-            "Choose an absolute path for a new triage report"
-        );
-        let parent = path
-            .parent()
-            .context("The triage report has no parent directory")?;
-        ensure!(
-            parent.is_dir(),
-            "The triage report directory does not exist"
-        );
-        ensure!(
-            !path.try_exists()?,
-            "The triage report destination already exists"
-        );
+        TriageReport::check_destination(&path)?;
         let report = target.collect().await?;
         let path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
-            let directory = path
-                .parent()
-                .context("The triage report has no parent directory")?;
-            let mut staged = tempfile::NamedTempFile::new_in(directory)?;
-            serde_json::to_writer_pretty(staged.as_file_mut(), &report)?;
-            staged.as_file().sync_all()?;
-            staged
-                .persist_noclobber(&path)
-                .map_err(|error| error.error)
-                .context("Saving the Linux triage report")?;
+            report.save(&path)?;
             Ok(path)
         })
         .await??;

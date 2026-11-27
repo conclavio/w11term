@@ -58,6 +58,8 @@ pub(super) enum Purpose {
     SshGroupDefinition,
     StartRecording,
     OpenRecording,
+    OpenTriageReport(PathBuf),
+    SaveTriageReport(PathBuf),
 }
 
 fn is_local_folder(folder: &Path) -> bool {
@@ -210,6 +212,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFile
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
+                | Purpose::OpenTriageReport(_)
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
                 | Purpose::ToolBundle(_)
@@ -231,6 +234,28 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let multiple = matches!(purpose, Purpose::UploadFiles);
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
+            Purpose::OpenTriageReport(ref current) | Purpose::SaveTriageReport(ref current) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: w!("Linux triage reports"),
+                    pszSpec: w!("*.json"),
+                }])?;
+                dialog.SetDefaultExtension(w!("json"))?;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if matches!(&purpose, Purpose::OpenTriageReport(_)) {
+                    dialog.SetTitle(w!("Open Linux triage report"))?;
+                    options |= FOS_FILEMUSTEXIST;
+                } else {
+                    dialog.SetTitle(w!("Save Linux triage report"))?;
+                    dialog.SetFileName(w!("linux-triage.json"))?;
+                    options &= !FOS_OVERWRITEPROMPT;
+                    options |= FOS_NOTESTFILECREATE;
+                }
+                if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
             Purpose::StartRecording | Purpose::OpenRecording => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 dialog.SetFileTypes(&[

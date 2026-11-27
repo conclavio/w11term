@@ -23,6 +23,33 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "collects a reviewed SSH triage report and reopens it without an SSH pane"]
+async fn native_linux_triage_reviews_collects_and_reopens_a_report() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    fs::write(remote.path().join("triage-response"), TRIAGE_RESPONSE).unwrap();
+    let wire = remote.path().join("keyboard-input.bin");
+    fs::write(&wire, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let command = remote.path().join("triage-command");
+    fs::write(
+        state.path().join("triage-command-path"),
+        command.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("linux-triage-ui.ps1", &ssh, state.path());
+    assert!(command.exists());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 2);
+    assert!(fs::read(wire).unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits a profile's jump route and authenticates with a browsed key and certificate"]
 async fn native_profile_jump_editor_saves_and_connects_the_ordered_route() {
     use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};

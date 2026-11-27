@@ -2,14 +2,14 @@ use super::{ConnectionShare, ShareSlot};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use russh::{Channel, ChannelMsg, client};
-use serde::Serialize;
-use serde_json::{Value, json};
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::{io::Read, path::Path, time::Duration};
 use tokio::sync::watch;
 
 pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
 const STREAM_BYTES: usize = 16 * 1024;
 const WIRE_BYTES: usize = PROBES.len() * 2 * (STREAM_BYTES.div_ceil(3) * 4) + 4096;
+const REPORT_BYTES: u64 = 3 * 1024 * 1024;
 const SUPERVISOR: &str = include_str!("triage-supervisor.sh");
 const WORKER: &str = include_str!("triage-worker.sh");
 const PROBES: [(&str, &str, &str); 10] = [
@@ -59,20 +59,25 @@ impl Target {
         })
     }
 
-    pub(crate) fn preview(&self) -> Value {
+    pub fn preview(&self) -> Plan {
         let (host, user, port, fingerprint) = self.link.verified_endpoint();
-        json!({
-            "connection_generation": self.generation,
-            "host": host, "user": user, "port": port, "host_key_fingerprint": fingerprint,
-            "deadline_seconds": DEADLINE.as_secs(),
-            "max_bytes_per_stream": STREAM_BYTES,
-            "probes": PROBES.map(|(id, command, sampling)| json!({
-                "id": id, "command": command, "sampling": sampling,
-            })),
-        })
+        Plan {
+            connection_generation: self.generation,
+            host: host.into(),
+            user: user.into(),
+            port,
+            host_key_fingerprint: fingerprint.into(),
+            deadline_seconds: DEADLINE.as_secs(),
+            max_bytes_per_stream: STREAM_BYTES,
+            probes: PROBES.map(|(id, command, sampling)| Probe {
+                id: id.into(),
+                command: command.into(),
+                sampling: sampling.into(),
+            }),
+        }
     }
 
-    pub(crate) async fn collect(mut self) -> Result<Value> {
+    pub(crate) async fn collect(mut self) -> Result<Report> {
         let plan = self.preview();
         let _lease = self.link.try_lock_triage()?;
         let capture = tokio::time::timeout(DEADLINE, collect(&self.link));
@@ -81,7 +86,119 @@ impl Target {
             _ = self.lease.changed() => bail!("The selected SSH connection closed or changed during triage"),
             result = capture => result.context("Linux triage exceeded its 60-second deadline")??,
         };
-        Ok(json!({ "version": 1, "target": plan, "collection": parse(&bytes)? }))
+        Ok(Report {
+            version: 1,
+            target: plan,
+            collection: parse(&bytes)?,
+        })
+    }
+
+    pub fn collect_blocking(self) -> Result<Report> {
+        super::NETWORK.block_on(self.collect())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Plan {
+    pub connection_generation: u64,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub host_key_fingerprint: String,
+    pub deadline_seconds: u64,
+    pub max_bytes_per_stream: usize,
+    pub probes: [Probe; PROBES.len()],
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Probe {
+    pub id: String,
+    pub command: String,
+    pub sampling: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Report {
+    version: u8,
+    pub target: Plan,
+    pub collection: Collection,
+}
+
+impl Report {
+    pub fn load(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "Choose a regular triage report file"
+        );
+        let mut bytes = Vec::new();
+        file.take(REPORT_BYTES + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= REPORT_BYTES,
+            "The triage report exceeds 3 MiB"
+        );
+        let report: Self =
+            serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
+                .context("Reading the Linux triage report")?;
+        ensure!(
+            report.version == 1,
+            "Unsupported Linux triage report version"
+        );
+        ensure!(
+            report.collection.samples.len() == PROBES.len()
+                && report
+                    .collection
+                    .samples
+                    .iter()
+                    .zip(&report.target.probes)
+                    .zip(PROBES)
+                    .all(|((sample, probe), (id, _, _))| sample.id == id
+                        && probe.id == id
+                        && probe.command.len() <= 256
+                        && probe.sampling.len() <= 512
+                        && sample.stdout.text.len() <= STREAM_BYTES * 3
+                        && sample.stderr.text.len() <= STREAM_BYTES * 3)
+                && [
+                    &report.target.host,
+                    &report.target.user,
+                    &report.target.host_key_fingerprint
+                ]
+                .iter()
+                .all(|text| text.len() <= 4096),
+            "The Linux triage report has invalid sample metadata or output"
+        );
+        Ok(report)
+    }
+
+    pub(crate) fn check_destination(path: &Path) -> Result<&Path> {
+        ensure!(
+            path.is_absolute() && path.file_name().is_some(),
+            "Choose an absolute path for a new triage report"
+        );
+        let parent = path
+            .parent()
+            .context("The triage report has no parent directory")?;
+        ensure!(
+            parent.is_dir(),
+            "The triage report directory does not exist"
+        );
+        ensure!(
+            !path.try_exists()?,
+            "The triage report destination already exists"
+        );
+        Ok(parent)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let directory = Self::check_destination(path)?;
+        let mut staged = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer_pretty(staged.as_file_mut(), self)?;
+        staged.as_file().sync_all()?;
+        staged
+            .persist_noclobber(path)
+            .map_err(|error| error.error)
+            .context("Saving the Linux triage report")?;
+        Ok(())
     }
 }
 
@@ -151,29 +268,41 @@ impl Drop for PendingChannel {
     }
 }
 
-#[derive(Serialize)]
-struct Collection {
-    started_unix_ms: u64,
-    finished_unix_ms: u64,
-    supervisor_status: u32,
-    samples: Vec<Sample>,
+#[derive(Serialize, Deserialize)]
+pub struct Collection {
+    pub started_unix_ms: u64,
+    pub finished_unix_ms: u64,
+    pub supervisor_status: u32,
+    pub samples: Vec<Sample>,
 }
 
-#[derive(Serialize)]
-struct Sample {
-    id: &'static str,
-    started_unix_ms: Option<u64>,
-    finished_unix_ms: Option<u64>,
-    exit_status: Option<u32>,
-    status: &'static str,
-    stdout: Output,
-    stderr: Output,
+#[derive(Serialize, Deserialize)]
+pub struct Sample {
+    pub id: String,
+    pub started_unix_ms: Option<u64>,
+    pub finished_unix_ms: Option<u64>,
+    pub exit_status: Option<u32>,
+    pub status: SampleStatus,
+    pub stdout: Output,
+    pub stderr: Output,
 }
 
-#[derive(Serialize)]
-struct Output {
-    text: String,
-    at_byte_limit: bool,
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SampleStatus {
+    Ok,
+    Missing,
+    TimedOut,
+    Incomplete,
+    OutputLimit,
+    PermissionDenied,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Output {
+    pub text: String,
+    pub at_byte_limit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     base64: Option<String>,
 }
@@ -243,24 +372,24 @@ fn parse(bytes: &[u8]) -> Result<Collection> {
         let stderr = Output::decode(err)?;
         let exit_status = number(code)?;
         let status = match exit_status {
-            Some(0) => "ok",
-            Some(127) => "missing",
-            None if matches!(supervisor_status, 124 | 137) => "timed-out",
-            None => "incomplete",
-            Some(_) if stdout.at_byte_limit || stderr.at_byte_limit => "output-limit",
+            Some(0) => SampleStatus::Ok,
+            Some(127) => SampleStatus::Missing,
+            None if matches!(supervisor_status, 124 | 137) => SampleStatus::TimedOut,
+            None => SampleStatus::Incomplete,
+            Some(_) if stdout.at_byte_limit || stderr.at_byte_limit => SampleStatus::OutputLimit,
             Some(_) => {
                 let message = stderr.text.to_ascii_lowercase();
                 if message.contains("operation not permitted")
                     || message.contains("permission denied")
                 {
-                    "permission-denied"
+                    SampleStatus::PermissionDenied
                 } else {
-                    "failed"
+                    SampleStatus::Failed
                 }
             }
         };
         samples.push(Sample {
-            id,
+            id: id.into(),
             started_unix_ms: number(start)?,
             finished_unix_ms: number(end)?,
             exit_status,

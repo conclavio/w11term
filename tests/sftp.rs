@@ -1882,6 +1882,21 @@ fn registry(session: &Session) -> Registry {
     r
 }
 
+const TRIAGE_RESPONSE: &str = concat!(
+    "w11term-linux-triage-v1\t1000\t2000\t124\n",
+    "uptime\t1000\t1010\t0\tdXB0aW1lCg==\t\n",
+    "dmesg\t1000\t1010\t1\t\tT3BlcmF0aW9uIG5vdCBwZXJtaXR0ZWQ=\n",
+    "vmstat\t1000\t2000\t0\t\t\n",
+    "mpstat\t1000\t1010\t127\t\t\n",
+    "pidstat\t1000\t2000\t0\t\t\n",
+    "iostat\t1000\t2000\t0\t\t\n",
+    "free\t1000\t1010\t0\t\t\n",
+    "sar-dev\t1000\t2000\t0\t\t\n",
+    "sar-tcp\t1000\t-\t-\t\t\n",
+    "top\t1000\t1010\t0\t\t\n",
+    "end\n"
+);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linux_triage_saves_a_generation_bound_report_without_touching_the_shell() {
     let (pane, _, remote, opens, server) = fixture(false).await;
@@ -1916,27 +1931,26 @@ async fn linux_triage_saves_a_generation_bound_report_without_touching_the_shell
             .is_err()
     );
     assert!(!destination.exists());
-    let response = concat!(
-        "w11term-linux-triage-v1\t1000\t2000\t124\n",
-        "uptime\t1000\t1010\t0\tdXB0aW1lCg==\t\n",
-        "dmesg\t1000\t1010\t1\t\tT3BlcmF0aW9uIG5vdCBwZXJtaXR0ZWQ=\n",
-        "vmstat\t1000\t2000\t0\t\t\n",
-        "mpstat\t1000\t1010\t127\t\t\n",
-        "pidstat\t1000\t2000\t0\t\t\n",
-        "iostat\t1000\t2000\t0\t\t\n",
-        "free\t1000\t1010\t0\t\t\n",
-        "sar-dev\t1000\t2000\t0\t\t\n",
-        "sar-tcp\t1000\t-\t-\t\t\n",
-        "top\t1000\t1010\t0\t\t\n",
-        "end\n"
-    );
-    fs::write(remote.path().join("triage-response"), response).unwrap();
+    fs::write(remote.path().join("triage-response"), TRIAGE_RESPONSE).unwrap();
     let result = registry
         .execute(request(generation), capture.clone())
         .await
         .unwrap();
     assert_eq!(result["report_path"], json!(destination));
     let bytes = fs::read(&destination).unwrap();
+    let reopened = w11term::ssh::TriageReport::load(&destination).unwrap();
+    assert_eq!(
+        reopened.collection.samples[1].stderr.text,
+        "Operation not permitted"
+    );
+    let bad = output.path().join("incomplete.json");
+    let mut incomplete: Value = serde_json::from_slice(&bytes).unwrap();
+    incomplete["collection"]["samples"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    fs::write(&bad, serde_json::to_vec(&incomplete).unwrap()).unwrap();
+    assert!(w11term::ssh::TriageReport::load(&bad).is_err());
     let report: Value = serde_json::from_slice(&bytes).unwrap();
     let samples = &report["collection"]["samples"];
     assert_eq!(report["target"], preview["plan"]);

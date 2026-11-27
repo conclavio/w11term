@@ -741,6 +741,7 @@ impl TerminalApp {
         let panel = &mut self.command_reference;
         match action {
             Action::Open | Action::Selection(_) => {
+                self.triage.open = false;
                 if panel.private_page.is_some() || panel.tool_install.is_some() {
                     return;
                 }

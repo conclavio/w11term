@@ -26,7 +26,10 @@ pub use sharing::{ConnectionShare, SshTransport, VerifiedSshPeer, VerifiedSshRou
 pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing, TransportWatch};
 pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};
-pub use triage::Target as TriageTarget;
+pub use triage::{
+    Plan as TriagePlan, Report as TriageReport, SampleStatus as TriageSampleStatus,
+    Target as TriageTarget,
+};
 
 const SESSION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 

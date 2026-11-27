@@ -116,6 +116,7 @@ mod text_diff;
 mod text_export;
 mod text_size;
 mod title_tools;
+mod triage;
 mod visual_bell;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
@@ -1042,6 +1043,7 @@ fn tab_menu_message(label: String) -> Message {
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         command_reference::LABEL => Message::CommandReference(command_reference::Action::Open),
+        triage::LABEL => Message::Triage(triage::Action::Open),
         command_reference::SELECTION => {
             Message::CommandReference(command_reference::Action::Selection(None))
         }
@@ -1349,6 +1351,7 @@ pub struct TerminalApp {
     appearance_error: Option<String>,
     saved_commands: w11term::saved_commands::Commands,
     command_reference: command_reference::Panel,
+    triage: triage::Panel,
     dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     rotation_hover: Option<pane_view::RotationHover>,
@@ -1534,6 +1537,7 @@ pub enum Message {
     Patterns(pattern_settings::Edit),
     SavedCommands(saved_commands::Edit),
     CommandReference(command_reference::Action),
+    Triage(triage::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -4709,6 +4713,7 @@ impl TerminalApp {
                 KeyAction::FindCommandHistory,
             ),
             MenuItem::item("command-reference", command_reference::LABEL),
+            MenuItem::item("linux-triage", triage::LABEL),
             command_menu_item(
                 "command-reference-selection",
                 command_reference::SELECTION,
@@ -5923,6 +5928,7 @@ impl Component for TerminalApp {
             appearance_error,
             saved_commands: Default::default(),
             command_reference: Default::default(),
+            triage: Default::default(),
             dividers: Rc::default(),
             measured_layout: None,
             rotation_hover: None,
@@ -6368,7 +6374,7 @@ impl Component for TerminalApp {
             Message::PickerFromMenu(shortcut) => self.open_picker_from_menu(shortcut, context),
             Message::SetTitleFiles(pane, open) => {
                 if matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
-                    if live.session.pane_id == pane && (live.files.open && !self.command_reference.open) != open)
+                    if live.session.pane_id == pane && (live.files.open && !self.command_reference.open && !self.triage.open) != open)
                 {
                     self.file_action(FileAction::Toggle, context);
                 }
@@ -7753,6 +7759,7 @@ impl Component for TerminalApp {
             Message::Patterns(edit) => self.edit_patterns(edit),
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
             Message::CommandReference(action) => self.command_reference_action(action, context),
+            Message::Triage(action) => self.triage_action(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();
@@ -8512,7 +8519,9 @@ impl Component for TerminalApp {
         } else {
             Border::new().into()
         };
-        let content = if self.command_reference.open {
+        let content = if self.triage.open {
+            self.with_triage(content, context)
+        } else if self.command_reference.open {
             self.with_command_reference(content, context)
         } else {
             self.with_file_drawer(content, context)

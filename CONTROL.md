@@ -1445,6 +1445,8 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 
 ### Collect Linux performance triage
 
+In the Windows app, open **More → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. The report shows the result and output for each sample. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.
+
 Review the verified SSH endpoint, fixed sample commands and limits, then pass the reviewed connection generation when collecting. Choose a new Windows file for the report.
 
 ```powershell
