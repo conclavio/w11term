@@ -1,7 +1,8 @@
 use super::*;
 use std::fmt::Write as _;
-use trace::{Filter, Group, Trace};
+use trace::{Filter, Group, Raw, Trace};
 
+mod handles;
 mod trace;
 
 pub(super) const LABEL: &str = "Syscall trace viewer";
@@ -20,6 +21,7 @@ pub enum Action {
     Select(TabId, usize),
     Groups(TabId, bool),
     Originals(TabId, bool),
+    Handles(handles::Action),
 }
 
 #[derive(Default)]
@@ -33,6 +35,7 @@ pub(super) struct PageState {
     group_page: usize,
     raw_page: usize,
     selected: Option<usize>,
+    descriptors: handles::ViewState,
 }
 
 impl TerminalApp {
@@ -74,6 +77,7 @@ impl TerminalApp {
                             page.loaded = Some(trace);
                             page.query.clear();
                             page.filter = Filter::default();
+                            page.descriptors = Default::default();
                             page.reset_position();
                         }
                         Ok(None) => (),
@@ -134,6 +138,7 @@ impl TerminalApp {
                     );
                 }
             }
+            Action::Handles(action) => self.syscall_handles_action(action, ctx),
             Action::Show => (),
         }
     }
@@ -307,6 +312,10 @@ impl PageState {
             };
             header.push(KeyedView::new("order", TextBlock::new().text(order)));
         }
+        header.push(self.descriptors.switch(id, idle, ctx));
+        if self.descriptors.open {
+            return self.descriptors.view(id, trace, header, idle, ctx);
+        }
         let selected_filter = Filter::CHOICES
             .iter()
             .position(|(_, filter)| *filter == self.filter)
@@ -430,20 +439,7 @@ impl PageState {
             .iter()
             .flat_map(|event| event.originals())
         {
-            let (path, bytes) = trace.original(raw);
-            let file = path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy();
-            let _ = writeln!(original, "{} · Line {}", safe_text(&file), raw.line);
-            let fragment = &bytes[..bytes.len().min(RAW_PREVIEW_BYTES)];
-            original.push_str(&safe_text(
-                String::from_utf8_lossy(fragment).trim_end_matches(['\r', '\n']),
-            ));
-            if bytes.len() > fragment.len() {
-                original.push_str(" [preview clipped]");
-            }
-            original.push_str("\n\n");
+            append_raw(&mut original, trace, raw);
         }
         let detail = format!(
             "Calls {}–{} of {}",
@@ -477,6 +473,23 @@ impl PageState {
                 ),
             ))
     }
+}
+
+fn append_raw(text: &mut String, trace: &Trace, raw: Raw) {
+    let (path, bytes) = trace.original(raw);
+    let file = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    let _ = writeln!(text, "{} · Line {}", safe_text(&file), raw.line);
+    let fragment = &bytes[..bytes.len().min(RAW_PREVIEW_BYTES)];
+    text.push_str(&safe_text(
+        String::from_utf8_lossy(fragment).trim_end_matches(['\r', '\n']),
+    ));
+    if bytes.len() > fragment.len() {
+        text.push_str(" [preview clipped]");
+    }
+    text.push_str("\n\n");
 }
 
 fn group_label(trace: &Trace, index: usize) -> String {

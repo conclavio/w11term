@@ -15,6 +15,10 @@ $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
 $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
 $rawId = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'syscall-original-text')
+$descriptorId = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'descriptor-original-text')
+$edit = [System.Windows.Automation.ControlType]::Edit
+$value = [System.Windows.Automation.ValuePattern]::Pattern
 $byListItem = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $listItem)
 [IO.File]::WriteAllText($profiles, '{"profiles":{}}')
@@ -26,6 +30,12 @@ $byListItem = [System.Windows.Automation.PropertyCondition]::new(
 502 1740000000.002100 execve("/usr/bin/cat", ["cat"], 0x0) = 0 <0.000005>
 501 1740000000.003000 <... read resumed>"b", 1) = 1 <0.000003>
 501 1740000000.004000 openat(AT_FDCWD, "/tmp/missing", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000001>
+501 1740000000.005000 close(3</tmp/retry>) = 0 <0.000001>
+501 1740000000.006000 openat(AT_FDCWD, "/tmp/reused", O_WRONLY) = 3</tmp/reused> <0.000001>
+501 1740000000.007000 write(3</tmp/reused>, "x", 1) = 1 <0.000001>
+501 1740000000.008000 dup(3</tmp/reused>) = 7</tmp/reused> <0.000001>
+501 1740000000.009000 close(7</tmp/reused>) = 0 <0.000001>
+501 1740000000.010000 close(3</tmp/reused>) = 0 <0.000001>
 '@ + [char]10)
 [IO.File]::WriteAllText($first, '1740000010.011000 close(5</tmp/split>) = 0 <0.000002>' + [char]10)
 [IO.File]::WriteAllText($second, '1740000010.001000 open("/tmp/split", O_RDONLY) = 5</tmp/split> <0.000003>' + [char]10)
@@ -53,9 +63,9 @@ function Find-TraceGroup([string]$Pattern) {
     }
 }
 
-function Raw-Text {
+function Raw-Text($Which = $rawId) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-    $raw = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $rawId)
+    $raw = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $Which)
     if ($raw) { $raw.Current.Name }
 }
 
@@ -87,6 +97,39 @@ try {
         (Find-TraceGroup '*openat*"/tmp/missing"*ENOENT*')
     }
     if (Find-TraceGroup '*read*0.005 ms in calls*') { throw 'A successful read survived error filtering' }
+
+    Click 'File descriptors'
+    $field = Wait-Until 'descriptor lifetime search' { Find-Element 'Search descriptor lifetimes' $edit }
+    $field.SetFocus()
+    $field.GetCurrentPattern($value).SetValue('FD 3')
+    $null = Wait-Until 'descriptor filter value applied' {
+        (Find-Element 'Search descriptor lifetimes' $edit).GetCurrentPattern($value).Current.Value -ceq 'FD 3'
+    }
+    Click 'Filter descriptors'
+    $secondOpen = Wait-Until 'reused FD 3 appears as two separate closed lifetimes' {
+        if ((Find-Element "2 descriptor lifetimes${dot}Page 1 of 1") -and
+            (Find-TraceGroup '*/tmp/retry*PID 501*FD 3*Lifetime 1*Closed')) {
+            Find-TraceGroup '*/tmp/reused*PID 501*FD 3*Lifetime 2*Closed'
+        }
+    }
+    $secondOpen.GetCurrentPattern($select).Select()
+    $null = Wait-Until 'new lifetime shows its own write and closing evidence' {
+        $evidence = Raw-Text $descriptorId
+        $evidence -and $evidence.Contains('write(3</tmp/reused>') -and
+            $evidence.Contains('close(3</tmp/reused>)') -and !$evidence.Contains('/tmp/retry')
+    }
+    Click 'Show related lifetimes'
+    $alias = Wait-Until 'duplicate is related only to the new open file' {
+        if (Find-Element "2 descriptor lifetimes${dot}Page 1 of 1") {
+            Find-TraceGroup '*/tmp/reused*PID 501*FD 7*Lifetime 3*Closed'
+        }
+    }
+    $alias.GetCurrentPattern($select).Select()
+    $null = Wait-Until 'original dup and close lines explain the alias' {
+        $evidence = Raw-Text $descriptorId
+        $evidence -and $evidence.Contains('Duplicated from lifetime 2') -and $evidence.Contains('close(7</tmp/reused>)')
+    }
+    Click 'Back to syscall groups'
 
     Open-Trace ('"' + $first + '" "' + $second + '"')
     $null = Wait-Until 'per-process files merged by epoch and opened on the earlier record' {

@@ -8,6 +8,9 @@ use std::{
     sync::Arc,
 };
 
+mod descriptors;
+pub(super) use descriptors::{DescriptorReport, Lifetime};
+
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORDS: usize = 1_000_000;
 const MAX_FILES: usize = 256;
@@ -610,15 +613,19 @@ fn call_end(tail: &str) -> Option<(&str, &str)> {
     ))
 }
 
-fn resource(name: &str, arguments: &str) -> String {
+fn argument_values(arguments: &str) -> impl Iterator<Item = &str> {
     let mut start = 0;
-    let mut args = boundaries(arguments)
+    boundaries(arguments)
         .chain(std::iter::once((arguments.len(), b',')))
-        .map(|(index, _)| {
+        .map(move |(index, _)| {
             let arg = arguments.get(start..index).unwrap_or("").trim();
             start = index.saturating_add(1);
             arg
-        });
+        })
+}
+
+fn resource(name: &str, arguments: &str) -> String {
+    let mut args = argument_values(arguments);
     let first = args.next().unwrap_or("");
     let second = args.next().unwrap_or("");
     let value = match name {
