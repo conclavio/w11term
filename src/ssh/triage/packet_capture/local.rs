@@ -13,7 +13,10 @@ mod compare;
 mod summary;
 pub use compare::CaptureComparison;
 pub use summary::ip_protocol_label;
-use summary::{Bucket, CaptureCounters, Conversations, IpProtocols, PacketStats, Summary};
+use summary::{
+    Bucket, CaptureCounters, Conversations, IpProtocols, PacketStats, Summary,
+    TransportConversations,
+};
 
 pub struct LocalCapture {
     pub path: PathBuf,
@@ -42,6 +45,7 @@ struct Report<'a> {
     timeline: Option<TimelineReport>,
     ip_conversations: &'a Conversations,
     ip_protocols: &'a IpProtocols,
+    transport_conversations: &'a TransportConversations,
     link_types: &'a BTreeSet<u16>,
     complete: bool,
     issue: Option<&'a str>,
@@ -157,6 +161,7 @@ impl LocalCapture {
             }),
             ip_conversations: &summary.conversations,
             ip_protocols: &summary.ip_protocols,
+            transport_conversations: &summary.transport_conversations,
             link_types: &summary.link_types,
             complete: summary.issue.is_none(),
             issue: summary.issue.as_deref(),

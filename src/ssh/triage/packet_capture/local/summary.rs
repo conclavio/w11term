@@ -11,9 +11,11 @@ mod ip;
 mod pcapng;
 mod protocols;
 mod timeline;
+mod transport;
 pub use conversations::{Conversations, Traffic};
 pub use protocols::{IpProtocols, TcpFlags, ip_protocol_label};
 pub use timeline::{Bucket, Timeline};
+pub use transport::TransportConversations;
 
 const MAX_RECORDS: u32 = 1_000_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -27,6 +29,13 @@ pub struct Summary {
     pub timeline: Option<Timeline>,
     pub conversations: Conversations,
     pub ip_protocols: IpProtocols,
+    pub transport_conversations: TransportConversations,
+}
+
+#[derive(Default)]
+struct ConversationScans {
+    ip: conversations::Scan,
+    transport: transport::Scan,
 }
 
 pub struct InterfaceSummary {
@@ -67,7 +76,7 @@ pub struct PacketStats {
 impl Summary {
     pub(super) fn scan(file: &mut (impl Read + Seek), bytes: u64, format: &Format) -> Self {
         let mut summary = Self::default();
-        let mut conversations = conversations::Scan::default();
+        let mut conversations = ConversationScans::default();
         let result = file
             .rewind()
             .map_err(anyhow::Error::from)
@@ -76,7 +85,8 @@ impl Summary {
                 Format::PcapNg => pcapng::scan(&mut summary, file, bytes, &mut conversations),
             });
         summary.issue = result.err().map(|error| format!("{error:#}"));
-        summary.conversations = conversations.finish();
+        summary.conversations = conversations.ip.finish();
+        summary.transport_conversations = conversations.transport.finish();
         summary
     }
 
@@ -84,7 +94,7 @@ impl Summary {
         &mut self,
         file: &mut (impl Read + Seek),
         bytes: u64,
-        conversations: &mut conversations::Scan,
+        conversations: &mut ConversationScans,
     ) -> Result<()> {
         let mut header = [0; 24];
         file.read_exact(&mut header)?;
@@ -138,7 +148,7 @@ impl Summary {
         original: u32,
         timestamp: Option<i128>,
         decoded: Option<ip::Packet>,
-        conversations: &mut conversations::Scan,
+        conversations: &mut ConversationScans,
     ) {
         self.stats.record(captured, original, timestamp);
         self.interfaces[interface]
@@ -149,7 +159,10 @@ impl Summary {
                 .get_or_insert_with(Timeline::default)
                 .record(timestamp, captured);
         }
-        conversations.record(decoded.as_ref().map(|packet| packet.addresses), captured);
+        conversations
+            .ip
+            .record(decoded.as_ref().map(|packet| packet.addresses), captured);
+        conversations.transport.record(decoded.as_ref(), captured);
         self.ip_protocols.record(decoded, captured);
     }
 }

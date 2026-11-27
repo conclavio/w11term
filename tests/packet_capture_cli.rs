@@ -113,6 +113,12 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
                 "fragmented_packets": 0,
                 "tcp_flags": {"decoded_headers": 0, "syn_without_ack": 0, "syn_ack": 0, "rst": 0, "fin": 0}
             },
+            "transport_conversations": {
+                "tracked_pairs": 0,
+                "packets_without_ports": 0,
+                "untracked_packets": 0,
+                "top": []
+            },
             "interfaces": 1,
             "interface_details": [{
                 "section": null,

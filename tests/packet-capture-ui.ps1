@@ -86,18 +86,24 @@ Write-CaptureFixture $conversationCapture 1 @(
     ,([byte[]]($eth4 + $sameVersionTunnel + $ipv4))
 )
 $protocolFrames = [System.Collections.Generic.List[byte[]]]::new()
+$servicePorts = [byte[]]@(0xc0, 0x00, 0x01, 0xbb)
 foreach ($flags in @(0x02, 0x12, 0x04, 0x11, 0x02)) {
     $tcp = [byte[]]($ipv4 + [byte[]]::new(20))
     $tcp[3] = 40
     $tcp[9] = 6
+    [Array]::Copy($servicePorts, 0, $tcp, 20, 4)
     $tcp[32] = 0x50
     $tcp[33] = $flags
     $protocolFrames.Add($tcp)
 }
+$protocolFrames[1][15] = 2
+$protocolFrames[1][19] = 1
+[Array]::Copy([byte[]]@(0x01, 0xbb, 0xc0, 0x00), 0, $protocolFrames[1], 20, 4)
 $protocolFrames[4][7] = 1 # Later IPv4 fragment with bytes that look like a SYN.
 $udp = [byte[]]($ipv4 + [byte[]]::new(8))
 $udp[3] = 28
 $udp[9] = 17
+[Array]::Copy($servicePorts, 0, $udp, 20, 4)
 $udp[25] = 8
 $protocolFrames.Add($udp)
 $icmpv6 = [byte[]]($ipv6 + [byte[]]::new(8))
@@ -455,6 +461,27 @@ try {
         $protocols.tcp_flags.syn_without_ack -ne 1 -or $protocols.tcp_flags.syn_ack -ne 1 -or
         $protocols.tcp_flags.rst -ne 1 -or $protocols.tcp_flags.fin -ne 1) {
         throw 'The CLI protocol report differs from the capture panel'
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    $expander = Open-PacketSection 'packet-transport-conversations'
+    $null = Wait-Until 'TCP and UDP port pairs are displayed separately with directional totals' {
+        (Find-Element "TCP${dot}192.0.2.1:49152 $bothDirections 192.0.2.2:443") -and
+        (Find-Element "UDP${dot}192.0.2.1:49152 $bothDirections 192.0.2.2:443") -and
+        (Find-Element "Tracked transport pairs 2${dot}TCP or UDP packets without ports 1") -and
+        (Find-Element "Packets 4${dot}Captured bytes 160") -and
+        (Find-Element "Left to right 3 packets, 120 bytes${dot}Right to left 1 packets, 40 bytes")
+    }
+    $transport = $summary.transport_conversations
+    $tcp = $transport.top[0]
+    $udp = $transport.top[1]
+    if ($transport.tracked_pairs -ne 2 -or $transport.packets_without_ports -ne 1 -or
+        $transport.untracked_packets -ne 0 -or $tcp.protocol -ne 6 -or $udp.protocol -ne 17 -or
+        $tcp.a -cne '192.0.2.1:49152' -or $tcp.b -cne '192.0.2.2:443' -or
+        $udp.a -cne $tcp.a -or $udp.b -cne $tcp.b -or
+        $tcp.a_to_b.packets -ne 3 -or $tcp.a_to_b.captured_bytes -ne 120 -or
+        $tcp.b_to_a.packets -ne 1 -or $tcp.b_to_a.captured_bytes -ne 40 -or
+        $udp.a_to_b.captured_bytes -ne 28 -or $udp.b_to_a.packets -ne 0) {
+        throw 'The CLI transport report differs from the capture panel'
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'

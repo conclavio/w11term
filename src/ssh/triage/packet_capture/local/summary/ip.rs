@@ -4,6 +4,7 @@ pub(super) const PREFIX_BYTES: usize = 256;
 const IPV4: u16 = 0x0800;
 const IPV6: u16 = 0x86dd;
 pub(super) const TCP: u8 = 6;
+pub(super) const UDP: u8 = 17;
 const MAX_IPV6_EXTENSIONS: usize = 16;
 
 pub(super) type Addresses = (IpAddr, IpAddr);
@@ -13,6 +14,33 @@ pub(super) struct Packet {
     pub protocol: Option<u8>,
     pub tcp_flags: Option<u8>,
     pub fragmented: bool,
+    pub ports: Option<(u16, u16)>,
+}
+
+impl Packet {
+    fn read_transport(&mut self, payload: &[u8]) {
+        match self.protocol {
+            Some(TCP) => {
+                let Some(header) = payload.get(..20) else {
+                    return;
+                };
+                let len = usize::from(header[12] >> 4) * 4;
+                if len >= 20 && len <= payload.len() {
+                    self.ports = Some(port_pair(header));
+                    self.tcp_flags = Some(header[13]);
+                }
+            }
+            Some(UDP) => {
+                let Some(header) = payload.get(..8) else {
+                    return;
+                };
+                if u16::from_be_bytes([header[4], header[5]]) >= 8 {
+                    self.ports = Some(port_pair(header));
+                }
+            }
+            _ => (),
+        }
+    }
 }
 
 pub(super) fn decode(link_type: u16, prefix: &[u8]) -> Option<Packet> {
@@ -75,16 +103,17 @@ fn decode_ip(protocol: u16, ip: &[u8]) -> Option<Packet> {
             let flags_and_offset = u16::from_be_bytes([header[6], header[7]]);
             let protocol = header[9];
             let payload = &ip[header_length..total_length.min(ip.len())];
-            Some(Packet {
+            let mut packet = Packet {
                 addresses: (a.into(), b.into()),
                 protocol: Some(protocol),
-                tcp_flags: if protocol == TCP && flags_and_offset & 0x1fff == 0 {
-                    tcp_flags(payload)
-                } else {
-                    None
-                },
+                tcp_flags: None,
                 fragmented: flags_and_offset & 0x3fff != 0,
-            })
+                ports: None,
+            };
+            if flags_and_offset & 0x1fff == 0 {
+                packet.read_transport(payload);
+            }
+            Some(packet)
         }
         (IPV6, 6) => {
             let a = <[u8; 16]>::try_from(ip.get(8..24)?).ok()?;
@@ -107,13 +136,12 @@ fn ipv6_packet(addresses: Addresses, mut next: u8, mut payload: &[u8]) -> Packet
         protocol: None,
         tcp_flags: None,
         fragmented: false,
+        ports: None,
     };
     for depth in 0..=MAX_IPV6_EXTENSIONS {
         if !ipv6_extension(next) {
             packet.protocol = Some(next);
-            if next == TCP {
-                packet.tcp_flags = tcp_flags(payload);
-            }
+            packet.read_transport(payload);
             break;
         }
         if depth == MAX_IPV6_EXTENSIONS {
@@ -156,10 +184,11 @@ fn ipv6_extension(number: u8) -> bool {
     matches!(number, 0 | 43 | 44 | 51 | 60 | 135 | 139 | 140 | 253 | 254)
 }
 
-fn tcp_flags(payload: &[u8]) -> Option<u8> {
-    let header = payload.get(..20)?;
-    let len = usize::from(header[12] >> 4) * 4;
-    (len >= 20 && len <= payload.len()).then_some(header[13])
+fn port_pair(header: &[u8]) -> (u16, u16) {
+    (
+        u16::from_be_bytes([header[0], header[1]]),
+        u16::from_be_bytes([header[2], header[3]]),
+    )
 }
 
 fn be16(bytes: &[u8]) -> Option<u16> {
@@ -226,9 +255,14 @@ mod tests {
         packet[0] = 0x46; // IPv4 options precede TCP.
         packet[3] = 48;
         packet[9] = TCP;
+        packet[24..28].copy_from_slice(&[0xc0, 0x00, 0x01, 0xbb]);
         packet[36] = 0x60;
         packet[37] = 0x12;
         assert_eq!(super::decode(101, &packet).unwrap().tcp_flags, Some(0x12));
+        assert_eq!(
+            super::decode(101, &packet).unwrap().ports,
+            Some((49152, 443))
+        );
         assert_eq!(super::decode(101, &packet[..47]).unwrap().tcp_flags, None);
         packet[3] = 44;
         assert_eq!(super::decode(101, &packet).unwrap().tcp_flags, None);
@@ -240,6 +274,31 @@ mod tests {
         let later = super::decode(101, &packet).unwrap();
         assert_eq!(later.protocol, Some(TCP));
         assert_eq!(later.tcp_flags, None);
+        assert_eq!(later.ports, None);
+    }
+
+    #[test]
+    fn reads_udp_ports_after_ipv6_extensions_only_when_the_udp_header_is_available() {
+        let mut packet = [0; 56];
+        packet[0] = 0x60;
+        packet[5] = 24; // The UDP payload itself was not captured.
+        packet[6] = 60;
+        packet[40] = UDP;
+        packet[48..56].copy_from_slice(&[0x00, 0x00, 0x14, 0xe9, 0x00, 0x10, 0x00, 0x00]);
+        let decoded = super::decode(101, &packet).unwrap();
+        assert_eq!(decoded.protocol, Some(UDP));
+        assert_eq!(decoded.ports, Some((0, 5353)));
+        assert_eq!(decoded.tcp_flags, None);
+        assert_eq!(super::decode(101, &packet[..55]).unwrap().ports, None);
+        packet[53] = 7;
+        assert_eq!(super::decode(101, &packet).unwrap().ports, None);
+        packet[53] = 16;
+        packet[6] = 44;
+        packet[43] = 8;
+        let fragment = super::decode(101, &packet).unwrap();
+        assert_eq!(fragment.protocol, Some(UDP));
+        assert!(fragment.fragmented);
+        assert_eq!(fragment.ports, None);
     }
 
     #[test]

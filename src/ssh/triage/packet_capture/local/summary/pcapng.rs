@@ -1,6 +1,6 @@
 use super::{
-    CaptureCounters, CounterSnapshot, InterfaceSummary, NANOS_PER_SECOND, PacketStats, Summary,
-    check_record_limit, conversations, ip,
+    CaptureCounters, ConversationScans, CounterSnapshot, InterfaceSummary, NANOS_PER_SECOND,
+    PacketStats, Summary, check_record_limit, ip,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{Read, Seek};
@@ -91,7 +91,7 @@ pub(super) fn scan(
     summary: &mut Summary,
     file: &mut (impl Read + Seek),
     mut remaining: u64,
-    conversations: &mut conversations::Scan,
+    conversations: &mut ConversationScans,
 ) -> Result<()> {
     let mut order = None;
     let mut interfaces = Vec::new();

@@ -41,6 +41,7 @@ pub enum Action {
     SelectTimelineInterval(PathBuf, usize),
     ProtocolsExpanded(bool),
     ConversationsExpanded(bool),
+    TransportConversationsExpanded(bool),
     SelectConversation(PathBuf, Option<usize>),
     LimitConversationInterval(PathBuf, bool),
     Tmpfs(bool),
@@ -208,6 +209,7 @@ pub(super) struct Panel {
     timeline_interval: Option<usize>,
     protocols_expanded: bool,
     conversations_expanded: bool,
+    transport_conversations_expanded: bool,
     selected_conversation: Option<usize>,
     limit_conversation_interval: bool,
     wireshark: Option<PathBuf>,
@@ -255,6 +257,7 @@ impl Panel {
         self.timeline_interval = None;
         self.protocols_expanded = false;
         self.conversations_expanded = false;
+        self.transport_conversations_expanded = false;
         self.selected_conversation = None;
         self.limit_conversation_interval = false;
         self.activity = None;
@@ -841,6 +844,61 @@ impl Panel {
                         ]),
                 ));
             }
+            let transport = &summary.transport_conversations;
+            if transport.tracked_pairs != 0 || transport.packets_without_ports != 0 {
+                let mut rows = Vec::new();
+                if self.transport_conversations_expanded {
+                    rows.push(text(
+                        "coverage",
+                        format!(
+                            "Tracked transport pairs {} · TCP or UDP packets without ports {}",
+                            transport.tracked_pairs, transport.packets_without_ports,
+                        ),
+                    ));
+                    if transport.untracked_packets != 0 {
+                        rows.push(text(
+                            "limit",
+                            format!("Transport pair limit reached · {} packets omitted from the ranking", transport.untracked_packets),
+                        ));
+                    }
+                    rows.extend(transport.top.iter().map(|pair| {
+                        let label = format!("{} · {} ↔ {}", ip_protocol_label(pair.protocol), pair.a, pair.b);
+                        let total = pair.total();
+                        KeyedView::new(
+                            label.clone(),
+                            StackPanel::new().spacing(3.0).keyed_children([
+                                text("endpoints", label),
+                                text("totals", format!("Packets {} · Captured bytes {}", total.packets, total.captured_bytes)),
+                                text("directions", format!(
+                                    "Left to right {} packets, {} bytes · Right to left {} packets, {} bytes",
+                                    pair.a_to_b.packets, pair.a_to_b.captured_bytes,
+                                    pair.b_to_a.packets, pair.b_to_a.captured_bytes,
+                                )),
+                            ]),
+                        )
+                    }));
+                }
+                files.push(KeyedView::new(
+                    "local-transport",
+                    Expander::new()
+                        .automation_name("TCP and UDP conversations")
+                        .automation_id("packet-transport-conversations")
+                        .is_expanded(self.transport_conversations_expanded)
+                        .on_is_expanded_changed(ctx.callback(|expanded| {
+                            message(Action::TransportConversationsExpanded(expanded))
+                        }))
+                        .slots([
+                            SlotView::new(
+                                ExpanderSlot::Header,
+                                TextBlock::new().text("TCP and UDP conversations"),
+                            ),
+                            SlotView::new(
+                                ExpanderSlot::Content,
+                                StackPanel::new().spacing(6.0).keyed_children(rows),
+                            ),
+                        ]),
+                ));
+            }
             if !summary.interfaces.is_empty() {
                 let mut types: Vec<_> = summary
                     .link_types
@@ -1096,6 +1154,7 @@ impl TerminalApp {
                             Action::SelectConversation(..)
                                 | Action::ProtocolsExpanded(_)
                                 | Action::ConversationsExpanded(_)
+                                | Action::TransportConversationsExpanded(_)
                                 | Action::Comparison(_, compare::Change::Pair { .. })
                                 | Action::Comparison(_, compare::Change::ProtocolsExpanded(_))
                         )) =>
@@ -1155,6 +1214,9 @@ impl TerminalApp {
             Action::TimelineExpanded(expanded) => panel.timeline_expanded = expanded,
             Action::ProtocolsExpanded(expanded) => panel.protocols_expanded = expanded,
             Action::ConversationsExpanded(expanded) => panel.conversations_expanded = expanded,
+            Action::TransportConversationsExpanded(expanded) => {
+                panel.transport_conversations_expanded = expanded;
+            }
             Action::SelectConversation(path, index) => {
                 if let Some(LoadedCapture::Local(capture)) = &panel.loaded
                     && capture.path == path
