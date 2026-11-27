@@ -71,7 +71,7 @@ Open **More → Command reference** to browse short tldr-pages manuals beside th
 
 Use **Settings → Edit profile → SSH tools** to sync an approved bundle of Linux utilities before login or reconnect. The profile can append its launcher directory to Bash or Zsh's `PATH`. The control CLI can preview, install, and roll back bundles on an existing SSH connection. [SSH tool bundle setup](CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
-Use `w11term-cli fetch-tool-bundle` to download pinned Linux executables to the Windows cache. The starter bundle includes `rg`, `jq`, `dust`, and `hyperfine` for x86-64 and ARM64. [Download a pinned SSH tool bundle](CONTROL.md#download-a-pinned-ssh-tool-bundle)
+Choose **Use Linux essentials** in the profile editor to prepare `rg`, `jq`, `dust`, and `hyperfine` for Linux x86-64 and ARM64. `w11term-cli fetch-tool-bundle` can also download pinned builds to the Windows cache. [Download a pinned SSH tool bundle](CONTROL.md#download-a-pinned-ssh-tool-bundle)
 
 Choose **Copy** to copy an example, or **Edit example** to fill in its placeholders. **Insert into terminal** puts the edited text in the selected writable shell. Press Enter in the terminal when you are ready to run it. English pages are available offline on first launch. **Update pages** downloads the latest English archive from tldr-pages and keeps the current pages available if the update fails. For private commands, put TLDR-format Markdown in `%LOCALAPPDATA%\w11term\command-reference\pages\<platform>\<command>.md` before opening the panel. Use an upstream platform directory name such as `common`, `linux`, or `windows`. [tldr-pages](https://github.com/tldr-pages/tldr)
 

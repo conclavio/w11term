@@ -2,7 +2,10 @@ use super::*;
 use std::path::PathBuf;
 use w11term::{
     options::{ToolPath, ToolSync},
-    sftp::{DotfileShell, UtilityBundle, validate_dotfiles_home, validate_zdotdir},
+    sftp::{
+        DotfileShell, UtilityBundle, prepare_starter_tool_bundle, validate_dotfiles_home,
+        validate_zdotdir,
+    },
 };
 
 const TITLE: &str = "SSH tools";
@@ -22,6 +25,8 @@ pub enum Action {
     PathMode(Option<usize>),
     Browse,
     Picked(Arc<()>, Result<Option<String>, String>),
+    Starter,
+    StarterFinished(Arc<()>, Result<String, String>),
     Review,
     Reviewed(Arc<()>, Result<Box<ToolSync>, String>),
     Approve,
@@ -39,7 +44,8 @@ pub(super) struct Editor {
     approved: Option<Box<ToolSync>>,
     reviewed: Option<Box<ToolSync>>,
     work: Option<Arc<()>>,
-    error: Option<String>,
+    starter: Option<(Arc<()>, ComponentTask)>,
+    feedback: Option<String>,
 }
 
 impl Editor {
@@ -123,7 +129,7 @@ impl Editor {
     fn edited(&mut self) {
         self.reviewed = None;
         self.work = None;
-        self.error = None;
+        self.feedback = None;
     }
 
     pub(super) fn view(
@@ -155,7 +161,11 @@ impl Editor {
             .approved
             .as_ref()
             .filter(|settings| self.agrees(settings, draft, base));
-        let status = if let Some(settings) = reviewed {
+        let status = if self.starter.is_some() {
+            "Preparing verified Linux builds for x86-64 and ARM64…".into()
+        } else if let Some(feedback) = &self.feedback {
+            feedback.clone()
+        } else if let Some(settings) = reviewed {
             format!(
                 "{} → {}@{}:{} · {}/{}",
                 settings.name,
@@ -172,6 +182,7 @@ impl Editor {
         } else {
             "Tool sync off".into()
         };
+        let idle = self.work.is_none() && self.starter.is_none();
         let mut fields = vec![
             KeyedView::new(
                 "bundle",
@@ -184,10 +195,23 @@ impl Editor {
             ),
             KeyedView::new(
                 "browse",
-                Button::new()
-                    .is_enabled(self.work.is_none())
-                    .on_click(send(Action::Browse))
-                    .content("Browse for tool bundle"),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .is_enabled(idle)
+                            .on_click(send(Action::Browse))
+                            .content("Browse for tool bundle"),
+                        Button::new()
+                            .is_enabled(self.work.is_none())
+                            .on_click(send(Action::Starter))
+                            .content(if self.starter.is_some() {
+                                "Cancel tool download"
+                            } else {
+                                "Use Linux essentials"
+                            }),
+                    )),
             ),
             KeyedView::new(
                 "home",
@@ -240,11 +264,11 @@ impl Editor {
                     .spacing(8.0)
                     .children((
                         Button::new()
-                            .is_enabled(self.work.is_none())
+                            .is_enabled(idle)
                             .on_click(send(Action::Review))
                             .content("Review tool bundle"),
                         Button::new()
-                            .is_enabled(reviewed.is_some())
+                            .is_enabled(self.starter.is_none() && reviewed.is_some())
                             .on_click(send(Action::Approve))
                             .content("Approve tool sync"),
                         Button::new()
@@ -256,7 +280,7 @@ impl Editor {
             KeyedView::new(
                 "status",
                 TextBlock::new()
-                    .text(self.error.as_deref().unwrap_or(&status))
+                    .text(status)
                     .text_wrapping(TextWrapping::Wrap),
             ),
         ]);
@@ -312,9 +336,16 @@ impl TerminalApp {
                 if *slot != value {
                     *slot = value;
                     editor.edited();
+                    if matches!(field, Field::Bundle)
+                        && let Some((_, task)) = editor.starter.take()
+                    {
+                        task.cancel();
+                    }
                 }
             }
-            Action::Browse if draft.tool_bundle.work.is_none() => {
+            Action::Browse
+                if draft.tool_bundle.work.is_none() && draft.tool_bundle.starter.is_none() =>
+            {
                 let Some(owner) = owner else { return };
                 let text = draft.tool_bundle.bundle.trim();
                 let current: PathBuf = if text.is_empty() {
@@ -354,11 +385,67 @@ impl TerminalApp {
                     rejected,
                 );
             }
-            Action::Review if draft.tool_bundle.work.is_none() => {
+            Action::Starter if draft.tool_bundle.work.is_none() => {
+                let editor = &mut draft.tool_bundle;
+                if let Some((_, task)) = editor.starter.take() {
+                    task.cancel();
+                    editor.feedback = Some("Tool download cancelled".into());
+                    return;
+                }
+                editor.feedback = None;
+                let request = Arc::new(());
+                let rejected = Message::ProfileTools(
+                    id,
+                    Action::StarterFinished(
+                        request.clone(),
+                        Err("Tool download unavailable".into()),
+                    ),
+                );
+                let work_request = request.clone();
+                let task = ctx.spawn_background_with_rejection(
+                    move |cancel| {
+                        let result = prepare_starter_tool_bundle(|| cancel.is_cancelled())
+                            .and_then(|path| {
+                                path.into_os_string().into_string().map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "The starter manifest path cannot be represented as text"
+                                    )
+                                })
+                            })
+                            .map_err(|error| format!("{error:#}"));
+                        Message::ProfileTools(id, Action::StarterFinished(work_request, result))
+                    },
+                    rejected,
+                );
+                editor.starter = Some((request, task));
+            }
+            Action::StarterFinished(request, result) => {
+                let editor = &mut draft.tool_bundle;
+                if editor
+                    .starter
+                    .take_if(|(current, _)| Arc::ptr_eq(current, &request))
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(path) => {
+                        editor.bundle = path;
+                        editor.edited();
+                        editor.feedback = Some(
+                            "Linux essentials is ready. Review the bundle to approve sync.".into(),
+                        );
+                    }
+                    Err(error) => editor.feedback = Some(error),
+                }
+            }
+            Action::Review
+                if draft.tool_bundle.work.is_none() && draft.tool_bundle.starter.is_none() =>
+            {
                 let mut settings = match draft.tool_bundle.candidate(draft, base) {
                     Ok(settings) => Box::new(settings),
                     Err(error) => {
-                        draft.tool_bundle.error = Some(format!("{error:#}"));
+                        draft.tool_bundle.feedback = Some(format!("{error:#}"));
                         return;
                     }
                 };
@@ -398,7 +485,7 @@ impl TerminalApp {
                         editor.edited();
                     }
                     Ok(None) => (),
-                    Err(error) => editor.error = Some(error),
+                    Err(error) => editor.feedback = Some(error),
                 }
             }
             Action::Reviewed(request, result) => {
@@ -415,15 +502,15 @@ impl TerminalApp {
                         draft.tool_bundle.reviewed = Some(scope)
                     }
                     Ok(_) => (),
-                    Err(error) => draft.tool_bundle.error = Some(error),
+                    Err(error) => draft.tool_bundle.feedback = Some(error),
                 }
             }
-            Action::Approve => {
+            Action::Approve if draft.tool_bundle.starter.is_none() => {
                 if let Some(scope) = draft.tool_bundle.reviewed.take()
                     && draft.tool_bundle.agrees(&scope, draft, base)
                 {
                     draft.tool_bundle.approved = Some(scope);
-                    draft.tool_bundle.error = None;
+                    draft.tool_bundle.feedback = None;
                     draft.saved = false;
                 }
             }
@@ -432,7 +519,7 @@ impl TerminalApp {
                 draft.tool_bundle.approved = None;
                 draft.saved = false;
             }
-            Action::Browse | Action::Review => (),
+            Action::Browse | Action::Review | Action::Starter | Action::Approve => (),
         }
     }
 }

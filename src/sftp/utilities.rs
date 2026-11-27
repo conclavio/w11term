@@ -7,7 +7,9 @@ mod downloads;
 mod install;
 mod login;
 use build::{LibcVersion, Verified};
-pub use downloads::{UtilityDownload, fetch_tool_bundle};
+pub use downloads::{
+    UtilityDownload, export_starter_tool_bundle, fetch_tool_bundle, prepare_starter_tool_bundle,
+};
 use install::{InstallPlan, Release, StoredTool};
 pub(crate) use login::sync_login_tools;
 

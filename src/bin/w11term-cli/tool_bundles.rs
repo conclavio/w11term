@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::{io::Write, path::Path};
-use w11term::sftp::{UtilityArchitecture, UtilityBundle, fetch_tool_bundle};
+use std::path::Path;
+use w11term::sftp::{
+    UtilityArchitecture, UtilityBundle, export_starter_tool_bundle, fetch_tool_bundle,
+};
 
 pub const HELP: &str = "w11term-cli fetch-tool-bundle BUNDLE.json [--architecture x86_64|aarch64]\n\
 w11term-cli fetch-tool-bundle --example NEW_BUNDLE.json";
-
-const EXAMPLE: &str = include_str!("../../../examples/tool-bundles/essentials.json");
 
 pub fn run(args: &[String]) -> Result<Value> {
     match args {
@@ -31,17 +31,7 @@ fn fetch(file: &str, architecture: Option<UtilityArchitecture>) -> Result<Value>
 }
 
 fn write_example(path: &Path) -> Result<Value> {
-    let path = std::path::absolute(path)?;
-    let parent = path
-        .parent()
-        .context("Choose a file for the example tool bundle")?;
-    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-    staged.write_all(EXAMPLE.as_bytes())?;
-    staged.as_file().sync_all()?;
-    staged
-        .persist_noclobber(&path)
-        .context("Writing a new example tool bundle")?;
-    Ok(json!({"manifest": path}))
+    Ok(json!({"manifest": export_starter_tool_bundle(path)?}))
 }
 
 #[cfg(test)]

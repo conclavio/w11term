@@ -51,6 +51,14 @@ function Wait-Browse {
         $control -and $control.Current.IsEnabled
     }
 }
+function File-Sha256([string]$Path) {
+    $hash = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        [BitConverter]::ToString($hash.ComputeHash([IO.File]::ReadAllBytes($Path))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $hash.Dispose()
+    }
+}
 function Pick-Key([string]$Name) {
     Click $browseLabel
     $dialog = Wait-Until 'owned SSH key picker' { Find-OwnedDialog $pickTitle }
@@ -160,6 +168,22 @@ try {
         $field = Find-Element 'Tool bundle manifest' $edit
         if ($field) { [FixtureDialog]::SameFile($toolBundle, $field.GetCurrentPattern($value).Current.Value) }
     }
+    $example = Join-Path $PSScriptRoot '../examples/tool-bundles/essentials.json'
+    $starterDigest = File-Sha256 $example
+    $starterDirectory = Join-Path $env:W11TERM_DATA_DIR "tools/bundles/$starterDigest"
+    $starterManifest = Join-Path $starterDirectory 'linux-essentials.json'
+    $null = [IO.Directory]::CreateDirectory($starterDirectory)
+    [IO.File]::WriteAllText($starterManifest, 'edited starter')
+    Click 'Use Linux essentials'
+    $null = Wait-Until 'edited starter reported without downloading' {
+        Find-Element 'The saved Linux essentials manifest was modified. Browse for that manifest to use your copy, or move it aside and retry.'
+    }
+    $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+    if (![FixtureDialog]::SameFile($toolBundle, $toolField) -or
+        [IO.File]::ReadAllText($starterManifest) -cne 'edited starter') {
+        throw 'Preparing the starter overwrote an existing manifest or changed the draft on failure'
+    }
+    [IO.File]::Delete($starterManifest)
     Set-Field 'Tool bundle SFTP home' '/home/test'
     Set-Field 'Tool bundle host-key fingerprint' $fingerprint
     $pathMode = Wait-Until 'tool PATH selector' { Find-Element 'Tool bundle shell PATH' $combo }
@@ -187,6 +211,42 @@ try {
     Click 'Save profile changes'
     $null = Wait-Until 'tool approvals removed' {
         !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle)
+    }
+
+    if ($env:W11TERM_VERIFY_STARTER_DOWNLOAD -eq '1') {
+        Click 'Use Linux essentials'
+        Click 'Cancel tool download'
+        $null = Wait-Until 'starter download cancelled' { Find-Element 'Tool download cancelled' }
+        $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+        if (![FixtureDialog]::SameFile($toolBundle, $toolField)) { throw 'Cancelling changed the selected manifest' }
+
+        Click 'Use Linux essentials'
+        $null = Wait-Until 'verified starter builds ready' {
+            Find-Element 'Linux essentials is ready. Review the bundle to approve sync.'
+        }
+        $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+        if (![FixtureDialog]::SameFile($starterManifest, $toolField)) { throw 'Starter manifest was not selected' }
+        $starter = [IO.File]::ReadAllText($starterManifest) | ConvertFrom-Json
+        if (@($starter.tools.builds).Count -ne 8) { throw 'Expected eight builds in the starter manifest' }
+        foreach ($build in $starter.tools.builds) {
+            $cached = Join-Path $env:W11TERM_DATA_DIR "tools/cache/v1/$($build.sha256)"
+            if ((File-Sha256 $cached) -cne $build.sha256) {
+                throw "Starter cache did not contain the pinned $($build.architecture) build"
+            }
+        }
+        if (([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle) {
+            throw 'Selecting the starter authorized deployment before review'
+        }
+        Click 'Review tool bundle'
+        $review = 'linux-essentials ' + [char]0x2192 + ' test@example.test:22 ' + [char]0x00b7 + ' /home/test/.local/bin'
+        $null = Wait-Until 'starter destination reviewed' { Find-Element $review }
+        Click 'Approve tool sync'
+        Click 'Save profile changes'
+        $null = Wait-Until 'starter approval saved' {
+            $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+            $tools.name -ceq 'linux-essentials' -and $tools.add_to_path.shell -ceq 'bash' -and
+                [FixtureDialog]::SameFile($starterManifest, $tools.bundle)
+        }
     }
 } finally {
     if (!$app.HasExited) {

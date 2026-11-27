@@ -4,6 +4,7 @@ use std::io::{Cursor, Write};
 const MAX_RESOURCE: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_PLAIN: u64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
+const STARTER_MANIFEST: &[u8] = include_bytes!("../../../examples/tool-bundles/essentials.json");
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "format", rename_all = "kebab-case", deny_unknown_fields)]
@@ -172,6 +173,60 @@ pub(super) fn cache_dir() -> Result<PathBuf> {
         .join("v1"))
 }
 
+/// Export the built-in Linux essentials manifest without overwriting a file.
+pub fn export_starter_tool_bundle(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    write_starter_manifest(&path, false)?;
+    Ok(path)
+}
+
+/// Select a version of the starter manifest and cache its builds on Windows.
+pub fn prepare_starter_tool_bundle(cancelled: impl Fn() -> bool) -> Result<PathBuf> {
+    ensure!(!cancelled(), "Tool download cancelled");
+    let manifest = managed_starter_manifest(&crate::keys::data_dir()?)?;
+    let bundle =
+        serde_json::from_slice(STARTER_MANIFEST).context("Reading the built-in tool bundle")?;
+    fetch_bundle_at(&bundle, None, &cache_dir()?, |url, limit| {
+        crate::https::get(url, limit, &cancelled)
+    })?;
+    ensure!(!cancelled(), "Tool download cancelled");
+    Ok(manifest)
+}
+
+fn managed_starter_manifest(data: &Path) -> Result<PathBuf> {
+    // Keep each app version's pins available to profiles that already reference them.
+    let digest = digest_hex(Sha256::new_with_prefix(STARTER_MANIFEST));
+    let directory = data.join("tools").join("bundles").join(digest);
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("linux-essentials.json");
+    write_starter_manifest(&path, true)?;
+    Ok(path)
+}
+
+fn write_starter_manifest(path: &Path, reuse: bool) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Choose a file for the starter tool bundle")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(STARTER_MANIFEST)?;
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if reuse && error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut existing = Vec::new();
+            std::fs::File::open(path)?
+                .take(STARTER_MANIFEST.len() as u64 + 1)
+                .read_to_end(&mut existing)?;
+            ensure!(
+                existing == STARTER_MANIFEST,
+                "The saved Linux essentials manifest was modified. Browse for that manifest to use your copy, or move it aside and retry."
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.error).context("Writing a new starter tool bundle"),
+    }
+}
+
 /// Cache a bundle's pinned downloads locally. No SSH pane is required.
 pub fn fetch_tool_bundle(
     bundle: &UtilityBundle,
@@ -281,6 +336,24 @@ fn charge(bytes: &[u8], remaining: &mut u64) -> Result<()> {
 mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
+
+    #[test]
+    fn managed_starter_reuses_only_the_exact_builtin_manifest() {
+        let data = tempfile::tempdir().unwrap();
+        let path = managed_starter_manifest(data.path()).unwrap();
+        assert_eq!(
+            path.parent().unwrap().file_name().unwrap(),
+            digest(STARTER_MANIFEST).as_str()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), STARTER_MANIFEST);
+        assert_eq!(UtilityBundle::load(&path).unwrap().name, "linux-essentials");
+        assert_eq!(managed_starter_manifest(data.path()).unwrap(), path);
+
+        std::fs::write(&path, "user edit").unwrap();
+        let error = managed_starter_manifest(data.path()).unwrap_err();
+        assert!(error.to_string().contains("manifest was modified"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user edit");
+    }
 
     fn digest(bytes: &[u8]) -> String {
         digest_hex(Sha256::new_with_prefix(bytes))

@@ -1329,6 +1329,8 @@ A reviewed manual switch holds the chosen bundle on later logins, including when
 
 ### Download a pinned SSH tool bundle
 
+In **Settings → Edit profile → SSH tools**, choose **Use Linux essentials** to download the starter builds and select the manifest in the editor. The downloads run in the background. When they finish, review the host and account, approve sync, and save the profile. A new version of the built-in starter uses a new manifest, so earlier approvals keep their pins until you select and approve the new version.
+
 Export the starter manifest and fetch its pinned Linux builds from their upstream HTTPS releases. The starter includes `rg`, `jq`, `dust`, and `hyperfine` for `x86_64` and `aarch64`. Omit `--architecture` to fetch both architectures.
 
 ```powershell
