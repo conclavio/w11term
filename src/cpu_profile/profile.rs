@@ -174,6 +174,10 @@ impl Profile {
         id < self.frames.len()
     }
 
+    pub(super) fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
     pub fn row(&self, zoom: usize, depth: usize) -> &[usize] {
         let root = self.frame(zoom);
         let Some(frames) = self.rows.get(root.depth + depth) else {

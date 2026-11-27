@@ -2,6 +2,7 @@ use super::Profile;
 use super::profile::{symbol_pattern, symbol_query};
 use std::{
     cmp::{Ordering, Reverse},
+    num::NonZeroUsize,
     path::PathBuf,
     sync::Arc,
 };
@@ -13,6 +14,7 @@ pub struct Comparison {
     paths: [PathBuf; 2],
     totals: [u64; 2],
     changes: Vec<Change>,
+    frame_changes: [Box<[Option<NonZeroUsize>]>; 2],
 }
 
 pub struct Change {
@@ -69,11 +71,23 @@ impl Comparison {
             }
         }
         changes.sort_unstable_by_key(|change| (Reverse(change.magnitude), change.frames));
+        let mut frame_changes = profiles
+            .each_ref()
+            .map(|profile| vec![None; profile.frame_count()].into_boxed_slice());
+        for (index, change) in changes.iter().enumerate() {
+            let change_id = NonZeroUsize::new(index + 1);
+            for (side, frame) in change.frame_ids().into_iter().enumerate() {
+                if let Some(frame) = frame {
+                    frame_changes[side][frame] = change_id;
+                }
+            }
+        }
         Self {
             profiles,
             paths,
             totals,
             changes,
+            frame_changes,
         }
     }
 
@@ -91,6 +105,11 @@ impl Comparison {
 
     pub fn changes(&self) -> &[Change] {
         &self.changes
+    }
+
+    pub fn change_at_frame(&self, side: usize, frame: usize) -> Option<&Change> {
+        let index = self.frame_changes.get(side)?.get(frame)?.as_ref()?.get() - 1;
+        Some(&self.changes[index])
     }
 
     pub fn filter(self: &Arc<Self>, query: &str) -> FilteredComparison {
@@ -123,7 +142,7 @@ impl Comparison {
         }
     }
 
-    fn delta_points(&self, change: &Change) -> f64 {
+    pub fn delta_points(&self, change: &Change) -> f64 {
         let denominator = u128::from(self.totals[0]) * u128::from(self.totals[1]);
         let pp = 100.0 * (change.magnitude as f64 / denominator as f64);
         if change.increased { pp } else { -pp }

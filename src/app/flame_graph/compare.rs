@@ -17,14 +17,14 @@ pub enum Action {
     Select(Arc<Comparison>, usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProfileSide {
     Before,
     After,
 }
 
 impl ProfileSide {
-    fn index(self) -> usize {
+    pub(super) fn index(self) -> usize {
         self as usize
     }
 
@@ -32,6 +32,13 @@ impl ProfileSide {
         match self {
             Self::Before => "Before profile",
             Self::After => "After profile",
+        }
+    }
+
+    pub(super) fn widths(self) -> &'static str {
+        match self {
+            Self::Before => "Before widths",
+            Self::After => "After widths",
         }
     }
 }
@@ -178,6 +185,13 @@ impl ViewState {
                     .is_enabled(idle && export_idle)
                     .on_click(send(|| Action::Export))
                     .content("Export comparison…"),
+            ),
+            KeyedView::new(
+                "compare-differential",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(ctx.callback(|_| message(super::Action::Differential)))
+                    .content("Differential flame graph"),
             ),
         ];
         if comparison.changes().is_empty() {

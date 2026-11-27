@@ -8,6 +8,8 @@ $folded = Join-Path $State 'worker profile.folded'
 $after = Join-Path $State 'after recording.folded'
 $svgPath = Join-Path $State 'hot branch.svg'
 $inspectedSvg = Join-Path $State 'after hot branch.svg'
+$diffAfterSvg = Join-Path $State 'diff after.svg'
+$diffBeforeSvg = Join-Path $State 'diff before.svg'
 $comparisonPath = Join-Path $State 'filtered CPU comparison.json'
 $dot = ' ' + [char]0xb7 + ' '
 $arrow = ' ' + [char]0x2192 + ' '
@@ -19,6 +21,25 @@ function Click-GraphButton([string]$Name) {
         $item = Find-Element $Name $button
         if ($item -and $item.Current.IsEnabled) { $item }
     })
+}
+
+function Export-DifferentialSvg([string]$Path) {
+    Click-GraphButton 'Export SVG'
+    $dialog = Wait-Until 'owned differential graph export dialog' { Find-OwnedDialog 'Export CPU flame graph' }
+    $null = Wait-Until 'enter the differential graph destination' {
+        [FixtureDialog]::SetFilename($dialog, $Path, 'cpu-flame-graph.svg')
+    }
+    $null = Wait-Until 'save the differential graph' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'differential SVG written' { (Find-Element 'Saved flame graph SVG') -and [IO.File]::Exists($Path) }
+    [xml][IO.File]::ReadAllText($Path)
+}
+
+function Find-SvgFrame([xml]$Svg, [string]$Symbol) {
+    foreach ($title in $Svg.GetElementsByTagName('title', 'http://www.w3.org/2000/svg')) {
+        if ($title.InnerText.StartsWith("$Symbol ") -and $title.ParentNode.LocalName -eq 'g') {
+            return ,$title.ParentNode
+        }
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -170,6 +191,48 @@ try {
     if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliPath)) -cne
         [Convert]::ToBase64String([IO.File]::ReadAllBytes($comparisonPath))) {
         throw 'CLI comparison differs from the GUI export with the same profiles and filter'
+    }
+    Click-GraphButton 'Differential flame graph'
+    $null = Wait-Until 'differential opens with the after recording widths' {
+        (Find-Element 'Differential CPU flame graph') -and (Find-Element 'After profile') -and
+            (Find-Element 'CPU flame graph chart') -and
+            (Find-Element "All samples${dot}20 samples${dot}100.0% of capture")
+    }
+    $svgAfter = Export-DifferentialSvg $diffAfterSvg
+    $readFrame = Find-SvgFrame $svgAfter 'read_file'
+    $hotFrame = Find-SvgFrame $svgAfter 'hot_loop'
+    if (!$readFrame -or $readFrame.title -notmatch 'Before 0.+After 15.+\+75\.00 pp' -or
+        $readFrame.rect.fill -cne 'rgb(255,111,99)' -or
+        !$hotFrame -or $hotFrame.title -notmatch 'Before 3.+After 5.+-50\.00 pp' -or
+        (Find-SvgFrame $svgAfter 'wait_for_work')) {
+        throw 'The after differential SVG has incorrect widths, colors, or exact-stack deltas'
+    }
+    $diffSearch = Find-Element 'Search flame graph symbols' ([System.Windows.Automation.ControlType]::Edit)
+    $diffSearch.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('hot_loop')
+    Click-GraphButton 'Next symbol match'
+    $null = Wait-Until 'zoomed differential frame reports both exact-stack counts' {
+        (Find-Element 'Zoomed to hot_loop') -and
+        (Find-Element "Exact stack${dot}Before 3${dot}After 5${dot}-50.00 pp")
+    }
+    Click-GraphButton 'Before widths'
+    $null = Wait-Until 'before geometry includes its own sample total' {
+        (Find-Element 'Before profile') -and (Find-Element "All samples${dot}4 samples${dot}100.0% of capture")
+    }
+    $svgBefore = Export-DifferentialSvg $diffBeforeSvg
+    $removed = Find-SvgFrame $svgBefore 'wait_for_work'
+    $hotBefore = Find-SvgFrame $svgBefore 'hot_loop'
+    if (!$removed -or $removed.title -notmatch 'Before 1.+After 0.+-25\.00 pp' -or
+        $removed.rect.fill -cne 'rgb(141,175,229)' -or
+        $hotBefore.rect.fill -cne $hotFrame.rect.fill -or
+        (Find-SvgFrame $svgBefore 'read_file')) {
+        throw 'The before differential SVG did not reveal removed paths with the same color scale'
+    }
+    Click-GraphButton 'After widths'
+    $null = Wait-Until 'the after width view retains its own zoom' { Find-Element 'Zoomed to hot_loop' }
+    Click-GraphButton 'Back to comparison'
+    $null = Wait-Until 'after closing differential the stack selection is unchanged' {
+        (Find-Element "1 of 3 changed stacks${dot}Page 1 of 1") -and
+            (Find-Element "Before 3 samples (75.00%)${dot}After 5 samples (25.00%)${dot}-50.00 pp")
     }
     Click-GraphButton 'Back to flame graph'
     $null = Wait-Until 'return to the original zoom and symbol search' {

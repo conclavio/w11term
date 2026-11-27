@@ -1,5 +1,5 @@
 use super::*;
-use plot::{Plot, Range};
+use plot::{Differential, Plot, Range};
 use std::path::PathBuf;
 use w11term::cpu_profile::{FilteredComparison, Profile, Search, sample_share};
 use w11term::diagnostic_history::Kind as ArtifactKind;
@@ -18,6 +18,8 @@ pub enum Action {
     OpenFile(Option<PathBuf>),
     CompareFile,
     Compare(compare::Action),
+    Differential,
+    DifferentialWidth(compare::ProfileSide, Arc<()>),
     ReturnToComparison,
     Export(Arc<()>),
     Capture(capture::Action),
@@ -54,6 +56,7 @@ struct Loaded {
     path: PathBuf,
     plot: Plot,
     capture: Option<CpuProfileSummary>,
+    differential: Option<Differential>,
     ticket: Arc<()>,
     zoom: usize,
     hovered: Option<usize>,
@@ -66,6 +69,7 @@ struct Loaded {
 struct Inspection {
     side: compare::ProfileSide,
     source: Loaded,
+    alternate: Option<Loaded>,
 }
 
 #[derive(Default)]
@@ -163,7 +167,6 @@ impl Panel {
                         .on_click(send(|| Action::ReturnToComparison))
                         .content("Back to comparison"),
                 ),
-                text("inspection-side", inspection.side.caption()),
                 KeyedView::new(
                     "inspection-export",
                     Button::new()
@@ -172,6 +175,26 @@ impl Panel {
                         .content("Export SVG"),
                 ),
             ]);
+            if inspection.alternate.is_some() {
+                let switch = |side: compare::ProfileSide| {
+                    let source = inspection.source.ticket.clone();
+                    Button::new()
+                        .is_enabled(idle && side != inspection.side)
+                        .on_click(ctx.callback(move |_| {
+                            message(Action::DifferentialWidth(side, source.clone()))
+                        }))
+                        .content(side.widths())
+                };
+                fields.extend([
+                    text("differential-title", "Differential CPU flame graph"),
+                    KeyedView::new("differential-widths", StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(6.0)
+                        .children((switch(compare::ProfileSide::Before), switch(compare::ProfileSide::After)))),
+                    text("differential-legend", "Full profiles · Exact-stack sample share · Red increased · Blue decreased · Gray unchanged"),
+                ]);
+            }
+            fields.push(text("inspection-side", inspection.side.caption()));
             inspection.source.graph(window_height, ctx, &mut fields);
         } else if let Some(comparison) = &self.comparison {
             fields.extend(comparison.fields(idle, export_idle, ctx));
@@ -235,12 +258,37 @@ impl Loaded {
         capture: Option<CpuProfileSummary>,
         zoom: usize,
     ) -> Self {
+        Self::with_mode(profile, path, capture, zoom, None)
+    }
+
+    fn differential(
+        comparison: Arc<w11term::cpu_profile::Comparison>,
+        side: compare::ProfileSide,
+    ) -> Self {
+        let index = side.index();
+        Self::with_mode(
+            comparison.profiles()[index].clone(),
+            comparison.paths()[index].clone(),
+            None,
+            0,
+            Some(Differential { comparison, side }),
+        )
+    }
+
+    fn with_mode(
+        profile: Arc<Profile>,
+        path: PathBuf,
+        capture: Option<CpuProfileSummary>,
+        zoom: usize,
+        differential: Option<Differential>,
+    ) -> Self {
         let search = Arc::<Search>::default();
         Self {
-            plot: Plot::new(profile.clone(), search.clone()),
+            plot: Plot::new(profile.clone(), search.clone(), differential.clone()),
             profile,
             path,
             capture,
+            differential,
             ticket: Arc::new(()),
             zoom,
             hovered: None,
@@ -443,6 +491,12 @@ impl Loaded {
                 sample_share(focus.samples, total)
             ),
         ));
+        if let Some(differential) = &self.differential {
+            fields.push(text(
+                "stack-delta",
+                differential.detail(self.hovered.unwrap_or(self.zoom)),
+            ));
+        }
         if focus.parent != 0 {
             fields.push(text(
                 "caller",
@@ -623,6 +677,43 @@ impl TerminalApp {
                 }
             }
             Action::ReturnToComparison => (),
+            Action::Differential
+                if panel.open
+                    && panel.pending.is_none()
+                    && panel.capture.is_none()
+                    && panel.inspection.is_none() =>
+            {
+                if let Some(view) = &panel.comparison {
+                    let comparison = view.results.comparison().clone();
+                    panel.status = None;
+                    panel.inspection = Some(Inspection {
+                        side: compare::ProfileSide::After,
+                        source: Loaded::differential(
+                            comparison.clone(),
+                            compare::ProfileSide::After,
+                        ),
+                        alternate: Some(Loaded::differential(
+                            comparison,
+                            compare::ProfileSide::Before,
+                        )),
+                    });
+                }
+            }
+            Action::DifferentialWidth(side, ticket)
+                if panel.open && panel.pending.is_none() && panel.capture.is_none() =>
+            {
+                if let Some(inspection) = &mut panel.inspection
+                    && inspection.side != side
+                    && Arc::ptr_eq(&inspection.source.ticket, &ticket)
+                    && let Some(alternate) = &mut inspection.alternate
+                {
+                    std::mem::swap(&mut inspection.source, alternate);
+                    inspection.side = side;
+                    inspection.source.hovered = None;
+                    panel.status = None;
+                }
+            }
+            Action::Differential | Action::DifferentialWidth(..) => (),
             Action::Stop(ticket) => {
                 if panel
                     .pending
@@ -667,6 +758,7 @@ impl TerminalApp {
                 let compare_path = matches!(action, Action::CompareFile).then(|| path.clone());
                 let profile = loaded.map(|loaded| loaded.profile.clone());
                 let zoom = loaded.map_or(0, |loaded| loaded.zoom);
+                let differential = loaded.and_then(|loaded| loaded.differential.clone());
                 let ticket = panel.begin(if recent.is_some() {
                     "Opening folded stacks…"
                 } else if export {
@@ -701,7 +793,7 @@ impl TerminalApp {
                             if export {
                                 let profile =
                                     profile.context("Open folded stacks before exporting")?;
-                                plot::export(&profile, zoom, &file)?;
+                                plot::export(&profile, zoom, &file, differential.as_ref())?;
                                 Ok(Some(Outcome::Exported))
                             } else if let Some(before_path) = compare_path {
                                 let before = profile.context("Open a before profile to compare")?;
@@ -746,6 +838,7 @@ impl TerminalApp {
                             panel.inspection = Some(Inspection {
                                 side,
                                 source: Loaded::new(profile, path, None, frame),
+                                alternate: None,
                             });
                         }
                     }
