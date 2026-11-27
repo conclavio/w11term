@@ -26,6 +26,7 @@ pub enum Action {
 #[derive(Deserialize)]
 pub struct Review {
     bundle: String,
+    bundle_sha256: Option<String>,
     host: Host,
     bin_directory: String,
     path_status: String,
@@ -39,6 +40,20 @@ pub struct Review {
     supports_atomic_replace: bool,
     #[serde(default)]
     automatic_sync_paused: bool,
+    #[serde(default)]
+    repairs: Vec<ReviewedRepair>,
+}
+
+#[derive(Deserialize)]
+struct ReviewedRepair {
+    pin: RepairPin,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct RepairPin {
+    name: String,
+    sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +107,8 @@ pub struct Installation {
     launchers_created: usize,
     #[serde(default)]
     automatic_sync_paused: bool,
+    #[serde(default)]
+    repaired_tools: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -335,10 +352,18 @@ impl Installer {
                 ));
             }
         }
-        let install = command.map_or_else(
-            || "Install reviewed bundle".into(),
-            |name| format!("Install reviewed {name}"),
-        );
+        let install = if self
+            .review
+            .as_ref()
+            .is_some_and(|review| !review.repairs.is_empty())
+        {
+            "Repair from reviewed bundle".into()
+        } else {
+            command.map_or_else(
+                || "Install reviewed bundle".into(),
+                |name| format!("Install reviewed {name}"),
+            )
+        };
         fields.push(KeyedView::new(
             "install-actions",
             StackPanel::new().spacing(8.0).children((
@@ -425,7 +450,32 @@ impl Review {
         if self.automatic_sync_paused {
             fields.push(detail(
                 "sync-hold",
-                "Automatic sync will be paused for this bundle after installation.".into(),
+                if command.is_none() {
+                    "Automatic sync stays paused for this bundle."
+                } else {
+                    "Automatic sync will be paused for this bundle after installation."
+                }
+                .into(),
+            ));
+        }
+        for repair in &self.repairs {
+            let action = match repair.reason.as_str() {
+                "missing" => "Restore missing executable",
+                "permissions-changed" => "Restore executable permissions",
+                _ => "Replace changed executable",
+            };
+            fields.push(detail(
+                &format!("repair-{}", repair.pin.name),
+                format!(
+                    "{} · {}\nPinned SHA-256 {}",
+                    action, repair.pin.name, repair.pin.sha256
+                ),
+            ));
+        }
+        if !self.repairs.is_empty() && self.current.version != self.bundle_sha256 {
+            fields.push(detail(
+                "activate-repaired-release",
+                "The repaired release will become active.".into(),
             ));
         }
         for (key, directory) in [
@@ -444,7 +494,12 @@ impl Review {
         } else if !self.ready && self.current.version.is_some() && !self.supports_atomic_replace {
             fields.push(detail(
                 "atomic-replace",
-                "Switching an active release requires the server's atomic rename extension".into(),
+                if self.repairs.iter().any(|repair| repair.reason != "missing") {
+                    "Replacing an executable requires the server's atomic rename extension"
+                } else {
+                    "Switching an active release requires the server's atomic rename extension"
+                }
+                .into(),
             ));
         }
         for tool in &self.tools {
@@ -637,6 +692,7 @@ impl TerminalApp {
                     None
                 };
                 let apply = work == Work::Apply;
+                let manual_review = matches!(&source, BundleSource::Manifest(_));
                 let token = if apply {
                     let Some(token) = installer.token() else {
                         return;
@@ -704,7 +760,8 @@ impl TerminalApp {
                             if scope.is_cancelled() {
                                 return Err("Tool bundle operation cancelled".into());
                             }
-                            let timeout = Duration::from_secs(if apply { 600 } else { 30 });
+                            let timeout =
+                                Duration::from_secs(if apply || manual_review { 600 } else { 30 });
                             run_pane_sftp_job(input, target, operation, timeout, None)
                         })();
                         if apply {
@@ -752,7 +809,17 @@ impl TerminalApp {
                             ));
                             let changed =
                                 installation.changed || installation.launchers_created != 0;
-                            if let Some(name) = installer.source.command() {
+                            if !installation.repaired_tools.is_empty() {
+                                let mut status = format!(
+                                    "Repaired tool bundle {} · {}",
+                                    installation.bundle,
+                                    installation.repaired_tools.join(", ")
+                                );
+                                if installation.automatic_sync_paused {
+                                    status.push_str("\nAutomatic bundle sync is paused.");
+                                }
+                                status
+                            } else if let Some(name) = installer.source.command() {
                                 let mut status = if changed {
                                     format!("Installed {name}")
                                 } else {

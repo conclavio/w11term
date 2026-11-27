@@ -2,7 +2,11 @@ use super::*;
 use russh::ChannelMsg;
 use std::collections::BTreeMap;
 
+mod prune;
 mod remote_digest;
+mod repair;
+
+use repair::RepairTool;
 
 const MANIFEST: &str = ".w11term-manifest.json";
 const MANIFEST_LIMIT: text_preview::PreviewLimit = text_preview::PreviewLimit {
@@ -18,9 +22,11 @@ const MUTATING: &str =
 type Ssh = russh::client::Handle<crate::ssh::Handler>;
 
 fn valid_tool_permissions(attrs: &FileAttributes) -> bool {
-    attrs
-        .permissions
-        .is_some_and(|mode| mode & 0o170000 == 0o100000 && mode & 0o100 != 0 && mode & 0o7022 == 0)
+    attrs.permissions.is_some_and(valid_tool_mode)
+}
+
+fn valid_tool_mode(mode: u32) -> bool {
+    mode & 0o170000 == 0o100000 && mode & 0o100 != 0 && mode & 0o7022 == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,6 +156,7 @@ pub(super) struct InstallPlan {
     pub id: Option<String>,
     pub manual: bool,
     pub configure_launchers: bool,
+    pub(super) repairs: Vec<RepairTool>,
 }
 
 impl Engine {
@@ -622,6 +629,7 @@ impl Engine {
             id: Some(id),
             manual: true,
             configure_launchers: false,
+            repairs: Vec::new(),
         };
         let Some(review) = review else {
             return self.review_utility_plan(plan);
@@ -657,12 +665,18 @@ impl Engine {
                 self.check_launchers(&plan.home, store, &plan.release).await?;
             }
             let version_path = format!("{store}/versions/{id}");
-            let (uploaded, copied_tools) = if self.utility_lstat(&version_path).await?.is_some() {
+            let (uploaded, copied_tools, repaired_tools) = if self.utility_lstat(&version_path).await?.is_some() {
+                let repaired = if plan.repairs.is_empty() {
+                    Vec::new()
+                } else {
+                    self.repair_utility_release(plan, id).await?
+                };
                 self.verify_utility_release(session, store, &plan.release.name, plan.release.architecture, id).await?;
-                (false, Vec::new())
+                (!repaired.is_empty(), Vec::new(), repaired)
             } else {
+                ensure!(plan.repairs.is_empty(), "The release to repair disappeared. Review the bundle again.");
                 let copied = self.stage_utility_release(plan, id).await?;
-                (copied.len() < plan.selected.len(), copied)
+                (copied.len() < plan.selected.len(), copied, Vec::new())
             };
             let launchers = if plan.configure_launchers {
                 self.create_launchers(&plan.home, store, &plan.release, &plan.bin).await?
@@ -673,6 +687,7 @@ impl Engine {
             Ok(json!({
                 "bundle": plan.release.name, "bundle_sha256": id, "previous_bundle_sha256": plan.selector.version,
                 "changed": changed, "uploaded": uploaded, "copied_tools": copied_tools,
+                "repaired_tools": repaired_tools, "automatic_sync_paused": plan.manual,
                 "launchers_created": launchers, "version_directory": version_path,
                 "path_status": plan.report["path_status"],
             }))
