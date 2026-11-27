@@ -55,6 +55,8 @@ fn serve(listener: TcpListener, directory: &Path) {
                 Err(error) => panic!("{error}"),
             }
         };
+        // Winsock can inherit the listener's nonblocking mode on accept.
+        client.set_nonblocking(false).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
