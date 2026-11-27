@@ -10,6 +10,7 @@ $selectPattern = [System.Windows.Automation.SelectionItemPattern]::Pattern
 $dot = ' ' + [char]0xb7 + ' '
 $report = Join-Path $State 'captured.json'
 $afterReport = Join-Path $State 'after triage.json'
+$comparisonReport = Join-Path $State 'saved triage comparison.txt'
 $command = [IO.File]::ReadAllText((Join-Path $State 'triage-command-path'))
 
 function Click([string]$Name) {
@@ -150,6 +151,27 @@ try {
         (Find-Element "After${dot}84% user + system") -and
         (Find-Element '3 0 0 8 40 12 46 1 1') -and
         (Find-Element '3 0 0 8 70 14 14 1 1')
+    }
+    Click ('Export comparison' + [char]0x2026)
+    $save = Wait-Until 'owned comparison export dialog' { Find-OwnedDialog 'Save Linux triage comparison' }
+    $null = Wait-Until 'enter the triage comparison export path' {
+        [FixtureDialog]::SetFilename($save, $comparisonReport, 'linux-triage-comparison.txt')
+    }
+    $null = Wait-Until 'save the comparison as text' { [FixtureDialog]::ClickButton($save, 1) }
+    $null = Wait-Until 'triage comparison export published' { [IO.File]::Exists($comparisonReport) }
+    $export = [IO.File]::ReadAllText($comparisonReport)
+    if (!$export.Contains("Before${dot}captured.json") -or !$export.Contains("After${dot}after triage.json") -or
+        !$export.Contains("Before${dot}Permission denied${dot}Exit 1") -or
+        !$export.Contains("After${dot}OK${dot}Exit 0") -or
+        !$export.Contains('1 | Operation not permitted') -or
+        !$export.Contains("Sampling${dot}Updated interval sampling") -or
+        !$export.Contains("Before${dot}52% user + system${dot}vmstat stdout line 3") -or
+        !$export.Contains("After${dot}84% user + system${dot}vmstat stdout line 3") -or
+        !$export.Contains("Delta${dot}+32.0 pp") -or
+        !$export.Contains('3 | 3 0 0 8 40 12 46 1 1') -or !$export.Contains('3 | 3 0 0 8 70 14 14 1 1') -or
+        $export.Contains("Before${dot}uptime") -or $export.Contains($State) -or
+        $export.Contains($saved.target.host_key_fingerprint)) {
+        throw "The export did not preserve the paired changes and source evidence. $export"
     }
     Click ('Review comparison with OpenRouter' + [char]0x2026)
     $null = Wait-Until 'comparison remains open beside the paired review preview' {

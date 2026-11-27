@@ -1,7 +1,9 @@
 use super::*;
 use crate::app::openrouter_assistance::clip;
-use std::fmt::Write as _;
+use std::{borrow::Cow, fmt::Write as _};
 use w11term::ssh::TriageFinding;
+
+mod export;
 
 const SIDES: [&str; 2] = ["Before", "After"];
 
@@ -11,12 +13,14 @@ enum Kind {
     Finding([Option<usize>; 2]),
 }
 
+#[derive(Clone)]
 struct Change {
     probe: usize,
     kind: Kind,
     delta: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Comparison {
     reports: [Arc<TriageReport>; 2],
     paths: [Option<PathBuf>; 2],
@@ -120,15 +124,19 @@ impl Comparison {
         }
     }
 
-    fn source(&self, side: usize) -> View {
-        let report = &self.reports[side];
-        let name = self.paths[side]
+    fn source_name(&self, side: usize) -> Cow<'_, str> {
+        self.paths[side]
             .as_ref()
             .and_then(|path| path.file_name())
             .map_or_else(
                 || "Current collection".into(),
                 |name| name.to_string_lossy(),
-            );
+            )
+    }
+
+    fn source(&self, side: usize) -> View {
+        let report = &self.reports[side];
+        let name = self.source_name(side);
         StackPanel::new().spacing(4.0).keyed_children([
             detail("file", display_output(&format!("{} · {name}", SIDES[side]))),
             detail("target", display_output(&endpoint(&report.target))),
@@ -260,13 +268,20 @@ impl Comparison {
         preview
     }
 
-    pub fn fields(&self, ctx: &ViewContext<TerminalApp>) -> Vec<KeyedView> {
+    pub fn fields(&self, export_idle: bool, ctx: &ViewContext<TerminalApp>) -> Vec<KeyedView> {
         let mut fields = vec![
             KeyedView::new(
                 "compare-back",
                 Button::new()
                     .on_click(ctx.callback(|_| message(Action::BackFromComparison)))
                     .content("Back to report"),
+            ),
+            KeyedView::new(
+                "compare-export",
+                Button::new()
+                    .is_enabled(export_idle)
+                    .on_click(ctx.callback(|_| message(Action::ExportComparison)))
+                    .content("Export comparison…"),
             ),
             KeyedView::new(
                 "compare-openrouter",

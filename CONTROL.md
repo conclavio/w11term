@@ -1520,6 +1520,8 @@ Findings summarize observed CPU activity and runnable tasks, available memory an
 
 Choose **Compare reports** to use the displayed report as **Before** and open a saved JSON report as **After**. The offline view shows changes in check status, sampling commands, and reported observations. Choose a change to see the two values and their source output lines or excerpts. Numeric deltas require matching sampling commands and complete output on both sides. Disk and interface deltas also require the same recorded endpoint and device name. **Back to report** restores the original sample selection.
 
+Choose **Export comparison…** to save a new text file with all changes, both source names and coverage summaries, and the stored stdout and stderr text for each changed check. Output keeps its source line numbers so you can trace an observation back to either report. The file records whether the SSH endpoints match and uses only the report filenames from disk.
+
 Review the verified SSH endpoint, fixed sample commands and limits, then pass the reviewed connection generation when collecting. Choose a new Windows file for the report.
 
 ```powershell

@@ -19,6 +19,7 @@ pub enum Action {
     SaveReport,
     CompareReport,
     BackFromComparison,
+    ExportComparison,
     ComparisonChange(Arc<TriageReport>, usize),
     Sample(usize),
     Resource(usize),
@@ -122,7 +123,12 @@ impl Panel {
         ticket
     }
 
-    fn view(&self, active: Option<Connection>, ctx: &ViewContext<TerminalApp>) -> View {
+    fn view(
+        &self,
+        active: Option<Connection>,
+        export_idle: bool,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         let idle = self.pending.is_none();
         let send = |action: fn() -> Action| ctx.callback(move |_| message(action()));
         let button = |label: &str, enabled, action: fn() -> Action| {
@@ -177,7 +183,7 @@ impl Panel {
             ));
         }
         match (&self.comparison, &self.content) {
-            (Some(comparison), _) => fields.extend(comparison.fields(ctx)),
+            (Some(comparison), _) => fields.extend(comparison.fields(export_idle, ctx)),
             (None, Some(Content::Review { pane, plan })) => {
                 let ready = active
                     == Some(Connection {
@@ -479,7 +485,7 @@ impl TerminalApp {
                     Border::new()
                         .grid_column(1)
                         .background(Color::rgb(35, 35, 35))
-                        .content(self.triage.view(active, ctx)),
+                        .content(self.triage.view(active, self.export.pending.is_none(), ctx)),
                 ),
             ])
     }
@@ -662,6 +668,15 @@ impl TerminalApp {
                 }
             }
             Action::BackFromComparison => panel.comparison = None,
+            Action::ExportComparison => {
+                if let Some(comparison) = panel.comparison.clone() {
+                    self.begin_text_export(
+                        text_export::Subject::TriageComparison,
+                        move |output| comparison.write_report(output),
+                        ctx,
+                    );
+                }
+            }
             Action::ComparisonChange(marker, index) => {
                 if let Some(comparison) = &mut panel.comparison {
                     comparison.select(&marker, index);

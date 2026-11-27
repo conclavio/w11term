@@ -69,6 +69,7 @@ pub(super) enum Purpose {
     SaveSyscallTrace(PathBuf),
     SyscallComparison,
     CpuComparison,
+    TriageComparison,
     FlameGraph {
         path: PathBuf,
         export: bool,
@@ -596,6 +597,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             | Purpose::FolderComparison
             | Purpose::SyscallComparison
             | Purpose::CpuComparison
+            | Purpose::TriageComparison
             | Purpose::SftpTransferHistory
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
@@ -655,6 +657,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                         "cpu-profile-comparison.json",
                         w!("json"),
                     ),
+                    Purpose::TriageComparison => (
+                        w!("Save Linux triage comparison"),
+                        "linux-triage-comparison.txt",
+                        w!("txt"),
+                    ),
                     Purpose::SftpTransferHistory => (
                         w!("Save recent SFTP transfers as JSON"),
                         "sftp-transfers.json",
@@ -684,7 +691,10 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 dialog.SetDefaultExtension(extension)?;
                 // The atomic writer creates its own sibling file and reports any write errors.
                 options |= FOS_NOTESTFILECREATE;
-                if matches!(purpose, Purpose::SyscallComparison | Purpose::CpuComparison) {
+                if matches!(
+                    purpose,
+                    Purpose::SyscallComparison | Purpose::CpuComparison | Purpose::TriageComparison
+                ) {
                     options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                     options &= !FOS_OVERWRITEPROMPT;
                     None
