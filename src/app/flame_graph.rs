@@ -123,13 +123,11 @@ impl Panel {
                 "Open a folded stacks file from w11term or another profiler.",
             ));
         }
-        ScrollViewer::new()
-            .content(
-                Border::new()
-                    .padding(12.0)
-                    .content(StackPanel::new().spacing(8.0).keyed_children(fields)),
-            )
-            .into()
+        ScrollViewer::new().content(
+            Border::new()
+                .padding(12.0)
+                .content(StackPanel::new().spacing(8.0).keyed_children(fields)),
+        )
     }
 
     fn graph(
