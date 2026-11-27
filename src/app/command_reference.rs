@@ -235,15 +235,7 @@ impl Panel {
                 KeyedView::new("title", TextBlock::new().font_size(22.0).text(&page.title)),
                 KeyedView::new(
                     "platform",
-                    TextBlock::new().text(format!(
-                        "{} · {}",
-                        platform.1,
-                        if page.custom {
-                            "Custom page"
-                        } else {
-                            "tldr-pages (CC BY 4.0)"
-                        }
-                    )),
+                    TextBlock::new().text(format!("{} · {}", platform.1, page.source.label())),
                 ),
                 KeyedView::new(
                     "description",

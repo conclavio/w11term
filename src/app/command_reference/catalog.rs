@@ -11,6 +11,20 @@ pub(super) const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
 const MAX_PAGE: usize = 64 * 1024;
 const MAX_CONTENT: usize = 32 * 1024 * 1024;
 const MAX_PAGES: usize = 20_000;
+const TOOL_PAGES: &[(&str, &str)] = &[
+    (
+        "diskwatch",
+        include_str!("../../../assets/command-reference/linux/diskwatch.md"),
+    ),
+    (
+        "mdd",
+        include_str!("../../../assets/command-reference/linux/mdd.md"),
+    ),
+    (
+        "netwatch",
+        include_str!("../../../assets/command-reference/linux/netwatch.md"),
+    ),
+];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct Platform(pub &'static str, pub &'static str);
@@ -45,16 +59,33 @@ pub(super) struct Example {
 }
 
 #[derive(Debug)]
+pub(super) enum PageSource {
+    Tldr,
+    BuiltIn,
+    Custom,
+}
+
+impl PageSource {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::Tldr => "tldr-pages (CC BY 4.0)",
+            Self::BuiltIn => "w11term manual",
+            Self::Custom => "Custom page",
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct Page {
     pub title: String,
     pub description: String,
     pub link: Option<String>,
     pub examples: Vec<Example>,
-    pub custom: bool,
+    pub source: PageSource,
 }
 
 impl Page {
-    fn parse(text: &str, custom: bool) -> Option<Self> {
+    fn parse(text: &str, source: PageSource) -> Option<Self> {
         let mut lines = text.trim_start_matches('\u{feff}').lines().map(str::trim);
         let title = lines.find(|line| !line.is_empty())?.strip_prefix("# ")?;
         let mut description = Vec::new();
@@ -93,7 +124,7 @@ impl Page {
             description: description.join("\n"),
             link,
             examples,
-            custom,
+            source,
         })
     }
 }
@@ -174,7 +205,7 @@ impl Catalog {
                 expanded <= MAX_CONTENT,
                 "Command reference pages exceed the cache budget"
             );
-            let Some(page) = Page::parse(&text, false) else {
+            let Some(page) = Page::parse(&text, PageSource::Tldr) else {
                 continue;
             };
             let key = Key { platform, name };
@@ -220,7 +251,7 @@ impl Catalog {
                     expanded <= MAX_CONTENT,
                     "Custom command reference exceeds the cache budget"
                 );
-                if let Some(page) = Page::parse(&text, true) {
+                if let Some(page) = Page::parse(&text, PageSource::Custom) {
                     self.pages.insert(
                         Key {
                             platform,
@@ -234,6 +265,22 @@ impl Catalog {
         Ok(())
     }
 
+    fn add_tool_pages(&mut self) {
+        for &(name, text) in TOOL_PAGES {
+            if self.exact(name, LINUX).is_none() {
+                let page =
+                    Page::parse(text, PageSource::BuiltIn).expect("valid embedded command page");
+                self.pages.insert(
+                    Key {
+                        platform: LINUX,
+                        name: name.to_owned(),
+                    },
+                    page,
+                );
+            }
+        }
+    }
+
     pub(super) fn search(&self, text: &str, preferred: Platform) -> Vec<(&Key, &Page)> {
         let text = query(text);
         if text.is_empty() {
@@ -245,7 +292,7 @@ impl Catalog {
             .filter_map(|(key, page)| {
                 let rank = if key.name == text {
                     0
-                } else if key.name.starts_with(&text) {
+                } else if key.name.starts_with(&text) || (text == "mddog" && key.name == "mdd") {
                     1
                 } else if key.name.contains(&text) {
                     2
@@ -322,7 +369,7 @@ pub(super) fn load() -> Result<Loaded> {
             "Using bundled TLDR pages because the local cache could not be opened".to_owned(),
         ),
     };
-    Ok(with_custom(catalog, status, &directory))
+    Ok(with_local_pages(catalog, status, &directory))
 }
 
 pub(super) fn update(bytes: Vec<u8>) -> Result<Loaded> {
@@ -337,17 +384,18 @@ fn update_at(directory: &Path, bytes: &[u8]) -> Result<Loaded> {
     file.as_file().sync_all()?;
     file.persist(directory.join("tldr-pages.en.zip"))
         .context("Saving the TLDR cache")?;
-    Ok(with_custom(
+    Ok(with_local_pages(
         catalog,
         "Updated TLDR pages".to_owned(),
         directory,
     ))
 }
 
-fn with_custom(mut catalog: Catalog, mut status: String, directory: &Path) -> Loaded {
+fn with_local_pages(mut catalog: Catalog, mut status: String, directory: &Path) -> Loaded {
     if let Err(err) = catalog.custom_pages(&directory.join("pages")) {
         status = format!("{status}. Reading custom pages: {err:#}");
     }
+    catalog.add_tool_pages();
     Loaded { catalog, status }
 }
 
@@ -383,6 +431,59 @@ mod tests {
     }
 
     #[test]
+    fn every_builtin_tool_has_an_exact_offline_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = with_local_pages(
+            Catalog::archive(BUNDLED).unwrap(),
+            String::new(),
+            directory.path(),
+        )
+        .catalog;
+        for name in w11term::sftp::builtin_tool_names() {
+            let key = catalog
+                .exact(name, LINUX)
+                .unwrap_or_else(|| panic!("missing page for {name}"));
+            let page = catalog.page(&key).unwrap();
+            assert!(!page.examples.is_empty(), "{name}");
+            assert!(page.link.is_some(), "{name}");
+        }
+        let results = catalog.search("mddog", LINUX);
+        assert_eq!(results[0].0.name, "mdd");
+        assert!(matches!(results[0].1.source, PageSource::BuiltIn));
+    }
+
+    #[test]
+    fn refreshed_and_private_pages_take_precedence_over_supplements() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, title) in [
+            ("common/netwatch.md", "Upstream NetWatch"),
+            ("linux/ip.md", "ip"),
+            ("windows/dir.md", "dir"),
+        ] {
+            zip.start_file(path, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writeln!(zip, "# {title}").unwrap();
+        }
+        let upstream = zip.finish().unwrap().into_inner();
+        let common = directory.path().join("pages").join("common");
+        fs::create_dir_all(&common).unwrap();
+        fs::write(common.join("diskwatch.md"), "# Team disk notes").unwrap();
+        let updated = update_at(directory.path(), &upstream).unwrap();
+        let lookup = |name: &str| {
+            updated
+                .catalog
+                .page(&updated.catalog.exact(name, LINUX).unwrap())
+                .unwrap()
+        };
+        assert!(matches!(lookup("netwatch").source, PageSource::Tldr));
+        assert_eq!(lookup("netwatch").title, "Upstream NetWatch");
+        assert!(matches!(lookup("diskwatch").source, PageSource::Custom));
+        assert_eq!(lookup("diskwatch").title, "Team disk notes");
+        assert!(matches!(lookup("mdd").source, PageSource::BuiltIn));
+    }
+
+    #[test]
     fn an_invalid_refresh_preserves_the_previous_archive() {
         let directory = tempfile::tempdir().unwrap();
         update_at(directory.path(), BUNDLED).unwrap();
@@ -405,12 +506,15 @@ mod tests {
         catalog.custom_pages(local.path()).unwrap();
         let results = catalog.search("rg", LINUX);
         assert_eq!(results[0].1.title, "local rg");
-        assert!(results[0].1.custom);
+        assert!(matches!(results[0].1.source, PageSource::Custom));
         assert_eq!(
             results[0].1.examples[0].command,
             "rg {{pattern}} \"{{path}}\""
         );
-        assert!(!catalog.search("rg", WINDOWS)[0].1.custom);
+        assert!(matches!(
+            catalog.search("rg", WINDOWS)[0].1.source,
+            PageSource::Tldr
+        ));
         for text in ["ls\r", "ls\n", "ls\x1b[D", "ls\t"] {
             assert!(!insertable(text));
         }

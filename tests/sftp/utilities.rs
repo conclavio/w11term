@@ -647,12 +647,27 @@ async fn utility_install_preserves_racing_user_command_and_checks_remote_lock() 
 }
 
 fn save_login_manifest(directory: &std::path::Path, variant: u8) {
-    let mut binary = executable(UtilityArchitecture::X86_64, None);
-    binary[255] = variant;
-    let mut build = build(directory, "rg", UtilityArchitecture::X86_64, binary);
-    build.path = "rg".into();
-    let Operation::PreviewToolBundle { bundle } = preview(vec![build]) else {
-        unreachable!()
+    save_login_tools(directory, variant, &["rg"]);
+}
+
+fn save_login_tools(directory: &std::path::Path, variant: u8, tools: &[&str]) {
+    let bundle = UtilityBundle {
+        version: 1,
+        name: "portable".into(),
+        bin_directory: ".local/bin".into(),
+        tools: tools
+            .iter()
+            .map(|name| {
+                let mut binary = executable(UtilityArchitecture::X86_64, None);
+                binary[255] = variant;
+                let mut build = build(directory, name, UtilityArchitecture::X86_64, binary);
+                build.path = (*name).into();
+                UtilityTool {
+                    name: (*name).into(),
+                    builds: vec![build],
+                }
+            })
+            .collect(),
     };
     fs::write(
         directory.join("fleet.json"),
@@ -695,7 +710,7 @@ pub(super) fn reference_tool_profile(
 ) -> SshOptions {
     probe_response(remote, "x86_64", "/", "/usr/bin:/.local/bin");
     fs::write(remote.join("posix-rename-version"), "1").unwrap();
-    save_login_manifest(local, 1);
+    save_login_tools(local, 1, &["rg", "mdd"]);
     let mut profile = approved_login(source, local);
     profile.tool_bundle.as_mut().unwrap().add_to_path = None;
     profile

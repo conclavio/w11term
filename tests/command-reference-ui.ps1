@@ -54,6 +54,17 @@ function Wait-Platform([string]$Name) {
         }
     }
 }
+function Select-InstalledTool([string]$Name) {
+    Click 'Installed SSH tools'
+    $tools = Wait-Until 'active remote tools offered lookup' { Find-Element 'Installed SSH commands' $combo }
+    $tools.SetFocus()
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $tools.GetCurrentPattern($expand).Expand()
+    $choice = Wait-Until "installed $Name from the portable bundle" {
+        Find-Element "${Name}${dot}portable" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+}
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -69,6 +80,10 @@ try {
     Wait-Platform 'Auto (Windows)'
     if (Find-Element 'Installed SSH tools' $button) { throw 'A PowerShell pane offered SSH tool lookup' }
     Search 'rg' 'Common'
+    Set-Field 'Search command reference' 'mddog'
+    $null = Wait-Until 'project name finds the bundled mdd manual offline' {
+        (Find-Element 'mdd') -and (Find-Element "Linux${dot}w11term manual")
+    }
     Search 'Get-ChildItem' 'Windows'
     Click 'Edit example 1'
     $null = Wait-Until 'PowerShell command draft' {
@@ -84,17 +99,13 @@ try {
         $insert = Find-Element 'Insert into terminal' $button
         !$insert -or !$insert.Current.IsEnabled
     }
-    Click 'Installed SSH tools'
-    $tools = Wait-Until 'active remote tools offered lookup' { Find-Element 'Installed SSH commands' $combo }
-    $tools.SetFocus()
-    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $tools.GetCurrentPattern($expand).Expand()
-    $choice = Wait-Until 'installed rg from the portable bundle' {
-        Find-Element "rg${dot}portable" ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-InstalledTool 'rg'
     $null = Wait-Until 'installed command opened its private Linux reference' {
         (Find-Element 'Team rg notes') -and (Find-Element "Linux${dot}Custom page")
+    }
+    Select-InstalledTool 'mdd'
+    $null = Wait-Until 'installed mdd opened its bundled manual' {
+        (Find-Element 'mdd') -and (Find-Element "Linux${dot}w11term manual")
     }
     if ([IO.File]::ReadAllText($wire)) { throw 'Looking up a managed tool wrote to the SSH shell' }
     Search 'ip' 'Linux'
