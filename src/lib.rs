@@ -31,6 +31,7 @@ pub mod sound;
 pub mod ssh;
 pub mod ssh_config;
 mod stored_json;
+pub mod syscall_trace;
 pub mod tabs;
 pub mod terminal;
 pub mod text_layout;

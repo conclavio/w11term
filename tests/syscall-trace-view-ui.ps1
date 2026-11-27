@@ -242,6 +242,14 @@ try {
             !(Find-TraceGroup 'Changed count*read*') -and
             $right -and $right.Contains('ENOENT')
     }
+    $cliReport = & $Cli compare-syscall-traces --working $working --failing $failing --filter 'OPENAT enoent /BIN/DIAG' |
+        ConvertFrom-Json
+    $cliChange = $cliReport.changes[0]
+    if ($LASTEXITCODE -ne 0 -or $cliReport.changes.Count -ne 1 -or !$cliChange.first_divergence -or
+        $cliChange.syscall -cne 'openat' -or $cliChange.failing_evidence.errno -cne 'ENOENT' -or
+        $cliChange.failing_evidence.elapsed_ns -ne 1000000 -or $cliChange.duration_delta_ms -ne 10) {
+        throw 'The offline CLI and viewer disagreed on the first filtered syscall divergence'
+    }
     Apply-ChangeFilter 'read /TMP/DATA'
     $reads = Wait-Until 'FD reuse is normalized before comparing read counts' {
         Find-TraceGroup 'Changed count*read*/tmp/data*'

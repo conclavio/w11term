@@ -11,6 +11,8 @@ use w11term::control::{self, Reply, Request};
 mod automation;
 #[path = "w11term-cli/cpu_profile.rs"]
 mod cpu_profile;
+#[path = "w11term-cli/offline.rs"]
+mod offline;
 #[path = "w11term-cli/packet_capture.rs"]
 mod packet_capture;
 #[path = "w11term-cli/sftp.rs"]
@@ -297,29 +299,19 @@ async fn main() -> ExitCode {
         );
         println!("\n{}\n{}", cpu_profile::HELP, cpu_profile::COMPARE_HELP);
         println!("\n{}", packet_capture::HELP);
-        println!("\n{}", syscall_capture::HELP);
+        println!(
+            "\n{}\n{}",
+            syscall_capture::HELP,
+            syscall_capture::COMPARE_HELP
+        );
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {
         println!("{}", tool_bundles::HELP);
         return ExitCode::SUCCESS;
     }
-    if args
-        .first()
-        .is_some_and(|arg| arg == cpu_profile::COMPARE_VERB)
-    {
-        if args[1..] == ["--help"] || args[1..] == ["-h"] {
-            println!("{}", cpu_profile::COMPARE_HELP);
-            return ExitCode::SUCCESS;
-        }
-        return match cpu_profile::compare_files(&args[1..], std::io::stdout().lock()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                let reply = Reply::from_result(Err(error));
-                eprintln!("{}", serde_json::to_string(&reply).unwrap());
-                ExitCode::FAILURE
-            }
-        };
+    if let Some(exit) = offline::run(&args) {
+        return exit;
     }
     let mut success_check = None;
     let result = if args

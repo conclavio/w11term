@@ -1516,6 +1516,16 @@ Enter terms such as `openat ENOENT /tmp/settings` and choose **Apply change filt
 
 Choose **Export comparison…** to save a new text file. It includes all changes that pass the applied filter and timing setting, across every results page. Each change includes its counts, available duration delta, and source file and line references. The export also includes both originals for the currently selected evidence pair, with the same preview limits as the viewer.
 
+Use `compare-syscall-traces` to compare saved runs from a script without a GUI or SSH connection. Repeat `--working` or `--failing` to supply each side's `strace -ff` files. The command uses the viewer's normalization and matching, including errno filters and the default of hiding timing-only rows. Add `--include-timing` to include those rows.
+
+```powershell
+$report = & $ctl compare-syscall-traces --working '.\working.strace' --failing '.\failing.strace' --filter 'openat ENOENT' | ConvertFrom-Json
+$report.changes
+& $ctl compare-syscall-traces --working '.\working.21' --working '.\working.22' --failing '.\failing.77' --failing '.\failing.78' --include-timing --output-file '.\syscall-comparison.json'
+```
+
+The schema-version-1 JSON includes the source file names, merge order, comparison limit status, and all matching changes. Each change contains counts, timing when available, alignment confidence, and the file and line references for the representative evidence pair or the pair matched by the filter. The `representative_working_result` and `representative_failing_result` fields describe the group. Read `working_evidence` and `failing_evidence` for the exact call that matched an errno filter and its elapsed nanoseconds from the start of that run. With `--output-file`, the command writes a new report file and returns its path at `result.path`. Errors return a nonzero exit code and a JSON reply on stderr.
+
 ### Collect Linux performance triage
 
 In the Windows app, open **More → Diagnostics → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.

@@ -63,7 +63,7 @@ impl TerminalApp {
                     && page.finish(&ticket)
                 {
                     let state = &mut page.descriptors;
-                    state.show_results((0..report.lifetimes.len()).collect(), None);
+                    state.show_results((0..report.lifetimes().len()).collect(), None);
                     state.report = Some(report);
                 }
             }
@@ -181,7 +181,7 @@ impl ViewState {
     }
 
     fn current(&self) -> Option<&trace::Lifetime> {
-        self.report.as_ref()?.lifetimes.get(self.selection?)
+        self.report.as_ref()?.lifetimes().get(self.selection?)
     }
 
     pub(super) fn switch(
@@ -289,7 +289,7 @@ impl ViewState {
             .collection_slot(
                 ListViewSlot::Items,
                 window.iter().map(|&id| {
-                    let life = &report.lifetimes[id];
+                    let life = &report.lifetimes()[id];
                     let path: String = life.resource.chars().take(160).collect();
                     let pid = life
                         .pid
@@ -351,7 +351,7 @@ impl ViewState {
         let end = (begin + EVIDENCE_ROWS).min(life.steps.len());
         let mut original = String::new();
         for item in &life.steps[begin..end] {
-            let event = &trace.events[item.event];
+            let event = &trace.events()[item.event];
             let actor = event
                 .pid
                 .map_or_else(|| "PID unknown".into(), |pid| format!("PID {pid}"));

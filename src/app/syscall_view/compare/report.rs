@@ -26,7 +26,7 @@ impl Snapshot {
             .map(|&index| {
                 let sample = state
                     .match_sample(index)
-                    .unwrap_or(comparison.rows[index].sample);
+                    .unwrap_or(comparison.rows()[index].sample);
                 (index, sample)
             })
             .collect();
@@ -43,14 +43,14 @@ impl Snapshot {
         let mut output = BufWriter::new(output);
         let compare = &self.comparison;
         writeln!(output, "Syscall trace comparison")?;
-        for (label, trace) in SIDES.into_iter().zip(&compare.traces) {
+        for (label, trace) in SIDES.into_iter().zip(compare.traces()) {
             let files = trace.file_count();
             let unit = if files == 1 { "file" } else { "files" };
             writeln!(
                 output,
                 "{label} · {} · {files} source {unit} · {} events",
                 file_name(trace.first_path()),
-                trace.events.len(),
+                trace.events().len(),
             )?;
         }
         if let Some(query) = &self.query {
@@ -65,14 +65,14 @@ impl Snapshot {
             output,
             "Reported changes · {} of {}",
             self.rows.len(),
-            compare.rows.len()
+            compare.rows().len()
         )?;
         if compare.limited {
             writeln!(output, "{COMPARISON_LIMIT}")?;
         }
         let first = compare.first_divergence();
         for (offset, &(index, sample)) in self.rows.iter().enumerate() {
-            let row = &compare.rows[index];
+            let row = &compare.rows()[index];
             let divergence = if Some(index) == first {
                 " · First divergence"
             } else {
@@ -125,7 +125,7 @@ impl Snapshot {
         if let Some((index, sample)) = self.selected
             && let Ok(offset) = self.rows.binary_search_by_key(&index, |&(index, _)| index)
         {
-            let row = &compare.rows[index];
+            let row = &compare.rows()[index];
             writeln!(
                 output,
                 "\nEvidence for change {} · pair {} of {}",
@@ -156,8 +156,8 @@ fn write_source(
     let Some(index) = compare.event(row, side, sample) else {
         return writeln!(output, "   {label} · No corresponding call");
     };
-    let trace = &compare.traces[side];
-    let event = &trace.events[index];
+    let trace = &compare.traces()[side];
+    let event = &trace.events()[index];
     let result = event
         .error
         .as_deref()

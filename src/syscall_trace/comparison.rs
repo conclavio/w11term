@@ -1,16 +1,20 @@
 use super::{Outcome, Trace, argument_values};
+use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     sync::Arc,
 };
 
+mod report;
+
 const MAX_ROWS: usize = 20_000;
 const LOOKAHEAD: usize = 48;
 const TIME_FLOOR_NS: u64 = 1_000_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::app::syscall_view) enum Kind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
     Result,
     Count,
     Added,
@@ -32,12 +36,12 @@ impl Kind {
     }
 }
 
-pub(in crate::app::syscall_view) struct Row {
+pub struct Row {
     pub kind: Kind,
     pub call: Arc<str>,
     pub resource: Arc<str>,
     pub process: Arc<str>,
-    pub spans: [Range<usize>; 2],
+    spans: [Range<usize>; 2],
     pub sample: usize,
     pub result: [Option<Arc<str>>; 2],
     pub durations: [Option<u64>; 2],
@@ -61,14 +65,14 @@ pub struct RowMatch {
 }
 
 pub struct Comparison {
-    pub(in crate::app::syscall_view) traces: [Arc<Trace>; 2],
-    pub(in crate::app::syscall_view) rows: Vec<Row>,
+    traces: [Arc<Trace>; 2],
+    rows: Vec<Row>,
     pub limited: bool,
     orders: [Vec<usize>; 2],
 }
 
 impl Comparison {
-    pub(in crate::app::syscall_view) fn build(working: Arc<Trace>, failing: Arc<Trace>) -> Self {
+    pub fn build(working: Arc<Trace>, failing: Arc<Trace>) -> Self {
         let traces = [working, failing];
         let processes = traces.each_ref().map(|trace| Processes::read(trace));
         let (pairs, identities) = pair_processes(&processes);
@@ -118,24 +122,33 @@ impl Comparison {
         comparison
     }
 
-    pub(in crate::app::syscall_view) fn event(
-        &self,
-        row: &Row,
-        side: usize,
-        sample: usize,
-    ) -> Option<usize> {
+    pub fn traces(&self) -> &[Arc<Trace>; 2] {
+        &self.traces
+    }
+
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    pub fn row_visible(&self, index: usize, include_timing: bool) -> bool {
+        self.rows
+            .get(index)
+            .is_some_and(|row| include_timing || row.kind != Kind::Timing)
+    }
+
+    pub fn event(&self, row: &Row, side: usize, sample: usize) -> Option<usize> {
         let span = &row.spans[side];
         (sample < span.len()).then(|| self.orders[side][span.start + sample])
     }
 
-    pub(in crate::app::syscall_view) fn first_divergence(&self) -> Option<usize> {
+    pub fn first_divergence(&self) -> Option<usize> {
         self.rows
             .iter()
             .position(|row| row.kind != Kind::Timing && !row.uncertain)
             .or_else(|| self.rows.iter().position(|row| row.kind != Kind::Timing))
     }
 
-    pub(in crate::app::syscall_view) fn search(&self, query: &str) -> Vec<RowMatch> {
+    pub fn search(&self, query: &str) -> Vec<RowMatch> {
         let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
         self.rows
             .iter()

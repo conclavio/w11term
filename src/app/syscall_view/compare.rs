@@ -1,5 +1,7 @@
 use super::*;
-use trace::{Comparison, ComparisonKind, ComparisonMatch, ComparisonRow};
+use trace::{
+    Comparison, ComparisonKind, ComparisonMatch, ComparisonRow, duration_delta_ms as delta,
+};
 
 mod report;
 
@@ -75,9 +77,9 @@ impl TerminalApp {
                     match result {
                         Ok(Some(comparison)) => {
                             if page.loaded.is_none() {
-                                page.load(comparison.traces[0].clone());
+                                page.load(comparison.traces()[0].clone());
                             }
-                            let paths = comparison.traces[1].paths();
+                            let paths = comparison.traces()[1].paths();
                             let state = &mut page.comparison;
                             *state = ViewState {
                                 open: true,
@@ -139,7 +141,7 @@ impl TerminalApp {
             }
             Action::Query(tab, text) => {
                 if let Some(state) = self.comparison_input(tab) {
-                    state.query = text.chars().take(256).collect();
+                    state.query = text.chars().take(trace::MAX_QUERY_CHARS).collect();
                 }
             }
             Action::Filter(tab) => self.filter_trace_comparison(tab, ctx),
@@ -284,8 +286,7 @@ impl TerminalApp {
 impl ViewState {
     fn filter(&mut self, prefer_match: bool) {
         let Some(compare) = &self.compare else { return };
-        let show =
-            |&index: &usize| self.timing || compare.rows[index].kind != ComparisonKind::Timing;
+        let show = |&index: &usize| compare.row_visible(index, self.timing);
         self.visible = if let Some(filter) = &self.applied {
             filter
                 .matches
@@ -294,7 +295,7 @@ impl ViewState {
                 .filter(show)
                 .collect()
         } else {
-            (0..compare.rows.len()).filter(show).collect()
+            (0..compare.rows().len()).filter(show).collect()
         };
         let selected = self
             .selected
@@ -340,7 +341,7 @@ impl ViewState {
 
     fn current(&self) -> Option<(&Comparison, &ComparisonRow)> {
         let compare = self.compare.as_deref()?;
-        Some((compare, compare.rows.get(self.selected?)?))
+        Some((compare, compare.rows().get(self.selected?)?))
     }
 
     pub(super) fn launch(
@@ -494,7 +495,7 @@ impl ViewState {
             .collection_slot(
                 ListViewSlot::Items,
                 window.iter().map(|&index| {
-                    let row = &compare.rows[index];
+                    let row = &compare.rows()[index];
                     let resource = row.resource.chars().take(126).collect::<String>();
                     let lead = if Some(index) == first_divergence {
                         "First divergence · "
@@ -600,7 +601,7 @@ impl ViewState {
             if let [Some(before), Some(after)] = [0, 1].map(|side| {
                 compare
                     .event(row, side, self.sample)
-                    .and_then(|event| compare.traces[side].events[event].duration)
+                    .and_then(|event| compare.traces()[side].events()[event].duration)
             }) {
                 heading.push(KeyedView::new(
                     "sample-duration",
@@ -629,7 +630,7 @@ impl ViewState {
                 ),
             ));
         } else {
-            let text = if compare.rows.is_empty() {
+            let text = if compare.rows().is_empty() {
                 "No differences found in the available records."
             } else if self.applied.is_some() {
                 "No changes match the filter."
@@ -667,7 +668,7 @@ impl ViewState {
         row: Option<&ComparisonRow>,
         side: usize,
     ) -> View {
-        let trace = &compare.traces[side];
+        let trace = &compare.traces()[side];
         let first = trace.first_path();
         let name = first
             .file_name()
@@ -705,7 +706,7 @@ fn evidence_text(compare: &Comparison, row: &ComparisonRow, side: usize, sample:
     let Some(event) = compare.event(row, side, sample) else {
         return "No corresponding call in this run.".into();
     };
-    let trace = &compare.traces[side];
+    let trace = &compare.traces()[side];
     let mut evidence = String::new();
     if let Some(elapsed) = trace.relative_start(event) {
         let _ = writeln!(
@@ -714,22 +715,18 @@ fn evidence_text(compare: &Comparison, row: &ComparisonRow, side: usize, sample:
             elapsed as f64 / 1_000_000.0
         );
     }
-    if let Some(duration) = trace.events[event].duration {
+    if let Some(duration) = trace.events()[event].duration {
         let _ = writeln!(
             evidence,
             "Call duration {:.3} ms",
             duration as f64 / 1_000_000.0
         );
     }
-    if let Some(pid) = trace.events[event].pid {
+    if let Some(pid) = trace.events()[event].pid {
         let _ = writeln!(evidence, "PID {pid}");
     }
-    for raw in trace.events[event].originals() {
+    for raw in trace.events()[event].originals() {
         append_raw(&mut evidence, trace, raw);
     }
     evidence
-}
-
-fn delta(before: u64, after: u64) -> f64 {
-    (i128::from(after) - i128::from(before)) as f64 / 1_000_000.0
 }

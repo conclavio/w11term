@@ -1,4 +1,7 @@
+//! Saved strace parsing, descriptor lifetimes and comparison for the viewer and CLI.
+
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -10,10 +13,16 @@ use std::{
 
 mod comparison;
 mod descriptors;
-pub(super) use comparison::{
+pub use comparison::{
     Comparison, Kind as ComparisonKind, Row as ComparisonRow, RowMatch as ComparisonMatch,
 };
-pub(super) use descriptors::{DescriptorReport, Lifetime};
+pub use descriptors::{DescriptorReport, Lifetime, Step};
+
+pub const MAX_QUERY_CHARS: usize = 256;
+
+pub fn duration_delta_ms(working_ns: u64, failing_ns: u64) -> f64 {
+    (i128::from(failing_ns) - i128::from(working_ns)) as f64 / 1_000_000.0
+}
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORDS: usize = 1_000_000;
@@ -23,7 +32,7 @@ const CLOCK_DAY_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 const CLOCK_HALF_DAY_NS: i64 = CLOCK_DAY_NS / 2;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum Filter {
+pub enum Filter {
     #[default]
     All,
     Errors,
@@ -42,8 +51,9 @@ impl Filter {
     ];
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Outcome {
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
     Success,
     ZeroRead,
     Error,
@@ -70,7 +80,7 @@ impl Outcome {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Raw {
+pub struct Raw {
     source: u16,
     pub line: u32,
     start: u32,
@@ -127,7 +137,7 @@ impl RelativeClock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MergeOrder {
+pub enum MergeOrder {
     File,
     Epoch,
     Clock { anchor: i64, earliest: i64 },
@@ -194,7 +204,7 @@ impl ClockMerge {
     }
 }
 
-pub(super) struct Event {
+pub struct Event {
     pub pid: Option<u32>,
     pub name: Arc<str>,
     pub resource: Arc<str>,
@@ -273,7 +283,7 @@ impl Event {
     }
 }
 
-pub(super) struct Group {
+pub struct Group {
     pub range: Range<usize>,
     pub duration: u64,
     pub timed: usize,
@@ -287,9 +297,9 @@ struct Source {
 
 pub struct Trace {
     sources: Vec<Source>,
-    pub(super) events: Vec<Event>,
-    pub(super) groups: Vec<Group>,
-    pub(super) merge_order: MergeOrder,
+    events: Vec<Event>,
+    groups: Vec<Group>,
+    merge_order: MergeOrder,
     pub incomplete: usize,
     pub errors: usize,
 }
@@ -458,7 +468,7 @@ impl Trace {
         &self.sources[0].path
     }
 
-    pub(super) fn paths(&self) -> Vec<PathBuf> {
+    pub fn paths(&self) -> Vec<PathBuf> {
         self.sources
             .iter()
             .map(|source| source.path.clone())
@@ -469,11 +479,23 @@ impl Trace {
         self.sources.len()
     }
 
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    pub fn merge_order(&self) -> MergeOrder {
+        self.merge_order
+    }
+
     fn merged_by_time(&self) -> bool {
         self.merge_order != MergeOrder::File
     }
 
-    pub(super) fn original(&self, raw: Raw) -> (&Path, &[u8]) {
+    pub fn original(&self, raw: Raw) -> (&Path, &[u8]) {
         (
             &self.sources[usize::from(raw.source)].path,
             slice(&self.sources, raw),
@@ -512,7 +534,7 @@ impl Trace {
         current.ns.checked_sub(start.ns)
     }
 
-    pub(super) fn filtered(&self, filter: Filter, query: &str) -> Vec<usize> {
+    pub fn filtered(&self, filter: Filter, query: &str) -> Vec<usize> {
         let query = query.trim().to_lowercase();
         let pid = query.parse::<u32>().ok();
         self.groups

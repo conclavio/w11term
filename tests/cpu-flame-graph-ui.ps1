@@ -152,6 +152,8 @@ try {
     $app = $null
     $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui-restart.log')
     $window = Wait-InputWindow
+    $restartedPane = ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id
+    Wait-Text $restartedPane 'PS '
     Run-Palette 'Diagnostics overview'
     $null = Wait-Until 'pinned files still appear after restarting' { Find-Element 'Pinned files' }
     Choose-DiagnosticFileAction 'worker profile.folded' 'Copy path'

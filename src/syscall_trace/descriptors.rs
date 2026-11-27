@@ -44,7 +44,7 @@ enum Change {
 }
 
 #[derive(Clone, Copy)]
-pub(in crate::app::syscall_view) struct Step {
+pub struct Step {
     pub event: usize,
     change: Change,
 }
@@ -93,7 +93,7 @@ impl End {
     }
 }
 
-pub(in crate::app::syscall_view) struct Lifetime {
+pub struct Lifetime {
     pub pid: Option<u32>,
     pub fd: u32,
     pub resource: Arc<str>,
@@ -110,11 +110,15 @@ impl Lifetime {
 
 #[derive(Default)]
 pub struct DescriptorReport {
-    pub(in crate::app::syscall_view) lifetimes: Vec<Lifetime>,
+    lifetimes: Vec<Lifetime>,
     pub limited: bool,
 }
 
 impl DescriptorReport {
+    pub fn lifetimes(&self) -> &[Lifetime] {
+        &self.lifetimes
+    }
+
     pub(super) fn comparison_bindings(&self) -> impl Iterator<Item = (usize, u32, usize)> + '_ {
         self.lifetimes.iter().flat_map(|life| {
             life.steps.iter().filter_map(move |step| {
@@ -142,7 +146,7 @@ impl DescriptorReport {
                 )
             })
     }
-    pub(in crate::app::syscall_view) fn search(&self, trace: &Trace, query: &str) -> Vec<usize> {
+    pub fn search(&self, trace: &Trace, query: &str) -> Vec<usize> {
         let query = query.trim().to_lowercase();
         let pid = query
             .strip_prefix("pid ")
@@ -240,7 +244,7 @@ struct Builder {
 }
 
 impl Trace {
-    pub(in crate::app::syscall_view) fn descriptor_report(&self) -> DescriptorReport {
+    pub fn descriptor_report(&self) -> DescriptorReport {
         let mut builder = Builder::default();
         let mut order = self
             .events

@@ -1,6 +1,10 @@
+use super::offline;
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::BTreeMap, path};
-use w11term::control::{Request, SyscallFilter, SyscallOptions};
+use std::{collections::BTreeMap, io::Write, path, sync::Arc};
+use w11term::{
+    control::{Request, SyscallFilter, SyscallOptions},
+    syscall_trace::{Comparison, Trace},
+};
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] preview-syscall-capture --pane ID --program PROGRAM [TRACE OPTIONS]\n",
@@ -10,6 +14,59 @@ pub(super) const HELP: &str = concat!(
     "TRACE OPTIONS: [--arg ARG ...] [--directory PATH] [--seconds N] [--max-mib N] ",
     "[--string-size N] [--filter all|files|processes|network]",
 );
+
+pub(super) const COMPARE_VERB: &str = "compare-syscall-traces";
+pub(super) const COMPARE_HELP: &str = concat!(
+    "w11term-cli compare-syscall-traces --working PATH [--working PATH ...] ",
+    "--failing PATH [--failing PATH ...] [--filter TEXT] [--include-timing] [--output-file PATH]",
+);
+
+pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut args = args.iter();
+    let mut working = Vec::new();
+    let mut failing = Vec::new();
+    let mut filter = None;
+    let mut output_file = None;
+    let mut include_timing = false;
+    while let Some(flag) = args.next() {
+        let mut value = || {
+            args.next()
+                .with_context(|| format!("{flag} requires a value"))
+        };
+        match flag.as_str() {
+            "--working" => working.push(path::absolute(value()?)?),
+            "--failing" => failing.push(path::absolute(value()?)?),
+            "--include-timing" => {
+                ensure!(!include_timing, "specify {flag} only once");
+                include_timing = true;
+            }
+            "--filter" | "--output-file" => {
+                let target = if flag == "--filter" {
+                    &mut filter
+                } else {
+                    &mut output_file
+                };
+                ensure!(target.is_none(), "specify {flag} only once");
+                *target = Some(value()?.as_str());
+            }
+            _ => bail!("unknown option {flag} for {COMPARE_VERB}"),
+        }
+    }
+    ensure!(
+        !working.is_empty(),
+        "provide at least one --working trace file"
+    );
+    ensure!(
+        !failing.is_empty(),
+        "provide at least one --failing trace file"
+    );
+    let working = Arc::new(Trace::open(working).context("Reading the working trace")?);
+    let failing = Arc::new(Trace::open(failing).context("Reading the failing trace")?);
+    let comparison = Comparison::build(working, failing);
+    offline::write_report(stdout, output_file, |dest| {
+        comparison.write_json(filter.unwrap_or_default(), include_timing, dest)
+    })
+}
 
 pub(super) fn parse(
     verb: &str,

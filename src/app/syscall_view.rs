@@ -1,11 +1,10 @@
 use super::*;
 use std::{fmt::Write as _, path::PathBuf};
-use trace::{Filter, Group, Raw, Trace};
+use w11term::syscall_trace::{self as trace, Filter, Group, Raw, Trace};
 
 mod capture;
 mod compare;
 mod handles;
-mod trace;
 
 pub(super) const LABEL: &str = "Syscall trace viewer";
 const GROUPS_PER_PAGE: usize = 64;
@@ -120,7 +119,7 @@ impl TerminalApp {
             }
             Action::Query(id, query) => {
                 if let Some(page) = self.syscall_page(id).filter(|page| page.pending.is_none()) {
-                    page.query = query.chars().take(256).collect();
+                    page.query = query.chars().take(trace::MAX_QUERY_CHARS).collect();
                 }
             }
             Action::Filter(id, index) => {
@@ -283,7 +282,7 @@ impl PageState {
     }
 
     fn load(&mut self, trace: Arc<Trace>) {
-        self.visible = (0..trace.groups.len()).collect();
+        self.visible = (0..trace.groups().len()).collect();
         self.loaded = Some(trace);
         self.query.clear();
         self.filter = Filter::default();
@@ -318,7 +317,7 @@ impl PageState {
     }
 
     fn selection(&self) -> Option<&Group> {
-        self.loaded.as_ref()?.groups.get(self.selected?)
+        self.loaded.as_ref()?.groups().get(self.selected?)
     }
 
     pub(super) fn view(
@@ -369,7 +368,7 @@ impl PageState {
                 .file_name()
                 .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
             trace.file_count(),
-            trace.events.len(),
+            trace.events().len(),
             trace.errors,
             trace.incomplete,
         );
@@ -380,7 +379,7 @@ impl PageState {
                 .text_wrapping(TextWrapping::Wrap),
         ));
         if trace.file_count() > 1 {
-            let order = match trace.merge_order {
+            let order = match trace.merge_order() {
                 trace::MergeOrder::Epoch => "Files merged by epoch timestamp",
                 trace::MergeOrder::Clock { .. } => "Files merged by time of day",
                 trace::MergeOrder::File => {
@@ -516,7 +515,7 @@ impl PageState {
         let start = group.range.start + self.raw_page * CALLS_PER_PAGE;
         let end = (start + CALLS_PER_PAGE).min(group.range.end);
         let mut original = String::new();
-        for raw in trace.events[start..end]
+        for raw in trace.events()[start..end]
             .iter()
             .flat_map(|event| event.originals())
         {
@@ -574,8 +573,8 @@ fn append_raw(text: &mut String, trace: &Trace, raw: Raw) {
 }
 
 fn group_label(trace: &Trace, index: usize) -> String {
-    let group = &trace.groups[index];
-    let event = &trace.events[group.range.start];
+    let group = &trace.groups()[index];
+    let event = &trace.events()[group.range.start];
     let pid = event
         .pid
         .map_or_else(|| "PID unknown".into(), |pid| format!("PID {pid}"));
