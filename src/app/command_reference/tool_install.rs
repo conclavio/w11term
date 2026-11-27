@@ -87,6 +87,8 @@ struct Retained {
 #[derive(Deserialize)]
 pub struct Installation {
     bundle: String,
+    bundle_sha256: String,
+    path_status: String,
     changed: bool,
     launchers_created: usize,
     #[serde(default)]
@@ -133,6 +135,7 @@ pub(super) struct Installer {
     status: Option<String>,
     history: Option<history::Panel>,
     path_review: Option<Box<path_repair::Review>>,
+    path_setup: Option<path_repair::Setup>,
 }
 
 fn message(action: Action) -> Message {
@@ -166,6 +169,9 @@ impl Installer {
     ) -> View {
         if let Some(history) = &self.history {
             return history.view(&self.account, active == Some(self.target), ctx);
+        }
+        if let Some(setup) = self.path_setup.as_ref().filter(|setup| setup.open) {
+            return setup.view(self, active == Some(self.target), ctx);
         }
         let available = active == Some(self.target) && self.pending.is_none();
         let command = self.source.command();
@@ -236,7 +242,7 @@ impl Installer {
         if active == Some(self.target)
             && let Some(review) = &self.path_review
         {
-            review.describe(&mut fields);
+            review.describe(&mut fields, false);
             if review.ready {
                 fields.push(KeyedView::new(
                     "apply-path",
@@ -302,6 +308,14 @@ impl Installer {
                 TextBlock::new()
                     .text(status)
                     .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        if self.path_setup.is_some() {
+            fields.push(KeyedView::new(
+                "setup-tool-path",
+                button("Set up PATH for new shells", available, || {
+                    Action::Path(path_repair::Action::OpenSetup)
+                }),
             ));
         }
         if let Some(review) = &self.review {
@@ -515,6 +529,7 @@ impl TerminalApp {
                     status: None,
                     history: None,
                     path_review: None,
+                    path_setup: None,
                 });
                 if !review_now {
                     return;
@@ -583,6 +598,7 @@ impl TerminalApp {
                     Ok(Some(path)) => {
                         installer.source = BundleSource::Manifest(Some(path));
                         installer.review = None;
+                        installer.path_setup = None;
                     }
                     Ok(None) => (),
                     Err(error) => installer.status = Some(error),
@@ -626,6 +642,7 @@ impl TerminalApp {
                 if work != Work::Download {
                     installer.review = None;
                 }
+                installer.path_setup = None;
                 let ticket = installer.begin(work);
                 let rejected = if apply {
                     message(Action::Applied(
@@ -708,6 +725,12 @@ impl TerminalApp {
                     installer.status = Some(match result {
                         Ok(installation) => {
                             panel.tools = None;
+                            if installation.path_status == "missing" {
+                                installer.path_setup = Some(path_repair::Setup::new(
+                                    installation.bundle.clone(),
+                                    installation.bundle_sha256,
+                                ));
+                            }
                             let changed =
                                 installation.changed || installation.launchers_created != 0;
                             if let Some(name) = installer.source.command() {

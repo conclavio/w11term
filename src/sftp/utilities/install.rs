@@ -303,6 +303,43 @@ impl Engine {
         Ok(tools)
     }
 
+    pub(in crate::sftp) async fn installed_tool_bin_directory(
+        &self,
+        home: &str,
+        name: &str,
+        id: &str,
+    ) -> Result<String> {
+        let store = managed_tool_store(home, name)?;
+        let managed = self
+            .utility_directories(home, &format!("{STORE}/{name}/versions"))
+            .await?;
+        let selector = self.utility_selector_state(&store, &managed).await?;
+        ensure!(
+            !selector.conflict && selector.version.as_deref() == Some(id),
+            "The installed tool bundle changed. Review the installation again."
+        );
+        let release = self
+            .utility_release_manifest(&store, name, None, id)
+            .await?;
+        let bin = self
+            .utility_directories(home, &release.bin_directory)
+            .await?;
+        let launchers = self.launcher_actions(home, &store, &release, &bin).await?;
+        for (tool, (launcher, action)) in release.tools.iter().zip(launchers) {
+            ensure!(
+                action == "managed",
+                "The managed launcher changed at {launcher}"
+            );
+            let executable = format!("{store}/versions/{id}/{}", tool.name);
+            ensure!(
+                self.tool_file_attrs(&executable).await?.size == Some(tool.bytes),
+                "The installed executable changed at {executable}"
+            );
+        }
+        self.check_selector(&store, &selector).await?;
+        Ok(release.bin_directory)
+    }
+
     pub(super) fn utility_review(&self, report: &Value) -> Result<String> {
         let mut digest = Sha256::new_with_prefix(self.dotfiles_review_scope.to_le_bytes());
         digest.update(b"w11term-tools-review-v1\0");
@@ -424,6 +461,7 @@ impl Engine {
                 "bundle": plan.release.name, "bundle_sha256": id, "previous_bundle_sha256": plan.selector.version,
                 "changed": changed, "uploaded": uploaded, "copied_tools": copied_tools,
                 "launchers_created": launchers, "version_directory": version_path,
+                "path_status": plan.report["path_status"],
             }))
         }).await
     }

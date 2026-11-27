@@ -50,6 +50,27 @@ try {
     if (Find-Element 'Download pinned Linux build' $button) { throw 'A retained executable was offered a replacement download' }
     Click 'Install reviewed rg'
     $null = Wait-Until 'reviewed rg launcher repaired' { Find-Element 'Installed rg' }
+    Click 'Set up PATH for new shells'
+    Click 'Review PATH setup'
+    $null = Wait-Until 'review explains the startup edits for a manual install' {
+        (Find-Element "Append managed block to${dot}/.bashrc") -and (Find-Element "Create${dot}/.profile") -and
+            (Find-Element 'The launcher directory will be appended to PATH for new shells.') -and
+            (Find-Element 'Apply reviewed PATH setup' $button).Current.IsEnabled
+    }
+    if ([IO.File]::Exists($fixture.login) -or [IO.File]::ReadAllText($fixture.startup).Contains('w11term tool PATH')) {
+        throw 'Review changed remote startup files before confirmation'
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot apply the PATH review' {
+        $apply = Find-Element 'Apply reviewed PATH setup' $button
+        $apply -and !$apply.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    Click 'Apply reviewed PATH setup'
+    $null = Wait-Until 'manual PATH setup completed' { Find-Element 'Managed PATH added for new shells' }
+    Click 'Back to tool installer'
     Click 'Back to command reference'
 
     Lookup 'jq'

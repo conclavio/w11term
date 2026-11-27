@@ -566,6 +566,158 @@ async fn retained_tool_verification_uses_server_hashes_with_sftp_fallback() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_tool_path_requires_a_review_of_the_active_release_and_startup_files() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "x86_64", "/", "/usr/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let launcher_dir = "operator/bin";
+    let rc = remote.join(".bashrc");
+    fs::write(&rc, "# existing settings\n").unwrap();
+    let Operation::PreviewToolBundle { mut bundle } = preview(vec![build(
+        local.path(),
+        "rg",
+        UtilityArchitecture::X86_64,
+        executable(UtilityArchitecture::X86_64, None),
+    )]) else {
+        unreachable!()
+    };
+    bundle.bin_directory = launcher_dir.into();
+    let operation = || Operation::PreviewToolBundle {
+        bundle: bundle.clone(),
+    };
+    let reviewed = guarded_job(&pane, None, operation()).await.unwrap();
+    let installed = guarded_job(&pane, None, apply(operation(), &reviewed))
+        .await
+        .unwrap();
+    assert_eq!(installed["path_status"], "missing");
+    let id = installed["bundle_sha256"].as_str().unwrap();
+    let setup = |shell, review| Operation::ReviewInstalledToolPath {
+        bundle: bundle.name.clone(),
+        bundle_sha256: id.to_owned(),
+        path: ToolPath {
+            shell,
+            zdotdir: None,
+        },
+        review,
+    };
+    let bash = DotfileShell::Bash;
+    let generation = pane.ssh_connection_generation().unwrap();
+    let error = guarded_job(&pane, None, setup(bash, None))
+        .await
+        .unwrap_err();
+    assert!(error.contains("original SSH connection"), "{error}");
+
+    let plan = guarded_job(&pane, Some(generation), setup(bash, None))
+        .await
+        .unwrap();
+    assert_eq!(plan["bundle_sha256"], id);
+    assert_eq!(plan["bin_directory"], launcher_dir);
+    assert_eq!(plan["ready"], true);
+    assert_eq!(fs::read_to_string(&rc).unwrap(), "# existing settings\n");
+    assert!(!remote.join(".profile").exists());
+    let token = || Some(plan["review"].as_str().unwrap().to_owned());
+    let wrong_shell = guarded_job(&pane, Some(generation), setup(DotfileShell::Zsh, token()))
+        .await
+        .unwrap_err();
+    assert!(wrong_shell.contains("review is stale"), "{wrong_shell}");
+    assert!(!remote.join(".zshrc").exists());
+
+    let selector = remote.join(".local/share/w11term/tools/portable/current");
+    let active = fs::read_to_string(&selector).unwrap();
+    fs::write(&selector, active.replace(id, &"f".repeat(64))).unwrap();
+    let changed = guarded_job(&pane, Some(generation), setup(bash, token()))
+        .await
+        .unwrap_err();
+    assert!(
+        changed.contains("installed tool bundle changed"),
+        "{changed}"
+    );
+    fs::write(&selector, &active).unwrap();
+
+    let launcher = remote.join(launcher_dir).join("rg");
+    let link = fs::read_to_string(&launcher).unwrap();
+    fs::write(&launcher, "operator-owned launcher").unwrap();
+    let conflict = guarded_job(&pane, Some(generation), setup(bash, token()))
+        .await
+        .unwrap_err();
+    assert!(conflict.contains("managed launcher changed"), "{conflict}");
+    assert_eq!(
+        fs::read_to_string(&launcher).unwrap(),
+        "operator-owned launcher"
+    );
+    fs::write(&launcher, link).unwrap();
+
+    fs::write(&rc, "# edited after preview\n").unwrap();
+    let stale = guarded_job(&pane, Some(generation), setup(bash, token()))
+        .await
+        .unwrap_err();
+    assert!(stale.contains("review is stale"), "{stale}");
+    assert!(!remote.join(".profile").exists());
+    let fresh = guarded_job(&pane, Some(generation), setup(bash, None))
+        .await
+        .unwrap();
+    let applied = guarded_job(
+        &pane,
+        Some(generation),
+        setup(bash, Some(fresh["review"].as_str().unwrap().to_owned())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(applied["changed"], true);
+    let content = fs::read_to_string(&rc).unwrap();
+    assert!(content.starts_with("# edited after preview\n"));
+    assert!(content.contains("PATH=\"${PATH:+$PATH:}$HOME/operator/bin\""));
+    assert!(
+        fs::read_to_string(remote.join(".profile"))
+            .unwrap()
+            .contains("$HOME/operator/bin")
+    );
+    assert_eq!(fs::read_to_string(&selector).unwrap(), active);
+    let current = guarded_job(&pane, Some(generation), setup(bash, None))
+        .await
+        .unwrap();
+    assert_eq!(current["ready"], false);
+    assert!(current["review"].is_null());
+    assert!(
+        current["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["action"] == "unchanged")
+    );
+    let zdotdir = remote.join("config/zsh");
+    fs::create_dir_all(&zdotdir).unwrap();
+    let zsh = |review| Operation::ReviewInstalledToolPath {
+        bundle: bundle.name.clone(),
+        bundle_sha256: id.to_owned(),
+        path: ToolPath {
+            shell: DotfileShell::Zsh,
+            zdotdir: Some("config/zsh".into()),
+        },
+        review,
+    };
+    let zsh_plan = guarded_job(&pane, Some(generation), zsh(None))
+        .await
+        .unwrap();
+    assert_eq!(zsh_plan["files"][0]["path"], "/config/zsh/.zprofile");
+    assert_eq!(zsh_plan["files"][1]["path"], "/config/zsh/.zshrc");
+    let zsh_token = zsh_plan["review"].as_str().unwrap().to_owned();
+    guarded_job(&pane, Some(generation), zsh(Some(zsh_token)))
+        .await
+        .unwrap();
+    assert!(
+        fs::read_to_string(zdotdir.join(".zshrc"))
+            .unwrap()
+            .contains("$HOME/operator/bin")
+    );
+    assert!(!remote.join(".zshrc").exists());
+    assert_eq!(fs::read_to_string(&rc).unwrap(), content);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adding_tools_keeps_active_binaries_and_pauses_login_sync() {
     use UtilityArchitecture::X86_64;
 
@@ -1015,7 +1167,7 @@ pub(super) async fn seed_catalog_tool_for_reference(
     local: &std::path::Path,
     remote: &std::path::Path,
 ) -> String {
-    probe_response(remote, "x86_64", "/", "/usr/bin:/.local/bin");
+    probe_response(remote, "x86_64", "/", "/usr/bin");
     fs::write(remote.join("posix-rename-version"), "1").unwrap();
     save_login_tools(local, "catalog-seed.json", 1, &["rg"]);
     let mut bundle = UtilityBundle::load(&local.join("catalog-seed.json")).unwrap();

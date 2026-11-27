@@ -95,6 +95,14 @@ pub(super) fn valid_bin_directory(directory: &str) -> bool {
         && !directory.starts_with(&format!("{STORE}/"))
 }
 
+pub(super) fn managed_tool_store(home: &str, bundle: &str) -> Result<String> {
+    ensure!(
+        safe_component(bundle) && !bundle.starts_with('.'),
+        "Invalid tool bundle name"
+    );
+    Ok(under_home(home, &format!("{STORE}/{bundle}")))
+}
+
 fn valid_command_name(name: &str) -> bool {
     safe_component(name) && !name.starts_with(['.', '-'])
 }

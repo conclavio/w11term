@@ -2857,6 +2857,9 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
     let root = remote.path();
     let id = super::utilities::seed_catalog_tool_for_reference(&pane, state.path(), root).await;
     drop(pane);
+    let startup = root.join(".bashrc");
+    fs::write(&startup, "# keep the user's startup files\n").unwrap();
+    let login = root.join(".profile");
     let bin = root.join(".local/bin");
     fs::remove_file(bin.join("rg")).unwrap();
     let conflict = bin.join("jq");
@@ -2872,15 +2875,36 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
         .sha256;
     fs::write(
         state.path().join("catalog-tool-fixture.json"),
-        serde_json::to_vec(&json!({"conflict": conflict, "pin": pin})).unwrap(),
+        serde_json::to_vec(
+            &json!({"conflict": conflict, "pin": pin, "startup": startup, "login": login}),
+        )
+        .unwrap(),
     )
     .unwrap();
 
     let store = root.join(format!(".local/share/w11term/tools/{}", catalog.name));
     let original = fs::read(store.join("versions").join(&id).join("rg")).unwrap();
     drive_mixed_gui("install-command-tool-ui.ps1", &ssh, state.path());
+    let profiles: Value =
+        serde_json::from_slice(&fs::read(state.path().join("profiles.json")).unwrap()).unwrap();
+    assert!(profiles["profiles"]["palette-ssh"]["tool_bundle"].is_null());
     let launcher = fs::read_to_string(bin.join("rg")).unwrap();
     assert!(launcher.ends_with("/linux-essentials/current/rg\n"));
+    assert!(
+        fs::read_to_string(&startup)
+            .unwrap()
+            .starts_with("# keep the user's startup files\n")
+    );
+    assert!(
+        fs::read_to_string(&startup)
+            .unwrap()
+            .contains("PATH=\"${PATH:+$PATH:}$HOME/.local/bin\"")
+    );
+    assert!(
+        fs::read_to_string(&login)
+            .unwrap()
+            .contains("$HOME/.local/bin")
+    );
     let selector = fs::read_to_string(store.join("current")).unwrap();
     let version = selector.lines().nth(1).unwrap();
     if std::env::var("W11TERM_TEST_LIVE_CATALOG_DOWNLOAD").as_deref() == Ok("1") {

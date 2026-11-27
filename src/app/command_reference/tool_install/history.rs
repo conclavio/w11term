@@ -488,6 +488,7 @@ impl TerminalApp {
                             reference.tools = None;
                         }
                         installer.review = None;
+                        installer.path_setup = None;
                         installer.status = None;
                         if let Some(versions) = &mut history.versions {
                             for row in versions

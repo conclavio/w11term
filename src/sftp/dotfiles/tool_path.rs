@@ -1,6 +1,6 @@
 use super::*;
 use crate::options::{ToolPath, ToolSync};
-use crate::sftp::utilities::{valid_bin_directory, with_lock};
+use crate::sftp::utilities::{managed_tool_store, valid_bin_directory, with_lock};
 use std::ops::Range;
 
 struct PathPlan {
@@ -138,46 +138,85 @@ impl Engine {
             home == settings.home,
             "SFTP home differs from the approved tool bundle home"
         );
+        let plan =
+            self.review_path_change(&home, &settings.bin_directory, path, None, review, stage);
+        if review.is_some() {
+            with_lock(session, &home, plan).await
+        } else {
+            plan.await
+        }
+    }
+
+    pub(in crate::sftp) async fn review_installed_tool_path(
+        &self,
+        session: &russh::client::Handle<crate::ssh::Handler>,
+        bundle: &str,
+        bundle_sha256: &str,
+        path: &ToolPath,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        let home = self.dotfile_home().await?;
+        let id = normalize_sha256(bundle_sha256)?;
+        let plan = async {
+            let bin = self
+                .installed_tool_bin_directory(&home, bundle, &id)
+                .await?;
+            self.review_path_change(&home, &bin, path, Some((bundle, &id)), review, stage)
+                .await
+        };
+        if review.is_some() {
+            let store = managed_tool_store(&home, bundle)?;
+            self.check_entry_parent(&store).await?;
+            with_lock(session, &store, with_lock(session, &home, plan)).await
+        } else {
+            plan.await
+        }
+    }
+
+    async fn review_path_change(
+        &self,
+        home: &str,
+        bin: &str,
+        path: &ToolPath,
+        installed: Option<(&str, &str)>,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
         ensure!(
             !home.contains(':'),
             "The account home contains a PATH separator"
         );
-
-        let review_plan = async {
-            let plan = self
-                .plan_tool_path(&home, &settings.bin_directory, path, true)
-                .await?;
-            let block = plan.check().err().map(|error| error.to_string());
-            let ready = block.is_none() && plan.changed().next().is_some();
-            let mut report = json!({
-                "operation": "tool-path",
-                "home": home,
-                "bin_directory": settings.bin_directory,
-                "shell": path.shell,
-                "files": plan.edits.iter().map(Edit::report).collect::<Vec<_>>(),
-                "blocked": block,
-                "ready": ready,
-            });
-            if let Some(review) = review {
-                ensure!(
-                    self.dotfiles_review(&report)? == normalize_sha256(review)?,
-                    "The tool PATH review is stale or belongs to another SFTP connection. Review again."
-                );
-                plan.check()?;
-                ensure!(ready, "The tool PATH is already current");
-                let changed = self.apply_tool_path(&plan, stage).await?;
-                Ok(json!({ "changed": changed }))
-            } else {
-                if ready {
-                    report["review"] = json!(self.dotfiles_review(&report)?);
-                }
-                Ok(report)
-            }
-        };
-        if review.is_some() {
-            with_lock(session, &home, review_plan).await
+        let plan = self.plan_tool_path(home, bin, path, true).await?;
+        let block = plan.check().err().map(|error| error.to_string());
+        let ready = block.is_none() && plan.changed().next().is_some();
+        let mut report = json!({
+            "operation": "tool-path",
+            "home": home,
+            "bin_directory": bin,
+            "shell": path.shell,
+            "files": plan.edits.iter().map(Edit::report).collect::<Vec<_>>(),
+            "blocked": block,
+            "ready": ready,
+        });
+        if let Some((bundle, id)) = installed {
+            report["bundle"] = json!(bundle);
+            report["bundle_sha256"] = json!(id);
+        }
+        if let Some(review) = review {
+            ensure!(
+                self.dotfiles_review(&report)? == normalize_sha256(review)?,
+                "The tool PATH review is stale or belongs to another SFTP connection. Review again."
+            );
+            plan.check()?;
+            ensure!(ready, "The tool PATH is already current");
+            let changed = self.apply_tool_path(&plan, stage).await?;
+            Ok(json!({ "changed": changed }))
         } else {
-            review_plan.await
+            if ready {
+                report["review"] = json!(self.dotfiles_review(&report)?);
+            }
+            Ok(report)
         }
     }
 }

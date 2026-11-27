@@ -291,6 +291,13 @@ pub enum Operation {
     ReviewToolPath {
         review: Option<String>,
     },
+    #[serde(skip)]
+    ReviewInstalledToolPath {
+        bundle: String,
+        bundle_sha256: String,
+        path: crate::options::ToolPath,
+        review: Option<String>,
+    },
     PreviewToolBundle {
         bundle: UtilityBundle,
     },
@@ -874,7 +881,7 @@ pub(crate) async fn run(
         } = job;
         if expected_generation.is_none() {
             let missing = match operation {
-                Operation::ReviewToolPath { .. } => {
+                Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
                     Some("The PATH review needs its original SSH connection")
                 }
                 Operation::SaveText { .. } => Some("The editor needs its original SSH connection"),
@@ -1056,9 +1063,11 @@ pub(crate) async fn run(
                 Operation::ToolBundleVersions => {
                     JobStage::Checking("Tool history lookup did not finish")
                 }
-                Operation::ReviewToolPath { .. } => JobStage::Checking(
-                    "Tool PATH review did not finish. Review the startup files again.",
-                ),
+                Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
+                    JobStage::Checking(
+                        "Tool PATH review did not finish. Review the startup files again.",
+                    )
+                }
                 Operation::ApplyToolBundle { .. }
                 | Operation::AddToToolBundle { .. }
                 | Operation::RollbackToolBundle { .. }
@@ -1613,6 +1622,22 @@ impl Engine {
                     .context("The verified SSH connection has no matching tool PATH approval")?;
                 self.review_tool_path(session, settings, review.as_deref(), stage)
                     .await?
+            }
+            ReviewInstalledToolPath {
+                bundle,
+                bundle_sha256,
+                path,
+                review,
+            } => {
+                self.review_installed_tool_path(
+                    session,
+                    &bundle,
+                    &bundle_sha256,
+                    &path,
+                    review.as_deref(),
+                    stage,
+                )
+                .await?
             }
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             ApplyToolBundle { bundle, review } => {
