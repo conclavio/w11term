@@ -34,8 +34,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   list-dotfile-versions --shell bash|zsh\n\
-  preview-dotfiles-switch SHA256|disabled --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
-  switch-dotfiles SHA256|disabled --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
+  switch-dotfiles SHA256|disabled|automatic --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -385,12 +385,12 @@ pub fn parse(
                 "preview-dotfiles-switch" | "switch-dotfiles"
             ) {
                 let value = path()?;
-                let target = if value == "disabled" {
-                    DotfileTarget::Disabled
-                } else {
-                    DotfileTarget::Bundle {
+                let target = match value.as_str() {
+                    "disabled" => DotfileTarget::Disabled,
+                    "automatic" => DotfileTarget::Automatic,
+                    _ => DotfileTarget::Bundle {
                         sha256: normalize_sha256(&value)?,
-                    }
+                    },
                 };
                 fields.insert("op".into(), json!("switch-dotfiles"));
                 fields.insert("target".into(), json!(target));
@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn switches_dotfiles_only_with_a_reviewed_bundle_or_disable_request() {
+    fn switches_dotfiles_only_with_a_reviewed_target() {
         let id = "a".repeat(64);
         let token = "b".repeat(64);
         let (_, preview) = p(&[
@@ -737,6 +737,28 @@ mod tests {
                 },
                 ..
             } if review == token
+        ));
+        let (_, resume) = p(&[
+            "--pane",
+            "2",
+            "preview-dotfiles-switch",
+            "automatic",
+            "--shell",
+            "bash",
+        ])
+        .unwrap();
+        assert!(matches!(
+            resume,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::SwitchDotfiles {
+                    target: DotfileTarget::Automatic,
+                    shell: DotfileShell::Bash,
+                    review: None,
+                    ..
+                },
+                ..
+            }
         ));
         assert!(
             p(&[

@@ -170,12 +170,40 @@ try {
     Click 'Disable reviewed dotfiles'
     $null = Wait-Until 'history shows disabled dotfiles' { Find-Element 'Managed dotfiles disabled' }
     if ([IO.File]::ReadAllText($selectorPath) -cne "disabled`n") { throw 'Disable did not switch the selector' }
+
+    Click 'Review resuming automatic dotfile sync'
+    $null = Wait-Until 'resumption explains that disabled fragments stay inactive' {
+        Find-Element 'Keep managed fragments inactive until a bundle is installed'
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "disabled`n") { throw 'Review changed the disabled selector' }
+    Click 'Resume automatic dotfile sync'
+    $null = Wait-Until 'no version is active while the profile has yet to sync' {
+        Find-Element 'Waiting for an approved profile to sync managed dotfiles'
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "automatic`n") { throw 'Resuming activated a bundle immediately' }
+    Click 'Review disabling managed dotfiles'
+    Click 'Disable reviewed dotfiles'
+    $null = Wait-Until 'a waiting sync can be disabled again' { Find-Element 'Managed dotfiles disabled' }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "disabled`n") { throw 'Disable did not restore the hold' }
+
     Select-RetainedDotfile $pane $first
     Click 'Review dotfile restore'
     Click 'Restore reviewed dotfiles'
     $null = Wait-Until 'a retained version restores from the disabled state' {
         (Find-Element "Active version $first") -and (Find-Element 'Automatic dotfile sync paused')
     }
+    Click 'Review resuming automatic dotfile sync'
+    $null = Wait-Until 'resumption keeps the current version active' {
+        (Find-Element "Reviewed active version $first") -and (Find-Element 'Keep the reviewed version active') -and
+            (Find-Element 'Approved profiles can sync on their next SSH connection.')
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "$first`nmanual`n") { throw 'Review changed the held selector' }
+    Click 'Resume automatic dotfile sync'
+    $null = Wait-Until 'automatic sync is resumed without changing the active version' {
+        (Find-Element "Active version $first") -and (Find-Element 'Managed dotfiles active') -and
+            (Find-Element 'Automatic dotfile sync resumed')
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "$first`n") { throw 'Resuming changed the active version or left it held' }
     if ([IO.File]::ReadAllText($startup) -cne $installed) { throw 'Switching versions changed the startup hooks' }
 } finally {
     if ($app) { Close-FixtureApp $app }

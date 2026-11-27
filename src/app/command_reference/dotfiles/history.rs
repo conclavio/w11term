@@ -7,6 +7,7 @@ pub enum Action {
     Select(Option<usize>),
     ReviewRestore,
     ReviewDisable,
+    ReviewResume,
     Apply,
     Completed(Arc<()>, Result<serde_json::Value, String>),
     Back,
@@ -22,7 +23,7 @@ pub(super) struct Panel {
 #[derive(Deserialize)]
 struct SwitchReview {
     home: String,
-    bundle_sha256: Option<String>,
+    target: DotfileTarget,
     active_bundle_sha256: Option<String>,
     selector: Edit,
     supports_atomic_replace: bool,
@@ -31,7 +32,7 @@ struct SwitchReview {
 
 #[derive(Deserialize)]
 struct Switched {
-    bundle_sha256: Option<String>,
+    target: DotfileTarget,
     changed: bool,
 }
 
@@ -67,7 +68,18 @@ impl Panel {
         self.listing.as_ref().is_some_and(|listing| {
             matches!(
                 listing.state,
-                DotfileVersionState::Active | DotfileVersionState::Paused
+                DotfileVersionState::Active
+                    | DotfileVersionState::Paused
+                    | DotfileVersionState::AwaitingSync
+            )
+        })
+    }
+
+    fn can_resume(&self) -> bool {
+        self.listing.as_ref().is_some_and(|listing| {
+            matches!(
+                listing.state,
+                DotfileVersionState::Paused | DotfileVersionState::Disabled
             )
         })
     }
@@ -104,6 +116,9 @@ impl Panel {
             fields.push(detail("home", format!("SFTP home {}", listing.home)));
             let state = match listing.state {
                 DotfileVersionState::Inactive => "No managed version active",
+                DotfileVersionState::AwaitingSync => {
+                    "Waiting for an approved profile to sync managed dotfiles"
+                }
                 DotfileVersionState::Active => "Managed dotfiles active",
                 DotfileVersionState::Paused => "Automatic dotfile sync paused",
                 DotfileVersionState::Disabled => "Managed dotfiles disabled",
@@ -162,8 +177,15 @@ impl Panel {
                 ),
             ),
         ]);
+        if self.can_resume() {
+            fields.push(KeyedView::new(
+                "review-resume",
+                button("Review resuming automatic dotfile sync", idle, || {
+                    Action::ReviewResume
+                }),
+            ));
+        }
         if let Some(review) = &self.review {
-            let restoring = review.bundle_sha256.is_some();
             fields.push(detail(
                 "review-home",
                 format!("Reviewed SFTP home {}", review.home),
@@ -174,15 +196,30 @@ impl Panel {
                     format!("Reviewed active version {current}"),
                 ));
             }
-            let change = review.bundle_sha256.as_ref().map_or_else(
-                || "Disable managed dotfiles for new shells".into(),
-                |id| format!("Restore version {id}"),
-            );
+            let paused = "This choice pauses automatic dotfile sync on reconnect.";
+            let (change, effect, button_label) = match &review.target {
+                DotfileTarget::Bundle { sha256 } => (
+                    format!("Restore version {sha256}"),
+                    paused,
+                    "Restore reviewed dotfiles",
+                ),
+                DotfileTarget::Disabled => (
+                    "Disable managed dotfiles for new shells".into(),
+                    paused,
+                    "Disable reviewed dotfiles",
+                ),
+                DotfileTarget::Automatic => (
+                    if review.active_bundle_sha256.is_some() {
+                        "Keep the reviewed version active".into()
+                    } else {
+                        "Keep managed fragments inactive until a bundle is installed".into()
+                    },
+                    "Approved profiles can sync on their next SSH connection.",
+                    "Resume automatic dotfile sync",
+                ),
+            };
             fields.push(detail("change", change));
-            fields.push(detail(
-                "sync-effect",
-                "This choice pauses automatic dotfile sync on reconnect.".into(),
-            ));
+            fields.push(detail("sync-effect", effect.into()));
             fields.push(detail(
                 "selector",
                 format!(
@@ -194,11 +231,7 @@ impl Panel {
             fields.push(KeyedView::new(
                 "apply-switch",
                 button(
-                    if restoring {
-                        "Restore reviewed dotfiles"
-                    } else {
-                        "Disable reviewed dotfiles"
-                    },
+                    button_label,
                     idle && review
                         .selector
                         .blocker(review.supports_atomic_replace)
@@ -285,7 +318,12 @@ impl TerminalApp {
                     }
                     None
                 }
-                Action::ReviewRestore | Action::ReviewDisable | Action::Apply if idle => {
+                Action::ReviewRestore
+                | Action::ReviewDisable
+                | Action::ReviewResume
+                | Action::Apply
+                    if idle =>
+                {
                     let (target, review) = match action {
                         Action::ReviewRestore => {
                             let Some(id) = history.selected_id() else {
@@ -301,6 +339,9 @@ impl TerminalApp {
                         Action::ReviewDisable if history.can_disable() => {
                             (DotfileTarget::Disabled, None)
                         }
+                        Action::ReviewResume if history.can_resume() => {
+                            (DotfileTarget::Automatic, None)
+                        }
                         Action::Apply => {
                             let Some(reviewed) = history.review.take_if(|review| {
                                 review
@@ -310,12 +351,7 @@ impl TerminalApp {
                             }) else {
                                 return;
                             };
-                            let target = reviewed
-                                .bundle_sha256
-                                .map_or(DotfileTarget::Disabled, |sha256| DotfileTarget::Bundle {
-                                    sha256,
-                                });
-                            (target, Some(reviewed.review))
+                            (reviewed.target, Some(reviewed.review))
                         }
                         _ => return,
                     };
@@ -366,11 +402,16 @@ impl TerminalApp {
                         },
                         Work::SwitchVersion => match decode::<Switched>(result) {
                             Ok(switched) => {
-                                let message = match (switched.changed, switched.bundle_sha256) {
-                                    (true, Some(id)) => {
-                                        format!("Restored dotfile version {}", short_id(&id))
+                                let message = match (switched.changed, switched.target) {
+                                    (true, DotfileTarget::Bundle { sha256 }) => {
+                                        format!("Restored dotfile version {}", short_id(&sha256))
                                     }
-                                    (true, None) => "Disabled managed dotfiles".into(),
+                                    (true, DotfileTarget::Disabled) => {
+                                        "Disabled managed dotfiles".into()
+                                    }
+                                    (true, DotfileTarget::Automatic) => {
+                                        "Automatic dotfile sync resumed".into()
+                                    }
                                     (false, _) => "No dotfiles change needed".into(),
                                 };
                                 *history = Panel::default();

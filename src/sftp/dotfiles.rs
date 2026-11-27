@@ -5,6 +5,8 @@ mod tool_path;
 const DIRECTORY: &str = ".config/w11term/dotfiles";
 const PARENTS: [&str; 3] = [".config", ".config/w11term", DIRECTORY];
 const DISABLED: &str = "disabled\n";
+// Startup hooks only load fragments when the first line is a bundle digest.
+const AUTOMATIC: &str = "automatic\n";
 const MANUAL: &str = "manual\n";
 const BEGIN: &str = "# >>> w11term dotfiles >>>";
 const END: &str = "# <<< w11term dotfiles <<<";
@@ -85,12 +87,14 @@ pub enum DotfileShell {
 pub enum DotfileTarget {
     Bundle { sha256: String },
     Disabled,
+    Automatic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DotfileVersionState {
     Inactive,
+    AwaitingSync,
     Active,
     Paused,
     Disabled,
@@ -270,6 +274,20 @@ impl Edit {
         self.before.as_deref().and_then(selector_version)
     }
 
+    fn selector(path: String, before: Option<String>, desired: String) -> Self {
+        match before.as_deref() {
+            None if desired == DISABLED => Self::new(path, "unchanged", None, None),
+            None => Self::new(path, "create", None, Some(desired)),
+            Some(text) if text == desired => Self::new(path, "unchanged", before, Some(desired)),
+            Some(text)
+                if matches!(text, DISABLED | AUTOMATIC) || selector_version(text).is_some() =>
+            {
+                Self::new(path, "replace", before, Some(desired))
+            }
+            Some(_) => Self::new(path, "selector-conflict", before, None),
+        }
+    }
+
     fn report(&self) -> Value {
         let hash = |text: &str| digest_hex(Sha256::new_with_prefix(text));
         let mut report = json!({
@@ -435,14 +453,12 @@ impl Engine {
             .await?
         {
             result.active_bundle_sha256 = selector_version(&selector).map(str::to_owned);
-            result.state = match (
-                result.active_bundle_sha256.is_some(),
-                selector_held(&selector),
-            ) {
-                (true, true) => DotfileVersionState::Paused,
-                (true, false) => DotfileVersionState::Active,
-                (false, true) => DotfileVersionState::Disabled,
-                (false, false) => DotfileVersionState::Conflict,
+            result.state = match (selector.as_str(), result.active_bundle_sha256.is_some()) {
+                (AUTOMATIC, _) => DotfileVersionState::AwaitingSync,
+                (DISABLED, _) => DotfileVersionState::Disabled,
+                (text, true) if selector_held(text) => DotfileVersionState::Paused,
+                (_, true) => DotfileVersionState::Active,
+                _ => DotfileVersionState::Conflict,
             };
         }
         let prefix = format!("{}-", shell.name());
@@ -577,9 +593,11 @@ impl Engine {
         stage: &mut JobStage,
     ) -> Result<Value> {
         validate_zdotdir(shell, zdotdir)?;
-        let id = match target {
-            DotfileTarget::Bundle { sha256 } => Some(normalize_sha256(&sha256)?),
-            DotfileTarget::Disabled => None,
+        let target = match target {
+            DotfileTarget::Bundle { sha256 } => DotfileTarget::Bundle {
+                sha256: normalize_sha256(&sha256)?,
+            },
+            target => target,
         };
         let home = self.dotfile_home().await?;
         for relative in PARENTS {
@@ -589,6 +607,23 @@ impl Engine {
                 "Managed dotfiles directory is missing: {path}"
             );
         }
+        let path = selector_path(&home, shell);
+        let before = self.dotfile_text(&path).await?;
+        let desired = match &target {
+            DotfileTarget::Bundle { sha256 } => format!("{sha256}\n{MANUAL}"),
+            DotfileTarget::Disabled => DISABLED.to_owned(),
+            DotfileTarget::Automatic => {
+                ensure!(
+                    before.as_deref().is_some_and(selector_held),
+                    "Automatic dotfile sync is not paused or disabled on this account. Refresh dotfile versions."
+                );
+                before
+                    .as_deref()
+                    .and_then(selector_version)
+                    .map_or_else(|| AUTOMATIC.to_owned(), |id| format!("{id}\n"))
+            }
+        };
+        let id = selector_version(&desired).map(str::to_owned);
         let files = match &id {
             Some(id) => {
                 self.verified_dotfile_version(&home, shell, zdotdir, id)
@@ -596,15 +631,13 @@ impl Engine {
             }
             None => Vec::new(),
         };
-        let desired = id
-            .as_ref()
-            .map_or_else(|| DISABLED.to_owned(), |id| format!("{id}\n{MANUAL}"));
-        let selector = self.dotfile_selector(&home, shell, desired).await?;
+        let selector = Edit::selector(path, before, desired);
         let atomic_replace = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let mut report = json!({
             "operation": "switch-dotfiles",
             "shell": shell,
             "home": home,
+            "target": target,
             "bundle_sha256": id,
             "active_bundle_sha256": selector.active_version(),
             "selector": selector.report(),
@@ -630,7 +663,9 @@ impl Engine {
             );
             self.write_dotfile(&selector, stage).await?;
         }
-        Ok(json!({"shell": shell, "home": home, "bundle_sha256": id, "changed": changed}))
+        Ok(json!({
+            "shell": shell, "home": home, "target": target, "bundle_sha256": id, "changed": changed
+        }))
     }
 
     async fn verified_dotfile_version(
@@ -669,7 +704,7 @@ impl Engine {
         for hook in &hooks {
             ensure!(
                 hook.action == "unchanged",
-                "Install or repair the managed startup hook at {} before restoring a bundle",
+                "Install or repair the managed startup hook at {} before using this bundle",
                 hook.path
             );
         }
@@ -752,9 +787,9 @@ impl Engine {
             files.push(Edit::new(path, action, original, after));
         }
         files.extend(self.dotfile_hooks(&home, shell, zdotdir).await?);
-        let selector = self
-            .dotfile_selector(&home, shell, format!("{id}\n"))
-            .await?;
+        let path = selector_path(&home, shell);
+        let before = self.dotfile_text(&path).await?;
+        let selector = Edit::selector(path, before, format!("{id}\n"));
         Ok(Plan {
             home,
             id,
@@ -833,25 +868,6 @@ impl Engine {
         let rc = startup(&format!(".{}rc", shell.name()));
         let rc_original = self.dotfile_text(&rc).await?;
         Ok([(login, login_original), (rc, rc_original)])
-    }
-
-    async fn dotfile_selector(
-        &self,
-        home: &str,
-        shell: DotfileShell,
-        desired: String,
-    ) -> Result<Edit> {
-        let path = selector_path(home, shell);
-        let before = self.dotfile_text(&path).await?;
-        Ok(match before.as_deref() {
-            None if desired == DISABLED => Edit::new(path, "unchanged", None, None),
-            None => Edit::new(path, "create", None, Some(desired)),
-            Some(text) if text == desired => Edit::new(path, "unchanged", before, Some(desired)),
-            Some(text) if text == DISABLED || selector_version(text).is_some() => {
-                Edit::new(path, "replace", before, Some(desired))
-            }
-            Some(_) => Edit::new(path, "selector-conflict", before, None),
-        })
     }
 
     async fn dotfile_directory_exists(&self, path: &str) -> Result<bool> {

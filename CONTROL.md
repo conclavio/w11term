@@ -1294,11 +1294,13 @@ Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_fil
 
 ### Restore or disable SSH dotfiles
 
-In **Command reference → Apply SSH dotfiles**, choose the shell and its startup directory, then open **Dotfile versions**. Select a retained version and choose **Review dotfile restore** followed by **Restore reviewed dotfiles**. To disable managed fragments, use **Review disabling managed dotfiles** followed by **Disable reviewed dotfiles**. Both actions pause automatic dotfile sync for that shell on the remote account. Return to the installer and apply a reviewed bundle to resume automatic sync.
+In **Command reference → Apply SSH dotfiles**, choose the shell and its startup directory, then open **Dotfile versions**. Select a retained version and choose **Review dotfile restore** followed by **Restore reviewed dotfiles**. To disable managed fragments, use **Review disabling managed dotfiles** followed by **Disable reviewed dotfiles**. Both actions pause automatic dotfile sync for that shell on the remote account.
 
-Use `list-dotfile-versions --shell bash|zsh` to get a shell's SFTP home, active hash, selector state and up to 64 retained versions. The active version appears first, followed by the most recently modified directories. The listing identifies candidate directories. **Review dotfile restore** verifies the selected bundle's contents and startup hooks.
+Choose **Review resuming automatic dotfile sync** and then **Resume automatic dotfile sync** to allow an approved profile to sync on its next SSH connection. After a restore, the currently selected version stays active. After disabling, managed fragments stay inactive until a bundle is installed. To apply a particular local bundle immediately, return to the installer and review it there.
 
-Use `preview-dotfiles-switch SHA256|disabled --shell bash|zsh` to review a switch on the pane's SFTP connection. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
+Use `list-dotfile-versions --shell bash|zsh` to get a shell's SFTP home, active hash, selector state and up to 64 retained versions. The active version appears first, followed by the most recently modified directories. After resuming from disabled, the selector state is `awaiting-sync` until a bundle is installed. The listing identifies candidate directories. **Review dotfile restore** verifies the selected bundle's contents and startup hooks.
+
+Use `preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh` to review a switch on the pane's SFTP connection. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
 
 ```powershell
 $versions = & $ctl --pid 12345 sftp --pane $pane list-dotfile-versions --shell bash | ConvertFrom-Json
@@ -1308,9 +1310,9 @@ $preview.result.sftp
 & $ctl --pid 12345 sftp --pane $pane switch-dotfiles $previousBundle --shell bash --review $preview.result.sftp.review
 ```
 
-Use the same two commands with `disabled` to stop loading managed dotfiles in new shells. Switching only changes the selector. The startup hooks and retained files stay available for the next review. Restoring checks that the retained fragments match their bundle hash and that both startup hooks are installed. A stale token or edited fragment prevents activation. The reply reports `shell`, `home`, the selected `bundle_sha256` or null, and `changed`.
+Use the same two commands with `disabled` to stop loading managed dotfiles in new shells, or with `automatic` to lift a hold from a restore or disable. Switching only changes the selector. The startup hooks and retained files stay available for the next review. Restoring a version or lifting its hold checks that the retained fragments match their bundle hash and that both startup hooks are installed. A stale token or edited fragment prevents the change. The reply reports `shell`, `home`, `target`, the selected `bundle_sha256` or null, and `changed`.
 
-Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list the versions and `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. Include the returned `"review"` to publish the switch.
+Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list the versions and `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. To lift a hold, use `"target":{"kind":"automatic"}`. Include the returned `"review"` to publish the switch.
 
 ### Sync dotfiles on SSH connect
 
