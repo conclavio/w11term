@@ -64,7 +64,7 @@ pub enum Outcome {
     Saved(PacketCapture),
     Loaded(Arc<LocalPacketCapture>),
     Compared {
-        comparison: Box<PacketCaptureComparison>,
+        comparison: Arc<PacketCaptureComparison>,
         baseline: Option<Arc<LocalPacketCapture>>,
         paths: [PathBuf; 2],
     },
@@ -260,11 +260,12 @@ impl Panel {
     fn view(
         &self,
         active: Option<flame_graph::Connection>,
+        export_idle: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let idle = self.pending.is_none();
         if let Some(comparison) = &self.comparison {
-            return comparison.view(self.status.as_deref(), idle, ctx);
+            return comparison.view(self.status.as_deref(), idle, export_idle, ctx);
         }
         let button = |label: &str, enabled, action: fn() -> Action| {
             Button::new()
@@ -983,7 +984,11 @@ impl TerminalApp {
 
     pub(super) fn with_packet_capture(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.4).clamp(285.0, 520.0);
-        let panel = self.packet_capture.view(self.profile_connection(), ctx);
+        let panel = self.packet_capture.view(
+            self.profile_connection(),
+            self.export.pending.is_none(),
+            ctx,
+        );
         self.diagnostics_layout(content, "packet-capture", panel, width)
     }
 
@@ -1118,6 +1123,22 @@ impl TerminalApp {
                 });
             }
             Action::CompareCapture => self.choose_capture_file(FileChoice::Compare, ctx),
+            Action::Comparison(revision, compare::Change::Export) => {
+                if let Some(comparison) = panel
+                    .comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.export_model(&revision))
+                {
+                    self.begin_comparison_export(
+                        text_export::Subject::PacketComparison,
+                        move |output, format| match format {
+                            file_picker::ComparisonFormat::Text => comparison.write_report(output),
+                            file_picker::ComparisonFormat::Json => comparison.write_json(output),
+                        },
+                        ctx,
+                    );
+                }
+            }
             Action::Comparison(revision, change) => {
                 if let Some((capture, a, b)) = panel
                     .comparison
@@ -1472,7 +1493,7 @@ fn compare_captures(
 ) -> anyhow::Result<Outcome> {
     let after = LocalPacketCapture::open(after).context("Opening the after capture")?;
     Ok(Outcome::Compared {
-        comparison: Box::new(PacketCaptureComparison::new(&before, &after)),
+        comparison: Arc::new(PacketCaptureComparison::new(&before, &after)),
         paths: [before.path.clone(), after.path],
         baseline: install_baseline.then_some(before),
     })

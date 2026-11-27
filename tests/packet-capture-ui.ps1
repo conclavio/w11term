@@ -132,6 +132,23 @@ function Select-Viewer([switch]$FromComparison) {
     $null = Wait-Until 'viewer picker closed' { !(Find-OwnedDialog 'Choose Wireshark executable') }
 }
 
+function Save-PacketComparison([string]$Path, [switch]$Json) {
+    Click ('Export comparison' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet comparison export dialog' {
+        Find-OwnedDialog 'Save packet capture comparison'
+    }
+    if ($Json) {
+        $null = Wait-Until 'select JSON in the packet comparison export' {
+            [FixtureDialog]::SelectFileType($dialog, 'JSON report (*.json)')
+        }
+    }
+    $null = Wait-Until 'enter the packet comparison export path' {
+        [FixtureDialog]::SetFilename($dialog, $Path, 'packet-capture-comparison.txt') -or
+            [FixtureDialog]::SetFilename($dialog, $Path, 'packet-capture-comparison.json')
+    }
+    $null = Wait-Until 'save the packet comparison report' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
 function Open-PacketSection([string]$Id) {
     $expander = Wait-Until "the capture exposes '$Id'" {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -351,6 +368,29 @@ try {
     $null = Wait-Until 'the same filter is sent to the original Before capture' {
         $filterPath = $conversationCapture + '.filter'
         [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $ipv4Filter
+    }
+    $guiText = Join-Path $State 'packet changes.txt'
+    Save-PacketComparison $guiText
+    $null = Wait-Until 'the Text comparison export is published' { [IO.File]::Exists($guiText) }
+    $textReport = [IO.File]::ReadAllText($guiText)
+    if (!$textReport.Contains("Before${dot}IP conversations.pcap${dot}PCAP") -or
+        !$textReport.Contains("After${dot}older capture.pcapng${dot}PCAPNG") -or
+        !$textReport.Contains("IP conversation changes${dot}3") -or
+        !$textReport.Contains("Change${dot}-3 packets${dot}-146 captured bytes") -or $textReport.Contains($State)) {
+        throw 'The text export did not preserve the comparison or included a full source path'
+    }
+    $jsonBase = Join-Path $State 'packet changes structured'
+    Save-PacketComparison $jsonBase -Json
+    $guiJson = "$jsonBase.json"
+    $null = Wait-Until 'the JSON export uses the selected file extension' { [IO.File]::Exists($guiJson) }
+    foreach ($format in @('text', 'json')) {
+        $guiReport = if ($format -ceq 'text') { $guiText } else { $guiJson }
+        $cliReport = Join-Path $State "packet comparison from CLI.$format"
+        $null = & $Cli compare-packet-captures $conversationCapture $olderCapture --format $format --output-file $cliReport
+        if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliReport)) -cne
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($guiReport))) {
+            throw "The $format export differs between the packet viewer and CLI"
+        }
     }
     Click 'Back to capture'
     $null = Wait-Until 'comparison returns to the original before capture' {

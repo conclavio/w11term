@@ -9,10 +9,11 @@ pub enum Change {
     Pair { page: usize, row: Option<usize> },
     Source(usize),
     Open,
+    Export,
 }
 
 pub(super) struct Comparison {
-    model: Box<PacketCaptureComparison>,
+    model: Arc<PacketCaptureComparison>,
     paths: [PathBuf; 2],
     revision: Arc<()>,
     page: usize,
@@ -21,7 +22,7 @@ pub(super) struct Comparison {
 }
 
 impl Comparison {
-    pub(super) fn new(model: Box<PacketCaptureComparison>, paths: [PathBuf; 2]) -> Self {
+    pub(super) fn new(model: Arc<PacketCaptureComparison>, paths: [PathBuf; 2]) -> Self {
         Self {
             model,
             paths,
@@ -38,6 +39,10 @@ impl Comparison {
             .len()
             .div_ceil(ROWS_PER_PAGE)
             .max(1)
+    }
+
+    pub(super) fn export_model(&self, revision: &Arc<()>) -> Option<Arc<PacketCaptureComparison>> {
+        Arc::ptr_eq(revision, &self.revision).then(|| Arc::clone(&self.model))
     }
 
     pub(super) fn update(
@@ -76,6 +81,7 @@ impl Comparison {
         &self,
         status: Option<&str>,
         idle: bool,
+        export_idle: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let model = &self.model;
@@ -83,13 +89,22 @@ impl Comparison {
             let revision = Arc::clone(&self.revision);
             ctx.callback(move |_| message(Action::Comparison(revision.clone(), change)))
         };
-        let mut fields = vec![KeyedView::new(
-            "back",
-            Button::new()
-                .is_enabled(idle)
-                .on_click(ctx.callback(|_| message(Action::BackToCapture)))
-                .content("Back to capture"),
-        )];
+        let mut fields = vec![
+            KeyedView::new(
+                "back",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(ctx.callback(|_| message(Action::BackToCapture)))
+                    .content("Back to capture"),
+            ),
+            KeyedView::new(
+                "export",
+                Button::new()
+                    .is_enabled(idle && export_idle)
+                    .on_click(action(Change::Export))
+                    .content("Export comparison…"),
+            ),
+        ];
         if let Some(status) = status {
             fields.push(text("status", status));
         }

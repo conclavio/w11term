@@ -1,9 +1,10 @@
 use super::{LocalCapture, summary::Traffic};
+use crate::prompts::sanitize_single_line;
 use serde::{Serialize, Serializer};
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     net::IpAddr,
 };
 
@@ -141,9 +142,92 @@ impl CaptureComparison {
         }
     }
 
-    pub fn write_json(&self, mut output: impl Write) -> io::Result<()> {
+    pub fn write_json(&self, output: impl Write) -> io::Result<()> {
+        let mut output = BufWriter::new(output);
         serde_json::to_writer(&mut output, self).map_err(io::Error::other)?;
         output.write_all(b"\n")?;
+        output.flush()
+    }
+
+    pub fn write_report(&self, output: impl Write) -> io::Result<()> {
+        let mut output = BufWriter::new(output);
+        writeln!(output, "Packet capture comparison")?;
+        for (role, side) in [("Before", &self.before), ("After", &self.after)] {
+            writeln!(
+                output,
+                "\n{role} · {} · {}",
+                sanitize_single_line(&side.file_name, usize::MAX),
+                side.format
+            )?;
+            writeln!(
+                output,
+                "Packets {} · {} captured bytes · {} truncated",
+                side.packets, side.captured_bytes, side.truncated_packets
+            )?;
+            if let Some(span) = side.timestamp_span_ns {
+                writeln!(
+                    output,
+                    "Timestamp span {span} ns · {} of {} packets timestamped",
+                    side.timestamped_packets, side.packets
+                )?;
+            } else {
+                writeln!(output, "No usable timestamps")?;
+            }
+            writeln!(
+                output,
+                "Unclassified packets {} · Untracked packets {}",
+                side.unclassified_packets, side.untracked_packets
+            )?;
+            if let Some(issue) = &side.issue {
+                writeln!(
+                    output,
+                    "Partial scan · {}",
+                    sanitize_single_line(issue, usize::MAX)
+                )?;
+            } else {
+                writeln!(output, "Complete scan")?;
+            }
+        }
+        if let Some(delta) = &self.totals_delta {
+            writeln!(
+                output,
+                "\nCapture change · {:+} packets · {:+} captured bytes · {:+} truncated",
+                delta.packets, delta.captured_bytes, delta.truncated_packets
+            )?;
+        } else {
+            writeln!(output, "\nCapture deltas unavailable for a partial scan")?;
+        }
+        writeln!(
+            output,
+            "\nIP conversation changes · {}",
+            self.conversation_changes.len()
+        )?;
+        for change in &self.conversation_changes {
+            writeln!(output, "\n{} ↔ {}", change.a, change.b)?;
+            for (role, traffic) in [("Before", change.before), ("After", change.after)] {
+                if let Some(traffic) = traffic {
+                    writeln!(
+                        output,
+                        "{role} · A to B {} packets, {} bytes · B to A {} packets, {} bytes",
+                        traffic.a_to_b.packets,
+                        traffic.a_to_b.captured_bytes,
+                        traffic.b_to_a.packets,
+                        traffic.b_to_a.captured_bytes
+                    )?;
+                } else {
+                    writeln!(output, "{role} · Pair coverage unavailable")?;
+                }
+            }
+            if let Some(delta) = &change.delta {
+                writeln!(
+                    output,
+                    "Change · {:+} packets · {:+} captured bytes",
+                    delta.packets, delta.captured_bytes
+                )?;
+            } else {
+                writeln!(output, "Change · Unavailable")?;
+            }
+        }
         output.flush()
     }
 }

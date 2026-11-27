@@ -208,6 +208,33 @@ fn compares_beyond_the_ranked_summary_and_keeps_direction_only_changes() {
         fs::read(root.join("comparison.json")).unwrap(),
         output.stdout
     );
+    let text = compare(root, before, after, &["--format", "text"]);
+    assert!(text.status.success(), "{text:?}");
+    let text = std::str::from_utf8(&text.stdout).unwrap();
+    assert!(text.contains("Before · before.pcap · PCAP"));
+    assert!(text.contains("After · after.pcap · PCAP"));
+    assert!(text.contains("Timestamp span 11000000000 ns · 12 of 12 packets timestamped"));
+    assert!(text.contains("Capture change · +1 packets · +20 captured bytes · +0 truncated"));
+    assert!(text.contains("IP conversation changes · 2"));
+    assert!(text.contains(
+        "0.0.0.0 ↔ 0.0.0.12\nBefore · A to B 1 packets, 20 bytes · B to A 0 packets, 0 bytes"
+    ));
+    assert!(!text.contains(root.to_string_lossy().as_ref()));
+    let collision = compare(
+        root,
+        before,
+        after,
+        &["--format", "text", "--output-file", "comparison.json"],
+    );
+    assert!(!collision.status.success());
+    assert_eq!(
+        fs::read(root.join("comparison.json")).unwrap(),
+        output.stdout
+    );
+    let invalid = compare(root, before, after, &["--format", "csv"]);
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("--format requires json or text"));
     after_bytes.pop();
     fs::write(root.join(after), after_bytes).unwrap();
     let partial = compare(root, before, after, &[]);
@@ -217,6 +244,12 @@ fn compares_beyond_the_ranked_summary_and_keeps_direction_only_changes() {
     assert!(report["totals_delta"].is_null());
     assert_eq!(report["conversation_changes"][0]["b"], "0.0.0.12");
     assert!(report["conversation_changes"][0]["delta"].is_null());
+    let text = compare(root, before, after, &["--format", "text"]);
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("Partial scan · The pcap packet is incomplete or invalid"));
+    assert!(text.contains("Capture deltas unavailable for a partial scan"));
+    assert!(text.contains("Change · Unavailable"));
 }
 
 #[test]
@@ -242,4 +275,9 @@ fn a_pair_missing_after_the_tracking_limit_has_unknown_coverage() {
     assert!(unknown["before"].is_null());
     assert!(unknown["delta"].is_null());
     assert_eq!(unknown["after"]["a_to_b"]["packets"], 1);
+    let text = compare(root, before, after, &["--format", "text"]);
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("IP conversation changes · 4097"));
+    assert!(text.contains("0.0.0.0 ↔ 0.0.16.1\nBefore · Pair coverage unavailable"));
 }

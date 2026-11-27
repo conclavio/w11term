@@ -76,6 +76,7 @@ pub(super) enum Purpose {
     SyscallComparison,
     CpuComparison,
     TriageComparison,
+    PacketComparison,
     FlameGraph {
         path: PathBuf,
         export: bool,
@@ -285,7 +286,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let comparison_formats = matches!(
             purpose,
-            Purpose::SyscallComparison | Purpose::TriageComparison
+            Purpose::SyscallComparison | Purpose::TriageComparison | Purpose::PacketComparison
         );
         let cookie = match purpose {
             Purpose::SaveSyscallTrace(path) => {
@@ -679,6 +680,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             | Purpose::SyscallComparison
             | Purpose::CpuComparison
             | Purpose::TriageComparison
+            | Purpose::PacketComparison
             | Purpose::SftpTransferHistory
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
@@ -743,6 +745,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                         "linux-triage-comparison.txt",
                         w!("txt"),
                     ),
+                    Purpose::PacketComparison => (
+                        w!("Save packet capture comparison"),
+                        "packet-capture-comparison.txt",
+                        w!("txt"),
+                    ),
                     Purpose::SftpTransferHistory => (
                         w!("Save recent SFTP transfers as JSON"),
                         "sftp-transfers.json",
@@ -786,10 +793,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 dialog.SetDefaultExtension(extension)?;
                 // The atomic writer creates its own sibling file and reports any write errors.
                 options |= FOS_NOTESTFILECREATE;
-                if matches!(
-                    purpose,
-                    Purpose::SyscallComparison | Purpose::CpuComparison | Purpose::TriageComparison
-                ) {
+                if comparison_formats || matches!(purpose, Purpose::CpuComparison) {
                     options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                     options &= !FOS_OVERWRITEPROMPT;
                     None
