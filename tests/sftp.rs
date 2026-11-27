@@ -240,6 +240,19 @@ impl server::Handler for Peer {
         command: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if command.starts_with(b"/bin/sh -c 'exec 9<")
+            && self.root.join("utility-probe-response").is_file()
+        {
+            s.channel_success(c)?;
+            if self.root.join("hold-utility-lock").is_file() {
+                s.exit_status_request(c, 3)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else {
+                s.data(c, b"w11term-tools-locked-v1\n".as_slice())?;
+            }
+            return Ok(());
+        }
         if command.starts_with(b"/bin/sh -c 'printf")
             && let Ok(report) = fs::read(self.root.join("utility-probe-response"))
         {
@@ -859,6 +872,11 @@ impl russh_sftp::server::Handler for Files {
             return Err(StatusCode::ConnectionLost);
         }
         let mut attrs = entry_attrs(&self.path(&path))?;
+        if self.root.join("utility-probe-response").is_file()
+            && self.utility_fixture_link(&path).is_some()
+        {
+            attrs.permissions = Some(0o120777);
+        }
         if let Some(posix) = &self.posix {
             posix.stat(&path, &mut attrs);
         }
@@ -883,7 +901,35 @@ impl russh_sftp::server::Handler for Files {
         Ok(Attrs { id, attrs })
     }
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        if self.root.join("utility-probe-response").is_file()
+            && let Some(target) = self.utility_fixture_link(&path)
+        {
+            return Ok(Name {
+                id,
+                files: vec![russh_sftp::protocol::File::dummy(target)],
+            });
+        }
         self.properties_readlink(id, &path)
+    }
+    async fn symlink(
+        &mut self,
+        id: u32,
+        target: String,
+        link: String,
+    ) -> Result<Status, StatusCode> {
+        if !self.root.join("utility-probe-response").is_file() {
+            return Err(StatusCode::OpUnsupported);
+        }
+        let path = self.path(&link);
+        if self.root.join("race-tool-launcher").is_file() && link.ends_with("/bin/rg") {
+            fs::File::create_new(&path)
+                .and_then(|mut file| file.write_all(b"my racing command"))
+                .map_err(io)?;
+        }
+        fs::File::create_new(path)
+            .and_then(|mut file| writeln!(file, "fixture-tool-symlink\n{target}"))
+            .map_err(io)?;
+        Ok(status(id))
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
         if self.root.join("no-fstat").exists() {
@@ -908,6 +954,13 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        if self.root.join("utility-probe-response").is_file()
+            && let Some(mode) = attrs.permissions
+            && let Some(posix) = &mut self.posix
+        {
+            posix.set_permissions(path, mode);
+            return Ok(status(id));
+        }
         if attrs.permissions.is_some() && self.root.join("fixture-permissions").is_file() {
             self.set_permissions("SETSTAT", path, &attrs)?;
             return Ok(status(id));
@@ -1077,6 +1130,9 @@ impl russh_sftp::server::Handler for Files {
             )
         }
         .map_err(|_| StatusCode::Failure)?;
+        if let Some(posix) = &mut self.posix {
+            posix.renamed(&from, &to);
+        }
         self.hold_response("hold-rename-reply").await;
         if self.root.join("disconnect-after-rename").exists() {
             let _ = self

@@ -3,7 +3,9 @@ use super::*;
 use std::{collections::BTreeSet, io::Read};
 
 mod build;
+mod install;
 use build::{LibcVersion, Verified};
+use install::{InstallPlan, Release, StoredTool};
 
 const DEFAULT_BIN: &str = ".local/bin";
 const STORE: &str = ".local/share/w11term/tools";
@@ -60,6 +62,14 @@ fn safe_component(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
 }
 
+fn valid_bin_directory(directory: &str) -> bool {
+    directory.len() <= 192
+        && directory.split('/').all(safe_component)
+        && directory.split('/').count() <= 8
+        && directory != STORE
+        && !directory.starts_with(&format!("{STORE}/"))
+}
+
 impl UtilityBundle {
     pub fn load(manifest: &Path) -> Result<Self> {
         let manifest = std::path::absolute(manifest)?;
@@ -98,11 +108,7 @@ impl UtilityBundle {
             "Invalid tool bundle name"
         );
         ensure!(
-            self.bin_directory.len() <= 192
-                && self.bin_directory.split('/').all(safe_component)
-                && self.bin_directory.split('/').count() <= 8
-                && self.bin_directory != STORE
-                && !self.bin_directory.starts_with(&format!("{STORE}/")),
+            valid_bin_directory(&self.bin_directory),
             "Tool bin_directory must be a relative directory under the remote home"
         );
         ensure!((1..=16).contains(&self.tools.len()), "Choose 1 to 16 tools");
@@ -297,6 +303,19 @@ impl Engine {
         session: &russh::client::Handle<crate::ssh::Handler>,
         bundle: UtilityBundle,
     ) -> Result<Value> {
+        let plan = self.utility_plan(session, bundle).await?;
+        let mut report = plan.report;
+        if report["ready"] == true {
+            report["review"] = json!(self.utility_review(&report)?);
+        }
+        Ok(report)
+    }
+
+    async fn utility_plan(
+        &self,
+        session: &russh::client::Handle<crate::ssh::Handler>,
+        bundle: UtilityBundle,
+    ) -> Result<InstallPlan> {
         bundle.validate()?;
         let (host, home) = tokio::try_join!(probe(session), self.dotfile_home())?;
         ensure!(
@@ -326,7 +345,19 @@ impl Engine {
             )?;
             let choice = builds.iter().position(|build| build.status == "compatible");
             if let Some(choice) = choice {
-                selected.push((name.clone(), builds[choice].sha256.clone()));
+                let choice = &builds[choice];
+                selected.push((
+                    StoredTool {
+                        name: name.clone(),
+                        sha256: choice.sha256.clone(),
+                        bytes: choice
+                            .verified
+                            .as_ref()
+                            .expect("compatible build verified")
+                            .bytes,
+                    },
+                    choice.path.clone(),
+                ));
             }
             blocked |= launcher == "conflict" || choice.is_none();
             reports.push(json!({
@@ -335,17 +366,14 @@ impl Engine {
                 "selected_build": choice, "builds": builds,
             }));
         }
+        let release = Release {
+            name: bundle.name,
+            bin_directory: bundle.bin_directory,
+            architecture: host.architecture,
+            tools: selected.iter().map(|(tool, _)| tool.clone()).collect(),
+        };
         let bundle_sha256 = (selected.len() == reports.len())
-            .then(|| {
-                let encoded = serde_json::to_vec(&(
-                    bundle.name.as_str(),
-                    bundle.bin_directory.as_str(),
-                    &selected,
-                ))?;
-                let mut digest = Sha256::new_with_prefix(b"w11term-tools-v1\0");
-                digest.update(encoded);
-                Ok::<_, anyhow::Error>(digest_hex(digest))
-            })
+            .then(|| release.id())
             .transpose()?;
         let atomic_replace = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let version_path = bundle_sha256
@@ -356,14 +384,35 @@ impl Engine {
             Some(_) => "present",
             None => "missing",
         };
-        Ok(json!({
-            "bundle": bundle.name, "bundle_sha256": bundle_sha256,
+        let selector = self.utility_selector_state(&store_path, &managed).await?;
+        let bin_matches_active = self
+            .utility_bin_matches_active(&store_path, &selector, &release)
+            .await?;
+        blocked |= selector.conflict
+            || !bin_matches_active
+            || selector
+                .version
+                .as_ref()
+                .is_some_and(|current| !atomic_replace && Some(current) != bundle_sha256.as_ref());
+        let report = json!({
+            "bundle": release.name, "bundle_sha256": bundle_sha256,
             "host": {"os": "Linux", "architecture": host.architecture, "home": home, "glibc": host.glibc.map(|v| v.to_string())},
-            "bin_directory": bin_path, "path_status": path, "path_source": "ssh-exec",
-            "managed_directory": store_path, "version_directory": version_path,
+            "bin_directory": bin_path, "bin_matches_active": bin_matches_active, "path_status": path, "path_source": "ssh-exec",
+            "managed_directory": store_path, "version_directory": version_path, "current": selector,
             "bin_directory_plan": bin, "managed_directory_plan": managed,
             "supports_atomic_replace": atomic_replace, "ready": !blocked, "tools": reports,
-        }))
+        });
+        Ok(InstallPlan {
+            report,
+            release,
+            selected,
+            selector,
+            bin,
+            managed,
+            home,
+            store: store_path,
+            id: bundle_sha256,
+        })
     }
 
     async fn utility_directories(&self, home: &str, relative: &str) -> Result<DirectoryPlan> {

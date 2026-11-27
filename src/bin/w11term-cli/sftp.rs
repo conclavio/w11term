@@ -26,6 +26,9 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
        [--contains TEXT]\n\
   sha256 PATH [--max-bytes N]\n\
   preview-tool-bundle BUNDLE.json\n\
+  apply-tool-bundle BUNDLE.json --review TOKEN\n\
+  preview-tool-bundle-rollback NAME SHA256\n\
+  rollback-tool-bundle NAME SHA256 --review TOKEN\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   preview-dotfiles-switch SHA256|disabled --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
@@ -313,11 +316,28 @@ pub fn parse(
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
             }
         }
-        "preview-tool-bundle" => {
+        "preview-tool-bundle" | "apply-tool-bundle" => {
+            if command == "apply-tool-bundle" {
+                let token = opts
+                    .remove("--review")
+                    .context("Preview the tool bundle and supply --review")?;
+                fields.insert("review".into(), json!(normalize_sha256(&token)?));
+            }
             let manifest = path()?;
             let bundle = UtilityBundle::load(std::path::Path::new(&manifest))
                 .with_context(|| format!("Opening the tool bundle {manifest}"))?;
             fields.insert("bundle".into(), json!(bundle));
+        }
+        "preview-tool-bundle-rollback" | "rollback-tool-bundle" => {
+            if command == "rollback-tool-bundle" {
+                let token = opts
+                    .remove("--review")
+                    .context("Preview rollback and supply --review")?;
+                fields.insert("review".into(), json!(normalize_sha256(&token)?));
+            }
+            fields.insert("op".into(), json!("rollback-tool-bundle"));
+            fields.insert("name".into(), json!(path()?));
+            fields.insert("bundle_sha256".into(), json!(normalize_sha256(&path()?)?));
         }
         "preview-dotfiles" | "apply-dotfiles" | "preview-dotfiles-switch" | "switch-dotfiles" => {
             let shell = match opts.remove("--shell").as_deref() {
@@ -490,6 +510,38 @@ mod tests {
         };
         assert_eq!(bundle.bin_directory, ".local/bin");
         assert_eq!(bundle.tools[0].builds[0].path, local.path().join("bins/rg"));
+    }
+
+    #[test]
+    fn tool_install_and_rollback_require_an_explicit_review() {
+        let version = "a".repeat(64);
+        let token = "b".repeat(64);
+        assert!(p(&["--pane", "9", "apply-tool-bundle", "fleet.json"]).is_err());
+        assert!(p(&["--pane", "9", "rollback-tool-bundle", "fleet", &version]).is_err());
+        let (_, preview) = p(&[
+            "--pane",
+            "9",
+            "preview-tool-bundle-rollback",
+            "fleet",
+            &version,
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 9, operation: Operation::RollbackToolBundle { review: None, bundle_sha256, .. }, ..
+        } if bundle_sha256 == version));
+        let (_, request) = p(&[
+            "--pane",
+            "9",
+            "rollback-tool-bundle",
+            "fleet",
+            &version,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(request, Request::Sftp {
+            pane: 9, operation: Operation::RollbackToolBundle { review: Some(review), bundle_sha256, .. }, ..
+        } if review == token && bundle_sha256 == version));
     }
 
     #[test]

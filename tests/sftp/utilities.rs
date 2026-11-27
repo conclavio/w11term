@@ -2,6 +2,17 @@ use super::*;
 use sha2::{Digest, Sha256};
 use w11term::sftp::{Operation, UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityTool};
 
+impl Files {
+    pub(super) fn utility_fixture_link(&self, path: &str) -> Option<String> {
+        let file = fs::File::open(self.path(path)).ok()?;
+        let mut text = String::new();
+        file.take(4096).read_to_string(&mut text).ok()?;
+        text.strip_prefix("fixture-tool-symlink\n")?
+            .strip_suffix('\n')
+            .map(str::to_owned)
+    }
+}
+
 fn probe_response(root: &std::path::Path, arch: &str, home: &str, path: &str) {
     fs::write(
         root.join("utility-probe-response"),
@@ -192,5 +203,213 @@ async fn utility_preview_rejects_wrong_machine_hash_and_account_home() {
         .unwrap_err();
     assert!(error.contains("disagree on the account's home"), "{error}");
     assert!(!root.path().join(".local").exists());
+    server.abort();
+}
+
+fn apply(preview: Operation, report: &Value) -> Operation {
+    let Operation::PreviewToolBundle { bundle } = preview else {
+        unreachable!()
+    };
+    Operation::ApplyToolBundle {
+        bundle,
+        review: report["review"].as_str().unwrap().into(),
+    }
+}
+
+fn rollback(id: &str, preview: Option<&Value>) -> Operation {
+    Operation::RollbackToolBundle {
+        name: "portable".into(),
+        bundle_sha256: id.into(),
+        review: preview.map(|report| report["review"].as_str().unwrap().into()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "x86_64", "/", "/usr/bin:/.local/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    fs::write(remote.join("transfer-trace"), []).unwrap();
+    fs::write(remote.join("fixture-copy-data"), []).unwrap();
+    let version = |byte| {
+        let mut binary = executable(UtilityArchitecture::X86_64, None);
+        binary[255] = byte;
+        binary.resize(96 * 1024, 0);
+        let operation = preview(vec![build(
+            local.path(),
+            "rg",
+            UtilityArchitecture::X86_64,
+            binary,
+        )]);
+        let Operation::PreviewToolBundle { mut bundle } = operation else {
+            unreachable!()
+        };
+        bundle.tools.push(UtilityTool {
+            name: "jq".into(),
+            builds: vec![build(
+                local.path(),
+                "jq",
+                UtilityArchitecture::X86_64,
+                executable(UtilityArchitecture::X86_64, None),
+            )],
+        });
+        Operation::PreviewToolBundle { bundle }
+    };
+    let a = guarded_job(&pane, None, version(1)).await.unwrap();
+    let a_id = a["bundle_sha256"].as_str().unwrap();
+    let installed = guarded_job(&pane, None, apply(version(1), &a))
+        .await
+        .unwrap();
+    assert_eq!(installed["uploaded"], true);
+    assert_eq!(installed["changed"], true);
+    let store = remote.join(".local/share/w11term/tools/portable");
+    let selector = || fs::read_to_string(store.join("current")).unwrap();
+    let launcher = || fs::read_to_string(remote.join(".local/bin/rg")).unwrap();
+    assert!(selector().ends_with(&format!("versions/{a_id}\n")));
+    let original_launcher = launcher();
+    assert!(original_launcher.ends_with("/portable/current/rg\n"));
+    assert_eq!(
+        fs::read(store.join("versions").join(a_id).join("rg")).unwrap()[255],
+        1
+    );
+    let Operation::PreviewToolBundle { mut bundle } = version(1) else {
+        unreachable!()
+    };
+    bundle.bin_directory = "portable-bin".into();
+    let moved = guarded_job(&pane, None, Operation::PreviewToolBundle { bundle })
+        .await
+        .unwrap();
+    assert_eq!(moved["ready"], false);
+    assert_eq!(moved["bin_matches_active"], false);
+
+    fs::write(remote.join("transfer-trace"), []).unwrap();
+    let repeat = guarded_job(&pane, None, version(1)).await.unwrap();
+    let unchanged = guarded_job(&pane, None, apply(version(1), &repeat))
+        .await
+        .unwrap();
+    assert_eq!(unchanged["changed"], false);
+    assert_eq!(unchanged["uploaded"], false);
+    assert!(
+        !fs::read_to_string(remote.join("transfer-trace"))
+            .unwrap()
+            .contains("WRITE")
+    );
+
+    let b = guarded_job(&pane, None, version(2)).await.unwrap();
+    let error = guarded_job(&pane, None, apply(version(2), &repeat))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    fs::write(remote.join("fail-next-write"), []).unwrap();
+    let failed = guarded_job(&pane, None, apply(version(2), &b))
+        .await
+        .unwrap_err();
+    assert!(failed.contains("activation did not finish"), "{failed}");
+    assert!(selector().ends_with(&format!("versions/{a_id}\n")));
+    assert_eq!(fs::read_dir(store.join("versions")).unwrap().count(), 1);
+    fs::remove_file(remote.join("fail-next-write")).unwrap();
+    let installed = guarded_job(&pane, None, apply(version(2), &b))
+        .await
+        .unwrap();
+    let b_id = b["bundle_sha256"].as_str().unwrap();
+    assert_eq!(installed["previous_bundle_sha256"], a_id);
+    assert_eq!(installed["copied_tools"], json!(["jq"]));
+    assert!(
+        fs::read_to_string(remote.join("transfer-trace"))
+            .unwrap()
+            .contains("COPY-DATA")
+    );
+    assert!(selector().ends_with(&format!("versions/{b_id}\n")));
+    assert_eq!(launcher(), original_launcher);
+
+    fs::remove_file(local.path().join("rg")).unwrap();
+    fs::remove_file(local.path().join("jq")).unwrap();
+    let original = fs::read(store.join("versions").join(a_id).join("rg")).unwrap();
+    let review = guarded_job(&pane, None, rollback(a_id, None))
+        .await
+        .unwrap();
+    let old_path = store.join("versions").join(a_id).join("rg");
+    let mut changed = original.clone();
+    changed[255] = 77;
+    fs::write(&old_path, &changed).unwrap();
+    let error = guarded_job(&pane, None, rollback(a_id, Some(&review)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("contents changed"), "{error}");
+    assert!(selector().ends_with(&format!("versions/{b_id}\n")));
+    fs::write(old_path, original).unwrap();
+    let review = guarded_job(&pane, None, rollback(a_id, None))
+        .await
+        .unwrap();
+    let restored = guarded_job(&pane, None, rollback(a_id, Some(&review)))
+        .await
+        .unwrap();
+    assert_eq!(restored["previous_bundle_sha256"], b_id);
+    assert_eq!(restored["uploaded"], false);
+    assert!(selector().ends_with(&format!("versions/{a_id}\n")));
+    assert_eq!(launcher(), original_launcher);
+    let trace = fs::read_to_string(remote.join("transfer-trace")).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.starts_with("POSIX-RENAME"))
+            .count(),
+        2
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn utility_install_preserves_racing_user_command_and_checks_remote_lock() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "aarch64", "/", "/usr/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let version = || {
+        preview(vec![build(
+            local.path(),
+            "rg",
+            UtilityArchitecture::Aarch64,
+            executable(UtilityArchitecture::Aarch64, None),
+        )])
+    };
+    let first = guarded_job(&pane, None, version()).await.unwrap();
+    fs::write(remote.join("hold-utility-lock"), []).unwrap();
+    let failed = guarded_job(&pane, None, apply(version(), &first))
+        .await
+        .unwrap_err();
+    assert!(failed.contains("Could not lock"), "{failed}");
+    let store = remote.join(".local/share/w11term/tools/portable");
+    assert!(!store.join("current").exists());
+    assert_eq!(fs::read_dir(store.join("versions")).unwrap().count(), 0);
+    fs::remove_file(remote.join("hold-utility-lock")).unwrap();
+
+    let before = guarded_job(&pane, None, version()).await.unwrap();
+    fs::write(remote.join("race-tool-launcher"), []).unwrap();
+    let error = guarded_job(&pane, None, apply(version(), &before))
+        .await
+        .unwrap_err();
+    assert!(error.contains("Creating launcher"), "{error}");
+    assert_eq!(
+        fs::read(remote.join(".local/bin/rg")).unwrap(),
+        b"my racing command"
+    );
+    assert!(!store.join("current").exists());
+
+    fs::remove_file(remote.join("race-tool-launcher")).unwrap();
+    fs::remove_file(remote.join(".local/bin/rg")).unwrap();
+    let reviewed = guarded_job(&pane, None, version()).await.unwrap();
+    let installed = guarded_job(&pane, None, apply(version(), &reviewed))
+        .await
+        .unwrap();
+    assert_eq!(
+        installed["uploaded"], false,
+        "reuse the verified version staged in the earlier attempt"
+    );
+    assert_eq!(installed["changed"], true);
+    assert!(store.join("current").exists());
     server.abort();
 }

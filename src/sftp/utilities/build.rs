@@ -3,7 +3,7 @@ use goblin::elf::{Elf, header, program_header};
 use std::io::Read;
 use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_SHARE_READ};
 
-const MAX_BINARY: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_BINARY: u64 = 64 * 1024 * 1024;
 
 #[derive(Serialize)]
 pub(super) struct Verified {
@@ -40,32 +40,8 @@ impl std::fmt::Display for LibcVersion {
 
 impl Verified {
     pub(super) fn read(build: &UtilityBuild, remaining: &mut u64) -> Result<Self> {
-        use super::super::upload_directory::{Source, open_source};
-
-        let Source::File(file, size) = open_source(&build.path, FILE_READ_DATA, FILE_SHARE_READ)?
-        else {
-            bail!("Choose a raw Linux executable file");
-        };
-        ensure!(
-            size > 0 && size <= MAX_BINARY,
-            "Linux executable must be between 1 byte and 64 MiB"
-        );
-        ensure!(
-            size <= *remaining,
-            "Tool preview exceeds its 256 MiB local read budget"
-        );
-        *remaining -= size;
-        let mut bytes = Vec::with_capacity(size as usize);
-        file.take(size + 1).read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 == size,
-            "The Windows file size changed while reading it"
-        );
-        let sha256 = digest_hex(Sha256::new_with_prefix(&bytes));
-        ensure!(
-            sha256 == normalize_sha256(&build.sha256)?,
-            "SHA-256 does not match the pinned executable"
-        );
+        let sha256 = normalize_sha256(&build.sha256)?;
+        let bytes = read_pinned(&build.path, &sha256, remaining)?;
         Self::from_elf(build.architecture, &bytes, sha256)
     }
 
@@ -146,4 +122,29 @@ impl Verified {
             libraries: elf.libraries.into_iter().map(str::to_owned).collect(),
         })
     }
+}
+
+pub(super) fn read_pinned(path: &Path, sha256: &str, remaining: &mut u64) -> Result<Vec<u8>> {
+    use super::super::upload_directory::{Source, open_source};
+
+    let Source::File(file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
+        bail!("Choose a raw Linux executable file");
+    };
+    ensure!(
+        size > 0 && size <= MAX_BINARY,
+        "Linux executable must be between 1 byte and 64 MiB"
+    );
+    ensure!(size <= *remaining, "Tool read exceeded its byte budget");
+    *remaining -= size;
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(size + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == size,
+        "The Windows file size changed while reading it"
+    );
+    ensure!(
+        digest_hex(Sha256::new_with_prefix(&bytes)) == sha256,
+        "SHA-256 does not match the pinned executable"
+    );
+    Ok(bytes)
 }

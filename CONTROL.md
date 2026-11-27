@@ -1363,6 +1363,24 @@ Keep the raw Linux executables on Windows and point a version-1 bundle at them. 
 
 The preview uses the pane's verified SSH connection. A read-only SSH exec probe identifies Linux, architecture, home, and the exec environment's `PATH`. The preview checks the same home over SFTP, verifies local file hashes and ELF headers, and selects the first verified self-contained build for each command. For dynamic builds it reports the interpreter, linked libraries, and glibc requirements it could read, including a missing loader or insufficient glibc when detectable. The report shows planned destinations, directory and launcher conflicts, and executable files found earlier in the probed `PATH`. Interactive shell startup files can change that search order.
 
+### Install or roll back a reviewed SSH tool bundle
+
+Review the destinations, PATH status, and selected builds. When the report has `ready: true`, pass its `review` token back to the same pane. The commands below use the default JSON response from `w11term-cli`.
+
+```powershell
+$plan = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools.json' | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane apply-tool-bundle '.\Fleet tools.json' --review $plan.review
+```
+
+Installation verifies the uploaded files over SFTP and publishes the version under `~/.local/share/w11term/tools/<name>/versions/<sha256>/`. It adds launchers to the bundle's `bin_directory`, preserving entries already owned by the account. Add that directory to the shell's `PATH` if the preview reports it missing. Keep the bin directory fixed across versions of one named bundle. The installer reuses a verified copy when the requested version is already present and copies unchanged tools from the active version when building a new one. The `previous_bundle_sha256` in an update reply identifies the version to restore.
+
+```powershell
+$restore = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-rollback my-tools $previousSha256 | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane rollback-tool-bundle my-tools $previousSha256 --review $restore.review
+```
+
+Rollback uses the retained remote files. The client checks their hashes and executable permissions before activating them. Launchers for commands omitted from the active version remain dormant so older versions can restore them. Installation and rollback require the host's `flock` command and SFTP symlinks. Switching an active version requires OpenSSH's atomic rename extension. Run a fresh preview after changing the manifest, moving to another pane or connection, or retrying an interrupted operation.
+
 ### Run SFTP operations
 
 ```powershell

@@ -42,6 +42,21 @@ impl PosixMetadata {
         self.attrs.entry(path).or_insert((1701, 2048, 0o640)).2 = mode;
     }
 
+    pub(super) fn renamed(&mut self, from: &str, to: &str) {
+        let mut moved = Vec::new();
+        self.attrs.retain(|path, attr| {
+            if let Some(rest) = path.strip_prefix(from)
+                && (rest.is_empty() || rest.starts_with('/'))
+            {
+                moved.push((format!("{to}{rest}"), *attr));
+                false
+            } else {
+                true
+            }
+        });
+        self.attrs.extend(moved);
+    }
+
     pub(super) fn fstat(&self, handle: &str, attrs: &mut FileAttributes) -> Result<(), StatusCode> {
         self.stat(self.handles.get(handle).ok_or(StatusCode::Failure)?, attrs);
         Ok(())

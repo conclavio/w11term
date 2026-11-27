@@ -230,6 +230,16 @@ pub enum Operation {
     PreviewToolBundle {
         bundle: UtilityBundle,
     },
+    ApplyToolBundle {
+        bundle: UtilityBundle,
+        review: String,
+    },
+    RollbackToolBundle {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     PreviewDotfiles {
         bundle: DotfileBundle,
         shell: DotfileShell,
@@ -955,6 +965,9 @@ pub(crate) async fn run(
                 Operation::PreviewToolBundle { .. } => {
                     JobStage::Checking("Tool bundle preview did not finish")
                 }
+                Operation::ApplyToolBundle { .. } | Operation::RollbackToolBundle { .. } => {
+                    JobStage::Checking("Tool bundle review did not finish")
+                }
                 Operation::ApplyDotfiles { .. } => JobStage::Checking(
                     "Dotfiles installation did not finish. Preview again to check the active bundle.",
                 ),
@@ -1495,6 +1508,18 @@ impl Engine {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
             }
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
+            ApplyToolBundle { bundle, review } => {
+                self.apply_utility_bundle(session, bundle, &review, stage)
+                    .await?
+            }
+            RollbackToolBundle {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.rollback_utility_bundle(session, name, bundle_sha256, review.as_deref(), stage)
+                    .await?
+            }
             Get {
                 remote,
                 local,
