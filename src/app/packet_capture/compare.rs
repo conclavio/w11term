@@ -1,6 +1,7 @@
 use super::*;
 use w11term::ssh::{PacketConversationChange, PacketConversationEndpoints};
 
+mod search;
 mod timeline;
 
 const ROWS_PER_PAGE: usize = 12;
@@ -30,21 +31,18 @@ impl ConversationView {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Change {
     View(ConversationView),
-    Page(ConversationView, usize),
-    Pair {
-        view: ConversationView,
-        page: usize,
-        row: Option<usize>,
-    },
+    Filter(String),
+    Page { list: u64, page: usize },
+    Pair { list: u64, row: Option<usize> },
     Source(usize),
     ProtocolsExpanded(bool),
     TimelineExpanded(bool),
     TimelineInterval(usize),
     OpenTimelineInterval(usize, usize),
-    Open(ConversationView, usize),
+    Open { list: u64, row: Option<usize> },
     Export,
 }
 
@@ -53,6 +51,9 @@ pub(super) struct Comparison {
     paths: [PathBuf; 2],
     revision: Arc<()>,
     conversation_view: ConversationView,
+    conversation_query: String,
+    matching_rows: Option<Vec<usize>>,
+    list_generation: u64,
     page: usize,
     selected: Option<usize>,
     source: usize,
@@ -68,6 +69,9 @@ impl Comparison {
             paths,
             revision: Arc::new(()),
             conversation_view: ConversationView::Ip,
+            conversation_query: String::new(),
+            matching_rows: None,
+            list_generation: 0,
             page: 0,
             selected: None,
             source: 1,
@@ -82,11 +86,26 @@ impl Comparison {
     }
 
     fn row_count(&self) -> usize {
+        self.matching_rows
+            .as_ref()
+            .map_or_else(|| self.unfiltered_count(), Vec::len)
+    }
+
+    fn unfiltered_count(&self) -> usize {
         self.row_groups().iter().map(|group| group.len()).sum()
     }
 
-    fn rows(&self) -> impl Iterator<Item = &PacketConversationChange> {
-        self.row_groups().into_iter().flatten()
+    fn row(&self, index: usize) -> Option<&PacketConversationChange> {
+        let index = match &self.matching_rows {
+            Some(rows) => *rows.get(index)?,
+            None => index,
+        };
+        let [counts, rates] = self.row_groups();
+        if index < counts.len() {
+            counts.get(index)
+        } else {
+            rates.get(index - counts.len())
+        }
     }
 
     fn row_groups(&self) -> [&[PacketConversationChange]; 2] {
@@ -100,6 +119,25 @@ impl Comparison {
                 &self.model.rate_only_changes.transport_conversations,
             ],
         }
+    }
+
+    fn apply_filter(&mut self) {
+        let query = search::Query::new(&self.conversation_query);
+        self.matching_rows = (!query.is_empty()).then(|| {
+            self.row_groups()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(index, change)| query.matches(change.endpoints).then_some(index))
+                .collect()
+        });
+        self.set_page(0);
+    }
+
+    fn set_page(&mut self, page: usize) {
+        self.page = page;
+        self.selected = None;
+        self.list_generation = self.list_generation.wrapping_add(1);
     }
 
     pub(super) fn export_model(&self, revision: &Arc<()>) -> Option<Arc<PacketCaptureComparison>> {
@@ -118,20 +156,20 @@ impl Comparison {
         match change {
             Change::View(view) if view != self.conversation_view => {
                 self.conversation_view = view;
-                self.page = 0;
-                self.selected = None;
+                self.apply_filter();
             }
-            Change::Page(view, page)
-                if view == self.conversation_view
+            Change::Filter(query) if self.conversation_query != query => {
+                self.conversation_query = query;
+                self.apply_filter();
+            }
+            Change::Page { list, page }
+                if list == self.list_generation
                     && page < self.page_count()
                     && page != self.page =>
             {
-                self.page = page;
-                self.selected = None;
+                self.set_page(page);
             }
-            Change::Pair { view, page, row }
-                if view == self.conversation_view && page == self.page =>
-            {
+            Change::Pair { list, row } if list == self.list_generation => {
                 self.selected =
                     row.filter(|&row| row < ROWS_PER_PAGE && start + row < self.row_count());
             }
@@ -162,8 +200,8 @@ impl Comparison {
                     WiresharkFilter::Interval(interval),
                 ));
             }
-            Change::Open(view, page) if view == self.conversation_view && page == self.page => {
-                let pair = self.rows().nth(start + self.selected?)?;
+            Change::Open { list, row } if list == self.list_generation && row == self.selected => {
+                let pair = self.row(start + row?)?;
                 let filter = match pair.endpoints {
                     PacketConversationEndpoints::Ip { a, b } => {
                         WiresharkFilter::Conversation(a, b, None)
@@ -190,9 +228,11 @@ impl Comparison {
         let view = self.conversation_view;
         let category = view.category();
         let conversation_count = self.row_count();
-        let action = |change| {
+        let total_conversations = self.unfiltered_count();
+        let list = self.list_generation;
+        let action = |change: Change| {
             let revision = Arc::clone(&self.revision);
-            ctx.callback(move |_| message(Action::Comparison(revision.clone(), change)))
+            ctx.callback(move |_| message(Action::Comparison(revision.clone(), change.clone())))
         };
         let mut fields = vec![
             KeyedView::new(
@@ -339,6 +379,7 @@ impl Comparison {
             ));
         }
         let type_revision = Arc::clone(&self.revision);
+        let filter_revision = Arc::clone(&self.revision);
         fields.extend([
             KeyedView::new(
                 "conversation-type",
@@ -362,13 +403,49 @@ impl Comparison {
             ),
             text(
                 "changes",
-                format!("{category} conversation changes {conversation_count}"),
+                format!("{category} conversation changes {total_conversations}"),
+            ),
+            KeyedView::new(
+                "conversation-filter",
+                TextBox::new()
+                    .automation_name("Filter conversations")
+                    .placeholder_text(match view {
+                        ConversationView::Ip => "IP address or CIDR",
+                        ConversationView::Transport => "IP address, CIDR, port, or protocol",
+                    })
+                    .text(&self.conversation_query)
+                    .is_enabled(idle)
+                    .on_text_changed(ctx.callback(move |value| {
+                        message(Action::Comparison(
+                            filter_revision.clone(),
+                            Change::Filter(value),
+                        ))
+                    })),
             ),
         ]);
+        if self.matching_rows.is_some() {
+            fields.extend([
+                text(
+                    "match-count",
+                    format!("Matching conversations {conversation_count} of {total_conversations}"),
+                ),
+                KeyedView::new(
+                    "clear-filter",
+                    Button::new()
+                        .is_enabled(idle)
+                        .on_click(action(Change::Filter(String::new())))
+                        .content("Clear conversation filter"),
+                ),
+            ]);
+        }
         if conversation_count == 0 {
             fields.push(text(
                 "empty",
-                format!("No changes in observed {category} conversations"),
+                if self.matching_rows.is_some() {
+                    "No conversations match the filter".to_owned()
+                } else {
+                    format!("No changes in observed {category} conversations")
+                },
             ));
         }
         if self.page_count() > 1 {
@@ -382,7 +459,10 @@ impl Comparison {
                     .children((
                         Button::new()
                             .is_enabled(idle && self.page != 0)
-                            .on_click(action(Change::Page(view, previous)))
+                            .on_click(action(Change::Page {
+                                list,
+                                page: previous,
+                            }))
                             .content("Previous page"),
                         TextBlock::new().text(format!(
                             "Page {} of {}",
@@ -391,7 +471,7 @@ impl Comparison {
                         )),
                         Button::new()
                             .is_enabled(idle && next < self.page_count())
-                            .on_click(action(Change::Page(view, next)))
+                            .on_click(action(Change::Page { list, page: next }))
                             .content("Next page"),
                     )),
             ));
@@ -402,17 +482,17 @@ impl Comparison {
             let source_revision = Arc::clone(&self.revision);
             fields.extend([
                 KeyedView::new(
-                    format!("conversations-{category}-{page}"),
+                    format!("conversations-{list}"),
                     ListView::new()
                         .automation_name(format!("Changed {category} conversations"))
                         .max_height(320.0)
                         .selected_index(self.selected)
                         .on_selection_changed(ctx.callback(move |row| {
-                            message(Action::Comparison(row_revision.clone(), Change::Pair { view, page, row }))
+                            message(Action::Comparison(row_revision.clone(), Change::Pair { list, row }))
                         }))
                         .collection_slot(
                             ListViewSlot::Items,
-                            self.rows().skip(page * ROWS_PER_PAGE).take(ROWS_PER_PAGE).map(|change| {
+                            (page * ROWS_PER_PAGE..(page + 1) * ROWS_PER_PAGE).filter_map(|index| self.row(index)).map(|change| {
                                 let label = change.endpoints.to_string();
                                 let mut details = vec![text("endpoints", label.clone())];
                                 for (side, traffic) in [("Before", change.before), ("After", change.after)] {
@@ -467,7 +547,7 @@ impl Comparison {
                     "open-conversation",
                     Button::new()
                         .is_enabled(idle && self.selected.is_some())
-                        .on_click(action(Change::Open(view, page)))
+                        .on_click(action(Change::Open { list, row: self.selected }))
                         .content("Open conversation in Wireshark"),
                 ),
                 KeyedView::new(

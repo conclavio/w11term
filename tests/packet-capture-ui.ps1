@@ -9,6 +9,7 @@ $partialCapture = Join-Path $State 'incomplete capture.pcapng'
 $conversationCapture = Join-Path $State 'IP conversations.pcap'
 $slowerCapture = Join-Path $State 'IP conversations spaced out.pcap'
 $protocolCapture = Join-Path $State 'IP protocols.pcap'
+$manyPortsCapture = Join-Path $State 'Fifteen UDP conversations.pcap'
 $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
@@ -120,6 +121,14 @@ $missingExtension[6] = 60
 $protocolFrames.Add($missingExtension)
 $protocolFrames.Add([byte[]]@(0))
 Write-CaptureFixture $protocolCapture 101 ($protocolFrames.ToArray())
+$manyPortsFrames = [System.Collections.Generic.List[byte[]]]::new()
+foreach ($port in 50001..50015) {
+    $frame = [byte[]]$udp.Clone()
+    $frame[20] = [byte]($port -shr 8)
+    $frame[21] = [byte]($port -band 255)
+    $manyPortsFrames.Add($frame)
+}
+Write-CaptureFixture $manyPortsCapture 101 ($manyPortsFrames.ToArray())
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
 using System.IO;
@@ -206,6 +215,16 @@ function Wait-CaptureCombo([string]$Name) {
         $item = Find-Element $Name ([System.Windows.Automation.ControlType]::ComboBox)
         if ($item -and $item.Current.IsEnabled) { $item }
     }
+}
+
+function Select-ComparisonConversationType([string]$Name) {
+    $type = Wait-CaptureCombo 'Conversation type'
+    $type.SetFocus()
+    $type.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $item = Wait-Until "conversation type '$Name' is selectable" {
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
 }
 
 function Open-Conversation([string]$Label, [string]$Filter) {
@@ -410,6 +429,12 @@ try {
         $filterPath = $conversationCapture + '.filter'
         [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $ipv4Filter
     }
+    Set-Field 'Filter conversations' '2001:0DB8::/32'
+    $null = Wait-Until 'IPv6 network filtering narrows the view before exporting' {
+        (Find-Element 'Matching conversations 1 of 3') -and
+        (Find-Element "2001:db8::1 $bothDirections 2001:db8::2") -and
+        !(Find-Element "192.0.2.1 $bothDirections 192.0.2.2")
+    }
     $guiText = Join-Path $State 'packet changes.txt'
     Save-PacketComparison $guiText
     $null = Wait-Until 'the Text comparison export is published' { [IO.File]::Exists($guiText) }
@@ -564,13 +589,7 @@ try {
         (Find-Element "RST${dot}Before 1${dot}After 0") -and
         (Find-Element 'TCP flag deltas unavailable for this coverage')
     }
-    $type = Wait-CaptureCombo 'Conversation type'
-    $type.SetFocus()
-    $type.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $ports = Wait-Until 'transport pairs are selectable in the comparison' {
-        Find-Element 'TCP and UDP ports' ([System.Windows.Automation.ControlType]::ListItem)
-    }
-    $ports.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-ComparisonConversationType 'TCP and UDP ports'
     $null = Wait-Until 'the transport comparison reports both pairs and their coverage' {
         (Find-Element 'TCP and UDP conversation changes 2') -and
         (Find-Element "TCP/UDP packets without ports 1${dot}Untracked TCP/UDP packets 0") -and
@@ -596,6 +615,41 @@ try {
     Click 'Open conversation in Wireshark'
     $null = Wait-Until 'the Before capture opens with the same TCP pair filter' {
         [IO.File]::Exists($transportFilterPath) -and [IO.File]::ReadAllText($transportFilterPath) -ceq $tcpPortFilter
+    }
+    Click 'Back to capture'
+    Select-Capture $manyPortsCapture
+    Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'
+    Select-ComparisonConversationType 'TCP and UDP ports'
+    $null = Wait-Until 'the unfiltered transport comparison spans two pages' {
+        (Find-Element 'TCP and UDP conversation changes 15') -and (Find-Element 'Page 1 of 2')
+    }
+    Set-Field 'Filter conversations' 'UDP 192.0.2.0/24 :50015'
+    $row = Wait-Until 'the filter finds a pair that was off the first page' {
+        if ((Find-Element 'Matching conversations 1 of 15') -and !(Find-Element 'Page 1 of 2')) {
+            Find-Element "UDP${dot}192.0.2.1:50015 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
+        }
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Open conversation in Wireshark'
+    $expected = 'frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip:udp(?::|$)" && ' +
+        '((ip.src#1 == 192.0.2.1 && udp.srcport#1 == 50015 && ip.dst#1 == 192.0.2.2 && udp.dstport#1 == 443) || ' +
+        '(ip.src#1 == 192.0.2.2 && udp.srcport#1 == 443 && ip.dst#1 == 192.0.2.1 && udp.dstport#1 == 50015))'
+    $null = Wait-Until 'Wireshark opens the filtered transport pair' {
+        $filterPath = $olderCapture + '.filter'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $expected
+    }
+    Set-Field 'Filter conversations' 'udp 50014'
+    $null = Wait-Until 'a new filter clears selection even when it finds one row again' {
+        $open = Find-Element 'Open conversation in Wireshark' $button
+        (Find-Element "UDP${dot}192.0.2.1:50014 $bothDirections 192.0.2.2:443") -and $open -and !$open.Current.IsEnabled
+    }
+    Set-Field 'Filter conversations' 'tcp 50014'
+    $null = Wait-Until 'an unmatched filter explains the empty list' {
+        (Find-Element 'Matching conversations 0 of 15') -and (Find-Element 'No conversations match the filter')
+    }
+    Click 'Clear conversation filter'
+    $null = Wait-Until 'clearing the filter restores the first page' {
+        (Find-Element 'Page 1 of 2') -and !(Find-Element 'Clear conversation filter' $button)
     }
     Click 'Back to capture'
     Click 'Return to diagnostics overview'
