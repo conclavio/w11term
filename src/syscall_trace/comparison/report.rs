@@ -1,4 +1,4 @@
-use super::{Comparison, Kind, Row, RowMatch};
+use super::{Comparison, Kind, Row, RowMatch, TimingAnchor};
 use crate::syscall_trace::{MAX_QUERY_CHARS, MergeOrder, Outcome, Trace, duration_delta_ms};
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::{
@@ -13,6 +13,7 @@ impl Comparison {
         &self,
         query: &str,
         include_timing: bool,
+        anchor: Option<TimingAnchor>,
         output: impl Write,
     ) -> io::Result<()> {
         let query: String = query.chars().take(MAX_QUERY_CHARS).collect();
@@ -35,7 +36,7 @@ impl Comparison {
                 (matched.index, matched.sample.unwrap_or(row.sample))
             })
             .collect();
-        self.write_visible_json(filter, include_timing, &rows, output)
+        self.write_visible_json(filter, include_timing, &rows, anchor, output)
     }
 
     /// Write a report from the viewer's ordered (row index, evidence index) selection.
@@ -44,6 +45,7 @@ impl Comparison {
         filter: &str,
         include_timing: bool,
         rows: &[(usize, usize)],
+        anchor: Option<TimingAnchor>,
         output: impl Write,
     ) -> io::Result<()> {
         if rows.iter().any(|&(index, sample)| {
@@ -62,9 +64,11 @@ impl Comparison {
             include_timing,
             limited: self.limited,
             total_changes: self.rows.len(),
+            timing_anchor: anchor.map(|anchor| AnchorReport::from_comparison(self, anchor)),
             changes: Changes {
                 comparison: self,
                 rows,
+                anchor,
             },
         };
         let mut output = BufWriter::new(output);
@@ -83,7 +87,44 @@ struct Report<'a> {
     include_timing: bool,
     limited: bool,
     total_changes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timing_anchor: Option<AnchorReport<'a>>,
     changes: Changes<'a>,
+}
+
+#[derive(Serialize)]
+struct AnchorReport<'a> {
+    syscall: &'a str,
+    working: AnchorSource<'a>,
+    failing: AnchorSource<'a>,
+}
+
+#[derive(Serialize)]
+struct AnchorSource<'a> {
+    file_number: usize,
+    #[serde(flatten)]
+    source: Line<'a>,
+}
+
+impl<'a> AnchorReport<'a> {
+    fn from_comparison(comparison: &'a Comparison, anchor: TimingAnchor) -> Self {
+        let [working, failing] = [0, 1].map(|side| {
+            let trace = &comparison.traces[side];
+            let raw = trace.events[anchor.event(side)].first;
+            AnchorSource {
+                file_number: raw.source_number(),
+                source: Line {
+                    file_name: file_name(trace.original(raw).0),
+                    line: raw.line,
+                },
+            }
+        });
+        Self {
+            syscall: &comparison.traces[0].events[anchor.event(0)].name,
+            working,
+            failing,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -112,6 +153,7 @@ fn source(trace: &Trace) -> Source<'_> {
 struct Changes<'a> {
     comparison: &'a Comparison,
     rows: &'a [(usize, usize)],
+    anchor: Option<TimingAnchor>,
 }
 
 impl Serialize for Changes<'_> {
@@ -145,8 +187,8 @@ impl Serialize for Changes<'_> {
                     .map(|(working, failing)| duration_delta_ms(working, failing)),
                 evidence_pair: sample + 1,
                 evidence_pairs: row.evidence_count(),
-                working_evidence: evidence(comparison, row, 0, sample),
-                failing_evidence: evidence(comparison, row, 1, sample),
+                working_evidence: evidence(comparison, row, 0, sample, self.anchor),
+                failing_evidence: evidence(comparison, row, 1, sample, self.anchor),
             })?;
         }
         changes.end()
@@ -182,6 +224,8 @@ struct Evidence<'a> {
     outcome: Outcome,
     errno: Option<&'a str>,
     elapsed_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset_from_anchor_ns: Option<i128>,
     duration_ns: Option<u64>,
     sources: Vec<Line<'a>>,
 }
@@ -197,6 +241,7 @@ fn evidence<'a>(
     row: &Row,
     side: usize,
     sample: usize,
+    anchor: Option<TimingAnchor>,
 ) -> Option<Evidence<'a>> {
     let trace = &comparison.traces[side];
     let index = comparison.event(row, side, sample)?;
@@ -206,6 +251,8 @@ fn evidence<'a>(
         outcome: event.outcome,
         errno: event.error.as_deref(),
         elapsed_ns: trace.relative_start(index),
+        offset_from_anchor_ns: anchor
+            .and_then(|anchor| comparison.offset_from_anchor_ns(anchor, side, index)),
         duration_ns: event.duration,
         sources: event
             .originals()

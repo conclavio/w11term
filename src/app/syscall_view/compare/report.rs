@@ -1,5 +1,6 @@
 use super::{
-    COMPARISON_LIMIT, Comparison, ComparisonRow, ViewState, delta, evidence_text, safe_text,
+    COMPARISON_LIMIT, Comparison, ComparisonRow, ComparisonTimingAnchor, ViewState, delta,
+    evidence_text, safe_text, timing_text,
 };
 use crate::app::openrouter_assistance::clip;
 use std::{
@@ -153,6 +154,7 @@ pub(super) struct Snapshot {
     selected: Option<(usize, usize)>,
     query: Option<String>,
     timing: bool,
+    anchor: Option<ComparisonTimingAnchor>,
 }
 
 impl Snapshot {
@@ -174,6 +176,7 @@ impl Snapshot {
             selected: state.selected.map(|index| (index, state.sample)),
             query: state.applied.as_ref().map(|filter| filter.query.clone()),
             timing: state.timing,
+            anchor: state.anchor,
         })
     }
 
@@ -187,6 +190,7 @@ impl Snapshot {
             self.query.as_deref().unwrap_or_default(),
             self.timing,
             &self.rows,
+            self.anchor,
             output,
         )
     }
@@ -207,6 +211,9 @@ impl Snapshot {
         }
         if let Some(query) = &self.query {
             writeln!(output, "Applied filter · {}", field(query))?;
+        }
+        if let Some(anchor) = self.anchor {
+            writeln!(output, "{}", timing_reference(compare, anchor))?;
         }
         writeln!(
             output,
@@ -271,7 +278,7 @@ impl Snapshot {
                 )?;
             }
             for (side, label) in SIDES.into_iter().enumerate() {
-                write_source(&mut output, compare, row, side, sample, label)?;
+                write_source(&mut output, compare, row, side, sample, label, self.anchor)?;
             }
         }
         if let Some((index, sample)) = self.selected
@@ -289,7 +296,7 @@ impl Snapshot {
                 writeln!(
                     output,
                     "\n{label}\n{}",
-                    evidence_text(compare, row, side, sample)
+                    evidence_text(compare, row, side, sample, self.anchor)
                 )?;
             }
         }
@@ -304,6 +311,7 @@ fn write_source(
     side: usize,
     sample: usize,
     label: &str,
+    anchor: Option<ComparisonTimingAnchor>,
 ) -> io::Result<()> {
     let Some(index) = compare.event(row, side, sample) else {
         return writeln!(output, "   {label} · No corresponding call");
@@ -326,7 +334,28 @@ fn write_source(
             raw.line
         )?;
     }
+    if anchor.is_some()
+        && let Some(timing) = timing_text(compare, anchor, side, index)
+    {
+        write!(output, " · {timing}")?;
+    }
     writeln!(output)
+}
+
+pub(super) fn timing_reference(compare: &Comparison, anchor: ComparisonTimingAnchor) -> String {
+    let [working, failing] = [0, 1].map(|side| {
+        let trace = &compare.traces()[side];
+        let raw = trace.events()[anchor.event(side)]
+            .originals()
+            .next()
+            .unwrap();
+        format!("{} line {}", file_name(trace.original(raw).0), raw.line)
+    });
+    let syscall = &compare.traces()[0].events()[anchor.event(0)].name;
+    format!(
+        "Timing reference · {} · Working {working} · Failing {failing}",
+        field(syscall)
+    )
 }
 
 fn file_name(path: &Path) -> String {

@@ -15,6 +15,7 @@ mod comparison;
 mod descriptors;
 pub use comparison::{
     Comparison, Kind as ComparisonKind, Row as ComparisonRow, RowMatch as ComparisonMatch,
+    TimingAnchor as ComparisonTimingAnchor,
 };
 pub use descriptors::{DescriptorReport, Lifetime, Step};
 
@@ -535,6 +536,21 @@ impl Trace {
             return None;
         }
         current.ns.checked_sub(start.ns)
+    }
+
+    fn offset_from_event(&self, reference: usize, index: usize) -> Option<i128> {
+        let reference_stamp = self.events.get(reference)?.stamp?;
+        let current = self.events.get(index)?.stamp?;
+        if current.basis != reference_stamp.basis {
+            return None;
+        }
+        let (reference, current) = match current.basis {
+            TimeBasis::Epoch | TimeBasis::Relative => (reference_stamp.ns, current.ns),
+            // Use the existing run clock checks for time-of-day records.
+            TimeBasis::Clock => (self.relative_start(reference)?, self.relative_start(index)?),
+            TimeBasis::Delta => return None,
+        };
+        Some(i128::from(current) - i128::from(reference))
     }
 
     pub fn filtered(&self, filter: Filter, query: &str) -> Vec<usize> {

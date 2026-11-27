@@ -241,6 +241,13 @@ try {
             $right.Contains('77      0.001000 openat') -and $left.Contains('+1.000 ms from run start') -and
             $right.Contains('+1.000 ms from run start')
     }
+    Click 'Use selected pair as time zero'
+    $null = Wait-Until 'both records start at zero on the selected reference' {
+        $left = Raw-Text $workingId
+        $right = Raw-Text $failingId
+        $left -and $right -and $left.Contains('+0.000 ms from timing reference') -and
+            $right.Contains('+0.000 ms from timing reference')
+    }
     Apply-ChangeFilter 'OPENAT enoent /BIN/DIAG'
     $null = Wait-Until 'filter narrows by syscall, errno, and executable' {
         $right = Raw-Text $failingId
@@ -273,7 +280,13 @@ try {
         $left = Raw-Text $workingId
         $right = Raw-Text $failingId
         $left -and $right -and $left.Contains('read(3</tmp/data>, "a"') -and
-            $right.Contains('read(8</tmp/data>, "a"')
+            $right.Contains('read(8</tmp/data>, "a"') -and
+            $left.Contains('+3.000 ms from timing reference') -and
+            $right.Contains('+3.000 ms from timing reference')
+    }
+    $anchorButton = Find-Element 'Use selected pair as time zero' $button
+    if (!$anchorButton -or $anchorButton.Current.IsEnabled) {
+        throw 'A repeat count mismatch was offered as a timing reference'
     }
     Set-ChangeFilter '/unapplied/draft'
     $report = Join-Path $State 'comparison report.txt'
@@ -283,6 +296,8 @@ try {
     if (!$saved.Contains("Applied filter${dot}read /TMP/DATA") -or
         !$saved.Contains("Reported changes${dot}1 of 4") -or
         !$saved.Contains("Count delta -1") -or
+        !$saved.Contains("Timing reference${dot}openat${dot}Working working diag.strace line 2") -or
+        !$saved.Contains('+3.000 ms from timing reference') -or
         !$saved.Contains('working diag.strace line 6') -or
         !$saved.Contains('read(3</tmp/data>, "a"') -or
         !$saved.Contains('read(8</tmp/data>, "a"') -or
@@ -308,6 +323,10 @@ try {
     if ($structured.schema_version -ne 1 -or $structured.filter -cne 'read /TMP/DATA' -or
         $structured.include_timing -or $structured.changes.Count -ne 1 -or $change.syscall -cne 'read' -or
         $change.count_delta -ne -1 -or $change.evidence_pair -ne 1 -or $change.evidence_pairs -ne 2 -or
+        $structured.timing_anchor.syscall -cne 'openat' -or
+        $structured.timing_anchor.working.file_number -ne 1 -or $structured.timing_anchor.failing.line -ne 2 -or
+        $change.working_evidence.offset_from_anchor_ns -ne 3000000 -or
+        $change.failing_evidence.offset_from_anchor_ns -ne 3000000 -or
         $change.working_evidence.sources[0].file_name -cne 'working diag.strace' -or
         $change.working_evidence.sources[0].line -ne 5 -or
         $change.failing_evidence.sources[0].file_name -cne 'failing diag.strace' -or
@@ -319,11 +338,13 @@ try {
         (Find-Element 'No changes match the filter.') -and
             !(Find-TraceGroup 'Changed count*read*')
     }
+    Click 'Use run starts'
     Apply-ChangeFilter ''
     $null = Wait-Until 'clearing the filter restores the first divergence and all changes' {
         $right = Raw-Text $failingId
         (Find-TraceGroup 'First divergence*Changed result*openat*') -and
-            (Find-TraceGroup 'Changed count*read*') -and $right -and $right.Contains('ENOENT')
+            (Find-TraceGroup 'Changed count*read*') -and $right -and $right.Contains('ENOENT') -and
+            $right.Contains('+1.000 ms from run start')
     }
     Apply-ChangeFilter 'changed timing close /tmp/data'
     $null = Wait-Until 'timing-only changes stay hidden by default while filtering' {

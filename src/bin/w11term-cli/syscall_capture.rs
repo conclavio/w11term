@@ -18,7 +18,8 @@ pub(super) const HELP: &str = concat!(
 pub(super) const COMPARE_VERB: &str = "compare-syscall-traces";
 pub(super) const COMPARE_HELP: &str = concat!(
     "w11term-cli compare-syscall-traces --working PATH [--working PATH ...] ",
-    "--failing PATH [--failing PATH ...] [--filter TEXT] [--include-timing] [--output-file PATH]",
+    "--failing PATH [--failing PATH ...] [--filter TEXT] [--include-timing] ",
+    "[--anchor WORKING_FILE:LINE,FAILING_FILE:LINE] [--output-file PATH]",
 );
 
 pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<()> {
@@ -28,6 +29,7 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
     let mut filter = None;
     let mut output_file = None;
     let mut include_timing = false;
+    let mut anchor = None;
     while let Some(flag) = args.next() {
         let mut value = || {
             args.next()
@@ -39,6 +41,10 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
             "--include-timing" => {
                 ensure!(!include_timing, "specify {flag} only once");
                 include_timing = true;
+            }
+            "--anchor" => {
+                ensure!(anchor.is_none(), "specify {flag} only once");
+                anchor = Some(parse_anchor(value()?)?);
             }
             "--filter" | "--output-file" => {
                 let target = if flag == "--filter" {
@@ -63,9 +69,30 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
     let working = Arc::new(Trace::open(working).context("Reading the working trace")?);
     let failing = Arc::new(Trace::open(failing).context("Reading the failing trace")?);
     let comparison = Comparison::build(working, failing);
+    let anchor = anchor
+        .map(|sources| {
+            comparison.timing_anchor_for_sources(sources).context(
+                "--anchor must identify a reliably aligned call with a usable time in each trace",
+            )
+        })
+        .transpose()?;
     offline::write_report(stdout, output_file, |dest| {
-        comparison.write_json(filter.unwrap_or_default(), include_timing, dest)
+        comparison.write_json(filter.unwrap_or_default(), include_timing, anchor, dest)
     })
+}
+
+fn parse_anchor(value: &str) -> Result<[(usize, u32); 2]> {
+    fn source(value: &str) -> Option<(usize, u32)> {
+        let (file, line) = value.split_once(':')?;
+        let file = file.parse().ok()?;
+        let line = line.parse().ok()?;
+        (file > 0 && line > 0).then_some((file, line))
+    }
+
+    let pair = value
+        .split_once(',')
+        .and_then(|(working, failing)| Some([source(working)?, source(failing)?]));
+    pair.context("--anchor requires two one-based file and line references in WORKING_FILE:LINE,FAILING_FILE:LINE form")
 }
 
 pub(super) fn parse(

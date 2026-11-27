@@ -2,6 +2,7 @@ use super::{Outcome, Trace, argument_values};
 use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
+    num::NonZeroU32,
     ops::Range,
     sync::Arc,
 };
@@ -64,11 +65,23 @@ pub struct RowMatch {
     pub sample: Option<usize>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TimingAnchor {
+    events: [usize; 2],
+}
+
+impl TimingAnchor {
+    pub fn event(self, side: usize) -> usize {
+        self.events[side]
+    }
+}
+
 pub struct Comparison {
     traces: [Arc<Trace>; 2],
     rows: Vec<Row>,
     pub limited: bool,
     orders: [Vec<usize>; 2],
+    paired_events: Vec<Option<NonZeroU32>>,
 }
 
 impl Comparison {
@@ -83,6 +96,7 @@ impl Comparison {
             rows: Vec::new(),
             limited: normalized.iter().any(|side| side.limited),
             orders: Default::default(),
+            paired_events: vec![None; traces[0].events.len()],
         };
         for pair in pairs {
             let runs = [0, 1].map(|side| match pair.index[side] {
@@ -139,6 +153,42 @@ impl Comparison {
     pub fn event(&self, row: &Row, side: usize, sample: usize) -> Option<usize> {
         let span = &row.spans[side];
         (sample < span.len()).then(|| self.orders[side][span.start + sample])
+    }
+
+    pub fn timing_anchor_at(&self, row: &Row, sample: usize) -> Option<TimingAnchor> {
+        self.timing_anchor([self.event(row, 0, sample)?, self.event(row, 1, sample)?])
+    }
+
+    /// Resolve one-based source file positions and line numbers to an aligned call pair.
+    pub fn timing_anchor_for_sources(&self, sources: [(usize, u32); 2]) -> Option<TimingAnchor> {
+        let find = |side: usize| {
+            self.traces[side].events.iter().position(|event| {
+                event
+                    .originals()
+                    .any(|raw| (raw.source_number(), raw.line) == sources[side])
+            })
+        };
+        self.timing_anchor([find(0)?, find(1)?])
+    }
+
+    fn timing_anchor(&self, events: [usize; 2]) -> Option<TimingAnchor> {
+        let [working, failing] = events;
+        if self.paired_events[working]?.get() as usize != failing + 1 {
+            return None;
+        }
+        let anchor = TimingAnchor { events };
+        self.offset_from_anchor_ns(anchor, 0, working)?;
+        self.offset_from_anchor_ns(anchor, 1, failing)?;
+        Some(anchor)
+    }
+
+    pub fn offset_from_anchor_ns(
+        &self,
+        anchor: TimingAnchor,
+        side: usize,
+        index: usize,
+    ) -> Option<i128> {
+        self.traces[side].offset_from_event(anchor.event(side), index)
     }
 
     pub fn first_divergence(&self) -> Option<usize> {
@@ -204,6 +254,19 @@ impl Comparison {
             let after = runs[1].get(at[1]);
             match (before, after) {
                 (Some(left), Some(right)) if left.key == right.key => {
+                    if !uncertain
+                        && !ambiguous_anchor
+                        && !left.uncertain
+                        && !right.uncertain
+                        && left.calls.len() == right.calls.len()
+                    {
+                        // Keep exact pairs from unchanged runs as well. Trace's record
+                        // cap lets us store each failing index in a compact slot.
+                        for (left, right) in left.calls.iter().zip(&right.calls) {
+                            self.paired_events[left.event] =
+                                NonZeroU32::new(right.event as u32 + 1);
+                        }
+                    }
                     if let Some(difference) = paired_difference(left, right) {
                         self.store(
                             [before, after],

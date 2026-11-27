@@ -52,6 +52,7 @@ fn compares_offline_with_matching_error_evidence_and_optional_timing() {
     assert_eq!(all["limited"], false);
     assert_eq!(all["total_changes"], 2);
     assert_eq!(all["changes"].as_array().unwrap().len(), 1);
+    assert!(all.get("timing_anchor").is_none());
     let with_timing = [&inputs[..], &["--include-timing"]].concat();
     let timed = report(&compare(path, &with_timing));
     assert_eq!(timed["changes"].as_array().unwrap().len(), 2);
@@ -102,6 +103,84 @@ fn compares_offline_with_matching_error_evidence_and_optional_timing() {
 }
 
 #[test]
+fn uses_even_an_unchanged_call_as_a_timing_reference() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    fs::write(
+        path.join("working.strace"),
+        concat!(
+            "1700000000.000000 execve(\"/bin/diag\", [\"diag\"], NULL) = 0\n",
+            "1700000000.001000 access(\"/tmp/before\", F_OK) = 0\n",
+            "1700000000.006000 access(\"/tmp/phase\", F_OK) = 0\n",
+            "1700000000.010000 access(\"/tmp/after\", F_OK) = 0\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        path.join("failing.strace"),
+        concat!(
+            "execve(\"/bin/diag\", [\"diag\"], NULL) = 0\n",
+            "1800000000.004000 access(\"/tmp/before\", F_OK) = -1 ENOENT (Missing)\n",
+            "1800000000.008000 access(\"/tmp/phase\", F_OK) = 0\n",
+            "1800000000.013000 access(\"/tmp/after\", F_OK) = -1 EACCES (Permission denied)\n",
+        ),
+    )
+    .unwrap();
+    let inputs = ["--working", "working.strace", "--failing", "failing.strace"];
+    let anchored = [&inputs[..], &["--anchor", "1:3,1:3"]].concat();
+    let result = report(&compare(path, &anchored));
+    assert_eq!(
+        result["timing_anchor"],
+        json!({
+            "syscall": "access",
+            "working": {"file_number": 1, "file_name": "working.strace", "line": 3},
+            "failing": {"file_number": 1, "file_name": "failing.strace", "line": 3},
+        })
+    );
+    let changes = result["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0]["working_evidence"]["elapsed_ns"], 1_000_000);
+    assert!(changes[0]["failing_evidence"]["elapsed_ns"].is_null());
+    assert_eq!(
+        changes[0]["working_evidence"]["offset_from_anchor_ns"],
+        -5_000_000
+    );
+    assert_eq!(
+        changes[0]["failing_evidence"]["offset_from_anchor_ns"],
+        -4_000_000
+    );
+    assert_eq!(
+        changes[1]["working_evidence"]["offset_from_anchor_ns"],
+        4_000_000
+    );
+    assert_eq!(
+        changes[1]["failing_evidence"]["offset_from_anchor_ns"],
+        5_000_000
+    );
+
+    let filtered = [&anchored[..], &["--filter", "EACCES"]].concat();
+    let filtered = report(&compare(path, &filtered));
+    assert_eq!(filtered["timing_anchor"], result["timing_anchor"]);
+    assert_eq!(filtered["changes"], json!([changes[1]]));
+
+    for (selector, message) in [
+        ("0:3,1:3", "one-based file and line"),
+        ("1:1,1:1", "reliably aligned call"),
+        ("1:3,1:4", "reliably aligned call"),
+        ("2:3,1:3", "reliably aligned call"),
+    ] {
+        let failed = compare(path, &[&inputs[..], &["--anchor", selector]].concat());
+        assert!(!failed.status.success());
+        assert!(failed.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&failed.stderr).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains(message),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn compares_split_runs_and_rejects_mismatched_input_sets() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
@@ -148,6 +227,8 @@ fn compares_split_runs_and_rejects_mismatched_input_sets() {
             "failed.78",
             "--failing",
             "failed.77",
+            "--anchor",
+            "1:1,1:1",
         ],
     ));
     assert_eq!(result["working"]["merge_order"], "epoch");
@@ -161,6 +242,11 @@ fn compares_split_runs_and_rejects_mismatched_input_sets() {
     assert_eq!(change["executable"], "/bin/helper");
     assert_eq!(change["working_evidence"]["pid"], 22);
     assert_eq!(change["failing_evidence"]["elapsed_ns"], 3_000_000);
+    assert_eq!(
+        change["failing_evidence"]["offset_from_anchor_ns"],
+        1_000_000
+    );
+    assert_eq!(result["timing_anchor"]["working"]["file_name"], "ok.22");
     assert_eq!(
         change["failing_evidence"]["sources"],
         json!([{"file_name": "failed.78", "line": 2}])

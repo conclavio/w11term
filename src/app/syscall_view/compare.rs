@@ -1,6 +1,7 @@
 use super::*;
 use trace::{
-    Comparison, ComparisonKind, ComparisonMatch, ComparisonRow, duration_delta_ms as delta,
+    Comparison, ComparisonKind, ComparisonMatch, ComparisonRow, ComparisonTimingAnchor,
+    duration_delta_ms as delta,
 };
 
 mod report;
@@ -16,6 +17,8 @@ pub enum Action {
     Select(TabId, Arc<Comparison>, usize),
     Page(TabId, bool),
     Evidence(TabId, bool),
+    SetTimingAnchor(TabId),
+    ClearTimingAnchor(TabId),
     Timing(TabId, bool),
     Query(TabId, String),
     Filter(TabId),
@@ -40,6 +43,7 @@ pub(super) struct ViewState {
     page: usize,
     selected: Option<usize>,
     sample: usize,
+    anchor: Option<ComparisonTimingAnchor>,
 }
 
 fn message(action: Action) -> Message {
@@ -146,6 +150,18 @@ impl TerminalApp {
                     && let Some((_, row)) = state.current()
                 {
                     state.sample = step(state.sample, row.evidence_count(), next);
+                }
+            }
+            Action::SetTimingAnchor(tab) => {
+                if let Some(state) = self.comparison_input(tab)
+                    && let Some(anchor) = state.selected_timing_anchor()
+                {
+                    state.anchor = Some(anchor);
+                }
+            }
+            Action::ClearTimingAnchor(tab) => {
+                if let Some(state) = self.comparison_input(tab) {
+                    state.anchor = None;
                 }
             }
             Action::Timing(tab, enabled) => {
@@ -371,6 +387,11 @@ impl ViewState {
     fn current(&self) -> Option<(&Comparison, &ComparisonRow)> {
         let compare = self.compare.as_deref()?;
         Some((compare, compare.rows().get(self.selected?)?))
+    }
+
+    fn selected_timing_anchor(&self) -> Option<ComparisonTimingAnchor> {
+        let (compare, row) = self.current()?;
+        compare.timing_anchor_at(row, self.sample)
     }
 
     pub(super) fn launch(
@@ -680,6 +701,33 @@ impl ViewState {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
+        let selected_anchor = self.selected_timing_anchor();
+        heading.push(KeyedView::new(
+            "timing-reference-actions",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    Button::new()
+                        .is_enabled(
+                            idle && selected_anchor.is_some() && selected_anchor != self.anchor,
+                        )
+                        .on_click(ctx.callback(move |_| message(Action::SetTimingAnchor(tab))))
+                        .content("Use selected pair as time zero"),
+                    Button::new()
+                        .is_enabled(idle && self.anchor.is_some())
+                        .on_click(ctx.callback(move |_| message(Action::ClearTimingAnchor(tab))))
+                        .content("Use run starts"),
+                )),
+        ));
+        if let Some(anchor) = self.anchor {
+            heading.push(KeyedView::new(
+                "timing-reference",
+                TextBlock::new()
+                    .text(report::timing_reference(compare, anchor))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .row_spacing(6.0)
@@ -717,7 +765,7 @@ impl ViewState {
             "comparison-failing-original"
         };
         let evidence = row.map_or_else(String::new, |row| {
-            evidence_text(compare, row, side, self.sample)
+            evidence_text(compare, row, side, self.sample, self.anchor)
         });
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -738,18 +786,20 @@ impl ViewState {
     }
 }
 
-fn evidence_text(compare: &Comparison, row: &ComparisonRow, side: usize, sample: usize) -> String {
+fn evidence_text(
+    compare: &Comparison,
+    row: &ComparisonRow,
+    side: usize,
+    sample: usize,
+    anchor: Option<ComparisonTimingAnchor>,
+) -> String {
     let Some(event) = compare.event(row, side, sample) else {
         return "No corresponding call in this run.".into();
     };
     let trace = &compare.traces()[side];
     let mut evidence = String::new();
-    if let Some(elapsed) = trace.relative_start(event) {
-        let _ = writeln!(
-            evidence,
-            "+{:.3} ms from run start",
-            elapsed as f64 / 1_000_000.0
-        );
+    if let Some(timing) = timing_text(compare, anchor, side, event) {
+        let _ = writeln!(evidence, "{timing}");
     }
     if let Some(duration) = trace.events()[event].duration {
         let _ = writeln!(
@@ -765,4 +815,22 @@ fn evidence_text(compare: &Comparison, row: &ComparisonRow, side: usize, sample:
         append_raw(&mut evidence, trace, raw);
     }
     evidence
+}
+
+fn timing_text(
+    compare: &Comparison,
+    anchor: Option<ComparisonTimingAnchor>,
+    side: usize,
+    event: usize,
+) -> Option<String> {
+    Some(match anchor {
+        Some(anchor) => format!(
+            "{:+.3} ms from timing reference",
+            compare.offset_from_anchor_ns(anchor, side, event)? as f64 / 1_000_000.0
+        ),
+        None => format!(
+            "+{:.3} ms from run start",
+            compare.traces()[side].relative_start(event)? as f64 / 1_000_000.0
+        ),
+    })
 }
