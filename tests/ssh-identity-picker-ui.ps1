@@ -213,21 +213,33 @@ try {
         !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle)
     }
 
+    $presets = Wait-Until 'built-in tool preset selector' { Find-Element 'Built-in Linux tool bundle' $combo }
+    $presets.SetFocus()
+    $presetPopup = $presets.GetCurrentPattern($expand)
+    $presetPopup.Expand()
+    $admin = Wait-Until 'visible admin tools preset' { Find-Element 'Linux admin tools' $item -Visible }
+    $admin.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    if ($presetPopup.Current.ExpandCollapseState -eq 'Expanded') { $presetPopup.Collapse() }
+    $null = Wait-Until 'admin preset selected without modifying the custom bundle' {
+        (Find-Element 'Use Linux admin tools' $button) -and
+            [FixtureDialog]::SameFile($toolBundle, (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value)
+    }
+
     if ($env:W11TERM_VERIFY_STARTER_DOWNLOAD -eq '1') {
-        Click 'Use Linux essentials'
+        Click 'Use Linux admin tools'
         Click 'Cancel tool download'
         $null = Wait-Until 'starter download cancelled' { Find-Element 'Tool download cancelled' }
         $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
         if (![FixtureDialog]::SameFile($toolBundle, $toolField)) { throw 'Cancelling changed the selected manifest' }
 
-        Click 'Use Linux essentials'
-        $null = Wait-Until 'verified starter builds ready' {
-            Find-Element 'Linux essentials is ready. Review the bundle to approve sync.'
+        Click 'Use Linux admin tools'
+        $null = Wait-Until 'verified admin builds ready' {
+            Find-Element 'Linux admin tools is ready. Review the bundle to approve sync.'
         }
-        $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
-        if (![FixtureDialog]::SameFile($starterManifest, $toolField)) { throw 'Starter manifest was not selected' }
-        $starter = [IO.File]::ReadAllText($starterManifest) | ConvertFrom-Json
-        if (@($starter.tools.builds).Count -ne 8) { throw 'Expected eight builds in the starter manifest' }
+        $adminManifest = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+        if ([IO.Path]::GetFileName($adminManifest) -cne 'linux-admin-tools.json') { throw 'Admin manifest was not selected' }
+        $starter = [IO.File]::ReadAllText($adminManifest) | ConvertFrom-Json
+        if (@($starter.tools.builds).Count -ne 18) { throw 'Expected 18 builds in the admin manifest' }
         foreach ($build in $starter.tools.builds) {
             $cached = Join-Path $env:W11TERM_DATA_DIR "tools/cache/v1/$($build.sha256)"
             if ((File-Sha256 $cached) -cne $build.sha256) {
@@ -245,7 +257,7 @@ try {
         $null = Wait-Until 'starter approval saved' {
             $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
             $tools.name -ceq 'linux-essentials' -and $tools.add_to_path.shell -ceq 'bash' -and
-                [FixtureDialog]::SameFile($starterManifest, $tools.bundle)
+                [FixtureDialog]::SameFile($adminManifest, $tools.bundle)
         }
     }
 } finally {

@@ -1,10 +1,52 @@
 use super::*;
+use std::borrow::Cow;
 use std::io::{Cursor, Write};
 
 const MAX_RESOURCE: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_PLAIN: u64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const STARTER_MANIFEST: &[u8] = include_bytes!("../../../examples/tool-bundles/essentials.json");
+const ADMIN_ADDITIONS: &[u8] =
+    include_bytes!("../../../examples/tool-bundles/admin-additions.json");
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolBundlePreset {
+    #[default]
+    Essentials,
+    Admin,
+}
+
+impl ToolBundlePreset {
+    pub const ALL: [Self; 2] = [Self::Essentials, Self::Admin];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Essentials => "Linux essentials",
+            Self::Admin => "Linux admin tools",
+        }
+    }
+
+    fn bytes(self) -> Result<Cow<'static, [u8]>> {
+        match self {
+            Self::Essentials => Ok(Cow::Borrowed(STARTER_MANIFEST)),
+            Self::Admin => {
+                // Share launcher ownership and rollback history with Linux essentials.
+                let mut bundle: UtilityBundle = serde_json::from_slice(STARTER_MANIFEST)?;
+                let additions: Vec<UtilityTool> = serde_json::from_slice(ADMIN_ADDITIONS)?;
+                bundle.tools.extend(additions);
+                bundle.validate()?;
+                Ok(Cow::Owned(serde_json::to_vec_pretty(&bundle)?))
+            }
+        }
+    }
+
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Essentials => "linux-essentials.json",
+            Self::Admin => "linux-admin-tools.json",
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "format", rename_all = "kebab-case", deny_unknown_fields)]
@@ -173,19 +215,23 @@ pub(super) fn cache_dir() -> Result<PathBuf> {
         .join("v1"))
 }
 
-/// Export the built-in Linux essentials manifest without overwriting a file.
-pub fn export_starter_tool_bundle(path: &Path) -> Result<PathBuf> {
+/// Export a built-in Linux manifest without overwriting a file.
+pub fn export_builtin_tool_bundle(path: &Path, preset: ToolBundlePreset) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
-    write_starter_manifest(&path, false)?;
+    write_builtin_manifest(&path, &preset.bytes()?, false, preset)?;
     Ok(path)
 }
 
-/// Select a version of the starter manifest and cache its builds on Windows.
-pub fn prepare_starter_tool_bundle(cancelled: impl Fn() -> bool) -> Result<PathBuf> {
+/// Select a version of a built-in manifest and cache its builds on Windows.
+pub fn prepare_builtin_tool_bundle(
+    preset: ToolBundlePreset,
+    cancelled: impl Fn() -> bool,
+) -> Result<PathBuf> {
     ensure!(!cancelled(), "Tool download cancelled");
-    let manifest = managed_starter_manifest(&crate::keys::data_dir()?)?;
-    let bundle =
-        serde_json::from_slice(STARTER_MANIFEST).context("Reading the built-in tool bundle")?;
+    let data = crate::keys::data_dir()?;
+    let bytes = preset.bytes()?;
+    let manifest = managed_builtin_manifest(&data, &bytes, preset)?;
+    let bundle = serde_json::from_slice(&bytes).context("Reading the built-in tool bundle")?;
     fetch_bundle_at(&bundle, None, &cache_dir()?, |url, limit| {
         crate::https::get(url, limit, &cancelled)
     })?;
@@ -193,37 +239,47 @@ pub fn prepare_starter_tool_bundle(cancelled: impl Fn() -> bool) -> Result<PathB
     Ok(manifest)
 }
 
-fn managed_starter_manifest(data: &Path) -> Result<PathBuf> {
+fn managed_builtin_manifest(
+    data: &Path,
+    bytes: &[u8],
+    preset: ToolBundlePreset,
+) -> Result<PathBuf> {
     // Keep each app version's pins available to profiles that already reference them.
-    let digest = digest_hex(Sha256::new_with_prefix(STARTER_MANIFEST));
+    let digest = digest_hex(Sha256::new_with_prefix(bytes));
     let directory = data.join("tools").join("bundles").join(digest);
     std::fs::create_dir_all(&directory)?;
-    let path = directory.join("linux-essentials.json");
-    write_starter_manifest(&path, true)?;
+    let path = directory.join(preset.filename());
+    write_builtin_manifest(&path, bytes, true, preset)?;
     Ok(path)
 }
 
-fn write_starter_manifest(path: &Path, reuse: bool) -> Result<()> {
+fn write_builtin_manifest(
+    path: &Path,
+    bytes: &[u8],
+    reuse: bool,
+    preset: ToolBundlePreset,
+) -> Result<()> {
     let parent = path
         .parent()
         .context("Choose a file for the starter tool bundle")?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-    staged.write_all(STARTER_MANIFEST)?;
+    staged.write_all(bytes)?;
     staged.as_file().sync_all()?;
     match staged.persist_noclobber(path) {
         Ok(_) => Ok(()),
         Err(error) if reuse && error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             let mut existing = Vec::new();
             std::fs::File::open(path)?
-                .take(STARTER_MANIFEST.len() as u64 + 1)
+                .take(bytes.len() as u64 + 1)
                 .read_to_end(&mut existing)?;
             ensure!(
-                existing == STARTER_MANIFEST,
-                "The saved Linux essentials manifest was modified. Browse for that manifest to use your copy, or move it aside and retry."
+                existing == bytes,
+                "The saved {} manifest was modified. Browse for that manifest to use your copy, or move it aside and retry.",
+                preset.label()
             );
             Ok(())
         }
-        Err(error) => Err(error.error).context("Writing a new starter tool bundle"),
+        Err(error) => Err(error.error).context("Writing a new built-in tool bundle"),
     }
 }
 
@@ -340,17 +396,27 @@ mod tests {
     #[test]
     fn managed_starter_reuses_only_the_exact_builtin_manifest() {
         let data = tempfile::tempdir().unwrap();
-        let path = managed_starter_manifest(data.path()).unwrap();
+        let preset = ToolBundlePreset::Essentials;
+        let path = managed_builtin_manifest(data.path(), STARTER_MANIFEST, preset).unwrap();
         assert_eq!(
             path.parent().unwrap().file_name().unwrap(),
             digest(STARTER_MANIFEST).as_str()
         );
         assert_eq!(std::fs::read(&path).unwrap(), STARTER_MANIFEST);
         assert_eq!(UtilityBundle::load(&path).unwrap().name, "linux-essentials");
-        assert_eq!(managed_starter_manifest(data.path()).unwrap(), path);
+        assert_eq!(
+            managed_builtin_manifest(data.path(), STARTER_MANIFEST, preset).unwrap(),
+            path
+        );
+
+        let admin = ToolBundlePreset::Admin;
+        let expanded =
+            managed_builtin_manifest(data.path(), &admin.bytes().unwrap(), admin).unwrap();
+        assert_ne!(path.parent(), expanded.parent());
+        assert_eq!(std::fs::read(&path).unwrap(), STARTER_MANIFEST);
 
         std::fs::write(&path, "user edit").unwrap();
-        let error = managed_starter_manifest(data.path()).unwrap_err();
+        let error = managed_builtin_manifest(data.path(), STARTER_MANIFEST, preset).unwrap_err();
         assert!(error.to_string().contains("manifest was modified"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "user edit");
     }

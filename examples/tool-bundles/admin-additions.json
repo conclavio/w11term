@@ -1,0 +1,127 @@
+[
+  {
+    "name": "bandwhich",
+    "builds": [
+      {
+        "architecture": "x86_64",
+        "sha256": "cc64d0a37e599f52b08572c472429cbc37d10a32d4bf6ece72cd48cac58dc857",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/imsnif/bandwhich/releases/download/v0.23.1/bandwhich-v0.23.1-x86_64-unknown-linux-musl.tar.gz",
+          "member": "bandwhich",
+          "archive_sha256": "fec93e01c393cd3ef8aa168a675dffb8fa4841d5fd93390b5d14f238ae29e59c"
+        }
+      },
+      {
+        "architecture": "aarch64",
+        "sha256": "ab473b1d33d5c24440c12874008dd8dbd33419e07b4957ee901349dc0de6b5a5",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/imsnif/bandwhich/releases/download/v0.23.1/bandwhich-v0.23.1-aarch64-unknown-linux-musl.tar.gz",
+          "member": "bandwhich",
+          "archive_sha256": "6bbf084e5280a1a10833b8f466728ff428a7d637282c0487d6fcda0c4781357a"
+        }
+      }
+    ]
+  },
+  {
+    "name": "diskwatch",
+    "builds": [
+      {
+        "architecture": "x86_64",
+        "sha256": "2456a78f4223d27935dd01b16ccaba6feb4c9524796ce36ed65d24a5c25f6b72",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/matthart1983/diskwatch/releases/download/v0.7.2/diskwatch-linux-x86_64-static.tar.gz",
+          "member": "diskwatch-linux-x86_64-static",
+          "archive_sha256": "0e092b155c896049667b5fd090f8f24dbf5c814d2b2698b2cb5826da5eda84ba"
+        }
+      },
+      {
+        "architecture": "aarch64",
+        "sha256": "5ece3ddc0597ab2399345fcc9ffb36fd298507ffeef8032690304486e8c0d527",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/matthart1983/diskwatch/releases/download/v0.7.2/diskwatch-linux-aarch64-static.tar.gz",
+          "member": "diskwatch-linux-aarch64-static",
+          "archive_sha256": "ddeecbcd440a8717824267c14eee7c155c7b0522695c0ba88d8c4beadbbc1fe5"
+        }
+      }
+    ]
+  },
+  {
+    "name": "mdd",
+    "builds": [
+      {
+        "architecture": "x86_64",
+        "sha256": "cdf3fc01a3e4c5f5de86ae2deb20f89ae7f3040d287575354263b8e738442fc6",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/qu8n/mddog/releases/download/v1.5.1/mdd-linux-x86_64.tar.gz",
+          "member": "mdd",
+          "archive_sha256": "a05abd288d6a2c818f15d0f750136997ee34cd79e85ebbc69712cab602a54a73"
+        }
+      },
+      {
+        "architecture": "aarch64",
+        "sha256": "76233853c818c018f1f01f634a105371471400d19630d84ae74144a6e6f73b54",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/qu8n/mddog/releases/download/v1.5.1/mdd-linux-arm64.tar.gz",
+          "member": "mdd",
+          "archive_sha256": "e9052549476a14d470a6bfcd293c6bc08e42538a3f34cd4069c23cd81b2fecda"
+        }
+      }
+    ]
+  },
+  {
+    "name": "ncdu",
+    "builds": [
+      {
+        "architecture": "x86_64",
+        "sha256": "9386fd5577faf76b4e621ad7055ac617ce243fe2912057df04b1f899e50fda12",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/BratishkaErik/ncdu/releases/download/v2.13.0/ncdu-2.13.0-linux-x86_64.tar.gz",
+          "member": "ncdu",
+          "archive_sha256": "ab2ffa41a557873144255a78c6b33c0d39c89fcbc2ed9f0c67536afb052a52ce"
+        }
+      },
+      {
+        "architecture": "aarch64",
+        "sha256": "9fdb4894b7ffe79d75059fb8d4fa6eae4a4d134cfe162a15f5760316ed61ba87",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/BratishkaErik/ncdu/releases/download/v2.13.0/ncdu-2.13.0-linux-aarch64.tar.gz",
+          "member": "ncdu",
+          "archive_sha256": "5046196b4a54e0ea82b4f5500a52cd19a1654e9cd2505e385117e06c893c83cb"
+        }
+      }
+    ]
+  },
+  {
+    "name": "netwatch",
+    "builds": [
+      {
+        "architecture": "x86_64",
+        "sha256": "f8cf282261c81b0120eb8fb7c95cc990bfd929d5badeaace93ab96b0ca791b50",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/matthart1983/netwatch/releases/download/v1.0.0/netwatch-linux-x86_64-static.tar.gz",
+          "member": "netwatch-linux-x86_64-static",
+          "archive_sha256": "f4f05dd411c9e04c978a86b23ffb51810faf8c7a54588120e17505ce72e83828"
+        }
+      },
+      {
+        "architecture": "aarch64",
+        "sha256": "9016621e83da7d500d337bbdd2ff5005c8dd560a8939774a3778ccc356aad240",
+        "download": {
+          "format": "tar-gz",
+          "url": "https://github.com/matthart1983/netwatch/releases/download/v1.0.0/netwatch-linux-aarch64-static.tar.gz",
+          "member": "netwatch-linux-aarch64-static",
+          "archive_sha256": "425c6548bdb525cb554d613b46c0e077377f09c60c12f4287f4107e32042d82c"
+        }
+      }
+    ]
+  }
+]

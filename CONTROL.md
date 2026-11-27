@@ -1329,16 +1329,18 @@ A reviewed manual switch holds the chosen bundle on later logins, including when
 
 ### Download a pinned SSH tool bundle
 
-In **Settings → Edit profile → SSH tools**, choose **Use Linux essentials** to download the starter builds and select the manifest in the editor. The downloads run in the background. When they finish, review the host and account, approve sync, and save the profile. A new version of the built-in starter uses a new manifest, so earlier approvals keep their pins until you select and approve the new version.
+In **Settings → Edit profile → SSH tools**, select **Linux essentials** or **Linux admin tools** and choose **Use** for that preset. The download runs in the background and selects the prepared manifest when it finishes. Review the host and account, approve sync, and save the profile. Each preset revision has its own local manifest, so earlier approvals keep their pins until you select and approve a new version.
 
-Export the starter manifest and fetch its pinned Linux builds from their upstream HTTPS releases. The starter includes `rg`, `jq`, `dust`, and `hyperfine` for `x86_64` and `aarch64`. Omit `--architecture` to fetch both architectures.
+**Linux essentials** includes `rg`, `jq`, `dust`, and `hyperfine`. **Linux admin tools** adds `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. Both presets share the `linux-essentials` bundle name and `.local/bin` launchers for updates and rollback. Linux `x86_64` and `aarch64` are supported. Omit `--architecture` to fetch both. Use manual preview and apply for a first transfer that needs more than the login sync deadline.
 
 ```powershell
 & $ctl fetch-tool-bundle --example '.\Linux essentials.json'
 & $ctl fetch-tool-bundle '.\Linux essentials.json' --architecture x86_64
+& $ctl fetch-tool-bundle --example '.\Linux admin tools.json' --preset admin
+& $ctl fetch-tool-bundle '.\Linux admin tools.json' --architecture x86_64
 ```
 
-Each build in a version-1 manifest can use a `download` object in place of `path`. Set `format` to `raw` for a single executable. For `tar-gz` or `zip`, also set `member` to its path inside the archive and `archive_sha256` to the hash of the complete archive. The build's top-level `sha256` always pins the executable, and the client verifies its Linux ELF architecture before caching it. See the [starter manifest](examples/tool-bundles/essentials.json) for complete entries.
+Each build in a version-1 manifest can use a `download` object in place of `path`. Set `format` to `raw` for a single executable. For `tar-gz` or `zip`, also set `member` to its path inside the archive and `archive_sha256` to the hash of the complete archive. The build's top-level `sha256` always pins the executable, and the client verifies its Linux ELF architecture before caching it. [Essentials pins](examples/tool-bundles/essentials.json) · [Admin additions](examples/tool-bundles/admin-additions.json)
 
 Fetch the builds on Windows before using the manifest in a preview or SSH profile. w11term caches verified executables by SHA-256 in `%LOCALAPPDATA%\w11term\tools\cache\v1`. Preview and profile sync reverify the cached bytes and use them offline. To update a pin, edit the manifest and run the fetch command again.
 

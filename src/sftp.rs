@@ -35,9 +35,9 @@ pub use dotfiles::{
 };
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{
-    InstalledTool, InstalledTools, UtilityArchitecture, UtilityBuild, UtilityBundle,
-    UtilityDownload, UtilityTool, export_starter_tool_bundle, fetch_tool_bundle,
-    prepare_starter_tool_bundle,
+    InstalledTool, InstalledTools, ToolBundlePreset, UtilityArchitecture, UtilityBuild,
+    UtilityBundle, UtilityDownload, UtilityTool, export_builtin_tool_bundle, fetch_tool_bundle,
+    prepare_builtin_tool_bundle,
 };
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};

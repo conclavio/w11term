@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use w11term::{
     options::{ToolPath, ToolSync},
     sftp::{
-        DotfileShell, UtilityBundle, prepare_starter_tool_bundle, validate_dotfiles_home,
-        validate_zdotdir,
+        DotfileShell, ToolBundlePreset, UtilityBundle, prepare_builtin_tool_bundle,
+        validate_dotfiles_home, validate_zdotdir,
     },
 };
 
@@ -25,6 +25,7 @@ pub enum Action {
     PathMode(Option<usize>),
     Browse,
     Picked(Arc<()>, Result<Option<String>, String>),
+    Preset(Option<usize>),
     Starter,
     StarterFinished(Arc<()>, Result<String, String>),
     Review,
@@ -44,6 +45,7 @@ pub(super) struct Editor {
     approved: Option<Box<ToolSync>>,
     reviewed: Option<Box<ToolSync>>,
     work: Option<Arc<()>>,
+    preset: ToolBundlePreset,
     starter: Option<(Arc<()>, ComponentTask)>,
     feedback: Option<String>,
 }
@@ -195,21 +197,36 @@ impl Editor {
             ),
             KeyedView::new(
                 "browse",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(send(Action::Browse))
+                    .content("Browse for tool bundle"),
+            ),
+            KeyedView::new(
+                "builtin",
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
                     .children((
-                        Button::new()
+                        ComboBox::new()
+                            .automation_name("Built-in Linux tool bundle")
                             .is_enabled(idle)
-                            .on_click(send(Action::Browse))
-                            .content("Browse for tool bundle"),
+                            .items_source(ToolBundlePreset::ALL.map(ToolBundlePreset::label))
+                            .selected_index(
+                                ToolBundlePreset::ALL
+                                    .iter()
+                                    .position(|preset| *preset == self.preset),
+                            )
+                            .on_selection_changed(ctx.callback(move |index| {
+                                Message::ProfileTools(id, Action::Preset(index))
+                            })),
                         Button::new()
                             .is_enabled(self.work.is_none())
                             .on_click(send(Action::Starter))
                             .content(if self.starter.is_some() {
-                                "Cancel tool download"
+                                "Cancel tool download".into()
                             } else {
-                                "Use Linux essentials"
+                                format!("Use {}", self.preset.label())
                             }),
                     )),
             ),
@@ -325,6 +342,14 @@ impl TerminalApp {
                 draft.tool_bundle.edited();
             }
             Action::PathMode(_) => (),
+            Action::Preset(Some(index))
+                if draft.tool_bundle.work.is_none() && draft.tool_bundle.starter.is_none() =>
+            {
+                if let Some(preset) = ToolBundlePreset::ALL.get(index) {
+                    draft.tool_bundle.preset = *preset;
+                }
+            }
+            Action::Preset(_) => (),
             Action::Text(field, value) => {
                 let editor = &mut draft.tool_bundle;
                 let slot = match field {
@@ -393,6 +418,7 @@ impl TerminalApp {
                     return;
                 }
                 editor.feedback = None;
+                let preset = editor.preset;
                 let request = Arc::new(());
                 let rejected = Message::ProfileTools(
                     id,
@@ -404,7 +430,7 @@ impl TerminalApp {
                 let work_request = request.clone();
                 let task = ctx.spawn_background_with_rejection(
                     move |cancel| {
-                        let result = prepare_starter_tool_bundle(|| cancel.is_cancelled())
+                        let result = prepare_builtin_tool_bundle(preset, || cancel.is_cancelled())
                             .and_then(|path| {
                                 path.into_os_string().into_string().map_err(|_| {
                                     anyhow::anyhow!(
@@ -432,9 +458,10 @@ impl TerminalApp {
                     Ok(path) => {
                         editor.bundle = path;
                         editor.edited();
-                        editor.feedback = Some(
-                            "Linux essentials is ready. Review the bundle to approve sync.".into(),
-                        );
+                        editor.feedback = Some(format!(
+                            "{} is ready. Review the bundle to approve sync.",
+                            editor.preset.label()
+                        ));
                     }
                     Err(error) => editor.feedback = Some(error),
                 }
