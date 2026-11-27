@@ -81,6 +81,7 @@ use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
 mod command_palette;
+mod command_reference;
 mod directory_split;
 mod disconnect_ssh;
 mod durable_view;
@@ -1035,6 +1036,10 @@ fn tab_menu_message(label: String) -> Message {
         .map_or(label.as_str(), |(name, _)| name);
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
+        command_reference::LABEL => Message::CommandReference(command_reference::Action::Open),
+        command_reference::SELECTION => {
+            Message::CommandReference(command_reference::Action::Selection(None))
+        }
         pane_text_size::INCREASE => Message::PaneTextSize(pane_text_size::Change::Increase),
         pane_text_size::DECREASE => Message::PaneTextSize(pane_text_size::Change::Decrease),
         pane_text_size::RESET => Message::PaneTextSize(pane_text_size::Change::Reset),
@@ -1338,6 +1343,7 @@ pub struct TerminalApp {
     fonts: Vec<String>,
     appearance_error: Option<String>,
     saved_commands: w11term::saved_commands::Commands,
+    command_reference: command_reference::Panel,
     dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     rotation_hover: Option<pane_view::RotationHover>,
@@ -1521,6 +1527,7 @@ pub enum Message {
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
     SavedCommands(saved_commands::Edit),
+    CommandReference(command_reference::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -4239,6 +4246,9 @@ impl TerminalApp {
         let offered_close_other = close_other_tabs.clone();
         let offered_close_right = close_tabs_right.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
+            command_reference::SELECTION => {
+                Message::CommandReference(command_reference::Action::Selection(paste))
+            }
             label if pane_broadcast::is_label(label) => offered_broadcast
                 .clone()
                 .filter(|action| action.label() == label)
@@ -4691,6 +4701,12 @@ impl TerminalApp {
                 "find-command-history",
                 command_palette::FIND_COMMAND_HISTORY_LABEL,
                 KeyAction::FindCommandHistory,
+            ),
+            MenuItem::item("command-reference", command_reference::LABEL),
+            command_menu_item(
+                "command-reference-selection",
+                command_reference::SELECTION,
+                self.active_selection(),
             ),
             MenuItem::item(
                 "find-running-commands",
@@ -5894,6 +5910,7 @@ impl Component for TerminalApp {
             fonts,
             appearance_error,
             saved_commands: Default::default(),
+            command_reference: Default::default(),
             dividers: Rc::default(),
             measured_layout: None,
             rotation_hover: None,
@@ -6339,7 +6356,7 @@ impl Component for TerminalApp {
             Message::PickerFromMenu(shortcut) => self.open_picker_from_menu(shortcut, context),
             Message::SetTitleFiles(pane, open) => {
                 if matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
-                    if live.session.pane_id == pane && live.files.open != open)
+                    if live.session.pane_id == pane && (live.files.open && !self.command_reference.open) != open)
                 {
                     self.file_action(FileAction::Toggle, context);
                 }
@@ -7722,6 +7739,7 @@ impl Component for TerminalApp {
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
+            Message::CommandReference(action) => self.command_reference_action(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();
@@ -8481,7 +8499,11 @@ impl Component for TerminalApp {
         } else {
             Border::new().into()
         };
-        let content = self.with_file_drawer(content, context);
+        let content = if self.command_reference.open {
+            self.with_command_reference(content, context)
+        } else {
+            self.with_file_drawer(content, context)
+        };
         let mut views = vec![
             KeyedView::new(
                 "header",
