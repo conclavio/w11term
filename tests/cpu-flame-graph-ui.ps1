@@ -7,6 +7,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $folded = Join-Path $State 'worker profile.folded'
 $after = Join-Path $State 'after recording.folded'
 $svgPath = Join-Path $State 'hot branch.svg'
+$inspectedSvg = Join-Path $State 'after hot branch.svg'
 $comparisonPath = Join-Path $State 'filtered CPU comparison.json'
 $dot = ' ' + [char]0xb7 + ' '
 $arrow = ' ' + [char]0x2192 + ' '
@@ -82,6 +83,12 @@ try {
         (Find-Element ('Before 0 samples (0.00%)' + $dot + 'After 15 samples (75.00%)' + $dot + '+75.00 pp')) -and
         (Find-Element ('worker' + $arrow + 'io' + $arrow + 'read_file'))
     }
+    $null = Wait-Until 'the added stack can be inspected only in the after recording' {
+        $inspectBefore = Find-Element 'Inspect before flame graph' $button
+        $inspectAfter = Find-Element 'Inspect after flame graph' $button
+        $inspectBefore -and !$inspectBefore.Current.IsEnabled -and
+            $inspectAfter -and $inspectAfter.Current.IsEnabled
+    }
     $change = Wait-Until 'selectable hot loop change' {
         Find-Element ('-50.00 pp' + $dot + 'hot_loop' + $callerArrow + 'main') ([System.Windows.Automation.ControlType]::ListItem)
     }
@@ -106,6 +113,40 @@ try {
         $apply = Find-Element 'Apply filter' $button
         $apply -and $apply.Current.IsEnabled
     }
+    Click-GraphButton 'Inspect after flame graph'
+    $null = Wait-Until 'the after graph opens at the selected frame with its own samples' {
+        (Find-Element 'After profile') -and (Find-Element 'after recording.folded') -and
+            (Find-Element 'CPU flame graph chart') -and (Find-Element 'Zoomed to hot_loop') -and
+            (Find-Element ("hot_loop${dot}5 samples${dot}25.0% of capture")) -and (Find-Element 'Caller main')
+    }
+    Click-GraphButton 'Export SVG'
+    $dialog = Wait-Until 'owned inspected graph export dialog' { Find-OwnedDialog 'Export CPU flame graph' }
+    $null = Wait-Until 'enter the inspected graph export destination' {
+        [FixtureDialog]::SetFilename($dialog, $inspectedSvg, 'cpu-flame-graph.svg')
+    }
+    $null = Wait-Until 'save the inspected source graph' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'inspected SVG written' { (Find-Element 'Saved flame graph SVG') -and [IO.File]::Exists($inspectedSvg) }
+    $inspected = [IO.File]::ReadAllText($inspectedSvg)
+    if (!$inspected.Contains('hot_loop') -or !$inspected.Contains('5 samples') -or $inspected.Contains('read_file')) {
+        throw 'The inspected SVG did not use the after recording and selected branch'
+    }
+    $sourceSearch = Find-Element 'Search flame graph symbols' ([System.Windows.Automation.ControlType]::Edit)
+    $sourceSearch.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('read_file')
+    Click-GraphButton 'Next symbol match'
+    $null = Wait-Until 'the inspected after graph can navigate independently' { Find-Element 'Zoomed to read_file' }
+    Click-GraphButton 'Back to comparison'
+    $null = Wait-Until 'return preserves the applied filter, draft, and stack selection' {
+        $filter = Find-Element 'Filter changed call stacks' ([System.Windows.Automation.ControlType]::Edit)
+        $filter -and $filter.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq 'read_file' -and
+            (Find-Element "1 of 3 changed stacks${dot}Page 1 of 1") -and
+            (Find-Element "Before 3 samples (75.00%)${dot}After 5 samples (25.00%)${dot}-50.00 pp")
+    }
+    Click-GraphButton 'Inspect before flame graph'
+    $null = Wait-Until 'the before graph opens at the same call path in the baseline' {
+        (Find-Element 'Before profile') -and (Find-Element 'worker profile.folded') -and
+            (Find-Element 'Zoomed to hot_loop') -and (Find-Element "hot_loop${dot}3 samples${dot}75.0% of capture")
+    }
+    Click-GraphButton 'Back to comparison'
     Click-GraphButton ('Export comparison' + [char]0x2026)
     $dialog = Wait-Until 'owned comparison save dialog' { Find-OwnedDialog 'Save CPU profile comparison' }
     $null = Wait-Until 'enter the comparison destination' {

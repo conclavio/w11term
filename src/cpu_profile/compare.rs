@@ -145,6 +145,11 @@ impl Change {
         self.counts
     }
 
+    /// The terminal frame in each source tree, including paths with only descendant samples.
+    pub fn frame_ids(&self) -> [Option<usize>; 2] {
+        self.frames
+    }
+
     pub fn stack_end<'a>(&self, comparison: &'a Comparison) -> (&'a Profile, usize) {
         if let Some(before) = self.frames[0] {
             (&comparison.profiles[0], before)
@@ -257,6 +262,32 @@ mod tests {
         assert_eq!(comparison.changes[0].counts, [0, 1]);
         assert_eq!(comparison.changes[1].counts, [1, 0]);
         assert_eq!(comparison.filter("foo\\u{202e}bar").indices(), [0, 1]);
+    }
+
+    #[test]
+    fn retains_both_source_frames_when_one_side_only_has_descendant_samples() {
+        let comparison = compare("main;worker 4", "main;worker;child 5");
+        let worker = comparison
+            .changes()
+            .iter()
+            .find(|change| change.counts() == [4, 0])
+            .unwrap();
+        let [before, after] = worker.frame_ids().map(Option::unwrap);
+        let [before, after] = [
+            comparison.profiles()[0].frame(before),
+            comparison.profiles()[1].frame(after),
+        ];
+        assert_eq!((before.name.as_str(), before.own_samples), ("worker", 4));
+        assert_eq!(
+            (after.name.as_str(), after.own_samples, after.samples),
+            ("worker", 0, 5)
+        );
+        let child = comparison
+            .changes()
+            .iter()
+            .find(|change| change.counts() == [0, 5])
+            .unwrap();
+        assert_eq!(child.frame_ids()[0], None);
     }
 
     #[test]

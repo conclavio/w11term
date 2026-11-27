@@ -12,8 +12,28 @@ pub enum Action {
     Filter,
     Export,
     OpenRouter,
+    Inspect(ProfileSide),
     Page(bool),
     Select(Arc<Comparison>, usize),
+}
+
+#[derive(Clone, Copy)]
+pub enum ProfileSide {
+    Before,
+    After,
+}
+
+impl ProfileSide {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(super) fn caption(self) -> &'static str {
+        match self {
+            Self::Before => "Before profile",
+            Self::After => "After profile",
+        }
+    }
 }
 
 pub struct ViewState {
@@ -51,6 +71,21 @@ impl ViewState {
             comparison.profiles()[0].clone(),
             comparison.paths()[0].clone(),
         )
+    }
+
+    pub(super) fn selected_source(
+        &self,
+        side: ProfileSide,
+    ) -> Option<(Arc<Profile>, PathBuf, usize)> {
+        let comparison = self.results.comparison();
+        let change = comparison.changes().get(self.selected?)?;
+        let side = side.index();
+        let frame = change.frame_ids()[side]?;
+        Some((
+            comparison.profiles()[side].clone(),
+            comparison.paths()[side].clone(),
+            frame,
+        ))
     }
 
     fn page_rows(&self) -> &[usize] {
@@ -268,6 +303,28 @@ impl ViewState {
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
+            for (side, key, label) in [
+                (
+                    ProfileSide::Before,
+                    "inspect-before",
+                    "Inspect before flame graph",
+                ),
+                (
+                    ProfileSide::After,
+                    "inspect-after",
+                    "Inspect after flame graph",
+                ),
+            ] {
+                fields.push(KeyedView::new(
+                    key,
+                    Button::new()
+                        .is_enabled(idle && change.frame_ids()[side.index()].is_some())
+                        .on_click(ctx.callback(move |_| {
+                            message(super::Action::Compare(Action::Inspect(side)))
+                        }))
+                        .content(label),
+                ));
+            }
             fields.push(KeyedView::new(
                 "compare-review",
                 Button::new()

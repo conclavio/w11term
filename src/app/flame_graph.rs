@@ -18,16 +18,22 @@ pub enum Action {
     OpenFile(Option<PathBuf>),
     CompareFile,
     Compare(compare::Action),
-    Export,
+    ReturnToComparison,
+    Export(Arc<()>),
     Capture(capture::Action),
     Stop(Arc<()>),
+    Graph(Arc<()>, GraphAction),
+    Finished(Arc<()>, Result<Option<Outcome>, String>),
+}
+
+#[derive(Clone)]
+pub enum GraphAction {
     Query(String),
     Match(bool),
     Zoom(usize),
     Up,
     Depth(usize),
     Hover(Option<usize>),
-    Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
 pub enum Outcome {
@@ -48,6 +54,18 @@ struct Loaded {
     path: PathBuf,
     plot: Plot,
     capture: Option<CpuProfileSummary>,
+    ticket: Arc<()>,
+    zoom: usize,
+    hovered: Option<usize>,
+    first_depth: usize,
+    query: String,
+    search: Arc<Search>,
+    current_match: Option<usize>,
+}
+
+struct Inspection {
+    side: compare::ProfileSide,
+    source: Loaded,
 }
 
 #[derive(Default)]
@@ -56,16 +74,11 @@ pub(super) struct Panel {
     pub(super) activity: Option<diagnostics::Activity>,
     loaded: Option<Loaded>,
     comparison: Option<compare::ViewState>,
+    inspection: Option<Inspection>,
     pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
     status: Option<String>,
     capture: Option<capture::Form>,
-    zoom: usize,
-    hovered: Option<usize>,
-    first_depth: usize,
-    query: String,
-    search: Arc<Search>,
-    current_match: Option<usize>,
 }
 
 fn message(action: Action) -> Message {
@@ -82,41 +95,34 @@ impl Panel {
 
     fn load(&mut self, profile: Arc<Profile>, path: PathBuf, capture: Option<CpuProfileSummary>) {
         self.comparison = None;
-        self.zoom(0);
-        self.query.clear();
-        self.search = Arc::default();
-        self.current_match = None;
-        let plot = Plot::new(profile.clone(), self.search.clone());
-        self.loaded = Some(Loaded {
-            profile,
-            path,
-            plot,
-            capture,
-        });
+        self.inspection = None;
+        self.loaded = Some(Loaded::new(profile, path, capture, 0));
     }
 
-    fn visible_rows(window_height: f64) -> usize {
-        (((window_height - 285.0) / f64::from(plot::ROW_HEIGHT)).floor() as usize).clamp(3, 50)
+    fn visible_graph(&self) -> Option<&Loaded> {
+        if self.capture.is_some() {
+            None
+        } else if let Some(inspection) = &self.inspection {
+            Some(&inspection.source)
+        } else if self.comparison.is_none() {
+            self.loaded.as_ref()
+        } else {
+            None
+        }
     }
 
-    fn range(&self, profile: &Profile, window_height: f64) -> (Range, usize) {
-        let root = profile.frame(self.zoom);
-        let depth = root.last_depth - root.depth + 1;
-        let rows = (depth - self.first_depth).min(Self::visible_rows(window_height));
-        (
-            Range {
-                zoom: self.zoom,
-                first_depth: self.first_depth,
-                rows,
-            },
-            depth,
-        )
-    }
-
-    fn zoom(&mut self, id: usize) {
-        self.zoom = id;
-        self.first_depth = 0;
-        self.hovered = None;
+    fn graph_input(&mut self, ticket: &Arc<()>) -> Option<&mut Loaded> {
+        if !self.open || self.capture.is_some() {
+            return None;
+        }
+        if let Some(inspection) = &mut self.inspection {
+            Some(&mut inspection.source)
+        } else if self.comparison.is_none() {
+            self.loaded.as_mut()
+        } else {
+            None
+        }
+        .filter(|source| Arc::ptr_eq(ticket, &source.ticket))
     }
 
     fn view(
@@ -145,11 +151,32 @@ impl Panel {
                     .content("Stop and save profile"),
             ));
         }
-        if let Some(comparison) = &self.comparison {
-            fields.extend(comparison.fields(idle, export_idle, ctx));
-        } else if let Some(capture) = &self.capture {
+        if let Some(capture) = &self.capture {
             fields.extend(capture.fields(active, idle, ctx));
+        } else if let Some(inspection) = &self.inspection {
+            let source = inspection.source.ticket.clone();
+            fields.extend([
+                KeyedView::new(
+                    "return-to-comparison",
+                    Button::new()
+                        .is_enabled(idle)
+                        .on_click(send(|| Action::ReturnToComparison))
+                        .content("Back to comparison"),
+                ),
+                text("inspection-side", inspection.side.caption()),
+                KeyedView::new(
+                    "inspection-export",
+                    Button::new()
+                        .is_enabled(idle)
+                        .on_click(ctx.callback(move |_| message(Action::Export(source.clone()))))
+                        .content("Export SVG"),
+                ),
+            ]);
+            inspection.source.graph(window_height, ctx, &mut fields);
+        } else if let Some(comparison) = &self.comparison {
+            fields.extend(comparison.fields(idle, export_idle, ctx));
         } else {
+            let source = self.loaded.as_ref().map(|loaded| loaded.ticket.clone());
             fields.push(KeyedView::new(
                 "files",
                 StackPanel::new()
@@ -162,7 +189,11 @@ impl Panel {
                             .content("Open folded stacks"),
                         Button::new()
                             .is_enabled(idle && self.loaded.is_some())
-                            .on_click(send(|| Action::Export))
+                            .on_click(ctx.callback(move |_| {
+                                source.as_ref().map_or(Message::ControlIdle, |source| {
+                                    message(Action::Export(source.clone()))
+                                })
+                            }))
                             .content("Export SVG"),
                     )),
             ));
@@ -181,7 +212,7 @@ impl Panel {
                         .on_click(send(|| Action::CompareFile))
                         .content("Compare profiles"),
                 ));
-                self.graph(loaded, window_height, ctx, &mut fields);
+                loaded.graph(window_height, ctx, &mut fields);
             } else if self.status.is_none() {
                 fields.push(text(
                     "empty",
@@ -195,23 +226,80 @@ impl Panel {
                 .content(StackPanel::new().spacing(8.0).keyed_children(fields)),
         )
     }
+}
+
+impl Loaded {
+    fn new(
+        profile: Arc<Profile>,
+        path: PathBuf,
+        capture: Option<CpuProfileSummary>,
+        zoom: usize,
+    ) -> Self {
+        let search = Arc::<Search>::default();
+        Self {
+            plot: Plot::new(profile.clone(), search.clone()),
+            profile,
+            path,
+            capture,
+            ticket: Arc::new(()),
+            zoom,
+            hovered: None,
+            first_depth: 0,
+            query: String::new(),
+            search,
+            current_match: None,
+        }
+    }
+
+    fn events(&self) -> impl Fn(GraphAction) -> Message + Clone + use<> {
+        let ticket = self.ticket.clone();
+        move |action| message(Action::Graph(ticket.clone(), action))
+    }
+
+    fn visible_rows(window_height: f64) -> usize {
+        (((window_height - 285.0) / f64::from(plot::ROW_HEIGHT)).floor() as usize).clamp(3, 50)
+    }
+
+    fn range(&self, window_height: f64) -> (Range, usize) {
+        let root = self.profile.frame(self.zoom);
+        let depth = root.last_depth - root.depth + 1;
+        let rows = (depth - self.first_depth).min(Self::visible_rows(window_height));
+        (
+            Range {
+                zoom: self.zoom,
+                first_depth: self.first_depth,
+                rows,
+            },
+            depth,
+        )
+    }
+
+    fn zoom(&mut self, id: usize) {
+        self.zoom = id;
+        self.first_depth = 0;
+        self.hovered = None;
+    }
 
     fn graph(
         &self,
-        loaded: &Loaded,
         window_height: f64,
         ctx: &ViewContext<TerminalApp>,
         fields: &mut Vec<KeyedView>,
     ) {
-        let profile = &loaded.profile;
+        let event = self.events();
+        let command = |action: GraphAction| {
+            let event = event.clone();
+            ctx.callback(move |_| event(action.clone()))
+        };
+        let profile = &self.profile;
         let total = profile.frame(0).samples;
-        let (range, depth) = self.range(profile, window_height);
+        let (range, depth) = self.range(window_height);
         let root = profile.frame(self.zoom);
         let focus = profile.frame(self.hovered.unwrap_or(self.zoom));
-        let name = loaded
+        let name = self
             .path
             .file_name()
-            .unwrap_or(loaded.path.as_os_str())
+            .unwrap_or(self.path.as_os_str())
             .to_string_lossy();
         fields.push(KeyedView::new(
             "source",
@@ -229,7 +317,7 @@ impl Panel {
                     "Previous symbol match"
                 })
                 .is_enabled(!self.search.matches.is_empty())
-                .on_click(ctx.callback(move |_| message(Action::Match(next))))
+                .on_click(command(GraphAction::Match(next)))
                 .content(label)
         };
         fields.push(KeyedView::new(
@@ -242,7 +330,10 @@ impl Panel {
                         .automation_name("Search flame graph symbols")
                         .placeholder_text("Search symbols")
                         .text(&self.query)
-                        .on_text_changed(ctx.callback(|query| message(Action::Query(query)))),
+                        .on_text_changed({
+                            let event = event.clone();
+                            ctx.callback(move |query| event(GraphAction::Query(query)))
+                        }),
                     match_button(false, "Previous", 1),
                     match_button(true, "Next", 2),
                 )),
@@ -274,11 +365,11 @@ impl Panel {
                     Button::new()
                         .automation_name("Zoom to caller")
                         .is_enabled(self.zoom != 0)
-                        .on_click(ctx.callback(|_| message(Action::Up)))
+                        .on_click(command(GraphAction::Up))
                         .content("Up"),
                     Button::new()
                         .is_enabled(self.zoom != 0 || range.first_depth != 0)
-                        .on_click(ctx.callback(|_| message(Action::Zoom(0))))
+                        .on_click(command(GraphAction::Zoom(0)))
                         .content("Reset zoom"),
                 )),
         ));
@@ -296,11 +387,11 @@ impl Panel {
                         .children((
                             Button::new()
                                 .is_enabled(range.first_depth > 0)
-                                .on_click(ctx.callback(move |_| message(Action::Depth(shallow_at))))
+                                .on_click(command(GraphAction::Depth(shallow_at)))
                                 .content("Shallower"),
                             Button::new()
                                 .is_enabled(page_at < depth)
-                                .on_click(ctx.callback(move |_| message(Action::Depth(page_at))))
+                                .on_click(command(GraphAction::Depth(page_at)))
                                 .content("Deeper"),
                         )),
                 )),
@@ -308,10 +399,12 @@ impl Panel {
         }
 
         let sender = ctx.sender();
-        let hover = loaded.plot.pointer();
-        let exit = loaded.plot.pointer();
-        let click = loaded.plot.pointer();
+        let hover = self.plot.pointer();
+        let exit = self.plot.pointer();
+        let click = self.plot.pointer();
         let hover_sender = sender.clone();
+        let hover_event = event.clone();
+        let exit_event = event.clone();
         fields.push(KeyedView::new(
             "plot",
             Border::new()
@@ -320,23 +413,23 @@ impl Panel {
                 .automation_name("CPU flame graph chart")
                 .on_pointer_moved(move |pointer: PointerEventInfo| {
                     if let Some(target) = hover(pointer.x, pointer.y, true) {
-                        hover_sender.send(message(Action::Hover(target)));
+                        hover_sender.send(hover_event(GraphAction::Hover(target)));
                     }
                 })
                 .on_pointer_exited(move |_| {
                     if let Some(target) = exit(-1.0, -1.0, true) {
-                        sender.send(message(Action::Hover(target)));
+                        sender.send(exit_event(GraphAction::Hover(target)));
                     }
                 })
                 .on_pointer_pressed(ctx.callback(move |pointer: PointerEventInfo| {
                     if pointer.is_left_button_pressed
                         && let Some(Some(frame)) = click(pointer.x, pointer.y, false)
                     {
-                        return message(Action::Zoom(frame));
+                        return event(GraphAction::Zoom(frame));
                     }
                     Message::ControlIdle
                 }))
-                .content(loaded.plot.canvas(range, &self.search)),
+                .content(self.plot.canvas(range, &self.search)),
         ));
         if self.zoom != 0 {
             fields.push(text("zoom", format!("Zoomed to {}", root.name)));
@@ -356,7 +449,7 @@ impl Panel {
                 format!("Caller {}", profile.frame(focus.parent).name),
             ));
         }
-        if let Some(capture) = &loaded.capture {
+        if let Some(capture) = &self.capture {
             if let Some(raw) = &capture.perf_data {
                 fields.push(text(
                     "raw-recording",
@@ -388,6 +481,41 @@ impl Panel {
                     ]),
                 ));
             }
+        }
+    }
+
+    fn apply(&mut self, action: GraphAction) {
+        match action {
+            GraphAction::Query(query) if query != self.query => {
+                self.search = Arc::new(self.profile.search(&query));
+                self.query = query;
+                self.current_match = None;
+            }
+            GraphAction::Match(next) => {
+                let count = self.search.matches.len();
+                if count == 0 {
+                    return;
+                }
+                let index = match (next, self.current_match) {
+                    (true, None) => 0,
+                    (false, None) => count - 1,
+                    (true, Some(index)) => (index + 1) % count,
+                    (false, Some(index)) => (index + count - 1) % count,
+                };
+                self.current_match = Some(index);
+                self.zoom(self.search.matches[index]);
+            }
+            GraphAction::Zoom(id) if self.profile.has_frame(id) => self.zoom(id),
+            GraphAction::Up => self.zoom(self.profile.frame(self.zoom).parent),
+            GraphAction::Depth(depth) => {
+                let root = self.profile.frame(self.zoom);
+                self.first_depth = depth.min(root.last_depth - root.depth);
+                self.hovered = None;
+            }
+            GraphAction::Hover(id) => {
+                self.hovered = id.filter(|&id| self.profile.has_frame(id));
+            }
+            _ => (),
         }
     }
 }
@@ -483,9 +611,18 @@ impl TerminalApp {
             }
             Action::Close => {
                 panel.open = false;
-                panel.hovered = None;
+                panel.inspection = None;
+                if let Some(loaded) = &mut panel.loaded {
+                    loaded.hovered = None;
+                }
                 self.close_empty_diagnostics_window(ctx);
             }
+            Action::ReturnToComparison if panel.pending.is_none() && panel.capture.is_none() => {
+                if panel.inspection.take().is_some() {
+                    panel.status = None;
+                }
+            }
+            Action::ReturnToComparison => (),
             Action::Stop(ticket) => {
                 if panel
                     .pending
@@ -500,25 +637,36 @@ impl TerminalApp {
                     panel.status = Some("Stop requested. Saving collected CPU samples…".into());
                 }
             }
-            Action::OpenFile(_) | Action::CompareFile | Action::Export => {
+            Action::OpenFile(_) | Action::CompareFile | Action::Export(_) => {
+                let export = matches!(action, Action::Export(_));
+                let inspecting = export && panel.inspection.is_some();
                 let recent = match &action {
                     Action::OpenFile(path) => path.clone(),
                     _ => None,
                 };
-                if panel.pending.is_some() || (panel.comparison.is_some() && recent.is_none()) {
+                if panel.pending.is_some()
+                    || (panel.comparison.is_some() && recent.is_none() && !inspecting)
+                {
                     return;
                 }
                 let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
                     return;
                 };
-                let path = panel
-                    .loaded
-                    .as_ref()
-                    .map_or_else(|| self.store.path().into(), |loaded| loaded.path.clone());
-                let export = matches!(action, Action::Export);
+                let loaded = if export {
+                    panel.visible_graph()
+                } else {
+                    panel.loaded.as_ref()
+                };
+                if let Action::Export(source) = &action
+                    && !loaded.is_some_and(|loaded| Arc::ptr_eq(source, &loaded.ticket))
+                {
+                    return;
+                }
+                let path =
+                    loaded.map_or_else(|| self.store.path().into(), |loaded| loaded.path.clone());
                 let compare_path = matches!(action, Action::CompareFile).then(|| path.clone());
-                let profile = panel.loaded.as_ref().map(|loaded| loaded.profile.clone());
-                let zoom = panel.zoom;
+                let profile = loaded.map(|loaded| loaded.profile.clone());
+                let zoom = loaded.map_or(0, |loaded| loaded.zoom);
                 let ticket = panel.begin(if recent.is_some() {
                     "Opening folded stacks…"
                 } else if export {
@@ -577,11 +725,9 @@ impl TerminalApp {
                 );
             }
             Action::Compare(action) => {
-                let Some(view) = panel
-                    .comparison
-                    .as_mut()
-                    .filter(|_| panel.pending.is_none())
-                else {
+                let Some(view) = panel.comparison.as_mut().filter(|_| {
+                    panel.pending.is_none() && panel.inspection.is_none() && panel.capture.is_none()
+                }) else {
                     return;
                 };
                 match action {
@@ -592,6 +738,17 @@ impl TerminalApp {
                     compare::Action::Query(query) => view.query = query,
                     compare::Action::Page(forward) => view.page(forward),
                     compare::Action::Select(comparison, id) => view.select(&comparison, id),
+                    compare::Action::Inspect(side) => {
+                        if panel.open
+                            && let Some((profile, path, frame)) = view.selected_source(side)
+                        {
+                            panel.status = None;
+                            panel.inspection = Some(Inspection {
+                                side,
+                                source: Loaded::new(profile, path, None, frame),
+                            });
+                        }
+                    }
                     compare::Action::OpenRouter => {
                         if panel.open
                             && let Some(evidence) = view.openrouter_preview()
@@ -673,6 +830,10 @@ impl TerminalApp {
                         };
                         let path = view.after_path().to_owned();
                         panel.comparison = Some(*view);
+                        panel.inspection = None;
+                        if let Some(loaded) = &mut panel.loaded {
+                            loaded.hovered = None;
+                        }
                         if let Some(before) = before {
                             self.remember_diagnostic(ArtifactKind::CpuProfile, [before], ctx);
                         }
@@ -704,56 +865,10 @@ impl TerminalApp {
                     Err(error) => panel.status = Some(error),
                 }
             }
-            Action::Query(query) => {
-                if let Some(loaded) = &panel.loaded
-                    && query != panel.query
-                {
-                    panel.search = Arc::new(loaded.profile.search(&query));
-                    panel.query = query;
-                    panel.current_match = None;
+            Action::Graph(ticket, action) => {
+                if let Some(graph) = panel.graph_input(&ticket) {
+                    graph.apply(action);
                 }
-            }
-            Action::Match(next) => {
-                let count = panel.search.matches.len();
-                if count > 0 {
-                    let index = match (next, panel.current_match) {
-                        (true, None) => 0,
-                        (false, None) => count - 1,
-                        (true, Some(index)) => (index + 1) % count,
-                        (false, Some(index)) => (index + count - 1) % count,
-                    };
-                    panel.current_match = Some(index);
-                    panel.zoom(panel.search.matches[index]);
-                }
-            }
-            Action::Zoom(id) => {
-                if panel
-                    .loaded
-                    .as_ref()
-                    .is_some_and(|loaded| loaded.profile.has_frame(id))
-                {
-                    panel.zoom(id);
-                }
-            }
-            Action::Up => {
-                if let Some(loaded) = &panel.loaded {
-                    panel.zoom(loaded.profile.frame(panel.zoom).parent);
-                }
-            }
-            Action::Depth(depth) => {
-                if let Some(loaded) = &panel.loaded {
-                    let root = loaded.profile.frame(panel.zoom);
-                    panel.first_depth = depth.min(root.last_depth - root.depth);
-                    panel.hovered = None;
-                }
-            }
-            Action::Hover(id) => {
-                panel.hovered = id.filter(|&id| {
-                    panel
-                        .loaded
-                        .as_ref()
-                        .is_some_and(|loaded| loaded.profile.has_frame(id))
-                });
             }
             Action::Capture(action) => self.cpu_capture_action(action, ctx),
         }
