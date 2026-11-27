@@ -217,6 +217,7 @@ impl Installer {
             KeyedView::new(
                 "manifest",
                 TextBlock::new()
+                    .automation_id("ssh-tool-install-manifest")
                     .text(self.manifest.as_deref().map_or_else(
                         || "Choose a bundle manifest".into(),
                         |path| path.display().to_string(),

@@ -150,7 +150,14 @@ try {
     $manifestPath = Join-Path $State 'Tool review.json'
     $null = Wait-Until 'enter the full update manifest path' { [FixtureDialog]::SetFilename($manifestDialog, $manifestPath, '') }
     $null = Wait-Until 'select the update manifest' { [FixtureDialog]::ClickButton($manifestDialog, 1) }
-    $null = Wait-Until 'chosen update manifest shown' { Find-Element $manifestPath }
+    $null = Wait-Until 'close the update manifest picker' { !(Find-OwnedDialog 'Choose SSH tool bundle') }
+    $manifestId = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'ssh-tool-install-manifest')
+    $null = Wait-Until 'chosen update manifest shown' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $selected = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $manifestId)
+        if ($selected) { [FixtureDialog]::SameFile($manifestPath, $selected.Current.Name) }
+    }
     Click 'Review bundle'
     $null = Wait-Until 'existing launcher blocks installation' {
         $install = Find-Element 'Install reviewed bundle' $button
