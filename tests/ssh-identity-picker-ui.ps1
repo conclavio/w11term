@@ -59,6 +59,15 @@ function File-Sha256([string]$Path) {
         $hash.Dispose()
     }
 }
+function Pick-LinuxExecutable([string]$Action, [string]$Name) {
+    Click $Action
+    $dialog = Wait-OwnedDialog 'Choose a Linux executable'
+    $path = Join-Path $State $Name
+    $null = Wait-Until "enter the absolute path for '$Name'" {
+        [FixtureDialog]::SetFilename($dialog, $path, '')
+    }
+    $null = Wait-Until "accept '$Name' in the native picker" { [FixtureDialog]::ClickButton($dialog, 1) }
+}
 function Wait-DotfileControl([string]$Name, [System.Windows.Automation.ControlType]$Type) {
     $search = @{ scroll = $null }
     Wait-Until "visible dotfile control '$Name'" {
@@ -382,10 +391,7 @@ try {
     Set-Field 'Linux command name' 'operator'
     $dot = ' ' + [char]0xb7 + ' '
     foreach ($build in @(@('operator-x64', 'x86-64'), @('operator-arm','ARM64'))) {
-        Click 'Add Linux executable'
-        $picker = Wait-Until 'owned Linux executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
-        Select-DialogItem $picker $build[0]
-        $null = Wait-Until 'accept Linux executable file' { [FixtureDialog]::ClickButton($picker, 1) }
+        Pick-LinuxExecutable 'Add Linux executable' $build[0]
         $null = Wait-Until "detected $($build[1]) executable" { Find-Element "operator${dot}$($build[1])" }
     }
     Click 'Save new tool bundle'
@@ -421,10 +427,7 @@ try {
     $null = Wait-Until 'both previous builds loaded' {
         (Find-Element "operator${dot}x86-64") -and (Find-Element "operator${dot}ARM64")
     }
-    Click 'Replace operator x86-64'
-    $picker = Wait-Until 'owned replacement executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
-    Select-DialogItem $picker 'operator-x64-next'
-    $null = Wait-Until 'accept replacement executable' { [FixtureDialog]::ClickButton($picker, 1) }
+    Pick-LinuxExecutable 'Replace operator x86-64' 'operator-x64-next'
     Click 'Save bundle revision'
     $picker = Wait-Until 'owned save revision dialog' { Find-OwnedDialog 'Save new SSH tool bundle' }
     $null = Wait-Until 'save the separate bundle revision' { [FixtureDialog]::ClickButton($picker, 1) }
