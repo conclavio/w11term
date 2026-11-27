@@ -1307,6 +1307,8 @@ Direct pipe clients use `{"op":"switch-dotfiles","shell":"bash","target":{"kind"
 
 ### Sync dotfiles on SSH connect
 
+In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and enter a shared environment fragment, a Bash startup fragment, or a Zsh startup fragment. You can fill in more than one. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.
+
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
 
 The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.

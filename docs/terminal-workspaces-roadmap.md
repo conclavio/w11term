@@ -331,6 +331,8 @@ Ship selection explanation and Bash drafting with a shared request preview, then
 
 Use a single SSH profile to bring your shell setup and tools to a Linux account. Under **Settings → Edit profile**, configure **SSH dotfiles** for prompt and shell startup fragments and **SSH tools** for your pinned executables. Review and approve each bundle for the remote account. On an ordinary SSH connect or reconnect, w11term syncs the approved dotfiles first and then syncs the tools over SFTP before starting the shell. Each step reports its own outcome. A skipped sync still lets the shell open. [SSH dotfile sync](../CONTROL.md#sync-dotfiles-on-ssh-connect) · [SSH tool sync](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
+The SSH dotfiles editor can create a bundle locally or revise an existing bundle in a new file. It edits the shared environment and the Bash and Zsh fragments directly. Choosing the new file leaves the profile's saved approval in place until the new selection is approved and saved.
+
 From that pane, **More → Command reference** shows the tool sync result and the managed launcher path beside its manual. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
 
 **Acceptance.** Use a profile with both bundles enabled on a clean Linux account. At the first prompt, verify that the managed prompt is active and that `command -v` resolves a bundled utility to the expected launcher under `~/.local/bin`. Reconnect and verify both sync results and the same prompt and launcher.

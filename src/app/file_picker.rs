@@ -24,6 +24,10 @@ pub(super) enum Purpose {
     CompareLocalFolder,
     SshConfig(PathBuf),
     DotfilesBundle(PathBuf),
+    SaveDotfilesBundle {
+        current: PathBuf,
+        suggestion: String,
+    },
     ToolBundle(PathBuf),
     ToolExecutable(PathBuf),
     SaveToolBundle {
@@ -593,11 +597,19 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::SaveToolBundle {
-                current,
-                suggestion,
+            Purpose::SaveDotfilesBundle {
+                ref current,
+                ref suggestion,
+            }
+            | Purpose::SaveToolBundle {
+                ref current,
+                ref suggestion,
             } => {
-                dialog.SetTitle(w!("Save new SSH tool bundle"))?;
+                dialog.SetTitle(if matches!(&purpose, Purpose::SaveDotfilesBundle { .. }) {
+                    w!("Save new dotfiles bundle")
+                } else {
+                    w!("Save new SSH tool bundle")
+                })?;
                 let wide: Vec<_> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
                 dialog.SetDefaultExtension(w!("json"))?;

@@ -102,7 +102,7 @@ impl DotfileShell {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DotfileBundle {
     pub version: u8,
@@ -133,13 +133,33 @@ impl DotfileBundle {
     }
 
     pub fn validate(&self, shell: DotfileShell) -> Result<()> {
-        ensure!(self.version == 1, "Unsupported dotfiles bundle version");
-        let prompt = self.prompt(shell);
+        self.validate_fragments()?;
         ensure!(
-            self.environment.is_some() || prompt.is_some(),
+            self.environment.is_some() || self.prompt(shell).is_some(),
             "The bundle needs an environment or {} fragment",
             shell.name()
         );
+        Ok(())
+    }
+
+    pub fn validate_for_editing(&self) -> Result<()> {
+        self.validate_fragments()?;
+        ensure!(
+            self.environment.is_some() || self.bash.is_some() || self.zsh.is_some(),
+            "Enter at least one dotfile fragment"
+        );
+        Ok(())
+    }
+
+    pub fn save_new(&self, path: &Path) -> Result<()> {
+        self.validate_for_editing()?;
+        let mut contents = serde_json::to_string_pretty(self)?;
+        contents.push('\n');
+        crate::transcript::save(path, &contents, false)
+    }
+
+    fn validate_fragments(&self) -> Result<()> {
+        ensure!(self.version == 1, "Unsupported dotfiles bundle version");
         for fragment in [&self.environment, &self.bash, &self.zsh]
             .into_iter()
             .flatten()
@@ -811,4 +831,37 @@ fn remote_parent(path: &str) -> Result<&str> {
     path.rsplit_once('/')
         .map(|(parent, _)| parent)
         .context("Expected an absolute remote dotfile path")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_new_shell_bundles_without_replacing_the_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dotfiles.json");
+        let mut bundle = DotfileBundle {
+            version: 1,
+            environment: None,
+            bash: None,
+            zsh: Some("PROMPT='ops> '\nexport EDITOR=vi\n".into()),
+        };
+        bundle.save_new(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let loaded = DotfileBundle::load(&path).unwrap();
+        assert_eq!(loaded.zsh, bundle.zsh);
+        loaded.validate(DotfileShell::Zsh).unwrap();
+        assert!(loaded.validate(DotfileShell::Bash).is_err());
+
+        bundle.zsh = Some("PROMPT='changed> '\n".into());
+        assert!(bundle.save_new(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        let invalid = directory.path().join("invalid.json");
+        bundle.zsh = Some("x".repeat(MAX_FRAGMENT_BYTES + 1));
+        assert!(bundle.save_new(&invalid).is_err());
+        assert!(!invalid.exists());
+    }
 }
