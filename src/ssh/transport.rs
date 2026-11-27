@@ -1537,6 +1537,30 @@ impl Driver {
         }
     }
 }
+async fn wait_login_sync<T>(
+    task: impl Future<Output = T>,
+    input: &mut mpsc::UnboundedReceiver<TransportInput>,
+    size: &mut TerminalSize,
+    options: &mut SshOptions,
+) -> Option<T> {
+    tokio::pin!(task);
+    loop {
+        tokio::select! {
+            biased;
+            message = input.recv() => offline(message?, size, options),
+            result = &mut task => return Some(result),
+        }
+    }
+}
+
+fn login_sync_detail(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(480)
+        .collect()
+}
+
 async fn run_channel(
     mut shell: OpenShell,
     driver: &mut Driver,
@@ -1598,12 +1622,9 @@ async fn run_channel(
             .channel
             .close_game_session_on_drop(shell.link.as_ref().clone());
     }
-    let mut dotfiles_notice = None;
-    if !managed
-        && sharing.startup.is_none()
-        && !options.player.rustmush
-        && let Some(settings) = options.dotfiles.clone()
-    {
+    let mut login_notices = Vec::new();
+    let sync_allowed = !managed && sharing.startup.is_none() && !options.player.rustmush;
+    if sync_allowed && let Some(settings) = options.dotfiles.clone() {
         output
             .send(Event::Status("Checking SSH dotfiles".into()))
             .await?;
@@ -1615,16 +1636,8 @@ async fn run_channel(
             let _guard = shell.link.lock_dotfiles_sync().await;
             crate::sftp::sync_login_dotfiles(&shell.link.handle(), &settings).await
         });
-        tokio::pin!(sync);
-        let result = loop {
-            tokio::select! {
-                biased;
-                message = input.recv() => match message {
-                    Some(message) => offline(message, size, options),
-                    None => return Ok(()),
-                },
-                result = &mut sync => break result,
-            }
+        let Some(result) = wait_login_sync(sync, input, size, options).await else {
+            return Ok(());
         };
         match result {
             Ok(Ok(status)) => {
@@ -1633,17 +1646,13 @@ async fn run_channel(
                     serde_json::json!({"generation": generation, "status": status}),
                 );
                 if status == "held" {
-                    dotfiles_notice = Some("Dotfiles sync paused by manual selection".into());
+                    login_notices.push("Dotfiles sync paused by manual selection".into());
                 }
             }
             Ok(Err(error)) => {
-                let detail: String = format!("{error:#}")
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(480)
-                    .collect();
+                let detail = login_sync_detail(&error);
                 events.push("dotfiles-sync", serde_json::json!({"generation": generation, "status": "skipped", "detail": detail}));
-                dotfiles_notice = Some(format!("Dotfiles sync skipped: {detail}"));
+                login_notices.push(format!("Dotfiles sync skipped: {detail}"));
             }
             Err(_) => {
                 let detail = "Dotfiles sync reached its 10-second deadline. Preview to check the active bundle.";
@@ -1651,9 +1660,55 @@ async fn run_channel(
                     "dotfiles-sync",
                     serde_json::json!({"generation": generation, "status": "unconfirmed", "detail": detail}),
                 );
-                dotfiles_notice = Some(detail.into());
+                login_notices.push(detail.into());
             }
         }
+    }
+    if sync_allowed && let Some(settings) = options.tool_bundle.clone() {
+        output
+            .send(Event::Status("Checking SSH tool bundle".into()))
+            .await?;
+        let sync = tokio::time::timeout(Duration::from_secs(20), async {
+            ensure!(
+                settings.approves(shell.link.verified_endpoint()),
+                "The profile's tool bundle approval does not match the verified SSH account"
+            );
+            // Serialize startup-file edits with dotfiles sync on this connection.
+            let _guard = shell.link.lock_dotfiles_sync().await;
+            crate::sftp::sync_login_tools(&shell.link.handle(), &settings).await
+        });
+        let Some(result) = wait_login_sync(sync, input, size, options).await else {
+            return Ok(());
+        };
+        let mut data = serde_json::json!({"generation": generation});
+        match result {
+            Ok(Ok(result)) => {
+                data["status"] = result.status.into();
+                if let Some(path) = result.path {
+                    data["path"] = path.into();
+                }
+                if let Some(error) = result.path_error {
+                    let detail = login_sync_detail(&error);
+                    login_notices.push(format!("Tool PATH skipped: {detail}"));
+                    data["detail"] = detail.into();
+                } else if result.status == "held" {
+                    login_notices.push("Tool bundle sync paused by rollback".into());
+                }
+            }
+            Ok(Err(error)) => {
+                let detail = login_sync_detail(&error);
+                login_notices.push(format!("Tool bundle sync skipped: {detail}"));
+                data["status"] = "skipped".into();
+                data["detail"] = detail.into();
+            }
+            Err(_) => {
+                let detail = "Tool bundle sync reached its 20-second deadline. Preview to check the active bundle.";
+                login_notices.push(detail.into());
+                data["status"] = "unconfirmed".into();
+                data["detail"] = detail.into();
+            }
+        }
+        events.push("tool-bundle-sync", data);
     }
     let channel = shell.channel.channel();
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
@@ -1859,7 +1914,7 @@ async fn run_channel(
                         events.push("connected", serde_json::json!({"generation":generation}));
                         output.send(Event::Connected(generation)).await?;
                         let mut status = format!("{}@{}:{}", options.user, options.host, options.port);
-                        if let Some(notice) = dotfiles_notice.take() {
+                        for notice in login_notices.drain(..) {
                             status.push_str(" · ");
                             status.push_str(&notice);
                         }

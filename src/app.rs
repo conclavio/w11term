@@ -73,6 +73,7 @@ mod pattern_settings;
 mod profile_dotfiles;
 mod profile_forwards;
 mod profile_jumps;
+mod profile_tools;
 mod saved_commands;
 mod shell_setup;
 mod word_delimiters;
@@ -529,6 +530,7 @@ struct ProfileDraft {
     jump_editor: profile_jumps::Editor,
     local_forwards: Vec<w11term::options::LocalForwardPreset>,
     dotfiles: Box<profile_dotfiles::Editor>,
+    tool_bundle: Box<profile_tools::Editor>,
     forward_editor: profile_forwards::Editor,
     durable: bool,
     saved: bool,
@@ -572,6 +574,7 @@ impl Default for ProfileDraft {
             jump_editor: Default::default(),
             local_forwards: Vec::new(),
             dotfiles: Default::default(),
+            tool_bundle: Default::default(),
             forward_editor: Default::default(),
             durable: false,
             saved: false,
@@ -645,6 +648,7 @@ impl ProfileDraft {
             proxy_jump: self.proxy_jump.clone(),
             local_forwards: self.local_forwards.clone(),
             dotfiles: self.dotfiles.approval(),
+            tool_bundle: self.tool_bundle.approval(),
             group_prompt: (!self.group_prompt.trim().is_empty())
                 .then(|| self.group_prompt.clone().try_into())
                 .transpose()?,
@@ -673,6 +677,7 @@ impl ProfileDraft {
             proxy_jump: options.proxy_jump.clone(),
             local_forwards: options.local_forwards.clone(),
             dotfiles: Box::new(profile_dotfiles::Editor::new(options.dotfiles.clone())),
+            tool_bundle: Box::new(profile_tools::Editor::new(options.tool_bundle.clone())),
             name,
             durable: options.durable,
             host: options.host.clone(),
@@ -1518,6 +1523,7 @@ pub enum Message {
     QuickConnect(quick_connect::Action),
     SshIdentity(identity_picker::Action),
     ProfileDotfiles(TabId, profile_dotfiles::Action),
+    ProfileTools(TabId, profile_tools::Action),
     MoveProfile(String, isize, Arc<[String]>),
     SetProfilePin(String, bool),
     FilterProfiles(String),
@@ -5371,6 +5377,12 @@ impl TerminalApp {
             self.store.path().parent().unwrap_or(Path::new(".")),
             context,
         ));
+        fields.push(draft.tool_bundle.view(
+            id,
+            draft,
+            self.store.path().parent().unwrap_or(Path::new(".")),
+            context,
+        ));
         fields.push(draft.jump_editor.view(
             id,
             &draft.proxy_jump,
@@ -7707,6 +7719,7 @@ impl Component for TerminalApp {
             Message::QuickConnect(action) => self.edit_quick_connect(action, context),
             Message::SshIdentity(action) => self.ssh_identity_action(action, context),
             Message::ProfileDotfiles(id, action) => self.edit_profile_dotfiles(id, action, context),
+            Message::ProfileTools(id, action) => self.edit_profile_tools(id, action, context),
             Message::EditProfile(name) => self.edit_profile(name, context),
             Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
             Message::DeleteProfile(id) => {
@@ -9725,6 +9738,7 @@ mod profile_ui_tests {
                 host_key: Some("SHA256:test".into()),
                 host_key_alias: Some("cockpit.example".into()),
                 dotfiles: None,
+                tool_bundle: None,
                 group_prompt: Some("rack-[12]>>".to_owned().try_into().unwrap()),
                 proxy_jump: Vec::new(),
                 local_forwards: Vec::new(),

@@ -23,6 +23,7 @@ pub(super) enum Purpose {
     CompareLocalFolder,
     SshConfig(PathBuf),
     DotfilesBundle(PathBuf),
+    ToolBundle(PathBuf),
     OpenSshHostList,
     OpenSshGroupDefinition,
     SshIdentity {
@@ -206,6 +207,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
+                | Purpose::ToolBundle(_)
                 | Purpose::OpenSshHostList
                 | Purpose::OpenSshGroupDefinition
                 | Purpose::SshIdentity { .. }
@@ -278,8 +280,12 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::DotfilesBundle(current) => {
-                dialog.SetTitle(w!("Choose dotfiles bundle"))?;
+            Purpose::DotfilesBundle(ref current) | Purpose::ToolBundle(ref current) => {
+                dialog.SetTitle(if matches!(&purpose, Purpose::ToolBundle(_)) {
+                    w!("Choose SSH tool bundle")
+                } else {
+                    w!("Choose dotfiles bundle")
+                })?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);

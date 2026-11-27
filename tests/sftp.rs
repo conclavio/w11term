@@ -27,6 +27,7 @@ struct Peer {
     withheld_session_open: Option<server::ChannelOpenHandle>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
+    posix_entries: text_save::PosixEntries,
     reject: bool,
 }
 
@@ -338,6 +339,22 @@ impl server::Handler for Peer {
                 .into_bytes(),
             )?;
         }
+        if self.root.join("utility-shell-probe").is_file() {
+            let store = self.root.join(".local/share/w11term/tools/portable");
+            let selector = fs::read_to_string(store.join("current")).unwrap_or_default();
+            let target = selector.lines().nth(1).unwrap_or_default();
+            let id = target.rsplit('/').next().filter(|id| id.len() == 64);
+            let id = id
+                .filter(|id| {
+                    store.join("versions").join(id).join("rg").is_file()
+                        && self.root.join(".local/bin/rg").is_file()
+                })
+                .unwrap_or("absent");
+            let path = fs::read_to_string(self.root.join(".bashrc"))
+                .unwrap_or_default()
+                .contains("w11term tool PATH");
+            s.data(c, format!("tools-at-shell:{id}:{path}\r\n").into_bytes())?;
+        }
         s.data(c, b"ready\r\n".as_slice())?;
         #[cfg(feature = "ui-smoke")]
         if self.root.join("copy-history.vt").is_file() {
@@ -503,6 +520,7 @@ impl server::Handler for Peer {
             ssh: s.handle(),
             handles: HashMap::new(),
             posix: None,
+            posix_entries: self.posix_entries.clone(),
             next: 0,
         };
         tokio::spawn(async move {
@@ -520,6 +538,7 @@ struct Files {
     ssh: server::Handle,
     handles: HashMap<String, Opened>,
     posix: Option<text_save::PosixMetadata>,
+    posix_entries: text_save::PosixEntries,
     next: u64,
 }
 fn status(id: u32) -> Status {
@@ -643,7 +662,7 @@ impl russh_sftp::server::Handler for Files {
             version
                 .extensions
                 .insert("posix-rename@openssh.com".into(), value);
-            self.posix = Some(Default::default());
+            self.posix = Some(text_save::PosixMetadata::new(self.posix_entries.clone()));
         }
         if self.root.join("small-reads").exists() {
             version
@@ -654,7 +673,8 @@ impl russh_sftp::server::Handler for Files {
             version.extensions.insert("copy-data".into(), "1".into());
         }
         if let Ok(request) = fs::read_to_string(self.root.join("fixture-permissions")) {
-            self.posix.get_or_insert_with(Default::default);
+            self.posix
+                .get_or_insert_with(|| text_save::PosixMetadata::new(self.posix_entries.clone()));
             if request == "lsetstat" {
                 version
                     .extensions
@@ -1217,6 +1237,7 @@ async fn fixture_with_wire(
     let opens_for_server = opens.clone();
     let server = tokio::spawn(async move {
         let mut peers = tokio::task::JoinSet::new();
+        let posix_entries = text_save::PosixEntries::default();
         for _ in 0..connections {
             let (stream, _) = listener.accept().await.unwrap();
             accepted.fetch_add(1, Ordering::Relaxed);
@@ -1228,6 +1249,7 @@ async fn fixture_with_wire(
                 withheld_session_open: None,
                 root: root_path.clone(),
                 opens: opens_for_server.clone(),
+                posix_entries: posix_entries.clone(),
                 reject,
             };
             let config = config.clone();
@@ -1261,6 +1283,7 @@ async fn fixture_with_wire(
         local_forwards: Vec::new(),
         durable: false,
         dotfiles: None,
+        tool_bundle: None,
         group_prompt: None,
         player: Default::default(),
     });

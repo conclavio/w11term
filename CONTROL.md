@@ -1381,6 +1381,30 @@ $restore = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-rollback my
 
 Rollback uses the retained remote files. The client checks their hashes and executable permissions before activating them. Launchers for commands omitted from the active version remain dormant so older versions can restore them. Installation and rollback require the host's `flock` command and SFTP symlinks. Switching an active version requires OpenSSH's atomic rename extension. Run a fresh preview after changing the manifest, moving to another pane or connection, or retrying an interrupted operation.
 
+### Sync a tool bundle on SSH connect
+
+Open **Settings → Edit profile → SSH tools**. Browse for the bundle manifest and enter the remote SFTP home and verified SHA256 host-key fingerprint. A pinned profile fingerprint also works. Select **Manage Bash PATH** or **Manage Zsh PATH** to append the launcher directory after the shell's existing PATH entries. Then select **Review tool bundle**, confirm the account and launcher directory, choose **Approve tool sync**, and save.
+
+Profiles can store the same approval under `tool_bundle`. Paths to local manifests resolve beside the profile catalog. The approved `name` and `bin_directory` come from the manifest and bind later updates to that destination. Use `add_to_path.shell` with `bash` or `zsh`, and optionally `add_to_path.zdotdir` for a Zsh startup directory relative to home.
+
+```json
+{
+  "bundle": "Fleet tools.json",
+  "name": "my-tools",
+  "bin_directory": ".local/bin",
+  "host": "dev.example.net",
+  "user": "operator",
+  "port": 22,
+  "fingerprint": "SHA256:REPLACE_WITH_VERIFIED_HOST_FINGERPRINT",
+  "home": "/home/operator",
+  "add_to_path": { "shell": "bash" }
+}
+```
+
+On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. PATH management appends a marked block to the shell's login and interactive startup files and reports edits to that block for review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
+
+A manual rollback pauses automatic bundle updates. Preview and apply the desired bundle manually to resume syncing. **Disable tool sync** stops automatic updates from that profile.
+
 ### Run SFTP operations
 
 ```powershell

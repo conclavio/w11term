@@ -317,9 +317,11 @@ fi
 
 fn hook_change(path: String, original: Option<String>, hook: String) -> Edit {
     let text = original.as_deref().unwrap_or_default();
+    let begin = hook.lines().next().expect("generated opening marker");
+    let end = hook.lines().last().expect("generated closing marker");
     let markers: Vec<_> = text
         .lines()
-        .filter(|line| matches!(line.trim(), BEGIN | END))
+        .filter(|line| [begin, end].contains(&line.trim()))
         .take(3)
         .collect();
     let (action, after) = if markers.is_empty() {
@@ -338,7 +340,7 @@ fn hook_change(path: String, original: Option<String>, hook: String) -> Edit {
                 }
             }
         }
-    } else if markers == [BEGIN, END]
+    } else if markers == [begin, end]
         && text
             .match_indices(&hook)
             .any(|(start, _)| start == 0 || text.as_bytes()[start - 1] == b'\n')
@@ -662,6 +664,20 @@ impl Engine {
         shell: DotfileShell,
         zdotdir: Option<&str>,
     ) -> Result<[Edit; 2]> {
+        let [(login, login_original), (rc, rc_original)] =
+            self.startup_files(home, shell, zdotdir).await?;
+        Ok([
+            hook_change(login, login_original, hook_text(shell, Hook::Login)),
+            hook_change(rc, rc_original, hook_text(shell, Hook::Interactive)),
+        ])
+    }
+
+    async fn startup_files(
+        &self,
+        home: &str,
+        shell: DotfileShell,
+        zdotdir: Option<&str>,
+    ) -> Result<[(String, Option<String>); 2]> {
         let home_prefix = home.trim_end_matches('/');
         let startup_dir = if let Some(relative) = zdotdir {
             let mut path = home_prefix.to_owned();
@@ -698,10 +714,53 @@ impl Engine {
         };
         let rc = startup(&format!(".{}rc", shell.name()));
         let rc_original = self.dotfile_text(&rc).await?;
-        Ok([
-            hook_change(login, login_original, hook_text(shell, Hook::Login)),
-            hook_change(rc, rc_original, hook_text(shell, Hook::Interactive)),
-        ])
+        Ok([(login, login_original), (rc, rc_original)])
+    }
+
+    pub(super) async fn sync_tool_path(
+        &self,
+        home: &str,
+        bin: &str,
+        settings: &crate::options::ToolPath,
+    ) -> Result<bool> {
+        let zdotdir = settings.zdotdir.as_deref();
+        validate_zdotdir(settings.shell, zdotdir)?;
+        // The caller validates the relative bin path against the manifest grammar.
+        let id = digest_hex(Sha256::new_with_prefix(bin.as_bytes()));
+        let hook = format!(
+            "# >>> w11term tool PATH {id} >>>\n\
+             case \":${{PATH-}}:\" in\n\
+             *\":$HOME/{bin}:\"*) ;;\n\
+             *) PATH=\"${{PATH:+$PATH:}}$HOME/{bin}\"; export PATH ;;\n\
+             esac\n\
+             # <<< w11term tool PATH {id} <<<\n"
+        );
+        let edits = self
+            .startup_files(home, settings.shell, zdotdir)
+            .await?
+            .map(|(path, original)| hook_change(path, original, hook.clone()));
+        let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
+        for edit in &edits {
+            ensure!(
+                edit.after.is_some(),
+                "Resolve the managed PATH conflict at {}",
+                edit.path
+            );
+            ensure!(
+                !edit.changed() || edit.before.is_none() || atomic,
+                "The server cannot atomically replace {}",
+                edit.path
+            );
+        }
+        let mut stage = JobStage::Checking("Updating managed tool PATH");
+        let mut changed = false;
+        for edit in &edits {
+            if edit.changed() {
+                self.write_dotfile(edit, &mut stage).await?;
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
 
     async fn dotfile_selector(

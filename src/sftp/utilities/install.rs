@@ -65,6 +65,7 @@ impl Release {
 pub(super) struct Selector {
     pub conflict: bool,
     pub version: Option<String>,
+    pub manual: bool,
 }
 
 pub(super) struct InstallPlan {
@@ -103,7 +104,7 @@ impl Engine {
         if managed.blocked_at.is_some() {
             return Ok(Selector {
                 conflict: true,
-                version: None,
+                ..Default::default()
             });
         }
         let versions = format!("{store}/versions");
@@ -116,18 +117,22 @@ impl Engine {
         };
         if EntryKind::from_permissions(attrs.permissions) == Some(EntryKind::Symlink) {
             let target = self.read_link_target(&path).await?;
+            let (target, manual) = target
+                .strip_prefix("./")
+                .map_or((target.as_str(), false), |path| (path, true));
             if let Some(id) = target.strip_prefix("versions/")
                 && normalize_sha256(id).is_ok_and(|hash| hash == id)
             {
                 return Ok(Selector {
                     conflict: false,
                     version: Some(id.to_owned()),
+                    manual,
                 });
             }
         }
         Ok(Selector {
             conflict: true,
-            version: None,
+            ..Default::default()
         })
     }
 
@@ -140,6 +145,15 @@ impl Engine {
     ) -> Result<Value> {
         let plan = self.utility_plan(session, bundle).await?;
         self.check_utility_review(&plan.report, review)?;
+        self.activate_utility_plan(session, &plan, stage).await
+    }
+
+    pub(super) async fn activate_utility_plan(
+        &self,
+        session: &Ssh,
+        plan: &InstallPlan,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
         ensure!(
             plan.report["ready"] == true,
             "Resolve the tool bundle conflicts before installing"
@@ -160,14 +174,15 @@ impl Engine {
                 self.verify_utility_release(store, &plan.release.name, plan.release.architecture, id).await?;
                 (false, Vec::new())
             } else {
-                let copied = self.stage_utility_release(&plan, id).await?;
+                let copied = self.stage_utility_release(plan, id).await?;
                 (copied.len() < plan.selected.len(), copied)
             };
-            self.create_launchers(&plan.home, store, &plan.release, &plan.bin).await?;
-            let changed = self.switch_utility_selector(store, id, &plan.selector).await?;
+            let launchers = self.create_launchers(&plan.home, store, &plan.release, &plan.bin).await?;
+            let changed = self.switch_utility_selector(store, id, false, &plan.selector).await?;
             Ok(json!({
                 "bundle": plan.release.name, "bundle_sha256": id, "previous_bundle_sha256": plan.selector.version,
-                "changed": changed, "uploaded": uploaded, "copied_tools": copied_tools, "version_directory": version_path,
+                "changed": changed, "uploaded": uploaded, "copied_tools": copied_tools,
+                "launchers_created": launchers, "version_directory": version_path,
             }))
         }).await
     }
@@ -211,7 +226,9 @@ impl Engine {
         let ready = !selector.conflict
             && bin.blocked_at.is_none()
             && launchers.iter().all(|(_, action)| *action != "conflict")
-            && (atomic || selector.version.as_ref() == Some(&id) || selector.version.is_none());
+            && (atomic
+                || (selector.manual && selector.version.as_ref() == Some(&id))
+                || selector.version.is_none());
         let ready = ready
             && self
                 .utility_bin_matches_active(&store, &selector, &release)
@@ -236,7 +253,9 @@ impl Engine {
             self.verify_utility_release(&store, &name, host.architecture, &id)
                 .await?;
             self.create_launchers(&home, &store, &release, &bin).await?;
-            let changed = self.switch_utility_selector(&store, &id, &selector).await?;
+            let changed = self
+                .switch_utility_selector(&store, &id, true, &selector)
+                .await?;
             Ok(json!({
                 "bundle": name, "bundle_sha256": id, "previous_bundle_sha256": selector.version,
                 "changed": changed, "uploaded": false,
@@ -525,7 +544,7 @@ impl Engine {
         store: &str,
         release: &Release,
         plan: &DirectoryPlan,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         self.create_utility_directories(plan).await?;
         let bin = under_home(home, &release.bin_directory);
         let now = self
@@ -536,6 +555,7 @@ impl Engine {
             "The tool bin directory changed"
         );
         self.check_entry_parent(&bin).await?;
+        let mut created = 0;
         for tool in &release.tools {
             let path = format!("{bin}/{}", tool.name);
             let target = format!("{store}/current/{}", tool.name);
@@ -547,11 +567,12 @@ impl Engine {
                         .symlink(&target, &path)
                         .await
                         .with_context(|| format!("Creating launcher {path}"))?;
+                    created += 1;
                 }
                 _ => bail!("Existing command at {path} was preserved"),
             }
         }
-        Ok(())
+        Ok(created)
     }
 
     async fn check_selector(&self, store: &str, expected: &Selector) -> Result<()> {
@@ -570,13 +591,15 @@ impl Engine {
         &self,
         store: &str,
         id: &str,
+        manual: bool,
         before: &Selector,
     ) -> Result<bool> {
         self.check_selector(store, before).await?;
-        if before.version.as_deref() == Some(id) {
+        if before.version.as_deref() == Some(id) && before.manual == manual {
             return Ok(false);
         }
-        let target = format!("versions/{id}");
+        let prefix = if manual { "./" } else { "" };
+        let target = format!("{prefix}versions/{id}");
         let path = format!("{store}/current");
         if before.version.is_none() {
             self.raw.symlink(&target, &path).await?;
@@ -611,7 +634,7 @@ fn quote_sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-async fn with_lock<T>(
+pub(super) async fn with_lock<T>(
     session: &Ssh,
     directory: &str,
     work: impl Future<Output = Result<T>>,

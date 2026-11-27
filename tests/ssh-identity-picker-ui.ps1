@@ -146,6 +146,48 @@ try {
     $null = Wait-Until 'dotfiles approval removed' {
         !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles)
     }
+
+    Set-NativeExpansion 'SSH dotfiles' $false
+    Set-NativeExpansion 'SSH tools' $true
+    $toolName = 'Fleet tools.json'
+    $toolBundle = Join-Path $State $toolName
+    [IO.File]::WriteAllText($toolBundle, ('{"version":1,"name":"portable","tools":[{"name":"rg","builds":[{"architecture":"x86_64","path":"rg","sha256":"' + ('a' * 64) + '"}]}]}'))
+    Click 'Browse for tool bundle'
+    $toolDialog = Wait-Until 'owned tool bundle picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
+    Select-DialogItem $toolDialog $toolName
+    $null = Wait-Until 'choose the tool manifest' { [FixtureDialog]::ClickButton($toolDialog, 1) }
+    $null = Wait-Until 'tool manifest in draft' {
+        $field = Find-Element 'Tool bundle manifest' $edit
+        if ($field) { [FixtureDialog]::SameFile($toolBundle, $field.GetCurrentPattern($value).Current.Value) }
+    }
+    Set-Field 'Tool bundle SFTP home' '/home/test'
+    Set-Field 'Tool bundle host-key fingerprint' $fingerprint
+    $pathMode = Wait-Until 'tool PATH selector' { Find-Element 'Tool bundle shell PATH' $combo }
+    $pathMode.SetFocus()
+    $modePopup = $pathMode.GetCurrentPattern($expand)
+    $modePopup.Expand()
+    $bash = Wait-Until 'Bash PATH selection' { Find-Element 'Manage Bash PATH' $item -Visible }
+    $bash.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    if ($modePopup.Current.ExpandCollapseState -eq 'Expanded') { $modePopup.Collapse() }
+    Click 'Review tool bundle'
+    $review = 'portable ' + [char]0x2192 + ' test@example.test:22 ' + [char]0x00b7 + ' /home/test/.local/bin'
+    $null = Wait-Until 'tool bundle and launcher directory reviewed' { Find-Element $review }
+    Click 'Approve tool sync'
+    $null = Wait-Until 'tool sync approved' { Find-Element 'Approved tool bundle: portable' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'tool approvals persisted' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        $tools.name -ceq 'portable' -and $tools.bin_directory -ceq '.local/bin' -and
+            $tools.host -ceq 'example.test' -and $tools.home -ceq '/home/test' -and
+            $tools.fingerprint -ceq $fingerprint -and $tools.add_to_path.shell -ceq 'bash' -and
+            [FixtureDialog]::SameFile($toolBundle, $tools.bundle)
+    }
+    Click 'Disable tool sync'
+    $null = Wait-Until 'tool sync disabled' { Find-Element 'Tool sync off' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'tool approvals removed' {
+        !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle)
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

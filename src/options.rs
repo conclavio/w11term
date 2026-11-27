@@ -469,6 +469,8 @@ pub struct SshOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dotfiles: Option<Box<DotfileSync>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_bundle: Option<Box<ToolSync>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_prompt: Option<GroupPromptPattern>,
     #[serde(default)]
     pub durable: bool,
@@ -501,6 +503,40 @@ impl DotfileSync {
             self.fingerprint.as_str(),
         ) == endpoint
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSync {
+    pub bundle: PathBuf,
+    pub name: String,
+    pub bin_directory: String,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub fingerprint: String,
+    pub home: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_to_path: Option<ToolPath>,
+}
+
+impl ToolSync {
+    pub(crate) fn approves(&self, endpoint: (&str, &str, u16, &str)) -> bool {
+        (
+            self.host.as_str(),
+            self.user.as_str(),
+            self.port,
+            self.fingerprint.as_str(),
+        ) == endpoint
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPath {
+    pub shell: crate::sftp::DotfileShell,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zdotdir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -546,6 +582,7 @@ impl From<JumpHost> for SshOptions {
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             dotfiles: None,
+            tool_bundle: None,
             group_prompt: None,
             durable: false,
             player: PlayerOptions::default(),
@@ -615,6 +652,12 @@ impl SshOptions {
         self.validate_route()?;
         let base = catalog.parent().unwrap_or(Path::new("."));
         if let Some(sync) = &mut self.dotfiles
+            && sync.bundle.is_relative()
+            && !sync.bundle.as_os_str().is_empty()
+        {
+            sync.bundle = base.join(&sync.bundle);
+        }
+        if let Some(sync) = &mut self.tool_bundle
             && sync.bundle.is_relative()
             && !sync.bundle.as_os_str().is_empty()
         {
@@ -2122,6 +2165,7 @@ mod tests {
             local_forwards: Vec::new(),
             durable: false,
             dotfiles: None,
+            tool_bundle: None,
             group_prompt: None,
         };
         assert!(options.validate_route().is_err());

@@ -8,6 +8,26 @@ use w11term::{
 
 const TITLE: &str = "SSH dotfiles";
 
+pub(super) fn approved_fingerprint(entered: &str, profile_pin: &str) -> anyhow::Result<String> {
+    let profile_pin = profile_pin.trim();
+    let entered = entered.trim();
+    let fingerprint = if entered.is_empty() {
+        profile_pin
+    } else {
+        entered
+    };
+    let Ok(fingerprint @ Fingerprint::Sha256(_)) = fingerprint.parse() else {
+        anyhow::bail!("Enter the verified SHA256 host-key fingerprint for this account");
+    };
+    if let Ok(pin) = profile_pin.parse::<Fingerprint>() {
+        anyhow::ensure!(
+            pin == fingerprint,
+            "The fingerprint must match the profile's host-key pin"
+        );
+    }
+    Ok(fingerprint.to_string())
+}
+
 #[derive(Clone, Copy)]
 pub enum Field {
     Bundle,
@@ -64,21 +84,7 @@ impl Editor {
 
     fn candidate(&self, draft: &ProfileDraft, base: &Path) -> anyhow::Result<DotfileSync> {
         let (host, user, port) = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
-        let key = self.fingerprint.trim();
-        let key = if key.is_empty() {
-            draft.fingerprint.trim()
-        } else {
-            key
-        };
-        let Ok(key @ Fingerprint::Sha256(_)) = key.parse() else {
-            anyhow::bail!("Enter the verified SHA256 host-key fingerprint for this account");
-        };
-        if let Ok(pin) = draft.fingerprint.trim().parse::<Fingerprint>() {
-            anyhow::ensure!(
-                pin == key,
-                "The dotfiles fingerprint must match the profile's host-key pin"
-            );
-        }
+        let fingerprint = approved_fingerprint(&self.fingerprint, &draft.fingerprint)?;
         anyhow::ensure!(!self.bundle.trim().is_empty(), "Choose a dotfiles bundle");
         let home = self.home.trim();
         validate_dotfiles_home(home)?;
@@ -97,7 +103,7 @@ impl Editor {
             host,
             user,
             port,
-            fingerprint: key.to_string(),
+            fingerprint,
             home: home.to_owned(),
         })
     }

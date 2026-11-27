@@ -209,6 +209,7 @@ fn options() -> Result<SshOptions> {
         terminal_type: Default::default(),
         durable: false,
         dotfiles: None,
+        tool_bundle: None,
         group_prompt: None,
         player: crate::options::PlayerOptions {
             reconnect: false,

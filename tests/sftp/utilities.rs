@@ -1,6 +1,10 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use w11term::sftp::{Operation, UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityTool};
+use w11term::{
+    options::{ToolPath, ToolSync},
+    sftp::DotfileShell,
+};
 
 impl Files {
     pub(super) fn utility_fixture_link(&self, path: &str) -> Option<String> {
@@ -411,5 +415,238 @@ async fn utility_install_preserves_racing_user_command_and_checks_remote_lock() 
     );
     assert_eq!(installed["changed"], true);
     assert!(store.join("current").exists());
+    server.abort();
+}
+
+fn save_login_manifest(directory: &std::path::Path, variant: u8) {
+    let mut binary = executable(UtilityArchitecture::X86_64, None);
+    binary[255] = variant;
+    let mut build = build(directory, "rg", UtilityArchitecture::X86_64, binary);
+    build.path = "rg".into();
+    let Operation::PreviewToolBundle { bundle } = preview(vec![build]) else {
+        unreachable!()
+    };
+    fs::write(
+        directory.join("fleet.json"),
+        serde_json::to_vec(&bundle).unwrap(),
+    )
+    .unwrap();
+}
+
+fn approved_login(source: Source, local: &std::path::Path) -> SshOptions {
+    let Source::Ssh(mut options) = source else {
+        unreachable!()
+    };
+    options.tool_bundle = Some(Box::new(ToolSync {
+        bundle: "fleet.json".into(),
+        name: "portable".into(),
+        bin_directory: ".local/bin".into(),
+        host: options.host.clone(),
+        user: options.user.clone(),
+        port: options.port,
+        fingerprint: options.host_key.clone().unwrap(),
+        home: "/".into(),
+        add_to_path: Some(ToolPath {
+            shell: DotfileShell::Bash,
+            zdotdir: None,
+        }),
+    }));
+    let mut restored: SshOptions =
+        serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
+    restored
+        .prepare_profile_connection(&local.join("profiles.json"))
+        .unwrap();
+    restored
+}
+
+async fn wait_tool_login(pane: &Session, generation: u64, status: &str, path: Option<&str>) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let frame = pane.frames.load();
+            if frame.connection_generation >= generation
+                && frame
+                    .rows
+                    .iter()
+                    .any(|row| row.as_str().contains("tools-at-shell:"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "Tool shell failed to start: {e}: {:?}",
+            pane.events.since(0).events
+        )
+    });
+    let batch = pane.events.since(0);
+    let sync = batch
+        .events
+        .iter()
+        .find(|event| event.kind == "tool-bundle-sync" && event.data["generation"] == generation)
+        .unwrap();
+    assert_eq!(sync.data["status"], status, "{sync:?}");
+    assert_eq!(sync.data["path"].as_str(), path, "{sync:?}");
+}
+
+fn connect_tools(options: &SshOptions) -> Session {
+    Session::start_sized(
+        Source::Ssh(options.clone()),
+        wezterm_term::TerminalSize {
+            cols: 140,
+            ..Default::default()
+        },
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approved_tool_sync_installs_before_shell_and_respects_manual_rollback() {
+    let (source, remote, _, server) = fixture_connections(false, 8).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), []).unwrap();
+    fs::write(root.join(".bashrc"), "# existing user shell settings\n").unwrap();
+    save_login_manifest(local.path(), 1);
+    let mut options = approved_login(source, local.path());
+    let dotfiles = local.path().join("dotfiles.json");
+    fs::write(
+        &dotfiles,
+        br#"{"version":1,"environment":"export EDITOR=vi"}"#,
+    )
+    .unwrap();
+    let scope = options.tool_bundle.as_ref().unwrap();
+    options.dotfiles = Some(Box::new(w11term::options::DotfileSync {
+        bundle: dotfiles,
+        shell: DotfileShell::Bash,
+        zdotdir: None,
+        host: scope.host.clone(),
+        user: scope.user.clone(),
+        port: scope.port,
+        fingerprint: scope.fingerprint.clone(),
+        home: scope.home.clone(),
+    }));
+    if cfg!(feature = "ui-smoke") {
+        options.player.reconnect = true;
+        fs::write(root.join("keep-first-connection"), []).unwrap();
+    }
+
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    let store = root.join(".local/share/w11term/tools/portable");
+    let selector = || fs::read_to_string(store.join("current")).unwrap();
+    let first = selector()
+        .lines()
+        .nth(1)
+        .unwrap()
+        .strip_prefix("versions/")
+        .unwrap()
+        .to_owned();
+    assert!(pane.frames.load().rows.iter().any(|row| {
+        row.as_str()
+            .contains(&format!("tools-at-shell:{first}:true"))
+    }));
+    let rc = fs::read_to_string(root.join(".bashrc")).unwrap();
+    assert!(rc.starts_with("# existing user shell settings\n"));
+    assert_eq!(rc.matches("# >>> w11term dotfiles >>>").count(), 1);
+    assert!(rc.contains("PATH=\"${PATH:+$PATH:}$HOME/.local/bin\""));
+    assert_eq!(rc.matches("# >>> w11term tool PATH ").count(), 1);
+
+    save_login_manifest(local.path(), 2);
+    let updated = if cfg!(feature = "ui-smoke") {
+        fs::remove_file(root.join("keep-first-connection")).unwrap();
+        wait_tool_login(&pane, 2, "updated", Some("current")).await;
+        pane
+    } else {
+        let updated = connect_tools(&options);
+        wait_tool_login(&updated, 1, "updated", Some("current")).await;
+        updated
+    };
+    assert!(!selector().contains(&first));
+    assert_eq!(fs::read_to_string(root.join(".bashrc")).unwrap(), rc);
+    let review = guarded_job(&updated, None, rollback(&first, None))
+        .await
+        .unwrap();
+    guarded_job(&updated, None, rollback(&first, Some(&review)))
+        .await
+        .unwrap();
+    assert!(selector().contains(&format!("./versions/{first}")));
+
+    fs::remove_file(local.path().join("fleet.json")).unwrap();
+    let held = connect_tools(&options);
+    wait_tool_login(&held, 1, "held", None).await;
+    assert!(held.frames.load().rows.iter().any(|row| {
+        row.as_str()
+            .contains(&format!("tools-at-shell:{first}:true"))
+    }));
+    save_login_manifest(local.path(), 2);
+    let manifest = local.path().join("fleet.json");
+    let operation = || Operation::PreviewToolBundle {
+        bundle: UtilityBundle::load(&manifest).unwrap(),
+    };
+    let review = guarded_job(&held, None, operation()).await.unwrap();
+    guarded_job(&held, None, apply(operation(), &review))
+        .await
+        .unwrap();
+    assert!(selector().lines().nth(1).unwrap().starts_with("versions/"));
+    let resumed = connect_tools(&options);
+    wait_tool_login(&resumed, 1, "current", Some("current")).await;
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_sync_skips_scope_changes_and_preserves_edited_startup_hooks() {
+    let (source, remote, _, server) = fixture_connections(false, 5).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), []).unwrap();
+    save_login_manifest(local.path(), 1);
+    let options = approved_login(source, local.path());
+    let mut wrong = options.clone();
+    wrong.tool_bundle.as_mut().unwrap().fingerprint = "SHA256:unapproved".into();
+    let wrong = connect_tools(&wrong);
+    wait_tool_login(&wrong, 1, "skipped", None).await;
+    assert!(
+        !root.join("utility-probe-command").exists(),
+        "scope mismatch must stop before probing"
+    );
+
+    let mut wrong = options.clone();
+    wrong.tool_bundle.as_mut().unwrap().bin_directory = "other-bin".into();
+    let wrong = connect_tools(&wrong);
+    wait_tool_login(&wrong, 1, "skipped", None).await;
+    assert!(!root.join(".local").exists());
+
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    let path = root.join(".bashrc");
+    let changed = fs::read_to_string(&path)
+        .unwrap()
+        .replace("export PATH", "export PATH # user edit");
+    fs::write(&path, &changed).unwrap();
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "current", Some("skipped")).await;
+    assert_eq!(fs::read_to_string(path).unwrap(), changed);
+
+    let zdotdir = root.join("config/zsh");
+    fs::create_dir_all(&zdotdir).unwrap();
+    fs::write(zdotdir.join(".zshrc"), "# existing Zsh settings\n").unwrap();
+    let mut zsh = options;
+    zsh.tool_bundle.as_mut().unwrap().add_to_path = Some(ToolPath {
+        shell: DotfileShell::Zsh,
+        zdotdir: Some("config/zsh".into()),
+    });
+    let pane = connect_tools(&zsh);
+    wait_tool_login(&pane, 1, "current", Some("updated")).await;
+    let zshrc = fs::read_to_string(zdotdir.join(".zshrc")).unwrap();
+    assert!(zshrc.starts_with("# existing Zsh settings\n"));
+    assert!(zshrc.contains("$HOME/.local/bin"));
+    assert!(zdotdir.join(".zprofile").is_file());
+    assert!(!root.join(".zshrc").exists());
     server.abort();
 }

@@ -4,8 +4,10 @@ use std::{collections::BTreeSet, io::Read};
 
 mod build;
 mod install;
+mod login;
 use build::{LibcVersion, Verified};
 use install::{InstallPlan, Release, StoredTool};
+pub(crate) use login::sync_login_tools;
 
 const DEFAULT_BIN: &str = ".local/bin";
 const STORE: &str = ".local/share/w11term/tools";
@@ -390,10 +392,9 @@ impl Engine {
             .await?;
         blocked |= selector.conflict
             || !bin_matches_active
-            || selector
-                .version
-                .as_ref()
-                .is_some_and(|current| !atomic_replace && Some(current) != bundle_sha256.as_ref());
+            || selector.version.as_ref().is_some_and(|current| {
+                !atomic_replace && (selector.manual || Some(current) != bundle_sha256.as_ref())
+            });
         let report = json!({
             "bundle": release.name, "bundle_sha256": bundle_sha256,
             "host": {"os": "Linux", "architecture": host.architecture, "home": home, "glibc": host.glibc.map(|v| v.to_string())},
