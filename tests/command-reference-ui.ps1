@@ -158,13 +158,27 @@ try {
     }
     Click 'Install SSH tools'
     Click 'Bundle versions'
-    $history = Wait-Until 'retained tool versions offered' { Find-Element 'Retained tool bundle versions' $combo }
-    $history.SetFocus()
-    $history.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $prior = Wait-Until 'previous bundle appears in history' {
-        Find-Element "portable${dot}$($oldId.Substring(0,12))" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    $priorLabel = "portable${dot}$($oldId.Substring(0,12))"
+    $expandPattern = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selectPattern = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $null = Wait-Until "select retained bundle '$priorLabel'" {
+        if (Find-Element "SHA-256 $oldId") { return $true }
+        $history = Find-Element 'Retained tool bundle versions' $combo
+        if ($history -and $history.Current.IsEnabled) {
+            try {
+                $popup = $history.GetCurrentPattern($expandPattern)
+                if ($popup.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+                    $history.SetFocus()
+                    $popup.Expand()
+                } else {
+                    $prior = Find-Element $priorLabel ([System.Windows.Automation.ControlType]::ListItem)
+                    if ($prior) { $prior.GetCurrentPattern($selectPattern).Select() }
+                }
+            } catch [System.Windows.Automation.ElementNotAvailableException] {
+                # WinUI replaces the dropdown's automation elements when it opens.
+            }
+        }
     }
-    $prior.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     Click 'Review rollback'
     $null = Wait-Until 'rollback shows the prior contents and update policy' {
         (Find-Element 'Retained commands mdd, rg') -and
