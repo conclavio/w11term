@@ -12,7 +12,7 @@ mod pcapng;
 mod protocols;
 mod timeline;
 pub use conversations::{Conversations, Traffic};
-pub use protocols::IpProtocols;
+pub use protocols::{IpProtocols, TcpFlags, ip_protocol_label};
 pub use timeline::{Bucket, Timeline};
 
 const MAX_RECORDS: u32 = 1_000_000;

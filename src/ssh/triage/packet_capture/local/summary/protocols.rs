@@ -1,6 +1,6 @@
 use super::{Traffic, ip};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 #[derive(Default, Serialize)]
 pub struct IpProtocols {
@@ -11,7 +11,7 @@ pub struct IpProtocols {
     pub tcp_flags: TcpFlags,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Copy, Default, Serialize)]
 pub struct TcpFlags {
     pub decoded_headers: u32,
     pub syn_without_ack: u32,
@@ -21,6 +21,12 @@ pub struct TcpFlags {
 }
 
 impl IpProtocols {
+    pub fn tcp_packets(&self) -> u32 {
+        self.by_number
+            .get(&ip::TCP)
+            .map_or(0, |traffic| traffic.packets)
+    }
+
     pub(super) fn record(&mut self, packet: Option<ip::Packet>, captured: u32) {
         let Some(packet) = packet else {
             self.unclassified_packets += 1;
@@ -44,4 +50,23 @@ impl IpProtocols {
             self.tcp_flags.fin += u32::from(flags & 0x01 != 0);
         }
     }
+}
+
+pub fn ip_protocol_label(number: u8) -> Cow<'static, str> {
+    Cow::Borrowed(match number {
+        1 => "ICMP",
+        2 => "IGMP",
+        4 => "IPv4 encapsulation",
+        ip::TCP => "TCP",
+        17 => "UDP",
+        41 => "IPv6 encapsulation",
+        47 => "GRE",
+        50 => "ESP",
+        51 => "AH",
+        58 => "ICMPv6",
+        59 => "No Next Header",
+        89 => "OSPF",
+        132 => "SCTP",
+        _ => return Cow::Owned(format!("IP protocol {number}")),
+    })
 }

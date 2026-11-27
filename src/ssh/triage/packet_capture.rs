@@ -25,7 +25,7 @@ const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 mod local;
 mod ring;
-pub use local::{CaptureComparison, LocalCapture};
+pub use local::{CaptureComparison, LocalCapture, ip_protocol_label};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -26,17 +26,27 @@ fn compare(directory: &Path, before: &str, after: &str, options: &[&str]) -> Out
 }
 
 fn raw_ip_capture(pairs: impl IntoIterator<Item = (u32, u32)>) -> Vec<u8> {
+    raw_capture(pairs.into_iter().map(|(a, b)| {
+        let mut packet = [0_u8; 20];
+        packet[..12].copy_from_slice(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 253, 0, 0]);
+        packet[12..16].copy_from_slice(&a.to_be_bytes());
+        packet[16..20].copy_from_slice(&b.to_be_bytes());
+        packet
+    }))
+}
+
+fn raw_capture(packets: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<u8> {
     let mut bytes = classic_capture()[..24].to_vec();
     bytes[20] = 101;
-    for (index, (a, b)) in pairs.into_iter().enumerate() {
+    for (index, packet) in packets.into_iter().enumerate() {
+        let packet = packet.as_ref();
+        let size = packet.len() as u32;
         bytes.extend(
-            [10 + index as u32, 0, 20, 20]
+            [10 + index as u32, 0, size, size]
                 .into_iter()
                 .flat_map(u32::to_le_bytes),
         );
-        bytes.extend([0x45, 0, 0, 20, 0, 0, 0, 0, 64, 253, 0, 0]);
-        bytes.extend(a.to_be_bytes());
-        bytes.extend(b.to_be_bytes());
+        bytes.extend(packet);
     }
     bytes
 }
@@ -287,4 +297,86 @@ fn a_pair_missing_after_the_tracking_limit_has_unknown_coverage() {
     let text = String::from_utf8(text.stdout).unwrap();
     assert!(text.contains("IP conversation changes · 4097"));
     assert!(text.contains("0.0.0.0 ↔ 0.0.16.1\nBefore · Pair coverage unavailable"));
+}
+
+#[test]
+fn compares_protocols_and_withholds_tcp_flag_deltas_when_headers_are_unavailable() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "before.pcap";
+    let after = "after.pcap";
+    let tcp = |flags| {
+        let mut packet = [0_u8; 40];
+        packet[0] = 0x45;
+        packet[3] = 40;
+        packet[9] = 6;
+        packet[32] = 0x50;
+        packet[33] = flags;
+        packet
+    };
+    let mut udp = [0_u8; 28];
+    udp[..4].copy_from_slice(&[0x45, 0, 0, 28]);
+    udp[9] = 17;
+    fs::write(root.join(before), raw_capture([tcp(0x02), tcp(0x12)])).unwrap();
+    let mut packets: Vec<_> = [tcp(0x02), tcp(0x04), tcp(0x04)].map(Vec::from).into();
+    packets.push(udp.to_vec());
+    let complete = raw_capture(&packets);
+    fs::write(root.join(after), &complete).unwrap();
+    let inspect = || {
+        let output = compare(root, before, after, &[]);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let report = inspect();
+    assert_eq!(
+        report["protocol_changes"],
+        json!([
+            {"number": 6, "before": {"packets": 2, "captured_bytes": 80},
+             "after": {"packets": 3, "captured_bytes": 120}, "delta": {"packets": 1, "captured_bytes": 40}},
+            {"number": 17, "before": {"packets": 0, "captured_bytes": 0},
+             "after": {"packets": 1, "captured_bytes": 28}, "delta": {"packets": 1, "captured_bytes": 28}}
+        ])
+    );
+    assert_eq!(
+        report["tcp_flag_comparison"]["delta"],
+        json!({
+            "syn_without_ack": 0, "syn_ack": -1, "rst": 2, "fin": 0
+        })
+    );
+    let text = compare(root, before, after, &["--format", "text"]);
+    assert!(text.status.success(), "{text:?}");
+    assert!(
+        String::from_utf8(text.stdout)
+            .unwrap()
+            .contains("RST · Before 0 · After 2 · Change +2")
+    );
+
+    packets[2][7] = 1; // The second reset is in a later fragment.
+    fs::write(root.join(after), raw_capture(&packets)).unwrap();
+    let report = inspect();
+    assert_eq!(report["after"]["fragmented_packets"], 1);
+    assert_eq!(report["tcp_flag_comparison"]["after"]["decoded_headers"], 2);
+    assert_eq!(report["tcp_flag_comparison"]["after"]["rst"], 1);
+    assert!(report["tcp_flag_comparison"]["delta"].is_null());
+    assert_eq!(report["protocol_changes"][0]["delta"]["captured_bytes"], 40);
+
+    packets[2][7] = 0;
+    let mut unresolved_v6 = vec![0_u8; 40];
+    unresolved_v6[0] = 0x60;
+    unresolved_v6[5] = 8;
+    unresolved_v6[6] = 60;
+    packets.push(unresolved_v6);
+    fs::write(root.join(after), raw_capture(&packets)).unwrap();
+    let report = inspect();
+    assert_eq!(report["after"]["unresolved_protocol_packets"], 1);
+    assert_eq!(report["tcp_flag_comparison"]["after"]["decoded_headers"], 3);
+    assert!(report["tcp_flag_comparison"]["delta"].is_null());
+
+    fs::write(root.join(after), &complete[..complete.len() - 1]).unwrap();
+    let report = inspect();
+    assert_eq!(report["after"]["complete"], false);
+    assert_eq!(report["protocol_changes"][0]["before"]["packets"], 2);
+    assert_eq!(report["protocol_changes"][0]["after"]["packets"], 3);
+    assert!(report["protocol_changes"][0]["delta"].is_null());
+    assert!(report["tcp_flag_comparison"]["delta"].is_null());
 }

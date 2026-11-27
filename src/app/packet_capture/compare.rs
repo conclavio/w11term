@@ -8,6 +8,7 @@ pub enum Change {
     Page(usize),
     Pair { page: usize, row: Option<usize> },
     Source(usize),
+    ProtocolsExpanded(bool),
     Open,
     Export,
 }
@@ -19,6 +20,7 @@ pub(super) struct Comparison {
     page: usize,
     selected: Option<usize>,
     source: usize,
+    protocols_expanded: bool,
 }
 
 impl Comparison {
@@ -30,6 +32,7 @@ impl Comparison {
             page: 0,
             selected: None,
             source: 1,
+            protocols_expanded: false,
         }
     }
 
@@ -65,6 +68,7 @@ impl Comparison {
                 });
             }
             Change::Source(source) if source < self.paths.len() => self.source = source,
+            Change::ProtocolsExpanded(expanded) => self.protocols_expanded = expanded,
             Change::Open => {
                 let pair = self
                     .model
@@ -133,6 +137,13 @@ impl Comparison {
                         capture.unclassified_packets, capture.untracked_packets,
                     ),
                 ),
+                text(
+                    "protocol-coverage",
+                    format!(
+                        "Unresolved IP protocols {} · Fragmented IP packets {}",
+                        capture.unresolved_protocol_packets, capture.fragmented_packets
+                    ),
+                ),
             ];
             if let Some(issue) = &capture.issue {
                 details.push(text("partial", format!("Partial scan · {issue}")));
@@ -154,6 +165,49 @@ impl Comparison {
             fields.push(text(
                 "total-delta",
                 "Capture deltas unavailable for a partial scan",
+            ));
+        }
+        if !model.protocol_changes.is_empty() || model.tcp_flag_comparison.is_some() {
+            let mut rows = Vec::new();
+            if self.protocols_expanded {
+                rows.extend(
+                    model.protocol_changes.iter().map(|change| {
+                        text(&format!("protocol-{}", change.number), change.summary())
+                    }),
+                );
+                if let Some(flags) = &model.tcp_flag_comparison {
+                    rows.extend(
+                        flags
+                            .report_lines()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, line)| text(&format!("tcp-{index}"), line)),
+                    );
+                }
+            }
+            let revision = Arc::clone(&self.revision);
+            fields.push(KeyedView::new(
+                "protocol-changes",
+                Expander::new()
+                    .automation_name("IP protocol changes")
+                    .automation_id("comparison-ip-protocols")
+                    .is_expanded(self.protocols_expanded)
+                    .on_is_expanded_changed(ctx.callback(move |expanded| {
+                        message(Action::Comparison(
+                            revision.clone(),
+                            Change::ProtocolsExpanded(expanded),
+                        ))
+                    }))
+                    .slots([
+                        SlotView::new(
+                            ExpanderSlot::Header,
+                            TextBlock::new().text("IP protocol changes"),
+                        ),
+                        SlotView::new(
+                            ExpanderSlot::Content,
+                            StackPanel::new().spacing(6.0).keyed_children(rows),
+                        ),
+                    ]),
             ));
         }
         fields.push(text(

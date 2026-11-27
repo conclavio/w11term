@@ -8,9 +8,9 @@ use w11term::{
     control::PacketCaptureOptions,
     ssh::{
         CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureComparison,
-        PacketCaptureInterfaces, PacketCapturePlan, open_capture_conversation_in_wireshark,
-        open_capture_conversation_interval_in_wireshark, open_capture_in_wireshark,
-        open_capture_interval_in_wireshark,
+        PacketCaptureInterfaces, PacketCapturePlan, ip_protocol_label,
+        open_capture_conversation_in_wireshark, open_capture_conversation_interval_in_wireshark,
+        open_capture_in_wireshark, open_capture_interval_in_wireshark,
     },
 };
 
@@ -672,8 +672,7 @@ impl Panel {
                         (std::cmp::Reverse(traffic.captured_bytes), *number)
                     });
                     rows.extend(ranked.into_iter().map(|(&number, traffic)| {
-                        let name = protocol_name(number)
-                            .map_or_else(|| format!("IP protocol {number}"), str::to_owned);
+                        let name = ip_protocol_label(number);
                         text(
                             &format!("protocol-{number}"),
                             format!(
@@ -682,14 +681,15 @@ impl Panel {
                             ),
                         )
                     }));
-                    if let Some(tcp) = protocols.by_number.get(&6) {
+                    let tcp_packets = protocols.tcp_packets();
+                    if tcp_packets != 0 {
                         let flags = &protocols.tcp_flags;
                         rows.extend([
                             text(
                                 "tcp-coverage",
                                 format!(
                                     "TCP flags available on {} of {} TCP packets",
-                                    flags.decoded_headers, tcp.packets
+                                    flags.decoded_headers, tcp_packets
                                 ),
                             ),
                             text(
@@ -1022,25 +1022,6 @@ fn link_type(value: u16) -> String {
     .into()
 }
 
-fn protocol_name(number: u8) -> Option<&'static str> {
-    Some(match number {
-        1 => "ICMP",
-        2 => "IGMP",
-        4 => "IPv4 encapsulation",
-        6 => "TCP",
-        17 => "UDP",
-        41 => "IPv6 encapsulation",
-        47 => "GRE",
-        50 => "ESP",
-        51 => "AH",
-        58 => "ICMPv6",
-        59 => "No Next Header",
-        89 => "OSPF",
-        132 => "SCTP",
-        _ => return None,
-    })
-}
-
 fn default_wireshark() -> Option<PathBuf> {
     ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
         .into_iter()
@@ -1116,6 +1097,7 @@ impl TerminalApp {
                                 | Action::ProtocolsExpanded(_)
                                 | Action::ConversationsExpanded(_)
                                 | Action::Comparison(_, compare::Change::Pair { .. })
+                                | Action::Comparison(_, compare::Change::ProtocolsExpanded(_))
                         )) =>
             {
                 self.packet_capture_input(action, ctx);

@@ -8,12 +8,17 @@ use std::{
     net::IpAddr,
 };
 
+mod protocols;
+use protocols::{ProtocolChange, TcpFlagComparison};
+
 #[derive(Serialize)]
 pub struct CaptureComparison {
     schema_version: u8,
     pub before: CaptureSide,
     pub after: CaptureSide,
     pub totals_delta: Option<CountsDelta>,
+    pub protocol_changes: Vec<ProtocolChange>,
+    pub tcp_flag_comparison: Option<TcpFlagComparison>,
     pub conversation_changes: Vec<ConversationChange>,
 }
 
@@ -29,6 +34,8 @@ pub struct CaptureSide {
     pub timestamp_span_ns: Option<u128>,
     pub unclassified_packets: u32,
     pub untracked_packets: u32,
+    pub unresolved_protocol_packets: u32,
+    pub fragmented_packets: u32,
     pub complete: bool,
     pub issue: Option<String>,
 }
@@ -70,11 +77,25 @@ pub struct TrafficDelta {
     pub captured_bytes: i64,
 }
 
+impl TrafficDelta {
+    fn between(before: Traffic, after: Traffic) -> Self {
+        Self {
+            packets: i64::from(after.packets) - i64::from(before.packets),
+            captured_bytes: bytes_delta(before.captured_bytes, after.captured_bytes),
+        }
+    }
+}
+
 impl CaptureComparison {
     pub fn new(before: &LocalCapture, after: &LocalCapture) -> Self {
         let sources = [before, after];
         let [before, after] = sources.map(CaptureSide::from);
         let complete = before.complete && after.complete;
+        let (protocol_changes, tcp_flag_comparison) = protocols::compare(
+            &sources[0].summary.ip_protocols,
+            &sources[1].summary.ip_protocols,
+            complete,
+        );
         let totals_delta = complete.then(|| CountsDelta {
             packets: i64::from(after.packets) - i64::from(before.packets),
             captured_bytes: bytes_delta(before.captured_bytes, after.captured_bytes),
@@ -104,17 +125,7 @@ impl CaptureComparison {
                 let delta = before
                     .zip(after)
                     .filter(|_| complete)
-                    .map(|(before, after)| {
-                        let before = before.total();
-                        let after = after.total();
-                        TrafficDelta {
-                            packets: i64::from(after.packets) - i64::from(before.packets),
-                            captured_bytes: bytes_delta(
-                                before.captured_bytes,
-                                after.captured_bytes,
-                            ),
-                        }
-                    });
+                    .map(|(before, after)| TrafficDelta::between(before.total(), after.total()));
                 Some(ConversationChange {
                     a,
                     b,
@@ -138,6 +149,8 @@ impl CaptureComparison {
             before,
             after,
             totals_delta,
+            protocol_changes,
+            tcp_flag_comparison,
             conversation_changes,
         }
     }
@@ -178,6 +191,11 @@ impl CaptureComparison {
                 "Unclassified packets {} · Untracked packets {}",
                 side.unclassified_packets, side.untracked_packets
             )?;
+            writeln!(
+                output,
+                "Unresolved IP protocols {} · Fragmented IP packets {}",
+                side.unresolved_protocol_packets, side.fragmented_packets
+            )?;
             if let Some(issue) = &side.issue {
                 writeln!(
                     output,
@@ -196,6 +214,19 @@ impl CaptureComparison {
             )?;
         } else {
             writeln!(output, "\nCapture deltas unavailable for a partial scan")?;
+        }
+        writeln!(
+            output,
+            "\nIP protocol changes · {}",
+            self.protocol_changes.len()
+        )?;
+        for change in &self.protocol_changes {
+            writeln!(output, "{}", change.summary())?;
+        }
+        if let Some(flags) = &self.tcp_flag_comparison {
+            for line in flags.report_lines() {
+                writeln!(output, "{line}")?;
+            }
         }
         writeln!(
             output,
@@ -252,6 +283,8 @@ impl From<&LocalCapture> for CaptureSide {
             timestamp_span_ns: stats.span_ns(),
             unclassified_packets: conversations.unclassified_packets,
             untracked_packets: conversations.untracked_packets,
+            unresolved_protocol_packets: summary.ip_protocols.unresolved_protocol_packets,
+            fragmented_packets: summary.ip_protocols.fragmented_packets,
             complete: summary.issue.is_none(),
             issue: summary.issue.clone(),
         }

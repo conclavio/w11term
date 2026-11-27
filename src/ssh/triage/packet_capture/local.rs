@@ -12,6 +12,7 @@ use std::{
 mod compare;
 mod summary;
 pub use compare::CaptureComparison;
+pub use summary::ip_protocol_label;
 use summary::{Bucket, CaptureCounters, Conversations, IpProtocols, PacketStats, Summary};
 
 pub struct LocalCapture {

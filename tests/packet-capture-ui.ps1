@@ -457,6 +457,17 @@ try {
         throw 'The CLI protocol report differs from the capture panel'
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'
+    $expander = Open-PacketSection 'comparison-ip-protocols'
+    $right = [char]0x2192
+    $null = Wait-Until 'the comparison shows observed protocol changes and incomplete TCP header coverage' {
+        (Find-Element "TCP${dot}5 $right 0 packets${dot}200 $right 0 captured bytes${dot}Change -5 packets, -200 bytes") -and
+        (Find-Element "Unresolved IP protocols 1${dot}Fragmented IP packets 1") -and
+        (Find-Element "TCP headers decoded${dot}Before 4 of 5${dot}After 0 of 0") -and
+        (Find-Element "RST${dot}Before 1${dot}After 0") -and
+        (Find-Element 'TCP flag deltas unavailable for this coverage')
+    }
+    Click 'Back to capture'
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'
     $null = Wait-Until 'flame graph can open a saved artifact offline' {
