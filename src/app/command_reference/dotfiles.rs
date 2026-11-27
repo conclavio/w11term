@@ -186,6 +186,7 @@ enum Work {
     Apply,
     ApplyHooks,
     ListVersions,
+    SaveVersion,
     ReviewSwitch,
     SwitchVersion,
 }
@@ -247,7 +248,10 @@ impl Installer {
 
     fn applying(&self) -> bool {
         self.pending.as_ref().is_some_and(|(_, work)| {
-            matches!(work, Work::Apply | Work::ApplyHooks | Work::SwitchVersion)
+            matches!(
+                work,
+                Work::Apply | Work::ApplyHooks | Work::SaveVersion | Work::SwitchVersion
+            )
         })
     }
 
@@ -374,7 +378,10 @@ impl Installer {
                     Work::PreviewHooks => "Reviewing startup hooks…",
                     Work::Apply => "Applying reviewed dotfiles…",
                     Work::ApplyHooks => "Repairing reviewed startup hooks…",
-                    Work::ListVersions | Work::ReviewSwitch | Work::SwitchVersion => {
+                    Work::ListVersions
+                    | Work::SaveVersion
+                    | Work::ReviewSwitch
+                    | Work::SwitchVersion => {
                         unreachable!("the history view handles version operations")
                     }
                 }

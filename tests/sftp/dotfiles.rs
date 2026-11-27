@@ -502,6 +502,51 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     assert_eq!(versions[0]["bundle_sha256"], new_id);
     assert_eq!(versions[1]["bundle_sha256"], id);
 
+    let snapshots = tempfile::tempdir().unwrap();
+    let snapshot = snapshots.path().join("Older shell bundle.json");
+    let export = |local| Operation::ExportDotfileBundle {
+        shell: DotfileShell::Bash,
+        bundle_sha256: id.into(),
+        local,
+    };
+    let saved = guarded_job(&pane, None, export(snapshot.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        saved,
+        json!({"shell": "bash", "home": "/", "bundle_sha256": id, "local": snapshot})
+    );
+    let contents = fs::read(&snapshot).unwrap();
+    let snapshot_bundle = DotfileBundle::load(&snapshot).unwrap();
+    assert_eq!(snapshot_bundle.bash.as_deref(), Some("PS1='first> '\n"));
+    assert_eq!(
+        snapshot_bundle.environment.as_deref(),
+        Some("export PROJECT=local\n")
+    );
+    assert!(snapshot_bundle.zsh.is_none());
+    let roundtrip = guarded_job(
+        &pane,
+        None,
+        Operation::PreviewDotfiles {
+            bundle: snapshot_bundle,
+            shell: DotfileShell::Bash,
+            zdotdir: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(roundtrip["bundle_sha256"], id);
+    assert!(
+        guarded_job(&pane, None, export(snapshot.clone()))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&snapshot).unwrap(), contents);
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        format!("{new_id}\n")
+    );
+
     let restore = guarded_job(&pane, None, switch(Some(id), None))
         .await
         .unwrap();
@@ -517,6 +562,12 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         format!("{new_id}\n")
     );
     fs::write(&first_prompt, "PS1='drift> '\n").unwrap();
+    let corrupt = snapshots.path().join("Corrupt retained shell bundle.json");
+    let error = guarded_job(&pane, None, export(corrupt.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.contains("do not match bundle"), "{error}");
+    assert!(!corrupt.exists());
     let error = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
         .await
         .unwrap_err();
@@ -627,6 +678,68 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         "PS1='first> '\n"
     );
     assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exported_dotfile_bundle_round_trips_a_fragment_at_its_size_limit() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let environment = format!("# {}", "x".repeat(16 * 1024 - 2));
+    let bundle = DotfileBundle {
+        version: 1,
+        environment: Some(environment.clone()),
+        bash: None,
+        zsh: Some("PROMPT='portable> '\r\n".into()),
+    };
+    let preview = |bundle| Operation::PreviewDotfiles {
+        bundle,
+        shell: DotfileShell::Zsh,
+        zdotdir: None,
+    };
+    let plan = guarded_job(&pane, None, preview(bundle.clone()))
+        .await
+        .unwrap();
+    let id = plan["bundle_sha256"].as_str().unwrap();
+    guarded_job(
+        &pane,
+        None,
+        Operation::ApplyDotfiles {
+            bundle,
+            shell: DotfileShell::Zsh,
+            zdotdir: None,
+            review: plan["review"].as_str().unwrap().into(),
+        },
+    )
+    .await
+    .unwrap();
+    let remote_environment = remote
+        .path()
+        .join(format!(".config/w11term/dotfiles/zsh-{id}/environment.sh"));
+    assert_eq!(
+        fs::read_to_string(remote_environment).unwrap(),
+        format!("{environment}\n")
+    );
+    let snapshots = tempfile::tempdir().unwrap();
+    let snapshot = snapshots.path().join("Maximum Zsh fragment.json");
+    guarded_job(
+        &pane,
+        None,
+        Operation::ExportDotfileBundle {
+            shell: DotfileShell::Zsh,
+            bundle_sha256: id.into(),
+            local: snapshot.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let saved = DotfileBundle::load(&snapshot).unwrap();
+    assert_eq!(saved.environment.as_deref(), Some(environment.as_str()));
+    assert_eq!(saved.zsh.as_deref(), Some("PROMPT='portable> '\n"));
+    assert!(saved.bash.is_none());
+    assert_eq!(
+        guarded_job(&pane, None, preview(saved)).await.unwrap()["bundle_sha256"],
+        id
+    );
     server.abort();
 }
 

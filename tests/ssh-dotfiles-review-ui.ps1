@@ -209,6 +209,46 @@ try {
     Click 'Dotfile versions'
     $null = Wait-Until 'history shows the current version' { Find-Element "Active version $second" }
     Select-RetainedDotfile $pane $first
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot save the retained dotfiles' {
+        $save = Find-Element 'Save selected dotfile bundle' $button
+        $save -and !$save.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    $snapshot = Join-Path $State ('Retained shell bundle ' + [char]0x96ea + '.json')
+    $savedPrefix = "Saved dotfile bundle${dot}"
+    Click 'Save selected dotfile bundle'
+    $saveDialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'cancel the Windows bundle picker' { [FixtureDialog]::ClickButton($saveDialog, 2) }
+    $null = Wait-Until 'cancel returns to the retained version' {
+        (Find-Element "Selected version $first") -and !(Find-OwnedDialog 'Save new dotfiles bundle')
+    }
+    Click 'Save selected dotfile bundle'
+    $saveDialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'enter a draft retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($saveDialog, "$snapshot.draft") }
+    $null = Wait-Until 'choose the retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($saveDialog, $snapshot) }
+    $null = Wait-Until 'save the retained bundle' { [FixtureDialog]::ClickButton($saveDialog, 1) }
+    $null = Wait-Until 'saved bundle is available at the selected Windows destination' {
+        if ([IO.File]::Exists($snapshot)) {
+            Get-NativeTextLabels | Where-Object {
+                $_.StartsWith($savedPrefix) -and [FixtureDialog]::SameFile($snapshot, $_.Substring($savedPrefix.Length))
+            }
+        }
+    }
+    $saved = [IO.File]::ReadAllText($snapshot) | ConvertFrom-Json
+    if ($saved.version -ne 1 -or $saved.bash -cne "PS1='verified> '`n" -or
+        $saved.environment -cne "export EDITOR=vi`n" -or $null -ne $saved.zsh) {
+        throw 'The saved bundle did not contain the chosen older version'
+    }
+    $cliSnapshot = Join-Path $State 'CLI saved shell bundle.json'
+    $receipt = (Control @('sftp','--pane',"$pane",'export-dotfile-bundle',$second,$cliSnapshot,'--shell','bash')).sftp
+    $savedCli = [IO.File]::ReadAllText($cliSnapshot) | ConvertFrom-Json
+    if ($receipt.bundle_sha256 -cne $second -or ![FixtureDialog]::SameFile($cliSnapshot, $receipt.local) -or
+        $savedCli.bash -cne "PS1='second> '`n" -or [IO.File]::ReadAllText($selectorPath).Trim() -cne $second) {
+        throw 'CLI export did not save the expected active bundle'
+    }
     Click 'Review dotfile restore'
     $null = Wait-Until 'restore reviews the before and after versions' {
         (Find-Element "Reviewed active version $second") -and (Find-Element "Restore version $first") -and

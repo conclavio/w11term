@@ -1322,6 +1322,10 @@ Use the same two commands with `disabled` to stop loading managed dotfiles in ne
 
 Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list the versions and `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. To lift a hold, use `"target":{"kind":"automatic"}`. Include the returned `"review"` to publish the switch.
 
+Select an active or older version in **Dotfile versions** and choose **Save selected dotfile bundle** to write a new Windows JSON manifest. The manifest contains the verified environment and prompt fragments for the selected shell. Choose that shell when reviewing the saved manifest for another SSH account. The destination must be a new file.
+
+Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
+
 ### Sync dotfiles on SSH connect
 
 In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and enter a shared environment fragment, a Bash startup fragment, or a Zsh startup fragment. You can fill in more than one. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.

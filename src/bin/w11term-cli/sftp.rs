@@ -43,6 +43,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   repair-dotfile-hooks --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh\n\
   list-dotfile-versions --shell bash|zsh\n\
   preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   switch-dotfiles SHA256|disabled|automatic --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
@@ -408,6 +409,14 @@ pub fn parse(
                 json!(dotfile_shell(opts.remove("--shell").as_deref())?),
             );
         }
+        "export-dotfile-bundle" => {
+            fields.insert(
+                "shell".into(),
+                json!(dotfile_shell(opts.remove("--shell").as_deref())?),
+            );
+            fields.insert("bundle_sha256".into(), json!(normalize_sha256(&path()?)?));
+            fields.insert("local".into(), json!(std::path::absolute(path()?)?));
+        }
         "preview-dotfiles"
         | "apply-dotfiles"
         | "preview-dotfile-hooks"
@@ -684,6 +693,65 @@ mod tests {
                 ..
             } if name == "fleet" && tool == "rg" && review == token
         ));
+    }
+
+    #[test]
+    fn exporting_dotfiles_requires_a_shell_digest_and_new_local_destination() {
+        let id = "a".repeat(64);
+        let (_, request) = p(&[
+            "--pane",
+            "2",
+            "export-dotfile-bundle",
+            &id,
+            "Retained shell bundle.json",
+            "--shell",
+            "zsh",
+        ])
+        .unwrap();
+        assert!(matches!(request, Request::Sftp {
+            pane: 2,
+            operation: Operation::ExportDotfileBundle {
+                shell: DotfileShell::Zsh, bundle_sha256, local,
+            },
+            ..
+        } if bundle_sha256 == id && local == std::path::absolute("Retained shell bundle.json").unwrap()));
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "export-dotfile-bundle",
+                &id,
+                "bundle.json",
+                "--shell",
+                "fish"
+            ])
+            .is_err()
+        );
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "export-dotfile-bundle",
+                "latest",
+                "bundle.json",
+                "--shell",
+                "bash"
+            ])
+            .is_err()
+        );
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "export-dotfile-bundle",
+                &id,
+                "bundle.json",
+                "--shell",
+                "bash",
+                "--overwrite"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

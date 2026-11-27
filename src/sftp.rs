@@ -360,6 +360,11 @@ pub enum Operation {
     ListDotfileVersions {
         shell: DotfileShell,
     },
+    ExportDotfileBundle {
+        shell: DotfileShell,
+        bundle_sha256: String,
+        local: PathBuf,
+    },
     ApplyDotfiles {
         bundle: DotfileBundle,
         shell: DotfileShell,
@@ -1106,6 +1111,9 @@ pub(crate) async fn run(
                 }
                 Operation::SaveInstalledToolBundle { .. } => {
                     JobStage::Checking("Saving the installed tool bundle did not finish")
+                }
+                Operation::ExportDotfileBundle { .. } => {
+                    JobStage::Checking("Saving the retained dotfile bundle did not finish")
                 }
                 Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
                     JobStage::Checking(
@@ -1887,6 +1895,14 @@ impl Engine {
                 zdotdir,
             } => {
                 self.preview_dotfiles(bundle, shell, zdotdir.as_deref())
+                    .await?
+            }
+            ExportDotfileBundle {
+                shell,
+                bundle_sha256,
+                local,
+            } => {
+                self.export_dotfile_bundle(shell, &bundle_sha256, local, cancel)
                     .await?
             }
             ApplyDotfiles {

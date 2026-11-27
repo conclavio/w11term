@@ -3,6 +3,7 @@ use crate::events::DotfileSyncStatus;
 
 mod comparison;
 mod hooks;
+mod snapshot;
 mod tool_path;
 use comparison::FragmentBaseline;
 
