@@ -70,11 +70,14 @@ try {
     Wait-Focus $remote
     Click 'Run triage'
     $null = Wait-Until 'remote probes started' { [IO.File]::Exists($command) }
+    $null = Wait-Until 'finished probes appear while the final report is pending' {
+        (Find-Element '3 of 10 checks finished') -and (Find-Element 'Stop and keep report' $button)
+    }
     Click 'Return to diagnostics overview'
     $null = Control @('focus-pane','--pane',"$local")
     Wait-Focus $local
-    $null = Wait-Until 'running collection remains visible from PowerShell' {
-        Find-Element 'Running'
+    $null = Wait-Until 'probe count remains visible from PowerShell' {
+        Find-Element '3 of 10 checks finished'
     }
     Click 'Open Linux performance triage activity'
     Click 'Stop and keep report'

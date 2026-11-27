@@ -9,7 +9,8 @@ run_check() {
         ulimit -f 16 || exit 125
         "$@"
     ) > "$work/$id.out" 2> "$work/$id.err" || status=$?
-    printf '%s %s\n' "$status" "$(date +%s%3N)" > "$work/$id.done"
+    printf '%s %s\n' "$status" "$(date +%s%3N)" > "$work/$id.done" &&
+        printf 'w11term-triage-progress\t%s\n' "$id"
 }
 kernel_log() {
     set -o pipefail

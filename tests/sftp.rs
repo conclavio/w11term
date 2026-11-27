@@ -418,6 +418,16 @@ impl server::Handler for Peer {
             s.channel_success(c)?;
             if self.root.join("triage-wait-for-stop").is_file() {
                 fs::write(self.root.join(format!("triage-stop-{c}")), report)?;
+                s.data(
+                    c,
+                    concat!(
+                        "w11term-triage-progress\tuptime\n",
+                        "w11term-triage-progress\tdmesg\n",
+                        "w11term-triage-progress\tvmstat\n",
+                    )
+                    .as_bytes()
+                    .to_vec(),
+                )?;
                 return Ok(());
             }
             s.data(c, report)?;

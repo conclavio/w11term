@@ -17,6 +17,7 @@ pub use findings::{Finding, Resource};
 pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
 const STREAM_BYTES: usize = 16 * 1024;
 const WIRE_BYTES: usize = PROBES.len() * 2 * (STREAM_BYTES.div_ceil(3) * 4) + 4096;
+const PROGRESS_PREFIX: &[u8] = b"w11term-triage-progress\t";
 const REPORT_BYTES: u64 = 3 * 1024 * 1024;
 const SUPERVISOR: &str = include_str!("triage-supervisor.sh");
 const WORKER: &str = include_str!("triage-worker.sh");
@@ -90,12 +91,19 @@ impl Target {
     }
 
     pub(crate) async fn collect(self) -> Result<Report> {
-        self.collect_with_stop(None).await
+        self.collect_report(None, None).await
     }
 
-    async fn collect_with_stop(mut self, stop: Option<&CaptureStop>) -> Result<Report> {
+    async fn collect_report(
+        mut self,
+        stop: Option<&CaptureStop>,
+        progress: Option<watch::Sender<usize>>,
+    ) -> Result<Report> {
         let plan = self.preview();
-        let mut stdout = Vec::new();
+        let mut stdout = ReportStream {
+            progress,
+            ..ReportStream::default()
+        };
         self.run_diagnostic_to(
             "Linux triage",
             command(),
@@ -105,7 +113,7 @@ impl Target {
             stop,
         )
         .await?;
-        let collection = parse(&stdout)?;
+        let collection = parse(&stdout.report)?;
         Ok(Report {
             version: 1,
             target: plan,
@@ -119,7 +127,15 @@ impl Target {
     }
 
     pub fn collect_blocking_with_stop(self, stop: &CaptureStop) -> Result<Report> {
-        super::NETWORK.block_on(self.collect_with_stop(Some(stop)))
+        super::NETWORK.block_on(self.collect_report(Some(stop), None))
+    }
+
+    pub fn collect_blocking_with_progress(
+        self,
+        stop: &CaptureStop,
+        progress: watch::Sender<usize>,
+    ) -> Result<Report> {
+        super::NETWORK.block_on(self.collect_report(Some(stop), Some(progress)))
     }
 
     async fn run_diagnostic(
@@ -174,6 +190,48 @@ trait DiagnosticStdout: Send {
 impl DiagnosticStdout for Vec<u8> {
     async fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ReportStream {
+    report: Vec<u8>,
+    receiving_report: bool,
+    finished: [bool; PROBES.len()],
+    progress: Option<watch::Sender<usize>>,
+}
+
+impl DiagnosticStdout for ReportStream {
+    async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.report.extend_from_slice(bytes);
+        while !self.receiving_report {
+            let Some(end) = self.report.iter().position(|&byte| byte == b'\n') else {
+                ensure!(
+                    self.report.len() <= 128,
+                    "Invalid Linux triage progress or header"
+                );
+                break;
+            };
+            let Some(id) = self.report[..end].strip_prefix(PROGRESS_PREFIX) else {
+                self.receiving_report = true;
+                break;
+            };
+            let index = PROBES
+                .iter()
+                .position(|(name, _, _)| name.as_bytes() == id)
+                .context("Unknown Linux triage progress probe")?;
+            ensure!(
+                !self.finished[index],
+                "Duplicate Linux triage progress probe"
+            );
+            self.finished[index] = true;
+            self.report.drain(..=end);
+            if let Some(progress) = &self.progress {
+                let count = self.finished.iter().filter(|&&done| done).count();
+                progress.send_replace(count);
+            }
+        }
         Ok(())
     }
 }
@@ -613,6 +671,37 @@ fn parse(bytes: &[u8]) -> Result<Collection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn triage_progress_frames_are_bounded_and_separate_from_the_report() {
+        let (progress, observed) = watch::channel(0);
+        let mut stream = ReportStream {
+            progress: Some(progress),
+            ..ReportStream::default()
+        };
+        stream.write(b"w11term-triage-progress\tup").await.unwrap();
+        assert_eq!(*observed.borrow(), 0);
+        stream
+            .write(b"time\nw11term-triage-progress\tdmesg\nw11term-linux-triage-v1\t1000")
+            .await
+            .unwrap();
+        stream.write(b"\t2000\t0\n").await.unwrap();
+        assert_eq!(*observed.borrow(), 2);
+        assert_eq!(stream.report, b"w11term-linux-triage-v1\t1000\t2000\t0\n");
+
+        let mut invalid = ReportStream::default();
+        assert!(
+            invalid
+                .write(b"w11term-triage-progress\tunknown\n")
+                .await
+                .is_err()
+        );
+        let mut repeated = ReportStream::default();
+        let complete = b"w11term-triage-progress\tuptime\n";
+        repeated.write(complete).await.unwrap();
+        assert!(repeated.write(complete).await.is_err());
+        assert!(ReportStream::default().write(&[b'x'; 129]).await.is_err());
+    }
 
     #[test]
     fn triage_preserves_binary_evidence_and_rejects_oversized_streams() {

@@ -21,7 +21,11 @@ pub(super) struct Activity {
 }
 
 enum ActivityState {
-    Running { ticket: Arc<()>, stopping: bool },
+    Running {
+        ticket: Arc<()>,
+        stopping: bool,
+        progress: Option<String>,
+    },
     Finished(String),
 }
 
@@ -32,6 +36,7 @@ impl Activity {
             state: ActivityState::Running {
                 ticket: ticket.clone(),
                 stopping: false,
+                progress: None,
             },
         }
     }
@@ -39,6 +44,25 @@ impl Activity {
     pub(super) fn stopping(&mut self) {
         if let ActivityState::Running { stopping, .. } = &mut self.state {
             *stopping = true;
+        }
+    }
+
+    pub(super) fn record_progress(&mut self, ticket: &Arc<()>, update: String) {
+        if let ActivityState::Running {
+            ticket: active,
+            progress,
+            ..
+        } = &mut self.state
+            && Arc::ptr_eq(active, ticket)
+        {
+            *progress = Some(update);
+        }
+    }
+
+    pub(super) fn running_progress(&self) -> Option<&str> {
+        match &self.state {
+            ActivityState::Running { progress, .. } => progress.as_deref(),
+            ActivityState::Finished(_) => None,
         }
     }
 
@@ -61,8 +85,10 @@ impl Activity {
     fn summary(&self) -> &str {
         match &self.state {
             ActivityState::Running {
-                stopping: false, ..
-            } => "Running",
+                stopping: false,
+                progress,
+                ..
+            } => progress.as_deref().unwrap_or("Running"),
             ActivityState::Running { stopping: true, .. } => {
                 "Stop requested · saving collected data"
             }
@@ -318,6 +344,10 @@ mod tests {
         let mut activity = Activity::start(&ticket, "pilot", "2001:db8::1", 2222);
         assert_eq!(activity.endpoint, "pilot@[2001:db8::1]:2222");
         assert_eq!(activity.summary(), "Running");
+        activity.record_progress(&Arc::new(()), "Unrelated".into());
+        assert_eq!(activity.summary(), "Running");
+        activity.record_progress(&ticket, "4 of 10 checks finished".into());
+        assert_eq!(activity.summary(), "4 of 10 checks finished");
         activity.stopping();
         let saved = Ok(Some("Saved"));
         let summary = |outcome: &&str| Some((*outcome).into());
@@ -326,6 +356,7 @@ mod tests {
         activity.finish(&ticket, &saved, summary);
         activity.stopping();
         activity.finish(&ticket, &Err("Late callback".into()), summary);
+        activity.record_progress(&ticket, "Late progress".into());
         assert_eq!(activity.summary(), "Saved");
     }
 }

@@ -1,6 +1,7 @@
 """Exercise the exact remote triage supervisor and worker on Linux."""
 
 import base64
+import select
 import shlex
 import subprocess
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 SUPERVISOR = Path("src/ssh/triage-supervisor.sh").read_text()
 WORKER = Path("src/ssh/triage-worker.sh").read_text()
 IDS = ["uptime", "dmesg", "vmstat", "mpstat", "pidstat", "iostat", "free", "sar-dev", "sar-tcp", "top"]
+PROGRESS = "w11term-triage-progress\t"
 
 
 def collect(supervisor, worker):
@@ -21,13 +23,19 @@ def collect(supervisor, worker):
         check=True,
         timeout=60,
     )
-    status, reason, checks = parse_report(completed.stdout)
+    status, reason, progress, checks = parse_report(completed.stdout)
     assert reason == [], reason
-    return status, checks
+    return status, progress, checks
 
 
 def parse_report(output):
-    marker, *lines, end = output.decode("ascii").splitlines()
+    records = iter(output.decode("ascii").splitlines())
+    progress = []
+    marker = next(records)
+    while marker.startswith(PROGRESS):
+        progress.append(marker[len(PROGRESS):])
+        marker = next(records)
+    *lines, end = records
     assert end == "end", output
     version, started, finished, status, *reason = marker.split("\t")
     assert version == "w11term-linux-triage-v1" and int(started) <= int(finished)
@@ -39,7 +47,9 @@ def parse_report(output):
         assert max(len(stdout), len(stderr)) <= 16384, name
         checks[name] = (code, stdout, stderr)
     assert list(checks) == IDS, checks
-    return int(status), reason, checks
+    assert len(progress) == len(set(progress)), progress
+    assert all(check in checks and checks[check][0] != "-" for check in progress), progress
+    return int(status), reason, progress, checks
 
 
 def stop_collection(worker):
@@ -60,15 +70,21 @@ wait
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            bufsize=0,
         ) as child:
             deadline = time.monotonic() + 5
             while not marker.is_file() or not marker.stat().st_size:
                 assert child.poll() is None and time.monotonic() < deadline
                 time.sleep(0.01)
+            ready, _, _ = select.select([child.stdout], [], [], 2)
+            assert ready and child.poll() is None, "No progress while probe was running"
+            first = child.stdout.readline()
+            assert first.decode() == PROGRESS + "uptime\n", first
             stdout, stderr = child.communicate(b"stop\n", timeout=6)
             assert child.returncode == 0, stderr
-        status, reason, checks = parse_report(stdout)
+        status, reason, progress, checks = parse_report(first + stdout)
         assert status != 0 and reason == ["stopped"], (status, reason)
+        assert progress == ["uptime"], progress
         assert checks["uptime"][0] == "0" and checks["uptime"][1], checks
         assert checks["mpstat"][0] == "-", checks["mpstat"]
         scratch = Path(checks["top"][1].decode().strip())
@@ -87,8 +103,9 @@ wait
 
 
 def main():
-    status, checks = collect(SUPERVISOR, WORKER)
+    status, progress, checks = collect(SUPERVISOR, WORKER)
     assert status == 0, status
+    assert set(progress) == set(IDS), progress
     for name in ["uptime", "vmstat", "free"]:
         assert checks[name][0] == "0" and checks[name][1], name
     assert checks["top"][1] and (
@@ -104,8 +121,9 @@ run_check mpstat sleep 30 &
 printf '%s\\n' "$work" > "$work/top.out"
 wait
 """
-    status, checks = collect(SUPERVISOR.replace(" 50s ", " 2s "), workers)
+    status, progress, checks = collect(SUPERVISOR.replace(" 50s ", " 2s "), workers)
     assert status == 124, status
+    assert set(progress) == {"uptime", "free"}, progress
     assert len(checks["free"][1]) == 16384, checks["free"][0]
     assert checks["mpstat"][0] == "-", checks["mpstat"]
     directory = Path(checks["top"][1].decode().strip())

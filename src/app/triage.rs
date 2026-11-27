@@ -12,6 +12,7 @@ pub enum Action {
     Close,
     Review,
     Run,
+    Progress(Arc<()>, usize, usize),
     Stop(Arc<()>),
     OpenReport,
     SaveReport,
@@ -48,6 +49,7 @@ pub(super) struct Panel {
     status: Option<String>,
     pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
+    progress_timer: Option<crate::ui_timer::RetryTimer>,
     path: Option<PathBuf>,
     profile_source: Option<Connection>,
     busy_processes: Vec<processes::Process>,
@@ -140,6 +142,13 @@ impl Panel {
         ];
         if let Some(status) = &self.status {
             fields.push(detail("status", display_output(status)));
+        }
+        if let Some(progress) = self
+            .activity
+            .as_ref()
+            .and_then(diagnostics::Activity::running_progress)
+        {
+            fields.push(detail("progress", progress));
         }
         if let Some((stop, ticket)) = self.stop.as_ref().zip(self.pending.as_ref()) {
             let ticket = ticket.clone();
@@ -524,10 +533,24 @@ impl TerminalApp {
                 generation: plan.connection_generation,
             };
             let (user, host, port) = (plan.user.clone(), plan.host.clone(), plan.port);
+            let total = plan.probes.len();
             let ticket = self.triage.begin("Collecting Linux performance samples…");
             self.triage.activity = Some(diagnostics::Activity::start(&ticket, &user, &host, port));
             let stop = CaptureStop::default();
             self.triage.stop = Some(stop.clone());
+            let (progress, observed) = tokio::sync::watch::channel(0);
+            let sender = ctx.sender();
+            let running = ticket.clone();
+            let mut delivered = 0;
+            self.triage.progress_timer = crate::ui_timer::RetryTimer::new(move || {
+                let count = *observed.borrow();
+                if count > delivered
+                    && sender.send(message(Action::Progress(running.clone(), count, total)))
+                {
+                    delivered = count;
+                }
+            })
+            .ok();
             let rejected = message(Action::Finished(
                 ticket.clone(),
                 Err("Triage worker unavailable".into()),
@@ -535,7 +558,7 @@ impl TerminalApp {
             ctx.spawn_background_with_rejection(
                 move |_| {
                     let result = target
-                        .collect_blocking_with_stop(&stop)
+                        .collect_blocking_with_progress(&stop, progress)
                         .map(|report| {
                             Some(Outcome::Report {
                                 report: Arc::new(report),
@@ -553,6 +576,12 @@ impl TerminalApp {
         let panel = &mut self.triage;
         match action {
             Action::Close => panel.open = false,
+            Action::Progress(ticket, count, total) => {
+                if let Some(activity) = &mut panel.activity {
+                    activity
+                        .record_progress(&ticket, format!("{count} of {total} checks finished"));
+                }
+            }
             Action::Stop(ticket)
                 if panel
                     .pending
@@ -654,6 +683,7 @@ impl TerminalApp {
                     .is_some() =>
             {
                 panel.stop = None;
+                panel.progress_timer = None;
                 panel.status = None;
                 if let Some(activity) = &mut panel.activity {
                     activity.finish(&ticket, &result, |outcome| {
