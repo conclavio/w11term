@@ -1505,6 +1505,8 @@ Expand **IP conversations** to see up to ten outer IPv4 or IPv6 address pairs ra
 
 Select a ranked pair and choose **Open conversation in Wireshark** to open the original capture with both directions of that outer IP pair. The filter uses the layer operator in Wireshark 4.0 or later. [Wireshark layer filters](https://www.wireshark.org/docs/man-pages/wireshark-filter.html#_the_layer_operator) · [Wireshark 4.0 release notes](https://www.wireshark.org/docs/relnotes/wireshark-4.0.0.html)
 
+Turn on **Limit to timeline interval** to apply the selected packet interval as well. The checkbox shows the start and end relative to the timeline start. The interval includes its start and excludes its end. Choose a different interval in **Packet timeline** to change those bounds. The selection remains in effect when the timeline is collapsed. The checkbox starts off for each opened capture.
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

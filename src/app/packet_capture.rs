@@ -8,8 +8,8 @@ use w11term::{
     control::PacketCaptureOptions,
     ssh::{
         CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureInterfaces, PacketCapturePlan,
-        open_capture_conversation_in_wireshark, open_capture_in_wireshark,
-        open_capture_interval_in_wireshark,
+        open_capture_conversation_in_wireshark, open_capture_conversation_interval_in_wireshark,
+        open_capture_in_wireshark, open_capture_interval_in_wireshark,
     },
 };
 
@@ -38,6 +38,7 @@ pub enum Action {
     SelectTimelineInterval(PathBuf, usize),
     ConversationsExpanded(bool),
     SelectConversation(PathBuf, Option<usize>),
+    LimitConversationInterval(PathBuf, bool),
     Tmpfs(bool),
     Review,
     Save,
@@ -45,7 +46,7 @@ pub enum Action {
     OpenCaptureFile(Option<PathBuf>),
     ChooseWireshark,
     OpenWireshark,
-    OpenTimelineInterval(PathBuf, usize),
+    OpenTimelineInterval(PathBuf),
     OpenConversation(PathBuf),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
@@ -69,7 +70,7 @@ enum FileChoice {
 
 enum WiresharkFilter {
     Interval(Range<i128>),
-    Conversation(IpAddr, IpAddr),
+    Conversation(IpAddr, IpAddr, Option<Range<i128>>),
 }
 
 enum LoadedCapture {
@@ -193,6 +194,7 @@ pub(super) struct Panel {
     timeline_interval: Option<usize>,
     conversations_expanded: bool,
     selected_conversation: Option<usize>,
+    limit_conversation_interval: bool,
     wireshark: Option<PathBuf>,
     pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
@@ -516,11 +518,7 @@ impl Panel {
             }
             if let Some(timeline) = &summary.timeline {
                 let buckets: Vec<_> = timeline.buckets().collect();
-                if let Some((peak_index, peak)) = buckets
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(index, bucket)| (bucket.packets, std::cmp::Reverse(*index)))
-                {
+                if let Some((peak_index, peak)) = timeline.peak() {
                     const CHART_HEIGHT: f64 = 56.0;
                     let width = timeline.bucket_width_ns();
                     let selected = self
@@ -618,7 +616,7 @@ impl Panel {
                                     .text_wrapping(TextWrapping::Wrap),
                                 selection,
                                 Button::new().is_enabled(idle)
-                                    .on_click(ctx.callback(move |_| message(Action::OpenTimelineInterval(open_path.clone(), peak_index))))
+                                    .on_click(ctx.callback(move |_| message(Action::OpenTimelineInterval(open_path.clone()))))
                                     .content("Open interval in Wireshark"),
                             ))),
                         ])));
@@ -686,16 +684,40 @@ impl Panel {
                     rows.extend([
                         text("rank-order", "Ranked by captured bytes"),
                         KeyedView::new("ranked-conversations", list),
-                        KeyedView::new(
-                            "open-conversation",
-                            Button::new()
-                                .is_enabled(idle && self.selected_conversation.is_some())
-                                .on_click(ctx.callback(move |_| {
-                                    message(Action::OpenConversation(open_path.clone()))
-                                }))
-                                .content("Open conversation in Wireshark"),
-                        ),
                     ]);
+                    if let Some(timeline) = &summary.timeline
+                        && let Some(start) = timeline.start_unix_ns()
+                        && let Some(interval) = timeline.selected_interval(self.timeline_interval)
+                    {
+                        let scope_path = capture.path.clone();
+                        let label = format!(
+                            "Limit to timeline interval · +{} to +{} s",
+                            seconds_text(interval.start.abs_diff(start)),
+                            seconds_text(interval.end.abs_diff(start))
+                        );
+                        rows.push(KeyedView::new(
+                            "conversation-interval",
+                            CheckBox::new()
+                                .is_checked(self.limit_conversation_interval)
+                                .is_enabled(idle)
+                                .on_is_checked_changed(ctx.callback(move |checked| {
+                                    message(Action::LimitConversationInterval(
+                                        scope_path.clone(),
+                                        checked,
+                                    ))
+                                }))
+                                .content(label),
+                        ));
+                    }
+                    rows.push(KeyedView::new(
+                        "open-conversation",
+                        Button::new()
+                            .is_enabled(idle && self.selected_conversation.is_some())
+                            .on_click(ctx.callback(move |_| {
+                                message(Action::OpenConversation(open_path.clone()))
+                            }))
+                            .content("Open conversation in Wireshark"),
+                    ));
                 }
                 files.push(KeyedView::new(
                     "local-conversations",
@@ -1008,6 +1030,14 @@ impl TerminalApp {
                         index.filter(|&index| index < capture.summary.conversations.top.len());
                 }
             }
+            Action::LimitConversationInterval(path, limit) => {
+                if let Some(LoadedCapture::Local(capture)) = &panel.loaded
+                    && capture.path == path
+                    && capture.summary.timeline.is_some()
+                {
+                    panel.limit_conversation_interval = limit;
+                }
+            }
             Action::SelectTimelineInterval(path, index) => {
                 if let Some(LoadedCapture::Local(capture)) = &panel.loaded
                     && capture.path == path
@@ -1039,13 +1069,11 @@ impl TerminalApp {
                 let Some(capture) = &panel.loaded else { return };
                 let filter = match (action, capture) {
                     (Action::OpenWireshark, _) => None,
-                    (
-                        Action::OpenTimelineInterval(path, peak_index),
-                        LoadedCapture::Local(local),
-                    ) if panel.timeline_expanded && local.path == path => {
+                    (Action::OpenTimelineInterval(path), LoadedCapture::Local(local))
+                        if panel.timeline_expanded && local.path == path =>
+                    {
                         let Some(interval) = local.summary.timeline.as_ref().and_then(|timeline| {
-                            timeline
-                                .occupied_interval(panel.timeline_interval.unwrap_or(peak_index))
+                            timeline.selected_interval(panel.timeline_interval)
                         }) else {
                             return;
                         };
@@ -1060,7 +1088,19 @@ impl TerminalApp {
                         else {
                             return;
                         };
-                        Some(WiresharkFilter::Conversation(pair.a, pair.b))
+                        let interval = if panel.limit_conversation_interval {
+                            let Some(interval) =
+                                local.summary.timeline.as_ref().and_then(|timeline| {
+                                    timeline.selected_interval(panel.timeline_interval)
+                                })
+                            else {
+                                return;
+                            };
+                            Some(interval)
+                        } else {
+                            None
+                        };
+                        Some(WiresharkFilter::Conversation(pair.a, pair.b, interval))
                     }
                     _ => return,
                 };
@@ -1076,8 +1116,17 @@ impl TerminalApp {
                         Some(WiresharkFilter::Interval(interval)) => {
                             open_capture_interval_in_wireshark(&capture, &executable, interval)
                         }
-                        Some(WiresharkFilter::Conversation(a, b)) => {
+                        Some(WiresharkFilter::Conversation(a, b, None)) => {
                             open_capture_conversation_in_wireshark(&capture, &executable, a, b)
+                        }
+                        Some(WiresharkFilter::Conversation(a, b, Some(interval))) => {
+                            open_capture_conversation_interval_in_wireshark(
+                                &capture,
+                                &executable,
+                                a,
+                                b,
+                                interval,
+                            )
                         }
                     }?;
                     Ok(Some(Outcome::Opened))
@@ -1254,6 +1303,7 @@ impl TerminalApp {
                 panel.timeline_interval = None;
                 panel.conversations_expanded = false;
                 panel.selected_conversation = None;
+                panel.limit_conversation_interval = false;
                 panel.activity = None;
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,

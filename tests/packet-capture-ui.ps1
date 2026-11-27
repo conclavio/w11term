@@ -266,6 +266,16 @@ try {
     $null = Wait-Until 'the conversation capture opens offline' {
         Find-Element $conversationCapture
     }
+    $conversationTimeline = Open-PacketSection 'packet-timeline'
+    $intervals = Wait-Until 'the conversation capture has a timeline picker' {
+        Find-Element 'Packet timeline intervals' ([System.Windows.Automation.ControlType]::ComboBox)
+    }
+    $intervals.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $reverseInterval = Wait-Until 'the interval containing the reverse IPv4 packet can be selected' {
+        Find-Element "+1.048576 s${dot}1 packet" ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $reverseInterval.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $conversationTimeline.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     $expander = Open-PacketSection 'packet-ip-conversations'
     $null = Wait-Until 'the address pair shows totals and bytes in both directions' {
         (Find-Element "192.0.2.1 $bothDirections 192.0.2.2" -Visible) -and
@@ -290,8 +300,15 @@ try {
         '((ip.src#1 == 192.0.2.1 && ip.dst#1 == 192.0.2.2) || (ip.src#1 == 192.0.2.2 && ip.dst#1 == 192.0.2.1))'
     $ipv6Filter = 'frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ipv6(?::|$)" && ' +
         '((ipv6.src#1 == 2001:db8::1 && ipv6.dst#1 == 2001:db8::2) || (ipv6.src#1 == 2001:db8::2 && ipv6.dst#1 == 2001:db8::1))'
+    $limitedIpv4Filter = "($ipv4Filter) && " +
+        '(frame.time >= "1970-01-01T00:00:01.966080000Z" && frame.time < "1970-01-01T00:00:02.097152000Z")'
     Open-Conversation "192.0.2.1 $bothDirections 192.0.2.2" $ipv4Filter
     Open-Conversation "2001:db8::1 $bothDirections 2001:db8::2" $ipv6Filter
+    $scopeLabel = "Limit to timeline interval${dot}+1.048576 to +1.179648 s"
+    (Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    Open-Conversation "192.0.2.1 $bothDirections 192.0.2.2" $limitedIpv4Filter
+    (Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::On)).Toggle()
+    Open-Conversation "192.0.2.1 $bothDirections 192.0.2.2" $ipv4Filter
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'

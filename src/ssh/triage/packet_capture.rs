@@ -450,6 +450,27 @@ pub fn open_capture_conversation_in_wireshark(
     launch_wireshark(path, executable, Some(&filter))
 }
 
+pub fn open_capture_conversation_interval_in_wireshark(
+    path: &Path,
+    executable: &Path,
+    a: IpAddr,
+    b: IpAddr,
+    interval: Range<i128>,
+) -> Result<u32> {
+    let filter = wireshark_conversation_interval_filter(a, b, interval)?;
+    launch_wireshark(path, executable, Some(&filter))
+}
+
+fn wireshark_conversation_interval_filter(
+    a: IpAddr,
+    b: IpAddr,
+    interval: Range<i128>,
+) -> Result<String> {
+    let conversation = wireshark_conversation_filter(a, b)?;
+    let interval = wireshark_interval_filter(interval)?;
+    Ok(format!("({conversation}) && ({interval})"))
+}
+
 fn wireshark_conversation_filter(a: IpAddr, b: IpAddr) -> Result<String> {
     let protocol = match (a, b) {
         (IpAddr::V4(_), IpAddr::V4(_)) => "ip",
@@ -833,6 +854,22 @@ mod tests {
         );
         assert!(wireshark_interval_filter(0..0).is_err());
         assert!(wireshark_interval_filter(0..i128::MAX).is_err());
+    }
+
+    #[test]
+    fn wireshark_combines_the_entire_bidirectional_filter_with_exact_time_bounds() {
+        let a = "192.0.2.1".parse().unwrap();
+        let b = "192.0.2.2".parse().unwrap();
+        assert_eq!(
+            wireshark_conversation_interval_filter(a, b, 1_966_080_000..2_097_152_000).unwrap(),
+            concat!(
+                r#"(frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip(?::|$)" && "#,
+                "((ip.src#1 == 192.0.2.1 && ip.dst#1 == 192.0.2.2) || ",
+                "(ip.src#1 == 192.0.2.2 && ip.dst#1 == 192.0.2.1))) && ",
+                r#"(frame.time >= "1970-01-01T00:00:01.966080000Z" && frame.time < "1970-01-01T00:00:02.097152000Z")"#,
+            )
+        );
+        assert!(wireshark_conversation_interval_filter(a, b, 0..0).is_err());
     }
 
     #[test]

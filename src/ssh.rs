@@ -35,8 +35,8 @@ pub use triage::cpu_profile::{
 pub use triage::packet_capture::{
     Capture as PacketCapture, CaptureInterfaces as PacketCaptureInterfaces,
     LocalCapture as LocalPacketCapture, Plan as PacketCapturePlan,
-    open_capture_conversation_in_wireshark, open_capture_in_wireshark,
-    open_capture_interval_in_wireshark,
+    open_capture_conversation_in_wireshark, open_capture_conversation_interval_in_wireshark,
+    open_capture_in_wireshark, open_capture_interval_in_wireshark,
 };
 pub use triage::syscall_capture::{Capture as SyscallCapture, Plan as SyscallCapturePlan};
 pub use triage::{

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::{collections::BTreeMap, mem, ops::Range};
+use std::{cmp::Reverse, collections::BTreeMap, mem, ops::Range};
 
 const MIN_BUCKET_NS: i128 = 1_000;
 const MAX_BUCKETS: i128 = 64;
@@ -63,6 +63,19 @@ impl Timeline {
         self.width as u128
     }
 
+    pub fn peak(&self) -> Option<(usize, Bucket)> {
+        let (&first, _) = self.bins.first_key_value()?;
+        self.bins
+            .iter()
+            .max_by_key(|&(&index, bucket)| (bucket.packets, Reverse(index)))
+            .map(|(&index, &bucket)| ((index - first) as usize, bucket))
+    }
+
+    pub fn selected_interval(&self, selected: Option<usize>) -> Option<Range<i128>> {
+        let bucket = selected.or_else(|| self.peak().map(|(index, _)| index))?;
+        self.occupied_interval(bucket)
+    }
+
     pub fn occupied_interval(&self, bucket: usize) -> Option<Range<i128>> {
         let (&first, _) = self.bins.first_key_value()?;
         let index = first.checked_add(i128::try_from(bucket).ok()?)?;
@@ -110,5 +123,9 @@ mod tests {
         assert_eq!(timeline.occupied_interval(33), None);
         assert_eq!(timeline.occupied_interval(34), Some(4_000..8_000));
         assert_eq!(timeline.occupied_interval(35), None);
+        assert_eq!(timeline.peak().map(|(index, _)| index), Some(34));
+        assert_eq!(timeline.selected_interval(Some(32)), Some(-4_000..0));
+        assert_eq!(timeline.selected_interval(None), Some(4_000..8_000));
+        assert_eq!(timeline.selected_interval(Some(33)), None);
     }
 }
