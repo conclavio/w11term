@@ -465,7 +465,7 @@ impl Panel {
                             TextBox::new()
                                 .element_ref(&self.query_field)
                                 .automation_name("Search command reference")
-                                .placeholder_text("Find a command")
+                                .placeholder_text("Find a command or task")
                                 .text(&self.query)
                                 .on_text_changed(ctx.callback(|text| {
                                     Message::CommandReference(Action::Query(text))

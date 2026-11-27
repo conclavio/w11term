@@ -82,6 +82,7 @@ pub(super) struct Page {
     pub link: Option<String>,
     pub examples: Vec<Example>,
     pub source: PageSource,
+    search_words: Vec<Box<str>>,
 }
 
 impl Page {
@@ -119,14 +120,49 @@ impl Page {
                 });
             }
         }
+        let search_text = std::iter::once(title)
+            .chain(description.iter().copied())
+            .chain(examples.iter().map(|example| example.description.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let mut search_words: Vec<Box<str>> = keywords(&search_text).map(Box::from).collect();
+        search_words.sort_unstable();
+        search_words.dedup();
         Some(Self {
             title: title.to_owned(),
             description: description.join("\n"),
             link,
             examples,
             source,
+            search_words,
         })
     }
+}
+
+fn keywords(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|ch: char| !ch.is_alphanumeric()).filter(|word| {
+        !matches!(
+            *word,
+            "" | "a"
+                | "an"
+                | "and"
+                | "by"
+                | "do"
+                | "for"
+                | "from"
+                | "how"
+                | "i"
+                | "in"
+                | "is"
+                | "of"
+                | "on"
+                | "or"
+                | "the"
+                | "to"
+                | "with"
+        )
+    })
 }
 
 pub(super) fn insertable(text: &str) -> bool {
@@ -286,6 +322,11 @@ impl Catalog {
     }
 
     pub(super) fn search(&self, text: &str, preferred: Platform) -> Vec<(&Key, &Page)> {
+        let task = text.to_lowercase();
+        let mut terms: Vec<_> = keywords(&task).collect();
+        terms.sort_unstable();
+        terms.dedup();
+        let search_content = terms.iter().any(|term| term.chars().count() >= 3);
         let text = query(text);
         if text.is_empty() {
             return Vec::new();
@@ -294,21 +335,30 @@ impl Catalog {
             .pages
             .iter()
             .filter_map(|(key, page)| {
-                let rank = if key.name == text {
-                    0
-                } else if key.name.starts_with(&text) || (text == "mddog" && key.name == "mdd") {
-                    1
-                } else if key.name.contains(&text) {
-                    2
-                } else {
-                    return None;
-                };
                 let platform = if key.platform == preferred {
                     0
                 } else if key.platform == COMMON {
                     1
                 } else {
                     2
+                };
+                let rank = if key.name == text {
+                    0
+                } else if key.name.starts_with(&text) || (text == "mddog" && key.name == "mdd") {
+                    1
+                } else if key.name.contains(&text) {
+                    2
+                } else if platform < 2
+                    && search_content
+                    && terms.iter().all(|term| {
+                        page.search_words
+                            .binary_search_by(|word| word.as_ref().cmp(term))
+                            .is_ok()
+                    })
+                {
+                    3
+                } else {
+                    return None;
                 };
                 Some((
                     (rank, platform, key.name.as_str(), key.platform),
@@ -432,6 +482,51 @@ mod tests {
         assert_eq!(catalog.exact("rg", LINUX).unwrap().platform, COMMON);
         assert!(catalog.exact("get-childitem", LINUX).is_none());
         assert!(catalog.exact("git check", LINUX).is_none());
+    }
+
+    #[test]
+    fn task_search_ranks_names_first_and_uses_the_selected_platform() {
+        let mut catalog = Catalog {
+            pages: BTreeMap::new(),
+        };
+        for (platform, name, markdown) in [
+            (WINDOWS, "meter", "# meter\n> Collect timings."),
+            (
+                WINDOWS,
+                "clock",
+                "# clock\n> Measure time.\n- Use a meter:\n`clock --hiddenflag`",
+            ),
+            (COMMON, "timer", "# timer\n> Measure time with a meter."),
+            (
+                LINUX,
+                "time",
+                "# time\n> Measure command time with a meter.",
+            ),
+        ] {
+            catalog.set_private_page(
+                Key {
+                    platform,
+                    name: name.into(),
+                },
+                Page::parse(markdown, PageSource::Custom).unwrap(),
+            );
+        }
+        let matches = |text, platform| {
+            catalog
+                .search(text, platform)
+                .into_iter()
+                .map(|(key, _)| key.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matches("meter", WINDOWS), ["meter", "clock", "timer"]);
+        assert_eq!(
+            matches("How do I MEASURE time with a meter?", WINDOWS),
+            ["clock", "timer"]
+        );
+        assert_eq!(matches("measure time", LINUX), ["time", "timer"]);
+        assert_eq!(matches("time", WINDOWS), ["time", "timer", "clock"]);
+        assert!(matches("hiddenflag", WINDOWS).is_empty());
+        assert!(matches("with the", WINDOWS).is_empty());
     }
 
     #[test]

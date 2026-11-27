@@ -94,6 +94,10 @@ try {
     Wait-Platform 'Auto (Windows)'
     if (Find-Element 'Installed SSH tools' $button) { throw 'A PowerShell pane offered SSH tool lookup' }
     Search 'rg' 'Common'
+    Set-Field 'Search command reference' 'comparative benchmark'
+    $null = Wait-Until 'task search finds the offline hyperfine page' {
+        (Find-Element 'hyperfine') -and (Find-Element "Common${dot}tldr-pages (CC BY 4.0)")
+    }
     Set-Field 'Search command reference' 'mddog'
     $null = Wait-Until 'project name finds the bundled mdd manual offline' {
         (Find-Element 'mdd') -and (Find-Element "Linux${dot}w11term manual")
@@ -251,7 +255,7 @@ try {
     $manual = @'
 # Crew runbook
 
-> Check crew status.
+> Check the crew rotation.
 
 - Show report:
 
@@ -284,6 +288,11 @@ try {
     $null = Wait-Until 'closed command reference before reload' { !(Find-Element 'Search command reference' $edit) }
     Run-Palette 'Command reference'
     $null = Wait-Until 'the offline catalogue displays the edited page after reopening' { Find-Element 'Crew runbook updated' }
+    Search 'ip' 'Linux'
+    Set-Field 'Search command reference' 'crew rotation'
+    $null = Wait-Until 'task search finds the private Linux manual by description' {
+        (Find-Element 'Crew runbook updated') -and (Find-Element "Linux${dot}Custom page")
+    }
     if ([IO.File]::ReadAllText($wire)) { throw 'Browsing or editing a manual wrote to the SSH shell' }
     Search 'ip' 'Linux'
     Click 'Edit example 1'

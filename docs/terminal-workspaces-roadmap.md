@@ -327,11 +327,11 @@ Ship selection explanation and Bash drafting with a shared request preview, then
 
 ## Command reference
 
-Open **More → Command reference** for a Tealdeer-style side panel. Search for a command or subcommand, or look up a command selected in the pane. Each page shows common invocations and links to upstream documentation when available. Copy an example or edit its placeholders before inserting it into the active shell. Submitting the command takes a separate Enter in the terminal. [Tealdeer](https://github.com/tealdeer-rs/tealdeer)
+Open **More → Command reference** for a Tealdeer-style side panel. Search by command, subcommand, or task, or look up a command selected in the pane. Task search reads page descriptions and example labels for the chosen platform and common pages. Each page shows common invocations and links to upstream documentation when available. Copy an example or edit its placeholders before inserting it into the active shell. Submitting the command takes a separate Enter in the terminal. [Tealdeer](https://github.com/tealdeer-rs/tealdeer)
 
 English tldr-pages are bundled for offline lookup. The platform defaults to Windows for local shells and Linux for WSL and SSH. Use the platform dropdown for a different remote OS. **Update pages** keeps a usable cache if refreshing fails, and **New private page** adds a local manual for the selected platform. w11term bundles pages for `diskwatch`, `mdd`, and `netwatch` alongside the upstream collection. [tldr-pages client specification](https://github.com/tldr-pages/tldr/blob/main/CLIENT-SPECIFICATION.md)
 
-**Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
+**Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities
 
