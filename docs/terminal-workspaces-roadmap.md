@@ -20,6 +20,8 @@ The [Windows folder sharing roadmap](#mount-selected-windows-folders-on-a-linux-
 
 The [SSH host groups roadmap](#ssh-host-groups) covers running the same command across live remote shells from a single Windows tab.
 
+The [SSH diagnostics roadmap](#ssh-diagnostics) covers remote packet and syscall capture, Windows analysis, and comparison of working and failing runs.
+
 ## Current capabilities
 
 Each terminal tab has its own session, scrollback, search state and programmable control surface. Scripts can target a background session by ID, write raw bytes, wait for a regex, read committed screen text, capture PNGs and record VT output. The same authenticated SSH connection also supports SFTP. Profiles already support creation, editing and renaming, plus key, agent, password and keyboard-interactive authentication. [Current features](../README.md#tabs-and-profiles) · [Control and SFTP API](../CONTROL.md)
@@ -272,6 +274,30 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 154. **Retry reviewed unsent SSH commands from the CLI.** Resubmit the source command to explicitly named eligible panes and link the new run to each original recipient to prevent duplicate retries.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
+
+## SSH diagnostics
+
+Add **Diagnostics** for the selected Linux SSH pane. Review the verified host, target interface or binary, output destination, duration, and size limit before starting. Run the tool over a sibling channel on the pane's existing authenticated transport. Send progress and the stop reason to the Windows UI, and transfer finalized artifacts through SFTP. A server-side deadline and cleanup lease bound the job even if Windows disconnects.
+
+### Packet capture and Wireshark
+
+- Choose an interface, an optional capture filter, and a snap length. Start with `tcpdump -i IFACE -nn -p -s SNAPLEN -w CAPTURE`, use `-c` for an optional packet limit, and show the effective arguments before starting. Offer bounded rotation with `-C` and `-W` where supported, and show when the ring overwrites older files. Leave room for a final packet beyond a rotation threshold and enforce a separate total storage ceiling. End the capture cleanly so tcpdump can flush the final file and report packet drops. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)
+- Use a private job directory on disk or an operator-selected, verified `tmpfs` mount. Check available capacity and reserve headroom before starting. Enforce bytes and file-count budgets per capture and across concurrent captures on the host. For RAM-backed capture, use a filesystem quota or a bounded writer with headroom for the final record. Show the reason when the selected location cannot meet the budget and let the operator choose a disk location.
+- Download completed captures to a local staging path. Check the captured size and, when available, a remote checksum before publishing the local file. Open the published capture with the configured Windows Wireshark executable using `-r` and the local path. Keep **Save capture** available when Wireshark is absent. Clean up remote artifacts after a verified transfer or when the retention period expires. [Wireshark command-line options](https://www.wireshark.org/docs/wsug_html_chunked/ChCustCommandLine.html)
+
+### Syscall capture and Windows viewer
+
+- Start a selected binary with explicit arguments and working directory under `strace`. Use `-ff -o TRACE` to follow descendants and write per-process traces, `-ttt` for event timestamps, `-T` for syscall duration, `-yy` for descriptor details, and a bounded `-s` string length. Choose an interruptible mode for Stop and specify whether stopping detaches or terminates the binary launched by the job. Offer capture presets for file, process, and network calls and preserve the original trace alongside the parsed view. Apply a total output budget across all child traces and report truncation or a lost child trace explicitly. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+- Open completed traces or import existing traces into a Windows diagnostics tab. Group repetitive adjacent calls by process, syscall, resource, and outcome. Show counts and elapsed time, and expand groups to the original lines. Promote process transitions, file opens and closes, unusual delays, and errno results. Keep expected fallback errors visible and distinguish them from failures with no successful fallback in the observed trace.
+- Give each open handle a lifetime through `openat`, socket or pipe creation, duplication, inherited handles, and closure. Distinguish a reused descriptor number from the earlier handle. Track shared descriptor tables and close-on-exec. A file view should show which processes opened it, what they did with it, and where each handle was closed. Preserve unknown or incomplete events as such.
+
+### Compare a working run with a failing run
+
+Align the traces by executable and process lineage, then by syscall, resource, and sequence within each process. Map transient PIDs and descriptor numbers to their logical identities. Show added or missing calls, changes in return values or errno, count differences, and the first meaningful divergence. Show timing as elapsed time from run start or a paired event, plus per-call duration deltas. Let users expand uncertain matches and inspect the two original trace lines.
+
+**Ship order.** Start with capture, transfer, cleanup, and Wireshark launch. Add bounded strace capture and offline viewing with handle tracking next. Follow with side-by-side comparison.
+
+**Acceptance.** Capture a known loopback exchange on a Linux fixture and open the verified file in Windows Wireshark. Exercise the RAM budget and disconnect the client mid-capture to verify bounded storage, a stopped job, and cleanup. Trace working and failing runs of the same binary with shifted clocks and different descriptor numbers. Verify the comparison identifies the path of a failed file open, changed result, and relative timing. Include a reused descriptor and a repetitive read loop to check lifecycle tracking and expansion to raw evidence.
 
 ## Subsequent features for RustMUSH
 
