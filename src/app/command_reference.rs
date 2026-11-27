@@ -742,12 +742,12 @@ impl TerminalApp {
                 .and_then(|target| self.reference_selection(target)),
             _ => None,
         };
+        if matches!(action, Action::Open | Action::Selection(_)) {
+            self.set_diagnostics_drawer(None);
+        }
         let panel = &mut self.command_reference;
         match action {
             Action::Open | Action::Selection(_) => {
-                self.triage.open = false;
-                self.flame_graph.open = false;
-                self.packet_capture.open = false;
                 if panel.private_page.is_some() || panel.tool_install.is_some() {
                     return;
                 }

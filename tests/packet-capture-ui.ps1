@@ -48,10 +48,40 @@ $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profile
 try {
     $window = Wait-InputWindow
     $local = (Sessions | Where-Object label -eq 'Palette PowerShell').id
+    Invoke-Button (Get-NativeMenuAction 'Tab menu' 'Diagnostics overview' -Submenu 'Diagnostics')
+    $null = Wait-Until 'overview shown alongside local PowerShell' {
+        (Find-Element 'Diagnostics overview panel') -and
+            (Find-Element 'Select a connected Linux SSH pane to run diagnostics.')
+    }
+    Click 'CPU flame graph'
+    $null = Wait-Until 'flame graph can open a saved artifact offline' {
+        $openStacks = Find-Element 'Open folded stacks' $button
+        $captureSsh = Find-Element 'Capture from SSH' $button
+        $openStacks -and $openStacks.Current.IsEnabled -and $captureSsh -and !$captureSsh.Current.IsEnabled -and
+            !(Find-Element 'Diagnostics overview panel')
+    }
+    Click 'Return to diagnostics overview'
+    $null = Wait-Until 'returning from the flame graph restores the overview' { Find-Element 'Diagnostics overview panel' }
+    Click 'Syscall trace viewer'
+    $null = Wait-Until 'opening the offline syscall viewer dismisses the overview' {
+        (Find-Element ('Open syscall trace' + [char]0x2026) $button) -and !(Find-Element 'Diagnostics overview panel')
+    }
+    $null = Control @('focus-pane','--pane',"$local")
+    Wait-Focus $local
+    Run-Palette 'Diagnostics overview'
     $remote = (Control @('open','--profile','palette-ssh','--activate')).pane
     Wait-Focus $remote
     $null = Control @('wait-ssh-connected','--pane',"$remote",'--timeout','15')
-    Run-Palette 'Packet capture'
+    $sshProfile = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'
+    $null = Wait-Until 'overview updates to the authenticated SSH endpoint' {
+        Find-Element "SSH pane${dot}$($sshProfile.user)@$($sshProfile.host):$($sshProfile.port)"
+    }
+    Click 'Linux performance triage'
+    $null = Wait-Until 'triage offers a separately reviewed run on the selected pane' {
+        (Find-Element 'Review selected SSH pane' $button) -and !(Find-Element 'Diagnostics overview panel')
+    }
+    Click 'Return to diagnostics overview'
+    Click 'Packet capture'
     $catalog = Control @('list-packet-interfaces','--pane',"$remote")
     if (($catalog.interfaces.name -join ',') -cne 'eth0,any,lo' -or $catalog.truncated) {
         throw 'The CLI interface list did not match the reviewed SSH pane'
@@ -113,8 +143,14 @@ try {
     $null = Wait-Until 'enter the capture path' { [FixtureDialog]::SetFilename($dialog, $destination, 'packet-capture.pcap') }
     $null = Wait-Until 'save the capture path' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'tcpdump is running on the reviewed SSH pane' { [IO.File]::Exists($startMarker) }
+    Click 'Return to diagnostics overview'
     $null = Control @('focus-pane','--pane',"$local")
     Wait-Focus $local
+    $null = Wait-Until 'overview follows the active local pane while the capture runs' {
+        (Find-Element 'Diagnostics overview panel') -and
+            (Find-Element 'Select a connected Linux SSH pane to run diagnostics.')
+    }
+    Click 'Packet capture'
     Click 'Stop and save'
     $null = Wait-Until 'verified capture published on Windows' {
         (Find-Element 'Saved packet capture') -and (Find-Element 'Packets dropped by kernel 0') -and

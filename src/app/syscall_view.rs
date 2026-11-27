@@ -49,9 +49,7 @@ impl TerminalApp {
         if matches!(action, Action::Show) {
             let origin = self.profile_connection();
             self.command_reference.close();
-            self.triage.open = false;
-            self.flame_graph.open = false;
-            self.packet_capture.open = false;
+            self.set_diagnostics_drawer(None);
             let current = self
                 .tabs
                 .entries()

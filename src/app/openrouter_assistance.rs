@@ -121,9 +121,7 @@ impl TerminalApp {
     }
 
     fn show_openrouter(&mut self, task: Task, evidence: Evidence, ctx: &ComponentContext<Self>) {
-        self.triage.open = task == Task::Triage;
-        self.flame_graph.open = false;
-        self.packet_capture.open = false;
+        self.set_diagnostics_drawer((task == Task::Triage).then_some(diagnostics::Drawer::Triage));
         self.command_reference.close();
         let current = self
             .tabs

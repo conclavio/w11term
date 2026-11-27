@@ -444,18 +444,12 @@ impl Panel {
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .children((
-                Grid::new()
-                    .columns([GridLength::Star(1.0), GridLength::Auto])
-                    .column_spacing(8.0)
-                    .margin(12.0)
-                    .children((
-                        TextBlock::new().text(LABEL).font_size(18.0),
-                        Button::new()
-                            .grid_column(1)
-                            .automation_name("Close packet capture")
-                            .on_click(ctx.callback(|_| message(Action::Close)))
-                            .content("Close"),
-                    )),
+                Border::new().margin(12.0).content(diagnostics::header(
+                    LABEL,
+                    "Close packet capture",
+                    ctx.callback(|_| message(Action::Close)),
+                    ctx,
+                )),
                 Border::new().grid_row(1).padding(12.0).content(
                     ScrollViewer::new()
                         .content(StackPanel::new().spacing(8.0).keyed_children(fields)),
@@ -493,9 +487,7 @@ impl TerminalApp {
         match action {
             Action::Open => {
                 self.command_reference.close();
-                self.triage.open = false;
-                self.flame_graph.open = false;
-                self.packet_capture.open = true;
+                self.set_diagnostics_drawer(Some(diagnostics::Drawer::PacketCapture));
             }
             Action::Close => self.packet_capture.open = false,
             Action::Stop(ticket) => {

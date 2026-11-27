@@ -83,6 +83,7 @@ use file_drawer::{FileAction, FileDrawer};
 mod accessibility_smoke;
 mod command_palette;
 mod command_reference;
+mod diagnostics;
 mod directory_split;
 mod disconnect_ssh;
 mod durable_view;
@@ -1049,6 +1050,7 @@ fn tab_menu_message(label: String) -> Message {
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         command_reference::LABEL => Message::CommandReference(command_reference::Action::Open),
+        diagnostics::LABEL => Message::Diagnostics(diagnostics::Action::Open),
         triage::LABEL => Message::Triage(triage::Action::Open),
         flame_graph::LABEL => Message::FlameGraph(flame_graph::Action::Open),
         packet_capture::LABEL => Message::PacketCapture(packet_capture::Action::Open),
@@ -1366,6 +1368,7 @@ pub struct TerminalApp {
     appearance_error: Option<String>,
     saved_commands: w11term::saved_commands::Commands,
     command_reference: command_reference::Panel,
+    diagnostics_open: bool,
     triage: triage::Panel,
     flame_graph: flame_graph::Panel,
     packet_capture: packet_capture::Panel,
@@ -1554,6 +1557,7 @@ pub enum Message {
     Patterns(pattern_settings::Edit),
     SavedCommands(saved_commands::Edit),
     CommandReference(command_reference::Action),
+    Diagnostics(diagnostics::Action),
     Triage(triage::Action),
     FlameGraph(flame_graph::Action),
     PacketCapture(packet_capture::Action),
@@ -4742,10 +4746,7 @@ impl TerminalApp {
                 KeyAction::FindCommandHistory,
             ),
             MenuItem::item("command-reference", command_reference::LABEL),
-            MenuItem::item("linux-triage", triage::LABEL),
-            MenuItem::item("cpu-flame-graph", flame_graph::LABEL),
-            MenuItem::item("packet-capture", packet_capture::LABEL),
-            MenuItem::item("syscall-trace-viewer", syscall_view::LABEL),
+            diagnostics::menu(),
             MenuItem::item("openrouter-draft", openrouter_assistance::DRAFT),
             command_menu_item(
                 "openrouter-explain",
@@ -5971,6 +5972,7 @@ impl Component for TerminalApp {
             appearance_error,
             saved_commands: Default::default(),
             command_reference: Default::default(),
+            diagnostics_open: false,
             triage: Default::default(),
             flame_graph: Default::default(),
             packet_capture: Default::default(),
@@ -6426,6 +6428,7 @@ impl Component for TerminalApp {
                     }
                     if (live.files.open
                         && !self.command_reference.open
+                        && !self.diagnostics_open
                         && !self.triage.open
                         && !self.packet_capture.open
                         && !self.flame_graph.open)
@@ -7815,6 +7818,7 @@ impl Component for TerminalApp {
             Message::Patterns(edit) => self.edit_patterns(edit),
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
             Message::CommandReference(action) => self.command_reference_action(action, context),
+            Message::Diagnostics(action) => self.diagnostics_action(action),
             Message::Triage(action) => self.triage_action(action, context),
             Message::FlameGraph(action) => self.flame_graph_action(action, context),
             Message::PacketCapture(action) => self.packet_capture_action(action, context),
@@ -8594,6 +8598,8 @@ impl Component for TerminalApp {
             self.with_flame_graph(content, context)
         } else if self.triage.open {
             self.with_triage(content, context)
+        } else if self.diagnostics_open {
+            self.with_diagnostics(content, context)
         } else if self.command_reference.open {
             self.with_command_reference(content, context)
         } else {

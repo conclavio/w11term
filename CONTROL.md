@@ -1443,9 +1443,15 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 & $ctl --pid 12345 sftp --pane $pane resume-tool-bundle-updates my-tools $activeSha256 --review $resume.review
 ```
 
+### Open SSH diagnostics
+
+Open **More → Diagnostics → Diagnostics overview** or search for **Diagnostics overview** in the command palette. The overview shows the connected SSH endpoint for the focused pane and updates when you switch panes. Use its entries to open Linux performance triage, CPU flame graph, packet capture, or the syscall trace viewer. The tools retain their direct command-palette entries.
+
+Use **Back** in the triage, flame graph, or packet capture panel to return to the overview. Open saved reports, folded stacks, and syscall traces even when you have no active SSH connection. Each live capture still has its own target review and start action.
+
 ### Capture Linux packets and open Wireshark
 
-In the Windows app, select a connected Linux SSH pane and open **More → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. **Stop and save** asks the running tcpdump to finish writing its capture, then transfers the verified file. The result reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
+In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. **Stop and save** asks the running tcpdump to finish writing its capture, then transfers the verified file. The result reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
 
 Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
 
@@ -1473,7 +1479,7 @@ SFTP transfers the completed file over the existing SSH connection. w11term chec
 
 ### Capture Linux syscalls
 
-In the Windows app, open **More → Syscall trace viewer → Capture over SSH…**. Select a connected SSH pane, enter a Linux executable and its arguments as a JSON array of strings, and choose a working directory, preset and limits. **Review syscall capture** verifies the endpoint and shows the resolved executable and exact strace arguments. **Trace and save…** asks for a new Windows file before starting. **Stop syscall capture** ends the launched command and saves the records collected so far. The viewer opens the verified trace automatically and shows the stop reason.
+In the Windows app, open **More → Diagnostics → Syscall trace viewer → Capture over SSH…**. Select a connected SSH pane, enter a Linux executable and its arguments as a JSON array of strings, and choose a working directory, preset and limits. **Review syscall capture** verifies the endpoint and shows the resolved executable and exact strace arguments. **Trace and save…** asks for a new Windows file before starting. **Stop syscall capture** ends the launched command and saves the records collected so far. The viewer opens the verified trace automatically and shows the stop reason.
 
 Use a connected Linux SSH pane with SFTP and a version of strace that supports `--kill-on-exit`. Review the working directory, executable identity, exact arguments, and capture bounds first. `--arg` can be repeated and each value is passed literally. The command runs as the remote SSH account with stdin, stdout, and stderr disconnected from the terminal.
 
@@ -1488,7 +1494,7 @@ From a separate prompt, `stop-syscall-capture --pane 1 --connection-generation G
 
 The original PID-tagged trace includes per-call timing and decoded descriptor details. One byte budget covers the full stream across descendants. w11term checks the SFTP download's size and SHA-256 before acknowledging remote cleanup and saving a new local file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
 
-Open **More → Syscall trace viewer** to inspect a saved trace offline. Open one combined log or select the files from the same `strace -ff` run together. Names ending in `.PID` identify the process for those split logs. Where every record has an epoch timestamp, w11term merges the files by time. Otherwise it keeps the files in their input order.
+Open **More → Diagnostics → Syscall trace viewer** to inspect a saved trace offline. Open one combined log or select the files from the same `strace -ff` run together. Names ending in `.PID` identify the process for those split logs. Where every record has an epoch timestamp, w11term merges the files by time. Otherwise it keeps the files in their input order.
 
 The viewer groups adjacent calls with the same process, syscall, resource, and outcome. Each group shows its count and available call duration. Select a group to review its original records, including the two lines for an unfinished and resumed call. Search by PID, name, resource, or errno, choose a filter, and select **Apply filters**. A missing absolute path is marked when the same process later succeeds on that path with the same syscall. The original error stays visible. w11term reads up to 64 MiB or one million records per selection. Very long lines are clipped in the preview and remain available in the source file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
 
@@ -1498,7 +1504,7 @@ Open the working capture and choose **Compare with failing trace…**. The compa
 
 ### Collect Linux performance triage
 
-In the Windows app, open **More → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.
+In the Windows app, open **More → Diagnostics → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.
 
 Findings summarize observed CPU activity and runnable tasks, available memory and swapping, disk activity and queueing, network traffic and TCP errors, and kernel-log evidence. Peaks use the collected interval rows and exclude the first vmstat row and sar averages. Missing or denied samples appear under their resource. The same findings are saved in the JSON report and can be derived when opening an earlier capture. [Linux performance checklist](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf) · [iostat metrics](https://github.com/sysstat/sysstat/blob/master/man/iostat.in) · [sar metrics](https://github.com/sysstat/sysstat/blob/master/man/sar.in)
 
@@ -1526,7 +1532,7 @@ The response appears as selectable text. **Copy response** puts it on the Window
 
 ### Capture a Linux CPU profile
 
-In the Windows app, select a connected Linux SSH pane and open **More → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. That list ranks processes by their peak reported interval CPU usage and fills in the PID from the live report. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in)
+In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. That list ranks processes by their peak reported interval CPU usage and fills in the PID from the live report. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in)
 
 Choose **Review CPU profile** to check the live process and verified SSH endpoint. Then choose **Record CPU profile** and a new local folded stacks file. Changes to the settings require a fresh review. Recording stays tied to the pane, connection, and process start time from review. The resulting file opens in the flame graph with the unresolved frame count and **Perf output**, when available.
 

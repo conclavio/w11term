@@ -82,7 +82,7 @@ fn status_label(status: TriageSampleStatus) -> &'static str {
     }
 }
 
-fn display_output(text: &str) -> String {
+pub(super) fn display_output(text: &str) -> String {
     let mut display = String::with_capacity(text.len());
     for c in text.chars() {
         if (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
@@ -186,21 +186,12 @@ impl Panel {
             .keyed_children([
                 KeyedView::new(
                     "heading",
-                    Grid::new()
-                        .columns([GridLength::Star(1.0), GridLength::Auto])
-                        .column_spacing(8.0)
-                        .margin(12.0)
-                        .children((
-                            TextBlock::new()
-                                .text(LABEL)
-                                .font_size(18.0)
-                                .text_wrapping(TextWrapping::Wrap),
-                            Button::new()
-                                .grid_column(1)
-                                .automation_name("Close performance triage")
-                                .on_click(send(|| Action::Close))
-                                .content("Close"),
-                        )),
+                    Border::new().margin(12.0).content(diagnostics::header(
+                        LABEL,
+                        "Close performance triage",
+                        send(|| Action::Close),
+                        ctx,
+                    )),
                 ),
                 KeyedView::new(
                     "body",
@@ -466,9 +457,7 @@ impl TerminalApp {
         }
         if matches!(action, Action::Open) {
             self.command_reference.close();
-            self.flame_graph.open = false;
-            self.packet_capture.open = false;
-            self.triage.open = true;
+            self.set_diagnostics_drawer(Some(diagnostics::Drawer::Triage));
             if self.triage.content.is_some() || self.triage.pending.is_some() {
                 return;
             }

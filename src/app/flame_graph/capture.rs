@@ -403,9 +403,7 @@ impl TerminalApp {
             return;
         }
         self.command_reference.close();
-        self.triage.open = false;
-        self.packet_capture.open = false;
-        self.flame_graph.open = true;
+        self.set_diagnostics_drawer(Some(diagnostics::Drawer::FlameGraph));
         self.flame_graph.status = None;
         self.flame_graph.capture = Some(Form::from_triage(connection, pid));
     }

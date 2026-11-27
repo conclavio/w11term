@@ -115,17 +115,7 @@ impl Panel {
         let idle = self.pending.is_none();
         let mut fields = vec![KeyedView::new(
             "header",
-            Grid::new()
-                .columns([GridLength::Star(1.0), GridLength::Auto])
-                .column_spacing(8.0)
-                .children((
-                    TextBlock::new().text(LABEL).font_size(19.0),
-                    Button::new()
-                        .grid_column(1)
-                        .automation_name("Close CPU flame graph")
-                        .on_click(send(|| Action::Close))
-                        .content("Close"),
-                )),
+            diagnostics::header(LABEL, "Close CPU flame graph", send(|| Action::Close), ctx),
         )];
         if let Some(status) = &self.status {
             fields.push(text("status", status));
@@ -408,9 +398,7 @@ impl TerminalApp {
         match action {
             Action::Open => {
                 self.command_reference.close();
-                self.triage.open = false;
-                self.packet_capture.open = false;
-                panel.open = true;
+                self.set_diagnostics_drawer(Some(diagnostics::Drawer::FlameGraph));
             }
             Action::Close => {
                 panel.open = false;

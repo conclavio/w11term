@@ -279,7 +279,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 
 ## SSH diagnostics
 
-Add **Diagnostics** for the selected Linux SSH pane. Review the verified host, target interface or binary, output destination, duration, and size limit before starting. Run the tool over a sibling channel on the pane's existing authenticated transport. Send progress and the stop reason to the Windows UI, and transfer finalized artifacts through SFTP. A server-side deadline and cleanup lease bound the job even if Windows disconnects.
+Open **More → Diagnostics** to choose a tool or see the connected endpoint in **Diagnostics overview**. Review the verified host, target interface or binary, output destination, duration, and size limit before starting. Run the tool over a sibling channel on the pane's existing authenticated transport. Send progress and the stop reason to the Windows UI, and transfer finalized artifacts through SFTP. A server-side deadline and cleanup lease bound the job even if Windows disconnects.
 
 ### Packet capture and Wireshark
 
