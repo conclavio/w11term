@@ -39,13 +39,27 @@ impl std::fmt::Display for LibcVersion {
 }
 
 impl Verified {
-    pub(super) fn read(build: &UtilityBuild, remaining: &mut u64) -> Result<Self> {
+    pub(super) fn read(build: &UtilityBuild, remaining: &mut u64) -> Result<(Self, PathBuf)> {
         let sha256 = normalize_sha256(&build.sha256)?;
-        let bytes = read_pinned(&build.path, &sha256, remaining)?;
-        Self::from_elf(build.architecture, &bytes, sha256)
+        let path = if build.download.is_some() {
+            super::downloads::cache_dir()?.join(&sha256)
+        } else {
+            build.path.clone()
+        };
+        let bytes = if build.download.is_some() {
+            read_pinned(&path, &sha256, remaining)
+                .context("Cached executable unavailable or invalid. Run w11term-cli fetch-tool-bundle for this manifest")?
+        } else {
+            read_pinned(&path, &sha256, remaining)?
+        };
+        Ok((Self::from_elf(build.architecture, &bytes, sha256)?, path))
     }
 
-    fn from_elf(architecture: UtilityArchitecture, bytes: &[u8], sha256: String) -> Result<Self> {
+    pub(super) fn from_elf(
+        architecture: UtilityArchitecture,
+        bytes: &[u8],
+        sha256: String,
+    ) -> Result<Self> {
         let elf = Elf::parse(bytes).context("Reading Linux ELF executable headers")?;
         let machine = match architecture {
             UtilityArchitecture::X86_64 => header::EM_X86_64,

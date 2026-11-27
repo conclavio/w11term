@@ -10,6 +10,7 @@ pub mod enroll;
 pub mod events;
 pub mod folder_grants;
 pub mod hints;
+pub mod https;
 pub mod interaction;
 pub mod keys;
 pub mod options;

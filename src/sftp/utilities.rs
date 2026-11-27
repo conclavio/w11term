@@ -3,9 +3,11 @@ use super::*;
 use std::{collections::BTreeSet, io::Read};
 
 mod build;
+mod downloads;
 mod install;
 mod login;
 use build::{LibcVersion, Verified};
+pub use downloads::{UtilityDownload, fetch_tool_bundle};
 use install::{InstallPlan, Release, StoredTool};
 pub(crate) use login::sync_login_tools;
 
@@ -45,10 +47,17 @@ pub struct UtilityTool {
 #[serde(deny_unknown_fields)]
 pub struct UtilityBuild {
     pub architecture: UtilityArchitecture,
+    #[serde(default, skip_serializing_if = "empty_path")]
     pub path: PathBuf,
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<UtilityDownload>,
+}
+
+fn empty_path(path: &Path) -> bool {
+    path.as_os_str().is_empty()
 }
 
 fn default_bin() -> String {
@@ -93,11 +102,9 @@ impl UtilityBundle {
             .parent()
             .context("Tool bundle file has no parent directory")?;
         for build in bundle.tools.iter_mut().flat_map(|tool| &mut tool.builds) {
-            ensure!(
-                !build.path.as_os_str().is_empty(),
-                "Choose a Windows executable path"
-            );
-            build.path = directory.join(&build.path);
+            if !empty_path(&build.path) {
+                build.path = directory.join(&build.path);
+            }
         }
         bundle.validate()?;
         Ok(bundle)
@@ -127,10 +134,22 @@ impl UtilityBundle {
                 tool.name
             );
             for build in &tool.builds {
-                ensure!(
-                    build.path.is_absolute(),
-                    "Tool executable paths in control requests must be absolute Windows paths"
-                );
+                match &build.download {
+                    Some(download) => {
+                        ensure!(
+                            empty_path(&build.path),
+                            "Choose a path or a download for {}",
+                            tool.name
+                        );
+                        download
+                            .validate()
+                            .with_context(|| format!("Invalid download for {}", tool.name))?;
+                    }
+                    None => ensure!(
+                        build.path.is_absolute(),
+                        "Tool executable paths in control requests must be absolute Windows paths"
+                    ),
+                }
                 normalize_sha256(&build.sha256)
                     .with_context(|| format!("Invalid SHA-256 for {}", tool.name))?;
                 ensure!(
@@ -252,8 +271,10 @@ struct DirectoryPlan {
 #[derive(Serialize)]
 struct BuildReport {
     architecture: UtilityArchitecture,
-    path: PathBuf,
+    path: Option<PathBuf>,
     release: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download: Option<UtilityDownload>,
     sha256: String,
     verified: Option<Verified>,
     status: &'static str,
@@ -262,7 +283,7 @@ struct BuildReport {
 
 struct Candidate {
     build: UtilityBuild,
-    checked: Option<Result<Verified>>,
+    checked: Option<Result<(Verified, PathBuf)>>,
 }
 
 async fn inspect_builds(
@@ -358,7 +379,10 @@ impl Engine {
                             .expect("compatible build verified")
                             .bytes,
                     },
-                    choice.path.clone(),
+                    choice
+                        .path
+                        .clone()
+                        .expect("verified executable has a local path"),
                 ));
             }
             blocked |= launcher == "conflict" || choice.is_none();
@@ -500,10 +524,12 @@ impl Engine {
     ) -> Result<Vec<BuildReport>> {
         let mut reports = Vec::with_capacity(candidates.len());
         for Candidate { build, checked } in candidates {
+            let mut path = (!empty_path(&build.path)).then_some(build.path);
             let (status, reason, verified) = match checked {
                 None => ("other-architecture", None, None),
                 Some(Err(error)) => ("invalid", Some(format!("{error:#}")), None),
-                Some(Ok(verified)) => {
+                Some(Ok((verified, resolved))) => {
+                    path = Some(resolved);
                     let reason = self.utility_runtime_conflict(&verified, host).await?;
                     (
                         if reason.is_none() {
@@ -518,8 +544,9 @@ impl Engine {
             };
             reports.push(BuildReport {
                 architecture: build.architecture,
-                path: build.path,
+                path,
                 release: build.release,
+                download: build.download,
                 sha256: normalize_sha256(&build.sha256)?,
                 verified,
                 status,

@@ -34,7 +34,10 @@ pub use dotfiles::{
     DotfileBundle, DotfileShell, DotfileTarget, validate_dotfiles_home, validate_zdotdir,
 };
 pub(crate) use utilities::sync_login_tools;
-pub use utilities::{UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityTool};
+pub use utilities::{
+    UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityDownload, UtilityTool,
+    fetch_tool_bundle,
+};
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
 mod group_upload;

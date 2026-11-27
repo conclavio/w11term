@@ -1,6 +1,8 @@
 use super::*;
 use sha2::{Digest, Sha256};
-use w11term::sftp::{Operation, UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityTool};
+use w11term::sftp::{
+    Operation, UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityDownload, UtilityTool,
+};
 use w11term::{
     options::{ToolPath, ToolSync},
     sftp::DotfileShell,
@@ -79,6 +81,7 @@ fn build(
             .map(|b| format!("{b:02x}"))
             .collect(),
         release: None,
+        download: None,
     }
 }
 
@@ -226,6 +229,76 @@ fn rollback(id: &str, preview: Option<&Value>) -> Operation {
         bundle_sha256: id.into(),
         review: preview.map(|report| report["review"].as_str().unwrap().into()),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn utility_install_uses_a_verified_download_cache_without_network() {
+    const CHILD: &str = "W11TERM_UTILITY_CACHE_TEST";
+    let Some(state) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let state = tempfile::tempdir().unwrap();
+        // The other fixtures run in parallel. Set the cache override only in this child.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "utilities::utility_install_uses_a_verified_download_cache_without_network",
+            ])
+            .env(CHILD, state.path())
+            .env("W11TERM_DATA_DIR", state.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let (pane, _, root, _, server) = fixture(false).await;
+    probe_response(root.path(), "x86_64", "/", "/usr/bin:/.local/bin");
+    fs::write(root.path().join("posix-rename-version"), "1").unwrap();
+    let bytes = executable(UtilityArchitecture::X86_64, None);
+    let mut candidate = build(
+        &state,
+        "fixture-elf",
+        UtilityArchitecture::X86_64,
+        bytes.clone(),
+    );
+    fs::remove_file(std::mem::take(&mut candidate.path)).unwrap();
+    candidate.download = Some(UtilityDownload::Raw {
+        url: "https://example.invalid/never-fetched-on-connect".into(),
+    });
+    let cache = state.join("tools").join("cache").join("v1");
+    fs::create_dir_all(&cache).unwrap();
+    let cached = cache.join(&candidate.sha256);
+    let operation = preview(vec![candidate]);
+    let request = serde_json::to_value(&operation).unwrap();
+    let preview_request = || serde_json::from_value(request.clone()).unwrap();
+
+    let missing = guarded_job(&pane, None, preview_request()).await.unwrap();
+    assert_eq!(missing["ready"], false);
+    assert!(
+        missing["tools"][0]["builds"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("fetch-tool-bundle")
+    );
+    fs::write(&cached, &bytes).unwrap();
+    let plan = guarded_job(&pane, None, preview_request()).await.unwrap();
+    assert_eq!(plan["ready"], true);
+    assert_eq!(plan["tools"][0]["builds"][0]["path"], json!(cached));
+    let installed = guarded_job(&pane, None, apply(operation, &plan))
+        .await
+        .unwrap();
+    assert_eq!(installed["uploaded"], true);
+    let release = plan["bundle_sha256"].as_str().unwrap();
+    let installed_path = root
+        .path()
+        .join(".local/share/w11term/tools/portable/versions")
+        .join(release)
+        .join("rg");
+    assert_eq!(fs::read(installed_path).unwrap(), bytes);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

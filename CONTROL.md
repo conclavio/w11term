@@ -1327,9 +1327,22 @@ On an ordinary SSH shell launch or reconnect, w11term checks that the verified h
 
 A reviewed manual switch holds the chosen bundle on later logins, including when you choose `disabled`. Use a fresh manual preview and `apply-dotfiles` with the bundle you want to return to automatic sync.
 
+### Download a pinned SSH tool bundle
+
+Export the starter manifest and fetch its pinned Linux builds from their upstream HTTPS releases. The starter includes `rg`, `jq`, `dust`, and `hyperfine` for `x86_64` and `aarch64`. Omit `--architecture` to fetch both architectures.
+
+```powershell
+& $ctl fetch-tool-bundle --example '.\Linux essentials.json'
+& $ctl fetch-tool-bundle '.\Linux essentials.json' --architecture x86_64
+```
+
+Each build in a version-1 manifest can use a `download` object in place of `path`. Set `format` to `raw` for a single executable. For `tar-gz` or `zip`, also set `member` to its path inside the archive and `archive_sha256` to the hash of the complete archive. The build's top-level `sha256` always pins the executable, and the client verifies its Linux ELF architecture before caching it. See the [starter manifest](examples/tool-bundles/essentials.json) for complete entries.
+
+Fetch the builds on Windows before using the manifest in a preview or SSH profile. w11term caches verified executables by SHA-256 in `%LOCALAPPDATA%\w11term\tools\cache\v1`. Preview and profile sync reverify the cached bytes and use them offline. To update a pin, edit the manifest and run the fetch command again.
+
 ### Preview a managed SSH tool bundle
 
-Keep the raw Linux executables on Windows and point a version-1 bundle at them. Relative build paths resolve beside the manifest. Pin the SHA-256 of each extracted executable. Use the optional `release` URL to record its source. Supply an `x86_64` build, an `aarch64` build, or both. The default `bin_directory` is `.local/bin` under the remote home.
+Use a downloaded bundle or keep the Linux executables on Windows and point a version-1 bundle at them. Relative local build paths resolve beside the manifest. Pin the SHA-256 of each executable. Use the optional `release` URL to record its source. Supply an `x86_64` build, an `aarch64` build, or both. The default `bin_directory` is `.local/bin` under the remote home.
 
 ```json
 {
