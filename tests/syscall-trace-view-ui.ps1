@@ -54,20 +54,20 @@ $byListItem = [System.Windows.Automation.PropertyCondition]::new(
 '@ + [char]10)
 [IO.File]::WriteAllText($clockAfter, '00:00:00.010000 close(5</tmp/clock-split>) = 0' + [char]10)
 [IO.File]::WriteAllText($working, @'
-21 1700000000.000000 execve("/bin/diag", ["diag"], NULL) = 0 <0.000001>
-21 1700000000.001000 openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = 3</tmp/settings> <0.000001>
-21 1700000000.002000 close(3</tmp/settings>) = 0 <0.000001>
-21 1700000000.003000 openat(AT_FDCWD, "/tmp/data", O_RDONLY) = 3</tmp/data> <0.000001>
-21 1700000000.004000 read(3</tmp/data>, "a", 1) = 1 <0.000001>
-21 1700000000.005000 read(3</tmp/data>, "b", 1) = 1 <0.000001>
-21 1700000000.006000 close(3</tmp/data>) = 0 <0.000001>
+21 1700000000.000000 (+     0.000000) execve("/bin/diag", ["diag"], NULL) = 0 <0.000001>
+21 1700000000.001000 (+     0.001000) openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = 3</tmp/settings> <0.000001>
+21 1700000000.002000 (+     0.001000) close(3</tmp/settings>) = 0 <0.000001>
+21 1700000000.003000 (+     0.001000) openat(AT_FDCWD, "/tmp/data", O_RDONLY) = 3</tmp/data> <0.000001>
+21 1700000000.004000 (+     0.001000) read(3</tmp/data>, "a", 1) = 1 <0.000001>
+21 1700000000.005000 (+     0.001000) read(3</tmp/data>, "b", 1) = 1 <0.000001>
+21 1700000000.006000 (+     0.001000) close(3</tmp/data>) = 0 <0.000001>
 '@ + [char]10)
 [IO.File]::WriteAllText($failing, @'
-77 1800000000.000000 execve("/bin/diag", ["diag"], NULL) = 0 <0.000001>
-77 1800000000.001000 openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = -1 ENOENT (No such file or directory) <0.010001>
-77 1800000000.003000 openat(AT_FDCWD, "/tmp/data", O_RDONLY) = 8</tmp/data> <0.000001>
-77 1800000000.004000 read(8</tmp/data>, "a", 1) = 1 <0.000001>
-77 1800000000.006000 close(8</tmp/data>) = 0 <0.004001>
+77      0.000000 execve("/bin/diag", ["diag"], NULL) = 0 <0.000001>
+77      0.001000 openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = -1 ENOENT (No such file or directory) <0.010001>
+77      0.002000 openat(AT_FDCWD, "/tmp/data", O_RDONLY) = 8</tmp/data> <0.000001>
+77      0.001000 read(8</tmp/data>, "a", 1) = 1 <0.000001>
+77      0.002000 close(8</tmp/data>) = 0 <0.004001>
 '@ + [char]10)
 $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($trace))
 
@@ -230,7 +230,8 @@ try {
         (Find-TraceGroup 'First divergence*Changed result*openat*"/tmp/settings"*') -and
             (Find-Element 'Selected call duration delta +10.000 ms') -and
             $left -and $right -and $left.Contains('3</tmp/settings>') -and
-            $right.Contains('ENOENT') -and $left.Contains('+1.000 ms from run start') -and
+            $right.Contains('ENOENT') -and $left.Contains('(+     0.001000) openat') -and
+            $right.Contains('77      0.001000 openat') -and $left.Contains('+1.000 ms from run start') -and
             $right.Contains('+1.000 ms from run start')
     }
     Apply-ChangeFilter 'OPENAT enoent /BIN/DIAG'

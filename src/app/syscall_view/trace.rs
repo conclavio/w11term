@@ -88,6 +88,42 @@ enum TimeBasis {
     Epoch,
     Clock,
     Delta,
+    Relative,
+}
+
+enum RelativeClock {
+    Start,
+    Elapsed(u64),
+    Unavailable,
+}
+
+impl RelativeClock {
+    fn advance(&mut self, stamp: &mut Option<Stamp>, body: &str) {
+        if let Some(Stamp {
+            ns,
+            basis: TimeBasis::Delta,
+        }) = *stamp
+        {
+            let elapsed = match *self {
+                Self::Start => Some(0),
+                Self::Elapsed(elapsed) => elapsed.checked_add(ns),
+                Self::Unavailable => None,
+            };
+            if let Some(ns) = elapsed {
+                *self = Self::Elapsed(ns);
+                *stamp = Some(Stamp {
+                    ns,
+                    basis: TimeBasis::Relative,
+                });
+            } else {
+                *self = Self::Unavailable;
+            }
+        } else if stamp.is_some() || (!body.is_empty() && !body.starts_with("> ")) {
+            // Untimed records can hide an interval. Blank lines and stack
+            // frames are auxiliary output and carry no delta.
+            *self = Self::Unavailable;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +329,11 @@ impl Trace {
         for (source, input) in sources.iter().enumerate() {
             let mut start = 0;
             let mut previous_clock = None;
+            let mut relative = if sources.len() == 1 && input.pid.is_none() {
+                RelativeClock::Start
+            } else {
+                RelativeClock::Unavailable
+            };
             for (line, bytes) in input
                 .bytes
                 .split_inclusive(|&byte| byte == b'\n')
@@ -311,12 +352,15 @@ impl Trace {
                 };
                 start += bytes.len();
                 let line = String::from_utf8_lossy(bytes);
-                let (pid, stamp, body) = prefix(&line, input.pid);
+                let (pid, mut stamp, body) = prefix(&line, input.pid);
                 if let Some(merge) = &mut clock
                     && !merge.observe(stamp, &mut previous_clock)
                 {
                     clock = None;
                 }
+                // A resumed record also advances the trace-wide clock, even
+                // though the paired call keeps the time of its first record.
+                relative.advance(&mut stamp, body);
                 let key = (raw.source, pid);
                 if let Some((name, rest)) = resumed(body)
                     && let Some(&index) = pending.get(&key)
@@ -450,8 +494,11 @@ impl Trace {
         if self.sources.len() > 1 && !self.merged_by_time() {
             return None;
         }
-        let start = self.events.first()?.stamp?;
         let current = self.events.get(index)?.stamp?;
+        if current.basis == TimeBasis::Relative {
+            return Some(current.ns);
+        }
+        let start = self.events.first()?.stamp?;
         if start.basis == TimeBasis::Delta || current.basis != start.basis {
             return None;
         }
@@ -515,29 +562,52 @@ fn pid_hints(paths: &[PathBuf]) -> Result<Vec<Option<u32>>> {
 }
 
 fn prefix(line: &str, fallback: Option<u32>) -> (Option<u32>, Option<Stamp>, &str) {
-    let mut line = line.trim().trim_start_matches('\u{feff}').trim_start();
+    let input = line.trim_end();
+    let input = input.trim_start().strip_prefix('\u{feff}').unwrap_or(input);
+    let mut line = input.trim_start();
     let mut pid = fallback;
+    let mut integral_delta = false;
     if let Some((number, rest)) = line
         .strip_prefix("[pid ")
         .and_then(|line| line.split_once(']'))
     {
         pid = number.trim().parse().ok().or(pid);
         line = rest.trim_start();
+        integral_delta = true;
     } else if let Some((word, rest)) = line.split_once(char::is_whitespace)
+        && word.len() < 9
         && let Ok(number) = word.parse::<u32>()
     {
-        pid = Some(number);
-        line = rest.trim_start();
+        // Plain PIDs are printed at the left margin. Standalone integer
+        // relative deltas use strace's six-character, space-padded field.
+        let padding = &input[..input.len() - line.len()];
+        if padding.is_empty()
+            || padding.len() + word.len() != 6
+            || !padding.bytes().all(|byte| byte == b' ')
+        {
+            pid = Some(number);
+            line = rest.trim_start();
+        }
+        integral_delta = true;
     }
     if let Some((word, rest)) = line.split_once(char::is_whitespace)
-        && let Some(stamp) = parse_stamp(word)
+        && let Some(stamp) = parse_stamp(word, integral_delta)
     {
-        return (pid, Some(stamp), rest.trim_start());
+        let body = rest.trim_start();
+        let body = if stamp.basis == TimeBasis::Delta {
+            body
+        } else {
+            body.strip_prefix("(+")
+                .and_then(|text| text.split_once(')'))
+                .filter(|(delta, _)| nanos(delta.trim()).is_some())
+                .map_or(body, |(_, rest)| rest.trim_start())
+        };
+        return (pid, Some(stamp), body);
     }
     (pid, None, line)
 }
 
-fn parse_stamp(token: &str) -> Option<Stamp> {
+fn parse_stamp(token: &str, integral_delta: bool) -> Option<Stamp> {
     if token.contains(':') {
         let (hours, rest) = token.split_once(':')?;
         let (minutes, seconds) = rest.split_once(':')?;
@@ -552,10 +622,14 @@ fn parse_stamp(token: &str) -> Option<Stamp> {
             basis: TimeBasis::Clock,
         });
     }
-    let (seconds, _) = token.split_once('.')?;
+    let (seconds, fractional) = token.split_once('.').unwrap_or((token, ""));
+    let epoch = seconds.len() >= 9;
+    if !epoch && !integral_delta && fractional.is_empty() {
+        return None;
+    }
     Some(Stamp {
         ns: nanos(token)?,
-        basis: if seconds.len() >= 9 {
+        basis: if epoch {
             TimeBasis::Epoch
         } else {
             TimeBasis::Delta
@@ -895,6 +969,50 @@ mod tests {
     }
 
     #[test]
+    fn adds_relative_deltas_from_raw_records_even_when_a_call_is_resumed() {
+        let trace = parse(concat!(
+            "\n",
+            "30 0.500000 read(4, <unfinished ...>\n",
+            " > /tmp/fixture(main+0x1) [0x10]\n",
+            "31 0.001000 close(5) = 0\n",
+            "30 0.002000 <... read resumed>\"x\", 1) = 1 <0.010000>\n",
+            "30 0.003000 close(4) = 0\n",
+            "30 close(8) = 0\n",
+            "30 0.004000 close(9) = 0\n",
+        ));
+        assert_eq!(trace.events[1].name.as_ref(), "read");
+        assert_eq!(trace.events[1].last.unwrap().line, 5);
+        assert_eq!(trace.events[1].duration, Some(10_000_000));
+        assert_eq!(trace.relative_start(1), Some(0));
+        assert_eq!(trace.relative_start(2), None);
+        assert_eq!(trace.relative_start(3), Some(1_000_000));
+        assert_eq!(trace.relative_start(4), Some(6_000_000));
+        assert_eq!(trace.relative_start(6), None);
+    }
+
+    #[test]
+    fn accepts_integer_precision_and_reads_absolute_times_with_relative_suffixes() {
+        let relative = parse(concat!(
+            "     0 open(\"/tmp/source\", O_RDONLY) = 3\n",
+            "     2 close(3) = 0\n",
+            "[pid 22]      1 close(4) = 0\n",
+        ));
+        assert_eq!(relative.events[0].pid, None);
+        assert_eq!(relative.events[2].pid, Some(22));
+        assert_eq!(relative.relative_start(1), Some(2_000_000_000));
+        assert_eq!(relative.relative_start(2), Some(3_000_000_000));
+
+        let absolute = parse(concat!(
+            "1740000000 (+     0) open(\"/tmp/source\", O_RDONLY) = 3\n",
+            "21 1740000001 (+     3.012345678) close(3) = 0\n",
+        ));
+        assert_eq!(absolute.events[0].pid, None);
+        assert_eq!(absolute.events[0].name.as_ref(), "open");
+        assert_eq!(absolute.events[1].name.as_ref(), "close");
+        assert_eq!(absolute.relative_start(1), Some(1_000_000_000));
+    }
+
+    #[test]
     fn errors_include_later_success_evidence_and_incomplete_records_remain_visible() {
         let trace = parse(concat!(
             "[pid 90] 13:05:00.123000 openat(AT_FDCWD, \"/retry\", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000001>\n",
@@ -1005,6 +1123,22 @@ mod tests {
             assert_eq!(trace.events[0].pid, Some(501));
             assert_eq!(trace.relative_start(1), None);
         }
+    }
+
+    #[test]
+    fn relative_deltas_have_no_global_origin_in_per_process_files() {
+        let input = "0.000000 open(\"/tmp/source\", O_RDONLY) = 3\n0.010000 close(3) = 0\n";
+        let split = clock_files(input, "0.001000 close(4) = 0\n");
+        assert_eq!(split.merge_order, MergeOrder::File);
+        assert_eq!(split.relative_start(1), None);
+        let one_process = Trace::parse(vec![Source {
+            path: "relative.34".into(),
+            pid: Some(34),
+            bytes: input.as_bytes().into(),
+        }])
+        .unwrap();
+        assert_eq!(one_process.events[0].pid, Some(34));
+        assert_eq!(one_process.relative_start(1), None);
     }
 
     #[test]
