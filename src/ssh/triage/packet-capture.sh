@@ -12,7 +12,7 @@ fail() {
     exit 2
 }
 [[ $(uname -s) == Linux ]] || fail 'Packet capture requires Linux.'
-for tool in tcpdump flock timeout mktemp mkdir stat df tail id sha256sum mkfifo head cat wc rm; do
+for tool in tcpdump flock timeout mkdir stat df tail id sha256sum mkfifo head cat wc rm; do
     command -v "$tool" >/dev/null || fail "Packet capture requires $tool."
 done
 cd -P -- "$root" || fail 'The selected scratch directory is unavailable.'
