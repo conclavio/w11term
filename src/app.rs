@@ -6831,6 +6831,16 @@ impl Component for TerminalApp {
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
+            Message::Control(w11term::control::UiRequest::RepairWorkspace {
+                name,
+                replacements,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let result = self.control_repair_workspace(&name, &replacements);
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::TabOrder { order, reply }) => {
                 if !reply.is_closed() {
                     let result = match order {

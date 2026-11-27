@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance','CliRepairWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -138,7 +138,12 @@ function Open-TabSearch([IntPtr]$Hwnd, [string]$Query, [string]$Result) {
         $element = Find-Here $Hwnd 'Search tabs'
         if ($element -and $element.Current.HasKeyboardFocus) { $element }
     }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+    $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    # The wanted row can also be present before filtering. Wait for an empty result
+    # first so Enter can only act on a selection from the requested query.
+    $value.SetValue('w11term fixture search with no matching tab')
+    $null = Wait-Until 'tab search renders an empty result' { Find-Here $Hwnd 'No matching tabs' }
+    $value.SetValue($Query)
     $null = Wait-Until "tab search result '$Result'" { Find-Here $Hwnd $Result }
 }
 
@@ -1415,6 +1420,63 @@ function Test-ControlProfileWindows {
     Close-FixtureWindow $remoteWindow
 }
 
+function Test-ControlRepairWorkspace {
+    Expect-Focus $origin $ssh.id 'The source has focus before repairing a recipe' -PrepareWindow
+    $other = Control @('open','--profile','Destination PowerShell','--new-window')
+    $otherWindow = Wait-DetachedWindow $origin
+    $targetId = "$($other.window_id)"
+    $missing = 'missing-window-profile'
+    $before = Control @('get-workspace','--name','broken-copy','--window',$targetId)
+    if (($before.profile_check.missing_ssh_profiles -join ',') -cne $missing) {
+        throw 'The broken fixture did not show the missing profile'
+    }
+    $catalog = Join-Path $env:W11TERM_DATA_DIR 'workspaces.json'
+    $original = [IO.File]::ReadAllText($catalog)
+    $failed = & $Cli --pid $app.Id repair-workspace --window $targetId --name 'broken-copy' --replace $missing 'Destination PowerShell' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*Destination PowerShell*') {
+        throw 'The repair accepted a local profile as an SSH replacement'
+    }
+    $failed = & $Cli --pid $app.Id repair-workspace --window $targetId --name 'broken-copy' --replace $missing 'window-ssh' --replace 'unused-name' 'window-ssh' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*no longer in the layout*' -or
+        [IO.File]::ReadAllText($catalog) -cne $original) {
+        throw 'An invalid replacement list changed the saved layout'
+    }
+    $failed = & $Cli --pid $app.Id repair-workspace --window $targetId --name 'two-windows' --replace 'window-ssh' 'no-such-profile' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*available again*' -or
+        [IO.File]::ReadAllText($catalog) -cne $original) {
+        throw 'Repair changed an SSH profile that still exists'
+    }
+
+    $repair = Control @('repair-workspace','--window',$targetId,'--name','broken-copy','--replace',$missing,'window-ssh')
+    if ($repair.name -cne 'broken-copy' -or $repair.window_id -ne $other.window_id -or $repair.updated_panes -ne 1 -or
+        $repair.replacements.$missing -cne 'window-ssh') {
+        throw 'The repair did not report the exact saved mapping and pane count'
+    }
+    $after = Control @('get-workspace','--name','broken-copy','--window',$targetId)
+    $nodes = $before.tabs[0].layout
+    $nodes[$nodes[0].first].source.profile = 'window-ssh'
+    if ($after.profile_check.missing_ssh_profiles.Count -ne 0 -or $after.active_tab -ne $before.active_tab -or
+        ($after.tabs | ConvertTo-Json -Depth 8 -Compress) -cne ($before.tabs | ConvertTo-Json -Depth 8 -Compress) -or
+        @((Control @('list')).sessions).Count -ne 4) {
+        throw 'Repair changed the geometry, selection or live session count'
+    }
+    Expect-Focus $origin $ssh.id 'Repair leaves the source window focused'
+    $open = Control @('open-workspace','--window',$targetId,'--name','broken-copy','--activate')
+    $remote = $open.tabs[0].panes[0]
+    if (!$open.active -or $open.workspace_active_pane -ne $remote -or $remote -eq $ssh.id) {
+        throw 'The repaired saved split did not restore its own selected SSH pane'
+    }
+    Expect-Text $remote 'ready'
+    Expect-Text $open.tabs[0].panes[1] 'PS '
+    $null = Control @('send-text','--pane',"$remote",'--no-paste','cli-repaired/')
+    Expect-Text $remote 'cli-repaired/'
+    Expect-Focus $origin $ssh.id 'Restoring the repaired recipe keeps the original SSH pane focused'
+    Type-In $origin 'repair-source/'
+    Expect-Text $ssh.id 'repair-source/'
+    Close-FixtureWindow $otherWindow
+    Close-FixtureWindow $origin
+}
+
 function Test-ControlSaveWorkspace {
     Expect-Focus $origin $ssh.id 'SSH is selected before building the workspace' -PrepareWindow
     $name = 'CLI saved Ops'
@@ -2171,7 +2233,7 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance')) {
+    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance','CliRepairWorkspace')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
             'CliWorkspace' { Test-ControlWorkspace }
@@ -2187,6 +2249,7 @@ try {
             'CliTabOrder' { Test-ControlTabOrder }
             'CliTerminalNames' { Test-ControlTerminalNames }
             'CliTabAppearance' { Test-ControlTabAppearance }
+            'CliRepairWorkspace' { Test-ControlRepairWorkspace }
         }
         if (!$app.WaitForExit(10000)) {
             throw "The CLI window fixture process did not exit. Remaining HWNDs: $([TabFixtureWindows]::OwnedBy($app.Id) -join ', ')"

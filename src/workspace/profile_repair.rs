@@ -80,18 +80,20 @@ impl Workspace {
         mut self,
         replacements: &BTreeMap<String, String>,
         profiles: &BTreeMap<String, SshOptions>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, usize)> {
         ensure!(!replacements.is_empty(), "Choose a replacement SSH profile");
         let mut applied = BTreeSet::new();
+        let mut pane_count = 0;
         for tab in &mut self.tabs {
-            tab.layout
+            pane_count += tab
+                .layout
                 .repair_profiles(replacements, profiles, &mut applied)?;
         }
         ensure!(
             applied.len() == replacements.len(),
             "A missing SSH profile is no longer in the layout"
         );
-        Ok(self)
+        Ok((self, pane_count))
     }
 }
 
@@ -101,11 +103,11 @@ impl SavedLayout {
         replacements: &BTreeMap<String, String>,
         profiles: &BTreeMap<String, SshOptions>,
         applied: &mut BTreeSet<String>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         match self {
             Self::Split { first, second, .. } => {
-                first.repair_profiles(replacements, profiles, applied)?;
-                second.repair_profiles(replacements, profiles, applied)
+                Ok(first.repair_profiles(replacements, profiles, applied)?
+                    + second.repair_profiles(replacements, profiles, applied)?)
             }
             Self::Leaf(pane) => {
                 if let Some(name) = pane.source.ssh_profile()
@@ -123,8 +125,9 @@ impl SavedLayout {
                         })?;
                     applied.insert(name.to_owned());
                     pane.source = updated;
+                    return Ok(1);
                 }
-                Ok(())
+                Ok(0)
             }
         }
     }
@@ -138,15 +141,15 @@ impl WorkspaceStore {
         expected: &WorkspaceEntry,
         replacements: &BTreeMap<String, String>,
         profiles: &BTreeMap<String, SshOptions>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         self.edit(|catalog| {
             catalog.check_entry(name, expected)?;
-            let updated = expected
+            let (updated, pane_count) = expected
                 .layout
                 .clone()
                 .repair_profiles(replacements, profiles)?;
             catalog.workspaces.insert(name.to_owned(), updated);
-            Ok(())
+            Ok(pane_count)
         })
     }
 }

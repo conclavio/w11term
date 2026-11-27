@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -92,6 +92,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "open-ssh-group"
             | "open-workspace"
             | "get-workspace"
+            | "repair-workspace"
             | "save-workspace"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
@@ -733,6 +734,51 @@ mod tests {
             "open --profile fleet --new-window --new-window",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn repairs_explicit_missing_ssh_profile_names_in_one_workspace() {
+        let (_, request) = parse(
+            [
+                "repair-workspace",
+                "--window",
+                "12",
+                "--name",
+                "Fleet Ops",
+                "--replace",
+                "Old DB",
+                "New DB",
+                "--replace",
+                "Old App",
+                "New App",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb":"repair-workspace","window_id":12,"name":"Fleet Ops",
+                "replacements":[
+                    {"missing":"Old DB","replacement":"New DB"},
+                    {"missing":"Old App","replacement":"New App"}
+                ]
+            })
+        );
+        for invalid in [
+            "repair-workspace --window 12 --name Fleet",
+            "repair-workspace --name Fleet --replace old new",
+            "repair-workspace --window 12 --replace old new",
+            "repair-workspace --window 0 --name Fleet --replace old new",
+            "repair-workspace --window 12 --name Fleet --replace old",
+            "repair-workspace --window 12 --name Fleet --replace old old",
+            "repair-workspace --window 12 --name Fleet --replace old one --replace old two",
+        ] {
+            assert!(
+                parse(invalid.split_whitespace().map(str::to_owned)).is_err(),
+                "{invalid}"
+            );
         }
     }
 

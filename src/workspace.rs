@@ -1274,9 +1274,12 @@ mod tests {
                 .repair_profiles("desk", &saved, &selected, &restored_profiles)
                 .is_err()
         );
-        store
-            .repair_profiles("desk", &saved, &selected, &profiles)
-            .unwrap();
+        assert_eq!(
+            store
+                .repair_profiles("desk", &saved, &selected, &profiles)
+                .unwrap(),
+            3
+        );
         let repaired = store.entry("desk").unwrap();
         assert_eq!(repaired.identity, saved.identity);
         assert_eq!(repaired.layout.active_tab, saved.layout.active_tab);
