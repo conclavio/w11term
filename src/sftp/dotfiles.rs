@@ -123,6 +123,14 @@ pub struct RetainedDotfileVersion {
     pub modified: Option<u32>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExportedDotfileBundle {
+    pub shell: DotfileShell,
+    pub home: String,
+    pub bundle_sha256: String,
+    pub local: PathBuf,
+}
+
 impl DotfileShell {
     fn name(self) -> &'static str {
         match self {
@@ -175,6 +183,16 @@ impl DotfileBundle {
             self.environment.is_some() || self.prompt(shell).is_some(),
             "The bundle needs an environment or {} fragment",
             shell.name()
+        );
+        Ok(())
+    }
+
+    pub fn verify_version(&self, shell: DotfileShell, sha256: &str) -> Result<()> {
+        self.validate(shell)?;
+        let [environment, prompt] = self.fragments(shell);
+        ensure!(
+            bundle_id(&environment, &prompt) == sha256,
+            "The dotfiles bundle does not reproduce version {sha256}"
         );
         Ok(())
     }

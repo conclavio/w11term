@@ -343,6 +343,8 @@ Install and version reviews show which lines change in the managed environment a
 
 Select a version and save its verified fragments as a Windows bundle for reuse in another SSH profile. [Save a retained version](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 
+From the same pane, **Review saved dotfiles in this SSH profile** carries the saved bundle and authenticated target into the profile editor for approval. [Review a saved bundle](../CONTROL.md#restore-or-disable-ssh-dotfiles)
+
 From that pane, **More → Command reference** shows both login sync results for the current connection. **Apply SSH dotfiles** shows the reason when dotfiles sync was skipped or unconfirmed. The command manual can show the managed launcher path. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
 
 **Acceptance.** Use a profile with both bundles enabled on a clean Linux account. At the first prompt, verify that the managed prompt is active and that `command -v` resolves a bundled utility to the expected launcher under `~/.local/bin`. Reconnect and verify both sync results and the same prompt and launcher.

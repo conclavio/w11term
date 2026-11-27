@@ -291,7 +291,7 @@ impl super::Editor {
                 editor.phase = Phase::Ready;
                 match result {
                     Ok(Some(path)) => {
-                        self.bundle = path;
+                        self.select_bundle(path);
                         self.composer = None;
                     }
                     Ok(None) => {}

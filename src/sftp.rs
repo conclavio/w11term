@@ -32,7 +32,7 @@ mod utilities;
 pub(crate) use dotfiles::sync_login_dotfiles;
 pub use dotfiles::{
     DotfileBundle, DotfileShell, DotfileTarget, DotfileVersionState, DotfileVersions,
-    RetainedDotfileVersion, validate_dotfiles_home, validate_zdotdir,
+    ExportedDotfileBundle, RetainedDotfileVersion, validate_dotfiles_home, validate_zdotdir,
 };
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{

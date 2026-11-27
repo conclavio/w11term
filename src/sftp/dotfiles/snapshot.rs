@@ -40,12 +40,9 @@ impl Engine {
             DotfileShell::Bash => bundle.bash = Some(manifest_fragment(prompt)),
             DotfileShell::Zsh => bundle.zsh = Some(manifest_fragment(prompt)),
         }
-        bundle.validate(shell)?;
-        let [environment, prompt] = bundle.fragments(shell);
-        ensure!(
-            bundle_id(&environment, &prompt) == id,
-            "The retained fragments cannot be represented by an exact Windows dotfiles bundle"
-        );
+        bundle.verify_version(shell, &id).context(
+            "The retained fragments cannot be represented by an exact Windows dotfiles bundle",
+        )?;
         let cancel = cancel.cloned();
         let local = tokio::task::spawn_blocking(move || {
             ensure!(
@@ -56,6 +53,11 @@ impl Engine {
             Ok::<_, anyhow::Error>(local)
         })
         .await??;
-        Ok(json!({ "shell": shell, "home": home, "bundle_sha256": id, "local": local }))
+        Ok(serde_json::to_value(ExportedDotfileBundle {
+            shell,
+            home,
+            bundle_sha256: id,
+            local,
+        })?)
     }
 }

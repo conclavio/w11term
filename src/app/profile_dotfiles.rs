@@ -3,7 +3,10 @@ use russh::keys::ssh_key::Fingerprint;
 use std::path::PathBuf;
 use w11term::{
     options::DotfileSync,
-    sftp::{DotfileBundle, DotfileShell, validate_dotfiles_home, validate_zdotdir},
+    sftp::{
+        DotfileBundle, DotfileShell, ExportedDotfileBundle, validate_dotfiles_home,
+        validate_zdotdir,
+    },
 };
 
 mod bundle;
@@ -28,6 +31,21 @@ pub(super) fn approved_fingerprint(entered: &str, profile_pin: &str) -> anyhow::
         );
     }
     Ok(fingerprint.to_string())
+}
+
+pub(super) fn snapshot_fingerprint(
+    draft: &ProfileDraft,
+    home: &str,
+    (host, user, port, fingerprint): (&str, &str, u16, &str),
+) -> anyhow::Result<String> {
+    let account = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
+    anyhow::ensure!(
+        (account.0.as_str(), account.1.as_str(), account.2) == (host, user, port),
+        "This profile's SSH account differs from the connection that saved the bundle"
+    );
+    let fingerprint = approved_fingerprint(fingerprint, &draft.fingerprint)?;
+    validate_dotfiles_home(home)?;
+    Ok(fingerprint)
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +78,7 @@ pub(super) struct Editor {
     zdotdir: String,
     zsh: bool,
     approved: Option<Box<DotfileSync>>,
+    snapshot_version: Option<String>,
     checking: Option<Arc<()>>,
     browsing: Option<Arc<()>>,
     composer: Option<bundle::Editor>,
@@ -84,6 +103,41 @@ impl Editor {
 
     pub(super) fn approval(&self) -> Option<Box<DotfileSync>> {
         self.approved.clone()
+    }
+
+    fn select_bundle(&mut self, path: String) {
+        self.bundle = path;
+        self.snapshot_version = None;
+        self.checking = None;
+        self.error = None;
+    }
+
+    fn stage_snapshot(
+        draft: &mut ProfileDraft,
+        saved: ExportedDotfileBundle,
+        zdotdir: Option<String>,
+        endpoint: (&str, &str, u16, &str),
+    ) -> anyhow::Result<()> {
+        let fingerprint = snapshot_fingerprint(draft, &saved.home, endpoint)?;
+        validate_zdotdir(saved.shell, zdotdir.as_deref())?;
+        let path = saved
+            .local
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("The saved path cannot be represented as text"))?;
+        let editor = &mut draft.dotfiles;
+        anyhow::ensure!(
+            editor.checking.is_none() && editor.browsing.is_none() && editor.composer.is_none(),
+            "Finish the open dotfiles edit before selecting the saved bundle"
+        );
+        editor.select_bundle(path);
+        editor.expanded = true;
+        editor.home = saved.home;
+        editor.fingerprint = fingerprint;
+        editor.zsh = saved.shell == DotfileShell::Zsh;
+        editor.zdotdir = zdotdir.unwrap_or_default();
+        editor.snapshot_version = Some(saved.bundle_sha256);
+        Ok(())
     }
 
     fn candidate(&self, draft: &ProfileDraft, base: &Path) -> anyhow::Result<DotfileSync> {
@@ -233,6 +287,14 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
+        if let Some(version) = &self.snapshot_version {
+            content.push(KeyedView::new(
+                "snapshot-version",
+                TextBlock::new()
+                    .text(format!("Saved dotfile version {version}"))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         content.extend([
             KeyedView::new(
                 "actions",
@@ -289,6 +351,42 @@ impl Editor {
 }
 
 impl TerminalApp {
+    pub(super) fn open_profile_for_snapshot(
+        &mut self,
+        profile: &str,
+        ctx: &ComponentContext<Self>,
+    ) -> Option<(TabId, &mut ProfileDraft)> {
+        self.command_reference.close();
+        self.edit_profile(profile.to_owned(), ctx);
+        let id = self.tabs.active_id()?;
+        let Page::NewProfile(draft) = &mut self.tabs.get_mut(id)?.page else {
+            return None;
+        };
+        draft
+            .origin
+            .editing()
+            .is_some_and(|base| base.name == profile)
+            .then_some((id, draft))
+    }
+
+    pub(super) fn open_dotfile_snapshot_profile(
+        &mut self,
+        profile: &str,
+        saved: ExportedDotfileBundle,
+        zdotdir: Option<String>,
+        connection: &w11term::ssh::ConnectionShare,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some((_, draft)) = self.open_profile_for_snapshot(profile, ctx) else {
+            return;
+        };
+        if let Err(error) =
+            Editor::stage_snapshot(draft, saved, zdotdir, connection.verified_endpoint())
+        {
+            draft.error = Some(format!("{error:#}"));
+        }
+    }
+
     pub(super) fn edit_profile_dotfiles(
         &mut self,
         id: TabId,
@@ -324,6 +422,7 @@ impl TerminalApp {
                     }
                 };
                 let request = Arc::new(());
+                let snapshot_version = draft.dotfiles.snapshot_version.clone();
                 draft.dotfiles.checking = Some(request.clone());
                 draft.dotfiles.error = None;
                 let rejected = Message::ProfileDotfiles(
@@ -337,7 +436,10 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let result = DotfileBundle::load(&settings.bundle)
-                            .and_then(|bundle| bundle.validate(settings.shell))
+                            .and_then(|bundle| match snapshot_version {
+                                Some(version) => bundle.verify_version(settings.shell, &version),
+                                None => bundle.validate(settings.shell),
+                            })
                             .map_err(|err| format!("Checking the dotfiles bundle: {err:#}"));
                         Message::ProfileDotfiles(id, Action::Reviewed(request, settings, result))
                     },
@@ -363,6 +465,7 @@ impl TerminalApp {
                 match result {
                     Ok(()) => {
                         draft.dotfiles.approved = Some(settings);
+                        draft.dotfiles.snapshot_version = None;
                         draft.dotfiles.error = None;
                         draft.saved = false;
                     }
@@ -414,9 +517,7 @@ impl TerminalApp {
                 match result {
                     Ok(Some(path)) => match path.into_os_string().into_string() {
                         Ok(path) => {
-                            draft.dotfiles.bundle = path;
-                            draft.dotfiles.checking = None;
-                            draft.dotfiles.error = None;
+                            draft.dotfiles.select_bundle(path);
                         }
                         Err(_) => {
                             draft.dotfiles.error =
@@ -440,6 +541,7 @@ impl TerminalApp {
                     *target = text;
                     if matches!(field, Field::Bundle) {
                         editor.browsing = None;
+                        editor.snapshot_version = None;
                     }
                     editor.checking = None;
                     editor.error = None;
@@ -448,6 +550,7 @@ impl TerminalApp {
             Action::Shell(Some(index)) => {
                 if draft.dotfiles.zsh != (index == 1) {
                     draft.dotfiles.zsh = index == 1;
+                    draft.dotfiles.snapshot_version = None;
                     draft.dotfiles.checking = None;
                     draft.dotfiles.error = None;
                 }

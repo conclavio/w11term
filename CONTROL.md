@@ -1324,6 +1324,8 @@ Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list 
 
 Select an active or older version in **Dotfile versions** and choose **Save selected dotfile bundle** to write a new Windows JSON manifest. The manifest contains the verified environment and prompt fragments for the selected shell. Choose that shell when reviewing the saved manifest for another SSH account. The destination must be a new file.
 
+For the profile that opened the connected pane, choose **Review saved dotfiles in this SSH profile** after saving. The profile editor shows the saved digest, verified host-key fingerprint, SFTP home, shell, and optional Zsh startup directory. **Approve dotfiles sync** checks that the manifest still reproduces the saved version. Choose **Save profile changes** to use it on the next connection.
+
 Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
 
 ### Sync dotfiles on SSH connect

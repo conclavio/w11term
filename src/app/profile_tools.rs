@@ -144,15 +144,9 @@ impl Editor {
         draft: &mut ProfileDraft,
         manifest: &Path,
         home: &str,
-        (host, user, port, fingerprint): (&str, &str, u16, &str),
+        endpoint: (&str, &str, u16, &str),
     ) -> anyhow::Result<()> {
-        let account = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
-        anyhow::ensure!(
-            (account.0.as_str(), account.1.as_str(), account.2) == (host, user, port),
-            "This profile's SSH account differs from the connection that saved the bundle"
-        );
-        let fingerprint = profile_dotfiles::approved_fingerprint(fingerprint, &draft.fingerprint)?;
-        validate_dotfiles_home(home)?;
+        let fingerprint = profile_dotfiles::snapshot_fingerprint(draft, home, endpoint)?;
         let editor = &mut draft.tool_bundle;
         anyhow::ensure!(
             editor.work.is_none() && editor.starter.is_none() && editor.local.is_none(),
@@ -414,25 +408,9 @@ impl TerminalApp {
         connection: &w11term::ssh::ConnectionShare,
         ctx: &ComponentContext<Self>,
     ) {
-        self.command_reference.close();
-        self.edit_profile(profile.clone(), ctx);
-        let Some(id) = self.tabs.active_id() else {
+        let Some((id, draft)) = self.open_profile_for_snapshot(&profile, ctx) else {
             return;
         };
-        let Some(AppTab {
-            page: Page::NewProfile(draft),
-            ..
-        }) = self.tabs.get_mut(id)
-        else {
-            return;
-        };
-        if !draft
-            .origin
-            .editing()
-            .is_some_and(|base| base.name == profile)
-        {
-            return;
-        }
         match Editor::stage_snapshot(draft, manifest, home, connection.verified_endpoint()) {
             Ok(()) => self.edit_profile_tools(id, Action::Review, ctx),
             Err(error) => draft.error = Some(format!("{error:#}")),
