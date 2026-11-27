@@ -15,6 +15,7 @@ mod transport;
 pub use conversations::{Conversations, Traffic};
 pub use protocols::{IpProtocols, TcpFlags, ip_protocol_label};
 pub use timeline::{Bucket, Timeline};
+pub(super) use timeline::{MAX_BUCKETS, RelativeTimeline};
 pub use transport::TransportConversations;
 
 const MAX_RECORDS: u32 = 1_000_000;
@@ -27,6 +28,7 @@ pub struct Summary {
     pub link_types: BTreeSet<u16>,
     pub issue: Option<String>,
     pub timeline: Option<Timeline>,
+    pub(super) relative_timeline: Option<RelativeTimeline>,
     pub conversations: Conversations,
     pub ip_protocols: IpProtocols,
     pub transport_conversations: TransportConversations,
@@ -157,6 +159,9 @@ impl Summary {
         if let Some(timestamp) = timestamp {
             self.timeline
                 .get_or_insert_with(Timeline::default)
+                .record(timestamp, captured);
+            self.relative_timeline
+                .get_or_insert_with(|| RelativeTimeline::new(timestamp))
                 .record(timestamp, captured);
         }
         conversations

@@ -446,6 +446,41 @@ try {
         (Find-Element 'IP conversation changes 3') -and
         (Find-Element "Average change${dot}-0.250 packets/s, -12.167 captured bytes/s")
     }
+    $expander = Open-PacketSection 'comparison-packet-timeline'
+    $null = Wait-Until 'the two elapsed timelines share a bucket width and selected interval' {
+        (Find-Element 'Before packet timeline chart') -and
+        (Find-Element 'After packet timeline chart') -and
+        (Find-Element 'Interval width 0.262144 s') -and
+        (Find-Element "Before interval${dot}1 packets${dot}34 captured bytes") -and
+        (Find-Element "After interval${dot}1 packets${dot}34 captured bytes")
+    }
+    Click 'Open Before interval in Wireshark'
+    $null = Wait-Until 'the elapsed interval translates to the Before file clock' {
+        $filter = $conversationCapture + '.filter'
+        [IO.File]::Exists($filter) -and [IO.File]::ReadAllText($filter) -ceq
+            'frame.time >= "1970-01-01T00:00:01.000000000Z" && frame.time < "1970-01-01T00:00:01.262144000Z"'
+    }
+    Click 'Open After interval in Wireshark'
+    $null = Wait-Until 'the same elapsed interval translates to the After file clock' {
+        $filter = $slowerCapture + '.filter'
+        [IO.File]::Exists($filter) -and [IO.File]::ReadAllText($filter) -ceq
+            'frame.time >= "1970-01-01T00:00:02.000000000Z" && frame.time < "1970-01-01T00:00:02.262144000Z"'
+    }
+    $intervals = Wait-CaptureCombo 'Compared timeline intervals'
+    $intervals.SetFocus()
+    $intervals.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $empty = Wait-Until 'the empty elapsed interval is selectable' {
+        Find-Element '+0.262144 to +0.524288 s' ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $empty.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'an empty interval has known zero counts and no Wireshark target' {
+        $openBefore = Find-Element 'Open Before interval in Wireshark' $button
+        $openAfter = Find-Element 'Open After interval in Wireshark' $button
+        (Find-Element "Before interval${dot}0 packets${dot}0 captured bytes") -and
+        (Find-Element "After interval${dot}0 packets${dot}0 captured bytes") -and
+        $openBefore -and !$openBefore.Current.IsEnabled -and $openAfter -and !$openAfter.Current.IsEnabled
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Click 'Back to capture'
     Select-Capture $partialCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'partial comparison preserves the issue and withholds capture deltas' {

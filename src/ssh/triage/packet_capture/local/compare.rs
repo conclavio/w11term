@@ -12,8 +12,10 @@ use std::{
 
 mod protocols;
 mod rates;
+mod timeline;
 use protocols::{ProtocolChange, TcpFlagComparison};
 use rates::AverageRateComparison;
+use timeline::TimelineComparison;
 
 #[derive(Serialize)]
 pub struct CaptureComparison {
@@ -22,6 +24,7 @@ pub struct CaptureComparison {
     pub after: CaptureSide,
     pub totals_delta: Option<CountsDelta>,
     pub average_rates: AverageRateComparison,
+    pub timeline: Option<TimelineComparison>,
     pub protocol_changes: Vec<ProtocolChange>,
     pub tcp_flag_comparison: Option<TcpFlagComparison>,
     pub conversation_changes: Vec<ConversationChange>,
@@ -137,6 +140,9 @@ impl CaptureComparison {
             &sources[1].summary.ip_protocols,
             complete,
         );
+        let timeline = TimelineComparison::new(
+            sources.map(|source| source.summary.relative_timeline.as_ref()),
+        );
         let totals_delta = complete.then(|| CountsDelta {
             packets: i64::from(after.packets) - i64::from(before.packets),
             captured_bytes: bytes_delta(before.captured_bytes, after.captured_bytes),
@@ -202,6 +208,7 @@ impl CaptureComparison {
             after,
             totals_delta,
             average_rates,
+            timeline,
             protocol_changes,
             tcp_flag_comparison,
             conversation_changes,
@@ -281,6 +288,9 @@ impl CaptureComparison {
         writeln!(output, "\nAverage rates over each recorded timestamp span")?;
         for line in self.average_rates.report_lines() {
             writeln!(output, "{line}")?;
+        }
+        if let Some(timeline) = &self.timeline {
+            timeline.write_report(&mut output)?;
         }
         writeln!(
             output,

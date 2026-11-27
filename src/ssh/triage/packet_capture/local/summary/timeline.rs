@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::{cmp::Reverse, collections::BTreeMap, mem, ops::Range};
 
 const MIN_BUCKET_NS: i128 = 1_000;
-const MAX_BUCKETS: i128 = 64;
+pub(in crate::ssh::triage::packet_capture::local) const MAX_BUCKETS: i128 = 64;
 
 #[derive(Clone, Copy, Default, Serialize)]
 pub struct Bucket {
@@ -13,6 +13,25 @@ pub struct Bucket {
 pub struct Timeline {
     width: i128,
     bins: BTreeMap<i128, Bucket>,
+}
+
+pub(in crate::ssh::triage::packet_capture::local) struct RelativeTimeline {
+    pub origin_unix_ns: i128,
+    pub timeline: Timeline,
+}
+
+impl RelativeTimeline {
+    pub(super) fn new(origin_unix_ns: i128) -> Self {
+        Self {
+            origin_unix_ns,
+            timeline: Timeline::default(),
+        }
+    }
+
+    pub(super) fn record(&mut self, timestamp: i128, captured: u32) {
+        self.timeline
+            .record(timestamp - self.origin_unix_ns, captured);
+    }
 }
 
 impl Default for Timeline {
@@ -88,6 +107,14 @@ impl Timeline {
         let first = self.bins.first_key_value().map_or(0, |(&index, _)| index);
         let last = self.bins.last_key_value().map_or(-1, |(&index, _)| index);
         (first..=last).map(|index| self.bins.get(&index).copied().unwrap_or_default())
+    }
+
+    pub(in crate::ssh::triage::packet_capture::local) fn occupied(
+        &self,
+    ) -> impl Iterator<Item = (i128, Bucket)> + '_ {
+        self.bins
+            .iter()
+            .map(|(&index, &bucket)| (index * self.width, bucket))
     }
 }
 

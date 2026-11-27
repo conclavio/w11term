@@ -43,13 +43,22 @@ fn raw_capture_with_spacing(
     packets: impl IntoIterator<Item = impl AsRef<[u8]>>,
     spacing_seconds: u32,
 ) -> Vec<u8> {
+    raw_capture_at(
+        packets
+            .into_iter()
+            .enumerate()
+            .map(|(index, packet)| (10 + index as u32 * spacing_seconds, 0, packet)),
+    )
+}
+
+fn raw_capture_at(packets: impl IntoIterator<Item = (u32, u32, impl AsRef<[u8]>)>) -> Vec<u8> {
     let mut bytes = classic_capture()[..24].to_vec();
     bytes[20] = 101;
-    for (index, packet) in packets.into_iter().enumerate() {
+    for (seconds, micros, packet) in packets {
         let packet = packet.as_ref();
         let size = packet.len() as u32;
         bytes.extend(
-            [10 + index as u32 * spacing_seconds, 0, size, size]
+            [seconds, micros, size, size]
                 .into_iter()
                 .flat_map(u32::to_le_bytes),
         );
@@ -386,6 +395,90 @@ fn compares_transport_pairs_beyond_the_ranked_summary_and_keeps_protocols_distin
     assert!(text.contains(
         "UDP · 192.0.2.1:1012 ↔ 192.0.2.2:443\nBefore · A to B 1 packets, 28 bytes · B to A 0 packets, 0 bytes\nAfter · A to B 0 packets, 0 bytes · B to A 1 packets, 28 bytes"
     ));
+}
+
+#[test]
+fn aligns_packet_timelines_with_distinct_origins_and_preserves_empty_or_uncovered_intervals() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "baseline.pcap";
+    let after = "current.pcap";
+    let frame = raw_transport_packet(17, 1012, false);
+    let capture_at = |times: [(u32, u32); 3]| {
+        raw_capture_at(times.map(|(seconds, micros)| (seconds, micros, &frame)))
+    };
+    fs::write(
+        root.join(before),
+        capture_at([(1100, 0), (1099, 999_999), (1101, 0)]),
+    )
+    .unwrap();
+    fs::write(
+        root.join(after),
+        capture_at([(2100, 320), (2100, 321), (2102, 320)]),
+    )
+    .unwrap();
+    let output = compare(root, before, after, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let timeline = &report["timeline"];
+    assert_eq!(timeline["before_origin_unix_ns"], "1100000000000");
+    assert_eq!(timeline["after_origin_unix_ns"], "2100000320000");
+    assert_eq!(timeline["start_offset_ns"], "-32768000");
+    assert_eq!(timeline["bucket_width_ns"], "32768000");
+    let bins = timeline["buckets"].as_array().unwrap();
+    assert_eq!(bins.len(), 63);
+    let bucket = |packets| json!({"packets": packets, "captured_bytes": packets * 28});
+    assert_eq!(bins[0], json!({"before": bucket(1), "after": null}));
+    assert_eq!(bins[1], json!({"before": bucket(1), "after": bucket(2)}));
+    assert_eq!(bins[2], json!({"before": bucket(0), "after": bucket(0)}));
+    assert_eq!(bins[31], json!({"before": bucket(1), "after": bucket(0)}));
+    assert_eq!(bins[32], json!({"before": null, "after": bucket(0)}));
+    assert_eq!(bins[62], json!({"before": null, "after": bucket(1)}));
+    for side in ["before", "after"] {
+        assert_eq!(
+            bins.iter()
+                .filter_map(|bin| bin[side]["packets"].as_u64())
+                .sum::<u64>(),
+            3
+        );
+        assert_eq!(
+            bins.iter()
+                .filter_map(|bin| bin[side]["captured_bytes"].as_u64())
+                .sum::<u64>(),
+            84
+        );
+    }
+
+    let text = compare(root, before, after, &["--format", "text"]);
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("Elapsed packet timeline · 32768000 ns per interval"));
+    assert!(text.contains(
+        "-32768000 ns · Before 1 packets, 28 captured bytes · After outside timestamped coverage"
+    ));
+    assert!(text.contains(
+        "+0 ns · Before 1 packets, 28 captured bytes · After 2 packets, 56 captured bytes"
+    ));
+
+    let untimed = "untimed.pcap";
+    fs::write(
+        root.join(untimed),
+        raw_capture_at([(2100, 1_000_000, &frame)]),
+    )
+    .unwrap();
+    let output = compare(root, before, untimed, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["after"]["packets"], 1);
+    assert_eq!(report["after"]["timestamped_packets"], 0);
+    assert!(report["timeline"]["after_origin_unix_ns"].is_null());
+    assert!(
+        report["timeline"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|bin| bin["after"].is_null())
+    );
 }
 
 #[test]

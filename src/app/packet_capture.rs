@@ -1194,6 +1194,7 @@ impl TerminalApp {
                                 | Action::SelectTransportConversation(..)
                                 | Action::Comparison(_, compare::Change::Pair { .. })
                                 | Action::Comparison(_, compare::Change::ProtocolsExpanded(_))
+                                | Action::Comparison(_, compare::Change::TimelineExpanded(_))
                         )) =>
             {
                 self.packet_capture_input(action, ctx);

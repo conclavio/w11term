@@ -1,6 +1,8 @@
 use super::*;
 use w11term::ssh::{PacketConversationChange, PacketConversationEndpoints};
 
+mod timeline;
+
 const ROWS_PER_PAGE: usize = 12;
 const SOURCE_LABELS: [&str; 2] = ["Before capture", "After capture"];
 
@@ -39,6 +41,9 @@ pub enum Change {
     },
     Source(usize),
     ProtocolsExpanded(bool),
+    TimelineExpanded(bool),
+    TimelineInterval(usize),
+    OpenTimelineInterval(usize, usize),
     Open(ConversationView, usize),
     Export,
 }
@@ -52,6 +57,8 @@ pub(super) struct Comparison {
     selected: Option<usize>,
     source: usize,
     protocols_expanded: bool,
+    timeline_expanded: bool,
+    timeline_interval: Option<usize>,
 }
 
 impl Comparison {
@@ -65,6 +72,8 @@ impl Comparison {
             selected: None,
             source: 1,
             protocols_expanded: false,
+            timeline_expanded: false,
+            timeline_interval: None,
         }
     }
 
@@ -128,6 +137,31 @@ impl Comparison {
             }
             Change::Source(source) if source < self.paths.len() => self.source = source,
             Change::ProtocolsExpanded(expanded) => self.protocols_expanded = expanded,
+            Change::TimelineExpanded(expanded) => self.timeline_expanded = expanded,
+            Change::TimelineInterval(index) if self.timeline_expanded => {
+                if self
+                    .model
+                    .timeline
+                    .as_ref()?
+                    .offset_interval(index)
+                    .is_some()
+                {
+                    self.timeline_interval = Some(index);
+                }
+            }
+            Change::OpenTimelineInterval(side, index)
+                if self.timeline_expanded && self.selected_timeline_interval() == Some(index) =>
+            {
+                let interval = self
+                    .model
+                    .timeline
+                    .as_ref()?
+                    .occupied_interval(side, index)?;
+                return Some((
+                    self.paths.get(side)?.clone(),
+                    WiresharkFilter::Interval(interval),
+                ));
+            }
             Change::Open(view, page) if view == self.conversation_view && page == self.page => {
                 let pair = self.rows().nth(start + self.selected?)?;
                 let filter = match pair.endpoints {
@@ -260,6 +294,7 @@ impl Comparison {
                 ),
             ),
         ));
+        fields.extend(self.timeline_view(idle, ctx));
         if !model.protocol_changes.is_empty() || model.tcp_flag_comparison.is_some() {
             let mut rows = Vec::new();
             if self.protocols_expanded {
