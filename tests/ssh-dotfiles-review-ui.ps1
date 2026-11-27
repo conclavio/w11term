@@ -80,7 +80,7 @@ try {
     $null = Control @('wait-ssh-connected','--pane',"$pane",'--timeout','15')
     Click 'Apply SSH dotfiles'
     Click 'Browse for dotfiles bundle'
-    $dialog = Wait-Until 'owned local dotfiles bundle picker' { Find-OwnedDialog 'Choose dotfiles bundle' }
+    $dialog = Wait-OwnedDialog 'Choose dotfiles bundle'
     $null = Wait-Until 'enter the local bundle' { [FixtureDialog]::SetFilename($dialog, $bundle, '') }
     $null = Wait-Until 'select the local bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
     Click 'Review dotfiles changes'
@@ -150,6 +150,25 @@ try {
         (Find-Element "Reviewed active version $second") -and (Find-Element "Restore version $first") -and
             (Find-Element 'This choice pauses automatic dotfile sync on reconnect.')
     }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $resize.Resize(960, 480)
+    try {
+        $null = Wait-Until 'restore confirmation and Back stay visible in a short window' {
+            $bounds = $root.Current.BoundingRectangle
+            $details = Find-Element 'This choice pauses automatic dotfile sync on reconnect.'
+            $scroll = if ($details) { Find-NativeVerticalScroll $details }
+            $restore = Find-Element 'Restore reviewed dotfiles' $button -Visible
+            $back = Find-Element 'Back to dotfile installer' $button -Visible
+            $scroll -and $restore -and $back -and
+                $bounds.Contains($restore.Current.BoundingRectangle) -and $bounds.Contains($back.Current.BoundingRectangle)
+        }
+    } catch {
+        $bounds = $root.Current.BoundingRectangle
+        $restore = Find-Element 'Restore reviewed dotfiles' $button
+        $back = Find-Element 'Back to dotfile installer' $button
+        throw "$_ Window=$bounds Restore=$($restore.Current.BoundingRectangle) Offscreen=$($restore.Current.IsOffscreen) Back=$($back.Current.BoundingRectangle) Offscreen=$($back.Current.IsOffscreen)"
+    }
     if ([IO.File]::ReadAllText($selectorPath).Trim() -cne $second) { throw 'Review changed the selector' }
     $null = Control @('focus-pane','--pane',"$localPane")
     Wait-Focus $localPane
@@ -166,7 +185,10 @@ try {
     if ([IO.File]::ReadAllText($selectorPath) -cne "$first`nmanual`n") { throw 'Restore did not hold the first version' }
 
     Click 'Review disabling managed dotfiles'
-    $null = Wait-Until 'disabling can be confirmed' { Find-Element 'Disable managed dotfiles for new shells' }
+    $null = Wait-Until 'disable confirmation stays visible in the short window' {
+        (Find-Element 'Disable managed dotfiles for new shells') -and
+            (Find-Element 'Disable reviewed dotfiles' $button -Visible)
+    }
     Click 'Disable reviewed dotfiles'
     $null = Wait-Until 'history shows disabled dotfiles' { Find-Element 'Managed dotfiles disabled' }
     if ([IO.File]::ReadAllText($selectorPath) -cne "disabled`n") { throw 'Disable did not switch the selector' }

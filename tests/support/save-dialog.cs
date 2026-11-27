@@ -17,6 +17,7 @@ public static class FixtureDialog {
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder caption, int size);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr size, StringBuilder text, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
@@ -75,10 +76,42 @@ public static class FixtureDialog {
         return result.ToArray();
     }
 
-    private static bool IsControl(IntPtr hwnd, string type) {
+    private static string WindowClass(IntPtr hwnd) {
         var name = new StringBuilder(128);
         GetClassName(hwnd, name, name.Capacity);
-        return IsWindowVisible(hwnd) && IsWindowEnabled(hwnd) && name.ToString() == type;
+        return name.ToString();
+    }
+
+    private static string WindowCaption(IntPtr hwnd) {
+        var caption = new StringBuilder(512);
+        GetWindowText(hwnd, caption, caption.Capacity);
+        return caption.ToString();
+    }
+
+    public static IntPtr FindOwnedDialog(uint process, IntPtr owner, string title) {
+        const uint gwOwner = 4;
+        foreach (var hwnd in Windows(process)) {
+            // Shell dialogs are Win32 windows, even when their UI Automation
+            // provider has not finished publishing its class and name.
+            if (GetWindow(hwnd, gwOwner) == owner && WindowClass(hwnd) == "#32770" &&
+                String.Equals(WindowCaption(hwnd), title, StringComparison.OrdinalIgnoreCase)) {
+                return hwnd;
+            }
+        }
+        return IntPtr.Zero;
+    }
+
+    public static string DescribeWindows(uint process) {
+        var windows = new List<string>();
+        foreach (var hwnd in Windows(process)) {
+            windows.Add(String.Format("hwnd={0} owner={1} class={2} title={3}",
+                hwnd, GetWindow(hwnd, 4), WindowClass(hwnd), WindowCaption(hwnd)));
+        }
+        return String.Join(" | ", windows);
+    }
+
+    private static bool IsControl(IntPtr hwnd, string type) {
+        return IsWindowVisible(hwnd) && IsWindowEnabled(hwnd) && WindowClass(hwnd) == type;
     }
 
     private static string EditText(IntPtr hwnd) {
