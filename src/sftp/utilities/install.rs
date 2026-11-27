@@ -11,6 +11,7 @@ const MANIFEST_LIMIT: text_preview::PreviewLimit = text_preview::PreviewLimit {
 };
 const LOCK_READY: &[u8] = b"w11term-tools-locked-v1\n";
 const MAX_INSPECTED_BUNDLES: usize = 32;
+const MAX_LISTED_VERSIONS: usize = 32;
 const MUTATING: &str =
     "Tool bundle activation did not finish. Preview again to check the active version.";
 type Ssh = russh::client::Handle<crate::ssh::Handler>;
@@ -88,6 +89,22 @@ pub struct InstalledTools {
     pub skipped_bundles: usize,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct ToolBundleVersions {
+    pub versions: Vec<RetainedToolVersion>,
+    pub skipped_bundles: usize,
+    pub omitted_versions: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RetainedToolVersion {
+    pub bundle: String,
+    pub bundle_sha256: String,
+    pub active: bool,
+    pub held: bool,
+    pub modified: Option<u32>,
+}
+
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
 pub(super) struct Selector {
     pub conflict: bool,
@@ -113,27 +130,8 @@ impl Engine {
         cancel: Option<&TransferCancel>,
     ) -> Result<InstalledTools> {
         let home = self.dotfile_home().await?;
-        let root = under_home(&home, STORE);
-        let directory = self.utility_directories(&home, STORE).await?;
-        ensure!(
-            directory.blocked_at.is_none(),
-            "Managed tool directory is blocked"
-        );
+        let names = self.tool_bundle_names(&home, cancel).await?;
         let mut installed = InstalledTools::default();
-        if !directory.create.is_empty() {
-            return Ok(installed);
-        }
-        let mut names = BTreeSet::new();
-        for entry in self.read_directory(&root, cancel, true).await? {
-            let name = entry.filename;
-            if safe_component(&name)
-                && !name.starts_with('.')
-                && EntryKind::from_permissions(entry.attrs.permissions)
-                    == Some(EntryKind::Directory)
-            {
-                names.insert(name);
-            }
-        }
         installed.skipped_bundles = names.len().saturating_sub(MAX_INSPECTED_BUNDLES);
         for name in names.into_iter().take(MAX_INSPECTED_BUNDLES) {
             ensure!(
@@ -152,6 +150,115 @@ impl Engine {
             .tools
             .sort_unstable_by(|a, b| (&a.name, &a.bundle).cmp(&(&b.name, &b.bundle)));
         Ok(installed)
+    }
+
+    async fn tool_bundle_names(
+        &self,
+        home: &str,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<BTreeSet<String>> {
+        let directory = self.utility_directories(home, STORE).await?;
+        ensure!(
+            directory.blocked_at.is_none(),
+            "Managed tool directory is blocked"
+        );
+        if !directory.create.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let root = under_home(home, STORE);
+        Ok(self
+            .read_directory(&root, cancel, true)
+            .await?
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry.filename;
+                (safe_component(&name)
+                    && !name.starts_with('.')
+                    && EntryKind::from_permissions(entry.attrs.permissions)
+                        == Some(EntryKind::Directory))
+                .then_some(name)
+            })
+            .collect())
+    }
+
+    pub(in crate::sftp) async fn tool_bundle_versions(
+        &self,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<ToolBundleVersions> {
+        let home = self.dotfile_home().await?;
+        let names = self.tool_bundle_names(&home, cancel).await?;
+        let mut result = ToolBundleVersions {
+            skipped_bundles: names.len().saturating_sub(MAX_INSPECTED_BUNDLES),
+            ..Default::default()
+        };
+        for name in names.into_iter().take(MAX_INSPECTED_BUNDLES) {
+            ensure!(
+                !cancel.is_some_and(TransferCancel::is_cancelled),
+                "Tool history lookup cancelled"
+            );
+            match self.retained_versions(&home, &name, cancel).await {
+                Ok(versions) => {
+                    result.omitted_versions += versions.len().saturating_sub(MAX_LISTED_VERSIONS);
+                    result
+                        .versions
+                        .extend(versions.into_iter().take(MAX_LISTED_VERSIONS));
+                }
+                Err(error) if error.downcast_ref::<Error>().is_some_and(transport_error) => {
+                    return Err(error);
+                }
+                Err(_) => result.skipped_bundles += 1,
+            }
+        }
+        Ok(result)
+    }
+
+    async fn retained_versions(
+        &self,
+        home: &str,
+        name: &str,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<Vec<RetainedToolVersion>> {
+        let relative = format!("{STORE}/{name}");
+        let store = under_home(home, &relative);
+        let directory = self
+            .utility_directories(home, &format!("{relative}/versions"))
+            .await?;
+        ensure!(
+            directory.blocked_at.is_none(),
+            "The retained tool directory is blocked"
+        );
+        if !directory.create.is_empty() {
+            return Ok(Vec::new());
+        }
+        let selector = self.utility_selector_state(&store, &directory).await?;
+        let mut seen = BTreeSet::new();
+        let mut versions = Vec::new();
+        for entry in self
+            .read_directory(&format!("{store}/versions"), cancel, true)
+            .await?
+        {
+            let id = entry.filename;
+            if EntryKind::from_permissions(entry.attrs.permissions) == Some(EntryKind::Directory)
+                && normalize_sha256(&id).is_ok_and(|normalized| normalized == id)
+                && seen.insert(id.clone())
+            {
+                let active = selector.version.as_deref() == Some(id.as_str());
+                versions.push(RetainedToolVersion {
+                    bundle: name.to_owned(),
+                    bundle_sha256: id,
+                    active,
+                    held: active && selector.manual,
+                    modified: entry.attrs.mtime,
+                });
+            }
+        }
+        versions.sort_unstable_by(|a, b| {
+            b.active
+                .cmp(&a.active)
+                .then_with(|| b.modified.cmp(&a.modified))
+                .then_with(|| a.bundle_sha256.cmp(&b.bundle_sha256))
+        });
+        Ok(versions)
     }
 
     async fn installed_bundle_tools(&self, home: &str, name: &str) -> Result<Vec<InstalledTool>> {

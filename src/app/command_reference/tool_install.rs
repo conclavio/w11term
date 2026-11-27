@@ -3,6 +3,8 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use w11term::sftp::UtilityBundle;
 
+mod history;
+
 pub enum Action {
     Open(ToolPane),
     Browse,
@@ -11,6 +13,7 @@ pub enum Action {
     Previewed(Arc<()>, Result<Box<Review>, String>),
     Apply,
     Applied(Arc<()>, Result<Installation, String>),
+    History(history::Action),
     Close,
 }
 
@@ -83,6 +86,7 @@ pub(super) struct Installer {
     review: Option<Box<Review>>,
     pending: Option<(Arc<()>, Work)>,
     status: Option<String>,
+    history: Option<history::Panel>,
 }
 
 fn message(action: Action) -> Message {
@@ -109,6 +113,9 @@ impl Installer {
     }
 
     pub(super) fn view(&self, active: Option<ToolPane>, ctx: &ViewContext<TerminalApp>) -> View {
+        if let Some(history) = &self.history {
+            return history.view(&self.account, active == Some(self.target), ctx);
+        }
         let available = active == Some(self.target) && self.pending.is_none();
         let applying = self
             .pending
@@ -130,6 +137,12 @@ impl Installer {
                 TextBlock::new()
                     .text(&self.account)
                     .text_wrapping(TextWrapping::Wrap),
+            ),
+            KeyedView::new(
+                "history",
+                button("Bundle versions", available, || {
+                    Action::History(history::Action::Open)
+                }),
             ),
             KeyedView::new(
                 "manifest",
@@ -265,6 +278,10 @@ impl Review {
 
 impl TerminalApp {
     pub(super) fn tool_install_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if let Action::History(action) = action {
+            self.tool_bundle_history(action, ctx);
+            return;
+        }
         let current = self
             .reference_tool_target()
             .map(|(target, session)| (target, session.input.clone()));
@@ -291,6 +308,7 @@ impl TerminalApp {
                 review: None,
                 pending: None,
                 status: None,
+                history: None,
             });
             return;
         }
@@ -301,9 +319,13 @@ impl TerminalApp {
         let Some(installer) = &mut panel.tool_install else {
             return;
         };
+        if installer.history.is_some() {
+            return;
+        }
         let target = installer.target;
         match action {
             Action::Open(_) => unreachable!("opening handled above"),
+            Action::History(_) => unreachable!("history handled above"),
             Action::Close => {
                 if !installer
                     .pending

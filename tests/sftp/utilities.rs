@@ -532,6 +532,20 @@ async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
     );
     assert!(selector().ends_with(&format!("versions/{b_id}\n")));
     assert_eq!(launcher(), original_launcher);
+    fs::create_dir(store.join("versions/.w11term-stage-incomplete")).unwrap();
+    let retained = guarded_job(&pane, None, Operation::ToolBundleVersions)
+        .await
+        .unwrap();
+    let versions = retained["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0]["bundle"], "portable");
+    assert_eq!(versions[0]["bundle_sha256"], b_id);
+    assert_eq!(versions[0]["active"], true);
+    assert_eq!(versions[0]["held"], false);
+    assert_eq!(versions[1]["bundle_sha256"], a_id);
+    assert_eq!(versions[1]["active"], false);
+    assert_eq!(retained["skipped_bundles"], 0);
+    assert_eq!(retained["omitted_versions"], 0);
     let current = guarded_job(&pane, None, Operation::InstalledTools)
         .await
         .unwrap();
@@ -566,6 +580,14 @@ async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
     assert_eq!(restored["uploaded"], false);
     assert!(selector().ends_with(&format!("versions/{a_id}\n")));
     assert_eq!(launcher(), original_launcher);
+    let retained = guarded_job(&pane, None, Operation::ToolBundleVersions)
+        .await
+        .unwrap();
+    assert_eq!(retained["versions"][0]["bundle_sha256"], a_id);
+    assert_eq!(retained["versions"][0]["active"], true);
+    assert_eq!(retained["versions"][0]["held"], true);
+    assert_eq!(retained["versions"][1]["bundle_sha256"], b_id);
+    assert_eq!(retained["versions"][1]["active"], false);
     let current = guarded_job(&pane, None, Operation::InstalledTools)
         .await
         .unwrap();

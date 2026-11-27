@@ -12,7 +12,7 @@ pub use downloads::{
     fetch_tool_bundle, prepare_builtin_tool_bundle,
 };
 use install::{InstallPlan, Release, StoredTool};
-pub use install::{InstalledTool, InstalledTools};
+pub use install::{InstalledTool, InstalledTools, RetainedToolVersion, ToolBundleVersions};
 pub(crate) use login::sync_login_tools;
 
 const DEFAULT_BIN: &str = ".local/bin";

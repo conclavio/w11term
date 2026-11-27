@@ -135,6 +135,9 @@ try {
     }
     $conflict = [IO.File]::ReadAllText((Join-Path $State 'tool-launcher-conflict'))
     if ([IO.File]::ReadAllText($conflict) -cne 'existing fixture command') { throw 'Review changed an existing command' }
+    $remoteLocal = Split-Path -Parent (Split-Path -Parent $conflict)
+    $selectorPath = Join-Path $remoteLocal 'share/w11term/tools/portable/current'
+    $oldId = ([IO.File]::ReadAllText($selectorPath).Trim() -split '/')[-1]
     [IO.File]::Delete($conflict)
     Click 'Review bundle'
     $null = Wait-Until 'installation plan shows the new launcher' { Find-Element "netwatch${dot}Create /.local/bin/netwatch" }
@@ -153,6 +156,35 @@ try {
     $null = Wait-Until 'newly installed tool is visible on the same pane' {
         (Find-Element 'netwatch') -and (Find-Element "Linux${dot}w11term manual")
     }
+    Click 'Install SSH tools'
+    Click 'Bundle versions'
+    $history = Wait-Until 'retained tool versions offered' { Find-Element 'Retained tool bundle versions' $combo }
+    $history.SetFocus()
+    $history.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $prior = Wait-Until 'previous bundle appears in history' {
+        Find-Element "portable${dot}$($oldId.Substring(0,12))" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $prior.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Review rollback'
+    $null = Wait-Until 'rollback shows the prior contents and update policy' {
+        (Find-Element 'Retained commands mdd, rg') -and
+        (Find-Element 'Restoring this version pauses automatic bundle updates until you apply a bundle again.')
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'the other pane cannot restore the retained bundle' {
+        $restore = Find-Element 'Restore reviewed version' $button
+        $restore -and !$restore.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Restore reviewed version'
+    $null = Wait-Until 'rollback restored and pinned the original version' {
+        (Find-Element 'Restored tool bundle portable') -and
+        [IO.File]::ReadAllText($selectorPath).Contains("./versions/$oldId")
+    }
+    Click 'Back to tool installer'
+    Click 'Back to command reference'
     Set-Field 'Search command reference' 'crew report'
     Click 'New private page'
     $manual = @'

@@ -35,9 +35,9 @@ pub use dotfiles::{
 };
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{
-    InstalledTool, InstalledTools, ToolBundlePreset, UtilityArchitecture, UtilityBuild,
-    UtilityBundle, UtilityDownload, UtilityTool, builtin_tool_names, export_builtin_tool_bundle,
-    fetch_tool_bundle, prepare_builtin_tool_bundle,
+    InstalledTool, InstalledTools, RetainedToolVersion, ToolBundlePreset, ToolBundleVersions,
+    UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityDownload, UtilityTool,
+    builtin_tool_names, export_builtin_tool_bundle, fetch_tool_bundle, prepare_builtin_tool_bundle,
 };
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
@@ -233,6 +233,7 @@ pub enum CopyDestination {
 pub enum Operation {
     Info,
     InstalledTools,
+    ToolBundleVersions,
     PreviewToolBundle {
         bundle: UtilityBundle,
     },
@@ -974,6 +975,9 @@ pub(crate) async fn run(
                 Operation::InstalledTools => {
                     JobStage::Checking("Installed tools lookup did not finish")
                 }
+                Operation::ToolBundleVersions => {
+                    JobStage::Checking("Tool history lookup did not finish")
+                }
                 Operation::ApplyToolBundle { .. } | Operation::RollbackToolBundle { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
                 }
@@ -1517,6 +1521,7 @@ impl Engine {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
             }
             InstalledTools => serde_json::to_value(self.installed_tools(cancel).await?)?,
+            ToolBundleVersions => serde_json::to_value(self.tool_bundle_versions(cancel).await?)?,
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             ApplyToolBundle { bundle, review } => {
                 self.apply_utility_bundle(session, bundle, &review, stage)
