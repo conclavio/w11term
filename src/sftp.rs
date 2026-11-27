@@ -108,6 +108,56 @@ pub(crate) fn digest_hex(digest: Sha256) -> String {
         .collect()
 }
 
+pub(crate) async fn stage_diagnostic_download(
+    session: &russh::client::Handle<crate::ssh::Handler>,
+    remote: &str,
+    parent: &Path,
+    length: u64,
+    sha256: &str,
+) -> Result<tempfile::NamedTempFile> {
+    let parent = parent.to_owned();
+    let (staged, file) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let staged = tempfile::NamedTempFile::new_in(parent)?;
+        let file = staged.reopen()?;
+        Ok((staged, file))
+    })
+    .await??;
+    let mut file = tokio::fs::File::from_std(file);
+    let engine = Engine::connect(session).await?;
+    let handle = engine
+        .raw
+        .open(remote, OpenFlags::READ, FileAttributes::empty())
+        .await?
+        .handle;
+    let mut hash = Sha256::new();
+    let copied = engine
+        .read_contents(
+            &handle,
+            &mut file,
+            0,
+            Some((length, "reviewed capture size")),
+            None,
+            |_, bytes| {
+                hash.update(bytes);
+                Ok(())
+            },
+        )
+        .await;
+    let closed = engine.raw.close(handle).await;
+    ensure!(
+        copied? == length,
+        "The SFTP capture did not match its reported length"
+    );
+    closed?;
+    ensure!(
+        digest_hex(hash) == sha256,
+        "The SFTP capture did not match its SHA-256 digest"
+    );
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(staged)
+}
+
 struct DownloadChecks {
     max_bytes: Option<u64>,
     sha256: Option<String>,

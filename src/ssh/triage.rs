@@ -8,6 +8,7 @@ use tokio::sync::watch;
 
 pub(crate) mod cpu_profile;
 mod findings;
+pub(crate) mod packet_capture;
 pub use findings::{Finding, Resource};
 
 pub(crate) const DEADLINE: Duration = Duration::from_secs(60);

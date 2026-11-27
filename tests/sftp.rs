@@ -32,6 +32,9 @@ struct Peer {
 }
 
 const PERF_DATA_FIXTURE: &[u8] = b"PERFILE2\0\xff\r\nraw perf fixture\0";
+// Classic little-endian pcap, one captured packet with a four-byte payload.
+const PCAP_FIXTURE: &[u8] = b"\xd4\xc3\xb2\xa1\x02\0\x04\0\0\0\0\0\0\0\0\0\xc0\0\0\0\x01\0\0\0\
+    \x01\0\0\0\0\0\0\0\x04\0\0\0\x04\0\0\0\xab\xcd\xef\x01";
 
 fn perf_data_header() -> String {
     use sha2::{Digest, Sha256};
@@ -255,6 +258,57 @@ impl server::Handler for Peer {
         command: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if let Some((_, args)) = std::str::from_utf8(command)
+            .ok()
+            .filter(|command| command.starts_with("/bin/bash -c '# w11term-packet-capture-v1"))
+            .and_then(|command| command.rsplit_once("' w11term-packet-capture "))
+        {
+            s.channel_success(c)?;
+            if args.starts_with("inspect ") {
+                s.data(
+                    c,
+                    b"w11term-packet-plan-v1\ttmpfs\t12:34\t/dev/shm\n".to_vec(),
+                )?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else {
+                let job = args.rsplit_once(' ').unwrap().1.trim_matches('\'');
+                anyhow::ensure!(
+                    job.len() == 32 && job.bytes().all(|byte| byte.is_ascii_hexdigit())
+                );
+                let remote = self
+                    .root
+                    .join("dev")
+                    .join("shm")
+                    .join(format!("w11term-pcap-{job}"));
+                fs::create_dir_all(&remote)?;
+                fs::write(remote.join("capture.pcap"), PCAP_FIXTURE)?;
+                fs::write(
+                    self.root.join(format!("pcap-ack-{c}")),
+                    remote.to_str().unwrap(),
+                )?;
+                use sha2::{Digest, Sha256};
+                let sha256 = if self.root.join("pcap-bad-digest").exists() {
+                    "0".repeat(64)
+                } else {
+                    Sha256::digest(PCAP_FIXTURE)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect()
+                };
+                s.extended_data(c, 1, b"1 packet captured\n2 packets received by filter\n0 packets dropped by kernel\n".to_vec())?;
+                s.data(
+                    c,
+                    format!(
+                        "w11term-packet-ready-v1\tpackets\t{}\t{sha256}\n",
+                        PCAP_FIXTURE.len()
+                    )
+                    .into_bytes(),
+                )?;
+            }
+            return Ok(());
+        }
         if command.starts_with(b"/bin/sh -c '# w11term-linux-triage-v1")
             && let Ok(report) = fs::read(self.root.join("triage-response"))
         {
@@ -562,6 +616,21 @@ impl server::Handler for Peer {
         data: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        let capture_marker = self.root.join(format!("pcap-ack-{c}"));
+        if data == b"verified\n"
+            && let Ok(remote) = fs::read_to_string(&capture_marker)
+        {
+            let remote = PathBuf::from(remote);
+            fs::remove_file(remote.join("capture.pcap"))?;
+            fs::remove_dir(remote)?;
+            fs::remove_file(capture_marker)?;
+            fs::write(self.root.join("pcap-verified"), [])?;
+            s.data(c, b"w11term-packet-complete-v1\n".to_vec())?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
         if self.channels.contains_key(&c) {
             if let Some(wire) = &self.wire {
                 let _ = wire.send(in_band_resize::Wire::Input(c, data.to_vec()));
@@ -2004,6 +2073,91 @@ const TRIAGE_RESPONSE: &str = concat!(
     "top\t1000\t1010\t0\t\t\n",
     "end\n"
 );
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_cleanup() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let registry = registry(&pane);
+    let callback: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screenshot"));
+    let options = control::PacketCaptureOptions {
+        interface: "lo".into(),
+        filter: "udp and port 4096".into(),
+        snap_length: 192,
+        seconds: 5,
+        max_mib: 1,
+        packet_limit: Some(1),
+        scratch_directory: "/dev/shm".into(),
+        require_tmpfs: true,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewPacketCapture {
+                pane: 1,
+                options: options.clone(),
+            },
+            callback.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    assert_eq!(plan["scratch_filesystem"], "tmpfs");
+    assert_eq!(
+        plan["tcpdump_arguments"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "udp and port 4096"
+    );
+    let request = |name: &str, options| Request::CapturePackets {
+        pane: 1,
+        options,
+        connection_generation: plan["connection_generation"]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        review_id: plan["review_id"].as_str().unwrap().into(),
+        output_file: local.path().join(name),
+    };
+    let scratch = remote.path().join("dev/shm");
+    let mut changed = options.clone();
+    changed.seconds += 1;
+    let error = registry
+        .execute(request("stale.pcap", changed), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Review again"));
+    assert!(!scratch.exists());
+
+    fs::write(remote.path().join("pcap-bad-digest"), []).unwrap();
+    let error = registry
+        .execute(request("corrupt.pcap", options.clone()), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("SHA-256 digest"));
+    assert!(!remote.path().join("pcap-verified").exists());
+    assert!(!local.path().join("corrupt.pcap").exists());
+    fs::remove_file(remote.path().join("pcap-bad-digest")).unwrap();
+
+    let result = registry
+        .execute(request("reviewed capture.pcap", options), callback)
+        .await
+        .unwrap();
+    let capture = &result["capture"];
+    assert_eq!(capture["bytes"], PCAP_FIXTURE.len());
+    assert_eq!(capture["packets"], 1);
+    assert_eq!(capture["received_by_filter"], 2);
+    assert_eq!(capture["dropped_by_kernel"], 0);
+    assert_eq!(capture["stop_reason"], "packet-limit");
+    assert!(remote.path().join("pcap-verified").exists());
+    assert_eq!(
+        fs::read(local.path().join("reviewed capture.pcap")).unwrap(),
+        PCAP_FIXTURE
+    );
+    server.abort();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {

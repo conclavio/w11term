@@ -1443,6 +1443,21 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 & $ctl --pid 12345 sftp --pane $pane resume-tool-bundle-updates my-tools $activeSha256 --review $resume.review
 ```
 
+### Capture Linux packets and open Wireshark
+
+Use a connected Linux SSH pane and review the interface, literal tcpdump filter, limits, and scratch location. Pass the same capture options and the returned connection generation and review ID to record. The host needs tcpdump, Bash, GNU coreutils, flock, the SSH SFTP subsystem, and permission to capture on the selected interface. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)
+
+```powershell
+$packetOptions = @('--pane', $pane, '--interface', 'lo', '--filter', 'udp port 4096', '--seconds', '10', '--max-mib', '8', '--tmpfs')
+$plan = (& $ctl --pid 12345 preview-packet-capture @packetOptions | ConvertFrom-Json).result.plan
+$plan
+& $ctl --pid 12345 capture-packets @packetOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --output-file '.\loopback.pcap' --wireshark 'C:\Program Files\Wireshark\Wireshark.exe'
+```
+
+Defaults are 15 seconds, a 192-byte snap length, a 16 MiB budget, and `/tmp` scratch storage. Use `--tmpfs` to verify a RAM-backed mount, which defaults to `/dev/shm`, or choose a path with `--scratch-directory`. The worker requires 1 MiB of free-space headroom and applies a shared Linux-account capture lease. The effective packet limit is the smaller of `--packet-limit` and the number of maximum-size packet records that fit in the budget. A time limit interrupts tcpdump so it can finish writing and report drops.
+
+SFTP transfers the completed file over the existing SSH connection. w11term checks its size, SHA-256, and packet records before publishing a new local file and reports the packet count, stop reason, and available drop statistics. The private scratch files expire after the transfer lease or are cleaned up after verified receipt. `--wireshark` is optional and launches Wireshark on Windows after saving. If it cannot launch, the reply includes the saved path and the launch error. [Wireshark command-line options](https://www.wireshark.org/docs/wsug_html_chunked/ChCustCommandLine.html)
+
 ### Collect Linux performance triage
 
 In the Windows app, open **More → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.

@@ -38,6 +38,7 @@ mod ssh_groups;
 mod triage;
 mod workspace_preview;
 pub use crate::ssh::triage::cpu_profile::{CpuCallGraph, CpuProfileOptions};
+pub use crate::ssh::triage::packet_capture::PacketCaptureOptions;
 pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
@@ -73,6 +74,17 @@ pub enum Request {
         output_file: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         perf_data_file: Option<PathBuf>,
+    },
+    PreviewPacketCapture {
+        pane: u64,
+        options: PacketCaptureOptions,
+    },
+    CapturePackets {
+        pane: u64,
+        options: PacketCaptureOptions,
+        connection_generation: std::num::NonZeroU64,
+        review_id: String,
+        output_file: PathBuf,
     },
     Record {
         pane: u64,
@@ -1431,6 +1443,25 @@ impl Registry {
             Request::PreviewCpuProfile { pane, options } => {
                 self.preview_cpu_profile(pane, options).await
             }
+            Request::PreviewPacketCapture { pane, options } => {
+                self.preview_packet_capture(pane, options).await
+            }
+            Request::CapturePackets {
+                pane,
+                options,
+                connection_generation,
+                review_id,
+                output_file,
+            } => {
+                self.capture_packets(
+                    pane,
+                    options,
+                    connection_generation,
+                    &review_id,
+                    output_file,
+                )
+                .await
+            }
             Request::CaptureCpuProfile {
                 pane,
                 options,
@@ -2705,6 +2736,7 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
     tokio::time::timeout(
         Duration::from_secs(match request {
             Request::LinuxTriage { .. } => crate::ssh::triage::DEADLINE.as_secs() + 20,
+            Request::CapturePackets { .. } => crate::ssh::triage::packet_capture::CONTROL_SECONDS,
             Request::CaptureCpuProfile {
                 perf_data_file: Some(_),
                 ..

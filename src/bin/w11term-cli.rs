@@ -11,6 +11,8 @@ use w11term::control::{self, Reply, Request};
 mod automation;
 #[path = "w11term-cli/cpu_profile.rs"]
 mod cpu_profile;
+#[path = "w11term-cli/packet_capture.rs"]
+mod packet_capture;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 #[path = "w11term-cli/tool_bundles.rs"]
@@ -23,6 +25,7 @@ struct Invocation {
     pid: Option<u32>,
     request: Request,
     success_check: Option<SuccessCheck>,
+    wireshark: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -37,6 +40,7 @@ impl Invocation {
             pid,
             request,
             success_check: None,
+            wireshark: None,
         }
     }
 }
@@ -130,6 +134,17 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                 );
                 let request = cpu_profile::parse(&arg, args, pane)?;
                 return Ok(Invocation::new(pid, request));
+            }
+            "preview-packet-capture" | "capture-packets" if verb.is_none() => {
+                ensure!(
+                    payload.is_none() && path.is_none() && !no_paste,
+                    "invalid options before packet capture command"
+                );
+                let (request, wireshark) = packet_capture::parse(&arg, args, pane)?;
+                return Ok(Invocation {
+                    wireshark,
+                    ..Invocation::new(pid, request)
+                });
             }
             "sftp" if verb.is_none() => {
                 ensure!(
@@ -264,6 +279,7 @@ async fn main() -> ExitCode {
             "\nw11term-cli [--pid PID] preview-linux-triage --pane ID\nw11term-cli [--pid PID] linux-triage --pane ID --connection-generation N --output-file PATH"
         );
         println!("\n{}", cpu_profile::HELP);
+        println!("\n{}", packet_capture::HELP);
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {
@@ -311,7 +327,14 @@ async fn main() -> ExitCode {
             }
             Ok(invocation) => {
                 success_check = invocation.success_check;
-                control::call(invocation.pid, &invocation.request).await
+                control::call(invocation.pid, &invocation.request)
+                    .await
+                    .map(|mut reply| {
+                        if let Some(executable) = invocation.wireshark {
+                            packet_capture::open_in_wireshark(&mut reply, executable);
+                        }
+                        reply
+                    })
             }
             Err(e) => Err(e),
         }

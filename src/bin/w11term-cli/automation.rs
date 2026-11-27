@@ -1228,6 +1228,7 @@ pub(super) fn parse(
         pid,
         request,
         success_check,
+        wireshark: None,
     })
 }
 #[cfg(test)]

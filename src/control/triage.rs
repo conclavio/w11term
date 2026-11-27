@@ -67,6 +67,34 @@ impl Registry {
         }))
     }
 
+    pub(super) async fn preview_packet_capture(
+        &self,
+        pane: u64,
+        options: PacketCaptureOptions,
+    ) -> Result<Value> {
+        let mut target = self.diagnostic_target(pane, None).await?;
+        Ok(json!({ "pane": pane, "plan": target.preview_packet_capture(options).await? }))
+    }
+
+    pub(super) async fn capture_packets(
+        &self,
+        pane: u64,
+        options: PacketCaptureOptions,
+        connection_generation: NonZeroU64,
+        review_id: &str,
+        output_file: PathBuf,
+    ) -> Result<Value> {
+        let target = self
+            .diagnostic_target(pane, Some(connection_generation))
+            .await?;
+        let capture = target
+            .capture_packets(options, review_id, output_file)
+            .await?;
+        Ok(
+            json!({ "pane": pane, "connection_generation": connection_generation, "capture": capture }),
+        )
+    }
+
     async fn diagnostic_target(
         &self,
         pane: u64,
