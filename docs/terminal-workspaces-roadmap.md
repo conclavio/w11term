@@ -22,6 +22,8 @@ The [SSH host groups roadmap](#ssh-host-groups) covers running the same command 
 
 The [SSH diagnostics roadmap](#ssh-diagnostics) covers packet capture, syscall tracing, Linux performance triage, and flame graphs. The [LLM assistance roadmap](#llm-assistance) covers reviewing selected terminal evidence and drafting Bash commands.
 
+The [command reference](#command-reference) puts short manuals beside the terminal. [Managed SSH utilities](#managed-ssh-utilities) covers bringing a personal command-line toolkit to a Linux host.
+
 ## Current capabilities
 
 Each terminal tab has its own session, scrollback, search state and programmable control surface. Scripts can target a background session by ID, write raw bytes, wait for a regex, read committed screen text, capture PNGs and record VT output. The same authenticated SSH connection also supports SFTP. Profiles already support creation, editing and renaming, plus key, agent, password and keyboard-interactive authentication. [Current features](../README.md#tabs-and-profiles) · [Control and SFTP API](../CONTROL.md)
@@ -322,6 +324,26 @@ Add optional Windows-side OpenRouter settings. Store the user’s API key with W
 - **Review a performance report.** Send the user-approved summary and excerpts. Ask the model to call out anomalies, link to evidence by command and sample, and identify missing measurements. Keep those comments beside the locally produced report so readers can inspect the supporting numbers.
 
 Ship selection explanation and Bash drafting with a shared request preview, then add optional performance review. Test with a stub provider that captures the exact outbound payload, exercises cancellation and provider errors, and returns shell-looking text. Verify that requests require review and that the response alone never submits a command.
+
+## Command reference
+
+Add a searchable **Command reference** side panel inspired by Tealdeer. Search for a command or open the reference from a selected command name. Show a concise description, common invocations, and an upstream documentation link where available. Keep the terminal visible while the user browses. Offer copy and insertion into an editable command line for each example. [Tealdeer](https://github.com/tealdeer-rs/tealdeer) · [tldr-pages](https://github.com/tldr-pages/tldr)
+
+Cache an attributed, versioned tldr-pages index on Windows for offline use. Choose the platform from the selected pane, such as Linux in WSL or a verified Linux SSH session and Windows in a local PowerShell session. Expose a platform override for an unknown or unusual remote. Prefer a matching platform page, fall back to `common`, and label examples from other platforms. Keep the last usable cache during a failed refresh. Support local pages for private commands and utilities installed from a bundle. [tldr-pages client specification](https://github.com/tldr-pages/tldr/blob/main/CLIENT-SPECIFICATION.md)
+
+**Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
+
+## Managed SSH utilities
+
+Let users create named tool bundles on Windows and attach them to selected SSH profiles. Each entry names the command and pins a specific Linux release artifact or a user-supplied binary with a SHA-256 digest. Candidate commands include `rg`, `netwatch`, `diskwatch`, `mddog`, `bandwhich`, `ncdu`, `dust`, `hyperfine`, and `jq`. Record the exact upstream project and artifact for each catalog entry.
+
+Inspect the verified host’s OS, architecture, and runtime requirements before choosing an artifact. Prefer a compatible self-contained build when one is available. For dynamically linked builds, check the loader and libc requirements. Report unsupported combinations in the preview. Resolve and cache artifacts on Windows, then transfer the selected executables over the existing SFTP connection, verify their contents, and publish executable files in a versioned directory under the remote home. Show the selected build and destination in the preview. [Rust platform targets](https://doc.rust-lang.org/rustc/platform-support.html)
+
+Expose managed commands through `~/.local/bin` or a profile-selected user directory. Use the dotfiles environment hook to add that directory to `PATH` where needed, and show which executable will win if a command already exists. Keep an existing user-owned file or link in place and let the user pick a different name or directory. Updates should reuse verified copies, keep a previous version for rollback, and replace only launchers owned by the bundle. A tool runs with the remote account’s existing permissions. Link installed commands to their examples in the side panel.
+
+**Ship order.** Deliver offline command lookup and manual utility preview, install and rollback first. Then offer opt-in sync when a profile connects, using the same host and account approval as managed dotfiles.
+
+**Acceptance.** Install a small bundle on clean Linux x64 and arm64 fixtures and run the intended commands from the next shell prompt. Exercise an incompatible binary and an existing user-owned command. Verify the selected executable through `PATH`, that repeat sync skips unchanged bytes, and that rollback restores the previous managed version.
 
 ## Subsequent features for RustMUSH
 
