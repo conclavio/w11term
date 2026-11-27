@@ -147,9 +147,10 @@ try {
     }
     Click 'Browse for tool bundle'
     $manifestDialog = Wait-Until 'owned tool manifest picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
-    Select-DialogItem $manifestDialog 'Tool review.json'
+    $manifestPath = Join-Path $State 'Tool review.json'
+    $null = Wait-Until 'enter the full update manifest path' { [FixtureDialog]::SetFilename($manifestDialog, $manifestPath, '') }
     $null = Wait-Until 'select the update manifest' { [FixtureDialog]::ClickButton($manifestDialog, 1) }
-    $null = Wait-Until 'chosen update manifest shown' { Find-Element (Join-Path $State 'Tool review.json') }
+    $null = Wait-Until 'chosen update manifest shown' { Find-Element $manifestPath }
     Click 'Review bundle'
     $null = Wait-Until 'existing launcher blocks installation' {
         $install = Find-Element 'Install reviewed bundle' $button
@@ -204,7 +205,7 @@ try {
     Click 'Review rollback'
     $null = Wait-Until 'rollback shows the prior contents and update policy' {
         (Find-Element 'Retained commands mdd, rg') -and
-        (Find-Element 'Restoring this version pauses automatic bundle updates until you apply a bundle again.')
+        (Find-Element 'Restoring this version pauses automatic bundle updates.')
     }
     $null = Control @('focus-pane','--pane',"$localPane")
     Wait-Focus $localPane
@@ -218,6 +219,23 @@ try {
     $null = Wait-Until 'rollback restored and pinned the original version' {
         (Find-Element 'Restored tool bundle portable') -and
         [IO.File]::ReadAllText($selectorPath).Contains("./versions/$oldId")
+    }
+    Click 'Review update resumption'
+    $null = Wait-Until 'review explains when automatic updates run' {
+        Find-Element 'Approved SSH profiles can sync this bundle on their next connection.'
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot resume updates' {
+        $resume = Find-Element 'Resume automatic updates' $button
+        $resume -and !$resume.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Resume automatic updates'
+    $null = Wait-Until 'automatic updates resumed for the same active version' {
+        (Find-Element 'Resumed automatic updates for portable') -and
+        [IO.File]::ReadAllText($selectorPath).TrimEnd().EndsWith("`nversions/$oldId")
     }
     Click 'Back to tool installer'
     Click 'Back to command reference'

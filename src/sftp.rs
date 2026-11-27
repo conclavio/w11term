@@ -252,6 +252,12 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review: Option<String>,
     },
+    ResumeToolBundleUpdates {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     PreviewDotfiles {
         bundle: DotfileBundle,
         shell: DotfileShell,
@@ -990,7 +996,9 @@ pub(crate) async fn run(
                 Operation::ReviewToolPath { .. } => JobStage::Checking(
                     "Tool PATH review did not finish. Review the startup files again.",
                 ),
-                Operation::ApplyToolBundle { .. } | Operation::RollbackToolBundle { .. } => {
+                Operation::ApplyToolBundle { .. }
+                | Operation::RollbackToolBundle { .. }
+                | Operation::ResumeToolBundleUpdates { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
                 }
                 Operation::ApplyDotfiles { .. } => JobStage::Checking(
@@ -1554,6 +1562,20 @@ impl Engine {
             } => {
                 self.rollback_utility_bundle(session, name, bundle_sha256, review.as_deref(), stage)
                     .await?
+            }
+            ResumeToolBundleUpdates {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.resume_utility_updates(
+                    session,
+                    &name,
+                    &bundle_sha256,
+                    review.as_deref(),
+                    stage,
+                )
+                .await?
             }
             Get {
                 remote,

@@ -484,6 +484,71 @@ impl Engine {
         .await
     }
 
+    pub(in crate::sftp) async fn resume_utility_updates(
+        &self,
+        session: &Ssh,
+        name: &str,
+        id: &str,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        ensure!(
+            safe_component(name) && !name.starts_with('.'),
+            "Invalid tool bundle name"
+        );
+        let id = normalize_sha256(id)?;
+        let home = self.dotfile_home().await?;
+        let relative = format!("{STORE}/{name}");
+        let store = under_home(&home, &relative);
+        let managed = self
+            .utility_directories(&home, &format!("{relative}/versions"))
+            .await?;
+        ensure!(
+            managed.create.is_empty() && managed.blocked_at.is_none(),
+            "Managed tool bundle directory was not found"
+        );
+        let selector = self.utility_selector_state(&store, &managed).await?;
+        ensure!(
+            !selector.conflict && selector.manual && selector.version.as_deref() == Some(&id),
+            "The chosen version is no longer the active paused release. Refresh versions."
+        );
+        self.utility_release_manifest(&store, name, None, &id)
+            .await?;
+        let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
+        let mut report = json!({
+            "operation": "resume-tool-bundle-updates",
+            "home": home,
+            "bundle": name,
+            "bundle_sha256": id,
+            "current": selector,
+            "ready": atomic,
+            "supports_atomic_replace": atomic,
+        });
+        let Some(review) = review else {
+            if atomic {
+                report["review"] = json!(self.utility_review(&report)?);
+            }
+            return Ok(report);
+        };
+        self.check_utility_review(&report, review)?;
+        ensure!(
+            atomic,
+            "Resuming updates requires the server's atomic rename extension"
+        );
+        *stage = JobStage::Checking(
+            "Update resumption did not finish. Refresh versions to check the active release.",
+        );
+        with_lock(session, &store, async {
+            let changed = self
+                .switch_utility_selector(&store, &id, false, &selector)
+                .await?;
+            Ok(json!({
+                "bundle": name, "bundle_sha256": id, "changed": changed,
+            }))
+        })
+        .await
+    }
+
     async fn stage_utility_release(&self, plan: &InstallPlan, id: &str) -> Result<Vec<String>> {
         let versions = format!("{}/versions", plan.store);
         let staging = format!("{versions}/.w11term-stage-{:032x}", rand::random::<u128>());

@@ -6,10 +6,26 @@ pub enum Action {
     Listed(Arc<()>, Result<ToolBundleVersions, String>),
     Select(Option<usize>),
     Review,
-    Reviewed(Arc<()>, Result<Box<RollbackReview>, String>),
+    ReviewResume,
+    Reviewed(Arc<()>, Result<ReviewedVersion, String>),
     Restore,
-    Restored(Arc<()>, Result<Restored, String>),
+    Resume,
+    Switched(Arc<()>, Result<SwitchReport, String>),
     Close,
+}
+
+pub enum ReviewedVersion {
+    Rollback(Box<RollbackReview>),
+    Resume(ResumeReview),
+}
+
+#[derive(Deserialize)]
+pub struct ResumeReview {
+    home: String,
+    bundle: String,
+    bundle_sha256: String,
+    ready: bool,
+    review: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -39,7 +55,7 @@ struct RetainedTool {
 }
 
 #[derive(Deserialize)]
-pub struct Restored {
+pub struct SwitchReport {
     bundle: String,
     bundle_sha256: String,
 }
@@ -48,14 +64,22 @@ pub struct Restored {
 enum Work {
     List,
     Review,
+    ReviewResume,
     Restore,
+    Resume,
+}
+
+impl Work {
+    fn writes(self) -> bool {
+        matches!(self, Self::Restore | Self::Resume)
+    }
 }
 
 #[derive(Default)]
 pub(super) struct Panel {
     versions: Option<ToolBundleVersions>,
     selected: Option<usize>,
-    review: Option<Box<RollbackReview>>,
+    review: Option<ReviewedVersion>,
     pending: Option<(Arc<()>, Work)>,
     status: Option<String>,
 }
@@ -91,19 +115,24 @@ impl Panel {
         self.versions.as_ref()?.versions.get(self.selected?)
     }
 
-    fn token(&self) -> Option<&str> {
-        let review = self.review.as_ref().filter(|review| {
-            review.ready && review.current.version.as_deref() != Some(&review.bundle_sha256)
-        })?;
-        review.review.as_deref()
+    fn token(&self, work: Work) -> Option<&str> {
+        match (self.review.as_ref()?, work) {
+            (ReviewedVersion::Rollback(review), Work::Restore)
+                if review.ready
+                    && review.current.version.as_deref() != Some(&review.bundle_sha256) =>
+            {
+                review.review.as_deref()
+            }
+            (ReviewedVersion::Resume(review), Work::Resume) if review.ready => {
+                review.review.as_deref()
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn view(&self, account: &str, active: bool, ctx: &ViewContext<TerminalApp>) -> View {
         let available = active && self.pending.is_none();
-        let restoring = self
-            .pending
-            .as_ref()
-            .is_some_and(|(_, kind)| *kind == Work::Restore);
+        let writing = self.pending.as_ref().is_some_and(|(_, kind)| kind.writes());
         let button = |label: &str, enabled, action: fn() -> Action| {
             Button::new()
                 .is_enabled(enabled)
@@ -127,7 +156,9 @@ impl Panel {
             Some(match work {
                 Work::List => "Reading retained tool bundles…",
                 Work::Review => "Verifying retained tool bundle…",
+                Work::ReviewResume => "Reviewing automatic updates…",
                 Work::Restore => "Restoring reviewed tool bundle…",
+                Work::Resume => "Resuming automatic updates…",
             })
         } else if !active {
             Some("Return to the original SSH pane or open a new review")
@@ -180,11 +211,23 @@ impl Panel {
                 ));
             }
         }
-        if let Some(review) = &self.review {
-            review.describe(&mut fields);
+        match &self.review {
+            Some(ReviewedVersion::Rollback(review)) => review.describe(&mut fields),
+            Some(ReviewedVersion::Resume(review)) => review.describe(&mut fields),
+            None => (),
         }
-        fields.push(KeyedView::new(
-            "actions",
+        let actions = if self.selected().is_some_and(|row| row.held) {
+            StackPanel::new().spacing(8.0).children((
+                button("Review update resumption", available, || {
+                    Action::ReviewResume
+                }),
+                button(
+                    "Resume automatic updates",
+                    available && self.token(Work::Resume).is_some(),
+                    || Action::Resume,
+                ),
+            ))
+        } else {
             StackPanel::new().spacing(8.0).children((
                 button(
                     "Review rollback",
@@ -193,11 +236,15 @@ impl Panel {
                 ),
                 button(
                     "Restore reviewed version",
-                    available && self.token().is_some(),
+                    available && self.token(Work::Restore).is_some(),
                     || Action::Restore,
                 ),
-                button("Back to tool installer", !restoring, || Action::Close),
-            )),
+            ))
+        };
+        fields.push(KeyedView::new("actions", actions));
+        fields.push(KeyedView::new(
+            "back",
+            button("Back to tool installer", !writing, || Action::Close),
         ));
         Border::new().padding(12.0).content(
             ScrollViewer::new().content(StackPanel::new().spacing(8.0).keyed_children(fields)),
@@ -215,6 +262,26 @@ fn version_label(row: &RetainedToolVersion) -> String {
         ""
     };
     format!("{} · {digest}{suffix}", row.bundle)
+}
+
+impl ResumeReview {
+    fn describe(&self, fields: &mut Vec<KeyedView>) {
+        fields.push(detail(
+            "resume-destination",
+            format!(
+                "{} · Home {}\nActive SHA-256 {}",
+                self.bundle, self.home, self.bundle_sha256
+            ),
+        ));
+        fields.push(detail(
+            "resume-effect",
+            if self.ready {
+                "Approved SSH profiles can sync this bundle on their next connection."
+            } else {
+                "Resuming updates requires the server's atomic rename extension."
+            },
+        ));
+    }
 }
 
 impl RollbackReview {
@@ -272,7 +339,7 @@ impl RollbackReview {
         fields.push(detail(
             "effect",
             if self.ready {
-                "Restoring this version pauses automatic bundle updates until you apply a bundle again."
+                "Restoring this version pauses automatic bundle updates."
             } else {
                 "Resolve the conflicts before restoring this version."
             },
@@ -304,12 +371,16 @@ impl TerminalApp {
                 if !history
                     .pending
                     .as_ref()
-                    .is_some_and(|(_, work)| *work == Work::Restore)
+                    .is_some_and(|(_, work)| work.writes())
                 {
                     installer.history = None;
                 }
             }
-            Action::Open | Action::Review | Action::Restore => {
+            Action::Open
+            | Action::Review
+            | Action::ReviewResume
+            | Action::Restore
+            | Action::Resume => {
                 let Some(input) = input else { return };
                 if history.pending.is_some() {
                     return;
@@ -317,6 +388,8 @@ impl TerminalApp {
                 let work = match action {
                     Action::Open => Work::List,
                     Action::Review => Work::Review,
+                    Action::ReviewResume => Work::ReviewResume,
+                    Action::Resume => Work::Resume,
                     _ => Work::Restore,
                 };
                 let operation = if work == Work::List {
@@ -324,19 +397,33 @@ impl TerminalApp {
                     history.selected = None;
                     Operation::ToolBundleVersions
                 } else {
-                    let Some(row) = history.selected().filter(|row| !row.active) else {
+                    let resume = matches!(work, Work::ReviewResume | Work::Resume);
+                    let Some(row) = history
+                        .selected()
+                        .filter(|row| if resume { row.held } else { !row.active })
+                    else {
                         return;
                     };
-                    let review = if work == Work::Restore {
-                        let Some(token) = history.token() else { return };
+                    let review = if work.writes() {
+                        let Some(token) = history.token(work) else {
+                            return;
+                        };
                         Some(token.to_owned())
                     } else {
                         None
                     };
-                    Operation::RollbackToolBundle {
-                        name: row.bundle.clone(),
-                        bundle_sha256: row.bundle_sha256.clone(),
-                        review,
+                    if resume {
+                        Operation::ResumeToolBundleUpdates {
+                            name: row.bundle.clone(),
+                            bundle_sha256: row.bundle_sha256.clone(),
+                            review,
+                        }
+                    } else {
+                        Operation::RollbackToolBundle {
+                            name: row.bundle.clone(),
+                            bundle_sha256: row.bundle_sha256.clone(),
+                            review,
+                        }
                     }
                 };
                 history.review = None;
@@ -349,7 +436,11 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let timeout =
-                            Duration::from_secs(if work == Work::List { 30 } else { 600 });
+                            Duration::from_secs(if matches!(work, Work::Review | Work::Restore) {
+                                600
+                            } else {
+                                30
+                            });
                         result_message(
                             ticket,
                             work,
@@ -375,29 +466,44 @@ impl TerminalApp {
                 Ok(versions) => history.versions = Some(versions),
                 Err(error) => history.status = Some(error),
             },
-            Action::Reviewed(ticket, result) if history.finish(&ticket, Work::Review) => {
+            Action::Reviewed(ticket, result) => {
+                if !history.finish(&ticket, Work::Review)
+                    && !history.finish(&ticket, Work::ReviewResume)
+                {
+                    return;
+                }
                 match result {
                     Ok(review) => history.review = Some(review),
                     Err(error) => history.status = Some(error),
                 }
             }
-            Action::Restored(ticket, result) if history.finish(&ticket, Work::Restore) => {
+            Action::Switched(ticket, result) => {
+                let held = history.finish(&ticket, Work::Restore);
+                if !held && !history.finish(&ticket, Work::Resume) {
+                    return;
+                }
                 history.status = Some(match result {
-                    Ok(restored) => {
-                        reference.tools = None;
+                    Ok(switch) => {
+                        if held {
+                            reference.tools = None;
+                        }
                         installer.review = None;
                         installer.status = None;
                         if let Some(versions) = &mut history.versions {
                             for row in versions
                                 .versions
                                 .iter_mut()
-                                .filter(|row| row.bundle == restored.bundle)
+                                .filter(|row| row.bundle == switch.bundle)
                             {
-                                row.active = row.bundle_sha256 == restored.bundle_sha256;
-                                row.held = row.active;
+                                row.active = row.bundle_sha256 == switch.bundle_sha256;
+                                row.held = row.active && held;
                             }
                         }
-                        format!("Restored tool bundle {}", restored.bundle)
+                        if held {
+                            format!("Restored tool bundle {}", switch.bundle)
+                        } else {
+                            format!("Resumed automatic updates for {}", switch.bundle)
+                        }
                     }
                     Err(error) => error,
                 });
@@ -414,7 +520,8 @@ fn result_message(
 ) -> Message {
     message(match work {
         Work::List => Action::Listed(ticket, decode(result)),
-        Work::Review => Action::Reviewed(ticket, decode(result)),
-        Work::Restore => Action::Restored(ticket, decode(result)),
+        Work::Review => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Rollback)),
+        Work::ReviewResume => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Resume)),
+        Work::Restore | Work::Resume => Action::Switched(ticket, decode(result)),
     })
 }

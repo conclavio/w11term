@@ -138,7 +138,7 @@ try {
     Click 'Browse for dotfiles bundle'
     $bundleTitle = 'Choose dotfiles bundle'
     $bundleDialog = Wait-Until 'owned dotfiles bundle picker' { Find-OwnedDialog $bundleTitle }
-    Select-DialogItem $bundleDialog $bundleName
+    $null = Wait-Until 'enter the full dotfiles manifest path' { [FixtureDialog]::SetFilename($bundleDialog, $bundle, '') }
     $null = Wait-Until 'select dotfiles bundle' { [FixtureDialog]::ClickButton($bundleDialog, 1) }
     $null = Wait-Until 'use selected dotfiles bundle' {
         $field = Find-Element 'Dotfiles bundle' $edit
@@ -177,7 +177,7 @@ try {
     [IO.File]::WriteAllText($toolBundle, ('{"version":1,"name":"portable","tools":[{"name":"rg","builds":[{"architecture":"x86_64","path":"rg","sha256":"' + ('a' * 64) + '"}]}]}'))
     Click 'Browse for tool bundle'
     $toolDialog = Wait-Until 'owned tool bundle picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
-    Select-DialogItem $toolDialog $toolName
+    $null = Wait-Until 'enter the full tool manifest path' { [FixtureDialog]::SetFilename($toolDialog, $toolBundle, '') }
     $null = Wait-Until 'choose the tool manifest' { [FixtureDialog]::ClickButton($toolDialog, 1) }
     $null = Wait-Until 'tool manifest in draft' {
         $field = Find-Element 'Tool bundle manifest' $edit

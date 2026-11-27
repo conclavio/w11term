@@ -29,6 +29,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   apply-tool-bundle BUNDLE.json --review TOKEN\n\
   preview-tool-bundle-rollback NAME SHA256\n\
   rollback-tool-bundle NAME SHA256 --review TOKEN\n\
+  preview-tool-bundle-resume NAME SHA256\n\
+  resume-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   preview-dotfiles-switch SHA256|disabled --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
@@ -328,14 +330,26 @@ pub fn parse(
                 .with_context(|| format!("Opening the tool bundle {manifest}"))?;
             fields.insert("bundle".into(), json!(bundle));
         }
-        "preview-tool-bundle-rollback" | "rollback-tool-bundle" => {
-            if command == "rollback-tool-bundle" {
+        "preview-tool-bundle-rollback"
+        | "rollback-tool-bundle"
+        | "preview-tool-bundle-resume"
+        | "resume-tool-bundle-updates" => {
+            if matches!(
+                command.as_str(),
+                "rollback-tool-bundle" | "resume-tool-bundle-updates"
+            ) {
                 let token = opts
                     .remove("--review")
-                    .context("Preview rollback and supply --review")?;
+                    .context("Preview the tool bundle change and supply --review")?;
                 fields.insert("review".into(), json!(normalize_sha256(&token)?));
             }
-            fields.insert("op".into(), json!("rollback-tool-bundle"));
+            let op = match command.as_str() {
+                "preview-tool-bundle-resume" | "resume-tool-bundle-updates" => {
+                    "resume-tool-bundle-updates"
+                }
+                _ => "rollback-tool-bundle",
+            };
+            fields.insert("op".into(), json!(op));
             fields.insert("name".into(), json!(path()?));
             fields.insert("bundle_sha256".into(), json!(normalize_sha256(&path()?)?));
         }
@@ -542,6 +556,46 @@ mod tests {
         assert!(matches!(request, Request::Sftp {
             pane: 9, operation: Operation::RollbackToolBundle { review: Some(review), bundle_sha256, .. }, ..
         } if review == token && bundle_sha256 == version));
+    }
+
+    #[test]
+    fn resuming_tool_updates_requires_a_review_for_one_release() {
+        let version = "a".repeat(64);
+        let token = "b".repeat(64);
+        assert!(
+            p(&[
+                "--pane",
+                "9",
+                "resume-tool-bundle-updates",
+                "fleet",
+                &version
+            ])
+            .is_err()
+        );
+        let (_, preview) = p(&[
+            "--pane",
+            "9",
+            "preview-tool-bundle-resume",
+            "fleet",
+            &version,
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 9, operation: Operation::ResumeToolBundleUpdates { name, bundle_sha256, review: None }, ..
+        } if name == "fleet" && bundle_sha256 == version));
+        let (_, apply) = p(&[
+            "--pane",
+            "9",
+            "resume-tool-bundle-updates",
+            "fleet",
+            &version,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(apply, Request::Sftp {
+            pane: 9, operation: Operation::ResumeToolBundleUpdates { bundle_sha256, review: Some(review), .. }, ..
+        } if bundle_sha256 == version && review == token));
     }
 
     #[test]

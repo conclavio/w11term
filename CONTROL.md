@@ -1390,7 +1390,7 @@ The preview uses the pane's verified SSH connection. A read-only SSH exec probe 
 
 From a connected SSH pane, open **More → Command reference → Install SSH tools**. Choose a Windows manifest or use the bundle from the pane's profile. Select **Review bundle** to see the resolved home, architecture, launcher paths, PATH status, and any blocking conflicts. **Install reviewed bundle** applies that review on the same connection. The installation runs alongside the SSH shell and uses the manual SFTP deadline.
 
-Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose an earlier release and select **Review rollback** to verify its binaries and see its commands and launcher paths. **Restore reviewed version** switches to that release on the same connection and pauses automatic updates for the bundle until you apply a bundle again. Launchers for commands absent from the restored release become dormant.
+Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose an earlier release and select **Review rollback** to verify its binaries and see its commands and launcher paths. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
 
 Review the destinations, PATH status, and selected builds. When the report has `ready: true`, pass its `review` token back to the same pane. The commands below use the default JSON response from `w11term-cli`.
 
@@ -1436,7 +1436,12 @@ On an ordinary SSH connect or reconnect, w11term checks the verified endpoint an
 
 When the login PATH update is skipped, **Review PATH repair** checks the approved startup files over the current SSH connection. The review shows each file and the current and proposed text for any managed block it would replace. **Apply reviewed PATH repair** validates the review and writes the changes for new shells. Replacement requires one complete marker pair and preserves the text around it. Duplicate or incomplete marker pairs require manual correction.
 
-A manual rollback pauses automatic bundle updates. Preview and apply the desired bundle manually to resume syncing. **Disable tool sync** stops automatic updates from that profile.
+A manual rollback pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+
+```powershell
+$resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-tools $activeSha256 | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane resume-tool-bundle-updates my-tools $activeSha256 --review $resume.review
+```
 
 ### Run SFTP operations
 

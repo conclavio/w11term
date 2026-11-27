@@ -1008,6 +1008,13 @@ async fn approved_tool_sync_installs_before_shell_and_respects_manual_rollback()
         updated
     };
     assert!(!selector().contains(&first));
+    let second = selector()
+        .lines()
+        .nth(1)
+        .unwrap()
+        .strip_prefix("versions/")
+        .unwrap()
+        .to_owned();
     assert_eq!(fs::read_to_string(root.join(".bashrc")).unwrap(), rc);
     let review = guarded_job(&updated, None, rollback(&first, None))
         .await
@@ -1024,18 +1031,46 @@ async fn approved_tool_sync_installs_before_shell_and_respects_manual_rollback()
         row.as_str()
             .contains(&format!("tools-at-shell:{first}:true"))
     }));
-    save_login_manifest(local.path(), 2);
-    let manifest = local.path().join("fleet.json");
-    let operation = || Operation::PreviewToolBundle {
-        bundle: UtilityBundle::load(&manifest).unwrap(),
+    let resume = |review| Operation::ResumeToolBundleUpdates {
+        name: "portable".into(),
+        bundle_sha256: first.clone(),
+        review,
     };
-    let review = guarded_job(&held, None, operation()).await.unwrap();
-    guarded_job(&held, None, apply(operation(), &review))
+    let paused = selector();
+    let report = guarded_job(&held, Some(1), resume(None)).await.unwrap();
+    assert_eq!(report["ready"], true);
+    assert_eq!(report["current"]["manual"], true);
+    assert_eq!(selector(), paused);
+    let token = || Some(report["review"].as_str().unwrap().to_owned());
+    let changed = paused.replace(&first, &second);
+    fs::write(store.join("current"), &changed).unwrap();
+    let rejected = guarded_job(&held, Some(1), resume(token()))
         .await
-        .unwrap();
-    assert!(selector().lines().nth(1).unwrap().starts_with("versions/"));
+        .unwrap_err();
+    assert!(
+        rejected.contains("no longer the active paused release"),
+        "{rejected}"
+    );
+    assert_eq!(selector(), changed);
+    fs::write(store.join("current"), paused).unwrap();
+    let trace = root.join("transfer-trace");
+    fs::write(&trace, []).unwrap();
+    let resumed = guarded_job(&held, Some(1), resume(token())).await.unwrap();
+    assert_eq!(resumed["changed"], true);
+    assert_eq!(resumed["bundle_sha256"], first);
+    assert_eq!(
+        selector().lines().nth(1).unwrap(),
+        format!("versions/{first}")
+    );
+    assert!(!sftp_opened_tool(&trace));
+
+    save_login_manifest(local.path(), 2);
     let resumed = connect_tools(&options);
-    wait_tool_login(&resumed, 1, "current", Some("current")).await;
+    wait_tool_login(&resumed, 1, "updated", Some("current")).await;
+    assert_eq!(
+        selector().lines().nth(1).unwrap(),
+        format!("versions/{second}")
+    );
     server.abort();
 }
 
