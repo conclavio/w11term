@@ -646,7 +646,7 @@ impl Engine {
         })
     }
 
-    async fn dotfile_home(&self) -> Result<String> {
+    pub(super) async fn dotfile_home(&self) -> Result<String> {
         let homes = self.raw.realpath(".").await?.files;
         let [home] = homes.as_slice() else {
             bail!("SFTP did not resolve the remote home directory to one path");
@@ -783,7 +783,7 @@ fn version_directory(shell: DotfileShell, id: &str) -> String {
     format!("{DIRECTORY}/{}-{id}", shell.name())
 }
 
-fn under_home(home: &str, relative: &str) -> String {
+pub(super) fn under_home(home: &str, relative: &str) -> String {
     format!("{}/{relative}", home.trim_end_matches('/'))
 }
 

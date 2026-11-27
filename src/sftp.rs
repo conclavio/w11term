@@ -28,10 +28,12 @@ use tokio::{
 mod atomic_upload;
 mod directory;
 mod dotfiles;
+mod utilities;
 pub(crate) use dotfiles::sync_login_dotfiles;
 pub use dotfiles::{
     DotfileBundle, DotfileShell, DotfileTarget, validate_dotfiles_home, validate_zdotdir,
 };
+pub use utilities::{UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityTool};
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
 mod group_upload;
@@ -225,6 +227,9 @@ pub enum CopyDestination {
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
     Info,
+    PreviewToolBundle {
+        bundle: UtilityBundle,
+    },
     PreviewDotfiles {
         bundle: DotfileBundle,
         shell: DotfileShell,
@@ -947,6 +952,9 @@ pub(crate) async fn run(
                 Operation::PreviewDotfiles { .. } => {
                     JobStage::Checking("Dotfiles preview did not finish")
                 }
+                Operation::PreviewToolBundle { .. } => {
+                    JobStage::Checking("Tool bundle preview did not finish")
+                }
                 Operation::ApplyDotfiles { .. } => JobStage::Checking(
                     "Dotfiles installation did not finish. Preview again to check the active bundle.",
                 ),
@@ -1013,6 +1021,7 @@ pub(crate) async fn run(
                 .as_mut()
                 .unwrap()
                 .execute(
+                    &session,
                     operation,
                     progress.as_ref(),
                     cancel.as_ref(),
@@ -1459,6 +1468,7 @@ impl Engine {
 
     async fn execute(
         &mut self,
+        session: &russh::client::Handle<crate::ssh::Handler>,
         op: Operation,
         job_progress: Option<&JobProgress>,
         cancel: Option<&TransferCancel>,
@@ -1484,6 +1494,7 @@ impl Engine {
             Info => {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
             }
+            PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             Get {
                 remote,
                 local,

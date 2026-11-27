@@ -45,6 +45,7 @@ hmac = "0.13"
 zeroize = "1.9.1"
 rand = "0.10"
 zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+goblin = { version = "0.10.7", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

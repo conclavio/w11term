@@ -240,6 +240,17 @@ impl server::Handler for Peer {
         command: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if command.starts_with(b"/bin/sh -c 'printf")
+            && let Ok(report) = fs::read(self.root.join("utility-probe-response"))
+        {
+            fs::write(self.root.join("utility-probe-command"), command)?;
+            s.channel_success(c)?;
+            s.data(c, report)?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
         let trace = self.root.join("workspace-exec.bin");
         if !trace.exists() {
             s.channel_failure(c)?;
@@ -1567,6 +1578,8 @@ mod text_preview;
 mod text_save;
 #[path = "sftp/upload_folder.rs"]
 mod upload_folder;
+#[path = "sftp/utilities.rs"]
+mod utilities;
 #[path = "sftp/xterm_other_keys.rs"]
 mod xterm_other_keys;
 

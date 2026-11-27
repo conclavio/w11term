@@ -1327,6 +1327,42 @@ On an ordinary SSH shell launch or reconnect, w11term checks that the verified h
 
 A reviewed manual switch holds the chosen bundle on later logins, including when you choose `disabled`. Use a fresh manual preview and `apply-dotfiles` with the bundle you want to return to automatic sync.
 
+### Preview a managed SSH tool bundle
+
+Keep the raw Linux executables on Windows and point a version-1 bundle at them. Relative build paths resolve beside the manifest. Pin the SHA-256 of each extracted executable. Use the optional `release` URL to record its source. Supply an `x86_64` build, an `aarch64` build, or both. The default `bin_directory` is `.local/bin` under the remote home.
+
+```json
+{
+  "version": 1,
+  "name": "my-tools",
+  "tools": [
+    {
+      "name": "rg",
+      "builds": [
+        {
+          "architecture": "x86_64",
+          "path": "linux-x86_64/rg",
+          "sha256": "e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849",
+          "release": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz"
+        },
+        {
+          "architecture": "aarch64",
+          "path": "linux-aarch64/rg",
+          "sha256": "c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a",
+          "release": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz"
+        }
+      ]
+    }
+  ]
+}
+```
+
+```powershell
+& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools.json'
+```
+
+The preview uses the pane's verified SSH connection. A read-only SSH exec probe identifies Linux, architecture, home, and the exec environment's `PATH`. The preview checks the same home over SFTP, verifies local file hashes and ELF headers, and selects the first verified self-contained build for each command. For dynamic builds it reports the interpreter, linked libraries, and glibc requirements it could read, including a missing loader or insufficient glibc when detectable. The report shows planned destinations, directory and launcher conflicts, and executable files found earlier in the probed `PATH`. Interactive shell startup files can change that search order.
+
 ### Run SFTP operations
 
 ```powershell
