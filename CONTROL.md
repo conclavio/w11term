@@ -1445,7 +1445,9 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 
 ### Collect Linux performance triage
 
-In the Windows app, open **More → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. The report shows the result and output for each sample. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.
+In the Windows app, open **More → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.
+
+Findings summarize observed CPU activity and runnable tasks, available memory and swapping, disk activity and queueing, network traffic and TCP errors, and kernel-log evidence. Peaks use the collected interval rows and exclude the first vmstat row and sar averages. Missing or denied samples appear under their resource. The same findings are saved in the JSON report and can be derived when opening an earlier capture. [Linux performance checklist](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf) · [iostat metrics](https://github.com/sysstat/sysstat/blob/master/man/iostat.in) · [sar metrics](https://github.com/sysstat/sysstat/blob/master/man/sar.in)
 
 Review the verified SSH endpoint, fixed sample commands and limits, then pass the reviewed connection generation when collecting. Choose a new Windows file for the report.
 

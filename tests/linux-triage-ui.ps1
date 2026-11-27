@@ -41,6 +41,13 @@ function Show-KernelCheck {
     }
 }
 
+function Show-CpuEvidence {
+    Click 'Show evidence for Peak CPU busy'
+    $null = Wait-Until 'finding opens the exact live vmstat row' {
+        (Find-Element "Evidence${dot}vmstat output line 3") -and (Find-Element '3 0 0 8 40 12 46 1 1')
+    }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -63,6 +70,7 @@ try {
     Wait-Focus $remote
     Click 'Run triage'
     $null = Wait-Until 'collection summary' { Find-Element '7 of 10 checks complete' }
+    Show-CpuEvidence
     Show-KernelCheck
     Click 'Save report'
     $save = Wait-Until 'owned triage save dialog' { Find-OwnedDialog 'Save Linux triage report' }
@@ -80,6 +88,7 @@ try {
     $null = Wait-Until 'enter the saved report path' { [FixtureDialog]::SetFilename($open, $report, '') }
     $null = Wait-Until 'open through native dialog' { [FixtureDialog]::ClickButton($open, 1) }
     $null = Wait-Until 'saved triage reopened without the SSH pane' { Find-Element 'Opened Linux triage report' }
+    Show-CpuEvidence
     Show-KernelCheck
 } finally {
     Close-FixtureApp $app

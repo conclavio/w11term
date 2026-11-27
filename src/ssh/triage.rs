@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path, time::Duration};
 use tokio::sync::watch;
 
+mod findings;
+pub use findings::{Finding, Resource};
+
 pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
 const STREAM_BYTES: usize = 16 * 1024;
 const WIRE_BYTES: usize = PROBES.len() * 2 * (STREAM_BYTES.div_ceil(3) * 4) + 4096;
@@ -86,10 +89,12 @@ impl Target {
             _ = self.lease.changed() => bail!("The selected SSH connection closed or changed during triage"),
             result = capture => result.context("Linux triage exceeded its 60-second deadline")??,
         };
+        let collection = parse(&bytes)?;
         Ok(Report {
             version: 1,
             target: plan,
-            collection: parse(&bytes)?,
+            findings: findings::summarize(&collection),
+            collection,
         })
     }
 
@@ -122,6 +127,8 @@ pub struct Report {
     version: u8,
     pub target: Plan,
     pub collection: Collection,
+    #[serde(skip_deserializing)]
+    pub findings: Vec<Finding>,
 }
 
 impl Report {
@@ -137,7 +144,7 @@ impl Report {
             bytes.len() as u64 <= REPORT_BYTES,
             "The triage report exceeds 3 MiB"
         );
-        let report: Self =
+        let mut report: Self =
             serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
                 .context("Reading the Linux triage report")?;
         ensure!(
@@ -167,6 +174,7 @@ impl Report {
                 .all(|text| text.len() <= 4096),
             "The Linux triage report has invalid sample metadata or output"
         );
+        report.findings = findings::summarize(&report.collection);
         Ok(report)
     }
 

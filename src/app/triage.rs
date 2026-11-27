@@ -1,6 +1,6 @@
 use super::*;
 use std::path::PathBuf;
-use w11term::ssh::{TriagePlan, TriageReport, TriageSampleStatus};
+use w11term::ssh::{TriagePlan, TriageReport, TriageResource, TriageSampleStatus};
 
 pub(super) const LABEL: &str = "Linux performance triage";
 
@@ -12,6 +12,8 @@ pub enum Action {
     OpenReport,
     SaveReport,
     Sample(usize),
+    Resource(usize),
+    Finding(usize),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -30,6 +32,8 @@ pub(super) struct Panel {
     pub(super) open: bool,
     content: Option<Content>,
     sample: usize,
+    resource: TriageResource,
+    evidence_line: Option<usize>,
     status: Option<String>,
     pending: Option<Arc<()>>,
     path: Option<PathBuf>,
@@ -225,6 +229,7 @@ impl Panel {
                 format!("Collected in {:.1} seconds", elapsed as f64 / 1000.0),
             ));
         }
+        self.findings_view(report, fields, ctx);
         fields.push(KeyedView::new(
             "samples",
             ComboBox::new()
@@ -257,6 +262,26 @@ impl Panel {
                 |exit| format!("{} · Exit {exit}", status_label(sample.status)),
             ),
         ));
+        if let Some((line, text)) = self.evidence_line.and_then(|line| {
+            sample
+                .stdout
+                .text
+                .lines()
+                .nth(line.checked_sub(1)?)
+                .map(|text| (line, text))
+        }) {
+            fields.push(detail(
+                "evidence-line",
+                format!("Evidence · {} output line {line}", sample.id),
+            ));
+            fields.push(KeyedView::new(
+                "evidence",
+                TextBlock::new()
+                    .text(display_output(text.trim()))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
         for (key, label, output) in [
             ("stdout", "Output", &sample.stdout),
             ("stderr", "Standard error", &sample.stderr),
@@ -278,6 +303,59 @@ impl Panel {
                         .is_text_selection_enabled(true),
                 ));
             }
+        }
+    }
+
+    fn findings_view(
+        &self,
+        report: &TriageReport,
+        fields: &mut Vec<KeyedView>,
+        ctx: &ViewContext<TerminalApp>,
+    ) {
+        let selected = TriageResource::ALL
+            .iter()
+            .position(|resource| *resource == self.resource);
+        fields.push(detail("findings-label", "Findings by resource"));
+        fields.push(KeyedView::new(
+            "findings-resources",
+            ComboBox::new()
+                .automation_name("Triage resources")
+                .items_source(TriageResource::ALL.map(|resource| resource.label()))
+                .selected_index(selected)
+                .on_selection_changed(ctx.callback(|index: Option<usize>| {
+                    index.map_or(Message::ControlIdle, |index| {
+                        message(Action::Resource(index))
+                    })
+                })),
+        ));
+        let findings = report
+            .findings
+            .iter()
+            .enumerate()
+            .filter(|(_, finding)| finding.resource == self.resource);
+        let mut has_findings = false;
+        for (index, finding) in findings {
+            has_findings = true;
+            fields.push(KeyedView::new(
+                format!("finding-{index}"),
+                Button::new()
+                    .automation_name(format!("Show evidence for {}", finding.label))
+                    .on_click(ctx.callback(move |_| message(Action::Finding(index))))
+                    .content(
+                        TextBlock::new()
+                            .text(display_output(&format!(
+                                "{} · {}",
+                                finding.label, finding.value
+                            )))
+                            .text_wrapping(TextWrapping::Wrap),
+                    ),
+            ));
+        }
+        if !has_findings {
+            fields.push(detail(
+                "no-findings",
+                "No recognized measurements for this resource.",
+            ));
         }
     }
 }
@@ -382,8 +460,28 @@ impl TerminalApp {
             Action::Sample(index) => {
                 if let Some(Content::Report(report)) = &panel.content
                     && index < report.collection.samples.len()
+                    && index != panel.sample
                 {
                     panel.sample = index;
+                    panel.evidence_line = None;
+                }
+            }
+            Action::Resource(index) => {
+                if let Some(resource) = TriageResource::ALL.get(index) {
+                    panel.resource = *resource;
+                }
+            }
+            Action::Finding(index) => {
+                if let Some(Content::Report(report)) = &panel.content
+                    && let Some(finding) = report.findings.get(index)
+                    && let Some(sample) = report
+                        .collection
+                        .samples
+                        .iter()
+                        .position(|sample| sample.id == finding.sample_id)
+                {
+                    panel.sample = sample;
+                    panel.evidence_line = finding.stdout_line;
                 }
             }
             Action::OpenReport | Action::SaveReport if panel.pending.is_none() => {
@@ -453,6 +551,8 @@ impl TerminalApp {
                         }
                         panel.content = Some(Content::Report(report));
                         panel.sample = 0;
+                        panel.resource = TriageResource::default();
+                        panel.evidence_line = None;
                     }
                     Ok(Some(Outcome::Saved(path))) => {
                         panel.path = Some(path);

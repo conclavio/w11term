@@ -1886,7 +1886,7 @@ const TRIAGE_RESPONSE: &str = concat!(
     "w11term-linux-triage-v1\t1000\t2000\t124\n",
     "uptime\t1000\t1010\t0\tdXB0aW1lCg==\t\n",
     "dmesg\t1000\t1010\t1\t\tT3BlcmF0aW9uIG5vdCBwZXJtaXR0ZWQ=\n",
-    "vmstat\t1000\t2000\t0\t\t\n",
+    "vmstat\t1000\t2000\t0\tciBiIHNpIHNvIHVzIHN5IGlkIHdhIHN0CjIzIDEgMCAwIDk1IDQgMSAwIDAKMyAwIDAgOCA0MCAxMiA0NiAxIDEK\t\n",
     "mpstat\t1000\t1010\t127\t\t\n",
     "pidstat\t1000\t2000\t0\t\t\n",
     "iostat\t1000\t2000\t0\t\t\n",
@@ -1939,6 +1939,13 @@ async fn linux_triage_saves_a_generation_bound_report_without_touching_the_shell
     assert_eq!(result["report_path"], json!(destination));
     let bytes = fs::read(&destination).unwrap();
     let reopened = w11term::ssh::TriageReport::load(&destination).unwrap();
+    let cpu = reopened
+        .findings
+        .iter()
+        .find(|finding| finding.label == "Peak CPU busy")
+        .unwrap();
+    assert_eq!(cpu.value, "52% user + system");
+    assert_eq!(cpu.stdout_line, Some(3));
     assert_eq!(
         reopened.collection.samples[1].stderr.text,
         "Operation not permitted"
@@ -1952,6 +1959,13 @@ async fn linux_triage_saves_a_generation_bound_report_without_touching_the_shell
     fs::write(&bad, serde_json::to_vec(&incomplete).unwrap()).unwrap();
     assert!(w11term::ssh::TriageReport::load(&bad).is_err());
     let report: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["label"] == "Peak CPU busy" && finding["stdout_line"] == 3 })
+    );
     let samples = &report["collection"]["samples"];
     assert_eq!(report["target"], preview["plan"]);
     assert_eq!(samples[0]["stdout"]["text"], "uptime\n");
