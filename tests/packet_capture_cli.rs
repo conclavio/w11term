@@ -64,6 +64,12 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
             "truncated_packets": 1,
             "timestamped_packets": 2,
             "timestamp_span_ns": "1250000000",
+            "ip_conversations": {
+                "tracked_pairs": 0,
+                "unclassified_packets": 2,
+                "untracked_packets": 0,
+                "top": []
+            },
             "interfaces": 1,
             "interface_details": [{
                 "section": null,

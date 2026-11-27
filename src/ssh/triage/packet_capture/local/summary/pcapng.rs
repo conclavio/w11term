@@ -1,6 +1,6 @@
 use super::{
     CaptureCounters, CounterSnapshot, InterfaceSummary, NANOS_PER_SECOND, PacketStats, Summary,
-    check_record_limit,
+    check_record_limit, conversations,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{Read, Seek};
@@ -78,6 +78,7 @@ enum Entry {
         captured: u32,
         original: u32,
         timestamp: Option<i128>,
+        addresses: Option<conversations::Addresses>,
     },
     Statistics {
         interface: usize,
@@ -90,6 +91,7 @@ pub(super) fn scan(
     summary: &mut Summary,
     file: &mut (impl Read + Seek),
     mut remaining: u64,
+    conversations: &mut conversations::Scan,
 ) -> Result<()> {
     let mut order = None;
     let mut interfaces = Vec::new();
@@ -172,8 +174,10 @@ pub(super) fn scan(
                 captured,
                 original,
                 timestamp,
+                addresses,
             } => {
                 summary.packet(section_start + interface, captured, original, timestamp);
+                conversations.record(addresses, captured);
             }
             Entry::Statistics {
                 interface,
@@ -376,6 +380,7 @@ impl<T: Read + Seek> Block<'_, T> {
             captured,
             original,
             timestamp: Some(interface.timestamp_ns(ticks)),
+            addresses: self.packet_addresses(interface.link_type, captured)?,
         })
     }
 
@@ -398,6 +403,18 @@ impl<T: Read + Seek> Block<'_, T> {
             captured,
             original,
             timestamp: None,
+            addresses: self.packet_addresses(interface.link_type, captured)?,
         })
+    }
+
+    fn packet_addresses(
+        &mut self,
+        link_type: u16,
+        captured: u32,
+    ) -> Result<Option<conversations::Addresses>> {
+        let mut prefix = [0; conversations::PREFIX_BYTES];
+        let kept = prefix.len().min(captured as usize);
+        self.read_into(&mut prefix[..kept])?;
+        Ok(conversations::decode(link_type, &prefix[..kept]))
     }
 }

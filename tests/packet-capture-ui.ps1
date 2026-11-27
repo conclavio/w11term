@@ -6,6 +6,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $destination = Join-Path $State 'reviewed capture.pcap'
 $olderCapture = Join-Path $State 'older capture.pcapng'
 $partialCapture = Join-Path $State 'incomplete capture.pcapng'
+$conversationCapture = Join-Path $State 'IP conversations.pcap'
 $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
@@ -17,6 +18,7 @@ $check = [System.Windows.Automation.ControlType]::CheckBox
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $toggle = [System.Windows.Automation.TogglePattern]::Pattern
 $dot = ' ' + [char]0xb7 + ' '
+$bothDirections = [char]0x2194
 [IO.File]::WriteAllBytes($olderCapture, [byte[]]@(
     # Little-endian section, two named interfaces, two timed packets and an untimed packet.
     10,13,13,10, 28,0,0,0, 77,60,43,26, 1,0,0,0, 255,255,255,255,255,255,255,255, 28,0,0,0,
@@ -33,6 +35,18 @@ $dot = ' ' + [char]0xb7 + ' '
     7,0,8,0, 5,0,0,0,0,0,0,0, 60,0,0,0
 ))
 [IO.File]::WriteAllBytes($partialCapture, [byte[]]([IO.File]::ReadAllBytes($olderCapture) + @(6,0,0,0,36,0,0,0,0,0,0,0)))
+[IO.File]::WriteAllBytes($conversationCapture, [byte[]]@(
+    212,195,178,161, 2,0,4,0, 0,0,0,0, 0,0,0,0, 64,0,0,0, 1,0,0,0,
+    # Ethernet IPv4 in each direction, then a non-IP Ethernet record.
+    1,0,0,0, 0,0,0,0, 34,0,0,0, 34,0,0,0,
+    0,0,0,0,0,0, 0,0,0,0,0,0, 8,0,
+    69,0,0,20, 0,0,0,0, 64,0,0,0, 192,0,2,1, 192,0,2,2,
+    2,0,0,0, 0,0,0,0, 38,0,0,0, 38,0,0,0,
+    0,0,0,0,0,0, 0,0,0,0,0,0, 8,0,
+    69,0,0,24, 0,0,0,0, 64,0,0,0, 192,0,2,2, 192,0,2,1, 0,0,0,0,
+    3,0,0,0, 0,0,0,0, 14,0,0,0, 14,0,0,0,
+    0,0,0,0,0,0, 0,0,0,0,0,0, 8,6
+))
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
 using System.IO;
@@ -84,11 +98,11 @@ function Select-Viewer {
     $null = Wait-Until 'viewer picker closed' { !(Find-OwnedDialog 'Choose Wireshark executable') }
 }
 
-function Open-PacketTimeline {
-    $expander = Wait-Until 'the capture exposes a timeline expander' {
+function Open-PacketSection([string]$Id) {
+    $expander = Wait-Until "the capture exposes '$Id'" {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $condition = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'packet-timeline')
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $Id)
         $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
@@ -115,7 +129,7 @@ try {
             (Find-Element "Reported${dot}Received 12") -and
             (Find-Element "Reported${dot}Interface drops 1")
     }
-    $expander = Open-PacketTimeline
+    $expander = Open-PacketSection 'packet-timeline'
     $null = Wait-Until 'the timeline chart and its earliest peak are visible' {
         (Find-Element 'Packet timeline chart' -Visible) -and
             (Find-Element 'Bucket width 0.008192 s' -Visible) -and
@@ -171,7 +185,7 @@ try {
     }
     Select-Viewer
     if ([IO.File]::Exists($olderCapture + '.opened')) { throw 'Selecting the local file launched Wireshark' }
-    $expander = Open-PacketTimeline
+    $expander = Open-PacketSection 'packet-timeline'
     $intervals = Wait-Until 'the packet timeline can select populated intervals' {
         Find-Element 'Packet timeline intervals' ([System.Windows.Automation.ControlType]::ComboBox)
     }
@@ -204,6 +218,27 @@ try {
         $partial.issue -cne 'Incomplete or invalid PCAPNG block length') {
         throw 'CLI inspection did not preserve complete records in the partial capture'
     }
+    Select-Capture $conversationCapture
+    $null = Wait-Until 'the IPv4 conversation capture opens offline' {
+        Find-Element "PCAP${dot}158 bytes"
+    }
+    $expander = Open-PacketSection 'packet-ip-conversations'
+    $null = Wait-Until 'the address pair shows totals and bytes in both directions' {
+        (Find-Element "192.0.2.1 $bothDirections 192.0.2.2" -Visible) -and
+        (Find-Element "Tracked IP pairs 1${dot}Unclassified packets 1") -and
+        (Find-Element "2 packets${dot}72 captured bytes") -and
+        (Find-Element "Left to right 34 bytes${dot}Right to left 38 bytes")
+    }
+    $summary = & $Cli inspect-packet-capture $conversationCapture | ConvertFrom-Json
+    $conversation = $summary.ip_conversations.top[0]
+    if ($LASTEXITCODE -ne 0 -or $summary.ip_conversations.tracked_pairs -ne 1 -or
+        $summary.ip_conversations.unclassified_packets -ne 1 -or $summary.ip_conversations.untracked_packets -ne 0 -or
+        $conversation.a -cne '192.0.2.1' -or $conversation.b -cne '192.0.2.2' -or
+        $conversation.a_to_b.packets -ne 1 -or $conversation.a_to_b.captured_bytes -ne 34 -or
+        $conversation.b_to_a.packets -ne 1 -or $conversation.b_to_a.captured_bytes -ne 38) {
+        throw 'The CLI conversation ranking differs from the offline capture panel'
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'
     $null = Wait-Until 'flame graph can open a saved artifact offline' {

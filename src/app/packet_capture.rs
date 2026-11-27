@@ -31,6 +31,7 @@ pub enum Action {
     SelectSavedInterface(PathBuf, usize),
     TimelineExpanded(bool),
     SelectTimelineInterval(PathBuf, usize),
+    ConversationsExpanded(bool),
     Tmpfs(bool),
     Review,
     Save,
@@ -178,6 +179,7 @@ pub(super) struct Panel {
     saved_interface: usize,
     timeline_expanded: bool,
     timeline_interval: Option<usize>,
+    conversations_expanded: bool,
     wireshark: Option<PathBuf>,
     pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
@@ -609,6 +611,76 @@ impl Panel {
                         ])));
                 }
             }
+            if stats.packets != 0 {
+                let conversations = &summary.conversations;
+                let mut rows = vec![text(
+                    "coverage",
+                    format!(
+                        "Tracked IP pairs {} · Unclassified packets {}",
+                        conversations.tracked_pairs, conversations.unclassified_packets
+                    ),
+                )];
+                if conversations.untracked_packets != 0 {
+                    rows.push(text(
+                        "limit",
+                        format!(
+                            "IP pair limit reached · {} packets omitted from the ranking",
+                            conversations.untracked_packets
+                        ),
+                    ));
+                }
+                if !conversations.top.is_empty() {
+                    rows.push(text("rank-order", "Ranked by captured bytes"));
+                }
+                rows.extend(conversations.top.iter().map(|pair| {
+                    let total = pair.total();
+                    let label = format!("{} ↔ {}", pair.a, pair.b);
+                    let totals = format!(
+                        "{} packets · {} captured bytes",
+                        total.packets, total.captured_bytes
+                    );
+                    let directions = format!(
+                        "Left to right {} bytes · Right to left {} bytes",
+                        pair.a_to_b.captured_bytes, pair.b_to_a.captured_bytes
+                    );
+                    KeyedView::new(
+                        label.as_str(),
+                        StackPanel::new().spacing(2.0).children((
+                            TextBlock::new()
+                                .text(label.clone())
+                                .text_wrapping(TextWrapping::Wrap),
+                            TextBlock::new()
+                                .text(totals)
+                                .text_wrapping(TextWrapping::Wrap),
+                            TextBlock::new()
+                                .text(directions)
+                                .text_wrapping(TextWrapping::Wrap),
+                        )),
+                    )
+                }));
+                files.push(KeyedView::new(
+                    "local-conversations",
+                    Expander::new()
+                        .automation_name("IP conversations")
+                        .automation_id("packet-ip-conversations")
+                        .is_expanded(self.conversations_expanded)
+                        .on_is_expanded_changed(
+                            ctx.callback(|expanded| {
+                                message(Action::ConversationsExpanded(expanded))
+                            }),
+                        )
+                        .slots([
+                            SlotView::new(
+                                ExpanderSlot::Header,
+                                TextBlock::new().text("IP conversations"),
+                            ),
+                            SlotView::new(
+                                ExpanderSlot::Content,
+                                StackPanel::new().spacing(6.0).keyed_children(rows),
+                            ),
+                        ]),
+                ));
+            }
             if !summary.interfaces.is_empty() {
                 let mut types: Vec<_> = summary
                     .link_types
@@ -881,6 +953,7 @@ impl TerminalApp {
                 }
             }
             Action::TimelineExpanded(expanded) => panel.timeline_expanded = expanded,
+            Action::ConversationsExpanded(expanded) => panel.conversations_expanded = expanded,
             Action::SelectTimelineInterval(path, index) => {
                 if let Some(LoadedCapture::Local(capture)) = &panel.loaded
                     && capture.path == path
@@ -1108,6 +1181,7 @@ impl TerminalApp {
                 panel.saved_interface = 0;
                 panel.timeline_expanded = false;
                 panel.timeline_interval = None;
+                panel.conversations_expanded = false;
                 panel.activity = None;
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,

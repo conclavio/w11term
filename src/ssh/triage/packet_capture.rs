@@ -696,7 +696,7 @@ fn count_packet_records(
     let mut remaining = size - 24;
     let mut packets = 0;
     while remaining > 0 {
-        format.read_packet(file, &mut remaining)?;
+        format.read_packet(file, &mut remaining, &mut [])?;
         packets += 1;
     }
     Ok(packets)
@@ -733,7 +733,12 @@ impl ClassicPcap {
         })
     }
 
-    fn read_packet(&self, file: &mut (impl Read + Seek), remaining: &mut u64) -> Result<[u32; 4]> {
+    fn read_packet(
+        &self,
+        file: &mut (impl Read + Seek),
+        remaining: &mut u64,
+        prefix: &mut [u8],
+    ) -> Result<([u32; 4], usize)> {
         ensure!(*remaining >= 16, "The pcap packet header is truncated");
         let mut header = [0; 16];
         file.read_exact(&mut header)?;
@@ -745,9 +750,11 @@ impl ClassicPcap {
             caplen <= self.snap && caplen <= wirelen && u64::from(caplen) <= *remaining - 16,
             "The pcap packet is incomplete or invalid"
         );
-        file.seek_relative(i64::from(caplen))?;
+        let kept = prefix.len().min(caplen as usize);
+        file.read_exact(&mut prefix[..kept])?;
+        file.seek_relative(i64::from(caplen) - kept as i64)?;
         *remaining -= 16 + u64::from(caplen);
-        Ok(fields)
+        Ok((fields, kept))
     }
 }
 

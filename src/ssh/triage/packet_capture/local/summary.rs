@@ -6,8 +6,10 @@ use std::{
     io::{Read, Seek},
 };
 
+mod conversations;
 mod pcapng;
 mod timeline;
+pub use conversations::Conversations;
 pub use timeline::{Bucket, Timeline};
 
 const MAX_RECORDS: u32 = 1_000_000;
@@ -20,6 +22,7 @@ pub struct Summary {
     pub link_types: BTreeSet<u16>,
     pub issue: Option<String>,
     pub timeline: Option<Timeline>,
+    pub conversations: Conversations,
 }
 
 pub struct InterfaceSummary {
@@ -60,18 +63,25 @@ pub struct PacketStats {
 impl Summary {
     pub(super) fn scan(file: &mut (impl Read + Seek), bytes: u64, format: &Format) -> Self {
         let mut summary = Self::default();
+        let mut conversations = conversations::Scan::default();
         let result = file
             .rewind()
             .map_err(anyhow::Error::from)
             .and_then(|()| match format {
-                Format::Pcap => summary.pcap(file, bytes),
-                Format::PcapNg => pcapng::scan(&mut summary, file, bytes),
+                Format::Pcap => summary.pcap(file, bytes, &mut conversations),
+                Format::PcapNg => pcapng::scan(&mut summary, file, bytes, &mut conversations),
             });
         summary.issue = result.err().map(|error| format!("{error:#}"));
+        summary.conversations = conversations.finish();
         summary
     }
 
-    fn pcap(&mut self, file: &mut (impl Read + Seek), bytes: u64) -> Result<()> {
+    fn pcap(
+        &mut self,
+        file: &mut (impl Read + Seek),
+        bytes: u64,
+        conversations: &mut conversations::Scan,
+    ) -> Result<()> {
         let mut header = [0; 24];
         file.read_exact(&mut header)?;
         let format = ClassicPcap::parse(&header)?;
@@ -90,16 +100,21 @@ impl Summary {
             1_000_000
         };
         let mut remaining = bytes - 24;
+        let mut prefix = [0; conversations::PREFIX_BYTES];
         while remaining > 0 {
             check_record_limit(self.stats.packets)?;
-            let [seconds, fraction, captured, original] =
-                format.read_packet(file, &mut remaining)?;
+            let ([seconds, fraction, captured, original], kept) =
+                format.read_packet(file, &mut remaining, &mut prefix)?;
             let timestamp = (fraction < fraction_limit).then(|| {
                 i128::from(seconds) * i128::from(NANOS_PER_SECOND)
                     + i128::from(fraction)
                         * i128::from(NANOS_PER_SECOND / u64::from(fraction_limit))
             });
             self.packet(0, captured, original, timestamp);
+            conversations.record(
+                conversations::decode(format.link_type, &prefix[..kept]),
+                captured,
+            );
         }
         Ok(())
     }
@@ -368,5 +383,70 @@ mod tests {
         assert_eq!(partial.stats.packets, 2);
         assert_eq!(partial.interfaces[1].stats.packets, 0);
         assert!(partial.issue.unwrap().contains("block lengths disagree"));
+    }
+
+    #[test]
+    fn pcapng_reads_conversations_from_all_packet_blocks_within_their_validated_boundaries() {
+        let mut bytes = Vec::new();
+        let ip = [
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+        ];
+        section(&mut bytes, false, |bytes, enc16, enc32| {
+            block(bytes, enc32, 1, |data| {
+                data.extend(enc16(101));
+                data.extend(enc16(0));
+                data.extend(enc32(0));
+            });
+            block(bytes, enc32, 6, |data| {
+                data.extend([0, 0, 1, 20, 20].into_iter().flat_map(enc32));
+                data.extend(ip);
+            });
+            block(bytes, enc32, 3, |data| {
+                data.extend(enc32(20));
+                data.extend(ip);
+            });
+        });
+        section(&mut bytes, true, |bytes, enc16, enc32| {
+            block(bytes, enc32, 1, |data| {
+                data.extend(enc16(276));
+                data.extend(enc16(0));
+                data.extend(enc32(0));
+            });
+            block(bytes, enc32, 2, |data| {
+                data.extend(enc16(0));
+                data.extend(enc16(0xffff));
+                data.extend([0, 9, 40, 40].into_iter().flat_map(enc32));
+                data.extend([0x08, 0x00]);
+                data.extend([0; 18]);
+                data.extend(&ip[..12]);
+                data.extend(&ip[16..20]);
+                data.extend(&ip[12..16]);
+            });
+            block(bytes, enc32, 6, |data| {
+                data.extend([0, 0, 10, 39, 40].into_iter().flat_map(enc32));
+                data.extend([0x08, 0x00]);
+                data.extend([0; 18]);
+                data.extend(ip); // The last destination octet is outside caplen.
+            });
+        });
+        let summary = scan(&bytes, Format::PcapNg);
+        assert!(summary.issue.is_none());
+        assert_eq!(summary.stats.packets, 4);
+        assert_eq!(summary.conversations.unclassified_packets, 1);
+        assert_eq!(summary.conversations.tracked_pairs, 1);
+        let pair = &summary.conversations.top[0];
+        assert_eq!(
+            (pair.a.to_string(), pair.b.to_string()),
+            ("10.0.0.1".into(), "10.0.0.2".into())
+        );
+        assert_eq!((pair.a_to_b.packets, pair.a_to_b.captured_bytes), (2, 40));
+        assert_eq!((pair.b_to_a.packets, pair.b_to_a.captured_bytes), (1, 40));
+
+        bytes.truncate(bytes.len() - 72); // Discard the short packet block.
+        *bytes.last_mut().unwrap() ^= 1; // Corrupt the previous block trailer.
+        let partial = scan(&bytes, Format::PcapNg);
+        assert!(partial.issue.unwrap().contains("block lengths disagree"));
+        assert_eq!(partial.stats.packets, 2);
+        assert_eq!(partial.conversations.top[0].b_to_a.packets, 0);
     }
 }

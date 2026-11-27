@@ -10,7 +10,7 @@ use std::{
 };
 
 mod summary;
-use summary::{Bucket, CaptureCounters, PacketStats, Summary};
+use summary::{Bucket, CaptureCounters, Conversations, PacketStats, Summary};
 
 pub struct LocalCapture {
     pub path: PathBuf,
@@ -37,6 +37,7 @@ struct Report<'a> {
     interfaces: usize,
     interface_details: Vec<InterfaceReport<'a>>,
     timeline: Option<TimelineReport>,
+    ip_conversations: &'a Conversations,
     link_types: &'a BTreeSet<u16>,
     complete: bool,
     issue: Option<&'a str>,
@@ -150,6 +151,7 @@ impl LocalCapture {
                     buckets: timeline.buckets().collect(),
                 })
             }),
+            ip_conversations: &summary.conversations,
             link_types: &summary.link_types,
             complete: summary.issue.is_none(),
             issue: summary.issue.as_deref(),
