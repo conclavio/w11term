@@ -65,6 +65,7 @@ pub(super) enum Purpose {
     WiresharkExecutable(PathBuf),
     OpenSyscallTrace(PathBuf),
     SaveSyscallTrace(PathBuf),
+    SyscallComparison,
     FlameGraph {
         path: PathBuf,
         export: bool,
@@ -560,6 +561,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             | Purpose::GroupJsonReport(_)
             | Purpose::GroupRunComparison(_)
             | Purpose::FolderComparison
+            | Purpose::SyscallComparison
             | Purpose::SftpTransferHistory
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
@@ -609,6 +611,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                         "sftp-folder-comparison.json",
                         w!("json"),
                     ),
+                    Purpose::SyscallComparison => (
+                        w!("Save syscall comparison"),
+                        "syscall-comparison.txt",
+                        w!("txt"),
+                    ),
                     Purpose::SftpTransferHistory => (
                         w!("Save recent SFTP transfers as JSON"),
                         "sftp-transfers.json",
@@ -637,12 +644,19 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
                 dialog.SetDefaultExtension(extension)?;
                 // The atomic writer creates its own sibling file and reports any write errors.
-                options |= FOS_OVERWRITEPROMPT | FOS_NOTESTFILECREATE;
-                let sink: IFileDialogEvents = Overwrite {
-                    path: confirmed.clone(),
+                options |= FOS_NOTESTFILECREATE;
+                if matches!(purpose, Purpose::SyscallComparison) {
+                    options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                    options &= !FOS_OVERWRITEPROMPT;
+                    None
+                } else {
+                    options |= FOS_OVERWRITEPROMPT;
+                    let sink: IFileDialogEvents = Overwrite {
+                        path: confirmed.clone(),
+                    }
+                    .into();
+                    Some(dialog.Advise(&sink)?)
                 }
-                .into();
-                Some(dialog.Advise(&sink)?)
             }
         };
         dialog.SetOptions(options)?;

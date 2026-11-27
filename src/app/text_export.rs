@@ -59,6 +59,7 @@ pub enum Subject {
         run: u64,
     },
     FolderComparison(FolderComparisonTarget),
+    SyscallComparison,
     SftpTransferHistory,
     SshHostList,
     SshGroupDefinition,
@@ -88,6 +89,7 @@ impl Subject {
             Self::HostGroupRunDiff { .. } => "SSH group run differences".into(),
             Self::HostGroupRunComparison { .. } => "SSH group run comparison".into(),
             Self::FolderComparison(_) => "folder comparison".into(),
+            Self::SyscallComparison => "syscall comparison".into(),
             Self::SftpTransferHistory => "SFTP transfer history".into(),
             Self::SshHostList => "SSH host list".into(),
             Self::SshGroupDefinition => "SSH group definition".into(),
@@ -151,6 +153,7 @@ impl Subject {
                 ))
             }
             Self::FolderComparison(_) => file_picker::Purpose::FolderComparison,
+            Self::SyscallComparison => file_picker::Purpose::SyscallComparison,
             Self::SftpTransferHistory => file_picker::Purpose::SftpTransferHistory,
             Self::SshHostList => file_picker::Purpose::SshHostList,
             Self::SshGroupDefinition => file_picker::Purpose::SshGroupDefinition,

@@ -1506,6 +1506,8 @@ Open the working capture and choose **Compare with failing trace…**. The compa
 
 Enter terms such as `openat ENOENT /tmp/settings` and choose **Apply change filter** to narrow the comparison by syscall, resource, executable, change type, or errno. Searches ignore case. All terms must match the change or its paired evidence. If an errno matches a call inside a repeated group, the viewer opens that pair of original records. Clear the field and apply again to restore all changes allowed by the timing setting.
 
+Choose **Export comparison…** to save a new text file. It includes all changes that pass the applied filter and timing setting, across every results page. Each change includes its counts, available duration delta, and source file and line references. The export also includes both originals for the currently selected evidence pair, with the same preview limits as the viewer.
+
 ### Collect Linux performance triage
 
 In the Windows app, open **More → Diagnostics → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.

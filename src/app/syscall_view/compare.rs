@@ -1,7 +1,11 @@
 use super::*;
 use trace::{Comparison, ComparisonKind, ComparisonMatch, ComparisonRow};
 
+mod report;
+
 const ROWS: usize = 40;
+const COMPARISON_LIMIT: &str =
+    "Comparison reached its descriptor or change limit. Some evidence may be missing.";
 
 pub enum Action {
     Open(TabId),
@@ -13,7 +17,13 @@ pub enum Action {
     Timing(TabId, bool),
     Query(TabId, String),
     Filter(TabId),
-    Filtered(TabId, Arc<()>, Result<Vec<ComparisonMatch>, String>),
+    Filtered(TabId, Arc<()>, Result<AppliedFilter, String>),
+    Export(TabId),
+}
+
+pub struct AppliedFilter {
+    query: String,
+    matches: Vec<ComparisonMatch>,
 }
 
 #[derive(Default)]
@@ -22,7 +32,7 @@ pub(super) struct ViewState {
     compare: Option<Arc<Comparison>>,
     timing: bool,
     query: String,
-    matches: Option<Vec<ComparisonMatch>>,
+    applied: Option<AppliedFilter>,
     visible: Vec<usize>,
     page: usize,
     selected: Option<usize>,
@@ -108,12 +118,26 @@ impl TerminalApp {
                     && page.finish(&ticket)
                 {
                     match result {
-                        Ok(matches) => {
-                            page.comparison.matches = Some(matches);
+                        Ok(filter) => {
+                            page.comparison.applied = Some(filter);
                             page.comparison.filter(true);
                         }
                         Err(error) => page.status = Some(error),
                     }
+                }
+            }
+            Action::Export(tab) => {
+                if self.tabs.active_id() == Some(tab)
+                    && self.export.pending.is_none()
+                    && let Some(snapshot) = self
+                        .comparison_input(tab)
+                        .and_then(|state| report::Snapshot::capture(state))
+                {
+                    self.begin_text_export(
+                        text_export::Subject::SyscallComparison,
+                        move |file| snapshot.write(file),
+                        ctx,
+                    );
                 }
             }
         }
@@ -137,7 +161,7 @@ impl TerminalApp {
         let state = &mut page.comparison;
         let query = state.query.trim();
         if query.is_empty() {
-            state.matches = None;
+            state.applied = None;
             state.filter(false);
             page.status = None;
             return;
@@ -153,7 +177,14 @@ impl TerminalApp {
             Err("Syscall comparison filter worker unavailable".into()),
         ));
         ctx.spawn_background_with_rejection(
-            move |_| message(Action::Filtered(tab, ticket, Ok(compare.search(&query)))),
+            move |_| {
+                let matches = compare.search(&query);
+                message(Action::Filtered(
+                    tab,
+                    ticket,
+                    Ok(AppliedFilter { query, matches }),
+                ))
+            },
             rejected,
         );
     }
@@ -204,8 +235,9 @@ impl ViewState {
         let Some(compare) = &self.compare else { return };
         let show =
             |&index: &usize| self.timing || compare.rows[index].kind != ComparisonKind::Timing;
-        self.visible = if let Some(matches) = &self.matches {
-            matches
+        self.visible = if let Some(filter) = &self.applied {
+            filter
+                .matches
                 .iter()
                 .map(|matched| matched.index)
                 .filter(show)
@@ -236,7 +268,7 @@ impl ViewState {
     }
 
     fn match_sample(&self, index: usize) -> Option<usize> {
-        let matches = self.matches.as_ref()?;
+        let matches = &self.applied.as_ref()?.matches;
         let position = matches
             .binary_search_by_key(&index, |matched| matched.index)
             .ok()?;
@@ -314,7 +346,7 @@ impl ViewState {
         header.push(KeyedView::new(
             "compare-filter",
             Grid::new()
-                .columns([GridLength::Star(1.0), GridLength::Auto])
+                .columns([GridLength::Star(1.0), GridLength::Auto, GridLength::Auto])
                 .column_spacing(8.0)
                 .children((
                     TextBox::new()
@@ -328,16 +360,24 @@ impl ViewState {
                     Button::new()
                         .grid_column(1)
                         .is_enabled(
-                            idle && (self.matches.is_some() || !self.query.trim().is_empty()),
+                            idle && (self.applied.is_some() || !self.query.trim().is_empty()),
                         )
                         .on_click(ctx.callback(move |_| message(Action::Filter(tab))))
                         .content("Apply change filter"),
+                    Button::new()
+                        .grid_column(2)
+                        .is_enabled(idle)
+                        .on_click(ctx.callback(move |_| message(Action::Export(tab))))
+                        .content("Export comparison…"),
                 )),
         ));
         if comparison.limited {
-            header.push(KeyedView::new("comparison-limit", TextBlock::new()
-                .text("Comparison reached its descriptor or change limit. Some evidence may be missing.")
-                .text_wrapping(TextWrapping::Wrap)));
+            header.push(KeyedView::new(
+                "comparison-limit",
+                TextBlock::new()
+                    .text(COMPARISON_LIMIT)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
         }
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -374,7 +414,7 @@ impl ViewState {
             .position(|&index| Some(index) == self.selected);
         let first_divergence = compare.first_divergence();
         let count = self.visible.len();
-        let prefix = if self.matches.is_some() {
+        let prefix = if self.applied.is_some() {
             "matching "
         } else {
             ""
@@ -540,7 +580,7 @@ impl ViewState {
         } else {
             let text = if compare.rows.is_empty() {
                 "No differences found in the available records."
-            } else if self.matches.is_some() {
+            } else if self.applied.is_some() {
                 "No changes match the filter."
             } else {
                 "Timing-only changes are available."
@@ -588,31 +628,9 @@ impl ViewState {
         } else {
             "comparison-failing-original"
         };
-        let mut evidence = String::new();
-        if let Some(event) = row.and_then(|row| compare.event(row, side, self.sample)) {
-            if let Some(elapsed) = trace.relative_start(event) {
-                let _ = writeln!(
-                    evidence,
-                    "+{:.3} ms from run start",
-                    elapsed as f64 / 1_000_000.0
-                );
-            }
-            if let Some(duration) = trace.events[event].duration {
-                let _ = writeln!(
-                    evidence,
-                    "Call duration {:.3} ms",
-                    duration as f64 / 1_000_000.0
-                );
-            }
-            if let Some(pid) = trace.events[event].pid {
-                let _ = writeln!(evidence, "PID {pid}");
-            }
-            for raw in trace.events[event].originals() {
-                append_raw(&mut evidence, trace, raw);
-            }
-        } else if row.is_some() {
-            evidence.push_str("No corresponding call in this run.");
-        }
+        let evidence = row.map_or_else(String::new, |row| {
+            evidence_text(compare, row, side, self.sample)
+        });
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .row_spacing(6.0)
@@ -630,6 +648,35 @@ impl ViewState {
                 ),
             ))
     }
+}
+
+fn evidence_text(compare: &Comparison, row: &ComparisonRow, side: usize, sample: usize) -> String {
+    let Some(event) = compare.event(row, side, sample) else {
+        return "No corresponding call in this run.".into();
+    };
+    let trace = &compare.traces[side];
+    let mut evidence = String::new();
+    if let Some(elapsed) = trace.relative_start(event) {
+        let _ = writeln!(
+            evidence,
+            "+{:.3} ms from run start",
+            elapsed as f64 / 1_000_000.0
+        );
+    }
+    if let Some(duration) = trace.events[event].duration {
+        let _ = writeln!(
+            evidence,
+            "Call duration {:.3} ms",
+            duration as f64 / 1_000_000.0
+        );
+    }
+    if let Some(pid) = trace.events[event].pid {
+        let _ = writeln!(evidence, "PID {pid}");
+    }
+    for raw in trace.events[event].originals() {
+        append_raw(&mut evidence, trace, raw);
+    }
+    evidence
 }
 
 fn delta(before: u64, after: u64) -> f64 {

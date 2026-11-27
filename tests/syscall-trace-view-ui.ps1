@@ -91,7 +91,7 @@ function Raw-Text($Which = $rawId) {
     if ($raw) { $raw.Current.Name }
 }
 
-function Apply-ChangeFilter([string]$Text) {
+function Set-ChangeFilter([string]$Text) {
     $field = Wait-Until 'syscall comparison filter field' {
         Find-Element 'Filter syscall changes' $edit
     }
@@ -104,7 +104,21 @@ function Apply-ChangeFilter([string]$Text) {
     $null = Wait-Until 'filter text entered' {
         (Find-Element 'Filter syscall changes' $edit).GetCurrentPattern($value).Current.Value -ceq $Text
     }
+}
+
+function Apply-ChangeFilter([string]$Text) {
+    Set-ChangeFilter $Text
     Click 'Apply change filter'
+}
+
+function Save-Comparison([string]$Destination) {
+    Click ('Export comparison' + [char]0x2026)
+    $dialog = Wait-Until 'owned comparison save dialog' { Find-OwnedDialog 'Save syscall comparison' }
+    $null = Wait-Until 'enter comparison export path' {
+        [FixtureDialog]::SetFilename($dialog, $Destination, 'syscall-comparison.txt')
+    }
+    $null = Wait-Until 'confirm comparison export' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'comparison save dialog closes' { !(Find-OwnedDialog 'Save syscall comparison') }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -217,6 +231,29 @@ try {
         $left -and $right -and $left.Contains('read(3</tmp/data>, "a"') -and
             $right.Contains('read(8</tmp/data>, "a"')
     }
+    Set-ChangeFilter '/unapplied/draft'
+    $report = Join-Path $State 'comparison report.txt'
+    Save-Comparison $report
+    $null = Wait-Until 'text report is atomically published' { [IO.File]::Exists($report) }
+    $saved = [IO.File]::ReadAllText($report)
+    if (!$saved.Contains("Applied filter${dot}read /TMP/DATA") -or
+        !$saved.Contains("Reported changes${dot}1 of 4") -or
+        !$saved.Contains("Count delta -1") -or
+        !$saved.Contains('working diag.strace line 6') -or
+        !$saved.Contains('read(3</tmp/data>, "a"') -or
+        !$saved.Contains('read(8</tmp/data>, "a"') -or
+        $saved.Contains('/tmp/settings') -or $saved.Contains('/unapplied/draft')) {
+        throw "Comparison export did not capture the applied filter and selected evidence: $saved"
+    }
+    Save-Comparison $report
+    $null = Wait-Until 'export refuses an existing destination' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        foreach ($control in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition)) {
+            if ($control.Current.Name.StartsWith('Could not save syscall comparison.')) { return $true }
+        }
+    }
+    if ([IO.File]::ReadAllText($report) -cne $saved) { throw 'Export replaced an existing comparison file' }
     Apply-ChangeFilter '/missing/filter/fixture'
     $null = Wait-Until 'a nonmatching filter clears stale comparison evidence' {
         (Find-Element 'No changes match the filter.') -and
