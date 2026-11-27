@@ -1,4 +1,6 @@
 use super::*;
+use crate::app::openrouter_assistance::clip;
+use std::fmt::Write as _;
 use w11term::ssh::TriageFinding;
 
 const SIDES: [&str; 2] = ["Before", "After"];
@@ -127,27 +129,22 @@ impl Comparison {
                 || "Current collection".into(),
                 |name| name.to_string_lossy(),
             );
-        let complete = (0..report.collection.samples.len())
-            .filter(|&index| check_complete(report, index))
-            .count();
-        let status = if report.collection.stopped_by_user {
-            " · Stopped by request".into()
-        } else if report.collection.supervisor_status != 0 {
-            format!(" · Collector exit {}", report.collection.supervisor_status)
-        } else {
-            String::new()
-        };
         StackPanel::new().spacing(4.0).keyed_children([
             detail("file", display_output(&format!("{} · {name}", SIDES[side]))),
             detail("target", display_output(&endpoint(&report.target))),
-            detail(
-                "coverage",
-                format!(
-                    "{complete} of {} checks complete{status}",
-                    report.collection.samples.len()
-                ),
-            ),
+            detail("coverage", coverage_summary(report)),
         ])
+    }
+
+    fn observation_line(&self, change: &Change, side: usize) -> Option<(usize, &str)> {
+        let report = &self.reports[side];
+        let Kind::Finding(indices) = change.kind else {
+            return None;
+        };
+        let line = report.findings[indices[side]?].stdout_line?;
+        let sample = &report.collection.samples[change.probe];
+        let text = sample.stdout.text.lines().nth(line.checked_sub(1)?)?;
+        Some((line, text.trim()))
     }
 
     fn evidence(&self, change: &Change, side: usize) -> View {
@@ -162,25 +159,12 @@ impl Comparison {
             detail("command", display_output(&probe.command)),
             detail("sampling", display_output(&probe.sampling)),
         ];
-        let line = match change.kind {
-            Kind::Check => None,
-            Kind::Finding(indices) => {
-                indices[side].and_then(|index| report.findings[index].stdout_line)
-            }
-        };
-        if let Some((line, evidence)) = line.and_then(|line| {
-            sample
-                .stdout
-                .text
-                .lines()
-                .nth(line.checked_sub(1)?)
-                .map(|text| (line, text))
-        }) {
+        if let Some((line, evidence)) = self.observation_line(change, side) {
             fields.push(detail(
                 "evidence-label",
                 format!("{} output line {line}", probe.id),
             ));
-            fields.push(selectable("evidence", evidence.trim()));
+            fields.push(selectable("evidence", evidence));
         } else {
             fields.push(detail("check-status", check_status(report, change.probe)));
             for (key, label, output) in [
@@ -199,6 +183,83 @@ impl Comparison {
         StackPanel::new().spacing(4.0).keyed_children(fields)
     }
 
+    pub fn openrouter_preview(&self) -> String {
+        let mut preview = String::from("Linux performance triage comparison\n\n");
+        let endpoint_matches = same_target(&self.reports[0].target, &self.reports[1].target);
+        preview.push_str(if endpoint_matches {
+            "Same recorded SSH endpoint\n"
+        } else {
+            "Different recorded SSH endpoints\n"
+        });
+        for (side, report) in SIDES.into_iter().zip(&self.reports) {
+            let _ = writeln!(preview, "{side}: {}", coverage_summary(report));
+            for probe in 0..report.collection.samples.len() {
+                if !check_complete(report, probe) {
+                    let id = &report.target.probes[probe].id;
+                    let _ = writeln!(preview, "{side} {id}: {}", check_status(report, probe));
+                }
+            }
+        }
+        if let Some(change) = self.selected.and_then(|index| self.changes.get(index)) {
+            let _ = writeln!(preview, "\nSelected evidence · {}", self.title(change));
+            for (side, label) in SIDES.into_iter().enumerate() {
+                let report = &self.reports[side];
+                let probe = &report.target.probes[change.probe];
+                let sample = &report.collection.samples[change.probe];
+                let _ = writeln!(
+                    preview,
+                    "{label} {}: {}\nCommand: {}\nSampling: {}",
+                    probe.id,
+                    clip(&self.value(change, side), 192),
+                    clip(&probe.command, 192),
+                    clip(&probe.sampling, 192),
+                );
+                if let Some((line, text)) = self.observation_line(change, side) {
+                    let _ = writeln!(
+                        preview,
+                        "{label} {} stdout line {line}: {}",
+                        probe.id,
+                        clip(text, 512),
+                    );
+                } else {
+                    for (stream, text) in [
+                        ("stdout", &sample.stdout.text),
+                        ("stderr", &sample.stderr.text),
+                    ] {
+                        if !text.is_empty() {
+                            let _ = writeln!(
+                                preview,
+                                "{label} {} {stream} excerpt:\n{}",
+                                probe.id,
+                                clip(text, 512),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        preview.push_str("\nChanges in check coverage and observations\n");
+        if self.changes.is_empty() {
+            preview.push_str("No changes in check coverage or reported observations.\n");
+        }
+        for change in &self.changes {
+            let probe = &self.reports[0].target.probes[change.probe];
+            let _ = writeln!(
+                preview,
+                "{} · {}: Before {} · After {}{}",
+                probe.id,
+                self.title(change),
+                clip(&self.value(change, 0), 120),
+                clip(&self.value(change, 1), 120),
+                change
+                    .delta
+                    .as_ref()
+                    .map_or_else(String::new, |delta| format!(" · {delta}")),
+            );
+        }
+        preview
+    }
+
     pub fn fields(&self, ctx: &ViewContext<TerminalApp>) -> Vec<KeyedView> {
         let mut fields = vec![
             KeyedView::new(
@@ -206,6 +267,12 @@ impl Comparison {
                 Button::new()
                     .on_click(ctx.callback(|_| message(Action::BackFromComparison)))
                     .content("Back to report"),
+            ),
+            KeyedView::new(
+                "compare-openrouter",
+                Button::new()
+                    .on_click(ctx.callback(|_| message(Action::OpenRouterComparison)))
+                    .content("Review comparison with OpenRouter…"),
             ),
             KeyedView::new("compare-sources", columns(self.source(0), self.source(1))),
         ];
@@ -288,6 +355,23 @@ fn check_complete(report: &TriageReport, probe: usize) -> bool {
     sample.status == TriageSampleStatus::Ok
         && !sample.stdout.at_byte_limit
         && !sample.stderr.at_byte_limit
+}
+
+fn coverage_summary(report: &TriageReport) -> String {
+    let count = report.collection.samples.len();
+    let complete = (0..count)
+        .filter(|&index| check_complete(report, index))
+        .count();
+    let mut summary = format!("{complete} of {count} checks complete");
+    if report.collection.stopped_by_user {
+        summary.push_str(" · Stopped by request");
+    } else if report.collection.supervisor_status != 0 {
+        summary.push_str(&format!(
+            " · Collector exit {}",
+            report.collection.supervisor_status
+        ));
+    }
+    summary
 }
 
 fn check_status(report: &TriageReport, probe: usize) -> String {

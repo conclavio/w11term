@@ -1536,6 +1536,8 @@ Open **Settings → OpenRouter assistance** to save an API key protected by Wind
 
 Open **More → Draft a Bash command with OpenRouter** to describe a task, or select terminal text and choose **Explain selected text with OpenRouter**. To capture a pane without selecting text first, focus it and choose **Explain visible pane with OpenRouter** from **More** or the command palette. This snapshots the text rows then on screen, including a scrolled view, with no offscreen history or images. In a Linux performance report, **Review report with OpenRouter…** starts with local findings and excerpts from the selected sample.
 
+In a triage comparison, **Review comparison with OpenRouter…** drafts an editable preview of the changes, coverage limitations, and paired evidence for the selected row. The default preview leaves out report paths, host addresses, usernames, and host fingerprints from the report headers. It keeps the comparison open beside the review so you can check the output against both sources.
+
 Edit the preview to remove any details you want to keep local. The preview accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
 
 The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.

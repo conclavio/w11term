@@ -120,8 +120,19 @@ impl TerminalApp {
         );
     }
 
+    pub(super) fn review_triage_comparison_with_openrouter(
+        &mut self,
+        evidence: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.show_openrouter(Task::TriageComparison, Evidence::Text(evidence), ctx);
+    }
+
     fn show_openrouter(&mut self, task: Task, evidence: Evidence, ctx: &ComponentContext<Self>) {
-        self.set_diagnostics_drawer((task == Task::Triage).then_some(diagnostics::Drawer::Triage));
+        self.set_diagnostics_drawer(
+            matches!(task, Task::Triage | Task::TriageComparison)
+                .then_some(diagnostics::Drawer::Triage),
+        );
         self.command_reference.close();
         let current = self
             .tabs
@@ -544,6 +555,7 @@ impl PageState {
                     Task::Explain => "Explain terminal output",
                     Task::Draft => "Describe the Bash task",
                     Task::Triage => "Review Linux performance evidence",
+                    Task::TriageComparison => "Review Linux performance changes",
                 },
             ),
             KeyedView::new(
@@ -684,7 +696,7 @@ fn line(key: &str, text: impl Into<String>) -> KeyedView {
     )
 }
 
-fn clip(text: &str, bytes: usize) -> &str {
+pub(super) fn clip(text: &str, bytes: usize) -> &str {
     &text[..text.floor_char_boundary(bytes.min(text.len()))]
 }
 

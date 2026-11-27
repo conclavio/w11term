@@ -25,6 +25,7 @@ pub enum Action {
     Finding(usize),
     Profile(NonZeroU32),
     OpenRouter,
+    OpenRouterComparison,
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -484,6 +485,15 @@ impl TerminalApp {
     }
 
     pub(super) fn triage_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if matches!(action, Action::OpenRouterComparison) {
+            if self.triage.pending.is_none()
+                && let Some(comparison) = &self.triage.comparison
+            {
+                let evidence = comparison.openrouter_preview();
+                self.review_triage_comparison_with_openrouter(evidence, ctx);
+            }
+            return;
+        }
         if matches!(action, Action::OpenRouter) {
             if self.triage.pending.is_none()
                 && self.triage.comparison.is_none()

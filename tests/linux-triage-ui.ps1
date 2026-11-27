@@ -151,6 +151,21 @@ try {
         (Find-Element '3 0 0 8 40 12 46 1 1') -and
         (Find-Element '3 0 0 8 70 14 14 1 1')
     }
+    Click ('Review comparison with OpenRouter' + [char]0x2026)
+    $null = Wait-Until 'comparison remains open beside the paired review preview' {
+        $field = Find-Element 'OpenRouter request preview' ([System.Windows.Automation.ControlType]::Edit)
+        if (!$field -or !$field.Current.IsEnabled) { return }
+        $preview = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+        $preview.Contains('Linux performance triage comparison') -and
+            $preview.Contains('Before vmstat stdout line 3: 3 0 0 8 40 12 46 1 1') -and
+            $preview.Contains('After vmstat stdout line 3: 3 0 0 8 70 14 14 1 1') -and
+            $preview.Contains('Before dmesg: Permission denied') -and
+            $preview.Contains('+32.0 pp') -and
+            !$preview.Contains('captured.json') -and !$preview.Contains('after triage.json') -and
+            !$preview.Contains($saved.target.host_key_fingerprint) -and
+            (Find-Element 'Triage report changes')
+    }
+    if (Find-Element 'Send reviewed request' $button) { throw 'Opening a comparison created a reviewed request' }
     Click 'Back to report'
     Show-KernelCheck
     Click ('Review report with OpenRouter' + [char]0x2026)
