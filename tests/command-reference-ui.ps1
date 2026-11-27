@@ -65,6 +65,19 @@ function Select-InstalledTool([string]$Name) {
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
 }
+function Set-Manual([string]$Text) {
+    $field = Wait-Until 'editable private Markdown box' {
+        $control = Find-Element 'Private page Markdown' $edit
+        if ($control -and $control.Current.IsEnabled) { $control }
+    }
+    $field.SetFocus()
+    $markdownLf = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    $field.GetCurrentPattern($value).SetValue($markdownLf.Replace("`n", "`r"))
+    $null = Wait-Until 'complete private Markdown in the editor' {
+        $actual = (Find-Element 'Private page Markdown' $edit).GetCurrentPattern($value).Current.Value
+        $actual.Replace("`r`n", "`n").Replace("`r", "`n") -ceq $markdownLf
+    }
+}
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -107,7 +120,45 @@ try {
     $null = Wait-Until 'installed mdd opened its bundled manual' {
         (Find-Element 'mdd') -and (Find-Element "Linux${dot}w11term manual")
     }
-    if ([IO.File]::ReadAllText($wire)) { throw 'Looking up a managed tool wrote to the SSH shell' }
+    Set-Field 'Search command reference' 'crew report'
+    Click 'New private page'
+    $manual = @'
+# Crew runbook
+
+> Check crew status.
+
+- Show report:
+
+`crew-report --summary`
+'@
+    Set-Manual $manual
+    Click 'Save private page'
+    $null = Wait-Until 'saved manual shown immediately' {
+        (Find-Element 'Crew runbook') -and (Find-Element 'crew-report --summary')
+    }
+    $manualFile = Join-Path $privatePages 'crew-report.md'
+    if (![IO.File]::Exists($manualFile)) { throw 'Private manual was saved in the wrong platform directory' }
+    Click 'Edit private page'
+    $null = Wait-Until 'existing multiline page seeded without losing the example' {
+        $field = Find-Element 'Private page Markdown' $edit
+        $field -and $field.Current.IsEnabled -and $field.GetCurrentPattern($value).Current.Value.Contains('crew-report --summary')
+    }
+    Set-Manual ($manual.Replace('Crew runbook', 'Crew runbook updated').Replace('--summary','--details'))
+    Click 'Save private page'
+    $null = Wait-Until 'edited manual shown' {
+        (Find-Element 'Crew runbook updated') -and (Find-Element 'crew-report --details')
+    }
+    $saved = [IO.File]::ReadAllText($manualFile)
+    Click 'Edit private page'
+    Set-Manual ($manual.Replace('Crew runbook','Discarded draft'))
+    Click 'Cancel private page edit'
+    $null = Wait-Until 'cancel returns to the published page' { Find-Element 'Crew runbook updated' }
+    if ([IO.File]::ReadAllText($manualFile) -cne $saved) { throw 'Cancel changed the saved file' }
+    Click 'Close command reference'
+    $null = Wait-Until 'closed command reference before reload' { !(Find-Element 'Search command reference' $edit) }
+    Run-Palette 'Command reference'
+    $null = Wait-Until 'the offline catalogue displays the edited page after reopening' { Find-Element 'Crew runbook updated' }
+    if ([IO.File]::ReadAllText($wire)) { throw 'Browsing or editing a manual wrote to the SSH shell' }
     Search 'ip' 'Linux'
     Click 'Edit example 1'
     Set-Field 'Edit command example' 'ip address'

@@ -1,9 +1,10 @@
 use super::*;
-use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, Platform, WINDOWS};
+use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, PageSource, Platform, WINDOWS};
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod catalog;
 mod download;
+mod private_page;
 
 pub(super) const LABEL: &str = "Command reference";
 pub(super) const SELECTION: &str = "Look up selected command";
@@ -26,6 +27,7 @@ pub enum Action {
     ListTools(ToolPane),
     ListedTools(Arc<()>, Result<InstalledTools, String>),
     ToolPage(Arc<()>, usize),
+    Private(private_page::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,7 @@ pub(super) struct Panel {
     draft_field: ElementRef<TextBox>,
     focus: u64,
     tools: Option<ToolLookup>,
+    private_page: Option<private_page::Editor>,
 }
 
 fn pane_platform(source: Option<&Source>) -> Platform {
@@ -93,6 +96,7 @@ impl Panel {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.draft = None;
+        self.private_page = None;
         if let Some(lookup) = self.tools.take() {
             lookup.cancel.cancel();
         }
@@ -152,6 +156,32 @@ impl Panel {
         Some((page, key.platform))
     }
 
+    fn private_page_target(&self, preferred: Platform) -> Option<(Key, bool)> {
+        let library = self.library.as_ref().filter(|_| !self.loading)?;
+        let name = catalog::query(&self.query);
+        if !private_page::editable_name(&name) {
+            return None;
+        }
+        let is_private = |key| {
+            library
+                .catalog
+                .page(key)
+                .is_some_and(|page| matches!(page.source, PageSource::Custom))
+        };
+        let results = self.results(preferred);
+        let key = results
+            .get(self.selected)
+            .or_else(|| results.first())
+            .filter(|key| key.name == name && is_private(key))
+            .cloned()
+            .unwrap_or(Key {
+                platform: preferred,
+                name,
+            });
+        let editing = is_private(&key);
+        Some((key, editing))
+    }
+
     fn view(
         &self,
         auto: Platform,
@@ -159,6 +189,9 @@ impl Panel {
         tool_pane: Option<ToolPane>,
         ctx: &mut ViewContext<TerminalApp>,
     ) -> View {
+        if let Some(editor) = &self.private_page {
+            return editor.view(ctx);
+        }
         let target = if self
             .draft
             .as_ref()
@@ -229,6 +262,20 @@ impl Panel {
                         })),
                 ));
             }
+        }
+        if let Some((_, editing)) = self.private_page_target(preferred) {
+            pieces.push(KeyedView::new(
+                "author-private-page",
+                Button::new()
+                    .on_click(ctx.callback(|_| {
+                        Message::CommandReference(Action::Private(private_page::Action::Open))
+                    }))
+                    .content(if editing {
+                        "Edit private page"
+                    } else {
+                        "New private page"
+                    }),
+            ));
         }
         if let Some((page, platform)) = self.page(&results) {
             pieces.extend([
@@ -539,7 +586,7 @@ impl TerminalApp {
 
     fn start_reference_load(&mut self, refresh: bool, ctx: &ComponentContext<Self>) {
         let panel = &mut self.command_reference;
-        if panel.loading {
+        if panel.loading || panel.private_page.is_some() {
             return;
         }
         panel.loading = true;
@@ -625,6 +672,7 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         let origin = self.reference_origin();
+        let auto = self.reference_platform();
         let tool_pane = self.reference_tool_target().map(|(target, _)| target);
         let selected = match action {
             Action::Selection(target) => target
@@ -635,6 +683,9 @@ impl TerminalApp {
         let panel = &mut self.command_reference;
         match action {
             Action::Open | Action::Selection(_) => {
+                if panel.private_page.is_some() {
+                    return;
+                }
                 let was_open = panel.open;
                 panel.open = true;
                 panel.draft = None;
@@ -696,6 +747,7 @@ impl TerminalApp {
             }
             Action::Link(link) => Self::open_link(&link),
             Action::Refresh => self.start_reference_load(true, ctx),
+            Action::Private(action) => panel.author_private_page(action, auto, ctx),
             Action::ListTools(target) => self.start_tool_lookup(target, ctx),
             Action::ListedTools(request, result) => {
                 if let Some(lookup) = &mut panel.tools

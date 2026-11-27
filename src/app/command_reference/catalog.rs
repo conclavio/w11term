@@ -8,7 +8,7 @@ use std::{
 
 const BUNDLED: &[u8] = include_bytes!("../../../assets/command-reference/tldr-pages.en.zip");
 pub(super) const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
-const MAX_PAGE: usize = 64 * 1024;
+pub(super) const MAX_PAGE: usize = 64 * 1024;
 const MAX_CONTENT: usize = 32 * 1024 * 1024;
 const MAX_PAGES: usize = 20_000;
 const TOOL_PAGES: &[(&str, &str)] = &[
@@ -85,7 +85,7 @@ pub(super) struct Page {
 }
 
 impl Page {
-    fn parse(text: &str, source: PageSource) -> Option<Self> {
+    pub(super) fn parse(text: &str, source: PageSource) -> Option<Self> {
         let mut lines = text.trim_start_matches('\u{feff}').lines().map(str::trim);
         let title = lines.find(|line| !line.is_empty())?.strip_prefix("# ")?;
         let mut description = Vec::new();
@@ -157,6 +157,10 @@ pub(super) struct Catalog {
 impl Catalog {
     pub(super) fn page(&self, key: &Key) -> Option<&Page> {
         self.pages.get(key)
+    }
+
+    pub(super) fn set_private_page(&mut self, key: Key, page: Page) {
+        self.pages.insert(key, page);
     }
 
     pub(super) fn exact(&self, text: &str, preferred: Platform) -> Option<Key> {
@@ -322,7 +326,7 @@ impl Catalog {
     }
 }
 
-fn read_page(file: impl Read) -> Result<String> {
+pub(super) fn read_page(file: impl Read) -> Result<String> {
     let mut text = String::new();
     file.take(MAX_PAGE as u64 + 1).read_to_string(&mut text)?;
     ensure!(
@@ -338,7 +342,7 @@ pub struct Loaded {
     pub(super) status: String,
 }
 
-fn directory() -> Result<PathBuf> {
+pub(super) fn directory() -> Result<PathBuf> {
     Ok(w11term::keys::data_dir()?.join("command-reference"))
 }
 
