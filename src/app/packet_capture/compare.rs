@@ -1,15 +1,35 @@
 use super::*;
 
 const ROWS_PER_PAGE: usize = 12;
+const SOURCE_LABELS: [&str; 2] = ["Before capture", "After capture"];
+
+#[derive(Clone, Copy)]
+pub enum Change {
+    Page(usize),
+    Pair { page: usize, row: Option<usize> },
+    Source(usize),
+    Open,
+}
 
 pub(super) struct Comparison {
     model: Box<PacketCaptureComparison>,
+    paths: [PathBuf; 2],
+    revision: Arc<()>,
     page: usize,
+    selected: Option<usize>,
+    source: usize,
 }
 
 impl Comparison {
-    pub(super) fn new(model: Box<PacketCaptureComparison>) -> Self {
-        Self { model, page: 0 }
+    pub(super) fn new(model: Box<PacketCaptureComparison>, paths: [PathBuf; 2]) -> Self {
+        Self {
+            model,
+            paths,
+            revision: Arc::new(()),
+            page: 0,
+            selected: None,
+            source: 1,
+        }
     }
 
     fn page_count(&self) -> usize {
@@ -20,10 +40,36 @@ impl Comparison {
             .max(1)
     }
 
-    pub(super) fn select_page(&mut self, page: usize) {
-        if page < self.page_count() {
-            self.page = page;
+    pub(super) fn update(
+        &mut self,
+        revision: &Arc<()>,
+        change: Change,
+    ) -> Option<(PathBuf, IpAddr, IpAddr)> {
+        if !Arc::ptr_eq(revision, &self.revision) {
+            return None;
         }
+        let start = self.page * ROWS_PER_PAGE;
+        match change {
+            Change::Page(page) if page < self.page_count() && page != self.page => {
+                self.page = page;
+                self.selected = None;
+            }
+            Change::Pair { page, row } if page == self.page => {
+                self.selected = row.filter(|&row| {
+                    row < ROWS_PER_PAGE && start + row < self.model.conversation_changes.len()
+                });
+            }
+            Change::Source(source) if source < self.paths.len() => self.source = source,
+            Change::Open => {
+                let pair = self
+                    .model
+                    .conversation_changes
+                    .get(start + self.selected?)?;
+                return Some((self.paths[self.source].clone(), pair.a, pair.b));
+            }
+            _ => (),
+        }
+        None
     }
 
     pub(super) fn view(
@@ -33,6 +79,10 @@ impl Comparison {
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let model = &self.model;
+        let action = |change| {
+            let revision = Arc::clone(&self.revision);
+            ctx.callback(move |_| message(Action::Comparison(revision.clone(), change)))
+        };
         let mut fields = vec![KeyedView::new(
             "back",
             Button::new()
@@ -112,7 +162,7 @@ impl Comparison {
                     .children((
                         Button::new()
                             .is_enabled(idle && self.page != 0)
-                            .on_click(ctx.callback(move |_| message(Action::ComparePage(previous))))
+                            .on_click(action(Change::Page(previous)))
                             .content("Previous page"),
                         TextBlock::new().text(format!(
                             "Page {} of {}",
@@ -121,33 +171,85 @@ impl Comparison {
                         )),
                         Button::new()
                             .is_enabled(idle && next < self.page_count())
-                            .on_click(ctx.callback(move |_| message(Action::ComparePage(next))))
+                            .on_click(action(Change::Page(next)))
                             .content("Next page"),
                     )),
             ));
         }
-        fields.extend(model.conversation_changes.iter().skip(self.page * ROWS_PER_PAGE).take(ROWS_PER_PAGE).map(|change| {
-            let label = format!("{} ↔ {}", change.a, change.b);
-            let mut details = vec![text("addresses", label.clone())];
-            for (side, traffic) in [("Before", change.before), ("After", change.after)] {
-                let label = traffic.map_or_else(
-                    || format!("{side} · Pair coverage unavailable"),
-                    |traffic| format!(
-                        "{side} · Left to right {} packets, {} bytes · Right to left {} packets, {} bytes",
-                        traffic.a_to_b.packets, traffic.a_to_b.captured_bytes,
-                        traffic.b_to_a.packets, traffic.b_to_a.captured_bytes
-                    ),
-                );
-                details.push(text(side, label));
-            }
-            if let Some(delta) = &change.delta {
-                details.push(text("delta", format!(
-                    "Change · {:+} packets · {:+} captured bytes",
-                    delta.packets, delta.captured_bytes,
-                )));
-            }
-            KeyedView::new(label, StackPanel::new().spacing(3.0).keyed_children(details))
-        }));
+        if !model.conversation_changes.is_empty() {
+            let page = self.page;
+            let row_revision = Arc::clone(&self.revision);
+            let source_revision = Arc::clone(&self.revision);
+            fields.extend([
+                KeyedView::new(
+                    format!("conversations-{page}"),
+                    ListView::new()
+                        .automation_name("Changed IP conversations")
+                        .max_height(320.0)
+                        .selected_index(self.selected)
+                        .on_selection_changed(ctx.callback(move |row| {
+                            message(Action::Comparison(row_revision.clone(), Change::Pair { page, row }))
+                        }))
+                        .collection_slot(
+                            ListViewSlot::Items,
+                            model.conversation_changes.iter().skip(page * ROWS_PER_PAGE).take(ROWS_PER_PAGE).map(|change| {
+                                let label = format!("{} ↔ {}", change.a, change.b);
+                                let mut details = vec![text("addresses", label.clone())];
+                                for (side, traffic) in [("Before", change.before), ("After", change.after)] {
+                                    let detail = traffic.map_or_else(
+                                        || format!("{side} · Pair coverage unavailable"),
+                                        |traffic| format!(
+                                            "{side} · Left to right {} packets, {} bytes · Right to left {} packets, {} bytes",
+                                            traffic.a_to_b.packets, traffic.a_to_b.captured_bytes,
+                                            traffic.b_to_a.packets, traffic.b_to_a.captured_bytes
+                                        ),
+                                    );
+                                    details.push(text(side, detail));
+                                }
+                                if let Some(delta) = &change.delta {
+                                    details.push(text("delta", format!(
+                                        "Change · {:+} packets · {:+} captured bytes",
+                                        delta.packets, delta.captured_bytes,
+                                    )));
+                                }
+                                KeyedView::new(
+                                    label.as_str(),
+                                    ListViewItem::new().automation_name(&label).content(
+                                        StackPanel::new().spacing(3.0).keyed_children(details)
+                                    ),
+                                )
+                            }),
+                        ),
+                ),
+                KeyedView::new(
+                    "wireshark-source",
+                    ComboBox::new()
+                        .automation_name("Capture to open in Wireshark")
+                        .items_source(SOURCE_LABELS.map(str::to_owned))
+                        .selected_index(Some(self.source))
+                        .is_enabled(idle)
+                        .on_selection_changed(ctx.callback(move |source: Option<usize>| {
+                            source.map_or(Message::ControlIdle, |source| {
+                                message(Action::Comparison(source_revision.clone(), Change::Source(source)))
+                            })
+                        })),
+                ),
+                KeyedView::new(
+                    "open-conversation",
+                    Button::new()
+                        .is_enabled(idle && self.selected.is_some())
+                        .on_click(action(Change::Open))
+                        .content("Open conversation in Wireshark"),
+                ),
+                KeyedView::new(
+                    "choose-wireshark",
+                    HyperlinkButton::new()
+                        .is_enabled(idle)
+                        .on_click(ctx.callback(|_| message(Action::ChooseWireshark)))
+                        .content("Choose Wireshark executable…"),
+                ),
+            ]);
+        }
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .children((

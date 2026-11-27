@@ -1513,6 +1513,8 @@ Choose **Compare captures…** to use the displayed capture as **Before** and ch
 
 Use `compare-packet-captures BEFORE AFTER [--output-file PATH]` to get the same comparison as offline JSON. Omitted counts and deltas are `null`. Each file is subject to the same scan limits as `inspect-packet-capture`.
 
+In the comparison, select a changed IP pair, choose **Before capture** or **After capture**, and choose **Open conversation in Wireshark**. The source defaults to **After capture**. Wireshark opens the selected original file with both directions of the pair, including when the summary reports zero packets or unavailable coverage for that side. Use **Choose Wireshark executable…** to select an installation from the comparison view.
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

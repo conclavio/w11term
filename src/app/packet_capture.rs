@@ -48,7 +48,7 @@ pub enum Action {
     Stop(Arc<()>),
     OpenCaptureFile(Option<PathBuf>),
     CompareCapture,
-    ComparePage(usize),
+    Comparison(Arc<()>, compare::Change),
     BackToCapture,
     ChooseWireshark,
     OpenWireshark,
@@ -66,7 +66,7 @@ pub enum Outcome {
     Compared {
         comparison: Box<PacketCaptureComparison>,
         baseline: Option<Arc<LocalPacketCapture>>,
-        after: PathBuf,
+        paths: [PathBuf; 2],
     },
     Wireshark(PathBuf),
     Opened,
@@ -1018,7 +1018,9 @@ impl TerminalApp {
                     && (self.packet_capture.pending.is_none()
                         || matches!(
                             action,
-                            Action::SelectConversation(..) | Action::ConversationsExpanded(_)
+                            Action::SelectConversation(..)
+                                | Action::ConversationsExpanded(_)
+                                | Action::Comparison(_, compare::Change::Pair { .. })
                         )) =>
             {
                 self.packet_capture_input(action, ctx);
@@ -1116,9 +1118,17 @@ impl TerminalApp {
                 });
             }
             Action::CompareCapture => self.choose_capture_file(FileChoice::Compare, ctx),
-            Action::ComparePage(page) => {
-                if let Some(comparison) = &mut panel.comparison {
-                    comparison.select_page(page);
+            Action::Comparison(revision, change) => {
+                if let Some((capture, a, b)) = panel
+                    .comparison
+                    .as_mut()
+                    .and_then(|comparison| comparison.update(&revision, change))
+                {
+                    self.open_packet_viewer(
+                        capture,
+                        Some(WiresharkFilter::Conversation(a, b, None)),
+                        ctx,
+                    );
                 }
             }
             Action::BackToCapture => panel.comparison = None,
@@ -1165,35 +1175,44 @@ impl TerminalApp {
                     _ => return,
                 };
                 let capture = capture.path().to_owned();
-                let configured = panel.wireshark.clone();
-                let ticket = panel.begin("Opening Wireshark…");
-                work(ctx, ticket, move || {
-                    let executable = configured.or_else(default_wireshark).context(
-                        "Wireshark was not found. Choose its executable to open the capture.",
-                    )?;
-                    match filter {
-                        None => open_capture_in_wireshark(&capture, &executable),
-                        Some(WiresharkFilter::Interval(interval)) => {
-                            open_capture_interval_in_wireshark(&capture, &executable, interval)
-                        }
-                        Some(WiresharkFilter::Conversation(a, b, None)) => {
-                            open_capture_conversation_in_wireshark(&capture, &executable, a, b)
-                        }
-                        Some(WiresharkFilter::Conversation(a, b, Some(interval))) => {
-                            open_capture_conversation_interval_in_wireshark(
-                                &capture,
-                                &executable,
-                                a,
-                                b,
-                                interval,
-                            )
-                        }
-                    }?;
-                    Ok(Some(Outcome::Opened))
-                });
+                self.open_packet_viewer(capture, filter, ctx);
             }
             _ => (),
         }
+    }
+
+    fn open_packet_viewer(
+        &mut self,
+        capture: PathBuf,
+        filter: Option<WiresharkFilter>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let configured = self.packet_capture.wireshark.clone();
+        let ticket = self.packet_capture.begin("Opening Wireshark…");
+        work(ctx, ticket, move || {
+            let executable = configured
+                .or_else(default_wireshark)
+                .context("Wireshark was not found. Choose its executable to open the capture.")?;
+            match filter {
+                None => open_capture_in_wireshark(&capture, &executable),
+                Some(WiresharkFilter::Interval(interval)) => {
+                    open_capture_interval_in_wireshark(&capture, &executable, interval)
+                }
+                Some(WiresharkFilter::Conversation(a, b, None)) => {
+                    open_capture_conversation_in_wireshark(&capture, &executable, a, b)
+                }
+                Some(WiresharkFilter::Conversation(a, b, Some(interval))) => {
+                    open_capture_conversation_interval_in_wireshark(
+                        &capture,
+                        &executable,
+                        a,
+                        b,
+                        interval,
+                    )
+                }
+            }?;
+            Ok(Some(Outcome::Opened))
+        });
     }
 
     fn list_packet_interfaces(&mut self, ctx: &ComponentContext<Self>) {
@@ -1386,17 +1405,13 @@ impl TerminalApp {
             Ok(Some(Outcome::Compared {
                 comparison,
                 baseline,
-                after,
+                paths,
             })) => {
                 if let Some(baseline) = baseline {
                     panel.install_local(baseline);
                 }
-                panel.comparison = Some(compare::Comparison::new(comparison));
-                let before = panel
-                    .loaded
-                    .as_ref()
-                    .map(|capture| capture.path().to_owned());
-                for path in before.into_iter().chain([after]) {
+                panel.comparison = Some(compare::Comparison::new(comparison, paths.clone()));
+                for path in paths {
                     self.remember_diagnostic(
                         w11term::diagnostic_history::Kind::PacketCapture,
                         [path],
@@ -1458,8 +1473,8 @@ fn compare_captures(
     let after = LocalPacketCapture::open(after).context("Opening the after capture")?;
     Ok(Outcome::Compared {
         comparison: Box::new(PacketCaptureComparison::new(&before, &after)),
+        paths: [before.path.clone(), after.path],
         baseline: install_baseline.then_some(before),
-        after: after.path,
     })
 }
 

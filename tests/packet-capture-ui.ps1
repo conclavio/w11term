@@ -95,9 +95,9 @@ public static class Viewer {
 }
 '@
 
-function Click([string]$Name) {
+function Click([string]$Name, [System.Windows.Automation.ControlType]$Type = $button) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
-        $item = Find-Element $Name $button
+        $item = Find-Element $Name $Type
         if ($item -and $item.Current.IsEnabled) { $item }
     })
 }
@@ -123,8 +123,9 @@ function Select-Capture([string]$Path, [string]$Trigger = $openCaptureLabel, [st
     $null = Wait-Until 'source capture picker closed' { !(Find-OwnedDialog $Title) }
 }
 
-function Select-Viewer {
-    Click $chooseViewerLabel
+function Select-Viewer([switch]$FromComparison) {
+    $type = if ($FromComparison) { [System.Windows.Automation.ControlType]::Hyperlink } else { $button }
+    Click $chooseViewerLabel $type
     $dialog = Wait-Until 'owned executable picker' { Find-OwnedDialog 'Choose Wireshark executable' }
     $null = Wait-Until 'enter the fixture viewer path' { [FixtureDialog]::SetFilename($dialog, $viewer, '') }
     $null = Wait-Until 'select the fixture viewer' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -323,6 +324,33 @@ try {
         (Find-Element 'IP conversation changes 3') -and
         (Find-Element "192.0.2.1 $bothDirections 192.0.2.2") -and
         (Find-Element "Change${dot}-3 packets${dot}-146 captured bytes")
+    }
+    $null = Wait-Until 'opening a compared conversation requires a selected row' {
+        $open = Find-Element 'Open conversation in Wireshark' $button
+        $open -and !$open.Current.IsEnabled
+    }
+    $changedPair = Wait-Until 'the changed IPv4 pair is selectable' {
+        Find-Element "192.0.2.1 $bothDirections 192.0.2.2" ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $changedPair.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-Viewer -FromComparison
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until 'the default After file is launched with the compared pair filter' {
+        $filterPath = $olderCapture + '.filter'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $ipv4Filter
+    }
+    $source = Wait-CaptureCombo 'Capture to open in Wireshark'
+    $source.SetFocus()
+    $source.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $before = Wait-Until 'Before is selectable as the Wireshark source' {
+        Find-Element 'Before capture' ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $before.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Remove-Item -LiteralPath ($conversationCapture + '.filter') -ErrorAction Stop
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until 'the same filter is sent to the original Before capture' {
+        $filterPath = $conversationCapture + '.filter'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $ipv4Filter
     }
     Click 'Back to capture'
     $null = Wait-Until 'comparison returns to the original before capture' {
