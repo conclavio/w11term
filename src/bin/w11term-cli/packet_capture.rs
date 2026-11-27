@@ -6,7 +6,7 @@ use std::{
     path::{self, Path, PathBuf},
 };
 use w11term::control::{PacketCaptureOptions, Reply, Request};
-use w11term::ssh::{LocalPacketCapture, open_capture_in_wireshark};
+use w11term::ssh::{LocalPacketCapture, PacketCaptureComparison, open_capture_in_wireshark};
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] list-packet-interfaces --pane ID\n",
@@ -21,12 +21,38 @@ pub(super) const HELP: &str = concat!(
 pub(super) const INSPECT_VERB: &str = "inspect-packet-capture";
 pub(super) const INSPECT_HELP: &str =
     "w11term-cli inspect-packet-capture FILE [--output-file PATH]";
+pub(super) const COMPARE_VERB: &str = "compare-packet-captures";
+pub(super) const COMPARE_HELP: &str =
+    "w11term-cli compare-packet-captures BEFORE AFTER [--output-file PATH]";
 
 pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
     let path = args
         .next()
         .context("provide the local PCAP or PCAPNG file")?;
+    let output_file = report_output(INSPECT_VERB, args)?;
+    let capture = LocalPacketCapture::open(path::absolute(path)?)
+        .with_context(|| format!("Inspecting packet capture {path}"))?;
+    offline::write_report(stdout, output_file, |output| capture.write_json(output))
+}
+
+pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut args = args.iter();
+    let before = args.next().context("provide the before capture file")?;
+    let after = args.next().context("provide the after capture file")?;
+    let output_file = report_output(COMPARE_VERB, args)?;
+    let before = LocalPacketCapture::open(path::absolute(before)?)
+        .with_context(|| format!("Opening before capture {before}"))?;
+    let after = LocalPacketCapture::open(path::absolute(after)?)
+        .with_context(|| format!("Opening after capture {after}"))?;
+    let comparison = PacketCaptureComparison::new(&before, &after);
+    offline::write_report(stdout, output_file, |output| comparison.write_json(output))
+}
+
+fn report_output<'a>(
+    verb: &str,
+    mut args: impl Iterator<Item = &'a String>,
+) -> Result<Option<&'a str>> {
     let mut output_file = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -38,12 +64,10 @@ pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()
                         .as_str(),
                 );
             }
-            _ => bail!("unknown option {flag} for {INSPECT_VERB}"),
+            _ => bail!("unknown option {flag} for {verb}"),
         }
     }
-    let capture = LocalPacketCapture::open(path::absolute(path)?)
-        .with_context(|| format!("Inspecting packet capture {path}"))?;
-    offline::write_report(stdout, output_file, |output| capture.write_json(output))
+    Ok(output_file)
 }
 
 pub(super) fn parse(

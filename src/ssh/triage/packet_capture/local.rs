@@ -9,7 +9,9 @@ use std::{
     path::PathBuf,
 };
 
+mod compare;
 mod summary;
+pub use compare::CaptureComparison;
 use summary::{Bucket, CaptureCounters, Conversations, PacketStats, Summary};
 
 pub struct LocalCapture {

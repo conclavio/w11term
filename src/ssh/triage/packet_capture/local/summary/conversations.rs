@@ -19,6 +19,16 @@ pub struct Conversations {
     pub unclassified_packets: u32,
     pub untracked_packets: u32,
     pub top: Vec<Conversation>,
+    #[serde(skip)]
+    remaining: Vec<Conversation>,
+}
+
+impl Conversations {
+    pub(in crate::ssh::triage::packet_capture::local) fn pairs(
+        &self,
+    ) -> impl Iterator<Item = &Conversation> {
+        self.top.iter().chain(&self.remaining)
+    }
 }
 
 #[derive(Serialize)]
@@ -29,7 +39,7 @@ pub struct Conversation {
     pub b_to_a: Traffic,
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Traffic {
     pub packets: u32,
     pub captured_bytes: u64,
@@ -95,12 +105,13 @@ impl Scan {
                 pair.b,
             )
         });
-        top.truncate(MAX_RANKED_PAIRS);
+        let remaining = top.split_off(top.len().min(MAX_RANKED_PAIRS));
         Conversations {
             tracked_pairs,
             unclassified_packets: self.unclassified_packets,
             untracked_packets: self.untracked_packets,
             top,
+            remaining,
         }
     }
 }

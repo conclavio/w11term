@@ -21,6 +21,9 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         packet_capture::INSPECT_VERB => {
             (packet_capture::INSPECT_HELP, packet_capture::inspect_file)
         }
+        packet_capture::COMPARE_VERB => {
+            (packet_capture::COMPARE_HELP, packet_capture::compare_files)
+        }
         _ => return None,
     };
     if args == ["--help"] || args == ["-h"] {

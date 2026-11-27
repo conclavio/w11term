@@ -9,7 +9,7 @@ use std::{
 mod conversations;
 mod pcapng;
 mod timeline;
-pub use conversations::Conversations;
+pub use conversations::{Conversations, Traffic};
 pub use timeline::{Bucket, Timeline};
 
 const MAX_RECORDS: u32 = 1_000_000;

@@ -12,6 +12,7 @@ $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
 $saveLabel = 'Capture and save' + [char]0x2026
 $openCaptureLabel = 'Open capture file' + [char]0x2026
+$compareCaptureLabel = 'Compare captures' + [char]0x2026
 $chooseViewerLabel = 'Choose Wireshark executable' + [char]0x2026
 $edit = [System.Windows.Automation.ControlType]::Edit
 $check = [System.Windows.Automation.ControlType]::CheckBox
@@ -114,12 +115,12 @@ function Set-Field([string]$Name, [string]$Text) {
     }
 }
 
-function Select-Capture([string]$Path) {
-    Click $openCaptureLabel
-    $dialog = Wait-Until 'owned source capture picker' { Find-OwnedDialog 'Open packet capture' }
+function Select-Capture([string]$Path, [string]$Trigger = $openCaptureLabel, [string]$Title = 'Open packet capture') {
+    Click $Trigger
+    $dialog = Wait-Until 'owned source capture picker' { Find-OwnedDialog $Title }
     $null = Wait-Until 'enter the source capture path' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
     $null = Wait-Until 'select the source capture' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'source capture picker closed' { !(Find-OwnedDialog 'Open packet capture') }
+    $null = Wait-Until 'source capture picker closed' { !(Find-OwnedDialog $Title) }
 }
 
 function Select-Viewer {
@@ -135,10 +136,18 @@ function Open-PacketSection([string]$Id) {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $condition = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $Id)
-        $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if ($item -and $item.Current.IsEnabled) { $item }
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $expander
+}
+
+function Wait-CaptureCombo([string]$Name) {
+    Wait-Until "enabled capture dropdown '$Name'" {
+        $item = Find-Element $Name ([System.Windows.Automation.ControlType]::ComboBox)
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
 }
 
 function Open-Conversation([string]$Label, [string]$Filter) {
@@ -180,7 +189,7 @@ try {
             (Find-Element "Peak 1 packet${dot}4 bytes${dot}+0.000 s from timeline start" -Visible)
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
-    $picker = Find-Element 'Saved capture interfaces' ([System.Windows.Automation.ControlType]::ComboBox)
+    $picker = Wait-CaptureCombo 'Saved capture interfaces'
     $picker.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $wireless = Wait-Until 'the second saved interface can be selected' {
         Find-Element "Section 1${dot}Interface 1${dot}wireless" ([System.Windows.Automation.ControlType]::ListItem) -Visible
@@ -230,9 +239,7 @@ try {
     Select-Viewer
     if ([IO.File]::Exists($olderCapture + '.opened')) { throw 'Selecting the local file launched Wireshark' }
     $expander = Open-PacketSection 'packet-timeline'
-    $intervals = Wait-Until 'the packet timeline can select populated intervals' {
-        Find-Element 'Packet timeline intervals' ([System.Windows.Automation.ControlType]::ComboBox)
-    }
+    $intervals = Wait-CaptureCombo 'Packet timeline intervals'
     $intervals.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $interval = Wait-Until 'the second populated interval is available' {
         Find-Element "+0.499712 s${dot}1 packet" ([System.Windows.Automation.ControlType]::ListItem) -Visible
@@ -267,9 +274,7 @@ try {
         Find-Element $conversationCapture
     }
     $conversationTimeline = Open-PacketSection 'packet-timeline'
-    $intervals = Wait-Until 'the conversation capture has a timeline picker' {
-        Find-Element 'Packet timeline intervals' ([System.Windows.Automation.ControlType]::ComboBox)
-    }
+    $intervals = Wait-CaptureCombo 'Packet timeline intervals'
     $intervals.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $reverseInterval = Wait-Until 'the interval containing the reverse IPv4 packet can be selected' {
         Find-Element "+1.048576 s${dot}1 packet" ([System.Windows.Automation.ControlType]::ListItem)
@@ -310,6 +315,27 @@ try {
     (Wait-CheckBox $scopeLabel ([System.Windows.Automation.ToggleState]::On)).Toggle()
     Open-Conversation "192.0.2.1 $bothDirections 192.0.2.2" $ipv4Filter
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'
+    $null = Wait-Until 'comparison shows both files, signed capture changes, and the changed IP pair' {
+        (Find-Element "Before${dot}IP conversations.pcap${dot}PCAP") -and
+        (Find-Element "After${dot}older capture.pcapng${dot}PCAPNG") -and
+        (Find-Element "Capture change${dot}-4 packets${dot}-330 captured bytes${dot}+1 truncated") -and
+        (Find-Element 'IP conversation changes 3') -and
+        (Find-Element "192.0.2.1 $bothDirections 192.0.2.2") -and
+        (Find-Element "Change${dot}-3 packets${dot}-146 captured bytes")
+    }
+    Click 'Back to capture'
+    $null = Wait-Until 'comparison returns to the original before capture' {
+        Find-Element $conversationCapture
+    }
+    Select-Capture $partialCapture $compareCaptureLabel 'Choose after packet capture'
+    $null = Wait-Until 'partial comparison preserves the issue and withholds capture deltas' {
+        (Find-Element "After${dot}incomplete capture.pcapng${dot}PCAPNG") -and
+        (Find-Element "Partial scan${dot}Incomplete or invalid PCAPNG block length") -and
+        (Find-Element 'Capture deltas unavailable for a partial scan') -and
+        (Find-Element "After${dot}Pair coverage unavailable")
+    }
+    Click 'Back to capture'
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'
     $null = Wait-Until 'flame graph can open a saved artifact offline' {
@@ -356,7 +382,7 @@ try {
     }
     $null = Control @('focus-pane','--pane',"$remote")
     Wait-Focus $remote
-    $dropdown = Wait-Until 'returning to the same SSH connection restores the picker' { Find-Element 'Capture interfaces' $combo }
+    $dropdown = Wait-CaptureCombo 'Capture interfaces'
     $dropdown.SetFocus()
     $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $loopback = Wait-Until 'tcpdump loopback device can be chosen' {

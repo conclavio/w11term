@@ -68,6 +68,7 @@ pub(super) enum Purpose {
     SaveTriageReport(PathBuf),
     SaveCpuProfile(PathBuf),
     OpenPacketCapture(PathBuf),
+    ComparePacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
     WiresharkExecutable(PathBuf),
     OpenSyscallTrace(PathBuf),
@@ -248,6 +249,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::OpenTriageReport(_)
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
+                | Purpose::ComparePacketCapture(_)
                 | Purpose::WiresharkExecutable(_)
                 | Purpose::OpenSyscallTrace(_)
                 | Purpose::FlameGraph { export: false, .. }
@@ -349,9 +351,13 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::OpenPacketCapture(path) => {
+            Purpose::OpenPacketCapture(ref path) | Purpose::ComparePacketCapture(ref path) => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-                dialog.SetTitle(w!("Open packet capture"))?;
+                dialog.SetTitle(if matches!(purpose, Purpose::ComparePacketCapture(_)) {
+                    w!("Choose after packet capture")
+                } else {
+                    w!("Open packet capture")
+                })?;
                 dialog.SetFileTypes(&[
                     COMDLG_FILTERSPEC {
                         pszName: w!("Packet captures"),

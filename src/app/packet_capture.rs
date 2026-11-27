@@ -7,11 +7,14 @@ use std::{
 use w11term::{
     control::PacketCaptureOptions,
     ssh::{
-        CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureInterfaces, PacketCapturePlan,
-        open_capture_conversation_in_wireshark, open_capture_conversation_interval_in_wireshark,
-        open_capture_in_wireshark, open_capture_interval_in_wireshark,
+        CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureComparison,
+        PacketCaptureInterfaces, PacketCapturePlan, open_capture_conversation_in_wireshark,
+        open_capture_conversation_interval_in_wireshark, open_capture_in_wireshark,
+        open_capture_interval_in_wireshark,
     },
 };
+
+mod compare;
 
 pub(super) const LABEL: &str = "Packet capture";
 
@@ -44,6 +47,9 @@ pub enum Action {
     Save,
     Stop(Arc<()>),
     OpenCaptureFile(Option<PathBuf>),
+    CompareCapture,
+    ComparePage(usize),
+    BackToCapture,
     ChooseWireshark,
     OpenWireshark,
     OpenTimelineInterval(PathBuf),
@@ -56,7 +62,8 @@ pub enum Outcome {
     Reviewed(u64, Box<PacketCapturePlan>),
     Destination(PathBuf),
     Saved(PacketCapture),
-    Loaded(Box<LocalPacketCapture>),
+    Loaded(Arc<LocalPacketCapture>),
+    Compared(Box<PacketCaptureComparison>),
     Wireshark(PathBuf),
     Opened,
 }
@@ -64,6 +71,7 @@ pub enum Outcome {
 #[derive(Clone, Copy)]
 enum FileChoice {
     Capture,
+    Compare,
     Save,
     Wireshark,
 }
@@ -75,7 +83,7 @@ enum WiresharkFilter {
 
 enum LoadedCapture {
     Captured(PacketCapture),
-    Local(LocalPacketCapture),
+    Local(Arc<LocalPacketCapture>),
 }
 
 impl LoadedCapture {
@@ -189,6 +197,7 @@ pub(super) struct Panel {
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
     loaded: Option<LoadedCapture>,
+    comparison: Option<compare::Comparison>,
     saved_interface: usize,
     timeline_expanded: bool,
     timeline_interval: Option<usize>,
@@ -237,6 +246,9 @@ impl Panel {
         active: Option<flame_graph::Connection>,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
+        if let Some(comparison) = &self.comparison {
+            return comparison.view(ctx);
+        }
         let idle = self.pending.is_none();
         let button = |label: &str, enabled, action: fn() -> Action| {
             Button::new()
@@ -869,6 +881,10 @@ impl Panel {
         if self.loaded.is_some() {
             files.extend([
                 KeyedView::new(
+                    "compare-captures",
+                    button("Compare captures…", idle, || Action::CompareCapture),
+                ),
+                KeyedView::new(
                     "open",
                     button("Open in Wireshark", idle, || Action::OpenWireshark),
                 ),
@@ -1057,11 +1073,18 @@ impl TerminalApp {
             Action::OpenCaptureFile(Some(path)) => {
                 let ticket = panel.begin("Opening packet capture…");
                 work(ctx, ticket, move || {
-                    Ok(Some(Outcome::Loaded(Box::new(LocalPacketCapture::open(
+                    Ok(Some(Outcome::Loaded(Arc::new(LocalPacketCapture::open(
                         path,
                     )?))))
                 });
             }
+            Action::CompareCapture => self.choose_capture_file(FileChoice::Compare, ctx),
+            Action::ComparePage(page) => {
+                if let Some(comparison) = &mut panel.comparison {
+                    comparison.select_page(page);
+                }
+            }
+            Action::BackToCapture => panel.comparison = None,
             Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
             Action::OpenWireshark
             | Action::OpenTimelineInterval(..)
@@ -1192,7 +1215,7 @@ impl TerminalApp {
         let active = self.profile_connection();
         let panel = &mut self.packet_capture;
         match choice {
-            FileChoice::Wireshark if panel.loaded.is_none() => return,
+            FileChoice::Wireshark | FileChoice::Compare if panel.loaded.is_none() => return,
             FileChoice::Save
                 if !panel
                     .review
@@ -1218,7 +1241,16 @@ impl TerminalApp {
                 panel.wireshark.clone().unwrap_or_else(|| initial.into()),
             ),
             FileChoice::Capture => file_picker::Purpose::OpenPacketCapture(capture()),
+            FileChoice::Compare => file_picker::Purpose::ComparePacketCapture(capture()),
             FileChoice::Save => file_picker::Purpose::SavePacketCapture(capture()),
+        };
+        let before = if matches!(choice, FileChoice::Compare) {
+            panel.loaded.as_ref().map(|capture| match capture {
+                LoadedCapture::Local(capture) => Ok(Arc::clone(capture)),
+                LoadedCapture::Captured(capture) => Err(capture.path.clone()),
+            })
+        } else {
+            None
         };
         let ticket = panel.begin("Choosing a Windows file…");
         work(ctx, ticket, move || {
@@ -1227,7 +1259,18 @@ impl TerminalApp {
             };
             Ok(Some(match choice {
                 FileChoice::Capture => {
-                    Outcome::Loaded(Box::new(LocalPacketCapture::open(file.path)?))
+                    Outcome::Loaded(Arc::new(LocalPacketCapture::open(file.path)?))
+                }
+                FileChoice::Compare => {
+                    let before = match before.context("Open a before capture first")? {
+                        Ok(before) => before,
+                        Err(path) => Arc::new(
+                            LocalPacketCapture::open(path).context("Opening the before capture")?,
+                        ),
+                    };
+                    let after =
+                        LocalPacketCapture::open(file.path).context("Opening the after capture")?;
+                    Outcome::Compared(Box::new(PacketCaptureComparison::new(&before, &after)))
                 }
                 FileChoice::Save => Outcome::Destination(file.path),
                 FileChoice::Wireshark => Outcome::Wireshark(file.path),
@@ -1288,6 +1331,7 @@ impl TerminalApp {
             Ok(Some(Outcome::Saved(capture))) => {
                 let path = capture.path.clone();
                 panel.loaded = Some(LoadedCapture::Captured(capture));
+                panel.comparison = None;
                 panel.status = Some("Saved packet capture".into());
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,
@@ -1297,7 +1341,8 @@ impl TerminalApp {
             }
             Ok(Some(Outcome::Loaded(capture))) => {
                 let path = capture.path.clone();
-                panel.loaded = Some(LoadedCapture::Local(*capture));
+                panel.loaded = Some(LoadedCapture::Local(capture));
+                panel.comparison = None;
                 panel.saved_interface = 0;
                 panel.timeline_expanded = false;
                 panel.timeline_interval = None;
@@ -1310,6 +1355,9 @@ impl TerminalApp {
                     [path],
                     ctx,
                 );
+            }
+            Ok(Some(Outcome::Compared(comparison))) => {
+                panel.comparison = Some(compare::Comparison::new(comparison));
             }
             Ok(Some(Outcome::Wireshark(path))) => {
                 panel.status = Some(format!("Wireshark executable {}", path.display()));

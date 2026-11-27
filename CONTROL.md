@@ -1507,6 +1507,10 @@ Select a ranked pair and choose **Open conversation in Wireshark** to open the o
 
 Turn on **Limit to timeline interval** to apply the selected packet interval as well. The checkbox shows the start and end relative to the timeline start. The interval includes its start and excludes its end. Choose a different interval in **Packet timeline** to change those bounds. The selection remains in effect when the timeline is collapsed. The checkbox starts off for each opened capture.
 
+Choose **Compare captures…** to use the displayed capture as **Before** and choose a second PCAP or PCAPNG as **After**. The comparison shows each capture's packet totals, timestamp span, and coverage. It lists changes across all tracked IP pairs, with packet and byte counts in each direction. Deltas subtract **Before** from **After** and describe the two capture windows as recorded. Partial scans withhold deltas, and pairs whose counts could be hidden by a scan or tracking limit show unavailable coverage. Pair counts describe decoded outer IP headers. Non-IP or undecodable packets contribute to capture totals and the unclassified count. **Back to capture** returns to the original summary.
+
+Use `compare-packet-captures BEFORE AFTER [--output-file PATH]` to get the same comparison as offline JSON. Omitted counts and deltas are `null`. Each file is subject to the same scan limits as `inspect-packet-capture`.
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets
