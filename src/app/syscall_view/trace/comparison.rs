@@ -55,6 +55,11 @@ impl Row {
     }
 }
 
+pub struct RowMatch {
+    pub index: usize,
+    pub sample: Option<usize>,
+}
+
 pub struct Comparison {
     pub(in crate::app::syscall_view) traces: [Arc<Trace>; 2],
     pub(in crate::app::syscall_view) rows: Vec<Row>,
@@ -128,6 +133,50 @@ impl Comparison {
             .iter()
             .position(|row| row.kind != Kind::Timing && !row.uncertain)
             .or_else(|| self.rows.iter().position(|row| row.kind != Kind::Timing))
+    }
+
+    pub(in crate::app::syscall_view) fn search(&self, query: &str) -> Vec<RowMatch> {
+        let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let fields = [
+                    row.call.as_ref(),
+                    row.resource.as_ref(),
+                    row.process.as_ref(),
+                    row.kind.label(),
+                ]
+                .map(str::to_lowercase);
+                let missing: Vec<_> = terms
+                    .iter()
+                    .filter(|term| !fields.iter().any(|field| field.contains(term.as_str())))
+                    .collect();
+                if missing.is_empty() {
+                    return Some(RowMatch {
+                        index,
+                        sample: None,
+                    });
+                }
+                let sample = (0..row.evidence_count()).find(|&sample| {
+                    let errors = [0, 1].map(|side| {
+                        self.event(row, side, sample)
+                            .and_then(|event| self.traces[side].events[event].error.as_deref())
+                            .map(str::to_lowercase)
+                    });
+                    missing.iter().all(|term| {
+                        errors
+                            .iter()
+                            .flatten()
+                            .any(|error| error.contains(term.as_str()))
+                    })
+                })?;
+                Some(RowMatch {
+                    index,
+                    sample: Some(sample),
+                })
+            })
+            .collect()
     }
 
     fn compare_process(&mut self, runs: &[Vec<Run>; 2], image: Arc<str>, uncertain: bool) {
@@ -982,6 +1031,35 @@ mod tests {
         assert_eq!(&*reads.resource, "/tmp/data");
         assert_eq!(result.event(reads, 0, 1), Some(5));
         assert_eq!(result.event(reads, 1, 1), None);
+    }
+
+    #[test]
+    fn searches_normalized_changes_and_jumps_to_matching_error_evidence() {
+        let working = trace(concat!(
+            "21 execve(\"/bin/diag\", [\"diag\"], NULL) = 0\n",
+            "21 access(\"/tmp/settings\", R_OK) = 0\n",
+            "21 access(\"/tmp/settings\", R_OK) = 0\n",
+        ));
+        let failing = trace(concat!(
+            "87 execve(\"/bin/diag\", [\"diag\"], NULL) = 0\n",
+            "87 access(\"/tmp/settings\", R_OK) = -1 ENOENT (No such file or directory)\n",
+            "87 access(\"/tmp/settings\", R_OK) = -1 EACCES (Permission denied)\n",
+        ));
+        let comparison = Comparison::build(working, failing);
+        let matches = |query| {
+            comparison
+                .search(query)
+                .into_iter()
+                .map(|row| (row.index, row.sample))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            matches("/BIN/DIAG access /tmp/settings changed result"),
+            [(0, None)]
+        );
+        assert_eq!(matches("access enoent"), [(0, Some(0))]);
+        assert_eq!(matches("access eacces"), [(0, Some(1))]);
+        assert!(matches("access eacces /different/path").is_empty());
     }
 
     #[test]

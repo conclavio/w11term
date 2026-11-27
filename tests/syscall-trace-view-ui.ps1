@@ -59,7 +59,7 @@ $byListItem = [System.Windows.Automation.PropertyCondition]::new(
 77 1800000000.001000 openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = -1 ENOENT (No such file or directory) <0.010001>
 77 1800000000.003000 openat(AT_FDCWD, "/tmp/data", O_RDONLY) = 8</tmp/data> <0.000001>
 77 1800000000.004000 read(8</tmp/data>, "a", 1) = 1 <0.000001>
-77 1800000000.006000 close(8</tmp/data>) = 0 <0.000001>
+77 1800000000.006000 close(8</tmp/data>) = 0 <0.004001>
 '@ + [char]10)
 $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($trace))
 
@@ -89,6 +89,22 @@ function Raw-Text($Which = $rawId) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $raw = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $Which)
     if ($raw) { $raw.Current.Name }
+}
+
+function Apply-ChangeFilter([string]$Text) {
+    $field = Wait-Until 'syscall comparison filter field' {
+        Find-Element 'Filter syscall changes' $edit
+    }
+    $field.SetFocus()
+    $field = Wait-Until 'syscall comparison filter focused' {
+        $current = Find-Element 'Filter syscall changes' $edit -Visible
+        if ($current -and $current.Current.HasKeyboardFocus) { $current }
+    }
+    $field.GetCurrentPattern($value).SetValue($Text)
+    $null = Wait-Until 'filter text entered' {
+        (Find-Element 'Filter syscall changes' $edit).GetCurrentPattern($value).Current.Value -ceq $Text
+    }
+    Click 'Apply change filter'
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -175,6 +191,14 @@ try {
             $right.Contains('ENOENT') -and $left.Contains('+1.000 ms from run start') -and
             $right.Contains('+1.000 ms from run start')
     }
+    Apply-ChangeFilter 'OPENAT enoent /BIN/DIAG'
+    $null = Wait-Until 'filter narrows by syscall, errno, and executable' {
+        $right = Raw-Text $failingId
+        (Find-Element "1 matching change row${dot}Page 1 of 1") -and
+            !(Find-TraceGroup 'Changed count*read*') -and
+            $right -and $right.Contains('ENOENT')
+    }
+    Apply-ChangeFilter 'read /TMP/DATA'
     $reads = Wait-Until 'FD reuse is normalized before comparing read counts' {
         Find-TraceGroup 'Changed count*read*/tmp/data*'
     }
@@ -192,6 +216,30 @@ try {
         $right = Raw-Text $failingId
         $left -and $right -and $left.Contains('read(3</tmp/data>, "a"') -and
             $right.Contains('read(8</tmp/data>, "a"')
+    }
+    Apply-ChangeFilter '/missing/filter/fixture'
+    $null = Wait-Until 'a nonmatching filter clears stale comparison evidence' {
+        (Find-Element 'No changes match the filter.') -and
+            !(Find-TraceGroup 'Changed count*read*')
+    }
+    Apply-ChangeFilter ''
+    $null = Wait-Until 'clearing the filter restores the first divergence and all changes' {
+        $right = Raw-Text $failingId
+        (Find-TraceGroup 'First divergence*Changed result*openat*') -and
+            (Find-TraceGroup 'Changed count*read*') -and $right -and $right.Contains('ENOENT')
+    }
+    Apply-ChangeFilter 'changed timing close /tmp/data'
+    $null = Wait-Until 'timing-only changes stay hidden by default while filtering' {
+        Find-Element 'No changes match the filter.'
+    }
+    $timing = Wait-Until 'timing-only change toggle' {
+        Find-Element 'Include timing-only changes' ([System.Windows.Automation.ControlType]::CheckBox)
+    }
+    $timing.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+    $null = Wait-Until 'the timing toggle reveals only the timing change matching the filter' {
+        (Find-TraceGroup 'Changed timing*close*/tmp/data*') -and
+            (Find-Element 'Selected call duration delta +4.000 ms') -and
+            !(Find-TraceGroup 'Changed count*read*')
     }
     if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($trace)) -cne $before) { throw 'The viewer changed the original trace' }
 } finally {

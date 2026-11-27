@@ -10,7 +10,9 @@ use std::{
 
 mod comparison;
 mod descriptors;
-pub(super) use comparison::{Comparison, Kind as ComparisonKind, Row as ComparisonRow};
+pub(super) use comparison::{
+    Comparison, Kind as ComparisonKind, Row as ComparisonRow, RowMatch as ComparisonMatch,
+};
 pub(super) use descriptors::{DescriptorReport, Lifetime};
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;

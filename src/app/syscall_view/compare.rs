@@ -1,5 +1,5 @@
 use super::*;
-use trace::{Comparison, ComparisonKind, ComparisonRow};
+use trace::{Comparison, ComparisonKind, ComparisonMatch, ComparisonRow};
 
 const ROWS: usize = 40;
 
@@ -7,10 +7,13 @@ pub enum Action {
     Open(TabId),
     Back(TabId),
     Ready(TabId, Arc<()>, Result<Option<Arc<Comparison>>, String>),
-    Select(TabId, usize),
+    Select(TabId, Arc<Comparison>, usize),
     Page(TabId, bool),
     Evidence(TabId, bool),
     Timing(TabId, bool),
+    Query(TabId, String),
+    Filter(TabId),
+    Filtered(TabId, Arc<()>, Result<Vec<ComparisonMatch>, String>),
 }
 
 #[derive(Default)]
@@ -18,6 +21,8 @@ pub(super) struct ViewState {
     pub(super) open: bool,
     compare: Option<Arc<Comparison>>,
     timing: bool,
+    query: String,
+    matches: Option<Vec<ComparisonMatch>>,
     visible: Vec<usize>,
     page: usize,
     selected: Option<usize>,
@@ -44,7 +49,7 @@ impl TerminalApp {
                                 compare: Some(comparison),
                                 ..Default::default()
                             };
-                            state.filter();
+                            state.filter(false);
                         }
                         Ok(None) => (),
                         Err(error) => page.status = Some(error),
@@ -56,10 +61,13 @@ impl TerminalApp {
                     state.open = false;
                 }
             }
-            Action::Select(tab, offset) => {
+            Action::Select(tab, comparison, index) => {
                 if let Some(state) = self.comparison_input(tab)
-                    && offset < ROWS
-                    && let Some(&index) = state.visible.get(state.page * ROWS + offset)
+                    && state
+                        .compare
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &comparison))
+                    && state.page_rows().contains(&index)
                     && state.selected != Some(index)
                 {
                     state.select(Some(index));
@@ -86,7 +94,26 @@ impl TerminalApp {
                     && state.timing != enabled
                 {
                     state.timing = enabled;
-                    state.filter();
+                    state.filter(false);
+                }
+            }
+            Action::Query(tab, text) => {
+                if let Some(state) = self.comparison_input(tab) {
+                    state.query = text.chars().take(256).collect();
+                }
+            }
+            Action::Filter(tab) => self.filter_trace_comparison(tab, ctx),
+            Action::Filtered(tab, ticket, result) => {
+                if let Some(page) = self.syscall_page(tab)
+                    && page.finish(&ticket)
+                {
+                    match result {
+                        Ok(matches) => {
+                            page.comparison.matches = Some(matches);
+                            page.comparison.filter(true);
+                        }
+                        Err(error) => page.status = Some(error),
+                    }
                 }
             }
         }
@@ -95,6 +122,40 @@ impl TerminalApp {
     fn comparison_input(&mut self, tab: TabId) -> Option<&mut ViewState> {
         let page = self.syscall_page(tab)?;
         (page.comparison.open && page.pending.is_none()).then_some(&mut page.comparison)
+    }
+
+    fn filter_trace_comparison(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some(page) = self
+            .syscall_page(tab)
+            .filter(|page| page.comparison.open && page.pending.is_none())
+        else {
+            return;
+        };
+        let state = &mut page.comparison;
+        let query = state.query.trim();
+        if query.is_empty() {
+            state.matches = None;
+            state.filter(false);
+            page.status = None;
+            return;
+        }
+        let Some(compare) = state.compare.clone() else {
+            return;
+        };
+        let query = query.to_owned();
+        let ticket = page.begin("Filtering syscall changes…");
+        let rejected = message(Action::Filtered(
+            tab,
+            ticket.clone(),
+            Err("Syscall comparison filter worker unavailable".into()),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |_| message(Action::Filtered(tab, ticket, Ok(compare.search(&query)))),
+            rejected,
+        );
     }
 
     fn open_trace_comparison(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
@@ -139,31 +200,59 @@ impl TerminalApp {
 }
 
 impl ViewState {
-    fn filter(&mut self) {
+    fn filter(&mut self, prefer_match: bool) {
         let Some(compare) = &self.compare else { return };
-        self.visible = compare
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| {
-                (self.timing || row.kind != ComparisonKind::Timing).then_some(index)
-            })
-            .collect();
+        let show =
+            |&index: &usize| self.timing || compare.rows[index].kind != ComparisonKind::Timing;
+        self.visible = if let Some(matches) = &self.matches {
+            matches
+                .iter()
+                .map(|matched| matched.index)
+                .filter(show)
+                .collect()
+        } else {
+            (0..compare.rows.len()).filter(show).collect()
+        };
         let selected = self
             .selected
             .filter(|id| self.visible.contains(id))
-            .or_else(|| compare.first_divergence())
+            .or_else(|| {
+                compare
+                    .first_divergence()
+                    .filter(|id| self.visible.contains(id))
+            })
             .or_else(|| self.visible.first().copied());
         self.page = selected
             .and_then(|id| self.visible.iter().position(|&item| item == id))
             .unwrap_or_default()
             / ROWS;
-        self.select(selected);
+        if self.selected != selected {
+            self.select(selected);
+        } else if prefer_match
+            && let Some(sample) = selected.and_then(|index| self.match_sample(index))
+        {
+            self.sample = sample;
+        }
+    }
+
+    fn match_sample(&self, index: usize) -> Option<usize> {
+        let matches = self.matches.as_ref()?;
+        let position = matches
+            .binary_search_by_key(&index, |matched| matched.index)
+            .ok()?;
+        matches[position].sample
     }
 
     fn select(&mut self, index: Option<usize>) {
         self.selected = index;
-        self.sample = self.current().map_or(0, |(_, row)| row.sample);
+        self.sample = index
+            .and_then(|index| self.match_sample(index))
+            .unwrap_or_else(|| self.current().map_or(0, |(_, row)| row.sample));
+    }
+
+    fn page_rows(&self) -> &[usize] {
+        let first = self.page * ROWS;
+        &self.visible[first..(first + ROWS).min(self.visible.len())]
     }
 
     fn current(&self) -> Option<(&Comparison, &ComparisonRow)> {
@@ -222,6 +311,29 @@ impl ViewState {
                         .content("Include timing-only changes"),
                 )),
         ));
+        header.push(KeyedView::new(
+            "compare-filter",
+            Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Auto])
+                .column_spacing(8.0)
+                .children((
+                    TextBox::new()
+                        .automation_name("Filter syscall changes")
+                        .placeholder_text("Syscall, path, executable, or error")
+                        .is_enabled(idle)
+                        .text(&self.query)
+                        .on_text_changed(
+                            ctx.callback(move |text| message(Action::Query(tab, text))),
+                        ),
+                    Button::new()
+                        .grid_column(1)
+                        .is_enabled(
+                            idle && (self.matches.is_some() || !self.query.trim().is_empty()),
+                        )
+                        .on_click(ctx.callback(move |_| message(Action::Filter(tab))))
+                        .content("Apply change filter"),
+                )),
+        ));
         if comparison.limited {
             header.push(KeyedView::new("comparison-limit", TextBlock::new()
                 .text("Comparison reached its descriptor or change limit. Some evidence may be missing.")
@@ -249,30 +361,44 @@ impl ViewState {
     fn differences(
         &self,
         tab: TabId,
-        compare: &Comparison,
+        compare: &Arc<Comparison>,
         idle: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let first = self.page * ROWS;
-        let window = &self.visible[first..(first + ROWS).min(self.visible.len())];
+        let window = self.page_rows();
+        let row_ids: Arc<[usize]> = window.into();
+        let comparison = compare.clone();
         let selected = window
             .iter()
             .position(|&index| Some(index) == self.selected);
         let first_divergence = compare.first_divergence();
+        let count = self.visible.len();
+        let prefix = if self.matches.is_some() {
+            "matching "
+        } else {
+            ""
+        };
+        let label = if count == 1 {
+            "change row"
+        } else {
+            "change rows"
+        };
         let summary = format!(
-            "{} change rows · Page {} of {}",
-            self.visible.len(),
+            "{count} {prefix}{label} · Page {} of {}",
             self.page + 1,
-            self.visible.len().div_ceil(ROWS).max(1)
+            count.div_ceil(ROWS).max(1)
         );
         let list = ListView::new()
             .grid_row(1)
             .automation_name("Trace differences")
             .selected_index(selected)
             .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                index.map_or(Message::ControlIdle, |index| {
-                    message(Action::Select(tab, index))
-                })
+                index
+                    .and_then(|offset| row_ids.get(offset))
+                    .map_or(Message::ControlIdle, |&id| {
+                        message(Action::Select(tab, comparison.clone(), id))
+                    })
             }))
             .collection_slot(
                 ListViewSlot::Items,
@@ -414,6 +540,8 @@ impl ViewState {
         } else {
             let text = if compare.rows.is_empty() {
                 "No differences found in the available records."
+            } else if self.matches.is_some() {
+                "No changes match the filter."
             } else {
                 "Timing-only changes are available."
             };

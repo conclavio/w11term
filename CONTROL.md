@@ -1504,6 +1504,8 @@ Choose **File descriptors** to follow open files, sockets and pipes. Search by p
 
 Open the working capture and choose **Compare with failing trace…**. The comparison pairs processes by the executable and observed ancestry, then aligns syscall sequences by name and resource. It uses recorded descriptor lifetimes and process relationships to interpret numbers that differ between runs. Select a change to see both original records, the result or count delta, and available timing relative to each run's start. Turn on **Include timing-only changes** to include calls that differ by at least 1 ms and by at least a quarter of the slower duration. Some alignments are marked uncertain when evidence is incomplete or several sequences could match. Use the evidence arrows to see each record inside a repeated group.
 
+Enter terms such as `openat ENOENT /tmp/settings` and choose **Apply change filter** to narrow the comparison by syscall, resource, executable, change type, or errno. Searches ignore case. All terms must match the change or its paired evidence. If an errno matches a call inside a repeated group, the viewer opens that pair of original records. Clear the field and apply again to restore all changes allowed by the timing setting.
+
 ### Collect Linux performance triage
 
 In the Windows app, open **More → Diagnostics → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.
