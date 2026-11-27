@@ -109,6 +109,7 @@ mod session_browser;
 mod sftp_transfers;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
+mod syscall_view;
 mod tab_colors;
 mod tab_header_menu;
 mod tab_title;
@@ -422,6 +423,7 @@ enum Page {
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
+    SyscallTrace(Box<syscall_view::PageState>),
     Workspaces(workspace_view::WorkspacePage),
     Settings(Option<SettingsEditor>),
     NewProfile(ProfileDraft),
@@ -1048,6 +1050,7 @@ fn tab_menu_message(label: String) -> Message {
         triage::LABEL => Message::Triage(triage::Action::Open),
         flame_graph::LABEL => Message::FlameGraph(flame_graph::Action::Open),
         packet_capture::LABEL => Message::PacketCapture(packet_capture::Action::Open),
+        syscall_view::LABEL => Message::SyscallView(syscall_view::Action::Show),
         command_reference::SELECTION => {
             Message::CommandReference(command_reference::Action::Selection(None))
         }
@@ -1546,6 +1549,7 @@ pub enum Message {
     Triage(triage::Action),
     FlameGraph(flame_graph::Action),
     PacketCapture(packet_capture::Action),
+    SyscallView(syscall_view::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -4724,6 +4728,7 @@ impl TerminalApp {
             MenuItem::item("linux-triage", triage::LABEL),
             MenuItem::item("cpu-flame-graph", flame_graph::LABEL),
             MenuItem::item("packet-capture", packet_capture::LABEL),
+            MenuItem::item("syscall-trace-viewer", syscall_view::LABEL),
             command_menu_item(
                 "command-reference-selection",
                 command_reference::SELECTION,
@@ -7785,6 +7790,7 @@ impl Component for TerminalApp {
             Message::Triage(action) => self.triage_action(action, context),
             Message::FlameGraph(action) => self.flame_graph_action(action, context),
             Message::PacketCapture(action) => self.packet_capture_action(action, context),
+            Message::SyscallView(action) => self.syscall_view_action(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();
@@ -8534,6 +8540,7 @@ impl Component for TerminalApp {
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),
+                Page::SyscallTrace(page) => page.view(id, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
                 Page::QuickConnect(draft) => {
                     quick_connect::view(id, draft, self.identity_picker.is_none(), context)

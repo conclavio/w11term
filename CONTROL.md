@@ -1477,6 +1477,10 @@ From a separate prompt, `stop-syscall-capture --pane 1 --connection-generation G
 
 The original PID-tagged trace includes per-call timing and decoded descriptor details. One byte budget covers the full stream across descendants. w11term checks the SFTP download's size and SHA-256 before acknowledging remote cleanup and saving a new local file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
 
+Open **More → Syscall trace viewer** to inspect a saved trace offline. Open one combined log or select the files from the same `strace -ff` run together. Names ending in `.PID` identify the process for those split logs. Where every record has an epoch timestamp, w11term merges the files by time. Otherwise it keeps the files in their input order.
+
+The viewer groups adjacent calls with the same process, syscall, resource, and outcome. Each group shows its count and available call duration. Select a group to review its original records, including the two lines for an unfinished and resumed call. Search by PID, name, resource, or errno, choose a filter, and select **Apply filters**. A missing absolute path is marked when the same process later succeeds on that path with the same syscall. The original error stays visible. w11term reads up to 64 MiB or one million records per selection. Very long lines are clipped in the preview and remain available in the source file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+
 ### Collect Linux performance triage
 
 In the Windows app, open **More → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.

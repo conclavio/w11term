@@ -1,0 +1,831 @@
+use anyhow::{Context, Result, ensure};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::Read,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+const MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RECORDS: usize = 1_000_000;
+const MAX_FILES: usize = 256;
+const SLOW_NS: u64 = 10_000_000;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Filter {
+    #[default]
+    All,
+    Errors,
+    Lifecycle,
+    Slow,
+    Incomplete,
+}
+
+impl Filter {
+    pub const CHOICES: [(&'static str, Self); 5] = [
+        ("All calls and events", Self::All),
+        ("Errors and abnormal exits", Self::Errors),
+        ("File and process events", Self::Lifecycle),
+        ("Calls of at least 10 ms", Self::Slow),
+        ("Incomplete or unrecognized", Self::Incomplete),
+    ];
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Success,
+    ZeroRead,
+    Error,
+    Signal,
+    Exit,
+    AbnormalExit,
+    Incomplete,
+    Other,
+}
+
+impl Outcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Success => "OK",
+            Self::ZeroRead => "Read 0 bytes",
+            Self::Error => "Error",
+            Self::Signal => "Signal",
+            Self::Exit => "Exited",
+            Self::AbnormalExit => "Abnormal exit",
+            Self::Incomplete => "Incomplete",
+            Self::Other => "Unrecognized",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Raw {
+    source: u16,
+    pub line: u32,
+    start: u32,
+    len: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Stamp {
+    ns: u64,
+    basis: TimeBasis,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimeBasis {
+    Epoch,
+    Clock,
+    Delta,
+}
+
+pub(super) struct Event {
+    pub pid: Option<u32>,
+    pub name: Arc<str>,
+    pub resource: Arc<str>,
+    pub outcome: Outcome,
+    pub error: Option<Arc<str>>,
+    pub later_success: bool,
+    stamp: Option<Stamp>,
+    pub duration: Option<u64>,
+    first: Raw,
+    last: Option<Raw>,
+}
+
+impl Event {
+    pub fn originals(&self) -> impl Iterator<Item = Raw> {
+        std::iter::once(self.first).chain(self.last)
+    }
+
+    fn matches(&self, filter: Filter) -> bool {
+        match filter {
+            Filter::All => true,
+            Filter::Errors => matches!(self.outcome, Outcome::Error | Outcome::AbnormalExit),
+            Filter::Lifecycle => {
+                matches!(self.outcome, Outcome::Exit | Outcome::AbnormalExit)
+                    || matches!(
+                        &*self.name,
+                        "open"
+                            | "openat"
+                            | "openat2"
+                            | "creat"
+                            | "close"
+                            | "close_range"
+                            | "dup"
+                            | "dup2"
+                            | "dup3"
+                            | "fork"
+                            | "vfork"
+                            | "clone"
+                            | "clone3"
+                            | "execve"
+                            | "execveat"
+                            | "exit"
+                            | "exit_group"
+                            | "chdir"
+                            | "fchdir"
+                            | "pipe"
+                            | "pipe2"
+                            | "socket"
+                            | "socketpair"
+                            | "accept"
+                            | "accept4"
+                    )
+            }
+            Filter::Slow => self.duration.is_some_and(|ns| ns >= SLOW_NS),
+            Filter::Incomplete => matches!(self.outcome, Outcome::Incomplete | Outcome::Other),
+        }
+    }
+
+    fn like(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.first.source == other.first.source
+            && self.name == other.name
+            && self.resource == other.resource
+            && self.outcome == other.outcome
+            && self.error == other.error
+            && self.later_success == other.later_success
+            && (!self.resource.is_empty()
+                || matches!(
+                    &*self.name,
+                    "getpid" | "getppid" | "gettid" | "getuid" | "getgid" | "geteuid" | "getegid"
+                ))
+            && self.matches(Filter::Slow) == other.matches(Filter::Slow)
+            && matches!(
+                self.outcome,
+                Outcome::Success | Outcome::ZeroRead | Outcome::Error
+            )
+    }
+}
+
+pub(super) struct Group {
+    pub range: Range<usize>,
+    pub duration: u64,
+    pub timed: usize,
+}
+
+struct Source {
+    path: PathBuf,
+    pid: Option<u32>,
+    bytes: Vec<u8>,
+}
+
+pub struct Trace {
+    sources: Vec<Source>,
+    pub(super) events: Vec<Event>,
+    pub(super) groups: Vec<Group>,
+    pub merged_by_time: bool,
+    pub incomplete: usize,
+    pub errors: usize,
+}
+
+impl Trace {
+    pub fn open(paths: Vec<PathBuf>) -> Result<Self> {
+        ensure!(
+            (1..=MAX_FILES).contains(&paths.len()),
+            "Choose one trace or up to {MAX_FILES} per-process files"
+        );
+        let hints = pid_hints(&paths)?;
+        let mut sources = Vec::new();
+        let mut remaining = MAX_BYTES;
+        for (path, pid) in paths.into_iter().zip(hints) {
+            let file = File::open(&path).with_context(|| format!("Opening {}", path.display()))?;
+            let metadata = file.metadata()?;
+            ensure!(metadata.is_file(), "Choose regular trace files");
+            ensure!(
+                metadata.len() <= remaining as u64,
+                "Trace selection exceeds 64 MiB"
+            );
+            let mut bytes = Vec::new();
+            file.take(remaining as u64 + 1).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= remaining, "Trace selection exceeds 64 MiB");
+            remaining -= bytes.len();
+            sources.push(Source { path, pid, bytes });
+        }
+        Self::parse(sources)
+    }
+
+    fn parse(sources: Vec<Source>) -> Result<Self> {
+        let mut events: Vec<Event> = Vec::new();
+        let mut pending = HashMap::<(u16, Option<u32>), usize>::new();
+        let mut strings = HashSet::<Arc<str>>::new();
+        let mut records = 0;
+        for (source, input) in sources.iter().enumerate() {
+            let mut start = 0;
+            for (line, bytes) in input
+                .bytes
+                .split_inclusive(|&byte| byte == b'\n')
+                .enumerate()
+            {
+                records += 1;
+                ensure!(
+                    records <= MAX_RECORDS,
+                    "Trace selection exceeds {MAX_RECORDS} records"
+                );
+                let raw = Raw {
+                    source: source as u16,
+                    line: line as u32 + 1,
+                    start: start as u32,
+                    len: bytes.len() as u32,
+                };
+                start += bytes.len();
+                let line = String::from_utf8_lossy(bytes);
+                let (pid, stamp, body) = prefix(&line, input.pid);
+                let key = (raw.source, pid);
+                if let Some((name, rest)) = resumed(body)
+                    && let Some(&index) = pending.get(&key)
+                    && &*events[index].name == name
+                {
+                    pending.remove(&key);
+                    let event = &mut events[index];
+                    let first = String::from_utf8_lossy(slice(&sources, event.first));
+                    let (_, _, first) = prefix(&first, input.pid);
+                    let first = first
+                        .strip_suffix("<unfinished ...>")
+                        .unwrap_or(first)
+                        .trim_end();
+                    let combined = format!("{first}{rest}");
+                    let parsed = classify(&combined);
+                    update(event, parsed, &mut strings);
+                    if !bytes.ends_with(b"\n") {
+                        event.outcome = Outcome::Incomplete;
+                    }
+                    event.last = Some(raw);
+                    continue;
+                }
+                let parsed = classify(body);
+                if parsed.unfinished {
+                    pending.insert(key, events.len());
+                }
+                let mut event = Event {
+                    pid,
+                    name: Arc::default(),
+                    resource: Arc::default(),
+                    outcome: Outcome::Other,
+                    error: None,
+                    later_success: false,
+                    stamp,
+                    duration: None,
+                    first: raw,
+                    last: None,
+                };
+                update(&mut event, parsed, &mut strings);
+                if !bytes.ends_with(b"\n") && !matches!(event.outcome, Outcome::Other) {
+                    event.outcome = Outcome::Incomplete;
+                }
+                events.push(event);
+            }
+        }
+        ensure!(
+            !events.is_empty(),
+            "The selected files contain no trace records"
+        );
+        let merged_by_time = sources.len() > 1
+            && events.iter().all(|event| {
+                event
+                    .stamp
+                    .is_some_and(|stamp| stamp.basis == TimeBasis::Epoch)
+            });
+        if merged_by_time {
+            events.sort_by_key(|event| event.stamp.unwrap().ns);
+        }
+        mark_retries(&mut events);
+        let groups = group(&events);
+        let incomplete = events
+            .iter()
+            .filter(|event| event.matches(Filter::Incomplete))
+            .count();
+        let errors = events
+            .iter()
+            .filter(|event| event.matches(Filter::Errors))
+            .count();
+        Ok(Self {
+            sources,
+            events,
+            groups,
+            merged_by_time,
+            incomplete,
+            errors,
+        })
+    }
+
+    pub fn first_path(&self) -> &Path {
+        &self.sources[0].path
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub(super) fn original(&self, raw: Raw) -> (&Path, &[u8]) {
+        (
+            &self.sources[usize::from(raw.source)].path,
+            slice(&self.sources, raw),
+        )
+    }
+
+    pub fn relative_start(&self, index: usize) -> Option<u64> {
+        if self.sources.len() > 1 && !self.merged_by_time {
+            return None;
+        }
+        let start = self.events.first()?.stamp?;
+        let current = self.events.get(index)?.stamp?;
+        if start.basis == TimeBasis::Delta || current.basis != start.basis {
+            return None;
+        }
+        current.ns.checked_sub(start.ns)
+    }
+
+    pub(super) fn filtered(&self, filter: Filter, query: &str) -> Vec<usize> {
+        let query = query.trim().to_lowercase();
+        let pid = query.parse::<u32>().ok();
+        self.groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                let event = &self.events[group.range.start];
+                (event.matches(filter)
+                    && (query.is_empty()
+                        || pid.is_some_and(|pid| event.pid == Some(pid))
+                        || [
+                            &*event.name,
+                            &*event.resource,
+                            event.error.as_deref().unwrap_or(""),
+                        ]
+                        .iter()
+                        .any(|field| field.to_lowercase().contains(&query))))
+                .then_some(index)
+            })
+            .collect()
+    }
+}
+
+fn slice(sources: &[Source], raw: Raw) -> &[u8] {
+    let start = raw.start as usize;
+    &sources[usize::from(raw.source)].bytes[start..start + raw.len as usize]
+}
+
+fn pid_suffix(path: &Path) -> Option<(&str, u32)> {
+    let (basename, suffix) = path.file_name()?.to_str()?.rsplit_once('.')?;
+    let pid: u32 = suffix.parse().ok()?;
+    (pid > 0 && !basename.is_empty()).then_some((basename, pid))
+}
+
+fn pid_hints(paths: &[PathBuf]) -> Result<Vec<Option<u32>>> {
+    if let [path] = paths {
+        return Ok(vec![pid_suffix(path).map(|(_, pid)| pid)]);
+    }
+    let (prefix, _) =
+        pid_suffix(&paths[0]).context("Select one combined trace or matching NAME.PID files")?;
+    let mut pids = HashSet::new();
+    paths
+        .iter()
+        .map(|path| {
+            let (name, pid) =
+                pid_suffix(path).context("Each per-process trace must end in its numeric PID")?;
+            ensure!(
+                name == prefix && path.parent() == paths[0].parent() && pids.insert(pid),
+                "Select distinct NAME.PID files from the same trace and folder"
+            );
+            Ok(Some(pid))
+        })
+        .collect()
+}
+
+fn prefix(line: &str, fallback: Option<u32>) -> (Option<u32>, Option<Stamp>, &str) {
+    let mut line = line.trim().trim_start_matches('\u{feff}').trim_start();
+    let mut pid = fallback;
+    if let Some((number, rest)) = line
+        .strip_prefix("[pid ")
+        .and_then(|line| line.split_once(']'))
+    {
+        pid = number.trim().parse().ok().or(pid);
+        line = rest.trim_start();
+    } else if let Some((word, rest)) = line.split_once(char::is_whitespace)
+        && let Ok(number) = word.parse::<u32>()
+    {
+        pid = Some(number);
+        line = rest.trim_start();
+    }
+    if let Some((word, rest)) = line.split_once(char::is_whitespace)
+        && let Some(stamp) = parse_stamp(word)
+    {
+        return (pid, Some(stamp), rest.trim_start());
+    }
+    (pid, None, line)
+}
+
+fn parse_stamp(token: &str) -> Option<Stamp> {
+    if token.contains(':') {
+        let (hours, rest) = token.split_once(':')?;
+        let (minutes, seconds) = rest.split_once(':')?;
+        let hours: u64 = hours.parse().ok()?;
+        let minutes: u64 = minutes.parse().ok()?;
+        let ns = nanos(seconds)?;
+        if hours >= 24 || minutes >= 60 || ns >= 60_000_000_000 {
+            return None;
+        }
+        return Some(Stamp {
+            ns: (hours * 3600 + minutes * 60) * 1_000_000_000 + ns,
+            basis: TimeBasis::Clock,
+        });
+    }
+    let (seconds, _) = token.split_once('.')?;
+    Some(Stamp {
+        ns: nanos(token)?,
+        basis: if seconds.len() >= 9 {
+            TimeBasis::Epoch
+        } else {
+            TimeBasis::Delta
+        },
+    })
+}
+
+fn nanos(value: &str) -> Option<u64> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let whole = whole.parse::<u64>().ok()?.checked_mul(1_000_000_000)?;
+    if fraction.is_empty() {
+        return Some(whole);
+    }
+    if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    whole.checked_add(fraction.parse::<u64>().ok()? * 10u64.pow(9 - fraction.len() as u32))
+}
+
+fn resumed(body: &str) -> Option<(&str, &str)> {
+    body.strip_prefix("<... ")?.split_once(" resumed>")
+}
+
+struct Parsed<'a> {
+    name: &'a str,
+    resource: String,
+    outcome: Outcome,
+    error: Option<&'a str>,
+    duration: Option<u64>,
+    unfinished: bool,
+}
+
+fn classify(body: &str) -> Parsed<'_> {
+    let mut parsed = Parsed {
+        name: "Unknown record",
+        resource: String::new(),
+        outcome: Outcome::Other,
+        error: None,
+        duration: None,
+        unfinished: false,
+    };
+    if let Some((name, _)) = resumed(body).filter(|(name, _)| syscall_name(name)) {
+        parsed.name = name;
+        parsed.outcome = Outcome::Incomplete;
+        return parsed;
+    }
+    if let Some(status) = body
+        .strip_prefix("+++ ")
+        .and_then(|body| body.strip_suffix(" +++"))
+        .filter(|status| status.len() <= 128)
+    {
+        parsed.name = "Process exit";
+        parsed.resource = status.into();
+        parsed.outcome = if status == "exited with 0" {
+            Outcome::Exit
+        } else {
+            Outcome::AbnormalExit
+        };
+        return parsed;
+    }
+    if let Some(signal) = body
+        .strip_prefix("--- SIG")
+        .and_then(|signal| signal.split_ascii_whitespace().next())
+        .filter(|signal| signal.len() <= 32)
+    {
+        parsed.name = "Signal";
+        parsed.resource = format!("SIG{signal}");
+        parsed.outcome = Outcome::Signal;
+        return parsed;
+    }
+    let Some((name, tail)) = body.split_once('(') else {
+        return parsed;
+    };
+    if !syscall_name(name) {
+        return parsed;
+    }
+    parsed.name = name;
+    parsed.outcome = Outcome::Incomplete;
+    if let Some(arguments) = tail.strip_suffix("<unfinished ...>") {
+        parsed.unfinished = true;
+        parsed.resource = resource(name, arguments.trim_end());
+        return parsed;
+    }
+    let Some((arguments, result)) = call_end(tail) else {
+        parsed.resource = resource(name, tail);
+        return parsed;
+    };
+    parsed.resource = resource(name, arguments);
+    let result = result.trim_start();
+    if let Some((_, duration)) = result
+        .rsplit_once(" <")
+        .and_then(|(a, b)| Some((a, b.strip_suffix('>')?)))
+    {
+        parsed.duration = nanos(duration);
+    }
+    let mut words = result.split_ascii_whitespace();
+    match words.next() {
+        Some("-1") => {
+            parsed.error = words.next().filter(|word| errno(word));
+            parsed.outcome = if parsed.error.is_some() {
+                Outcome::Error
+            } else {
+                Outcome::Success
+            };
+        }
+        Some("?") | None => parsed.error = words.next().filter(|word| errno(word)),
+        Some("0") if matches!(name, "read" | "pread64" | "readv" | "preadv" | "preadv2") => {
+            parsed.outcome = Outcome::ZeroRead;
+        }
+        Some(_) => parsed.outcome = Outcome::Success,
+    }
+    parsed
+}
+
+fn syscall_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn errno(word: &str) -> bool {
+    word.starts_with('E')
+        && word.len() > 1
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+// Both call boundaries and argument separators lie outside C strings and
+// nested strace values. A descriptor such as 3<TCP:[127.0.0.1:80->…]> is one value.
+fn boundaries(value: &str) -> impl Iterator<Item = (usize, u8)> + '_ {
+    let mut depth = 0u32;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut descriptor = false;
+    let mut previous = 0;
+    value.bytes().enumerate().filter_map(move |(index, byte)| {
+        let previous = std::mem::replace(&mut previous, byte);
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if descriptor {
+            if byte == b'>' && previous != b'-' {
+                descriptor = false;
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b'<' if previous.is_ascii_digit() => descriptor = true,
+                b'(' | b'[' | b'{' => depth += 1,
+                b',' | b')' if depth == 0 => return Some((index, byte)),
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => (),
+            }
+        }
+        None
+    })
+}
+
+fn call_end(tail: &str) -> Option<(&str, &str)> {
+    let (index, _) = boundaries(tail).find(|&(_, byte)| byte == b')')?;
+    Some((
+        &tail[..index],
+        tail[index + 1..].trim_start().strip_prefix('=')?,
+    ))
+}
+
+fn resource(name: &str, arguments: &str) -> String {
+    let mut start = 0;
+    let mut args = boundaries(arguments)
+        .chain(std::iter::once((arguments.len(), b',')))
+        .map(|(index, _)| {
+            let arg = arguments.get(start..index).unwrap_or("").trim();
+            start = index.saturating_add(1);
+            arg
+        });
+    let first = args.next().unwrap_or("");
+    let second = args.next().unwrap_or("");
+    let value = match name {
+        "openat" | "openat2" | "newfstatat" | "fstatat64" | "faccessat" | "faccessat2"
+        | "unlinkat" | "mkdirat" | "statx" | "execveat" | "readlinkat" | "mknodat" => {
+            if second.starts_with("\"/") {
+                second.to_owned()
+            } else {
+                format!("{first}, {second}")
+            }
+        }
+        "rename" | "link" | "symlink" | "connect" | "bind" => format!("{first}, {second}"),
+        "renameat" | "renameat2" | "linkat" => {
+            format!(
+                "{first}, {second} → {}, {}",
+                args.next().unwrap_or(""),
+                args.next().unwrap_or("")
+            )
+        }
+        "read" | "write" | "readv" | "writev" | "pread64" | "pwrite64" | "preadv" | "pwritev"
+        | "close" | "close_range" | "dup" | "dup2" | "dup3" | "fcntl" | "ioctl" | "fstat"
+        | "fchdir" | "lseek" | "getdents" | "getdents64" | "recvfrom" | "recvmsg" | "sendto"
+        | "sendmsg" | "accept" | "accept4" | "listen" | "shutdown" | "wait4" | "waitid" => {
+            first.into()
+        }
+        _ if first.starts_with('"') => first.into(),
+        _ => String::new(),
+    };
+    // Overlong arguments keep their original evidence, but cannot form groups.
+    if value.len() <= 4096 {
+        value
+    } else {
+        String::new()
+    }
+}
+
+fn intern(value: &str, strings: &mut HashSet<Arc<str>>) -> Arc<str> {
+    if let Some(existing) = strings.get(value) {
+        return existing.clone();
+    }
+    let value: Arc<str> = value.into();
+    strings.insert(value.clone());
+    value
+}
+
+fn update(event: &mut Event, parsed: Parsed<'_>, strings: &mut HashSet<Arc<str>>) {
+    event.name = intern(parsed.name, strings);
+    event.resource = intern(&parsed.resource, strings);
+    event.outcome = parsed.outcome;
+    event.error = parsed.error.map(|error| intern(error, strings));
+    event.duration = parsed.duration;
+}
+
+fn mark_retries(events: &mut [Event]) {
+    let mut successes: HashMap<_, HashSet<_>> = HashMap::new();
+    for event in events.iter_mut().rev() {
+        let process = (event.first.source, event.pid);
+        if matches!(event.outcome, Outcome::Exit | Outcome::AbnormalExit)
+            || (event.outcome == Outcome::Success && matches!(&*event.name, "execve" | "execveat"))
+        {
+            successes.remove(&process);
+            continue;
+        }
+        if !matches!(
+            &*event.name,
+            "open"
+                | "openat"
+                | "openat2"
+                | "access"
+                | "faccessat"
+                | "faccessat2"
+                | "stat"
+                | "statx"
+                | "newfstatat"
+                | "lstat"
+        ) || !event.resource.starts_with("\"/")
+            || !event.resource.ends_with('"')
+        {
+            continue;
+        }
+        let key = (event.name.clone(), event.resource.clone());
+        if event.outcome == Outcome::Success {
+            successes.entry(process).or_default().insert(key);
+        } else if matches!(event.error.as_deref(), Some("ENOENT" | "ENOTDIR")) {
+            event.later_success = successes
+                .get(&process)
+                .is_some_and(|seen| seen.contains(&key));
+        }
+    }
+}
+
+fn group(events: &[Event]) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        if let Some(previous) = groups.last_mut()
+            && event.like(&events[previous.range.start])
+        {
+            previous.range.end += 1;
+            previous.duration = previous
+                .duration
+                .saturating_add(event.duration.unwrap_or_default());
+            previous.timed += usize::from(event.duration.is_some());
+        } else {
+            groups.push(Group {
+                range: index..index + 1,
+                duration: event.duration.unwrap_or_default(),
+                timed: usize::from(event.duration.is_some()),
+            });
+        }
+    }
+    groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Trace {
+        Trace::parse(vec![Source {
+            path: "fixture.strace".into(),
+            pid: None,
+            bytes: text.as_bytes().into(),
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn joins_resumed_calls_preserving_both_original_records_and_child_order() {
+        let trace = parse(concat!(
+            "30 1740000000.000000 read(4</tmp/data(4),copy>, \"first\", 5) = 5 <0.000001>\n",
+            "30 1740000000.001000 read(4</tmp/data(4),copy>,  <unfinished ...>\n",
+            "31 1740000000.001100 execve(\"/bin/cat\", [\"cat\"], 0x0) = 0 <0.000002>\n",
+            "30 1740000000.002000 <... read resumed>\"second\", 6) = 6 <0.000003>\n",
+            "30 1740000000.003000 read(4</tmp/other>, \"third\", 5) = 5 <0.001000>\n",
+        ));
+        assert_eq!(trace.events.len(), 4);
+        assert_eq!(trace.groups.len(), 3);
+        assert_eq!(trace.groups[0].range, 0..2);
+        assert_eq!(trace.groups[0].duration, 4_000);
+        assert_eq!(trace.relative_start(2), Some(1_100_000));
+        let originals = trace.events[1].originals().collect::<Vec<_>>();
+        assert_eq!((originals[0].line, originals[1].line), (2, 4));
+        assert!(
+            trace
+                .original(originals[1])
+                .1
+                .starts_with(b"30 1740000000.002000 <... read resumed>")
+        );
+        assert_eq!(trace.events[2].pid, Some(31));
+    }
+
+    #[test]
+    fn errors_include_later_success_evidence_and_incomplete_records_remain_visible() {
+        let trace = parse(concat!(
+            "[pid 90] 13:05:00.123000 openat(AT_FDCWD, \"/retry\", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000001>\n",
+            "[pid 90] 13:05:00.124000 openat(AT_FDCWD, \"/missing\", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000002>\n",
+            "[pid 90] 13:05:00.125000 openat(AT_FDCWD, \"/retry\", O_RDONLY) = 3</retry> <0.020003>\n",
+            "[pid 90] 13:05:00.126000 read(3</retry>, \"a) = b\", 6) = 6 <0.000010>\n",
+            "[pid 91] 13:05:00.127000 <... read resumed> \"lost\", 4) = 4 <0.000101>\n",
+            "[pid 90] 13:05:00.128000 read(3</retry>,  <unfinished ...>\n",
+            "[pid 90] 13:05:00.129000 --- SIGTERM {si_signo=SIGTERM} ---\n",
+            "[pid 90] 13:05:00.130000 +++ killed by SIGTERM +++\n",
+            "3 1740000000.000001 write(1, \"record cut at byte budget",
+        ));
+        assert!(trace.events[0].later_success);
+        assert!(!trace.events[1].later_success);
+        assert_eq!(trace.filtered(Filter::Errors, "enoent"), [0, 1]);
+        assert_eq!(trace.filtered(Filter::Errors, ""), [0, 1, 7]);
+        assert_eq!(trace.filtered(Filter::Slow, "90"), [2]);
+        assert_eq!(trace.filtered(Filter::Incomplete, ""), [4, 5, 8]);
+        assert_eq!(trace.incomplete, 3);
+    }
+
+    #[test]
+    fn imports_matching_pid_files_and_merges_epoch_order_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("trace.501");
+        let child = dir.path().join("trace.502");
+        std::fs::write(&parent, "1740000000.010000 close(5) = 0\n").unwrap();
+        std::fs::write(
+            &child,
+            "1740000000.001000 open(\"/tmp/test\", O_RDONLY) = 5\n",
+        )
+        .unwrap();
+        let trace = Trace::open(vec![parent.clone(), child.clone()]).unwrap();
+        assert!(trace.merged_by_time);
+        assert_eq!(trace.events[0].pid, Some(502));
+        assert_eq!(trace.relative_start(1), Some(9_000_000));
+        assert_eq!(trace.original(trace.events[0].first).0, child);
+        std::fs::write(&child, "0.000020 close(5) = 0\n").unwrap();
+        let trace = Trace::open(vec![parent.clone(), child]).unwrap();
+        assert!(!trace.merged_by_time);
+        assert_eq!(trace.events[0].pid, Some(501));
+        assert_eq!(trace.relative_start(1), None);
+        assert!(Trace::open(vec![parent.clone(), parent]).is_err());
+    }
+
+    #[test]
+    fn preserves_raw_non_utf8_and_a_truncated_record() {
+        let payload = b"30 1740000000.000000 open(\"/tmp/\xff\", O_RDONLY)";
+        let trace = Trace::parse(vec![Source {
+            path: "cut".into(),
+            pid: None,
+            bytes: payload.into(),
+        }])
+        .unwrap();
+        assert!(trace.events[0].outcome == Outcome::Incomplete);
+        assert_eq!(trace.original(trace.events[0].first).1, payload);
+    }
+}

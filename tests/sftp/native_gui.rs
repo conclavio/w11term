@@ -22,6 +22,13 @@ use shared::run_gui;
 #[path = "properties_ui.rs"]
 mod properties_ui;
 
+#[test]
+#[ignore = "opens combined and per-process strace files and reviews grouped calls offline"]
+fn native_syscall_trace_viewer_groups_calls_and_keeps_original_records() {
+    let state = tempfile::tempdir().unwrap();
+    drive_gui("syscall-trace-view-ui.ps1", state.path());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reviews an SSH packet capture, saves verified bytes and opens a local viewer"]
 async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
