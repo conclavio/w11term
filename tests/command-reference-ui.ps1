@@ -2,6 +2,7 @@
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $edit = [System.Windows.Automation.ControlType]::Edit
 $combo = [System.Windows.Automation.ControlType]::ComboBox
@@ -119,6 +120,38 @@ try {
     Select-InstalledTool 'mdd'
     $null = Wait-Until 'installed mdd opened its bundled manual' {
         (Find-Element 'mdd') -and (Find-Element "Linux${dot}w11term manual")
+    }
+    Click 'Install SSH tools'
+    $null = Wait-Until 'configured profile manifest offered' { Find-Element (Join-Path $State 'fleet.json') }
+    Click 'Browse for tool bundle'
+    $manifestDialog = Wait-Until 'owned tool manifest picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
+    Select-DialogItem $manifestDialog 'Tool review.json'
+    $null = Wait-Until 'select the update manifest' { [FixtureDialog]::ClickButton($manifestDialog, 1) }
+    $null = Wait-Until 'chosen update manifest shown' { Find-Element (Join-Path $State 'Tool review.json') }
+    Click 'Review bundle'
+    $null = Wait-Until 'existing launcher blocks installation' {
+        $install = Find-Element 'Install reviewed bundle' $button
+        (Find-Element "netwatch${dot}Existing entry at /.local/bin/netwatch") -and !$install.Current.IsEnabled
+    }
+    $conflict = [IO.File]::ReadAllText((Join-Path $State 'tool-launcher-conflict'))
+    if ([IO.File]::ReadAllText($conflict) -cne 'existing fixture command') { throw 'Review changed an existing command' }
+    [IO.File]::Delete($conflict)
+    Click 'Review bundle'
+    $null = Wait-Until 'installation plan shows the new launcher' { Find-Element "netwatch${dot}Create /.local/bin/netwatch" }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'the other pane cannot apply the original review' {
+        $install = Find-Element 'Install reviewed bundle' $button
+        $install -and !$install.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Install reviewed bundle'
+    $null = Wait-Until 'installation completed' { Find-Element 'Installed tool bundle portable' }
+    Click 'Back to command reference'
+    Select-InstalledTool 'netwatch'
+    $null = Wait-Until 'newly installed tool is visible on the same pane' {
+        (Find-Element 'netwatch') -and (Find-Element "Linux${dot}w11term manual")
     }
     Set-Field 'Search command reference' 'crew report'
     Click 'New private page'

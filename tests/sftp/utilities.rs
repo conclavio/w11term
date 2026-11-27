@@ -647,10 +647,10 @@ async fn utility_install_preserves_racing_user_command_and_checks_remote_lock() 
 }
 
 fn save_login_manifest(directory: &std::path::Path, variant: u8) {
-    save_login_tools(directory, variant, &["rg"]);
+    save_login_tools(directory, "fleet.json", variant, &["rg"]);
 }
 
-fn save_login_tools(directory: &std::path::Path, variant: u8, tools: &[&str]) {
+fn save_login_tools(directory: &std::path::Path, manifest: &str, variant: u8, tools: &[&str]) {
     let bundle = UtilityBundle {
         version: 1,
         name: "portable".into(),
@@ -670,7 +670,7 @@ fn save_login_tools(directory: &std::path::Path, variant: u8, tools: &[&str]) {
             .collect(),
     };
     fs::write(
-        directory.join("fleet.json"),
+        directory.join(manifest),
         serde_json::to_vec(&bundle).unwrap(),
     )
     .unwrap();
@@ -710,7 +710,17 @@ pub(super) fn reference_tool_profile(
 ) -> SshOptions {
     probe_response(remote, "x86_64", "/", "/usr/bin:/.local/bin");
     fs::write(remote.join("posix-rename-version"), "1").unwrap();
-    save_login_tools(local, 1, &["rg", "mdd"]);
+    save_login_tools(local, "fleet.json", 1, &["rg", "mdd"]);
+    save_login_tools(local, "Tool review.json", 1, &["rg", "mdd", "netwatch"]);
+    let bin = remote.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let conflict = bin.join("netwatch");
+    fs::write(&conflict, "existing fixture command").unwrap();
+    fs::write(
+        local.join("tool-launcher-conflict"),
+        conflict.to_str().unwrap(),
+    )
+    .unwrap();
     let mut profile = approved_login(source, local);
     profile.tool_bundle.as_mut().unwrap().add_to_path = None;
     profile

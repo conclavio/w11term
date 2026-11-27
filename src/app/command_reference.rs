@@ -5,6 +5,7 @@ use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 mod catalog;
 mod download;
 mod private_page;
+mod tool_install;
 
 pub(super) const LABEL: &str = "Command reference";
 pub(super) const SELECTION: &str = "Look up selected command";
@@ -28,12 +29,36 @@ pub enum Action {
     ListedTools(Arc<()>, Result<InstalledTools, String>),
     ToolPage(Arc<()>, usize),
     Private(private_page::Action),
+    ToolInstall(tool_install::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ToolPane {
     pane: u64,
     generation: u64,
+}
+
+fn run_pane_tool_job(
+    input: tokio::sync::mpsc::UnboundedSender<Command>,
+    target: ToolPane,
+    operation: Operation,
+    timeout: Duration,
+    cancel: Option<TransferCancel>,
+) -> Result<serde_json::Value, String> {
+    let (reply, response) = tokio::sync::oneshot::channel();
+    input
+        .send(Command::Sftp(Job {
+            expected_generation: Some(target.generation),
+            operation,
+            deadline: tokio::time::Instant::now() + timeout,
+            reply,
+            progress: None,
+            cancel,
+        }))
+        .map_err(|_| "SSH session has closed".to_owned())?;
+    response
+        .blocking_recv()
+        .map_err(|_| "SSH tool operation interrupted".to_owned())?
 }
 
 struct ToolLookup {
@@ -72,6 +97,7 @@ pub(super) struct Panel {
     focus: u64,
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
+    tool_install: Option<tool_install::Installer>,
 }
 
 fn pane_platform(source: Option<&Source>) -> Platform {
@@ -97,6 +123,7 @@ impl Panel {
         self.open = false;
         self.draft = None;
         self.private_page = None;
+        self.tool_install = None;
         if let Some(lookup) = self.tools.take() {
             lookup.cancel.cancel();
         }
@@ -192,6 +219,9 @@ impl Panel {
         if let Some(editor) = &self.private_page {
             return editor.view(ctx);
         }
+        if let Some(installer) = &self.tool_install {
+            return installer.view(tool_pane, ctx);
+        }
         let target = if self
             .draft
             .as_ref()
@@ -224,12 +254,21 @@ impl Panel {
             let lookup = self.tools.as_ref().filter(|lookup| lookup.pane == target);
             pieces.push(KeyedView::new(
                 "installed-tools",
-                Button::new()
-                    .is_enabled(lookup.is_none_or(|lookup| lookup.result.is_some()))
-                    .on_click(
-                        ctx.callback(move |_| Message::CommandReference(Action::ListTools(target))),
-                    )
-                    .content("Installed SSH tools"),
+                StackPanel::new().spacing(6.0).children((
+                    Button::new()
+                        .is_enabled(lookup.is_none_or(|lookup| lookup.result.is_some()))
+                        .on_click(ctx.callback(move |_| {
+                            Message::CommandReference(Action::ListTools(target))
+                        }))
+                        .content("Installed SSH tools"),
+                    Button::new()
+                        .on_click(ctx.callback(move |_| {
+                            Message::CommandReference(Action::ToolInstall(
+                                tool_install::Action::Open(target),
+                            ))
+                        }))
+                        .content("Install SSH tools"),
+                )),
             ));
             if self.query.is_empty()
                 && let Some(lookup) = lookup
@@ -586,7 +625,7 @@ impl TerminalApp {
 
     fn start_reference_load(&mut self, refresh: bool, ctx: &ComponentContext<Self>) {
         let panel = &mut self.command_reference;
-        if panel.loading || panel.private_page.is_some() {
+        if panel.loading || panel.private_page.is_some() || panel.tool_install.is_some() {
             return;
         }
         panel.loading = true;
@@ -644,20 +683,13 @@ impl TerminalApp {
                     if scope.is_cancelled() || cancel.is_cancelled() {
                         return Err("Installed tools lookup cancelled".into());
                     }
-                    let (reply, response) = tokio::sync::oneshot::channel();
-                    input
-                        .send(Command::Sftp(Job {
-                            expected_generation: Some(target.generation),
-                            operation: Operation::InstalledTools,
-                            deadline: tokio::time::Instant::now() + Duration::from_secs(12),
-                            reply,
-                            progress: None,
-                            cancel: Some(cancel),
-                        }))
-                        .map_err(|_| "SSH session has closed".to_owned())?;
-                    let value = response
-                        .blocking_recv()
-                        .map_err(|_| "Installed tools lookup interrupted".to_owned())??;
+                    let value = run_pane_tool_job(
+                        input,
+                        target,
+                        Operation::InstalledTools,
+                        Duration::from_secs(12),
+                        Some(cancel),
+                    )?;
                     serde_json::from_value(value).map_err(|error| error.to_string())
                 })();
                 Message::CommandReference(Action::ListedTools(request, result))
@@ -683,7 +715,7 @@ impl TerminalApp {
         let panel = &mut self.command_reference;
         match action {
             Action::Open | Action::Selection(_) => {
-                if panel.private_page.is_some() {
+                if panel.private_page.is_some() || panel.tool_install.is_some() {
                     return;
                 }
                 let was_open = panel.open;
@@ -748,6 +780,7 @@ impl TerminalApp {
             Action::Link(link) => Self::open_link(&link),
             Action::Refresh => self.start_reference_load(true, ctx),
             Action::Private(action) => panel.author_private_page(action, auto, ctx),
+            Action::ToolInstall(action) => self.tool_install_action(action, ctx),
             Action::ListTools(target) => self.start_tool_lookup(target, ctx),
             Action::ListedTools(request, result) => {
                 if let Some(lookup) = &mut panel.tools

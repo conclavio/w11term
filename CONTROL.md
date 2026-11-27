@@ -1384,6 +1384,8 @@ The preview uses the pane's verified SSH connection. A read-only SSH exec probe 
 
 ### Install or roll back a reviewed SSH tool bundle
 
+From a connected SSH pane, open **More → Command reference → Install SSH tools**. Choose a Windows manifest or use the bundle from the pane's profile. Select **Review bundle** to see the resolved home, architecture, launcher paths, PATH status, and any blocking conflicts. **Install reviewed bundle** applies that review on the same connection. The installation runs alongside the SSH shell and uses the manual SFTP deadline.
+
 Review the destinations, PATH status, and selected builds. When the report has `ready: true`, pass its `review` token back to the same pane. The commands below use the default JSON response from `w11term-cli`.
 
 ```powershell

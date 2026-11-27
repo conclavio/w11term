@@ -2567,6 +2567,11 @@ async fn native_command_reference_follows_powershell_and_ssh() {
     fs::write(state.path().join("ssh-wire"), trace.to_str().unwrap()).unwrap();
     let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
     drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
+    assert!(
+        fs::read_to_string(remote.path().join(".local/bin/netwatch"))
+            .unwrap()
+            .ends_with("/portable/current/netwatch\n")
+    );
     assert_eq!(fs::read(trace).unwrap(), b"ip address");
     assert_eq!(transports.load(Ordering::Relaxed), 1, "SSH TCP connections");
     server.abort();
