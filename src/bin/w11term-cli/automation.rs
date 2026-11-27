@@ -395,7 +395,7 @@ pub(super) fn parse(
             {
                 overwrite = true
             }
-            "--output-file" if command_detail => {
+            "--output-file" if command_detail || verb == "linux-triage" => {
                 ensure!(output_path.is_none(), "specify --output-file only once");
                 let path = value(&mut args)?;
                 ensure!(
@@ -445,7 +445,7 @@ pub(super) fn parse(
             "--connection-generation"
                 if matches!(
                     verb,
-                    "disconnect-ssh-shell" | "wait-for-text" | "wait-command"
+                    "disconnect-ssh-shell" | "wait-for-text" | "wait-command" | "linux-triage"
                 ) =>
             {
                 ensure!(
@@ -844,6 +844,28 @@ pub(super) fn parse(
         }
         "inspect" => Request::Inspect {
             pane: pane.context("--pane is required")?,
+        },
+        "preview-linux-triage" => Request::LinuxTriage {
+            pane: pane
+                .filter(|pane| *pane > 0)
+                .context("provide a positive --pane ID")?,
+            connection_generation: None,
+            output_file: None,
+        },
+        "linux-triage" => Request::LinuxTriage {
+            pane: pane
+                .filter(|pane| *pane > 0)
+                .context("provide a positive --pane ID")?,
+            connection_generation: Some(
+                connection_generation
+                    .and_then(std::num::NonZeroU64::new)
+                    .context("provide --connection-generation from preview-linux-triage")?,
+            ),
+            output_file: Some(
+                output_file
+                    .map(|file| file.path)
+                    .context("provide --output-file for the triage report")?,
+            ),
         },
         "interrupt-command" => Request::InterruptCommand {
             pane: pane
@@ -1252,6 +1274,29 @@ mod tests {
         assert!(disconnect(&["--pane", "2"]).is_err());
         assert!(disconnect(&["--connection-generation", "7"]).is_err());
         assert!(disconnect(&["--pane", "2", "--connection-generation", "0"]).is_err());
+    }
+
+    #[test]
+    fn triage_collection_requires_the_reviewed_generation_and_a_report_path() {
+        let invoke = |verb: &str, args: &[&str]| {
+            parse(verb, args.iter().map(|arg| arg.to_string()), None, Some(7))
+                .map(|invocation| invocation.request)
+        };
+        assert!(matches!(
+            invoke("preview-linux-triage", &[]).unwrap(),
+            Request::LinuxTriage {
+                pane: 7,
+                connection_generation: None,
+                output_file: None
+            }
+        ));
+        assert!(invoke("linux-triage", &["--output-file", "triage.json"]).is_err());
+        assert!(invoke("linux-triage", &["--connection-generation", "2"]).is_err());
+        assert!(matches!(
+            invoke("linux-triage", &["--connection-generation", "2", "--output-file", "triage.json"]).unwrap(),
+            Request::LinuxTriage { pane: 7, connection_generation: Some(generation), output_file: Some(path) }
+                if generation.get() == 2 && path.is_absolute()
+        ));
     }
     #[test]
     fn timed_recording_is_opt_in_and_old_record_requests_round_trip() {

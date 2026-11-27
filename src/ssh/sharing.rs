@@ -39,6 +39,7 @@ struct Link {
     runtime: runtime::Handle,
     forward_channels: Arc<Semaphore>,
     dotfiles_sync: tokio::sync::Mutex<()>,
+    triage: tokio::sync::Mutex<()>,
 }
 
 impl Drop for Link {
@@ -107,6 +108,7 @@ impl ConnectionShare {
             runtime: runtime::Handle::current(),
             forward_channels: Arc::new(Semaphore::new(super::local_forward::MAX_CHANNELS_PER_LINK)),
             dotfiles_sync: tokio::sync::Mutex::new(()),
+            triage: tokio::sync::Mutex::new(()),
         }))
     }
     pub fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
@@ -136,6 +138,12 @@ impl ConnectionShare {
     }
     pub(super) async fn lock_dotfiles_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.0.dotfiles_sync.lock().await
+    }
+    pub(super) fn try_lock_triage(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        self.0
+            .triage
+            .try_lock()
+            .context("Performance triage is already running on this SSH transport")
     }
     pub fn options(&self) -> &SshOptions {
         &self.0.options

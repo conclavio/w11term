@@ -241,6 +241,17 @@ impl server::Handler for Peer {
         command: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if command.starts_with(b"/bin/sh -c '# w11term-linux-triage-v1")
+            && let Ok(report) = fs::read(self.root.join("triage-response"))
+        {
+            fs::write(self.root.join("triage-command"), command)?;
+            s.channel_success(c)?;
+            s.data(c, report)?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
         if let Some(args) = std::str::from_utf8(command).ok().and_then(|command| {
             command
                 .split_once("' w11term-tools-sha256 ")
@@ -1869,6 +1880,84 @@ fn registry(session: &Session) -> Registry {
         input: session.input.clone(),
     }]);
     r
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linux_triage_saves_a_generation_bound_report_without_touching_the_shell() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("triage.json");
+    let capture: control::CapturePng = Arc::new(|_, _, _| unreachable!("triage uses no capture"));
+    let registry = registry(&pane);
+    let preview = registry
+        .execute(
+            Request::LinuxTriage {
+                pane: 1,
+                connection_generation: None,
+                output_file: None,
+            },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["plan"]["probes"].as_array().unwrap().len(), 10);
+    assert_eq!(preview["plan"]["host"], "127.0.0.1");
+    let generation = preview["plan"]["connection_generation"].as_u64().unwrap();
+    assert!(!remote.path().join("triage-command").exists());
+    let request = |generation| Request::LinuxTriage {
+        pane: 1,
+        connection_generation: std::num::NonZeroU64::new(generation),
+        output_file: Some(destination.clone()),
+    };
+    assert!(
+        registry
+            .execute(request(generation + 1), capture.clone())
+            .await
+            .is_err()
+    );
+    assert!(!destination.exists());
+    let response = concat!(
+        "w11term-linux-triage-v1\t1000\t2000\t124\n",
+        "uptime\t1000\t1010\t0\tdXB0aW1lCg==\t\n",
+        "dmesg\t1000\t1010\t1\t\tT3BlcmF0aW9uIG5vdCBwZXJtaXR0ZWQ=\n",
+        "vmstat\t1000\t2000\t0\t\t\n",
+        "mpstat\t1000\t1010\t127\t\t\n",
+        "pidstat\t1000\t2000\t0\t\t\n",
+        "iostat\t1000\t2000\t0\t\t\n",
+        "free\t1000\t1010\t0\t\t\n",
+        "sar-dev\t1000\t2000\t0\t\t\n",
+        "sar-tcp\t1000\t-\t-\t\t\n",
+        "top\t1000\t1010\t0\t\t\n",
+        "end\n"
+    );
+    fs::write(remote.path().join("triage-response"), response).unwrap();
+    let result = registry
+        .execute(request(generation), capture.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["report_path"], json!(destination));
+    let bytes = fs::read(&destination).unwrap();
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    let samples = &report["collection"]["samples"];
+    assert_eq!(report["target"], preview["plan"]);
+    assert_eq!(samples[0]["stdout"]["text"], "uptime\n");
+    assert_eq!(samples[1]["status"], "permission-denied");
+    assert_eq!(samples[3]["status"], "missing");
+    assert_eq!(samples[8]["status"], "timed-out");
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one shell and one exec channel"
+    );
+    assert!(
+        registry
+            .execute(request(generation), capture)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

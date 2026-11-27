@@ -88,6 +88,8 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "interrupt-command"
             | "wait-command"
             | "inspect"
+            | "preview-linux-triage"
+            | "linux-triage"
             | "playback"
             | "list-ssh-groups"
             | "list-saved-ssh-groups"
@@ -247,6 +249,9 @@ async fn main() -> ExitCode {
             sftp_args::HELP,
             automation::HELP,
             tool_bundles::HELP
+        );
+        println!(
+            "\nw11term-cli [--pid PID] preview-linux-triage --pane ID\nw11term-cli [--pid PID] linux-triage --pane ID --connection-generation N --output-file PATH"
         );
         return ExitCode::SUCCESS;
     }

@@ -1443,6 +1443,20 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 & $ctl --pid 12345 sftp --pane $pane resume-tool-bundle-updates my-tools $activeSha256 --review $resume.review
 ```
 
+### Collect Linux performance triage
+
+Review the verified SSH endpoint, fixed sample commands and limits, then pass the reviewed connection generation when collecting. Choose a new Windows file for the report.
+
+```powershell
+$plan = (& $ctl --pid 12345 preview-linux-triage --pane $pane | ConvertFrom-Json).result.plan
+$plan
+& $ctl --pid 12345 linux-triage --pane $pane --connection-generation $plan.connection_generation --output-file '.\linux-triage.json'
+$report = Get-Content -Raw '.\linux-triage.json' | ConvertFrom-Json
+$report.collection.samples | Select-Object id, status, exit_status
+```
+
+The collector uses a sibling SSH channel with a 60-second client deadline and a 50-second remote collection deadline. It runs the ten checklist probes in parallel with Bash and GNU coreutils, captures up to 16 KiB per command per stream, and uses a private temporary directory. The report keeps the verified endpoint, commands, timing, output, and individual outcomes such as missing utilities or denied kernel logs. It marks streams that reached their byte limit and keeps the original bytes in base64 when they contain invalid UTF-8. [Linux Performance Analysis in 60,000 Milliseconds](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf)
+
 ### Run SFTP operations
 
 ```powershell

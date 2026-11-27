@@ -12,6 +12,7 @@ mod local_forward;
 mod negotiation;
 mod sharing;
 mod transport;
+pub(crate) mod triage;
 pub use authentication::{AdditionalSshAuthentication, SshKeySource, VerifiedSshAuthentication};
 pub(crate) use durability::DurableControl;
 pub(crate) use durability::Start as DurableStart;
@@ -25,6 +26,7 @@ pub use sharing::{ConnectionShare, SshTransport, VerifiedSshPeer, VerifiedSshRou
 pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing, TransportWatch};
 pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};
+pub use triage::Target as TriageTarget;
 
 const SESSION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 

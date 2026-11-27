@@ -35,6 +35,7 @@ mod registry;
 pub(crate) mod security;
 mod sftp_transfers;
 mod ssh_groups;
+mod triage;
 mod workspace_preview;
 pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
@@ -52,6 +53,13 @@ pub type CapturePng =
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
+    LinuxTriage {
+        pane: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_generation: Option<std::num::NonZeroU64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<PathBuf>,
+    },
     Record {
         pane: u64,
         path: Option<PathBuf>,
@@ -1398,6 +1406,14 @@ impl Registry {
                 }
                 Ok(result)
             }
+            Request::LinuxTriage {
+                pane,
+                connection_generation,
+                output_file,
+            } => {
+                self.linux_triage(pane, connection_generation, output_file)
+                    .await
+            }
             Request::Sftp {
                 pane,
                 timeout_seconds,
@@ -2653,6 +2669,7 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
     let mut response = Vec::new();
     tokio::time::timeout(
         Duration::from_secs(match request {
+            Request::LinuxTriage { .. } => crate::ssh::triage::DEADLINE.as_secs() + 20,
             Request::Sftp {
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,

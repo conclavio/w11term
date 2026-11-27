@@ -169,6 +169,15 @@ jobs:
             python3 tests/shell-directory.py --shell fish
           '
 
+  linux-triage:
+    name: Linux performance triage script
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - *checkout
+      - name: Verify samples, deadline and cleanup with Linux shell utilities
+        run: python3 tests/linux-triage.py
+
   remote-mux:
     name: Stock Linux multiplexers over SSH
     runs-on: ubuntu-24.04
