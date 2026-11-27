@@ -6,6 +6,8 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $trace = Join-Path $State 'reviewed calls.strace'
 $first = Join-Path $State 'split trace.501'
 $second = Join-Path $State 'split trace.502'
+$clockBefore = Join-Path $State 'clock trace.601'
+$clockAfter = Join-Path $State 'clock trace.602'
 $working = Join-Path $State 'working diag.strace'
 $failing = Join-Path $State 'failing diag.strace'
 $openLabel = 'Open syscall trace' + [char]0x2026
@@ -45,6 +47,12 @@ $byListItem = [System.Windows.Automation.PropertyCondition]::new(
 '@ + [char]10)
 [IO.File]::WriteAllText($first, '1740000010.011000 close(5</tmp/split>) = 0 <0.000002>' + [char]10)
 [IO.File]::WriteAllText($second, '1740000010.001000 open("/tmp/split", O_RDONLY) = 5</tmp/split> <0.000003>' + [char]10)
+[IO.File]::WriteAllText($clockBefore, @'
+23:59:59.980000 open("/tmp/clock-split", O_RDONLY) = 5</tmp/clock-split>
+23:59:59.985000 clone(child_stack=NULL, flags=SIGCHLD) = 602
+00:00:00.020000 close(5</tmp/clock-split>) = 0
+'@ + [char]10)
+[IO.File]::WriteAllText($clockAfter, '00:00:00.010000 close(5</tmp/clock-split>) = 0' + [char]10)
 [IO.File]::WriteAllText($working, @'
 21 1700000000.000000 execve("/bin/diag", ["diag"], NULL) = 0 <0.000001>
 21 1700000000.001000 openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = 3</tmp/settings> <0.000001>
@@ -190,6 +198,26 @@ try {
         (Find-TraceGroup '*PID 501*close*10.000 ms*') -and
         $raw -and $raw.Contains('split trace.502')
     }
+
+    Open-Trace ('"' + $clockAfter + '" "' + $clockBefore + '"')
+    $null = Wait-Until 'time-of-day files merge across midnight with relative elapsed time' {
+        $raw = Raw-Text
+        (Find-Element 'Files merged by time of day') -and
+        (Find-TraceGroup '*PID 602*close*+30.000 ms*') -and
+        (Find-TraceGroup '*PID 601*close*+40.000 ms*') -and
+        $raw -and $raw.Contains('clock trace.601') -and $raw.Contains('23:59:59.980000 open')
+    }
+    Click 'File descriptors'
+    $childDescriptor = Wait-Until 'child descriptor inherited across midnight' {
+        Find-TraceGroup '*/tmp/clock-split*PID 602*FD 5*Closed'
+    }
+    $childDescriptor.GetCurrentPattern($select).Select()
+    $null = Wait-Until 'child lifetime links the original clone and the later close' {
+        $evidence = Raw-Text $descriptorId
+        $evidence -and $evidence.Contains('Inherited from lifetime 1') -and
+            $evidence.Contains('23:59:59.985000 clone') -and $evidence.Contains('00:00:00.010000 close')
+    }
+    Click 'Back to syscall groups'
 
     Open-Trace $working
     $null = Wait-Until 'working trace replaces split inputs' {

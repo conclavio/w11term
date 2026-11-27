@@ -343,10 +343,10 @@ impl Processes {
         };
         let mut active = HashMap::new();
         let mut known = HashMap::new();
-        let shared_order = trace.file_count() == 1 || trace.merged_by_time;
+        let shared_order = trace.file_count() == 1 || trace.merged_by_time();
         for (index, event) in trace.events.iter().enumerate() {
             let pid = Pid {
-                source: (!trace.merged_by_time || event.pid.is_none())
+                source: (!trace.merged_by_time() || event.pid.is_none())
                     .then_some(event.first.source),
                 number: event.pid,
             };

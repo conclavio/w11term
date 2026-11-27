@@ -255,7 +255,7 @@ impl Trace {
                 (index, raw)
             })
             .collect::<Vec<_>>();
-        if self.merged_by_time {
+        if self.merged_by_time() {
             order.sort_by_cached_key(|&(index, raw)| {
                 (self.stamp_of(raw).unwrap_or(u64::MAX), index)
             });
@@ -265,7 +265,8 @@ impl Trace {
         for (index, _) in order {
             let event = &self.events[index];
             let task = Task {
-                source: (!self.merged_by_time || event.pid.is_none()).then_some(event.first.source),
+                source: (!self.merged_by_time() || event.pid.is_none())
+                    .then_some(event.first.source),
                 pid: event.pid,
             };
             if self.descriptor_event(&mut builder, task, index).is_err() {
@@ -278,12 +279,12 @@ impl Trace {
 
     fn stamp_of(&self, raw: Raw) -> Option<u64> {
         let input = String::from_utf8_lossy(slice(&self.sources, raw));
-        prefix(&input, None).1.map(|stamp| stamp.ns)
+        self.merge_order.sort_time(prefix(&input, None).1?)
     }
 
     fn descriptor_event(&self, builder: &mut Builder, task: Task, index: usize) -> Bounded {
         let event = &self.events[index];
-        if self.sources.len() > 1 && !self.merged_by_time && is_spawn(&event.name) {
+        if self.sources.len() > 1 && !self.merged_by_time() && is_spawn(&event.name) {
             return Ok(());
         }
         if matches!(event.outcome, Outcome::Exit | Outcome::AbnormalExit) {

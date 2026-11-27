@@ -349,10 +349,12 @@ impl PageState {
                 .text_wrapping(TextWrapping::Wrap),
         ));
         if trace.file_count() > 1 {
-            let order = if trace.merged_by_time {
-                "Files merged by epoch timestamp"
-            } else {
-                "Files shown separately because comparable timestamps are unavailable"
+            let order = match trace.merge_order {
+                trace::MergeOrder::Epoch => "Files merged by epoch timestamp",
+                trace::MergeOrder::Clock { .. } => "Files merged by time of day",
+                trace::MergeOrder::File => {
+                    "Files shown separately because comparable timestamps are unavailable"
+                }
             };
             header.push(KeyedView::new("order", TextBlock::new().text(order)));
         }

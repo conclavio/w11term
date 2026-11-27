@@ -19,6 +19,8 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORDS: usize = 1_000_000;
 const MAX_FILES: usize = 256;
 const SLOW_NS: u64 = 10_000_000;
+const CLOCK_DAY_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
+const CLOCK_HALF_DAY_NS: i64 = CLOCK_DAY_NS / 2;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Filter {
@@ -86,6 +88,74 @@ enum TimeBasis {
     Epoch,
     Clock,
     Delta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MergeOrder {
+    File,
+    Epoch,
+    Clock { anchor: i64, earliest: i64 },
+}
+
+impl MergeOrder {
+    fn sort_time(self, stamp: Stamp) -> Option<u64> {
+        match self {
+            Self::File => None,
+            Self::Epoch => Some(stamp.ns),
+            Self::Clock { anchor, earliest } if stamp.basis == TimeBasis::Clock => {
+                u64::try_from(ClockMerge::offset(anchor, stamp.ns as i64) - earliest).ok()
+            }
+            Self::Clock { .. } => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClockMerge {
+    anchor: Option<i64>,
+    earliest: i64,
+    latest: i64,
+    observed_rollover: bool,
+}
+
+impl ClockMerge {
+    fn offset(anchor: i64, clock: i64) -> i64 {
+        (clock - anchor + CLOCK_HALF_DAY_NS).rem_euclid(CLOCK_DAY_NS) - CLOCK_HALF_DAY_NS
+    }
+
+    fn observe(&mut self, stamp: Option<Stamp>, previous: &mut Option<(i64, i64)>) -> bool {
+        let Some(Stamp {
+            ns,
+            basis: TimeBasis::Clock,
+        }) = stamp
+        else {
+            return false;
+        };
+        let clock = ns as i64;
+        let anchor = *self.anchor.get_or_insert(clock);
+        let offset = Self::offset(anchor, clock);
+        if let Some((last_clock, last_offset)) = *previous {
+            if offset < last_offset {
+                return false;
+            }
+            self.observed_rollover |= clock < last_clock;
+        }
+        *previous = Some((clock, offset));
+        self.earliest = self.earliest.min(offset);
+        self.latest = self.latest.max(offset);
+        self.latest - self.earliest < CLOCK_HALF_DAY_NS
+    }
+
+    fn timeline(self) -> Option<MergeOrder> {
+        let anchor = self.anchor?;
+        // A short arc through midnight could also be two distant times on
+        // the same day. Require a rollover in the records of one source.
+        let crosses_midnight = anchor + self.earliest < 0 || anchor + self.latest >= CLOCK_DAY_NS;
+        (!crosses_midnight || self.observed_rollover).then_some(MergeOrder::Clock {
+            anchor,
+            earliest: self.earliest,
+        })
+    }
 }
 
 pub(super) struct Event {
@@ -183,7 +253,7 @@ pub struct Trace {
     sources: Vec<Source>,
     pub(super) events: Vec<Event>,
     pub(super) groups: Vec<Group>,
-    pub merged_by_time: bool,
+    pub(super) merge_order: MergeOrder,
     pub incomplete: usize,
     pub errors: usize,
 }
@@ -219,8 +289,10 @@ impl Trace {
         let mut pending = HashMap::<(u16, Option<u32>), usize>::new();
         let mut strings = HashSet::<Arc<str>>::new();
         let mut records = 0;
+        let mut clock = (sources.len() > 1).then(ClockMerge::default);
         for (source, input) in sources.iter().enumerate() {
             let mut start = 0;
+            let mut previous_clock = None;
             for (line, bytes) in input
                 .bytes
                 .split_inclusive(|&byte| byte == b'\n')
@@ -240,6 +312,11 @@ impl Trace {
                 start += bytes.len();
                 let line = String::from_utf8_lossy(bytes);
                 let (pid, stamp, body) = prefix(&line, input.pid);
+                if let Some(merge) = &mut clock
+                    && !merge.observe(stamp, &mut previous_clock)
+                {
+                    clock = None;
+                }
                 let key = (raw.source, pid);
                 if let Some((name, rest)) = resumed(body)
                     && let Some(&index) = pending.get(&key)
@@ -289,13 +366,28 @@ impl Trace {
             !events.is_empty(),
             "The selected files contain no trace records"
         );
-        let merged_by_time = sources.len() > 1
+        let epoch = sources.len() > 1
             && events.iter().all(|event| {
                 event
                     .stamp
                     .is_some_and(|stamp| stamp.basis == TimeBasis::Epoch)
             });
-        if merged_by_time {
+        let merge_order = if epoch {
+            MergeOrder::Epoch
+        } else {
+            clock
+                .and_then(ClockMerge::timeline)
+                .unwrap_or(MergeOrder::File)
+        };
+        if matches!(merge_order, MergeOrder::Clock { .. }) {
+            for event in &mut events {
+                let stamp = event.stamp.as_mut().expect("validated clock timestamp");
+                stamp.ns = merge_order
+                    .sort_time(*stamp)
+                    .expect("validated clock timeline");
+            }
+        }
+        if merge_order != MergeOrder::File {
             events.sort_by_key(|event| event.stamp.unwrap().ns);
         }
         mark_retries(&mut events);
@@ -312,7 +404,7 @@ impl Trace {
             sources,
             events,
             groups,
-            merged_by_time,
+            merge_order,
             incomplete,
             errors,
         })
@@ -324,6 +416,10 @@ impl Trace {
 
     pub fn file_count(&self) -> usize {
         self.sources.len()
+    }
+
+    fn merged_by_time(&self) -> bool {
+        self.merge_order != MergeOrder::File
     }
 
     pub(super) fn original(&self, raw: Raw) -> (&Path, &[u8]) {
@@ -351,7 +447,7 @@ impl Trace {
     }
 
     pub fn relative_start(&self, index: usize) -> Option<u64> {
-        if self.sources.len() > 1 && !self.merged_by_time {
+        if self.sources.len() > 1 && !self.merged_by_time() {
             return None;
         }
         let start = self.events.first()?.stamp?;
@@ -821,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_matching_pid_files_and_merges_epoch_order_only() {
+    fn imports_matching_pid_files_and_merges_epoch_order() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("trace.501");
         let child = dir.path().join("trace.502");
@@ -832,16 +928,83 @@ mod tests {
         )
         .unwrap();
         let trace = Trace::open(vec![parent.clone(), child.clone()]).unwrap();
-        assert!(trace.merged_by_time);
+        assert_eq!(trace.merge_order, MergeOrder::Epoch);
         assert_eq!(trace.events[0].pid, Some(502));
         assert_eq!(trace.relative_start(1), Some(9_000_000));
         assert_eq!(trace.original(trace.events[0].first).0, child);
         std::fs::write(&child, "0.000020 close(5) = 0\n").unwrap();
         let trace = Trace::open(vec![parent.clone(), child]).unwrap();
-        assert!(!trace.merged_by_time);
+        assert_eq!(trace.merge_order, MergeOrder::File);
         assert_eq!(trace.events[0].pid, Some(501));
         assert_eq!(trace.relative_start(1), None);
         assert!(Trace::open(vec![parent.clone(), parent]).is_err());
+    }
+
+    fn clock_files(first: &str, second: &str) -> Trace {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("clock.501");
+        let child = dir.path().join("clock.502");
+        std::fs::write(&parent, first).unwrap();
+        std::fs::write(&child, second).unwrap();
+        Trace::open(vec![parent, child]).unwrap()
+    }
+
+    #[test]
+    fn merges_short_clock_traces_and_keeps_ties_in_input_order() {
+        let trace = clock_files(
+            "16:11:01.010000 close(3) = 0\n16:11:01.020000 close(4) = 0\n",
+            "16:11:01.000000 open(\"/tmp/source\", O_RDONLY) = 3\n16:11:01.010000 close(3) = 0\n",
+        );
+        assert!(matches!(trace.merge_order, MergeOrder::Clock { .. }));
+        let order: Vec<_> = trace.events.iter().map(|event| event.pid).collect();
+        assert_eq!(order, [Some(502), Some(501), Some(502), Some(501)]);
+        assert_eq!(trace.relative_start(1), Some(10_000_000));
+        assert_eq!(trace.relative_start(2), Some(10_000_000));
+        assert_eq!(trace.relative_start(3), Some(20_000_000));
+        let (path, raw) = trace.original(trace.events[0].first);
+        assert_eq!(path.file_name().unwrap(), "clock.502");
+        assert!(raw.starts_with(b"16:11:01.000000 open"));
+    }
+
+    #[test]
+    fn uses_a_resumed_record_to_prove_a_midnight_rollover() {
+        let trace = clock_files(
+            "00:00:00.010000 close(3) = 0\n",
+            concat!(
+                "23:59:59.980000 open(\"/tmp/source\", O_RDONLY) = 3\n",
+                "23:59:59.990000 read(3, <unfinished ...>\n",
+                "00:00:00.020000 <... read resumed>\"x\", 1) = 1\n",
+            ),
+        );
+        assert!(matches!(trace.merge_order, MergeOrder::Clock { .. }));
+        assert_eq!(trace.events.len(), 3);
+        assert_eq!(trace.events[0].pid, Some(502));
+        assert_eq!(trace.events[1].pid, Some(502));
+        assert!(trace.events[1].last.is_some());
+        assert_eq!(trace.events[2].pid, Some(501));
+        assert_eq!(trace.relative_start(1), Some(10_000_000));
+        assert_eq!(trace.relative_start(2), Some(30_000_000));
+    }
+
+    #[test]
+    fn preserves_input_order_when_clock_dates_or_record_order_are_ambiguous() {
+        for (first, second) in [
+            ("00:00:00.010 close(3) = 0\n", "23:59:59.990 close(4) = 0\n"),
+            ("18:50:00 close(3) = 0\n", "06:50:00 close(4) = 0\n"),
+            (
+                "16:11:02 close(3) = 0\n16:11:01 close(4) = 0\n",
+                "16:11:03 close(5) = 0\n",
+            ),
+            (
+                "16:11:02 close(3) = 0\n",
+                "16:11:01 close(4) = 0\nclose(5) = 0\n",
+            ),
+        ] {
+            let trace = clock_files(first, second);
+            assert_eq!(trace.merge_order, MergeOrder::File);
+            assert_eq!(trace.events[0].pid, Some(501));
+            assert_eq!(trace.relative_start(1), None);
+        }
     }
 
     #[test]
