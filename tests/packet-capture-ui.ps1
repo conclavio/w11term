@@ -165,9 +165,7 @@ try {
     $null = Control @('close-pane','--pane',"$remote")
     Wait-Focus $local
     Click 'Return to diagnostics overview'
-    $null = Wait-Until 'offline activity keeps the stop reason and local artifact' {
-        Find-Element ('Saved packet capture' + [char]10 + 'Stopped by request' + [char]10 + $destination)
-    }
+    Wait-DiagnosticArtifact 'Saved packet capture' $destination 'Stopped by request'
     Click 'Open Packet capture activity'
     Click $chooseViewerLabel
     $dialog = Wait-Until 'owned executable picker' { Find-OwnedDialog 'Choose Wireshark executable' }

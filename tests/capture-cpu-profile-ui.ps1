@@ -84,9 +84,7 @@ try {
     $null = Control @('close-pane','--pane',"$remotePane")
     Wait-Focus $localPane
     Click-CaptureButton 'Return to diagnostics overview'
-    $null = Wait-Until 'overview keeps the saved CPU profile after closing SSH' {
-        Find-Element ('Saved CPU profile' + [char]10 + $output)
-    }
+    Wait-DiagnosticArtifact 'Saved CPU profile' $output
     Click-CaptureButton 'Open CPU flame graph activity'
     $null = Wait-Until 'the completed graph survives closing SSH' {
         Find-Element ('All samples' + $dot + '1 sample' + $dot + '100.0% of capture')

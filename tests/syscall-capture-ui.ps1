@@ -96,11 +96,7 @@ try {
     $null = Control @('focus-pane','--pane',"$local")
     Wait-Focus $local
     Run-Palette 'Diagnostics overview'
-    $null = Wait-Until 'overview shows the saved trace and original stop reason' {
-        $summary = Find-TraceText 'Saved syscall trace'
-        $summary -and $summary.Current.Name.Contains('Stopped by request') -and
-            $summary.Current.Name.EndsWith($destination)
-    }
+    Wait-DiagnosticArtifact 'Saved syscall trace' $destination 'Stopped by request'
 } finally {
     Close-FixtureApp $app
 }
