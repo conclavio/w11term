@@ -316,11 +316,7 @@ try {
         if ($item -and $item.Current.IsEnabled) { $item }
     }
     $openRecentLabel = $recent.Current.Name
-    $triggerName = 'File actions for ' + $openRecentLabel.Substring('Reopen '.Length)
-    Invoke-Button (Get-NativeMenuAction $triggerName 'Copy paths' -Reveal {
-        $trigger = Find-Element $triggerName $button
-        if ($trigger -and $trigger.Current.IsEnabled -and $trigger.Current.IsOffscreen) { $trigger.SetFocus() }
-    })
+    Choose-DiagnosticFileAction ($openRecentLabel.Substring('Reopen '.Length)) 'Copy paths'
     $paths = Wait-Until 'clipboard has the split trace paths' { Read-ClipboardFixture }
     $paths = $paths -split '\r\n'
     $catalog = [IO.File]::ReadAllText((Join-Path $env:W11TERM_DATA_DIR 'recent-diagnostics.json')) | ConvertFrom-Json
@@ -337,6 +333,21 @@ try {
         $raw = Raw-Text
         (Find-Element 'Files merged by time of day') -and (Find-TraceGroup '*PID 602*close*+30.000 ms*') -and
         $raw -and $raw.Contains('clock trace.601')
+    }
+    Run-Palette 'Diagnostics overview'
+    Choose-DiagnosticFileAction 'working diag.strace' 'Use as baseline'
+    $null = Wait-Until 'saved syscall baseline selected' { Find-Element "Baseline${dot}working diag.strace" }
+    Choose-DiagnosticFileAction 'failing diag.strace' 'Compare with baseline'
+    $null = Wait-Until 'saved syscall comparison restores both original traces in order' {
+        $left = Raw-Text $workingId
+        $right = Raw-Text $failingId
+        (Find-TraceGroup 'First divergence*Changed result*openat*"/tmp/settings"*') -and
+        $left -and $right -and $left.Contains('working diag.strace') -and
+        $right.Contains('failing diag.strace') -and $right.Contains('ENOENT')
+    }
+    Click 'Back to working trace'
+    $null = Wait-Until 'syscall viewer returns to the saved working trace' {
+        Find-TraceGroup '*PID 21*openat*"/tmp/settings"*OK*'
     }
 } finally {
     Close-FixtureApp $app

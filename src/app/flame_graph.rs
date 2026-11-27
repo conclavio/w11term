@@ -33,7 +33,10 @@ pub enum Action {
 
 pub enum Outcome {
     Opened(Arc<Profile>, PathBuf),
-    Compared(Box<compare::ViewState>),
+    Compared {
+        view: Box<compare::ViewState>,
+        install_baseline: bool,
+    },
     ComparisonFiltered(String, Vec<usize>),
     Reviewed(Box<capture::Review>),
     Destination(Box<capture::Recording>),
@@ -413,6 +416,48 @@ fn profile_outcome(summary: &CpuProfileSummary) -> Option<String> {
 }
 
 impl TerminalApp {
+    pub(super) fn compare_recent_profiles(
+        &mut self,
+        before: PathBuf,
+        after: PathBuf,
+        ctx: &ComponentContext<Self>,
+    ) -> bool {
+        if self.flame_graph.pending.is_some() {
+            return false;
+        }
+        self.set_diagnostics_drawer(Some(diagnostics::Drawer::FlameGraph));
+        let ticket = self.flame_graph.begin("Comparing saved CPU profiles…");
+        let rejected = message(Action::Finished(
+            ticket.clone(),
+            Err("CPU comparison worker unavailable".into()),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = (|| -> anyhow::Result<_> {
+                    if scope.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let baseline = Profile::open(&before)
+                        .with_context(|| format!("Opening before profile {}", before.display()))?;
+                    let candidate = Profile::open(&after)
+                        .with_context(|| format!("Opening after profile {}", after.display()))?;
+                    Ok(Some(Outcome::Compared {
+                        view: Box::new(compare::ViewState::new(
+                            Arc::new(baseline),
+                            Arc::new(candidate),
+                            [before, after],
+                        )),
+                        install_baseline: true,
+                    }))
+                })()
+                .map_err(|error| format!("{error:#}"));
+                message(Action::Finished(ticket, result))
+            },
+            rejected,
+        );
+        true
+    }
+
     pub(super) fn with_flame_graph(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.67).clamp(275.0, 1100.0);
         Grid::new()
@@ -517,11 +562,14 @@ impl TerminalApp {
                             } else if let Some(before_path) = compare_path {
                                 let before = profile.context("Open a before profile to compare")?;
                                 let after = Arc::new(Profile::open(&file)?);
-                                Ok(Some(Outcome::Compared(Box::new(compare::ViewState::new(
-                                    before,
-                                    after,
-                                    [before_path, file],
-                                )))))
+                                Ok(Some(Outcome::Compared {
+                                    view: Box::new(compare::ViewState::new(
+                                        before,
+                                        after,
+                                        [before_path, file],
+                                    )),
+                                    install_baseline: false,
+                                }))
                             } else {
                                 Ok(Some(Outcome::Opened(Arc::new(Profile::open(&file)?), file)))
                             }
@@ -607,9 +655,18 @@ impl TerminalApp {
                         panel.load(profile, path.clone(), None);
                         self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);
                     }
-                    Ok(Some(Outcome::Compared(comparison))) => {
-                        let path = comparison.after_path().to_owned();
-                        panel.comparison = Some(*comparison);
+                    Ok(Some(Outcome::Compared {
+                        view,
+                        install_baseline,
+                    })) => {
+                        if install_baseline {
+                            let (profile, path) = view.before_source();
+                            panel.activity = None;
+                            panel.capture = None;
+                            panel.load(profile, path, None);
+                        }
+                        let path = view.after_path().to_owned();
+                        panel.comparison = Some(*view);
                         self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);
                     }
                     Ok(Some(Outcome::ComparisonFiltered(query, rows))) => {

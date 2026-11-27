@@ -195,6 +195,13 @@ impl ViewState {
         &self.comparison.paths[1]
     }
 
+    pub(super) fn before_source(&self) -> (Arc<Profile>, PathBuf) {
+        (
+            self.comparison.profiles[0].clone(),
+            self.comparison.paths[0].clone(),
+        )
+    }
+
     fn page_rows(&self) -> &[usize] {
         let first = self.page * PAGE_SIZE;
         &self.visible[first..(first + PAGE_SIZE).min(self.visible.len())]

@@ -20,14 +20,6 @@ function Click-GraphButton([string]$Name) {
     })
 }
 
-function Choose-DiagnosticFileAction([string]$Filename, [string]$Action) {
-    $triggerName = "File actions for $Filename"
-    Invoke-Button (Get-NativeMenuAction $triggerName $Action -Reveal {
-        $trigger = Find-Element $triggerName $button
-        if ($trigger -and $trigger.Current.IsEnabled -and $trigger.Current.IsOffscreen) { $trigger.SetFocus() }
-    })
-}
-
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -166,9 +158,24 @@ try {
         (Find-Element '4 samples') -and !(Find-Element 'Diagnostics overview panel')
     }
     Click-GraphButton 'Return to diagnostics overview'
+    Choose-DiagnosticFileAction 'worker profile.folded' 'Use as baseline'
+    $null = Wait-Until 'pinned CPU profile is the baseline' { Find-Element "Baseline${dot}worker profile.folded" }
+    Choose-DiagnosticFileAction 'after recording.folded' 'Compare with baseline'
+    $null = Wait-Until 'saved CPU comparison uses both source paths and the expected side' {
+        (Find-Element "Before${dot}worker profile.folded${dot}4 samples") -and
+        (Find-Element "After${dot}after recording.folded${dot}20 samples") -and
+        (Find-Element "Before 0 samples (0.00%)${dot}After 15 samples (75.00%)${dot}+75.00 pp")
+    }
+    Click-GraphButton 'Back to flame graph'
+    $null = Wait-Until 'the baseline is the current flame graph' { Find-Element '4 samples' }
+    Click-GraphButton 'Return to diagnostics overview'
     Choose-DiagnosticFileAction 'worker profile.folded' 'Unpin'
     $null = Wait-Until 'unpin moves the baseline into recent files' {
         !(Find-Element 'Pinned files') -and (Find-Element 'Reopen worker profile.folded' $button)
+    }
+    Choose-DiagnosticFileAction 'worker profile.folded' 'Clear baseline'
+    $null = Wait-Until 'clearing the baseline leaves its file in history' {
+        !(Find-Element "Baseline${dot}worker profile.folded") -and (Find-Element 'Reopen worker profile.folded' $button)
     }
     Choose-DiagnosticFileAction 'after recording.folded' 'Forget'
     $null = Wait-Until 'forget removes the persisted entry and keeps the artifact' {

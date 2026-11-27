@@ -101,6 +101,10 @@ impl Comparison {
         self.paths[1].as_deref()
     }
 
+    pub(super) fn before_source(&self) -> (Arc<TriageReport>, Option<PathBuf>) {
+        (self.reports[0].clone(), self.paths[0].clone())
+    }
+
     fn value(&self, change: &Change, side: usize) -> String {
         let report = &self.reports[side];
         match change.kind {
@@ -272,24 +276,31 @@ impl Comparison {
         preview
     }
 
-    pub fn fields(&self, export_idle: bool, ctx: &ViewContext<TerminalApp>) -> Vec<KeyedView> {
+    pub fn fields(
+        &self,
+        idle: bool,
+        export_idle: bool,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> Vec<KeyedView> {
         let mut fields = vec![
             KeyedView::new(
                 "compare-back",
                 Button::new()
+                    .is_enabled(idle)
                     .on_click(ctx.callback(|_| message(Action::BackFromComparison)))
                     .content("Back to report"),
             ),
             KeyedView::new(
                 "compare-export",
                 Button::new()
-                    .is_enabled(export_idle)
+                    .is_enabled(idle && export_idle)
                     .on_click(ctx.callback(|_| message(Action::ExportComparison)))
                     .content("Export comparison…"),
             ),
             KeyedView::new(
                 "compare-openrouter",
                 Button::new()
+                    .is_enabled(idle)
                     .on_click(ctx.callback(|_| message(Action::OpenRouterComparison)))
                     .content("Review comparison with OpenRouter…"),
             ),

@@ -1,5 +1,5 @@
 use super::*;
-use std::{cell::OnceCell, collections::VecDeque};
+use std::{cell::RefCell, collections::VecDeque};
 use w11term::diagnostic_history::{Artifact, Entry, Kind, Store};
 
 pub(super) const LABEL: &str = "Diagnostics overview";
@@ -24,6 +24,9 @@ pub enum RecentAction {
     Pin(bool),
     CopyPaths,
     Forget,
+    SetBaseline,
+    ClearBaseline,
+    Compare(Arc<Entry>),
 }
 
 enum Edit {
@@ -36,6 +39,7 @@ enum Edit {
 #[derive(Default)]
 pub(super) struct Recent {
     entries: Vec<RecentRow>,
+    baseline: Option<Arc<Entry>>,
     edits: VecDeque<Edit>,
     pending: bool,
     status: Option<String>,
@@ -43,7 +47,30 @@ pub(super) struct Recent {
 
 struct RecentRow {
     entry: Arc<Entry>,
-    menu: OnceCell<Menu>,
+    menu: RefCell<Option<(BaselineMenu, Menu)>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum BaselineMenu {
+    Unavailable,
+    Choose,
+    Selected,
+    Compare(Arc<Entry>),
+}
+
+impl Recent {
+    fn baseline_menu(&self, entry: &Entry) -> BaselineMenu {
+        if entry.artifact.kind == Kind::PacketCapture {
+            return BaselineMenu::Unavailable;
+        }
+        match self.baseline.as_ref() {
+            Some(before) if before.artifact == entry.artifact => BaselineMenu::Selected,
+            Some(before) if before.artifact.kind == entry.artifact.kind => {
+                BaselineMenu::Compare(before.clone())
+            }
+            _ => BaselineMenu::Choose,
+        }
+    }
 }
 
 pub(super) struct Activity {
@@ -140,11 +167,16 @@ fn diagnostic_file_menu(
     row: &RecentRow,
     filename: &str,
     ready: bool,
+    baseline: BaselineMenu,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let name = format!("File actions for {filename}");
     // Keep the open flyout's callback valid across terminal redraws.
-    let menu = row.menu.get_or_init(|| {
+    let mut cached = row.menu.borrow_mut();
+    if cached
+        .as_ref()
+        .is_none_or(|(previous, _)| *previous != baseline)
+    {
         let entry = row.entry.clone();
         let pin = if entry.pinned { "Unpin" } else { "Pin" };
         let copy = if entry.artifact.paths.len() == 1 {
@@ -152,24 +184,49 @@ fn diagnostic_file_menu(
         } else {
             "Copy paths"
         };
-        Menu::new(
-            [
-                MenuItem::item("pin", pin),
-                MenuItem::item("copy-paths", copy),
-                MenuItem::separator("remove"),
-                MenuItem::item("forget", "Forget"),
-            ],
+        let mut items = vec![
+            MenuItem::item("pin", pin),
+            MenuItem::item("copy-paths", copy),
+        ];
+        match &baseline {
+            BaselineMenu::Unavailable => (),
+            BaselineMenu::Selected => {
+                items.push(MenuItem::item("clear-baseline", "Clear baseline"));
+            }
+            BaselineMenu::Choose | BaselineMenu::Compare(_) => {
+                items.push(MenuItem::item("set-baseline", "Use as baseline"));
+                items.push(if matches!(baseline, BaselineMenu::Compare(_)) {
+                    MenuItem::item("compare", "Compare with baseline")
+                } else {
+                    MenuItem::disabled("compare", "Compare with baseline")
+                });
+            }
+        }
+        items.extend([
+            MenuItem::separator("remove"),
+            MenuItem::item("forget", "Forget"),
+        ]);
+        let stable_baseline = baseline.clone();
+        let menu = Menu::new(
+            items,
             ctx.callback(move |label: String| {
                 let action = match label.as_str() {
                     label if label == pin => RecentAction::Pin(!entry.pinned),
                     label if label == copy => RecentAction::CopyPaths,
+                    "Use as baseline" => RecentAction::SetBaseline,
+                    "Clear baseline" => RecentAction::ClearBaseline,
+                    "Compare with baseline" => match &stable_baseline {
+                        BaselineMenu::Compare(before) => RecentAction::Compare(before.clone()),
+                        _ => return Message::ControlIdle,
+                    },
                     "Forget" => RecentAction::Forget,
                     _ => return Message::ControlIdle,
                 };
                 Message::Diagnostics(Action::Recent(entry.clone(), action))
             }),
-        )
-    });
+        );
+        *cached = Some((baseline, menu));
+    }
     title_tools::button(&name)
         .is_enabled(ready)
         .content(
@@ -177,7 +234,23 @@ fn diagnostic_file_menu(
                 .glyph("\u{e712}")
                 .tooltip_with(title_tools::below(name)),
         )
-        .menu(menu.clone())
+        .menu(
+            cached
+                .as_ref()
+                .expect("file action menu initialized")
+                .1
+                .clone(),
+        )
+}
+
+fn artifact_filename(artifact: &Artifact) -> String {
+    let path = &artifact.paths[0];
+    triage::display_output(
+        &path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy(),
+    )
 }
 
 pub(super) fn menu() -> MenuItem {
@@ -254,6 +327,25 @@ impl TerminalApp {
                     }
                     RecentAction::CopyPaths => self.copy_diagnostic_paths(&entry.artifact),
                     RecentAction::Forget => self.edit_diagnostics_recent(Edit::Forget(entry), ctx),
+                    RecentAction::SetBaseline if entry.artifact.kind != Kind::PacketCapture => {
+                        self.diagnostics_recent.baseline = Some(entry);
+                        self.diagnostics_recent.status = None;
+                    }
+                    RecentAction::ClearBaseline
+                        if matches!(
+                            self.diagnostics_recent.baseline_menu(&entry),
+                            BaselineMenu::Selected
+                        ) =>
+                    {
+                        self.diagnostics_recent.baseline = None;
+                    }
+                    RecentAction::Compare(before)
+                        if matches!(self.diagnostics_recent.baseline_menu(&entry), BaselineMenu::Compare(current)
+                            if current.artifact == before.artifact) =>
+                    {
+                        self.compare_saved_diagnostics(&before.artifact, &entry.artifact, ctx);
+                    }
+                    _ => (),
                 }
             }
             Action::RecentReady(result) if self.diagnostics_recent.pending => {
@@ -272,11 +364,17 @@ impl TerminalApp {
                                 } else {
                                     RecentRow {
                                         entry: Arc::new(entry),
-                                        menu: OnceCell::new(),
+                                        menu: RefCell::new(None),
                                     }
                                 }
                             })
                             .collect();
+                        recent.baseline = recent.baseline.take().filter(|before| {
+                            recent
+                                .entries
+                                .iter()
+                                .any(|row| row.entry.artifact == before.artifact)
+                        });
                         recent.status = None;
                     }
                     Err(error) => recent.status = Some(error),
@@ -377,6 +475,31 @@ impl TerminalApp {
         });
     }
 
+    fn compare_saved_diagnostics(
+        &mut self,
+        before: &Artifact,
+        after: &Artifact,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let started = match (before.kind, before.paths.as_slice(), after.paths.as_slice()) {
+            (Kind::TriageReport, [before], [after]) => {
+                self.compare_recent_triage_reports(before.clone(), after.clone(), ctx)
+            }
+            (Kind::CpuProfile, [before], [after]) => {
+                self.compare_recent_profiles(before.clone(), after.clone(), ctx)
+            }
+            (Kind::SyscallTrace, before, after) => {
+                self.compare_recent_syscall_traces(before.to_vec(), after.to_vec(), ctx);
+                true
+            }
+            _ => return,
+        };
+        if !started {
+            self.diagnostics_recent.status =
+                Some("Wait for the current diagnostics job to finish.".into());
+        }
+    }
+
     pub(super) fn with_diagnostics(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.38).clamp(270.0, 460.0);
         Grid::new()
@@ -441,6 +564,14 @@ impl TerminalApp {
         let activity = self.diagnostics_activity_rows(ctx);
         let pinned = self.diagnostics_stored_rows(true, ctx);
         let recent = self.diagnostics_stored_rows(false, ctx);
+        let baseline = self.diagnostics_recent.baseline.as_ref().map(|entry| {
+            KeyedView::new(
+                "diagnostic-baseline",
+                TextBlock::new()
+                    .text(format!("Baseline · {}", artifact_filename(&entry.artifact)))
+                    .text_wrapping(TextWrapping::Wrap),
+            )
+        });
         let status = self.diagnostics_recent.status.as_ref().map(|status| {
             KeyedView::new(
                 "recent-status",
@@ -477,6 +608,7 @@ impl TerminalApp {
                                     .text_wrapping(TextWrapping::Wrap),
                             ))
                             .chain(status)
+                            .chain(baseline)
                             .chain(activity)
                             .chain(pinned)
                             .chain(rows)
@@ -515,11 +647,7 @@ impl TerminalApp {
             }
             let artifact = &entry.artifact;
             let path = &artifact.paths[0];
-            let filename = path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy();
-            let filename = triage::display_output(&filename);
+            let filename = artifact_filename(artifact);
             let kind = match artifact.kind {
                 Kind::TriageReport => "Linux triage report",
                 Kind::CpuProfile => "Folded CPU profile",
@@ -533,7 +661,13 @@ impl TerminalApp {
                 String::new()
             };
             let open = entry.clone();
-            let menu = diagnostic_file_menu(row, &filename, !recent.pending, ctx);
+            let menu = diagnostic_file_menu(
+                row,
+                &filename,
+                !recent.pending,
+                recent.baseline_menu(entry),
+                ctx,
+            );
             rows.push(KeyedView::new(
                 format!("recent-{index}"),
                 StackPanel::new().spacing(3.0).children((

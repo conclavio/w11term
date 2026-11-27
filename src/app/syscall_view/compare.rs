@@ -43,7 +43,28 @@ fn message(action: Action) -> Message {
     send(super::Action::Compare(action))
 }
 
+enum Input {
+    Picker {
+        working: Arc<Trace>,
+        owner: usize,
+    },
+    Saved {
+        before: Vec<PathBuf>,
+        after: Vec<PathBuf>,
+    },
+}
+
 impl TerminalApp {
+    pub(in crate::app) fn compare_recent_syscall_traces(
+        &mut self,
+        before: Vec<PathBuf>,
+        after: Vec<PathBuf>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let tab = self.new_saved_syscall_viewer(ctx);
+        self.read_trace_comparison(tab, Input::Saved { before, after }, ctx);
+    }
+
     pub(super) fn syscall_compare_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
             Action::Open(tab) => self.open_trace_comparison(tab, ctx),
@@ -53,6 +74,9 @@ impl TerminalApp {
                 {
                     match result {
                         Ok(Some(comparison)) => {
+                            if page.loaded.is_none() {
+                                page.load(comparison.traces[0].clone());
+                            }
                             let paths = comparison.traces[1].paths();
                             let state = &mut page.comparison;
                             *state = ViewState {
@@ -202,14 +226,21 @@ impl TerminalApp {
         let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
             return;
         };
+        let Some(working) = self.syscall_page(tab).and_then(|page| page.loaded.clone()) else {
+            return;
+        };
+        self.read_trace_comparison(tab, Input::Picker { working, owner }, ctx);
+    }
+
+    fn read_trace_comparison(&mut self, tab: TabId, input: Input, ctx: &ComponentContext<Self>) {
         let Some(page) = self.syscall_page(tab).filter(|page| page.pending.is_none()) else {
             return;
         };
-        let Some(working) = page.loaded.clone() else {
-            return;
+        let status = match &input {
+            Input::Picker { .. } => "Opening the failing trace and comparing syscall sequences…",
+            Input::Saved { .. } => "Comparing saved syscall traces…",
         };
-        let initial = working.first_path().to_owned();
-        let ticket = page.begin("Opening the failing trace and comparing syscall sequences…");
+        let ticket = page.begin(status);
         let rejected = message(Action::Ready(
             tab,
             ticket.clone(),
@@ -218,14 +249,28 @@ impl TerminalApp {
         ctx.spawn_background_with_rejection(
             move |scope| {
                 let result = (|| -> anyhow::Result<_> {
-                    let files = file_picker::pick_paths(
-                        owner,
-                        file_picker::Purpose::OpenSyscallTrace(initial),
-                    )?;
+                    if scope.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let (working, files) = match input {
+                        Input::Picker { working, owner } => {
+                            let initial = working.first_path().to_owned();
+                            let files = file_picker::pick_paths(
+                                owner,
+                                file_picker::Purpose::OpenSyscallTrace(initial),
+                            )?;
+                            (working, files)
+                        }
+                        Input::Saved { before, after } => (
+                            Arc::new(Trace::open(before).context("Opening the baseline trace")?),
+                            after,
+                        ),
+                    };
                     if files.is_empty() || scope.is_cancelled() {
                         return Ok(None);
                     }
-                    let failing = Arc::new(Trace::open(files)?);
+                    let failing =
+                        Arc::new(Trace::open(files).context("Opening the comparison trace")?);
                     Ok(Some(Arc::new(Comparison::build(working, failing))))
                 })()
                 .map_err(|error| format!("{error:#}"));

@@ -211,6 +211,16 @@ try {
     $null = Wait-Until 'recent comparison source reopens as its own local triage report' {
         (Find-Element 'Opened Linux triage report') -and (Find-Element '8 of 10 checks complete')
     }
+    Click 'Return to diagnostics overview'
+    Choose-DiagnosticFileAction 'captured.json' 'Use as baseline'
+    $null = Wait-Until 'saved triage baseline selected' { Find-Element "Baseline${dot}captured.json" }
+    Choose-DiagnosticFileAction 'after triage.json' 'Compare with baseline'
+    $null = Wait-Until 'saved triage comparison reopens both reports' {
+        (Find-Element "Before${dot}captured.json") -and (Find-Element "After${dot}after triage.json") -and
+        (Find-Element "Before${dot}Permission denied${dot}Exit 1") -and (Find-Element "After${dot}OK${dot}Exit 0")
+    }
+    Click 'Back to report'
+    $null = Wait-Until 'triage returns to the baseline report' { Find-Element '7 of 10 checks complete' }
 } finally {
     Close-FixtureApp $app
 }

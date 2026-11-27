@@ -10,6 +10,14 @@ $keymap = @{ shortcuts = @{
 [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($keymap | ConvertTo-Json))
 $button = [System.Windows.Automation.ControlType]::Button
 
+function Choose-DiagnosticFileAction([string]$Filename, [string]$Action) {
+    $triggerName = "File actions for $Filename"
+    Invoke-Button (Get-NativeMenuAction $triggerName $Action -Reveal {
+        $trigger = Find-Element $triggerName $button
+        if ($trigger -and $trigger.Current.IsEnabled -and $trigger.Current.IsOffscreen) { $trigger.SetFocus() }
+    })
+}
+
 function Sessions { (Control @('list')).sessions }
 function Type-Text([string]$Text) { foreach ($char in $Text.ToCharArray()) { Post-Key 0x102 ([uint32]$char) } }
 function Type-Line([string]$Text) { Type-Text $Text; Press-Key 13 }

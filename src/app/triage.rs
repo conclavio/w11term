@@ -38,7 +38,10 @@ pub enum Outcome {
         source: Option<Connection>,
     },
     Saved(PathBuf),
-    Compared(Box<compare::Comparison>),
+    Compared {
+        comparison: Box<compare::Comparison>,
+        install_baseline: bool,
+    },
 }
 
 enum Content {
@@ -117,6 +120,25 @@ pub(super) fn display_output(text: &str) -> String {
 }
 
 impl Panel {
+    fn load_report(
+        &mut self,
+        report: Arc<TriageReport>,
+        path: Option<PathBuf>,
+        source: Option<Connection>,
+    ) {
+        if let Some(path) = &path {
+            self.activity = None;
+            self.last_path = Some(path.clone());
+        }
+        self.busy_processes = source.map_or_else(Vec::new, |_| processes::busy_processes(&report));
+        self.profile_source = source;
+        self.content = Some(Content::Report { report, path });
+        self.comparison = None;
+        self.sample = 0;
+        self.resource = TriageResource::default();
+        self.evidence_line = None;
+    }
+
     fn begin(&mut self, status: &str) -> Arc<()> {
         let ticket = Arc::new(());
         self.pending = Some(ticket.clone());
@@ -184,7 +206,7 @@ impl Panel {
             ));
         }
         match (&self.comparison, &self.content) {
-            (Some(comparison), _) => fields.extend(comparison.fields(export_idle, ctx)),
+            (Some(comparison), _) => fields.extend(comparison.fields(idle, export_idle, ctx)),
             (None, Some(Content::Review { pane, plan })) => {
                 let ready = active
                     == Some(Connection {
@@ -463,6 +485,47 @@ impl Panel {
 }
 
 impl TerminalApp {
+    pub(super) fn compare_recent_triage_reports(
+        &mut self,
+        before: PathBuf,
+        after: PathBuf,
+        ctx: &ComponentContext<Self>,
+    ) -> bool {
+        if self.triage.pending.is_some() {
+            return false;
+        }
+        self.set_diagnostics_drawer(Some(diagnostics::Drawer::Triage));
+        let ticket = self.triage.begin("Comparing saved Linux triage reports…");
+        let rejected = message(Action::Finished(
+            ticket.clone(),
+            Err("Triage comparison worker unavailable".into()),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = (|| -> anyhow::Result<_> {
+                    if scope.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let baseline = TriageReport::load(&before)
+                        .with_context(|| format!("Opening before report {}", before.display()))?;
+                    let candidate = TriageReport::load(&after)
+                        .with_context(|| format!("Opening after report {}", after.display()))?;
+                    Ok(Some(Outcome::Compared {
+                        comparison: Box::new(compare::Comparison::new(
+                            [Arc::new(baseline), Arc::new(candidate)],
+                            [Some(before), Some(after)],
+                        )),
+                        install_baseline: true,
+                    }))
+                })()
+                .map_err(|error| format!("{error:#}"));
+                message(Action::Finished(ticket, result))
+            },
+            rejected,
+        );
+        true
+    }
+
     pub(super) fn triage_session(&self) -> Option<&Session> {
         let Page::Terminal(live) = &self.tabs.active()?.page else {
             return None;
@@ -668,8 +731,8 @@ impl TerminalApp {
                     panel.evidence_line = finding.stdout_line;
                 }
             }
-            Action::BackFromComparison => panel.comparison = None,
-            Action::ExportComparison => {
+            Action::BackFromComparison if panel.pending.is_none() => panel.comparison = None,
+            Action::ExportComparison if panel.pending.is_none() => {
                 if let Some(comparison) = panel.comparison.clone() {
                     self.begin_text_export(
                         text_export::Subject::TriageComparison,
@@ -678,7 +741,7 @@ impl TerminalApp {
                     );
                 }
             }
-            Action::ComparisonChange(marker, index) => {
+            Action::ComparisonChange(marker, index) if panel.pending.is_none() => {
                 if let Some(comparison) = &mut panel.comparison {
                     comparison.select(&marker, index);
                 }
@@ -743,10 +806,13 @@ impl TerminalApp {
                             Ok(Some(match report {
                                 Some((before, before_path)) if compare => {
                                     let after = Arc::new(TriageReport::load(&file)?);
-                                    Outcome::Compared(Box::new(compare::Comparison::new(
-                                        [before, after],
-                                        [before_path, Some(file)],
-                                    )))
+                                    Outcome::Compared {
+                                        comparison: Box::new(compare::Comparison::new(
+                                            [before, after],
+                                            [before_path, Some(file)],
+                                        )),
+                                        install_baseline: false,
+                                    }
                                 }
                                 Some((report, _)) => {
                                     report.save(&file)?;
@@ -791,23 +857,9 @@ impl TerminalApp {
                         path,
                         source,
                     })) => {
-                        if let Some(path) = &path {
-                            panel.activity = None;
-                            panel.status = Some("Opened Linux triage report".into());
-                            panel.last_path = Some(path.clone());
-                        }
-                        panel.busy_processes =
-                            source.map_or_else(Vec::new, |_| processes::busy_processes(&report));
-                        panel.profile_source = source;
-                        panel.content = Some(Content::Report {
-                            report,
-                            path: path.clone(),
-                        });
-                        panel.comparison = None;
-                        panel.sample = 0;
-                        panel.resource = TriageResource::default();
-                        panel.evidence_line = None;
+                        panel.load_report(report, path.clone(), source);
                         if let Some(path) = path {
+                            panel.status = Some("Opened Linux triage report".into());
                             self.remember_diagnostic(ArtifactKind::TriageReport, [path], ctx);
                         }
                     }
@@ -819,7 +871,14 @@ impl TerminalApp {
                         panel.status = Some("Saved Linux triage report".into());
                         self.remember_diagnostic(ArtifactKind::TriageReport, [path], ctx);
                     }
-                    Ok(Some(Outcome::Compared(comparison))) => {
+                    Ok(Some(Outcome::Compared {
+                        comparison,
+                        install_baseline,
+                    })) => {
+                        if install_baseline {
+                            let (report, path) = comparison.before_source();
+                            panel.load_report(report, path, None);
+                        }
                         let path = comparison.after_path().map(std::path::Path::to_owned);
                         panel.comparison = Some(*comparison);
                         if let Some(path) = path {
