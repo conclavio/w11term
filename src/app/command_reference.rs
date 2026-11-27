@@ -70,7 +70,7 @@ fn tool_sync_summary(report: &ToolBundleSyncReport) -> String {
     let status = match report.status {
         ToolBundleSyncStatus::Updated => "installed",
         ToolBundleSyncStatus::Current => "already current",
-        ToolBundleSyncStatus::Held => "paused after rollback",
+        ToolBundleSyncStatus::Held => "automatic sync paused",
         ToolBundleSyncStatus::Skipped => "sync skipped",
         ToolBundleSyncStatus::Unconfirmed => "sync unconfirmed",
         ToolBundleSyncStatus::NotRun => "skipped for this session",

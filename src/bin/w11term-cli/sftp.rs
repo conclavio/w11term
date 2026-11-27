@@ -27,6 +27,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   sha256 PATH [--max-bytes N]\n\
   preview-tool-bundle BUNDLE.json\n\
   apply-tool-bundle BUNDLE.json --review TOKEN\n\
+  preview-tool-bundle-add BUNDLE.json\n\
+  add-to-tool-bundle BUNDLE.json --review TOKEN\n\
   preview-tool-bundle-rollback NAME SHA256\n\
   rollback-tool-bundle NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-resume NAME SHA256\n\
@@ -327,12 +329,18 @@ pub fn parse(
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
             }
         }
-        "preview-tool-bundle" | "apply-tool-bundle" => {
-            if command == "apply-tool-bundle" {
+        "preview-tool-bundle"
+        | "apply-tool-bundle"
+        | "preview-tool-bundle-add"
+        | "add-to-tool-bundle" => {
+            if matches!(command.as_str(), "apply-tool-bundle" | "add-to-tool-bundle") {
                 let token = opts
                     .remove("--review")
                     .context("Preview the tool bundle and supply --review")?;
                 fields.insert("review".into(), json!(normalize_sha256(&token)?));
+            }
+            if command == "preview-tool-bundle-add" {
+                fields.insert("op".into(), json!("add-to-tool-bundle"));
             }
             let manifest = path()?;
             let bundle = UtilityBundle::load(std::path::Path::new(&manifest))
@@ -535,6 +543,36 @@ mod tests {
         };
         assert_eq!(bundle.bin_directory, ".local/bin");
         assert_eq!(bundle.tools[0].builds[0].path, local.path().join("bins/rg"));
+
+        let path = manifest.to_str().unwrap();
+        let (_, adding) = p(&["--pane", "7", "preview-tool-bundle-add", path]).unwrap();
+        assert!(matches!(
+            adding,
+            Request::Sftp {
+                pane: 7,
+                operation: Operation::AddToToolBundle { review: None, .. },
+                ..
+            }
+        ));
+        let token = "b".repeat(64);
+        assert!(p(&["--pane", "7", "add-to-tool-bundle", path]).is_err());
+        let (_, adding) = p(&[
+            "--pane",
+            "7",
+            "add-to-tool-bundle",
+            path,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(
+            adding,
+            Request::Sftp {
+                pane: 7,
+                operation: Operation::AddToToolBundle { review: Some(review), .. },
+                ..
+            } if review == token
+        ));
     }
 
     #[test]

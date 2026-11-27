@@ -297,6 +297,10 @@ pub enum Operation {
         bundle: UtilityBundle,
         review: String,
     },
+    AddToToolBundle {
+        bundle: UtilityBundle,
+        review: Option<String>,
+    },
     RollbackToolBundle {
         name: String,
         bundle_sha256: String,
@@ -1041,7 +1045,8 @@ pub(crate) async fn run(
                 Operation::ListDotfileVersions { .. } => {
                     JobStage::Checking("Dotfiles history lookup did not finish")
                 }
-                Operation::PreviewToolBundle { .. } => {
+                Operation::PreviewToolBundle { .. }
+                | Operation::AddToToolBundle { review: None, .. } => {
                     JobStage::Checking("Tool bundle preview did not finish")
                 }
                 Operation::InstalledTools => {
@@ -1054,6 +1059,7 @@ pub(crate) async fn run(
                     "Tool PATH review did not finish. Review the startup files again.",
                 ),
                 Operation::ApplyToolBundle { .. }
+                | Operation::AddToToolBundle { .. }
                 | Operation::RollbackToolBundle { .. }
                 | Operation::ResumeToolBundleUpdates { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
@@ -1610,6 +1616,10 @@ impl Engine {
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             ApplyToolBundle { bundle, review } => {
                 self.apply_utility_bundle(session, bundle, &review, stage)
+                    .await?
+            }
+            AddToToolBundle { bundle, review } => {
+                self.add_to_utility_bundle(session, bundle, review.as_deref(), stage)
                     .await?
             }
             RollbackToolBundle {

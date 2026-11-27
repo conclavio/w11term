@@ -566,6 +566,144 @@ async fn retained_tool_verification_uses_server_hashes_with_sftp_fallback() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_tools_keeps_active_binaries_and_pauses_login_sync() {
+    use UtilityArchitecture::X86_64;
+
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "x86_64", "/", "/usr/bin:/operator/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let original = executable(X86_64, None);
+    let Operation::PreviewToolBundle { mut bundle } =
+        preview(vec![build(local.path(), "rg", X86_64, original.clone())])
+    else {
+        unreachable!()
+    };
+    bundle.bin_directory = "operator/bin".into();
+    let replacement = || Operation::PreviewToolBundle {
+        bundle: bundle.clone(),
+    };
+    let initial = guarded_job(&pane, None, replacement()).await.unwrap();
+    guarded_job(&pane, None, apply(replacement(), &initial))
+        .await
+        .unwrap();
+
+    let store = remote.join(".local/share/w11term/tools/portable");
+    let before = initial["bundle_sha256"].as_str().unwrap();
+    let selector = || fs::read_to_string(store.join("current")).unwrap();
+    let old_selector = selector();
+    let rg = store.join("versions").join(before).join("rg");
+    let bin = remote.join("operator/bin");
+    let old_launcher = fs::read_to_string(bin.join("rg")).unwrap();
+    fs::remove_file(local.path().join("rg")).unwrap();
+
+    let mut requested = bundle;
+    requested.bin_directory = ".local/bin".into();
+    requested.tools[0].builds[0].sha256 = "a".repeat(64);
+    let mut jq = original.clone();
+    jq[255] = 2;
+    requested.tools.push(UtilityTool {
+        name: "jq".into(),
+        builds: vec![build(local.path(), "jq", X86_64, jq.clone())],
+    });
+    let add = |review: Option<&Value>| Operation::AddToToolBundle {
+        bundle: requested.clone(),
+        review: review.map(|preview| preview["review"].as_str().unwrap().to_owned()),
+    };
+    fs::write(bin.join("jq"), b"user-managed executable").unwrap();
+    let blocked = guarded_job(&pane, None, add(None)).await.unwrap();
+    assert_eq!(blocked["ready"], false);
+    assert!(blocked["review"].is_null());
+    assert_eq!(
+        fs::read(bin.join("jq")).unwrap(),
+        b"user-managed executable"
+    );
+    fs::remove_file(bin.join("jq")).unwrap();
+
+    let addition = guarded_job(&pane, None, add(None)).await.unwrap();
+    assert_eq!(addition["mode"], "add");
+    assert_eq!(addition["ready"], true);
+    assert_eq!(addition["bin_directory"], "/operator/bin");
+    assert_eq!(addition["automatic_sync_paused"], true);
+    assert_eq!(
+        addition["tools"][1]["retained"]["sha256"],
+        tool_sha256(&original)
+    );
+    assert_eq!(selector(), old_selector);
+    assert!(!bin.join("jq").exists());
+
+    fs::write(&rg, &jq).unwrap();
+    let error = guarded_job(&pane, None, add(Some(&addition)))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("Checking the tools that will stay installed"),
+        "{error}"
+    );
+    assert_eq!(selector(), old_selector);
+    assert!(!bin.join("jq").exists());
+    fs::write(&rg, &original).unwrap();
+
+    let installed = guarded_job(&pane, None, add(Some(&addition)))
+        .await
+        .unwrap();
+    let after = installed["bundle_sha256"].as_str().unwrap();
+    assert_eq!(installed["previous_bundle_sha256"], before);
+    assert_eq!(installed["copied_tools"], json!(["rg"]));
+    assert_eq!(installed["automatic_sync_paused"], true);
+    assert!(selector().ends_with(&format!("./versions/{after}\n")));
+    let extended = store.join("versions").join(after);
+    assert_eq!(fs::read(extended.join("rg")).unwrap(), original);
+    assert_eq!(fs::read(extended.join("jq")).unwrap(), jq);
+    assert_eq!(fs::read(&rg).unwrap(), original);
+    assert_eq!(fs::read_to_string(bin.join("rg")).unwrap(), old_launcher);
+    assert!(
+        fs::read_to_string(bin.join("jq"))
+            .unwrap()
+            .ends_with("/current/jq\n")
+    );
+
+    fs::remove_file(local.path().join("jq")).unwrap();
+    let repeat = guarded_job(&pane, None, add(None)).await.unwrap();
+    assert_eq!(repeat["bundle_sha256"], after);
+    let unchanged = guarded_job(&pane, None, add(Some(&repeat))).await.unwrap();
+    assert_eq!(unchanged["changed"], false);
+    assert_eq!(unchanged["uploaded"], false);
+    assert_eq!(unchanged["automatic_sync_paused"], true);
+
+    let mut fresh = requested;
+    fresh.name = "extra-tools".into();
+    fresh.tools.remove(0);
+    fs::write(local.path().join("jq"), &jq).unwrap();
+    let fresh_add = |review| Operation::AddToToolBundle {
+        bundle: fresh.clone(),
+        review,
+    };
+    let first = guarded_job(&pane, None, fresh_add(None)).await.unwrap();
+    assert_eq!(first["bin_directory"], "/.local/bin");
+    assert!(first["current"]["version"].is_null());
+    let token = first["review"].as_str().unwrap().to_owned();
+    let wrong_mode = Operation::ApplyToolBundle {
+        bundle: fresh.clone(),
+        review: token.clone(),
+    };
+    let error = guarded_job(&pane, None, wrong_mode).await.unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    assert!(!remote.join(".local/bin/jq").exists());
+    let added = guarded_job(&pane, None, fresh_add(Some(token)))
+        .await
+        .unwrap();
+    assert_eq!(added["automatic_sync_paused"], true);
+    assert!(
+        fs::read_to_string(remote.join(".local/bin/jq"))
+            .unwrap()
+            .contains("extra-tools")
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
     let (pane, _, root, _, server) = fixture(false).await;
     let remote = root.path();
@@ -943,7 +1081,7 @@ fn connect_tools(options: &SshOptions) -> Session {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn approved_tool_sync_installs_before_shell_and_respects_manual_rollback() {
+async fn approved_tool_sync_installs_before_shell_and_respects_manual_changes() {
     let (source, remote, _, server) = fixture_connections(false, 8).await;
     let root = remote.path();
     let local = tempfile::tempdir().unwrap();
@@ -1071,6 +1209,33 @@ async fn approved_tool_sync_installs_before_shell_and_respects_manual_rollback()
         selector().lines().nth(1).unwrap(),
         format!("versions/{second}")
     );
+    let mut extra = UtilityBundle::load(&local.path().join("fleet.json")).unwrap();
+    extra.tools = vec![UtilityTool {
+        name: "jq".into(),
+        builds: vec![build(
+            local.path(),
+            "jq",
+            UtilityArchitecture::X86_64,
+            executable(UtilityArchitecture::X86_64, None),
+        )],
+    }];
+    let add = |review| Operation::AddToToolBundle {
+        bundle: extra.clone(),
+        review,
+    };
+    let plan = guarded_job(&resumed, Some(1), add(None)).await.unwrap();
+    let review = plan["review"].as_str().unwrap().to_owned();
+    let added = guarded_job(&resumed, Some(1), add(Some(review)))
+        .await
+        .unwrap();
+    let extended = added["bundle_sha256"].as_str().unwrap();
+    let next = connect_tools(&options);
+    wait_tool_login(&next, 1, "held", None).await;
+    assert_eq!(
+        selector().lines().nth(1).unwrap(),
+        format!("./versions/{extended}")
+    );
+    assert!(store.join("versions").join(extended).join("jq").is_file());
     server.abort();
 }
 

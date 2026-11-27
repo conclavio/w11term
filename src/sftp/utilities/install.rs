@@ -115,13 +115,15 @@ pub(super) struct Selector {
 pub(super) struct InstallPlan {
     pub report: Value,
     pub release: Release,
-    pub selected: Vec<(StoredTool, PathBuf)>,
+    // A retained executable has no Windows fallback and must be copied from the active release.
+    pub selected: Vec<(StoredTool, Option<PathBuf>)>,
     pub selector: Selector,
     pub bin: DirectoryPlan,
     pub managed: DirectoryPlan,
     pub home: String,
     pub store: String,
     pub id: Option<String>,
+    pub manual: bool,
 }
 
 impl Engine {
@@ -363,9 +365,28 @@ impl Engine {
         review: &str,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        let plan = self.utility_plan(session, bundle).await?;
+        let plan = self
+            .utility_plan(session, bundle, InstallMode::Replace)
+            .await?;
         self.check_utility_review(&plan.report, review)?;
         self.activate_utility_plan(session, &plan, stage).await
+    }
+
+    pub(in crate::sftp) async fn add_to_utility_bundle(
+        &self,
+        session: &Ssh,
+        bundle: UtilityBundle,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        let plan = self.utility_plan(session, bundle, InstallMode::Add).await?;
+        let Some(review) = review else {
+            return self.review_utility_plan(plan);
+        };
+        self.check_utility_review(&plan.report, review)?;
+        let mut result = self.activate_utility_plan(session, &plan, stage).await?;
+        result["automatic_sync_paused"] = json!(plan.manual);
+        Ok(result)
     }
 
     pub(super) async fn activate_utility_plan(
@@ -398,7 +419,7 @@ impl Engine {
                 (copied.len() < plan.selected.len(), copied)
             };
             let launchers = self.create_launchers(&plan.home, store, &plan.release, &plan.bin).await?;
-            let changed = self.switch_utility_selector(store, id, false, &plan.selector).await?;
+            let changed = self.switch_utility_selector(store, id, plan.manual, &plan.selector).await?;
             Ok(json!({
                 "bundle": plan.release.name, "bundle_sha256": id, "previous_bundle_sha256": plan.selector.version,
                 "changed": changed, "uploaded": uploaded, "copied_tools": copied_tools,
@@ -586,7 +607,12 @@ impl Engine {
                     copied.push(tool.name.clone());
                     continue;
                 }
-                let source = path.clone();
+                let source = path.clone().with_context(|| {
+                    format!(
+                        "The existing executable {} changed. Review the tool bundle again.",
+                        tool.name
+                    )
+                })?;
                 let pin = tool.sha256.clone();
                 let mut remaining = tool.bytes;
                 let contents = tokio::task::spawn_blocking(move || {
@@ -698,7 +724,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn verify_utility_release(
+    pub(super) async fn verify_utility_release(
         &self,
         session: &Ssh,
         store: &str,

@@ -1712,7 +1712,7 @@ async fn run_channel(
                     login_notices.push(format!("Tool PATH skipped: {detail}"));
                     report.detail = Some(detail);
                 } else if result.status == ToolBundleSyncStatus::Held {
-                    login_notices.push("Tool bundle sync paused by rollback".into());
+                    login_notices.push("Tool bundle sync paused by a manual change".into());
                 }
             }
             Ok(Err(error)) => {

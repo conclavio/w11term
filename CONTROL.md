@@ -1414,6 +1414,15 @@ $plan = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools
 
 Installation verifies the uploaded files over SFTP and publishes the version under `~/.local/share/w11term/tools/<name>/versions/<sha256>/`. It adds launchers to the bundle's `bin_directory`, preserving entries already owned by the account. Add that directory to the shell's `PATH` if the preview reports it missing. Keep the bin directory fixed across versions of one named bundle. The installer reuses a verified copy when the requested version is already present and copies unchanged tools from the active version when building a new one. The `previous_bundle_sha256` in an update reply identifies the version to restore.
 
+Use `preview-tool-bundle-add BUNDLE.json` and `add-to-tool-bundle BUNDLE.json --review TOKEN` to add tools to the named bundle. The review shows the retained executables and checks their hashes. The addition keeps the active bundle's launcher directory and each existing tool's exact binary, including when the input names an existing tool. It uses the manifest's launcher directory when creating a bundle. A new version pauses automatic sync for that bundle so an older profile manifest cannot remove the added tools on reconnect. Use **Bundle versions** to review a rollback or resume automatic updates.
+
+```powershell
+$addition = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-add '.\Extra tools.json' | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane add-to-tool-bundle '.\Extra tools.json' --review $addition.review
+```
+
+Direct pipe clients use `"op":"add-to-tool-bundle"` with a `bundle` object and include the returned `review` to apply the addition on the same SFTP connection.
+
 For a retained version, w11term can calculate the hashes on the verified SSH host using `head` and `sha256sum`. It checks the manifest and file metadata through SFTP and falls back to hashing the bytes over SFTP when the remote checksum command is unavailable.
 
 ```powershell
@@ -1449,7 +1458,7 @@ On an ordinary SSH connect or reconnect, w11term checks the verified endpoint an
 
 When the login PATH update is skipped, **Review PATH repair** checks the approved startup files over the current SSH connection. The review shows each file and the current and proposed text for any managed block it would replace. **Apply reviewed PATH repair** validates the review and writes the changes for new shells. Replacement requires one complete marker pair and preserves the text around it. Duplicate or incomplete marker pairs require manual correction.
 
-A manual rollback pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+A manual rollback or addition pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
 
 ```powershell
 $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-tools $activeSha256 | ConvertFrom-Json).result.sftp
