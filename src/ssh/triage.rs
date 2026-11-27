@@ -9,6 +9,7 @@ use tokio::sync::watch;
 pub(crate) mod cpu_profile;
 mod findings;
 pub(crate) mod packet_capture;
+pub(crate) mod syscall_capture;
 pub use findings::{Finding, Resource};
 
 pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
@@ -326,6 +327,79 @@ async fn read_diagnostic(
         crate::events::display_field(&String::from_utf8_lossy(&stderr))
     );
     Ok(stderr)
+}
+
+struct ArtifactMessages {
+    operation: &'static str,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status: Option<u32>,
+}
+
+impl ArtifactMessages {
+    fn new(operation: &'static str) -> Self {
+        Self {
+            operation,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: None,
+        }
+    }
+
+    async fn receive(&mut self, channel: &mut Channel<client::Msg>) -> Result<bool> {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                ensure!(
+                    self.stdout.len() + data.len() <= 4096,
+                    "{} metadata exceeds its limit",
+                    self.operation
+                );
+                self.stdout.extend_from_slice(&data);
+            }
+            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                ensure!(
+                    self.stderr.len() + data.len() <= 12 * 1024,
+                    "{} diagnostics exceed their limit",
+                    self.operation
+                );
+                self.stderr.extend_from_slice(&data);
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => self.status = Some(exit_status),
+            Some(ChannelMsg::Failure) => {
+                bail!("The server rejected the {} command", self.operation)
+            }
+            Some(ChannelMsg::Close) | None => return Ok(false),
+            _ => (),
+        }
+        Ok(true)
+    }
+
+    async fn line(&mut self, channel: &mut Channel<client::Msg>) -> Result<String> {
+        loop {
+            if let Some(i) = self.stdout.iter().position(|&byte| byte == b'\n') {
+                let line = self.stdout.drain(..=i).collect::<Vec<_>>();
+                return Ok(std::str::from_utf8(&line[..i])?.to_owned());
+            }
+            if !self.receive(channel).await? {
+                bail!(
+                    "{} ended early ({:?}). {}",
+                    self.operation,
+                    self.status,
+                    crate::events::display_field(&String::from_utf8_lossy(&self.stderr))
+                );
+            }
+        }
+    }
+
+    async fn finish(&mut self, channel: &mut Channel<client::Msg>) -> Result<()> {
+        while self.status.is_none() && self.receive(channel).await? {}
+        ensure!(
+            self.status == Some(0) && self.stdout.is_empty(),
+            "{} cleanup failed",
+            self.operation
+        );
+        Ok(())
+    }
 }
 
 struct PendingChannel(Option<Channel<client::Msg>>);

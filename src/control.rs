@@ -39,6 +39,7 @@ mod triage;
 mod workspace_preview;
 pub use crate::ssh::triage::cpu_profile::{CpuCallGraph, CpuProfileOptions};
 pub use crate::ssh::triage::packet_capture::PacketCaptureOptions;
+pub use crate::ssh::triage::syscall_capture::{SyscallFilter, SyscallOptions};
 pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
@@ -78,6 +79,23 @@ pub enum Request {
     PreviewPacketCapture {
         pane: u64,
         options: PacketCaptureOptions,
+    },
+    PreviewSyscallCapture {
+        pane: u64,
+        options: SyscallOptions,
+    },
+    CaptureSyscalls {
+        pane: u64,
+        options: SyscallOptions,
+        connection_generation: std::num::NonZeroU64,
+        review_id: String,
+        job_id: String,
+        output_file: PathBuf,
+    },
+    StopSyscallCapture {
+        pane: u64,
+        connection_generation: std::num::NonZeroU64,
+        job_id: String,
     },
     CapturePackets {
         pane: u64,
@@ -1446,6 +1464,35 @@ impl Registry {
             Request::PreviewPacketCapture { pane, options } => {
                 self.preview_packet_capture(pane, options).await
             }
+            Request::PreviewSyscallCapture { pane, options } => {
+                self.preview_syscall_capture(pane, options).await
+            }
+            Request::CaptureSyscalls {
+                pane,
+                options,
+                connection_generation,
+                review_id,
+                job_id,
+                output_file,
+            } => {
+                self.capture_syscalls(
+                    pane,
+                    options,
+                    connection_generation,
+                    &review_id,
+                    &job_id,
+                    output_file,
+                )
+                .await
+            }
+            Request::StopSyscallCapture {
+                pane,
+                connection_generation,
+                job_id,
+            } => {
+                self.stop_syscall_capture(pane, connection_generation, &job_id)
+                    .await
+            }
             Request::CapturePackets {
                 pane,
                 options,
@@ -2737,6 +2784,7 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
         Duration::from_secs(match request {
             Request::LinuxTriage { .. } => crate::ssh::triage::DEADLINE.as_secs() + 20,
             Request::CapturePackets { .. } => crate::ssh::triage::packet_capture::CONTROL_SECONDS,
+            Request::CaptureSyscalls { .. } => crate::ssh::triage::syscall_capture::CONTROL_SECONDS,
             Request::CaptureCpuProfile {
                 perf_data_file: Some(_),
                 ..

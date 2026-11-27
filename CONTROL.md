@@ -1462,6 +1462,21 @@ Defaults are 15 seconds, a 192-byte snap length, a 16 MiB budget, and `/tmp` scr
 
 SFTP transfers the completed file over the existing SSH connection. w11term checks its size, SHA-256, and packet records before publishing a new local file and reports the packet count, stop reason, and available drop statistics. The private scratch files expire after the transfer lease or are cleaned up after verified receipt. `--wireshark` is optional and launches Wireshark on Windows after saving. If it cannot launch, the reply includes the saved path and the launch error. [Wireshark command-line options](https://www.wireshark.org/docs/wsug_html_chunked/ChCustCommandLine.html)
 
+### Capture Linux syscalls
+
+Use a connected Linux SSH pane with SFTP and a version of strace that supports `--kill-on-exit`. Review the working directory, executable identity, exact arguments, and capture bounds first. `--arg` can be repeated and each value is passed literally. The command runs as the remote SSH account with stdin, stdout, and stderr disconnected from the terminal.
+
+```powershell
+$traceOptions = @('--pane','1','--program','/usr/bin/ls','--arg','-l','--arg','/tmp','--directory','/tmp','--filter','files','--seconds','15','--max-mib','4')
+$plan = (& $ctl --pid 12345 preview-syscall-capture @traceOptions | ConvertFrom-Json).result.plan
+$job = [guid]::NewGuid().ToString('N')
+& $ctl --pid 12345 capture-syscalls @traceOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --job-id $job --output-file '.\example.strace'
+```
+
+From a separate prompt, `stop-syscall-capture --pane 1 --connection-generation GENERATION --job-id JOB` requests an early stop on the matching job. Choose a fresh job ID for each run. Stop, the deadline, and the byte limit terminate the launched command and traced descendants. The result gives the stop reason and reports the command's exit status when it completes on its own. A file that reaches the byte limit can end partway through a record.
+
+The original PID-tagged trace includes per-call timing and decoded descriptor details. One byte budget covers the full stream across descendants. w11term checks the SFTP download's size and SHA-256 before acknowledging remote cleanup and saving a new local file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+
 ### Collect Linux performance triage
 
 In the Windows app, open **More → Linux performance triage** or find it in the command palette. Select a connected SSH pane to review the endpoint and checks, then choose **Run triage**. Choose a resource under **Findings by resource**, then select a finding to see its source sample and output line when available. **Save report** writes a new JSON file. **Open report** reopens that format from the app, including reports collected by the CLI.

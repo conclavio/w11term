@@ -1,6 +1,7 @@
-use super::{ConnectionShare, PendingChannel, Target, diagnostic_destination, quote};
+use super::{
+    ArtifactMessages, ConnectionShare, PendingChannel, Target, diagnostic_destination, quote,
+};
 use anyhow::{Context, Result, bail, ensure};
-use russh::{Channel, ChannelMsg, client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,7 +13,6 @@ use std::{
 const SCRIPT: &str = include_str!("packet-capture.sh");
 const CAPTURE_FILE: &str = "capture.pcap";
 const METADATA_BYTES: usize = 4096;
-const DIAGNOSTIC_BYTES: usize = 12 * 1024;
 const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 
@@ -330,7 +330,7 @@ async fn capture_and_download(
             ),
         )
         .await?;
-    let mut messages = Messages::default();
+    let mut messages = ArtifactMessages::new("Packet capture");
     let line = messages.line(channel).await?;
     let parts: Vec<_> = line.split('\t').collect();
     let ["w11term-packet-ready-v1", reason, size, hash] = parts.as_slice() else {
@@ -405,64 +405,6 @@ fn count_stat(stderr: &str, label: &str) -> Option<u64> {
             .or_else(|| text.strip_prefix("packet "))?;
         (suffix == label).then(|| count.parse().ok()).flatten()
     })
-}
-
-#[derive(Default)]
-struct Messages {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    status: Option<u32>,
-}
-
-impl Messages {
-    async fn receive(&mut self, channel: &mut Channel<client::Msg>) -> Result<bool> {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => {
-                ensure!(
-                    self.stdout.len() + data.len() <= METADATA_BYTES,
-                    "Packet capture metadata exceeds its limit"
-                );
-                self.stdout.extend_from_slice(&data);
-            }
-            Some(ChannelMsg::ExtendedData { data, .. }) => {
-                ensure!(
-                    self.stderr.len() + data.len() <= DIAGNOSTIC_BYTES,
-                    "Packet capture diagnostics exceed their limit"
-                );
-                self.stderr.extend_from_slice(&data);
-            }
-            Some(ChannelMsg::ExitStatus { exit_status }) => self.status = Some(exit_status),
-            Some(ChannelMsg::Failure) => bail!("The server rejected the packet capture command"),
-            Some(ChannelMsg::Close) | None => return Ok(false),
-            _ => (),
-        }
-        Ok(true)
-    }
-
-    async fn line(&mut self, channel: &mut Channel<client::Msg>) -> Result<String> {
-        loop {
-            if let Some(i) = self.stdout.iter().position(|&byte| byte == b'\n') {
-                let line = self.stdout.drain(..=i).collect::<Vec<_>>();
-                return Ok(std::str::from_utf8(&line[..i])?.to_owned());
-            }
-            if !self.receive(channel).await? {
-                bail!(
-                    "Remote packet capture ended early ({:?}). {}",
-                    self.status,
-                    crate::events::display_field(&String::from_utf8_lossy(&self.stderr))
-                );
-            }
-        }
-    }
-
-    async fn finish(&mut self, channel: &mut Channel<client::Msg>) -> Result<()> {
-        while self.status.is_none() && self.receive(channel).await? {}
-        ensure!(
-            self.status == Some(0) && self.stdout.is_empty(),
-            "Remote packet capture cleanup failed"
-        );
-        Ok(())
-    }
 }
 
 fn count_packets(file: std::fs::File, size: u64) -> Result<u32> {

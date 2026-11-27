@@ -32,6 +32,8 @@ struct Peer {
 }
 
 const PERF_DATA_FIXTURE: &[u8] = b"PERFILE2\0\xff\r\nraw perf fixture\0";
+const SYSCALL_FIXTURE: &[u8] =
+    b"720 1700000000.000001 openat(AT_FDCWD, \"missing\", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000002>\n";
 // Classic little-endian pcap, one captured packet with a four-byte payload.
 const PCAP_FIXTURE: &[u8] = b"\xd4\xc3\xb2\xa1\x02\0\x04\0\0\0\0\0\0\0\0\0\xc0\0\0\0\x01\0\0\0\
     \x01\0\0\0\0\0\0\0\x04\0\0\0\x04\0\0\0\xab\xcd\xef\x01";
@@ -307,6 +309,40 @@ impl server::Handler for Peer {
                     )
                     .into_bytes(),
                 )?;
+            }
+            return Ok(());
+        }
+        if let Some((_, args)) = std::str::from_utf8(command)
+            .ok()
+            .filter(|command| command.starts_with("/bin/bash -c '# w11term-syscall-capture-v1"))
+            .and_then(|command| command.rsplit_once("' w11term-syscall-capture "))
+        {
+            s.channel_success(c)?;
+            if args.starts_with("inspect ") {
+                s.data(
+                    c,
+                    b"w11term-syscall-plan-v1\t/home/test\t/bin/sh\tfixture-identity\n".to_vec(),
+                )?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else {
+                let job = args
+                    .split_ascii_whitespace()
+                    .nth(10)
+                    .unwrap()
+                    .trim_matches('\'');
+                anyhow::ensure!(
+                    job.len() == 32 && job.bytes().all(|byte| byte.is_ascii_hexdigit())
+                );
+                let remote = self.root.join("tmp").join(format!("w11term-strace-{job}"));
+                fs::create_dir_all(&remote)?;
+                fs::write(remote.join("trace.strace"), SYSCALL_FIXTURE)?;
+                fs::write(
+                    self.root.join(format!("syscall-ack-{c}")),
+                    remote.to_str().unwrap(),
+                )?;
+                fs::write(self.root.join("syscall-started"), args)?;
             }
             return Ok(());
         }
@@ -630,6 +666,35 @@ impl server::Handler for Peer {
             s.exit_status_request(c, 0)?;
             s.eof(c)?;
             s.close(c)?;
+            return Ok(());
+        }
+        let syscall_marker = self.root.join(format!("syscall-ack-{c}"));
+        if let Ok(remote) = fs::read_to_string(&syscall_marker) {
+            if data == b"stop\n" {
+                use sha2::{Digest, Sha256};
+                let hash: String = Sha256::digest(SYSCALL_FIXTURE)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                s.data(
+                    c,
+                    format!(
+                        "w11term-syscall-ready-v1\tstopped\t-\t{}\t{hash}\n",
+                        SYSCALL_FIXTURE.len()
+                    )
+                    .into_bytes(),
+                )?;
+            } else if data == b"verified\n" {
+                let remote = PathBuf::from(remote);
+                fs::remove_file(remote.join("trace.strace"))?;
+                fs::remove_dir(remote)?;
+                fs::remove_file(syscall_marker)?;
+                fs::write(self.root.join("syscall-verified"), [])?;
+                s.data(c, b"w11term-syscall-complete-v1\n".to_vec())?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            }
             return Ok(());
         }
         if self.channels.contains_key(&c) {
@@ -2157,6 +2222,90 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
         fs::read(local.path().join("reviewed capture.pcap")).unwrap(),
         PCAP_FIXTURE
     );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let registry = registry(&pane);
+    let callback: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screenshot"));
+    let options = control::SyscallOptions {
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), "printf '%s' '$literal'".into()],
+        directory: "/home/test".into(),
+        seconds: 30,
+        max_mib: 1,
+        string_size: 128,
+        filter: control::SyscallFilter::Files,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewSyscallCapture {
+                pane: 1,
+                options: options.clone(),
+            },
+            callback.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    assert_eq!(
+        plan["strace_arguments"].as_array().unwrap().last().unwrap(),
+        "printf '%s' '$literal'"
+    );
+    let generation = plan["connection_generation"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let job = "1234567890abcdef1234567890abcdef";
+    let output_file = local.path().join("raw.strace");
+    let request = |options| Request::CaptureSyscalls {
+        pane: 1,
+        options,
+        connection_generation: generation,
+        review_id: plan["review_id"].as_str().unwrap().into(),
+        job_id: job.into(),
+        output_file: output_file.clone(),
+    };
+    let mut changed = options.clone();
+    changed.arguments.push("changed".into());
+    let error = registry
+        .execute(request(changed), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Review again"));
+    let started = remote.path().join("syscall-started");
+    assert!(!started.exists());
+    let stop = |job_id: &str| Request::StopSyscallCapture {
+        pane: 1,
+        connection_generation: generation,
+        job_id: job_id.into(),
+    };
+    let capture = registry.execute(request(options), callback.clone());
+    let stop = async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let error = registry
+            .execute(stop("00000000000000000000000000000000"), callback.clone())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("No matching running syscall capture"));
+        registry.execute(stop(job), callback.clone()).await.unwrap()
+    };
+    let (capture, stopped) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(capture, stop)
+    })
+    .await
+    .unwrap();
+    assert_eq!(stopped["stop_requested"], true);
+    let capture = capture.unwrap();
+    assert_eq!(capture["capture"]["stop_reason"], "stopped");
+    assert_eq!(fs::read(output_file).unwrap(), SYSCALL_FIXTURE);
+    assert!(remote.path().join("syscall-verified").exists());
     server.abort();
 }
 

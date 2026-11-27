@@ -40,6 +40,7 @@ struct Link {
     forward_channels: Arc<Semaphore>,
     dotfiles_sync: tokio::sync::Mutex<()>,
     diagnostic: tokio::sync::Mutex<()>,
+    syscall_capture: super::triage::syscall_capture::ActiveJobs,
 }
 
 impl Drop for Link {
@@ -109,6 +110,7 @@ impl ConnectionShare {
             forward_channels: Arc::new(Semaphore::new(super::local_forward::MAX_CHANNELS_PER_LINK)),
             dotfiles_sync: tokio::sync::Mutex::new(()),
             diagnostic: tokio::sync::Mutex::new(()),
+            syscall_capture: Default::default(),
         }))
     }
     pub fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
@@ -144,6 +146,10 @@ impl ConnectionShare {
             .diagnostic
             .try_lock()
             .context("A performance diagnostic is already running on this SSH transport")
+    }
+
+    pub(super) fn syscall_capture(&self) -> &super::triage::syscall_capture::ActiveJobs {
+        &self.0.syscall_capture
     }
     pub fn options(&self) -> &SshOptions {
         &self.0.options

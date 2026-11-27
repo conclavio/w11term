@@ -15,6 +15,8 @@ mod cpu_profile;
 mod packet_capture;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
+#[path = "w11term-cli/syscall_capture.rs"]
+mod syscall_capture;
 #[path = "w11term-cli/tool_bundles.rs"]
 mod tool_bundles;
 
@@ -145,6 +147,16 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                     wireshark,
                     ..Invocation::new(pid, request)
                 });
+            }
+            "preview-syscall-capture" | "capture-syscalls" | "stop-syscall-capture"
+                if verb.is_none() =>
+            {
+                ensure!(
+                    payload.is_none() && path.is_none() && !no_paste,
+                    "invalid options before syscall capture command"
+                );
+                return syscall_capture::parse(&arg, args, pane)
+                    .map(|request| Invocation::new(pid, request));
             }
             "sftp" if verb.is_none() => {
                 ensure!(
@@ -280,6 +292,7 @@ async fn main() -> ExitCode {
         );
         println!("\n{}", cpu_profile::HELP);
         println!("\n{}", packet_capture::HELP);
+        println!("\n{}", syscall_capture::HELP);
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {

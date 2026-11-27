@@ -76,6 +76,44 @@ impl Registry {
         Ok(json!({ "pane": pane, "plan": target.preview_packet_capture(options).await? }))
     }
 
+    pub(super) async fn preview_syscall_capture(
+        &self,
+        pane: u64,
+        options: SyscallOptions,
+    ) -> Result<Value> {
+        let mut target = self.diagnostic_target(pane, None).await?;
+        Ok(json!({ "pane": pane, "plan": target.preview_syscall_capture(options).await? }))
+    }
+
+    pub(super) async fn capture_syscalls(
+        &self,
+        pane: u64,
+        options: SyscallOptions,
+        generation: NonZeroU64,
+        review_id: &str,
+        job_id: &str,
+        path: PathBuf,
+    ) -> Result<Value> {
+        let target = self.diagnostic_target(pane, Some(generation)).await?;
+        let capture = target
+            .capture_syscalls(pane, options, review_id, job_id, path)
+            .await?;
+        Ok(
+            json!({ "pane": pane, "connection_generation": generation, "job_id": job_id, "capture": capture }),
+        )
+    }
+
+    pub(super) async fn stop_syscall_capture(
+        &self,
+        pane: u64,
+        generation: NonZeroU64,
+        job_id: &str,
+    ) -> Result<Value> {
+        let target = self.diagnostic_target(pane, Some(generation)).await?;
+        target.stop_syscall_capture(pane, job_id)?;
+        Ok(json!({ "pane": pane, "job_id": job_id, "stop_requested": true }))
+    }
+
     pub(super) async fn capture_packets(
         &self,
         pane: u64,
