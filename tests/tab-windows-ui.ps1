@@ -23,10 +23,13 @@ public static class TabFixtureWindows {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
-    public static string Describe(IntPtr hwnd) {
+    public static uint ProcessId(IntPtr hwnd) {
         uint pid;
         GetWindowThreadProcessId(hwnd, out pid);
-        return String.Format("HWND {0}, PID {1}", hwnd, pid);
+        return pid;
+    }
+    public static string Describe(IntPtr hwnd) {
+        return String.Format("HWND {0}, PID {1}", hwnd, ProcessId(hwnd));
     }
     public static string Title(IntPtr hwnd) {
         var title = new StringBuilder(512);
@@ -236,11 +239,15 @@ function Expect-Text([int]$Pane, [string]$Value) {
     $null = Control @('wait-for-text','--pane',"$Pane",'--timeout','15',$Value)
 }
 
-function Expect-Focus([IntPtr]$Hwnd, [int]$Pane, [string]$Stage, [switch]$PrepareWindow) {
+function Expect-Focus([IntPtr]$Hwnd, [int]$Pane, [string]$Stage, [switch]$PrepareWindow, [switch]$RecoverExternalFocus) {
     try {
         $null = Wait-Until "$Stage (pane $Pane, HWND $Hwnd)" {
-            # Only reacquire focus for fixture setup. Action results are observed without intervention.
-            if ($PrepareWindow -and [TabFixtureWindows]::GetForegroundWindow() -ne $Hwnd) {
+            $foreground = [TabFixtureWindows]::GetForegroundWindow()
+            # Window activation can be arranged for setup, or recovered after an
+            # unrelated process takes the desktop. A wrong w11term window is
+            # still a failure when observing an action result.
+            if ($foreground -ne $Hwnd -and ($PrepareWindow -or
+                    ($RecoverExternalFocus -and [TabFixtureWindows]::ProcessId($foreground) -ne $app.Id))) {
                 Use-Window $Hwnd
             }
             $active = @((Control @('list')).sessions | Where-Object active)
@@ -1811,7 +1818,7 @@ function Test-RepairWorkspace {
     if ($repairedSsh.tab_id -ne $repairedLocal.tab_id -or $repairedSsh.tab_title -cne 'Cockpit tools') {
         throw 'The repaired SSH pane lost its split or tab title'
     }
-    Expect-Focus $child $repairedSsh.id 'The repaired SSH pane receives the saved focus'
+    Expect-Focus $child $repairedSsh.id 'The repaired SSH pane receives the saved focus' -RecoverExternalFocus
     Expect-Text $repairedSsh.id 'ready'
     Expect-Text $repairedLocal.id 'PS '
     Type-In $child 'repaired-ssh/'
