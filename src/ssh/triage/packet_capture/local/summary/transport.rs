@@ -12,6 +12,16 @@ pub struct TransportConversations {
     pub packets_without_ports: u32,
     pub untracked_packets: u32,
     pub top: Vec<TransportConversation>,
+    #[serde(skip)]
+    remaining: Vec<TransportConversation>,
+}
+
+impl TransportConversations {
+    pub(in crate::ssh::triage::packet_capture::local) fn pairs(
+        &self,
+    ) -> impl Iterator<Item = &TransportConversation> {
+        self.top.iter().chain(&self.remaining)
+    }
 }
 
 #[derive(Serialize)]
@@ -56,23 +66,26 @@ impl Scan {
 
     pub(super) fn finish(self) -> TransportConversations {
         let (ranked, untracked_packets) = self.pairs.into_ranked();
+        let tracked_pairs = ranked.len();
+        let mut top: Vec<_> = ranked
+            .into_iter()
+            .map(
+                |((protocol, a, b), [a_to_b, b_to_a])| TransportConversation {
+                    protocol,
+                    a,
+                    b,
+                    a_to_b,
+                    b_to_a,
+                },
+            )
+            .collect();
+        let remaining = top.split_off(tracked_pairs.min(MAX_RANKED_PAIRS));
         TransportConversations {
-            tracked_pairs: ranked.len(),
+            tracked_pairs,
             packets_without_ports: self.packets_without_ports,
             untracked_packets,
-            top: ranked
-                .into_iter()
-                .take(MAX_RANKED_PAIRS)
-                .map(
-                    |((protocol, a, b), [a_to_b, b_to_a])| TransportConversation {
-                        protocol,
-                        a,
-                        b,
-                        a_to_b,
-                        b_to_a,
-                    },
-                )
-                .collect(),
+            top,
+            remaining,
         }
     }
 }

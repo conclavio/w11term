@@ -1,11 +1,12 @@
-use super::{LocalCapture, summary::Traffic};
+use super::{LocalCapture, ip_protocol_label, summary::Traffic};
 use crate::prompts::sanitize_single_line;
 use serde::{Serialize, Serializer};
 use std::{
     cmp::Reverse,
     collections::BTreeMap,
+    fmt,
     io::{self, BufWriter, Write},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
 };
 
 mod protocols;
@@ -20,6 +21,7 @@ pub struct CaptureComparison {
     pub protocol_changes: Vec<ProtocolChange>,
     pub tcp_flag_comparison: Option<TcpFlagComparison>,
     pub conversation_changes: Vec<ConversationChange>,
+    pub transport_changes: Vec<ConversationChange>,
 }
 
 #[derive(Serialize)]
@@ -36,6 +38,8 @@ pub struct CaptureSide {
     pub untracked_packets: u32,
     pub unresolved_protocol_packets: u32,
     pub fragmented_packets: u32,
+    pub packets_without_ports: u32,
+    pub transport_untracked_packets: u32,
     pub complete: bool,
     pub issue: Option<String>,
 }
@@ -49,11 +53,36 @@ pub struct CountsDelta {
 
 #[derive(Serialize)]
 pub struct ConversationChange {
-    pub a: IpAddr,
-    pub b: IpAddr,
+    #[serde(flatten)]
+    pub endpoints: ConversationEndpoints,
     pub before: Option<DirectionalTraffic>,
     pub after: Option<DirectionalTraffic>,
     pub delta: Option<TrafficDelta>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(untagged)]
+pub enum ConversationEndpoints {
+    Ip {
+        a: IpAddr,
+        b: IpAddr,
+    },
+    Transport {
+        protocol: u8,
+        a: SocketAddr,
+        b: SocketAddr,
+    },
+}
+
+impl fmt::Display for ConversationEndpoints {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip { a, b } => write!(f, "{a} ↔ {b}"),
+            Self::Transport { protocol, a, b } => {
+                write!(f, "{} · {a} ↔ {b}", ip_protocol_label(*protocol))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -102,48 +131,44 @@ impl CaptureComparison {
             truncated_packets: i64::from(after.truncated_packets)
                 - i64::from(before.truncated_packets),
         });
-        let missing_is_zero =
-            [&before, &after].map(|side| side.complete && side.untracked_packets == 0);
-        let mut pairs: BTreeMap<_, [Option<DirectionalTraffic>; 2]> = BTreeMap::new();
-        for (index, source) in sources.into_iter().enumerate() {
-            for pair in source.summary.conversations.pairs() {
-                pairs.entry((pair.a, pair.b)).or_default()[index] = Some(DirectionalTraffic {
-                    a_to_b: pair.a_to_b,
-                    b_to_a: pair.b_to_a,
-                });
-            }
-        }
-        let mut conversation_changes: Vec<_> = pairs
-            .into_iter()
-            .filter_map(|((a, b), [before, after])| {
-                let before =
-                    before.or_else(|| missing_is_zero[0].then(DirectionalTraffic::default));
-                let after = after.or_else(|| missing_is_zero[1].then(DirectionalTraffic::default));
-                if before == after {
-                    return None;
-                }
-                let delta = before
-                    .zip(after)
-                    .filter(|_| complete)
-                    .map(|(before, after)| TrafficDelta::between(before.total(), after.total()));
-                Some(ConversationChange {
-                    a,
-                    b,
-                    before,
-                    after,
-                    delta,
+        let sides = [&before, &after];
+        let conversation_changes = compare_pairs(
+            sources.map(|source| {
+                source.summary.conversations.pairs().map(|pair| {
+                    (
+                        ConversationEndpoints::Ip {
+                            a: pair.a,
+                            b: pair.b,
+                        },
+                        DirectionalTraffic {
+                            a_to_b: pair.a_to_b,
+                            b_to_a: pair.b_to_a,
+                        },
+                    )
                 })
-            })
-            .collect();
-        conversation_changes.sort_unstable_by_key(|change| {
-            let rank = change.delta.as_ref().map(|delta| {
-                (
-                    delta.captured_bytes.unsigned_abs(),
-                    delta.packets.unsigned_abs(),
-                )
-            });
-            (Reverse(rank), change.a, change.b)
-        });
+            }),
+            sides.map(|side| side.complete && side.untracked_packets == 0),
+            complete,
+        );
+        let transport_changes = compare_pairs(
+            sources.map(|source| {
+                source.summary.transport_conversations.pairs().map(|pair| {
+                    (
+                        ConversationEndpoints::Transport {
+                            protocol: pair.protocol,
+                            a: pair.a,
+                            b: pair.b,
+                        },
+                        DirectionalTraffic {
+                            a_to_b: pair.a_to_b,
+                            b_to_a: pair.b_to_a,
+                        },
+                    )
+                })
+            }),
+            sides.map(|side| side.has_port_coverage() && side.transport_untracked_packets == 0),
+            sides.into_iter().all(CaptureSide::has_port_coverage),
+        );
         Self {
             schema_version: 1,
             before,
@@ -152,6 +177,7 @@ impl CaptureComparison {
             protocol_changes,
             tcp_flag_comparison,
             conversation_changes,
+            transport_changes,
         }
     }
 
@@ -196,6 +222,11 @@ impl CaptureComparison {
                 "Unresolved IP protocols {} · Fragmented IP packets {}",
                 side.unresolved_protocol_packets, side.fragmented_packets
             )?;
+            writeln!(
+                output,
+                "TCP/UDP packets without ports {} · Untracked TCP/UDP packets {}",
+                side.packets_without_ports, side.transport_untracked_packets
+            )?;
             if let Some(issue) = &side.issue {
                 writeln!(
                     output,
@@ -228,38 +259,97 @@ impl CaptureComparison {
                 writeln!(output, "{line}")?;
             }
         }
-        writeln!(
-            output,
-            "\nIP conversation changes · {}",
-            self.conversation_changes.len()
-        )?;
-        for change in &self.conversation_changes {
-            writeln!(output, "\n{} ↔ {}", change.a, change.b)?;
-            for (role, traffic) in [("Before", change.before), ("After", change.after)] {
-                if let Some(traffic) = traffic {
-                    writeln!(
-                        output,
-                        "{role} · A to B {} packets, {} bytes · B to A {} packets, {} bytes",
-                        traffic.a_to_b.packets,
-                        traffic.a_to_b.captured_bytes,
-                        traffic.b_to_a.packets,
-                        traffic.b_to_a.captured_bytes
-                    )?;
-                } else {
-                    writeln!(output, "{role} · Pair coverage unavailable")?;
-                }
+        write_conversation_changes(&mut output, "IP", &self.conversation_changes)?;
+        write_conversation_changes(&mut output, "TCP and UDP", &self.transport_changes)?;
+        output.flush()
+    }
+}
+
+fn compare_pairs<T: IntoIterator<Item = (ConversationEndpoints, DirectionalTraffic)>>(
+    sources: [T; 2],
+    missing_is_zero: [bool; 2],
+    deltas_available: bool,
+) -> Vec<ConversationChange> {
+    let mut pairs: BTreeMap<_, [Option<DirectionalTraffic>; 2]> = BTreeMap::new();
+    for (index, source) in sources.into_iter().enumerate() {
+        for (endpoints, traffic) in source {
+            pairs.entry(endpoints).or_default()[index] = Some(traffic);
+        }
+    }
+    let mut changes: Vec<_> = pairs
+        .into_iter()
+        .filter_map(|(endpoints, [before, after])| {
+            let before = before.or_else(|| missing_is_zero[0].then(DirectionalTraffic::default));
+            let after = after.or_else(|| missing_is_zero[1].then(DirectionalTraffic::default));
+            if before == after {
+                return None;
             }
-            if let Some(delta) = &change.delta {
+            let delta = before
+                .zip(after)
+                .filter(|_| deltas_available)
+                .map(|(before, after)| TrafficDelta::between(before.total(), after.total()));
+            Some(ConversationChange {
+                endpoints,
+                before,
+                after,
+                delta,
+            })
+        })
+        .collect();
+    changes.sort_unstable_by_key(|change| {
+        let rank = change.delta.as_ref().map(|delta| {
+            (
+                delta.captured_bytes.unsigned_abs(),
+                delta.packets.unsigned_abs(),
+            )
+        });
+        (Reverse(rank), change.endpoints)
+    });
+    changes
+}
+
+fn write_conversation_changes(
+    mut output: impl Write,
+    category: &str,
+    changes: &[ConversationChange],
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "\n{category} conversation changes · {}",
+        changes.len()
+    )?;
+    for change in changes {
+        writeln!(output, "\n{}", change.endpoints)?;
+        for (role, traffic) in [("Before", change.before), ("After", change.after)] {
+            if let Some(traffic) = traffic {
                 writeln!(
                     output,
-                    "Change · {:+} packets · {:+} captured bytes",
-                    delta.packets, delta.captured_bytes
+                    "{role} · A to B {} packets, {} bytes · B to A {} packets, {} bytes",
+                    traffic.a_to_b.packets,
+                    traffic.a_to_b.captured_bytes,
+                    traffic.b_to_a.packets,
+                    traffic.b_to_a.captured_bytes
                 )?;
             } else {
-                writeln!(output, "Change · Unavailable")?;
+                writeln!(output, "{role} · Pair coverage unavailable")?;
             }
         }
-        output.flush()
+        if let Some(delta) = &change.delta {
+            writeln!(
+                output,
+                "Change · {:+} packets · {:+} captured bytes",
+                delta.packets, delta.captured_bytes
+            )?;
+        } else {
+            writeln!(output, "Change · Unavailable")?;
+        }
+    }
+    Ok(())
+}
+
+impl CaptureSide {
+    fn has_port_coverage(&self) -> bool {
+        self.complete && self.packets_without_ports == 0 && self.unresolved_protocol_packets == 0
     }
 }
 
@@ -285,6 +375,8 @@ impl From<&LocalCapture> for CaptureSide {
             untracked_packets: conversations.untracked_packets,
             unresolved_protocol_packets: summary.ip_protocols.unresolved_protocol_packets,
             fragmented_packets: summary.ip_protocols.fragmented_packets,
+            packets_without_ports: summary.transport_conversations.packets_without_ports,
+            transport_untracked_packets: summary.transport_conversations.untracked_packets,
             complete: summary.issue.is_none(),
             issue: summary.issue.clone(),
         }

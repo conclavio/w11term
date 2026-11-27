@@ -493,6 +493,7 @@ try {
         $expected = ('frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip:{0}(?::|$)" && ' +
             '((ip.src#1 == 192.0.2.1 && {0}.srcport#1 == 49152 && ip.dst#1 == 192.0.2.2 && {0}.dstport#1 == 443) || ' +
             '(ip.src#1 == 192.0.2.2 && {0}.srcport#1 == 443 && ip.dst#1 == 192.0.2.1 && {0}.dstport#1 == 49152))') -f $protocolField
+        if ($kind -ceq 'TCP') { $tcpPortFilter = $expected }
         $row = Wait-Until "the $kind port pair can be selected" {
             Find-Element "$kind${dot}192.0.2.1:49152 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
         }
@@ -512,6 +513,39 @@ try {
         (Find-Element "TCP headers decoded${dot}Before 4 of 5${dot}After 0 of 0") -and
         (Find-Element "RST${dot}Before 1${dot}After 0") -and
         (Find-Element 'TCP flag deltas unavailable for this coverage')
+    }
+    $type = Wait-CaptureCombo 'Conversation type'
+    $type.SetFocus()
+    $type.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $ports = Wait-Until 'transport pairs are selectable in the comparison' {
+        Find-Element 'TCP and UDP ports' ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $ports.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'the transport comparison reports both pairs and their coverage' {
+        (Find-Element 'TCP and UDP conversation changes 2') -and
+        (Find-Element "TCP/UDP packets without ports 1${dot}Untracked TCP/UDP packets 0") -and
+        (Find-Element "Before${dot}Left to right 3 packets, 120 bytes${dot}Right to left 1 packets, 40 bytes") -and
+        (Find-Element "Change${dot}Unavailable")
+    }
+    $row = Wait-Until 'the compared TCP pair can be selected' {
+        Find-Element "TCP${dot}192.0.2.1:49152 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until 'the After capture opens with the exact TCP pair filter' {
+        $filterPath = $olderCapture + '.filter'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $tcpPortFilter
+    }
+    $source = Wait-CaptureCombo 'Capture to open in Wireshark'
+    $source.SetFocus()
+    $source.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $before = Wait-Until 'Before is selectable for the compared transport pair' {
+        Find-Element 'Before capture' ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $before.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until 'the Before capture opens with the same TCP pair filter' {
+        [IO.File]::Exists($transportFilterPath) -and [IO.File]::ReadAllText($transportFilterPath) -ceq $tcpPortFilter
     }
     Click 'Back to capture'
     Click 'Return to diagnostics overview'

@@ -51,6 +51,29 @@ fn raw_capture(packets: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<u8> {
     bytes
 }
 
+fn raw_transport_packet(protocol: u8, port: u16, reverse: bool) -> Vec<u8> {
+    let mut packet = vec![0_u8; if protocol == 6 { 40 } else { 28 }];
+    packet[0] = 0x45;
+    packet[3] = packet.len() as u8;
+    packet[9] = protocol;
+    let mut endpoints = [([192, 0, 2, 1], port), ([192, 0, 2, 2], 443_u16)];
+    if reverse {
+        endpoints.swap(0, 1);
+    }
+    for (index, (address, port)) in endpoints.into_iter().enumerate() {
+        let address_offset = 12 + index * 4;
+        packet[address_offset..address_offset + 4].copy_from_slice(&address);
+        let port_offset = 20 + index * 2;
+        packet[port_offset..port_offset + 2].copy_from_slice(&port.to_be_bytes());
+    }
+    if protocol == 6 {
+        packet[32] = 0x50;
+    } else {
+        packet[25] = 8;
+    }
+    packet
+}
+
 fn classic_capture() -> Vec<u8> {
     let mut bytes = vec![
         0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 1, 0, 0, 0,
@@ -306,6 +329,94 @@ fn a_pair_missing_after_the_tracking_limit_has_unknown_coverage() {
 }
 
 #[test]
+fn compares_transport_pairs_beyond_the_ranked_summary_and_keeps_protocols_distinct() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "baseline.pcap";
+    let after = "current.pcap";
+    fs::write(
+        root.join(before),
+        raw_capture((1001..=1012).map(|port| raw_transport_packet(17, port, false))),
+    )
+    .unwrap();
+    fs::write(
+        root.join(after),
+        raw_capture(
+            (1001..=1012)
+                .map(|port| raw_transport_packet(17, port, port == 1012))
+                .chain([raw_transport_packet(6, 1012, false)]),
+        ),
+    )
+    .unwrap();
+
+    let output = compare(root, before, after, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let changes = report["transport_changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    let tcp = &changes[0];
+    let udp = &changes[1];
+    assert_eq!(tcp["protocol"], 6);
+    assert_eq!(udp["protocol"], 17);
+    assert_eq!(tcp["a"], "192.0.2.1:1012");
+    assert_eq!(tcp["a"], udp["a"]);
+    assert_eq!(tcp["b"], "192.0.2.2:443");
+    assert_eq!(tcp["b"], udp["b"]);
+    assert_eq!(tcp["before"]["a_to_b"]["packets"], 0);
+    assert_eq!(tcp["delta"], json!({"packets": 1, "captured_bytes": 40}));
+    assert_eq!(udp["before"]["a_to_b"]["packets"], 1);
+    assert_eq!(udp["after"]["a_to_b"]["packets"], 0);
+    assert_eq!(udp["after"]["b_to_a"]["packets"], 1);
+    assert_eq!(udp["delta"], json!({"packets": 0, "captured_bytes": 0}));
+    assert_eq!(report["conversation_changes"][0]["a"], "192.0.2.1");
+    assert!(report["conversation_changes"][0].get("protocol").is_none());
+
+    let text = compare(root, before, after, &["--format", "text"]);
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("TCP and UDP conversation changes · 2"));
+    assert!(text.contains("TCP · 192.0.2.1:1012 ↔ 192.0.2.2:443"));
+    assert!(text.contains(
+        "UDP · 192.0.2.1:1012 ↔ 192.0.2.2:443\nBefore · A to B 1 packets, 28 bytes · B to A 0 packets, 0 bytes\nAfter · A to B 0 packets, 0 bytes · B to A 1 packets, 28 bytes"
+    ));
+}
+
+#[test]
+fn tracking_limit_keeps_observed_transport_deltas_but_cannot_prove_missing_pairs() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "many.pcap";
+    let after = "two.pcap";
+    fs::write(
+        root.join(before),
+        raw_capture((1..=4097).map(|port| raw_transport_packet(17, port, false))),
+    )
+    .unwrap();
+    fs::write(
+        root.join(after),
+        raw_capture([
+            raw_transport_packet(17, 1, true),
+            raw_transport_packet(17, 4097, false),
+        ]),
+    )
+    .unwrap();
+    let output = compare(root, before, after, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["before"]["transport_untracked_packets"], 1);
+    let changes = report["transport_changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 4097);
+    let tracked = &changes[4095];
+    assert_eq!(tracked["a"], "192.0.2.1:1");
+    assert_eq!(tracked["delta"], json!({"packets": 0, "captured_bytes": 0}));
+    let untracked = changes.last().unwrap();
+    assert_eq!(untracked["a"], "192.0.2.1:4097");
+    assert!(untracked["before"].is_null());
+    assert!(untracked["delta"].is_null());
+    assert_eq!(untracked["after"]["a_to_b"]["packets"], 1);
+}
+
+#[test]
 fn compares_protocols_and_withholds_tcp_flag_deltas_when_headers_are_unavailable() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -323,6 +434,7 @@ fn compares_protocols_and_withholds_tcp_flag_deltas_when_headers_are_unavailable
     let mut udp = [0_u8; 28];
     udp[..4].copy_from_slice(&[0x45, 0, 0, 28]);
     udp[9] = 17;
+    udp[25] = 8;
     fs::write(root.join(before), raw_capture([tcp(0x02), tcp(0x12)])).unwrap();
     let mut packets: Vec<_> = [tcp(0x02), tcp(0x04), tcp(0x04)].map(Vec::from).into();
     packets.push(udp.to_vec());
@@ -365,6 +477,11 @@ fn compares_protocols_and_withholds_tcp_flag_deltas_when_headers_are_unavailable
     assert_eq!(report["tcp_flag_comparison"]["after"]["rst"], 1);
     assert!(report["tcp_flag_comparison"]["delta"].is_null());
     assert_eq!(report["protocol_changes"][0]["delta"]["captured_bytes"], 40);
+    assert_eq!(report["after"]["packets_without_ports"], 1);
+    let udp = &report["transport_changes"][0];
+    assert_eq!(udp["protocol"], 17);
+    assert_eq!(udp["after"]["a_to_b"]["packets"], 1);
+    assert!(udp["delta"].is_null());
 
     packets[2][7] = 0;
     let mut unresolved_v6 = vec![0_u8; 40];
@@ -377,6 +494,8 @@ fn compares_protocols_and_withholds_tcp_flag_deltas_when_headers_are_unavailable
     assert_eq!(report["after"]["unresolved_protocol_packets"], 1);
     assert_eq!(report["tcp_flag_comparison"]["after"]["decoded_headers"], 3);
     assert!(report["tcp_flag_comparison"]["delta"].is_null());
+    assert_eq!(report["after"]["packets_without_ports"], 0);
+    assert!(report["transport_changes"][0]["delta"].is_null());
 
     fs::write(root.join(after), &complete[..complete.len() - 1]).unwrap();
     let report = inspect();

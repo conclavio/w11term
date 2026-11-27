@@ -1320,16 +1320,12 @@ impl TerminalApp {
                 }
             }
             Action::Comparison(revision, change) => {
-                if let Some((capture, a, b)) = panel
+                if let Some((capture, filter)) = panel
                     .comparison
                     .as_mut()
                     .and_then(|comparison| comparison.update(&revision, change))
                 {
-                    self.open_packet_viewer(
-                        capture,
-                        Some(WiresharkFilter::Conversation(a, b, None)),
-                        ctx,
-                    );
+                    self.open_packet_viewer(capture, Some(filter), ctx);
                 }
             }
             Action::BackToCapture => panel.comparison = None,
