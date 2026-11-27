@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 import re
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,16 @@ def smoke():
         literal = "quoted '$ path.txt"
         (directory / literal).write_text("w11term fixture")
         shell = "/bin/sh"
+        mutable = directory / "mutable executable"
+        shutil.copy2("/bin/true", mutable)
+        plan = reviewed(tmp, str(mutable), [])
+        mutable.write_text("#!/bin/sh\nexit 0\n")
+        stale = subprocess.run(
+            command("capture", tmp, str(mutable), [], job=uuid.uuid4().hex, plan=plan),
+            input=b"", capture_output=True, timeout=5,
+        )
+        assert stale.returncode == 2 and b"executable or working directory changed" in stale.stderr
+
         args = ["-c", 'cat "$1" & wait "$!"; cat missing-fixture; exit 124', "fixture", literal]
         reason, status, raw = run(tmp, shell, args)
         assert (reason, status) == ("exit", "124")
@@ -109,14 +120,28 @@ def smoke():
         for disconnect in (False, True):
             pid_path = directory / ("disconnected" if disconnect else "stopped")
             fixture = [
-                "-c", 'sleep 30 & child=$!; printf "%s %s\n" "$$" "$child" > "$1"; wait',
-                "fixture", str(pid_path),
+                "-c", """
+import os
+from pathlib import Path
+import sys
+import time
+
+parent = os.getpid()
+child = os.fork()
+if child == 0:
+    os.setsid()
+    assert not any(Path(f"/proc/self/fd/{fd}").exists() for fd in (7, 8, 9))
+    Path(sys.argv[1]).write_text(f"{parent} {os.getpid()}")
+    time.sleep(30)
+else:
+    os.waitpid(child, 0)
+""", str(pid_path),
             ]
             if disconnect:
-                run(tmp, shell, fixture, seconds=30, disconnect_after=pid_path)
+                run(tmp, sys.executable, fixture, seconds=30, disconnect_after=pid_path)
             else:
-                reason, status, raw = run(tmp, shell, fixture, seconds=30, stop_after=pid_path)
-                assert (reason, status) == ("stopped", "-") and b"execve(" in raw
+                reason, status, raw = run(tmp, sys.executable, fixture, seconds=30, stop_after=pid_path)
+                assert (reason, status) == ("stopped", "-") and b"setsid(" in raw
             assert all(dead(int(pid)) for pid in pid_path.read_text().split()), pid_path.read_text()
 
         reason, status, raw = run(tmp, sys.executable, [
