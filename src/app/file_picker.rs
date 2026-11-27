@@ -110,6 +110,12 @@ fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
 pub(super) struct Selection {
     pub path: PathBuf,
     pub overwrite: bool,
+    pub comparison_format: Option<ComparisonFormat>,
+}
+
+pub(super) enum ComparisonFormat {
+    Text,
+    Json,
 }
 
 fn shell_path(item: &IShellItem) -> wincore::Result<PathBuf> {
@@ -257,6 +263,10 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             Purpose::UploadFiles | Purpose::OpenDiagnostic(_) | Purpose::OpenSyscallTrace(_)
         );
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
+        let comparison_formats = matches!(
+            purpose,
+            Purpose::SyscallComparison | Purpose::TriageComparison
+        );
         let cookie = match purpose {
             Purpose::SaveSyscallTrace(path) => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
@@ -695,6 +705,20 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     _ => (w!("Save scrollback as text"), "terminal.txt", w!("txt")),
                 };
                 dialog.SetTitle(title)?;
+                if comparison_formats {
+                    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                    dialog.SetFileTypes(&[
+                        COMDLG_FILTERSPEC {
+                            pszName: w!("Text report (*.txt)"),
+                            pszSpec: w!("*.txt"),
+                        },
+                        COMDLG_FILTERSPEC {
+                            pszName: w!("JSON report (*.json)"),
+                            pszSpec: w!("*.json"),
+                        },
+                    ])?;
+                    dialog.SetFileTypeIndex(1)?;
+                }
                 let wide: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
                 dialog.SetDefaultExtension(extension)?;
@@ -738,6 +762,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     Ok(Selection {
                         path: shell_path(&items.GetItemAt(index)?)?,
                         overwrite: false,
+                        comparison_format: None,
                     })
                 })
                 .collect();
@@ -750,6 +775,19 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             );
         }
         let overwrite = confirmed.borrow().as_ref() == Some(&path);
-        Ok(vec![Selection { path, overwrite }])
+        let comparison_format = if comparison_formats {
+            Some(match dialog.GetFileTypeIndex()? {
+                1 => ComparisonFormat::Text,
+                2 => ComparisonFormat::Json,
+                index => anyhow::bail!("Unexpected comparison file type {index}"),
+            })
+        } else {
+            None
+        };
+        Ok(vec![Selection {
+            path,
+            overwrite,
+            comparison_format,
+        }])
     }
 }

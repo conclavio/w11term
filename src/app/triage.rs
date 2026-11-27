@@ -703,9 +703,12 @@ impl TerminalApp {
             Action::BackFromComparison if panel.pending.is_none() => panel.comparison = None,
             Action::ExportComparison if panel.pending.is_none() => {
                 if let Some(comparison) = panel.comparison.as_ref().map(|view| view.model.clone()) {
-                    self.begin_text_export(
+                    self.begin_comparison_export(
                         text_export::Subject::TriageComparison,
-                        move |output| comparison.write_report(output),
+                        move |output, format| match format {
+                            file_picker::ComparisonFormat::Text => comparison.write_report(output),
+                            file_picker::ComparisonFormat::Json => comparison.write_json(output),
+                        },
                         ctx,
                     );
                 }

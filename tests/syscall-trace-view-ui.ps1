@@ -120,11 +120,17 @@ function Apply-ChangeFilter([string]$Text) {
     Click 'Apply change filter'
 }
 
-function Save-Comparison([string]$Destination) {
+function Save-Comparison([string]$Destination, [switch]$Json) {
     Click ('Export comparison' + [char]0x2026)
     $dialog = Wait-Until 'owned comparison save dialog' { Find-OwnedDialog 'Save syscall comparison' }
+    if ($Json) {
+        $null = Wait-Until 'select JSON in Save as type' {
+            [FixtureDialog]::SelectFileType($dialog, 'JSON report (*.json)')
+        }
+    }
     $null = Wait-Until 'enter comparison export path' {
-        [FixtureDialog]::SetFilename($dialog, $Destination, 'syscall-comparison.txt')
+        [FixtureDialog]::SetFilename($dialog, $Destination, 'syscall-comparison.txt') -or
+            ($Json -and [FixtureDialog]::SetFilename($dialog, $Destination, 'syscall-comparison.json'))
     }
     $null = Wait-Until 'confirm comparison export' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'comparison save dialog closes' { !(Find-OwnedDialog 'Save syscall comparison') }
@@ -292,6 +298,22 @@ try {
         }
     }
     if ([IO.File]::ReadAllText($report) -cne $saved) { throw 'Export replaced an existing comparison file' }
+    $jsonBase = Join-Path $State 'comparison structured report'
+    Save-Comparison $jsonBase -Json
+    $null = Wait-Until 'JSON report is published with the selected extension' {
+        [IO.File]::Exists("$jsonBase.json")
+    }
+    $structured = [IO.File]::ReadAllText("$jsonBase.json") | ConvertFrom-Json
+    $change = $structured.changes[0]
+    if ($structured.schema_version -ne 1 -or $structured.filter -cne 'read /TMP/DATA' -or
+        $structured.include_timing -or $structured.changes.Count -ne 1 -or $change.syscall -cne 'read' -or
+        $change.count_delta -ne -1 -or $change.evidence_pair -ne 1 -or $change.evidence_pairs -ne 2 -or
+        $change.working_evidence.sources[0].file_name -cne 'working diag.strace' -or
+        $change.working_evidence.sources[0].line -ne 5 -or
+        $change.failing_evidence.sources[0].file_name -cne 'failing diag.strace' -or
+        $change.failing_evidence.sources[0].line -ne 4) {
+        throw 'JSON export did not capture the applied filter and selected evidence pair'
+    }
     Apply-ChangeFilter '/missing/filter/fixture'
     $null = Wait-Until 'a nonmatching filter clears stale comparison evidence' {
         (Find-Element 'No changes match the filter.') -and

@@ -179,6 +179,26 @@ try {
         [Convert]::ToBase64String([IO.File]::ReadAllBytes($comparisonReport))) {
         throw 'CLI triage comparison differs from the viewer export for the same reports'
     }
+    $jsonBase = Join-Path $State 'structured triage comparison'
+    Click ('Export comparison' + [char]0x2026)
+    $save = Wait-Until 'owned JSON export dialog' { Find-OwnedDialog 'Save Linux triage comparison' }
+    $null = Wait-Until 'select JSON triage comparison' {
+        [FixtureDialog]::SelectFileType($save, 'JSON report (*.json)')
+    }
+    $null = Wait-Until 'enter the JSON comparison export path' {
+        [FixtureDialog]::SetFilename($save, $jsonBase, 'linux-triage-comparison.txt') -or
+            [FixtureDialog]::SetFilename($save, $jsonBase, 'linux-triage-comparison.json')
+    }
+    $null = Wait-Until 'save the comparison as JSON' { [FixtureDialog]::ClickButton($save, 1) }
+    $null = Wait-Until 'JSON report is published with the selected extension' {
+        [IO.File]::Exists("$jsonBase.json")
+    }
+    $cliJson = Join-Path $State 'offline triage comparison.json'
+    $null = & $Cli compare-linux-triage $report $afterReport --output-file $cliJson
+    if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliJson)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes("$jsonBase.json"))) {
+        throw 'CLI triage comparison JSON differs from the Windows export'
+    }
     Click ('Review comparison with OpenRouter' + [char]0x2026)
     $null = Wait-Until 'comparison remains open beside the paired review preview' {
         $field = Find-Element 'OpenRouter request preview' ([System.Windows.Automation.ControlType]::Edit)

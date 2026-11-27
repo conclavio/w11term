@@ -283,7 +283,7 @@ impl TerminalApp {
                 match result {
                     Ok(text) => self.save_export(
                         subject,
-                        move |file| file.write_all(text.as_bytes()),
+                        move |file, _| file.write_all(text.as_bytes()),
                         context,
                     ),
                     Err(error) => self.export.finish(subject, Err(error)),
@@ -420,6 +420,38 @@ impl TerminalApp {
         write: impl FnOnce(&mut File) -> io::Result<()> + Send + 'static,
         context: &ComponentContext<Self>,
     ) {
+        self.begin_export(subject, move |file, _| write(file), context);
+    }
+
+    pub(super) fn begin_comparison_export(
+        &mut self,
+        subject: Subject,
+        write: impl FnOnce(&mut File, file_picker::ComparisonFormat) -> io::Result<()> + Send + 'static,
+        context: &ComponentContext<Self>,
+    ) {
+        self.begin_export(
+            subject,
+            move |file, format| {
+                let format = format.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "No comparison file type selected",
+                    )
+                })?;
+                write(file, format)
+            },
+            context,
+        );
+    }
+
+    fn begin_export(
+        &mut self,
+        subject: Subject,
+        write: impl FnOnce(&mut File, Option<file_picker::ComparisonFormat>) -> io::Result<()>
+        + Send
+        + 'static,
+        context: &ComponentContext<Self>,
+    ) {
         if self.export.pending.is_some() {
             return;
         }
@@ -434,7 +466,9 @@ impl TerminalApp {
     fn save_export(
         &mut self,
         subject: Subject,
-        write: impl FnOnce(&mut File) -> io::Result<()> + Send + 'static,
+        write: impl FnOnce(&mut File, Option<file_picker::ComparisonFormat>) -> io::Result<()>
+        + Send
+        + 'static,
         context: &ComponentContext<Self>,
     ) {
         let Some(owner) = self.keyboard.hwnd() else {
@@ -458,7 +492,9 @@ impl TerminalApp {
                     if cancel.is_cancelled() {
                         return Ok(None);
                     }
-                    w11term::transcript::save_with(&file.path, file.overwrite, write)?;
+                    w11term::transcript::save_with(&file.path, file.overwrite, |output| {
+                        write(output, file.comparison_format)
+                    })?;
                     Ok(Some(file.path))
                 };
                 Message::Export(Action::Finished(

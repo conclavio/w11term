@@ -1540,7 +1540,7 @@ Open the working capture and choose **Compare with failing trace…**. The compa
 
 Enter terms such as `openat ENOENT /tmp/settings` and choose **Apply change filter** to narrow the comparison by syscall, resource, executable, change type, or errno. Searches ignore case. All terms must match the change or its paired evidence. If an errno matches a call inside a repeated group, the viewer opens that pair of original records. Clear the field and apply again to restore all changes allowed by the timing setting.
 
-Choose **Export comparison…** to save a new text file. It includes all changes that pass the applied filter and timing setting, across every results page. Each change includes its counts, available duration delta, and source file and line references. The export also includes both originals for the currently selected evidence pair, with the same preview limits as the viewer.
+Choose **Export comparison…**, then choose Text or JSON under **Save as type**. Both formats include all changes that pass the applied filter and timing setting across every results page, with counts, available duration deltas, and source file and line references. Text includes the original lines for the currently selected evidence pair within the viewer's preview limits. JSON uses the CLI schema below and records the evidence pair you are viewing for the selected change.
 
 Use `compare-syscall-traces` to compare saved runs from a script without a GUI or SSH connection. Repeat `--working` or `--failing` to supply each side's `strace -ff` files. The command uses the viewer's normalization and matching, including errno filters and the default of hiding timing-only rows. Add `--include-timing` to include those rows.
 
@@ -1560,7 +1560,7 @@ Findings summarize observed CPU activity and runnable tasks, available memory an
 
 Choose **Compare reports** to use the displayed report as **Before** and open a saved JSON report as **After**. The offline view shows changes in check status, sampling commands, and reported observations. Choose a change to see the two values and their source output lines or excerpts. Numeric deltas require matching sampling commands and complete output on both sides. Disk and interface deltas also require the same recorded endpoint and device name. **Back to report** restores the original sample selection.
 
-Choose **Export comparison…** to save a new text file with all changes, both source names and coverage summaries, and the stored stdout and stderr text for each changed check. Output keeps its source line numbers so you can trace an observation back to either report. The file records whether the SSH endpoints match and uses only the report filenames from disk.
+Choose **Export comparison…**, then choose Text or JSON under **Save as type**. Both formats include all changes, both source names and coverage summaries, and the stored stdout and stderr text for each changed check. Output keeps its source line numbers so you can trace an observation back to either report. The file records whether the SSH endpoints match and uses only the report filenames from disk. JSON uses the same schema as the CLI.
 
 Run `compare-linux-triage` with the before and after report paths to compare offline from a script. The default schema-version-1 JSON includes coverage, check and observation changes, signed numeric deltas with units when the inputs support them, and both source outputs for each changed check. Use `--format text` for the same report the viewer exports.
 

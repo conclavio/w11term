@@ -39,6 +39,20 @@ impl Snapshot {
         })
     }
 
+    pub(super) fn write_json(mut self, output: impl Write) -> io::Result<()> {
+        if let Some((index, sample)) = self.selected
+            && let Ok(offset) = self.rows.binary_search_by_key(&index, |&(index, _)| index)
+        {
+            self.rows[offset].1 = sample;
+        }
+        self.comparison.write_visible_json(
+            self.query.as_deref().unwrap_or_default(),
+            self.timing,
+            &self.rows,
+            output,
+        )
+    }
+
     pub(super) fn write(&self, output: impl Write) -> io::Result<()> {
         let mut output = BufWriter::new(output);
         let compare = &self.comparison;

@@ -116,6 +116,31 @@ public static class FixtureDialog {
         return changed;
     }
 
+    public static bool SelectFileType(IntPtr dialog, string label) {
+        bool selected = false;
+        EnumChildWindows(dialog, (hwnd, _) => {
+            if (!IsControl(hwnd, "ComboBox")) return true;
+            IntPtr index;
+            if (SendMessageTimeout(hwnd, 0x0158, (IntPtr)(-1), new StringBuilder(label), 2, 1000, out index) == IntPtr.Zero ||
+                index == (IntPtr)(-1)) return true; // CB_FINDSTRINGEXACT
+            IntPtr current;
+            if (SendMessageTimeout(hwnd, 0x0147, IntPtr.Zero, IntPtr.Zero, 2, 1000, out current) == IntPtr.Zero)
+                return false; // CB_GETCURSEL
+            if (current != index) {
+                IntPtr result;
+                int key = index.ToInt32() > current.ToInt32() ? 0x28 : 0x26; // VK_DOWN or VK_UP
+                // Navigate the native two-format combo so it delivers the usual Shell notifications.
+                SendMessageTimeout(dialog, 0x0028, hwnd, (IntPtr)1, 2, 1000, out result); // WM_NEXTDLGCTL
+                if (SendMessageTimeout(hwnd, 0x0100, (IntPtr)key, (IntPtr)1, 2, 1000, out result) == IntPtr.Zero ||
+                    SendMessageTimeout(hwnd, 0x0147, IntPtr.Zero, IntPtr.Zero, 2, 1000, out current) == IntPtr.Zero)
+                    return false;
+            }
+            selected = current == index;
+            return false;
+        }, IntPtr.Zero);
+        return selected;
+    }
+
     public static bool ClickButton(IntPtr dialog, int id) {
         bool clicked = false;
         EnumChildWindows(dialog, (hwnd, _) => {

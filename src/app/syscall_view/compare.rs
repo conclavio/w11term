@@ -181,9 +181,12 @@ impl TerminalApp {
                         .comparison_input(tab)
                         .and_then(|state| report::Snapshot::capture(state))
                 {
-                    self.begin_text_export(
+                    self.begin_comparison_export(
                         text_export::Subject::SyscallComparison,
-                        move |file| snapshot.write(file),
+                        move |file, format| match format {
+                            file_picker::ComparisonFormat::Text => snapshot.write(file),
+                            file_picker::ComparisonFormat::Json => snapshot.write_json(file),
+                        },
                         ctx,
                     );
                 }

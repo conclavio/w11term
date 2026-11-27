@@ -17,7 +17,7 @@ impl Comparison {
     ) -> io::Result<()> {
         let query: String = query.chars().take(MAX_QUERY_CHARS).collect();
         let filter = query.trim();
-        let mut matches = if filter.is_empty() {
+        let matches = if filter.is_empty() {
             (0..self.rows.len())
                 .map(|index| RowMatch {
                     index,
@@ -27,7 +27,33 @@ impl Comparison {
         } else {
             self.search(filter)
         };
-        matches.retain(|matched| self.row_visible(matched.index, include_timing));
+        let rows: Vec<_> = matches
+            .into_iter()
+            .filter(|matched| self.row_visible(matched.index, include_timing))
+            .map(|matched| {
+                let row = &self.rows[matched.index];
+                (matched.index, matched.sample.unwrap_or(row.sample))
+            })
+            .collect();
+        self.write_visible_json(filter, include_timing, &rows, output)
+    }
+
+    /// Write a report from the viewer's ordered (row index, evidence index) selection.
+    pub fn write_visible_json(
+        &self,
+        filter: &str,
+        include_timing: bool,
+        rows: &[(usize, usize)],
+        output: impl Write,
+    ) -> io::Result<()> {
+        if rows.iter().any(|&(index, sample)| {
+            !self.row_visible(index, include_timing) || sample >= self.rows[index].evidence_count()
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid syscall comparison row or evidence index",
+            ));
+        }
         let report = Report {
             schema_version: 1,
             working: source(&self.traces[0]),
@@ -38,7 +64,7 @@ impl Comparison {
             total_changes: self.rows.len(),
             changes: Changes {
                 comparison: self,
-                matches: &matches,
+                rows,
             },
         };
         let mut output = BufWriter::new(output);
@@ -85,18 +111,16 @@ fn source(trace: &Trace) -> Source<'_> {
 
 struct Changes<'a> {
     comparison: &'a Comparison,
-    matches: &'a [RowMatch],
+    rows: &'a [(usize, usize)],
 }
 
 impl Serialize for Changes<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let comparison = self.comparison;
         let first = comparison.first_divergence();
-        let mut changes = serializer.serialize_seq(Some(self.matches.len()))?;
-        for matched in self.matches {
-            let index = matched.index;
+        let mut changes = serializer.serialize_seq(Some(self.rows.len()))?;
+        for &(index, sample) in self.rows {
             let row = &comparison.rows[index];
-            let sample = matched.sample.unwrap_or(row.sample);
             let [working_count, failing_count] = row.counts();
             let [working_result, failing_result] =
                 row.result.each_ref().map(|value| value.as_deref());
