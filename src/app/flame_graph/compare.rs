@@ -17,32 +17,6 @@ pub enum Action {
     Select(Arc<Comparison>, usize),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ProfileSide {
-    Before,
-    After,
-}
-
-impl ProfileSide {
-    pub(super) fn index(self) -> usize {
-        self as usize
-    }
-
-    pub(super) fn caption(self) -> &'static str {
-        match self {
-            Self::Before => "Before profile",
-            Self::After => "After profile",
-        }
-    }
-
-    pub(super) fn widths(self) -> &'static str {
-        match self {
-            Self::Before => "Before widths",
-            Self::After => "After widths",
-        }
-    }
-}
-
 pub struct ViewState {
     pub query: String,
     pub results: FilteredComparison,

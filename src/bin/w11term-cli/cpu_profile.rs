@@ -8,7 +8,10 @@ use std::{
 };
 use w11term::{
     control::{CpuCallGraph, CpuProfileOptions, Request},
-    cpu_profile::{Comparison, Profile},
+    cpu_profile::{
+        Comparison, Profile,
+        flame_graph::{Differential, ProfileSide},
+    },
 };
 
 pub(super) const HELP: &str = concat!(
@@ -20,8 +23,10 @@ pub(super) const HELP: &str = concat!(
 );
 
 pub(super) const COMPARE_VERB: &str = "compare-cpu-profiles";
-pub(super) const COMPARE_HELP: &str =
-    "w11term-cli compare-cpu-profiles BEFORE AFTER [--filter TEXT] [--output-file PATH]";
+pub(super) const COMPARE_HELP: &str = concat!(
+    "w11term-cli compare-cpu-profiles BEFORE AFTER [--format json] [--filter TEXT] [--output-file PATH]\n",
+    "w11term-cli compare-cpu-profiles BEFORE AFTER --format svg [--widths before|after] [--output-file PATH]",
+);
 
 pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
@@ -29,10 +34,14 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
     let after = args.next().context("provide the AFTER folded profile")?;
     let mut filter = None;
     let mut output_file = None;
+    let mut format = None;
+    let mut widths = None;
     while let Some(flag) = args.next() {
         let target = match flag.as_str() {
             "--filter" => &mut filter,
             "--output-file" => &mut output_file,
+            "--format" => &mut format,
+            "--widths" => &mut widths,
             _ => bail!("unknown option {flag} for {COMPARE_VERB}"),
         };
         ensure!(target.is_none(), "specify {flag} only once");
@@ -41,6 +50,25 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
                 .with_context(|| format!("{flag} requires a value"))?,
         );
     }
+    let widths = widths.map(String::as_str);
+    let svg_side = match format.map(String::as_str) {
+        None | Some("json") => {
+            ensure!(widths.is_none(), "--widths requires --format svg");
+            None
+        }
+        Some("svg") => {
+            ensure!(
+                filter.is_none(),
+                "SVG uses both full profiles. --filter applies to JSON reports"
+            );
+            Some(match widths {
+                None | Some("after") => ProfileSide::After,
+                Some("before") => ProfileSide::Before,
+                Some(_) => bail!("--widths requires before or after"),
+            })
+        }
+        Some(_) => bail!("--format requires json or svg"),
+    };
     let paths = [PathBuf::from(before), PathBuf::from(after)];
     let open = |side: usize, name: &str| {
         Profile::open(&paths[side])
@@ -49,10 +77,16 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
     };
     let profiles = [open(0, "before")?, open(1, "after")?];
     let comparison = Arc::new(Comparison::new(profiles, paths));
-    let report = comparison.filter(filter.map_or("", String::as_str));
-    offline::write_report(stdout, output_file.map(String::as_str), |dest| {
-        report.write_json(dest)
-    })
+    let output_file = output_file.map(String::as_str);
+    match svg_side {
+        Some(side) => offline::write_report(stdout, output_file, |dest| {
+            Differential { comparison, side }.write_svg(0, dest)
+        }),
+        None => {
+            let report = comparison.filter(filter.map_or("", String::as_str));
+            offline::write_report(stdout, output_file, |dest| report.write_json(dest))
+        }
+    }
 }
 
 pub(super) fn parse(

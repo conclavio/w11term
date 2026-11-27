@@ -1,6 +1,7 @@
 use super::*;
-use plot::{Differential, Plot, Range};
+use plot::Plot;
 use std::path::PathBuf;
+use w11term::cpu_profile::flame_graph::{Differential, ProfileSide, ROW_HEIGHT, Range};
 use w11term::cpu_profile::{FilteredComparison, Profile, Search, sample_share};
 use w11term::diagnostic_history::Kind as ArtifactKind;
 use w11term::ssh::{CaptureStop, CpuProfileSummary};
@@ -19,7 +20,7 @@ pub enum Action {
     CompareFile,
     Compare(compare::Action),
     Differential,
-    DifferentialWidth(compare::ProfileSide, Arc<()>),
+    DifferentialWidth(ProfileSide, Arc<()>),
     ReturnToComparison,
     Export(Arc<()>),
     Capture(capture::Action),
@@ -67,7 +68,7 @@ struct Loaded {
 }
 
 struct Inspection {
-    side: compare::ProfileSide,
+    side: ProfileSide,
     source: Loaded,
     alternate: Option<Loaded>,
 }
@@ -176,7 +177,7 @@ impl Panel {
                 ),
             ]);
             if inspection.alternate.is_some() {
-                let switch = |side: compare::ProfileSide| {
+                let switch = |side: ProfileSide| {
                     let source = inspection.source.ticket.clone();
                     Button::new()
                         .is_enabled(idle && side != inspection.side)
@@ -190,7 +191,7 @@ impl Panel {
                     KeyedView::new("differential-widths", StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(6.0)
-                        .children((switch(compare::ProfileSide::Before), switch(compare::ProfileSide::After)))),
+                        .children((switch(ProfileSide::Before), switch(ProfileSide::After)))),
                     text("differential-legend", "Full profiles · Exact-stack sample share · Red increased · Blue decreased · Gray unchanged"),
                 ]);
             }
@@ -261,10 +262,7 @@ impl Loaded {
         Self::with_mode(profile, path, capture, zoom, None)
     }
 
-    fn differential(
-        comparison: Arc<w11term::cpu_profile::Comparison>,
-        side: compare::ProfileSide,
-    ) -> Self {
+    fn differential(comparison: Arc<w11term::cpu_profile::Comparison>, side: ProfileSide) -> Self {
         let index = side.index();
         Self::with_mode(
             comparison.profiles()[index].clone(),
@@ -305,7 +303,7 @@ impl Loaded {
     }
 
     fn visible_rows(window_height: f64) -> usize {
-        (((window_height - 285.0) / f64::from(plot::ROW_HEIGHT)).floor() as usize).clamp(3, 50)
+        (((window_height - 285.0) / f64::from(ROW_HEIGHT)).floor() as usize).clamp(3, 50)
     }
 
     fn range(&self, window_height: f64) -> (Range, usize) {
@@ -687,15 +685,9 @@ impl TerminalApp {
                     let comparison = view.results.comparison().clone();
                     panel.status = None;
                     panel.inspection = Some(Inspection {
-                        side: compare::ProfileSide::After,
-                        source: Loaded::differential(
-                            comparison.clone(),
-                            compare::ProfileSide::After,
-                        ),
-                        alternate: Some(Loaded::differential(
-                            comparison,
-                            compare::ProfileSide::Before,
-                        )),
+                        side: ProfileSide::After,
+                        source: Loaded::differential(comparison.clone(), ProfileSide::After),
+                        alternate: Some(Loaded::differential(comparison, ProfileSide::Before)),
                     });
                 }
             }

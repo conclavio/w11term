@@ -1,6 +1,7 @@
 //! Shared parsing, comparison and JSON export for saved folded CPU stacks.
 
 mod compare;
+pub mod flame_graph;
 mod profile;
 
 pub use compare::{Change, Comparison, FilteredComparison};

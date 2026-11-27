@@ -1653,6 +1653,13 @@ $report.changes
 & $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --output-file '.\comparison.json'
 ```
 
+Use `--format svg` to draw a full differential flame graph offline. The graph defaults to After widths. Pass `--widths before` to see removed call paths. Both modes use the same colors and sample-share deltas as the Windows viewer. SVG goes to stdout unless you provide `--output-file`. The `--filter` option applies to JSON reports.
+
+```powershell
+& $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --format svg --output-file '.\after.svg'
+& $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --format svg --widths before --output-file '.\before.svg'
+```
+
 ### Run SFTP operations
 
 ```powershell

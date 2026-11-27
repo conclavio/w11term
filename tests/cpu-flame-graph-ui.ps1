@@ -227,6 +227,15 @@ try {
         (Find-SvgFrame $svgBefore 'read_file')) {
         throw 'The before differential SVG did not reveal removed paths with the same color scale'
     }
+    foreach ($side in @('before', 'after')) {
+        $nativeSvg = if ($side -eq 'before') { $diffBeforeSvg } else { $diffAfterSvg }
+        $cliSvg = Join-Path $State "offline diff $side.svg"
+        $null = & $Cli compare-cpu-profiles $folded $after --format svg --widths $side --output-file $cliSvg
+        if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliSvg)) -cne
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($nativeSvg))) {
+            throw "The offline $side differential SVG differs from the Windows viewer export"
+        }
+    }
     Click-GraphButton 'After widths'
     $null = Wait-Until 'the after width view retains its own zoom' { Find-Element 'Zoomed to hot_loop' }
     Click-GraphButton 'Back to comparison'

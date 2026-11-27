@@ -83,3 +83,59 @@ fn invalid_inputs_fail_before_creating_a_report() {
     assert!(error.contains("Invalid folded stack on line 1"), "{error}");
     assert!(!path.join("report.json").exists());
 }
+
+#[test]
+fn exports_differential_svg_with_both_widths_and_preserves_existing_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let after = "after capture.folded";
+    fs::write(
+        path.join("before capture.folded"),
+        "main;work<&> 3\nidle 1\n",
+    )
+    .unwrap();
+    fs::write(path.join(after), "main;work<&> 5\nread 15\n").unwrap();
+
+    let output = compare(path, after, &["--format", "svg"]);
+    assert!(output.status.success(), "{output:?}");
+    let svg = std::str::from_utf8(&output.stdout).unwrap();
+    assert!(svg.contains("<desc>After widths."));
+    assert!(svg.contains("work&lt;&amp;&gt;"));
+    assert!(svg.contains("Before 0 · After 15 · +75.00 pp"));
+    assert!(!svg.contains("idle"));
+    assert!(output.stderr.is_empty());
+
+    let widths = ["--format", "svg", "--widths", "before"];
+    let output = compare(path, after, &widths);
+    assert!(output.status.success(), "{output:?}");
+    let svg = std::str::from_utf8(&output.stdout).unwrap();
+    assert!(svg.contains("<desc>Before widths."));
+    assert!(svg.contains("Before 1 · After 0 · -25.00 pp"));
+    assert!(!svg.contains("<title>read"));
+
+    let destination = "differential graph.svg";
+    let mut options = widths.to_vec();
+    options.extend(["--output-file", destination]);
+    let saved = compare(path, after, &options);
+    assert!(saved.status.success(), "{saved:?}");
+    let reply: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert!(Path::new(reply["result"]["path"].as_str().unwrap()).is_absolute());
+    assert_eq!(fs::read(path.join(destination)).unwrap(), output.stdout);
+    let collision = compare(path, after, &options);
+    assert!(!collision.status.success());
+    assert!(collision.stdout.is_empty());
+    assert_eq!(fs::read(path.join(destination)).unwrap(), output.stdout);
+
+    for options in [
+        ["--format", "svg", "--widths", "unknown"].as_slice(),
+        ["--format", "svg", "--filter", "read"].as_slice(),
+        ["--widths", "before"].as_slice(),
+        ["--format", "png"].as_slice(),
+    ] {
+        let error = compare(path, after, options);
+        assert!(!error.status.success(), "{options:?}");
+        assert!(error.stdout.is_empty());
+        let reply: Value = serde_json::from_slice(&error.stderr).unwrap();
+        assert_eq!(reply["ok"], false);
+    }
+}
