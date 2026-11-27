@@ -276,6 +276,7 @@ impl server::Handler for Peer {
                     "4096",
                 ] => {
                     let response = fs::read(self.root.join("profile-response"))?;
+                    fs::write(self.root.join("profile-captured"), [])?;
                     s.data(c, response)?;
                     s.extended_data(c, 1, b"Processed 3 events and lost 1 chunks!\n".to_vec())?;
                     s.exit_status_request(c, 0)?;

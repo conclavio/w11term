@@ -26,6 +26,7 @@ pub use sharing::{ConnectionShare, SshTransport, VerifiedSshPeer, VerifiedSshRou
 pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing, TransportWatch};
 pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};
+pub use triage::cpu_profile::{CpuProfilePlan, CpuProfileSummary};
 pub use triage::{
     Finding as TriageFinding, Plan as TriagePlan, Report as TriageReport,
     Resource as TriageResource, SampleStatus as TriageSampleStatus, Target as TriageTarget,

@@ -1,8 +1,11 @@
 use super::*;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use w11term::ssh::{TriagePlan, TriageReport, TriageResource, TriageSampleStatus};
 
 pub(super) const LABEL: &str = "Linux performance triage";
+mod processes;
+use flame_graph::Connection;
 
 pub enum Action {
     Open,
@@ -14,11 +17,16 @@ pub enum Action {
     Sample(usize),
     Resource(usize),
     Finding(usize),
+    Profile(NonZeroU32),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
 pub enum Outcome {
-    Report(Arc<TriageReport>, Option<PathBuf>),
+    Report {
+        report: Arc<TriageReport>,
+        path: Option<PathBuf>,
+        source: Option<Connection>,
+    },
     Saved(PathBuf),
 }
 
@@ -37,6 +45,8 @@ pub(super) struct Panel {
     status: Option<String>,
     pending: Option<Arc<()>>,
     path: Option<PathBuf>,
+    profile_source: Option<Connection>,
+    busy_processes: Vec<processes::Process>,
 }
 
 fn message(action: Action) -> Message {
@@ -93,7 +103,7 @@ impl Panel {
         ticket
     }
 
-    fn view(&self, active: Option<(u64, u64)>, ctx: &ViewContext<TerminalApp>) -> View {
+    fn view(&self, active: Option<Connection>, ctx: &ViewContext<TerminalApp>) -> View {
         let idle = self.pending.is_none();
         let send = |action: fn() -> Action| ctx.callback(move |_| message(action()));
         let button = |label: &str, enabled, action: fn() -> Action| {
@@ -129,7 +139,11 @@ impl Panel {
         }
         match &self.content {
             Some(Content::Review { pane, plan }) => {
-                let ready = active == Some((*pane, plan.connection_generation));
+                let ready = active
+                    == Some(Connection {
+                        pane: *pane,
+                        generation: plan.connection_generation,
+                    });
                 fields.extend([
                     detail("endpoint", endpoint(plan)),
                     detail(
@@ -157,7 +171,7 @@ impl Panel {
                     ));
                 }
             }
-            Some(Content::Report(report)) => self.report_view(report, &mut fields, ctx),
+            Some(Content::Report(report)) => self.report_view(report, active, &mut fields, ctx),
             None if self.status.is_none() => {
                 fields.push(detail(
                     "empty",
@@ -200,6 +214,7 @@ impl Panel {
     fn report_view(
         &self,
         report: &TriageReport,
+        active: Option<Connection>,
         fields: &mut Vec<KeyedView>,
         ctx: &ViewContext<TerminalApp>,
     ) {
@@ -230,6 +245,7 @@ impl Panel {
             ));
         }
         self.findings_view(report, fields, ctx);
+        self.profile_buttons(active, fields, ctx);
         fields.push(KeyedView::new(
             "samples",
             ComboBox::new()
@@ -306,6 +322,38 @@ impl Panel {
         }
     }
 
+    fn profile_buttons(
+        &self,
+        active: Option<Connection>,
+        fields: &mut Vec<KeyedView>,
+        ctx: &ViewContext<TerminalApp>,
+    ) {
+        if self.resource != TriageResource::Cpu || self.busy_processes.is_empty() {
+            return;
+        }
+        let ready = active.is_some() && active == self.profile_source && self.pending.is_none();
+        fields.push(detail("busy-processes", "Busy processes during triage"));
+        for process in &self.busy_processes {
+            let pid = process.pid;
+            let label = display_output(&format!(
+                "{} · PID {pid} · {:.1}% peak CPU",
+                process.command, process.peak_cpu
+            ));
+            fields.push(KeyedView::new(
+                format!("profile-pid-{pid}"),
+                Button::new()
+                    .automation_name(format!("Profile {label}"))
+                    .is_enabled(ready)
+                    .on_click(ctx.callback(move |_| message(Action::Profile(pid))))
+                    .content(
+                        TextBlock::new()
+                            .text(label)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ),
+            ));
+        }
+    }
+
     fn findings_view(
         &self,
         report: &TriageReport,
@@ -361,7 +409,7 @@ impl Panel {
 }
 
 impl TerminalApp {
-    fn triage_session(&self) -> Option<&Session> {
+    pub(super) fn triage_session(&self) -> Option<&Session> {
         let Page::Terminal(live) = &self.tabs.active()?.page else {
             return None;
         };
@@ -369,11 +417,7 @@ impl TerminalApp {
     }
 
     pub(super) fn with_triage(&self, content: View, ctx: &ViewContext<Self>) -> View {
-        let active = self.triage_session().and_then(|session| {
-            session
-                .ssh_connection_generation()
-                .map(|generation| (session.pane_id, generation))
-        });
+        let active = self.profile_connection();
         let width = (self.width * 0.4).clamp(265.0, 520.0);
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
@@ -390,6 +434,19 @@ impl TerminalApp {
     }
 
     pub(super) fn triage_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if let Action::Profile(pid) = action {
+            if let Some(source) = self.triage.profile_source
+                && self.triage.pending.is_none()
+                && self
+                    .triage
+                    .busy_processes
+                    .iter()
+                    .any(|process| process.pid == pid)
+            {
+                self.show_triage_process_profile(source, pid);
+            }
+            return;
+        }
         if matches!(action, Action::Open) {
             self.command_reference.close();
             self.flame_graph.open = false;
@@ -434,10 +491,14 @@ impl TerminalApp {
                 return;
             };
             if self.triage.pending.is_some()
-                || target.preview().connection_generation != plan.connection_generation
+                || target.connection_generation() != plan.connection_generation
             {
                 return;
             }
+            let source = Connection {
+                pane: *pane,
+                generation: plan.connection_generation,
+            };
             let ticket = self.triage.begin("Collecting Linux performance samples…");
             let rejected = message(Action::Finished(
                 ticket.clone(),
@@ -447,7 +508,13 @@ impl TerminalApp {
                 move |_| {
                     let result = target
                         .collect_blocking()
-                        .map(|report| Some(Outcome::Report(Arc::new(report), None)))
+                        .map(|report| {
+                            Some(Outcome::Report {
+                                report: Arc::new(report),
+                                path: None,
+                                source: Some(source),
+                            })
+                        })
                         .map_err(|error| format!("{error:#}"));
                     message(Action::Finished(ticket, result))
                 },
@@ -525,10 +592,11 @@ impl TerminalApp {
                                     report.save(&file.path)?;
                                     Outcome::Saved(file.path)
                                 }
-                                None => Outcome::Report(
-                                    Arc::new(TriageReport::load(&file.path)?),
-                                    Some(file.path),
-                                ),
+                                None => Outcome::Report {
+                                    report: Arc::new(TriageReport::load(&file.path)?),
+                                    path: Some(file.path),
+                                    source: None,
+                                },
                             }))
                         })()
                         .map_err(|error| format!("{error:#}"));
@@ -545,11 +613,18 @@ impl TerminalApp {
             {
                 panel.status = None;
                 match result {
-                    Ok(Some(Outcome::Report(report, path))) => {
+                    Ok(Some(Outcome::Report {
+                        report,
+                        path,
+                        source,
+                    })) => {
                         if let Some(path) = path {
                             panel.status = Some("Opened Linux triage report".into());
                             panel.path = Some(path);
                         }
+                        panel.busy_processes =
+                            source.map_or_else(Vec::new, |_| processes::busy_processes(&report));
+                        panel.profile_source = source;
                         panel.content = Some(Content::Report(report));
                         panel.sample = 0;
                         panel.resource = TriageResource::default();

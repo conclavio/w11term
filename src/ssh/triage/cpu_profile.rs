@@ -33,6 +33,9 @@ pub struct CpuProfileOptions {
 }
 
 impl CpuProfileOptions {
+    pub const DEFAULT_SECONDS: u8 = 10;
+    pub const DEFAULT_FREQUENCY: u8 = 99;
+
     pub fn validate(self) -> Result<Self> {
         ensure!(
             i32::try_from(self.target_pid.get()).is_ok(),
@@ -71,24 +74,57 @@ impl CpuCallGraph {
     }
 }
 
-#[derive(Serialize)]
-pub(crate) struct Plan {
-    connection_generation: u64,
-    host: String,
-    user: String,
-    port: u16,
-    host_key_fingerprint: String,
-    process_name: String,
-    process_start_ticks: u64,
-    options: CpuProfileOptions,
-    event: &'static str,
-    deadline_seconds: u64,
-    max_recording_bytes: usize,
-    max_stack_output_bytes: usize,
+#[derive(Clone, Serialize)]
+pub struct CpuProfilePlan {
+    pub connection_generation: u64,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub host_key_fingerprint: String,
+    pub process_name: String,
+    pub process_start_ticks: u64,
+    pub options: CpuProfileOptions,
+    pub event: &'static str,
+    pub deadline_seconds: u64,
+    pub max_recording_bytes: usize,
+    pub max_stack_output_bytes: usize,
 }
 
 impl Target {
-    pub(crate) async fn preview_cpu_profile(mut self, options: CpuProfileOptions) -> Result<Plan> {
+    pub fn preview_cpu_profile_blocking(
+        self,
+        options: CpuProfileOptions,
+    ) -> Result<CpuProfilePlan> {
+        crate::ssh::NETWORK.block_on(self.preview_cpu_profile(options))
+    }
+
+    pub fn save_cpu_profile_blocking(
+        self,
+        plan: &CpuProfilePlan,
+        path: &Path,
+    ) -> Result<CpuProfileSummary> {
+        let (host, user, port, fingerprint) = self.link.verified_endpoint();
+        ensure!(
+            plan.connection_generation == self.generation
+                && (host, user, port, fingerprint)
+                    == (
+                        plan.host.as_str(),
+                        plan.user.as_str(),
+                        plan.port,
+                        plan.host_key_fingerprint.as_str(),
+                    ),
+            "The reviewed SSH connection changed. Review the process again."
+        );
+        Folded::check_destination(path)?;
+        crate::ssh::NETWORK
+            .block_on(self.capture_cpu_profile(plan.options, plan.process_start_ticks))?
+            .save(path)
+    }
+
+    pub(crate) async fn preview_cpu_profile(
+        mut self,
+        options: CpuProfileOptions,
+    ) -> Result<CpuProfilePlan> {
         let options = options.validate()?;
         let (bytes, _) = self
             .run_diagnostic(
@@ -104,7 +140,7 @@ impl Target {
             "Unexpected CPU profile preview output"
         );
         let (host, user, port, fingerprint) = self.link.verified_endpoint();
-        Ok(Plan {
+        Ok(CpuProfilePlan {
             connection_generation: self.generation,
             host: host.into(),
             user: user.into(),
@@ -207,15 +243,15 @@ fn process_header(bytes: &[u8]) -> Result<(u64, String, &[u8])> {
 #[derive(Default)]
 pub(crate) struct Folded {
     stacks: BTreeMap<String, u64>,
-    summary: Summary,
+    summary: CpuProfileSummary,
 }
 
 #[derive(Default, Serialize)]
-pub(crate) struct Summary {
-    samples: u64,
-    distinct_stacks: usize,
-    unresolved_frames: u64,
-    diagnostics: Vec<String>,
+pub struct CpuProfileSummary {
+    pub samples: u64,
+    pub distinct_stacks: usize,
+    pub unresolved_frames: u64,
+    pub diagnostics: Vec<String>,
 }
 
 impl Folded {
@@ -223,7 +259,7 @@ impl Folded {
         diagnostic_destination(path, "folded CPU profile")
     }
 
-    pub(crate) fn save(self, path: &Path) -> Result<Summary> {
+    pub(crate) fn save(self, path: &Path) -> Result<CpuProfileSummary> {
         let directory = Self::check_destination(path)?;
         let mut staged = tempfile::NamedTempFile::new_in(directory)?;
         {

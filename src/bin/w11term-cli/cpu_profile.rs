@@ -58,13 +58,13 @@ pub(super) fn parse(
             .map(|arg| arg.parse())
             .transpose()
             .context("--seconds requires an integer from 1 to 30")?
-            .unwrap_or(10),
+            .unwrap_or(CpuProfileOptions::DEFAULT_SECONDS),
         frequency: flags
             .remove("--frequency")
             .map(|arg| arg.parse())
             .transpose()
             .context("--frequency requires an integer from 1 to 199")?
-            .unwrap_or(99),
+            .unwrap_or(CpuProfileOptions::DEFAULT_FREQUENCY),
         call_graph: match flags.remove("--call-graph").as_deref() {
             None | Some("fp") => CpuCallGraph::Fp,
             Some("dwarf") => CpuCallGraph::Dwarf,

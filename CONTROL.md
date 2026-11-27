@@ -1463,7 +1463,11 @@ The collector uses a sibling SSH channel with a 60-second client deadline and a 
 
 ### Capture a Linux CPU profile
 
-Choose a running PID on the remote Linux host. Preview the verified SSH endpoint, process name and start time, the sampling options, and file and time limits. Use the same options and the returned connection generation and process start ticks when starting the capture.
+In the Windows app, select a connected Linux SSH pane and open **More → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. That list ranks processes by their peak reported interval CPU usage and fills in the PID from the live report. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in)
+
+Choose **Review CPU profile** to check the live process and verified SSH endpoint. Then choose **Record CPU profile** and a new local folded stacks file. Changes to the settings require a fresh review. Recording stays tied to the pane, connection, and process start time from review. The resulting file opens in the flame graph with the unresolved frame count and **Perf output**, when available.
+
+For CLI capture, choose a running PID on the remote Linux host. Preview the verified SSH endpoint, process name and start time, sampling options, and file and time limits. Use the same options and the returned connection generation and process start ticks when starting the capture.
 
 ```powershell
 $sampling = @('--pane', $pane, '--target-pid', 4102, '--seconds', 10, '--frequency', 99, '--call-graph', 'fp')

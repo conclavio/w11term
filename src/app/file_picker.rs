@@ -60,6 +60,7 @@ pub(super) enum Purpose {
     OpenRecording,
     OpenTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
+    SaveCpuProfile(PathBuf),
     FlameGraph {
         path: PathBuf,
         export: bool,
@@ -239,6 +240,22 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let multiple = matches!(purpose, Purpose::UploadFiles);
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
+            Purpose::SaveCpuProfile(path) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetTitle(w!("Save CPU profile"))?;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: w!("Folded stacks"),
+                    pszSpec: w!("*.folded"),
+                }])?;
+                dialog.SetDefaultExtension(w!("folded"))?;
+                dialog.SetFileName(w!("cpu-profile.folded"))?;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT | FOS_NOTESTFILECREATE;
+                options &= !FOS_OVERWRITEPROMPT;
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
             Purpose::FlameGraph { path, export } => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;

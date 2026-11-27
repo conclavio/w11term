@@ -492,7 +492,7 @@ impl Session {
     pub fn triage_target(&self) -> anyhow::Result<ssh::TriageTarget> {
         anyhow::ensure!(
             !self.player.read().unwrap().rustmush,
-            "Linux triage requires an SSH pane outside a game session"
+            "Linux performance diagnostics require an SSH pane outside a game session"
         );
         let generation = self
             .ssh_connection_generation()

@@ -52,6 +52,10 @@ impl std::fmt::Debug for Target {
 }
 
 impl Target {
+    pub fn connection_generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn new(slot: &ShareSlot, generation: u64) -> Result<Self> {
         let (link, lease) = slot
             .forward_lease(generation)

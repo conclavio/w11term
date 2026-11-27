@@ -23,6 +23,52 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "records a reviewed CPU profile from the native Linux triage report"]
+async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let pidstat = STANDARD.encode(concat!(
+        "09:40:00 UID PID %usr %system %guest %wait %CPU CPU Command\n",
+        "09:40:01 1000 42 78.00 2.00 0.00 0.00 80.00 1 worker\n",
+        "09:40:01 1000 80 1.00 0.00 0.00 0.00 1.00 1 helper\n",
+    ));
+    let triage = TRIAGE_RESPONSE.replace(
+        "pidstat\t1000\t2000\t0\t\t",
+        &format!("pidstat\t1000\t2000\t0\t{pidstat}\t"),
+    );
+    fs::write(remote.path().join("triage-response"), triage).unwrap();
+    fs::write(
+        remote.path().join("profile-response"),
+        concat!(
+            "w11term-cpu-profile-v1\t800\td29ya2Vy\n",
+            " 42 22.01: cpu-clock:u:\n",
+            "\t   deadbeef hot_loop (/tmp/worker)\n",
+            "\t   12ab34cd main (/tmp/worker)\n\n",
+            "\nw11term-cpu-profile-end\n",
+        ),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let captured = remote.path().join("profile-captured");
+    fs::write(
+        state.path().join("capture-marker"),
+        captured.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("capture-cpu-profile-ui.ps1", &ssh, state.path());
+    assert!(captured.exists());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 5);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "captures a CPU profile over SSH and opens and exports it in the native graph viewer"]
 async fn native_cpu_flame_graph_reopens_profiles_offline_and_exports_the_zoom() {
     let transports = Arc::new(AtomicUsize::new(0));
