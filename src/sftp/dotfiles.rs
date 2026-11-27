@@ -88,26 +88,77 @@ fn relative_path(path: &str) -> bool {
         && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
-#[derive(Serialize)]
-struct Change {
+struct Edit {
     path: String,
     action: &'static str,
-    before_sha256: Option<String>,
-    after_sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<String>,
+    after: Option<String>,
     hook: Option<String>,
 }
 
-impl Change {
-    fn new(path: String, action: &'static str, before: Option<&str>, after: Option<&str>) -> Self {
-        let hash = |text: &str| digest_hex(Sha256::new_with_prefix(text));
+impl Edit {
+    fn new(
+        path: String,
+        action: &'static str,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> Self {
         Self {
             path,
             action,
-            before_sha256: before.map(hash),
-            after_sha256: after.map(hash),
+            before,
+            after,
             hook: None,
         }
+    }
+
+    fn changed(&self) -> bool {
+        self.before != self.after
+    }
+
+    fn report(&self) -> Value {
+        let hash = |text: &str| digest_hex(Sha256::new_with_prefix(text));
+        let mut report = json!({
+            "path": self.path,
+            "action": self.action,
+            "before_sha256": self.before.as_deref().map(hash),
+            "after_sha256": self.after.as_deref().map(hash),
+        });
+        if let Some(hook) = &self.hook {
+            report["hook"] = json!(hook);
+        }
+        report
+    }
+}
+
+struct Plan {
+    home: String,
+    id: String,
+    create: Vec<String>,
+    files: Vec<Edit>,
+    selector: Edit,
+    shell: DotfileShell,
+    atomic_replace: bool,
+}
+
+impl Plan {
+    fn edits(&self) -> impl Iterator<Item = &Edit> {
+        self.files.iter().chain(std::iter::once(&self.selector))
+    }
+
+    fn report(&self, review_scope: u128) -> Result<Value> {
+        let mut report = json!({
+            "shell": self.shell,
+            "home": self.home,
+            "bundle_sha256": self.id,
+            "directories_to_create": self.create,
+            "files": self.edits().map(Edit::report).collect::<Vec<_>>(),
+            "supports_atomic_replace": self.atomic_replace,
+        });
+        let mut digest = Sha256::new_with_prefix(review_scope.to_le_bytes());
+        digest.update(serde_json::to_vec(&report)?);
+        report["review"] = json!(digest_hex(digest));
+        Ok(report)
     }
 }
 
@@ -128,9 +179,11 @@ enum Hook {
 fn hook_text(shell: DotfileShell, hook: Hook) -> String {
     let name = shell.name();
     let version = shell.version_variable();
+    let selected = format!("_w11term_dotfiles_{name}_version");
+    let selector = format!("$HOME/{DIRECTORY}/{name}-current");
     let source = |role| {
         let flag = format!("_w11term_dotfiles_{name}_{role}");
-        let path = format!("$HOME/{DIRECTORY}/{name}-{role}.sh");
+        let path = format!("$HOME/{DIRECTORY}/{name}-${{{selected}}}/{role}.sh");
         format!(
             "if [ \"${{{flag}-}}\" != 1 ] && [ -r \"{path}\" ]; then\n  {flag}=1\n  . \"{path}\"\nfi\n"
         )
@@ -143,26 +196,45 @@ fn hook_text(shell: DotfileShell, hook: Hook) -> String {
         (DotfileShell::Bash, Hook::Login) => format!("{environment}{}", interactive(&prompt)),
         (DotfileShell::Zsh, Hook::Login) => environment,
     };
-    format!("{BEGIN}\nif [ -n \"${{{version}-}}\" ]; then\n{body}fi\n{END}\n")
+    format!(
+        "{BEGIN}
+if [ -n \"${{{version}-}}\" ]; then
+  if [ -z \"${{{selected}-}}\" ] && [ -r \"{selector}\" ]; then
+    IFS= read -r {selected} < \"{selector}\" || {selected}=
+  fi
+  case \"${{{selected}-}}\" in
+    ''|*[!0123456789abcdef]*) ;;
+    *)
+      if [ \"${{#{selected}}}\" -eq 64 ]; then
+{body}      fi
+      ;;
+  esac
+fi
+{END}\n"
+    )
 }
 
-fn hook_change(path: String, original: Option<&str>, hook: String) -> Change {
-    let text = original.unwrap_or_default();
+fn hook_change(path: String, original: Option<String>, hook: String) -> Edit {
+    let text = original.as_deref().unwrap_or_default();
     let markers: Vec<_> = text
         .lines()
         .filter(|line| matches!(line.trim(), BEGIN | END))
         .take(3)
         .collect();
-    let mut change = if markers.is_empty() {
-        match original {
-            None => Change::new(path, "create", None, Some(&hook)),
+    let (action, after) = if markers.is_empty() {
+        match original.as_deref() {
+            None => ("create", Some(hook.clone())),
             Some(text) => {
                 let mut result = text.to_owned();
                 if !result.is_empty() && !result.ends_with('\n') {
                     result.push('\n');
                 }
                 result.push_str(&hook);
-                Change::new(path, "append-hook", original, Some(&result))
+                if result.len() <= TEXT_PREVIEW_MAX_BYTES {
+                    ("append-hook", Some(result))
+                } else {
+                    ("hook-conflict", None)
+                }
             }
         }
     } else if markers == [BEGIN, END]
@@ -170,10 +242,11 @@ fn hook_change(path: String, original: Option<&str>, hook: String) -> Change {
             .match_indices(&hook)
             .any(|(start, _)| start == 0 || text.as_bytes()[start - 1] == b'\n')
     {
-        Change::new(path, "unchanged", original, original)
+        ("unchanged", original.clone())
     } else {
-        Change::new(path, "hook-conflict", original, None)
+        ("hook-conflict", None)
     };
+    let mut change = Edit::new(path, action, original, after);
     change.hook = Some(hook);
     change
 }
@@ -185,8 +258,114 @@ impl Engine {
         shell: DotfileShell,
         zdotdir: Option<&str>,
     ) -> Result<Value> {
+        self.dotfiles_plan(&bundle, shell, zdotdir)
+            .await?
+            .report(self.dotfiles_review_scope)
+    }
+
+    pub(super) async fn apply_dotfiles(
+        &self,
+        bundle: DotfileBundle,
+        shell: DotfileShell,
+        zdotdir: Option<&str>,
+        review: &str,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        let review = normalize_sha256(review).context("Invalid dotfiles review token")?;
+        let plan = self.dotfiles_plan(&bundle, shell, zdotdir).await?;
+        ensure!(
+            plan.report(self.dotfiles_review_scope)?["review"] == review,
+            "The dotfiles review is stale or belongs to another SFTP connection. Preview again."
+        );
+        for edit in plan.edits() {
+            ensure!(
+                edit.after.is_some(),
+                "Resolve the dotfiles conflict at {}",
+                edit.path
+            );
+            ensure!(
+                !edit.changed() || edit.before.is_none() || plan.atomic_replace,
+                "The server cannot atomically replace {}",
+                edit.path
+            );
+        }
+        const INTERRUPTED: &str =
+            "Dotfiles installation was interrupted. Preview again to check the active bundle.";
+        let mut changed = Vec::new();
+        for path in &plan.create {
+            self.check_entry_parent(remote_parent(path)?).await?;
+            self.raw
+                .mkdir(
+                    path,
+                    FileAttributes {
+                        permissions: Some(0o700),
+                        ..FileAttributes::empty()
+                    },
+                )
+                .await
+                .with_context(|| format!("Creating dotfiles directory {path}"))?;
+        }
+        for edit in &plan.files {
+            if edit.changed() {
+                self.write_dotfile(edit, stage).await?;
+                changed.push(edit.path.as_str());
+                *stage = JobStage::Checking(INTERRUPTED);
+            }
+        }
+        if plan.selector.changed() {
+            let current = self.dotfiles_plan(&bundle, shell, zdotdir).await?;
+            ensure!(
+                current.create.is_empty()
+                    && current.files.len() == plan.files.len()
+                    && current
+                        .files
+                        .iter()
+                        .zip(&plan.files)
+                        .all(|(now, reviewed)| {
+                            now.path == reviewed.path
+                                && now.before == reviewed.after
+                                && !now.changed()
+                        })
+                    && current.selector.path == plan.selector.path
+                    && current.selector.before == plan.selector.before,
+                "Remote dotfiles changed during staging. Preview again before activating."
+            );
+            self.write_dotfile(&plan.selector, stage).await?;
+            changed.push(plan.selector.path.as_str());
+        }
+        Ok(
+            json!({ "shell": shell, "home": plan.home, "bundle_sha256": plan.id, "changed_files": changed }),
+        )
+    }
+
+    async fn write_dotfile(&self, edit: &Edit, stage: &mut JobStage) -> Result<()> {
+        self.check_entry_parent(remote_parent(&edit.path)?).await?;
+        self.save_text(
+            &edit.path,
+            edit.before.as_deref(),
+            edit.after.as_deref().expect("validated edit"),
+            stage,
+        )
+        .await
+        .with_context(|| format!("Installing dotfile {}", edit.path))
+    }
+
+    async fn dotfiles_plan(
+        &self,
+        bundle: &DotfileBundle,
+        shell: DotfileShell,
+        zdotdir: Option<&str>,
+    ) -> Result<Plan> {
         bundle.validate(shell)?;
         validate_zdotdir(shell, zdotdir)?;
+        let environment = payload(bundle.environment.as_deref());
+        let prompt = payload(bundle.prompt(shell));
+        let mut digest = Sha256::new_with_prefix(b"w11term-dotfiles-v1\0");
+        digest.update((environment.len() as u64).to_le_bytes());
+        digest.update(environment.as_bytes());
+        digest.update(prompt.as_bytes());
+        let id = digest_hex(digest);
+        let version_directory = format!("{DIRECTORY}/{}-{id}", shell.name());
         let homes = self.raw.realpath(".").await?.files;
         let [home] = homes.as_slice() else {
             bail!("SFTP did not resolve the remote home directory to one path");
@@ -200,7 +379,7 @@ impl Engine {
         let home_prefix = home.trim_end_matches('/');
         let under_home = |relative: &str| format!("{home_prefix}/{relative}");
         let mut directories_to_create = Vec::new();
-        for relative in [".config", ".config/w11term", DIRECTORY] {
+        for relative in [".config", ".config/w11term", DIRECTORY, &version_directory] {
             let path = under_home(relative);
             if !self.dotfile_directory_exists(&path).await? {
                 directories_to_create.push(path);
@@ -242,42 +421,44 @@ impl Engine {
         let rc = startup(&format!(".{}rc", shell.name()));
         let rc_original = self.dotfile_text(&rc).await?;
         let mut files = Vec::with_capacity(4);
-        for (role, contents) in [
-            ("environment", bundle.environment.as_deref()),
-            ("prompt", bundle.prompt(shell)),
-        ] {
-            let path = under_home(&format!("{DIRECTORY}/{}-{role}.sh", shell.name()));
-            let desired = payload(contents);
+        for (role, desired) in [("environment", environment), ("prompt", prompt)] {
+            let path = under_home(&format!("{version_directory}/{role}.sh"));
             let original = self.dotfile_text(&path).await?;
-            let action = match original.as_deref() {
-                None => "create",
-                Some(text) if text == desired => "unchanged",
-                Some(_) => "replace",
+            let (action, after) = match original.as_deref() {
+                None => ("create", Some(desired)),
+                Some(text) if text == desired => ("unchanged", Some(desired)),
+                Some(_) => ("payload-conflict", None),
             };
-            files.push(Change::new(
-                path,
-                action,
-                original.as_deref(),
-                Some(&desired),
-            ));
+            files.push(Edit::new(path, action, original, after));
         }
         files.push(hook_change(
             login,
-            login_original.as_deref(),
+            login_original,
             hook_text(shell, Hook::Login),
         ));
         files.push(hook_change(
             rc,
-            rc_original.as_deref(),
+            rc_original,
             hook_text(shell, Hook::Interactive),
         ));
-        Ok(json!({
-            "shell": shell,
-            "home": home,
-            "directories_to_create": directories_to_create,
-            "files": files,
-            "supports_atomic_replace": self.extension(editor::POSIX_RENAME, "1").is_ok(),
-        }))
+        let path = under_home(&format!("{DIRECTORY}/{}-current", shell.name()));
+        let before = self.dotfile_text(&path).await?;
+        let desired = format!("{id}\n");
+        let selector = match before.as_deref() {
+            None => Edit::new(path, "create", None, Some(desired)),
+            Some(text) if text == desired => Edit::new(path, "unchanged", before, Some(desired)),
+            Some(text) if valid_selector(text) => Edit::new(path, "replace", before, Some(desired)),
+            Some(_) => Edit::new(path, "selector-conflict", before, None),
+        };
+        Ok(Plan {
+            home: home.to_owned(),
+            id,
+            create: directories_to_create,
+            files,
+            selector,
+            shell,
+            atomic_replace: self.extension(editor::POSIX_RENAME, "1").is_ok(),
+        })
     }
 
     async fn dotfile_directory_exists(&self, path: &str) -> Result<bool> {
@@ -306,4 +487,19 @@ impl Engine {
                 .with_context(|| format!("Reading dotfile {path}")),
         }
     }
+}
+
+fn valid_selector(text: &str) -> bool {
+    text.strip_suffix('\n').is_some_and(|line| {
+        line.len() == 64
+            && line
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn remote_parent(path: &str) -> Result<&str> {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .context("Expected an absolute remote dotfile path")
 }

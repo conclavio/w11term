@@ -228,6 +228,13 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
     },
+    ApplyDotfiles {
+        bundle: DotfileBundle,
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+        review: String,
+    },
     /// Explicit Save from the editor. An absent original requests a new file.
     #[serde(skip)]
     SaveText {
@@ -929,6 +936,9 @@ pub(crate) async fn run(
                 Operation::PreviewDotfiles { .. } => {
                     JobStage::Checking("Dotfiles preview did not finish")
                 }
+                Operation::ApplyDotfiles { .. } => JobStage::Checking(
+                    "Dotfiles installation did not finish. Preview again to check the active bundle.",
+                ),
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
                 Operation::PreviewImage { .. } => {
                     JobStage::Checking("Image preview did not finish")
@@ -1094,6 +1104,7 @@ struct Engine {
     handles: HashMap<u64, Handle>,
     read_size: usize,
     write_size: usize,
+    dotfiles_review_scope: u128,
 }
 // Bare russh Channels do not close on drop. Guard negotiation too, so rejection
 // or cancellation cannot leave unused session channels on a long-lived SSH link.
@@ -1159,6 +1170,7 @@ impl Engine {
             handles: HashMap::new(),
             read_size,
             write_size,
+            dotfiles_review_scope: rand::random(),
         })
     }
     fn extension(&self, name: &str, version: &str) -> Result<()> {
@@ -1590,6 +1602,15 @@ impl Engine {
                 zdotdir,
             } => {
                 self.preview_dotfiles(bundle, shell, zdotdir.as_deref())
+                    .await?
+            }
+            ApplyDotfiles {
+                bundle,
+                shell,
+                zdotdir,
+                review,
+            } => {
+                self.apply_dotfiles(bundle, shell, zdotdir.as_deref(), &review, stage)
                     .await?
             }
             PreviewImage { path } => self.read_preview_image(&path, cancel).await?,

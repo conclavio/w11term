@@ -25,6 +25,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
        [--contains TEXT]\n\
   sha256 PATH [--max-bytes N]\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
+  apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -308,7 +309,7 @@ pub fn parse(
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
             }
         }
-        "preview-dotfiles" => {
+        "preview-dotfiles" | "apply-dotfiles" => {
             let shell = match opts.remove("--shell").as_deref() {
                 Some("bash") => DotfileShell::Bash,
                 Some("zsh") => DotfileShell::Zsh,
@@ -316,6 +317,12 @@ pub fn parse(
             };
             let zdotdir = opts.remove("--zdotdir");
             validate_zdotdir(shell, zdotdir.as_deref())?;
+            if command == "apply-dotfiles" {
+                let review = opts
+                    .remove("--review")
+                    .context("--review is required. Preview the bundle first.")?;
+                fields.insert("review".into(), json!(normalize_sha256(&review)?));
+            }
             let manifest = path()?;
             let bytes = super::read_limited(
                 std::fs::File::open(&manifest)
@@ -473,6 +480,29 @@ mod tests {
             ])
             .is_err()
         );
+        let token = "a".repeat(64);
+        let (_, apply) = p(&[
+            "--pane",
+            "2",
+            "apply-dotfiles",
+            path,
+            "--shell",
+            "zsh",
+            "--review",
+            &token,
+            "--zdotdir",
+            "etc/zsh",
+        ])
+        .unwrap();
+        assert!(matches!(
+            apply,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::ApplyDotfiles { shell: DotfileShell::Zsh, review, .. },
+                ..
+            } if review == token
+        ));
+        assert!(p(&["--pane", "2", "apply-dotfiles", path, "--shell", "zsh"]).is_err());
     }
 
     #[test]

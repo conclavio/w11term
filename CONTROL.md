@@ -1260,7 +1260,7 @@ Direct pipe clients send
 `{"verb":"cancel-sftp-transfer","transfer_id":"7:2:11"}`. To wait, send
 `{"verb":"wait-sftp-transfer","transfer_id":"7:2:11","timeout_seconds":30}`.
 
-### Preview SSH dotfiles
+### Preview and apply SSH dotfiles
 
 `sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
 
@@ -1276,12 +1276,19 @@ Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` f
 ```
 
 ```powershell
-& $ctl --pid 12345 sftp --pane $pane preview-dotfiles '.\Fleet dotfiles.json' --shell bash
+$bundle = '.\Fleet dotfiles.json'
+$preview = & $ctl --pid 12345 sftp --pane $pane preview-dotfiles $bundle --shell bash | ConvertFrom-Json
+$preview.result.sftp
+# Review the home, files, and proposed hooks before running apply.
+$review = $preview.result.sftp.review
+& $ctl --pid 12345 sftp --pane $pane apply-dotfiles $bundle --shell bash --review $review
 ```
 
-In `result.sftp`, `directories_to_create` names missing managed directories and `files` gives the absolute paths, proposed actions, and before/after SHA-256 hashes. For Bash, the preview selects the first existing login file in the order `.bash_profile`, `.bash_login`, `.profile`, and plans a new `.profile` if none exists. It also previews `.bashrc`. Zsh previews `.zprofile` and `.zshrc`. Startup entries include the exact `hook` block, and a changed or duplicated marker block is reported as `hook-conflict`. The `supports_atomic_replace` field reports whether the server offers the OpenSSH atomic replacement extension.
+In `result.sftp`, `directories_to_create` names missing managed directories and `files` gives the absolute paths, proposed actions, and before/after SHA-256 hashes. For Bash, the preview selects the first existing login file in the order `.bash_profile`, `.bash_login`, `.profile`, and plans a new `.profile` if none exists. It also previews `.bashrc`. Zsh previews `.zprofile` and `.zshrc`. Startup entries include the exact `hook` block. A changed or duplicated marker block is a `hook-conflict`, and modified version files or selectors get their own conflict status. The `supports_atomic_replace` field reports whether the server offers the OpenSSH atomic replacement extension.
 
-This command is read-only. It reports `create`, `replace`, `append-hook`, `unchanged`, or `hook-conflict`. A missing fragment is planned as an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields.
+Pass the returned `review` token to apply on the same pane with the same bundle, shell and optional `--zdotdir`. If either the plan or the SFTP connection changed, preview again. Apply checks for conflicts and atomic replacement support before writing. It stages fragments in a directory named for `bundle_sha256` under `~/.config/w11term/dotfiles/`, installs the startup hooks, then switches the shell’s active bundle with a single file rename. New shells use that version. A failed activation can leave staged files, which a fresh preview can reuse. Older bundle directories are retained.
+
+Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_files`. An unchanged bundle returns an empty list. A missing fragment becomes an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields. Use `"op":"apply-dotfiles"` plus the returned `"review"` for the reviewed installation.
 
 ### Run SFTP operations
 
