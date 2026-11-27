@@ -97,10 +97,15 @@ function Wait-Until([string]$Description, [scriptblock]$Probe) {
     throw "Timed out waiting for $Description"
 }
 function Find-OwnedDialog([string]$Title) {
-    foreach ($hwnd in [FixtureDialog]::Windows($app.Id)) {
-        if ([FixtureDialog]::GetWindow($hwnd, 4) -ne $window) { continue }
-        $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-        if ($element.Current.ClassName -eq '#32770' -and $element.Current.Name -eq $Title) { return $hwnd }
+    $hwnd = [FixtureDialog]::FindOwnedDialog($app.Id, $window, $Title)
+    if ($hwnd -ne [IntPtr]::Zero) { return $hwnd }
+}
+function Wait-OwnedDialog([string]$Title) {
+    try {
+        Wait-Until "owned dialog '$Title'" { Find-OwnedDialog $Title }
+    } catch {
+        $visible = [FixtureDialog]::DescribeWindows($app.Id)
+        throw "$_ Expected owner $window. Visible windows: $visible"
     }
 }
 function Select-DialogItem([IntPtr]$Dialog, [string]$Name, [switch]$Add) {
@@ -247,13 +252,17 @@ function Find-NativeVerticalScroll($Element) {
 }
 function Move-NativeControlIntoView($Element, [hashtable]$Search) {
     if (!$Element -or !$Element.Current.IsEnabled -or !$Element.Current.IsOffscreen) { return }
-    if (!$Search.scroll) {
-        $Search.scroll = Find-NativeVerticalScroll $Element
-        if (!$Search.scroll) { throw "'$($Element.Current.Name)' is offscreen without a scrollable ancestor" }
-        $Search.scroll.SetScrollPercent(-1, 0)
-    } elseif ($Search.scroll.Current.VerticalScrollPercent -lt 100) {
-        $Search.scroll.Scroll([System.Windows.Automation.ScrollAmount]::NoAmount,
-            [System.Windows.Automation.ScrollAmount]::SmallIncrement)
+    try {
+        if (!$Search.scroll -or !$Search.scroll.Current.VerticallyScrollable) {
+            $Search.scroll = Find-NativeVerticalScroll $Element
+            # WinUI can expose a new control before arranging its scroll viewport.
+            if ($Search.scroll) { $Search.scroll.SetScrollPercent(-1, 0) }
+        } elseif ($Search.scroll.Current.VerticalScrollPercent -lt 100) {
+            $Search.scroll.Scroll([System.Windows.Automation.ScrollAmount]::NoAmount,
+                [System.Windows.Automation.ScrollAmount]::SmallIncrement)
+        }
+    } catch [System.Windows.Automation.ElementNotAvailableException] {
+        $Search.scroll = $null
     }
 }
 function Get-ScrollableMenuAction([string]$TriggerName, [string]$Name, [switch]$VisibleItem) {

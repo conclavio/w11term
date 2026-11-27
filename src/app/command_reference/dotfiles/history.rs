@@ -185,6 +185,7 @@ impl Panel {
                 }),
             ));
         }
+        let mut footer = Vec::with_capacity(2);
         if let Some(review) = &self.review {
             fields.push(detail(
                 "review-home",
@@ -228,7 +229,7 @@ impl Panel {
                     review.selector.path
                 ),
             ));
-            fields.push(KeyedView::new(
+            footer.push(KeyedView::new(
                 "apply-switch",
                 button(
                     button_label,
@@ -257,18 +258,33 @@ impl Panel {
         }) {
             fields.push(detail("status", status.into()));
         }
-        fields.push(KeyedView::new(
+        footer.push(KeyedView::new(
             "back",
             button("Back to dotfile installer", !installer.applying(), || {
                 Action::Back
             }),
         ));
-        ScrollViewer::new().content(
-            StackPanel::new()
-                .margin(12.0)
-                .spacing(8.0)
-                .keyed_children(fields),
-        )
+        Grid::new()
+            .rows([GridLength::Star(1.0), GridLength::Auto])
+            .keyed_children([
+                KeyedView::new(
+                    "versions",
+                    ScrollViewer::new().grid_row(0).content(
+                        StackPanel::new()
+                            .margin(12.0)
+                            .spacing(8.0)
+                            .keyed_children(fields),
+                    ),
+                ),
+                KeyedView::new(
+                    "footer",
+                    StackPanel::new()
+                        .grid_row(1)
+                        .margin(12.0)
+                        .spacing(8.0)
+                        .keyed_children(footer),
+                ),
+            ])
     }
 }
 

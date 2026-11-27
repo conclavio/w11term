@@ -61,7 +61,7 @@ try {
 
     Run-Palette 'CPU flame graph'
     Click-GraphButton 'Open folded stacks'
-    $dialog = Wait-Until 'owned folded stacks dialog' { Find-OwnedDialog 'Open folded stacks' }
+    $dialog = Wait-OwnedDialog 'Open folded stacks'
     $null = Wait-Until 'enter the folded stacks path' { [FixtureDialog]::SetFilename($dialog, $folded, '') }
     $null = Wait-Until 'open the profile' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'sample total with the SSH pane closed' { Find-Element '4 samples' }
