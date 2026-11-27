@@ -19,10 +19,29 @@ trap 'rm -rf -- "$work"' EXIT
 trap '' HUP
 trap 'exit 1' PIPE
 started=$(date +%s%3N)
+exec 8<&0
+timeout -k 2s 50s bash -c "$1" w11term-triage "$work" </dev/null 8<&- &
+worker=$!
+(
+    if IFS= read -r request <&8 && [ "$request" = stop ]; then
+        : > "$work/stopped"
+        kill -s TERM "$worker" 2>/dev/null || :
+    fi
+) &
+monitor=$!
+exec 8<&-
 code=0
-timeout -k 2s 50s bash -c "$1" w11term-triage "$work" || code=$?
+wait "$worker" || code=$?
+kill -s TERM "$monitor" 2>/dev/null || :
+wait "$monitor" 2>/dev/null || :
+if [ "$code" -ne 0 ]; then
+    # The timeout leader can exit before a descendant that ignores TERM.
+    kill -s KILL "-$worker" 2>/dev/null || :
+fi
 finished=$(date +%s%3N)
-printf 'w11term-linux-triage-v1\t%s\t%s\t%s\n' "$started" "$finished" "$code"
+printf 'w11term-linux-triage-v1\t%s\t%s\t%s' "$started" "$finished" "$code"
+if [ "$code" -ne 0 ] && [ -f "$work/stopped" ]; then printf '\tstopped'; fi
+printf '\n'
 for probe in uptime dmesg vmstat mpstat pidstat iostat free sar-dev sar-tcp top; do
     begin=- end=- status=-
     if [ -s "$work/$probe.start" ]; then

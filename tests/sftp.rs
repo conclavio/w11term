@@ -416,6 +416,10 @@ impl server::Handler for Peer {
         {
             fs::write(self.root.join("triage-command"), command)?;
             s.channel_success(c)?;
+            if self.root.join("triage-wait-for-stop").is_file() {
+                fs::write(self.root.join(format!("triage-stop-{c}")), report)?;
+                return Ok(());
+            }
             s.data(c, report)?;
             s.exit_status_request(c, 0)?;
             s.eof(c)?;
@@ -718,6 +722,17 @@ impl server::Handler for Peer {
         data: &[u8],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        if data == b"stop\n" {
+            let triage = self.root.join(format!("triage-stop-{c}"));
+            if let Ok(report) = fs::read(&triage) {
+                fs::remove_file(triage)?;
+                s.data(c, report)?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
+            }
+        }
         let capture_marker = self.root.join(format!("pcap-ack-{c}"));
         if data == b"stop\n"
             && self.root.join("pcap-wait-for-stop").is_file()

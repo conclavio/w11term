@@ -1,7 +1,7 @@
 use super::*;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use w11term::ssh::{TriagePlan, TriageReport, TriageResource, TriageSampleStatus};
+use w11term::ssh::{CaptureStop, TriagePlan, TriageReport, TriageResource, TriageSampleStatus};
 
 pub(super) const LABEL: &str = "Linux performance triage";
 mod processes;
@@ -12,6 +12,7 @@ pub enum Action {
     Close,
     Review,
     Run,
+    Stop(Arc<()>),
     OpenReport,
     SaveReport,
     Sample(usize),
@@ -46,6 +47,7 @@ pub(super) struct Panel {
     evidence_line: Option<usize>,
     status: Option<String>,
     pending: Option<Arc<()>>,
+    stop: Option<CaptureStop>,
     path: Option<PathBuf>,
     profile_source: Option<Connection>,
     busy_processes: Vec<processes::Process>,
@@ -139,6 +141,16 @@ impl Panel {
         if let Some(status) = &self.status {
             fields.push(detail("status", display_output(status)));
         }
+        if let Some((stop, ticket)) = self.stop.as_ref().zip(self.pending.as_ref()) {
+            let ticket = ticket.clone();
+            fields.push(KeyedView::new(
+                "stop",
+                Button::new()
+                    .is_enabled(!stop.is_requested())
+                    .on_click(ctx.callback(move |_| message(Action::Stop(ticket.clone()))))
+                    .content("Stop and keep report"),
+            ));
+        }
         match &self.content {
             Some(Content::Review { pane, plan }) => {
                 let ready = active
@@ -228,6 +240,9 @@ impl Panel {
                 format!("{ok} of {} checks complete", collection.samples.len()),
             ),
         ]);
+        if collection.stopped_by_user {
+            fields.push(detail("stop-reason", "Stopped by request"));
+        }
         if let Some(elapsed) = collection
             .finished_unix_ms
             .checked_sub(collection.started_unix_ms)
@@ -511,6 +526,8 @@ impl TerminalApp {
             let (user, host, port) = (plan.user.clone(), plan.host.clone(), plan.port);
             let ticket = self.triage.begin("Collecting Linux performance samples…");
             self.triage.activity = Some(diagnostics::Activity::start(&ticket, &user, &host, port));
+            let stop = CaptureStop::default();
+            self.triage.stop = Some(stop.clone());
             let rejected = message(Action::Finished(
                 ticket.clone(),
                 Err("Triage worker unavailable".into()),
@@ -518,7 +535,7 @@ impl TerminalApp {
             ctx.spawn_background_with_rejection(
                 move |_| {
                     let result = target
-                        .collect_blocking()
+                        .collect_blocking_with_stop(&stop)
                         .map(|report| {
                             Some(Outcome::Report {
                                 report: Arc::new(report),
@@ -536,6 +553,20 @@ impl TerminalApp {
         let panel = &mut self.triage;
         match action {
             Action::Close => panel.open = false,
+            Action::Stop(ticket)
+                if panel
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &ticket)) =>
+            {
+                if let Some(stop) = &panel.stop {
+                    stop.request();
+                    if let Some(activity) = &mut panel.activity {
+                        activity.stopping();
+                    }
+                    panel.status = Some("Stop requested. Waiting for collected samples…".into());
+                }
+            }
             Action::Sample(index) => {
                 if let Some(Content::Report(report)) = &panel.content
                     && index < report.collection.samples.len()
@@ -622,10 +653,17 @@ impl TerminalApp {
                     .take_if(|pending| Arc::ptr_eq(pending, &ticket))
                     .is_some() =>
             {
+                panel.stop = None;
                 panel.status = None;
                 if let Some(activity) = &mut panel.activity {
-                    activity.finish(&ticket, &result, |_| {
-                        Some("Collected Linux performance report".into())
+                    activity.finish(&ticket, &result, |outcome| {
+                        let collected = "Collected Linux performance report";
+                        Some(match outcome {
+                            Outcome::Report { report, .. } if report.collection.stopped_by_user => {
+                                format!("{collected}\nStopped by request")
+                            }
+                            _ => collected.into(),
+                        })
                     });
                 }
                 match result {

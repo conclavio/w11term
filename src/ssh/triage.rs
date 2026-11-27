@@ -1,6 +1,7 @@
 use super::{ConnectionShare, ShareSlot};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use capture_job::CaptureStop;
 use russh::{Channel, ChannelMsg, client};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path, time::Duration};
@@ -88,11 +89,22 @@ impl Target {
         }
     }
 
-    pub(crate) async fn collect(mut self) -> Result<Report> {
+    pub(crate) async fn collect(self) -> Result<Report> {
+        self.collect_with_stop(None).await
+    }
+
+    async fn collect_with_stop(mut self, stop: Option<&CaptureStop>) -> Result<Report> {
         let plan = self.preview();
-        let (stdout, _) = self
-            .run_diagnostic("Linux triage", command(), DEADLINE, WIRE_BYTES)
-            .await?;
+        let mut stdout = Vec::new();
+        self.run_diagnostic_to(
+            "Linux triage",
+            command(),
+            DEADLINE,
+            WIRE_BYTES,
+            &mut stdout,
+            stop,
+        )
+        .await?;
         let collection = parse(&stdout)?;
         Ok(Report {
             version: 1,
@@ -106,6 +118,10 @@ impl Target {
         super::NETWORK.block_on(self.collect())
     }
 
+    pub fn collect_blocking_with_stop(self, stop: &CaptureStop) -> Result<Report> {
+        super::NETWORK.block_on(self.collect_with_stop(Some(stop)))
+    }
+
     async fn run_diagnostic(
         &mut self,
         operation: &str,
@@ -115,7 +131,14 @@ impl Target {
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut stdout = Vec::new();
         let stderr = self
-            .run_diagnostic_to(operation, command, deadline, stdout_limit, &mut stdout)
+            .run_diagnostic_to(
+                operation,
+                command,
+                deadline,
+                stdout_limit,
+                &mut stdout,
+                None,
+            )
             .await?;
         Ok((stdout, stderr))
     }
@@ -127,11 +150,12 @@ impl Target {
         deadline: Duration,
         stdout_limit: usize,
         stdout: &mut impl DiagnosticStdout,
+        stop: Option<&CaptureStop>,
     ) -> Result<Vec<u8>> {
         let _busy = self.link.try_lock_diagnostic()?;
         let request = tokio::time::timeout(
             deadline,
-            read_diagnostic(&self.link, operation, command, stdout_limit, stdout),
+            read_diagnostic(&self.link, operation, command, stdout_limit, stdout, stop),
         );
         tokio::select! {
             biased;
@@ -280,6 +304,7 @@ async fn read_diagnostic(
     command: String,
     stdout_limit: usize,
     stdout: &mut impl DiagnosticStdout,
+    stop: Option<&CaptureStop>,
 ) -> Result<Vec<u8>> {
     let mut channel = PendingChannel(Some(
         link.handle()
@@ -293,7 +318,25 @@ async fn read_diagnostic(
     let mut stderr = Vec::new();
     let mut result = None;
     let mut eof = false;
-    while let Some(message) = channel.wait().await {
+    let mut stop = stop.map(CaptureStop::subscribe);
+    loop {
+        let message = tokio::select! {
+            biased;
+            message = channel.wait() => message,
+            _ = async {
+                if let Some(stop) = &mut stop {
+                    let _ = stop.wait_for(|requested| *requested).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                stop = None;
+                // A completed report can still arrive if the request races channel closure.
+                let _ = channel.data(b"stop\n".as_slice()).await;
+                continue;
+            }
+        };
+        let Some(message) = message else { break };
         match message {
             ChannelMsg::Data { data } => {
                 received += data.len();
@@ -418,6 +461,8 @@ pub struct Collection {
     pub started_unix_ms: u64,
     pub finished_unix_ms: u64,
     pub supervisor_status: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_by_user: bool,
     pub samples: Vec<Sample>,
 }
 
@@ -498,14 +543,21 @@ fn parse(bytes: &[u8]) -> Result<Collection> {
     let header = lines
         .next()
         .context("Remote triage did not return a report")?;
-    let [version, start, end, status] = header.split('\t').collect::<Vec<_>>()[..] else {
-        bail!("Invalid remote triage report header");
-    };
+    let (version, start, end, status, stopped_by_user) =
+        match header.split('\t').collect::<Vec<_>>()[..] {
+            [version, start, end, status] => (version, start, end, status, false),
+            [version, start, end, status, "stopped"] => (version, start, end, status, true),
+            _ => bail!("Invalid remote triage report header"),
+        };
     ensure!(
         version == "w11term-linux-triage-v1",
         "Unrecognized remote triage protocol"
     );
     let supervisor_status = status.parse()?;
+    ensure!(
+        !stopped_by_user || supervisor_status != 0,
+        "Invalid stopped triage status"
+    );
     let mut samples = Vec::with_capacity(PROBES.len());
     for (id, _, _) in PROBES {
         let line = lines.next().context("Remote triage report is incomplete")?;
@@ -519,7 +571,9 @@ fn parse(bytes: &[u8]) -> Result<Collection> {
         let status = match exit_status {
             Some(0) => SampleStatus::Ok,
             Some(127) => SampleStatus::Missing,
-            None if matches!(supervisor_status, 124 | 137) => SampleStatus::TimedOut,
+            None if !stopped_by_user && matches!(supervisor_status, 124 | 137) => {
+                SampleStatus::TimedOut
+            }
             None => SampleStatus::Incomplete,
             Some(_) if stdout.at_byte_limit || stderr.at_byte_limit => SampleStatus::OutputLimit,
             Some(_) => {
@@ -551,6 +605,7 @@ fn parse(bytes: &[u8]) -> Result<Collection> {
         started_unix_ms: start.parse()?,
         finished_unix_ms: end.parse()?,
         supervisor_status,
+        stopped_by_user,
         samples,
     })
 }

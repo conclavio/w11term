@@ -69,10 +69,21 @@ try {
     $null = Control @('focus-pane','--pane',"$remote")
     Wait-Focus $remote
     Click 'Run triage'
-    $null = Wait-Until 'collection summary' { Find-Element '7 of 10 checks complete' }
+    $null = Wait-Until 'remote probes started' { [IO.File]::Exists($command) }
+    Click 'Return to diagnostics overview'
+    $null = Control @('focus-pane','--pane',"$local")
+    Wait-Focus $local
+    $null = Wait-Until 'running collection remains visible from PowerShell' {
+        Find-Element 'Running'
+    }
+    Click 'Open Linux performance triage activity'
+    Click 'Stop and keep report'
+    $null = Wait-Until 'stopped collection keeps its completed checks' {
+        (Find-Element '7 of 10 checks complete') -and (Find-Element 'Stopped by request')
+    }
     Click 'Return to diagnostics overview'
     $null = Wait-Until 'overview shows the completed performance report' {
-        Find-Element 'Collected Linux performance report'
+        Find-Element ('Collected Linux performance report' + [char]10 + 'Stopped by request')
     }
     Click 'Open Linux performance triage activity'
     Show-CpuEvidence
@@ -83,7 +94,9 @@ try {
     $null = Wait-Until 'save through native dialog' { [FixtureDialog]::ClickButton($save, 1) }
     $null = Wait-Until 'saved report published' { (Find-Element 'Saved Linux triage report') -and [IO.File]::Exists($report) }
     $saved = [IO.File]::ReadAllText($report) | ConvertFrom-Json
-    if ($saved.version -ne 1 -or $saved.collection.samples[1].status -cne 'permission-denied') { throw 'Wrong report persisted' }
+    if ($saved.version -ne 1 -or !$saved.collection.stopped_by_user -or
+        $saved.collection.samples[1].status -cne 'permission-denied' -or
+        $saved.collection.samples[8].status -cne 'incomplete') { throw 'Wrong report persisted' }
     $null = Control @('close-pane','--pane',"$remote")
     Wait-Focus $local
     Click 'Close performance triage'
@@ -92,7 +105,9 @@ try {
     $open = Wait-Until 'owned triage open dialog' { Find-OwnedDialog 'Open Linux triage report' }
     $null = Wait-Until 'enter the saved report path' { [FixtureDialog]::SetFilename($open, $report, '') }
     $null = Wait-Until 'open through native dialog' { [FixtureDialog]::ClickButton($open, 1) }
-    $null = Wait-Until 'saved triage reopened without the SSH pane' { Find-Element 'Opened Linux triage report' }
+    $null = Wait-Until 'saved triage reopened without the SSH pane' {
+        (Find-Element 'Opened Linux triage report') -and (Find-Element 'Stopped by request')
+    }
     Show-CpuEvidence
     Show-KernelCheck
     Click ('Review report with OpenRouter' + [char]0x2026)

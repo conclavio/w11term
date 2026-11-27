@@ -167,6 +167,7 @@ impl Target {
                 deadline,
                 transcript_limit + MAX_BYTES + HEADER_BYTES,
                 &mut receiver,
+                None,
             )
             .await?;
         let (stdout, recording) = receiver.finish().await?;

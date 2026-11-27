@@ -489,6 +489,7 @@ mod tests {
             started_unix_ms: 0,
             finished_unix_ms: 0,
             supervisor_status: 0,
+            stopped_by_user: false,
             samples,
         })
     }

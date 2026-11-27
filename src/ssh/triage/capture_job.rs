@@ -36,12 +36,16 @@ impl CaptureStop {
         *self.0.borrow()
     }
 
+    pub(super) fn subscribe(&self) -> watch::Receiver<bool> {
+        self.0.subscribe()
+    }
+
     pub(super) async fn ready(
         &self,
         messages: &mut ArtifactMessages,
         channel: &mut Channel<client::Msg>,
     ) -> Result<String> {
-        let mut requested = self.0.subscribe();
+        let mut requested = self.subscribe();
         tokio::select! {
             biased;
             line = messages.line(channel) => line,

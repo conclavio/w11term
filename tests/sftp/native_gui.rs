@@ -203,7 +203,9 @@ async fn native_linux_triage_reviews_collects_and_reopens_a_report() {
     else {
         unreachable!()
     };
-    fs::write(remote.path().join("triage-response"), TRIAGE_RESPONSE).unwrap();
+    let stopped = TRIAGE_RESPONSE.replacen("\t124\n", "\t143\tstopped\n", 1);
+    fs::write(remote.path().join("triage-response"), stopped).unwrap();
+    fs::write(remote.path().join("triage-wait-for-stop"), []).unwrap();
     let wire = remote.path().join("keyboard-input.bin");
     fs::write(&wire, []).unwrap();
     let state = tempfile::tempdir().unwrap();

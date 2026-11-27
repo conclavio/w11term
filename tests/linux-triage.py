@@ -1,7 +1,10 @@
 """Exercise the exact remote triage supervisor and worker on Linux."""
 
 import base64
+import shlex
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 
@@ -18,9 +21,15 @@ def collect(supervisor, worker):
         check=True,
         timeout=60,
     )
-    marker, *lines, end = completed.stdout.decode("ascii").splitlines()
-    assert end == "end", completed.stdout
-    version, started, finished, status = marker.split("\t")
+    status, reason, checks = parse_report(completed.stdout)
+    assert reason == [], reason
+    return status, checks
+
+
+def parse_report(output):
+    marker, *lines, end = output.decode("ascii").splitlines()
+    assert end == "end", output
+    version, started, finished, status, *reason = marker.split("\t")
     assert version == "w11term-linux-triage-v1" and int(started) <= int(finished)
     checks = {}
     for line in lines:
@@ -30,7 +39,51 @@ def collect(supervisor, worker):
         assert max(len(stdout), len(stderr)) <= 16384, name
         checks[name] = (code, stdout, stderr)
     assert list(checks) == IDS, checks
-    return int(status), checks
+    return int(status), reason, checks
+
+
+def stop_collection(worker):
+    with tempfile.TemporaryDirectory() as temp:
+        marker = Path(temp) / "ready"
+        worker += f"""
+run_check uptime uptime
+printf '%s\\n' "$work" > "$work/top.out"
+run_check mpstat bash -c '
+    trap "" TERM
+    printf "%s\\n" "$$" > "$1"
+    exec sleep 30
+' fixture {shlex.quote(str(marker))} &
+wait
+"""
+        with subprocess.Popen(
+            ["/bin/sh", "-c", SUPERVISOR, "w11term-triage", worker],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as child:
+            deadline = time.monotonic() + 5
+            while not marker.is_file() or not marker.stat().st_size:
+                assert child.poll() is None and time.monotonic() < deadline
+                time.sleep(0.01)
+            stdout, stderr = child.communicate(b"stop\n", timeout=6)
+            assert child.returncode == 0, stderr
+        status, reason, checks = parse_report(stdout)
+        assert status != 0 and reason == ["stopped"], (status, reason)
+        assert checks["uptime"][0] == "0" and checks["uptime"][1], checks
+        assert checks["mpstat"][0] == "-", checks["mpstat"]
+        scratch = Path(checks["top"][1].decode().strip())
+        assert scratch.name.startswith("w11term-triage.") and not scratch.exists(), scratch
+        proc_stat = Path("/proc") / marker.read_text().strip() / "stat"
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                state = proc_stat.read_text().rsplit(") ", 1)[1][0]
+            except FileNotFoundError:
+                break
+            if state == "Z":
+                break
+            assert time.monotonic() < deadline, (proc_stat, state)
+            time.sleep(0.01)
 
 
 def main():
@@ -43,6 +96,7 @@ def main():
     ), checks["top"][0]
 
     workers = WORKER.split("run_check uptime uptime &", 1)[0]
+    stop_collection(workers)
     workers += """
 run_check uptime uptime &
 run_check free head -c 100000 /dev/zero &
