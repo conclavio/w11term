@@ -1495,6 +1495,8 @@ Use `inspect-packet-capture` to read the same summary as schema-version-1 JSON w
 
 Use **Saved capture interfaces** when a capture contains multiple interfaces. Each entry shows the recorded name when available, link type, snap length, packet count, bytes, truncation, and timestamp coverage. The JSON `interface_details` array includes the same breakdown. PCAPNG sections are numbered starting at one, and interface IDs start at zero within each section. A classic PCAP file has one implicit interface with a `null` section. A `null` snap length means the PCAPNG interface has no limit.
 
+If a PCAPNG file records interface statistics, the panel shows the newest timestamped counter snapshot for that interface. These cumulative counters can report packets received, accepted by the filter, delivered, dropped by the interface, or dropped by the OS. The JSON `capture_statistics` object includes the snapshot time as `timestamp_unix_ns`, a decimal nanosecond string. Missing counters are `null`. Each snapshot is reported once, and the packet-record totals still describe the packets stored in the file. [PCAPNG Interface Statistics Block](https://datatracker.ietf.org/doc/html/draft-ietf-opsawg-pcapng-06#section-4.6)
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

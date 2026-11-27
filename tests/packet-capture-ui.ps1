@@ -24,7 +24,13 @@ $dot = ' ' + [char]0xb7 + ' '
     1,0,0,0, 32,0,0,0, 20,1,0,0, 0,0,0,0, 2,0,8,0, 119,105,114,101,108,101,115,115, 32,0,0,0,
     6,0,0,0, 36,0,0,0, 0,0,0,0, 0,0,0,0, 64,66,15,0, 4,0,0,0, 8,0,0,0, 0,0,0,0, 36,0,0,0,
     6,0,0,0, 36,0,0,0, 1,0,0,0, 0,0,0,0, 96,227,22,0, 4,0,0,0, 4,0,0,0, 0,0,0,0, 36,0,0,0,
-    3,0,0,0, 20,0,0,0, 4,0,0,0, 0,0,0,0, 20,0,0,0
+    3,0,0,0, 20,0,0,0, 4,0,0,0, 0,0,0,0, 20,0,0,0,
+    # ISB snapshots for wired and wireless. Wireless reports zero interface drops and five OS drops.
+    5,0,0,0, 48,0,0,0, 0,0,0,0, 0,0,0,0, 128,132,30,0,
+    4,0,8,0, 12,0,0,0,0,0,0,0, 5,0,8,0, 1,0,0,0,0,0,0,0, 48,0,0,0,
+    5,0,0,0, 60,0,0,0, 1,0,0,0, 0,0,0,0, 160,37,38,0,
+    4,0,8,0, 100,0,0,0,0,0,0,0, 5,0,8,0, 0,0,0,0,0,0,0,0,
+    7,0,8,0, 5,0,0,0,0,0,0,0, 60,0,0,0
 ))
 [IO.File]::WriteAllBytes($partialCapture, [byte[]]([IO.File]::ReadAllBytes($olderCapture) + @(6,0,0,0,36,0,0,0,0,0,0,0)))
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
@@ -87,11 +93,13 @@ try {
     Click 'Packet capture'
     Select-Capture $olderCapture
     $null = Wait-Until 'an earlier capture opens before any SSH connection' {
-        (Find-Element "PCAPNG${dot}184 bytes") -and
+        (Find-Element "PCAPNG${dot}292 bytes") -and
             (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated") -and
             (Find-Element "Timestamp span 0.500 s${dot}2 of 3 packets timestamped") -and
             (Find-Element "Interfaces 2${dot}Ethernet, Linux cooked v2") -and
-            (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated")
+            (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated") -and
+            (Find-Element "Reported${dot}Received 12") -and
+            (Find-Element "Reported${dot}Interface drops 1")
     }
     $picker = Find-Element 'Saved capture interfaces' ([System.Windows.Automation.ControlType]::ComboBox)
     $picker.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
@@ -101,27 +109,34 @@ try {
     $wireless.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $null = Wait-Until 'the selected interface shows its own capture totals and snap length' {
         (Find-Element "wireless${dot}Linux cooked v2${dot}Unlimited snap length") -and
-            (Find-Element "Interface packets 1${dot}4 captured bytes${dot}0 truncated")
+            (Find-Element "Interface packets 1${dot}4 captured bytes${dot}0 truncated") -and
+            (Find-Element "Reported${dot}Received 100") -and
+            (Find-Element "Reported${dot}Interface drops 0${dot}OS drops 5")
     }
     $summary = & $Cli inspect-packet-capture $olderCapture | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or !$summary.complete -or $summary.format -cne 'pcapng' -or
-        $summary.file_bytes -ne 184 -or $summary.packets -ne 3 -or $summary.captured_bytes -ne 12 -or
+        $summary.file_bytes -ne 292 -or $summary.packets -ne 3 -or $summary.captured_bytes -ne 12 -or
         $summary.truncated_packets -ne 1 -or $summary.timestamped_packets -ne 2 -or
         $summary.timestamp_span_ns -cne '500000000' -or $summary.interfaces -ne 2 -or
         $summary.link_types.Count -ne 2 -or $summary.link_types[0] -ne 1 -or $summary.link_types[1] -ne 276 -or
         $summary.interface_details[0].name -cne 'wired' -or $summary.interface_details[0].packets -ne 2 -or
         $summary.interface_details[1].name -cne 'wireless' -or $summary.interface_details[1].packets -ne 1 -or
-        $summary.interface_details[1].snap_length -ne $null) {
+        $summary.interface_details[1].snap_length -ne $null -or
+        $summary.interface_details[0].capture_statistics.os_dropped -ne $null -or
+        $summary.interface_details[0].capture_statistics.interface_dropped -ne 1 -or
+        $summary.interface_details[1].capture_statistics.timestamp_unix_ns -cne '2500000000' -or
+        $summary.interface_details[1].capture_statistics.interface_dropped -ne 0 -or
+        $summary.interface_details[1].capture_statistics.os_dropped -ne 5) {
         throw 'The offline inspection differs from the saved capture panel'
     }
     Select-Capture $invalidCapture
     $null = Wait-Until 'a non-capture file leaves the previous capture selected' {
-        (Find-Element 'Choose a PCAP or PCAPNG capture file') -and (Find-Element "PCAPNG${dot}184 bytes")
+        (Find-Element 'Choose a PCAP or PCAPNG capture file') -and (Find-Element "PCAPNG${dot}292 bytes")
     }
     Click 'Return to diagnostics overview'
     Click ('Reopen ' + [IO.Path]::GetFileName($olderCapture))
     $null = Wait-Until 'recent packet capture reopens and is validated again' {
-        (Find-Element "PCAPNG${dot}184 bytes") -and
+        (Find-Element "PCAPNG${dot}292 bytes") -and
         (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated") -and
         !(Find-Element 'Choose a PCAP or PCAPNG capture file') -and
         !(Find-Element 'Diagnostics overview panel')

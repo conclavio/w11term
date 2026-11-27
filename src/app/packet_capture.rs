@@ -584,6 +584,32 @@ impl Panel {
                         ));
                     }
                 }
+                if let Some(snapshot) = &interface.capture_statistics {
+                    let counters = &snapshot.counters;
+                    let reported = [
+                        ("Received", counters.received),
+                        ("Filter accepted", counters.filter_accepted),
+                        ("Delivered", counters.delivered),
+                    ];
+                    let drops = [
+                        ("Interface drops", counters.interface_dropped),
+                        ("OS drops", counters.os_dropped),
+                    ];
+                    for (key, values) in [
+                        ("capture-reported-counts", reported.as_slice()),
+                        ("capture-reported-drops", drops.as_slice()),
+                    ] {
+                        let counters: Vec<_> = values
+                            .iter()
+                            .filter_map(|(label, value)| {
+                                value.map(|value| format!("{label} {value}"))
+                            })
+                            .collect();
+                        if !counters.is_empty() {
+                            files.push(text(key, format!("Reported · {}", counters.join(" · "))));
+                        }
+                    }
+                }
             }
             if let Some(issue) = &summary.issue {
                 files.push(text(

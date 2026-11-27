@@ -1,10 +1,13 @@
-use super::{InterfaceSummary, NANOS_PER_SECOND, PacketStats, Summary, check_record_limit};
+use super::{
+    CaptureCounters, CounterSnapshot, InterfaceSummary, NANOS_PER_SECOND, PacketStats, Summary,
+    check_record_limit,
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{Read, Seek};
 
 const SECTION: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
 const MAX_INTERFACES: usize = 4096;
-const MAX_INTERFACE_OPTIONS: u64 = 64 * 1024;
+const MAX_OPTIONS_BYTES: u64 = 64 * 1024;
 const MAX_NAME_BYTES: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -36,10 +39,10 @@ impl Order {
         }
     }
 
-    fn i64(self, bytes: [u8; 8]) -> i64 {
+    fn u64(self, bytes: [u8; 8]) -> u64 {
         match self {
-            Self::Little => i64::from_le_bytes(bytes),
-            Self::Big => i64::from_be_bytes(bytes),
+            Self::Little => u64::from_le_bytes(bytes),
+            Self::Big => u64::from_be_bytes(bytes),
         }
     }
 }
@@ -75,6 +78,10 @@ enum Entry {
         captured: u32,
         original: u32,
         timestamp: Option<i128>,
+    },
+    Statistics {
+        interface: usize,
+        snapshot: CounterSnapshot,
     },
     Other,
 }
@@ -135,6 +142,7 @@ pub(super) fn scan(
                 }
                 2 => block.timed_packet(&interfaces, true)?,
                 3 => block.simple_packet(&interfaces)?,
+                5 => block.statistics(&interfaces)?,
                 6 => block.timed_packet(&interfaces, false)?,
                 _ => Entry::Other,
             }
@@ -155,6 +163,7 @@ pub(super) fn scan(
                     snap_length: (interface.snap != 0).then_some(interface.snap),
                     name: interface.name.take(),
                     stats: PacketStats::default(),
+                    capture_statistics: None,
                 });
                 interfaces.push(interface);
             }
@@ -165,6 +174,18 @@ pub(super) fn scan(
                 timestamp,
             } => {
                 summary.packet(section_start + interface, captured, original, timestamp);
+            }
+            Entry::Statistics {
+                interface,
+                snapshot,
+            } => {
+                let latest = &mut summary.interfaces[section_start + interface].capture_statistics;
+                if latest
+                    .as_ref()
+                    .is_none_or(|current| snapshot.ticks >= current.ticks)
+                {
+                    *latest = Some(snapshot);
+                }
             }
             Entry::Other => (),
         }
@@ -203,6 +224,27 @@ impl<T: Read + Seek> Block<'_, T> {
         Ok(self.order.u32(self.read()?))
     }
 
+    fn ticks(&mut self) -> Result<u64> {
+        Ok((u64::from(self.u32()?) << 32) | u64::from(self.u32()?))
+    }
+
+    fn option(&mut self) -> Result<Option<(u16, u64)>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let code = self.u16()?;
+        let size = u64::from(self.u16()?);
+        if code == 0 {
+            ensure!(size == 0, "Invalid PCAPNG end-of-options length");
+            return Ok(None);
+        }
+        ensure!(
+            size.next_multiple_of(4) <= self.remaining,
+            "Incomplete PCAPNG option"
+        );
+        Ok(Some((code, size)))
+    }
+
     fn skip(&mut self, bytes: u64) -> Result<()> {
         ensure!(self.remaining >= bytes, "Incomplete PCAPNG block");
         self.file.seek_relative(bytes as i64)?;
@@ -229,25 +271,65 @@ impl<T: Read + Seek> Block<'_, T> {
             offset_seconds: 0,
         };
         ensure!(
-            self.remaining <= MAX_INTERFACE_OPTIONS,
+            self.remaining <= MAX_OPTIONS_BYTES,
             "PCAPNG interface options exceed the summary scan limit"
         );
-        while self.remaining > 0 {
-            let code = self.u16()?;
-            let size = u64::from(self.u16()?);
+        while let Some((code, size)) = self.option()? {
             match (code, size) {
-                (0, 0) => break,
                 (2, _) if interface.name.is_none() => interface.name = self.interface_name(size)?,
                 (9, 1) => {
                     interface.resolution = self.read::<1>()?[0];
                     self.skip(3)?;
                 }
-                (14, 8) => interface.offset_seconds = self.order.i64(self.read()?),
-                (0 | 9 | 14, _) => bail!("Invalid PCAPNG interface option length"),
+                (14, 8) => interface.offset_seconds = self.order.u64(self.read()?) as i64,
+                (9 | 14, _) => bail!("Invalid PCAPNG interface option length"),
                 _ => self.skip(size.next_multiple_of(4))?,
             }
         }
         Ok(interface)
+    }
+
+    fn statistics(&mut self, interfaces: &[Interface]) -> Result<Entry> {
+        let index = self.u32()? as usize;
+        let interface = interfaces
+            .get(index)
+            .context("PCAPNG statistics refer to an unknown interface")?;
+        let ticks = self.ticks()?;
+        ensure!(
+            self.remaining <= MAX_OPTIONS_BYTES,
+            "PCAPNG statistics options exceed the summary scan limit"
+        );
+        let mut counters = CaptureCounters::default();
+        let mut recorded = false;
+        while let Some((code, size)) = self.option()? {
+            let slot = match code {
+                4 => &mut counters.received,
+                5 => &mut counters.interface_dropped,
+                6 => &mut counters.filter_accepted,
+                7 => &mut counters.os_dropped,
+                8 => &mut counters.delivered,
+                _ => {
+                    self.skip(size.next_multiple_of(4))?;
+                    continue;
+                }
+            };
+            ensure!(size == 8, "Invalid PCAPNG statistics counter length");
+            let value = self.order.u64(self.read()?);
+            *slot = Some(value);
+            recorded = true;
+        }
+        Ok(if recorded {
+            Entry::Statistics {
+                interface: index,
+                snapshot: CounterSnapshot {
+                    ticks,
+                    timestamp_unix_ns: interface.timestamp_ns(ticks),
+                    counters,
+                },
+            }
+        } else {
+            Entry::Other
+        })
     }
 
     fn interface_name(&mut self, size: u64) -> Result<Option<String>> {
@@ -282,7 +364,7 @@ impl<T: Read + Seek> Block<'_, T> {
         let interface = interfaces
             .get(id as usize)
             .context("PCAPNG packet refers to an unknown interface")?;
-        let ticks = (u64::from(self.u32()?) << 32) | u64::from(self.u32()?);
+        let ticks = self.ticks()?;
         let captured = self.u32()?;
         let original = self.u32()?;
         ensure!(

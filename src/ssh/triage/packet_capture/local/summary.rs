@@ -1,5 +1,6 @@
 use super::{super::ClassicPcap, Format};
 use anyhow::{Result, ensure};
+use serde::Serialize;
 use std::{
     collections::BTreeSet,
     io::{Read, Seek},
@@ -25,6 +26,22 @@ pub struct InterfaceSummary {
     pub snap_length: Option<u32>,
     pub name: Option<String>,
     pub stats: PacketStats,
+    pub capture_statistics: Option<CounterSnapshot>,
+}
+
+pub struct CounterSnapshot {
+    ticks: u64,
+    pub timestamp_unix_ns: i128,
+    pub counters: CaptureCounters,
+}
+
+#[derive(Default, Serialize)]
+pub struct CaptureCounters {
+    pub received: Option<u64>,
+    pub interface_dropped: Option<u64>,
+    pub filter_accepted: Option<u64>,
+    pub os_dropped: Option<u64>,
+    pub delivered: Option<u64>,
 }
 
 #[derive(Default)]
@@ -62,6 +79,7 @@ impl Summary {
             snap_length: Some(format.snap),
             name: None,
             stats: PacketStats::default(),
+            capture_statistics: None,
         });
         let fraction_limit = if format.nanoseconds {
             1_000_000_000
@@ -256,6 +274,24 @@ mod tests {
             block(bytes, enc32, 3, |data| {
                 data.extend([6, 0].into_iter().flat_map(enc32))
             });
+            block(bytes, enc32, 5, |data| {
+                data.extend([0, 0, 2_000_000].into_iter().flat_map(enc32));
+                for (code, value) in [(4, 50_u64), (5, 0), (6, 20), (7, 5), (8, 15)] {
+                    data.extend(enc16(code));
+                    data.extend(enc16(8));
+                    data.extend(value.to_le_bytes());
+                }
+            });
+            block(bytes, enc32, 5, |data| {
+                data.extend([0, 0, 1_500_000].into_iter().flat_map(enc32));
+                data.extend(enc16(7));
+                data.extend(enc16(8));
+                data.extend(1_u64.to_le_bytes());
+            });
+            // A later ISB that carries only timestamps does not replace a counter snapshot.
+            block(bytes, enc32, 5, |data| {
+                data.extend([0, 0, 3_000_000].into_iter().flat_map(enc32));
+            });
         });
         section(&mut bytes, true, |bytes, enc16, enc32| {
             block(bytes, enc32, 1, |data| {
@@ -270,6 +306,12 @@ mod tests {
                 data.extend((-1_i64).to_be_bytes());
             });
             block(bytes, enc32, 0x123, |data| data.extend([0; 4]));
+            block(bytes, enc32, 5, |data| {
+                data.extend([0, 0, 9].into_iter().flat_map(enc32));
+                data.extend(enc16(7));
+                data.extend(enc16(8));
+                data.extend(0x0102_0304_0506_0708_u64.to_be_bytes());
+            });
             block(bytes, enc32, 2, |data| {
                 data.extend(enc16(0)); // interface zero in this section
                 data.extend(enc16(0xffff));
@@ -295,6 +337,20 @@ mod tests {
         assert_eq!(first.name.as_deref(), Some("eth0"));
         assert_eq!((first.stats.packets, first.stats.captured_bytes), (2, 8));
         assert_eq!((second.stats.packets, second.stats.captured_bytes), (1, 1));
+        let first_stats = first.capture_statistics.as_ref().unwrap();
+        let second_stats = second.capture_statistics.as_ref().unwrap();
+        assert_eq!(first_stats.timestamp_unix_ns, 2_000_000_000);
+        assert_eq!(first_stats.counters.received, Some(50));
+        assert_eq!(first_stats.counters.interface_dropped, Some(0));
+        assert_eq!(first_stats.counters.filter_accepted, Some(20));
+        assert_eq!(first_stats.counters.os_dropped, Some(5));
+        assert_eq!(first_stats.counters.delivered, Some(15));
+        assert_eq!(second_stats.timestamp_unix_ns, 3_500_000_000);
+        assert_eq!(
+            second_stats.counters.os_dropped,
+            Some(0x0102_0304_0506_0708)
+        );
+        assert_eq!(second_stats.counters.interface_dropped, None);
         assert_eq!(second.snap_length, None);
         assert_eq!(summary.link_types, [1, 276].into());
         assert_eq!(summary.stats.span_ns(), Some(500_000_000));

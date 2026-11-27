@@ -10,7 +10,7 @@ use std::{
 };
 
 mod summary;
-use summary::{PacketStats, Summary};
+use summary::{CaptureCounters, PacketStats, Summary};
 
 pub struct LocalCapture {
     pub path: PathBuf,
@@ -48,8 +48,16 @@ struct InterfaceReport<'a> {
     name: Option<&'a str>,
     link_type: u16,
     snap_length: Option<u32>,
+    capture_statistics: Option<CountersReport<'a>>,
     #[serde(flatten)]
     stats: StatsReport,
+}
+
+#[derive(Serialize)]
+struct CountersReport<'a> {
+    timestamp_unix_ns: String,
+    #[serde(flatten)]
+    values: &'a CaptureCounters,
 }
 
 #[derive(Serialize)]
@@ -118,6 +126,12 @@ impl LocalCapture {
                     name: interface.name.as_deref(),
                     link_type: interface.link_type,
                     snap_length: interface.snap_length,
+                    capture_statistics: interface.capture_statistics.as_ref().map(|sample| {
+                        CountersReport {
+                            timestamp_unix_ns: sample.timestamp_unix_ns.to_string(),
+                            values: &sample.counters,
+                        }
+                    }),
                     stats: (&interface.stats).into(),
                 })
                 .collect(),

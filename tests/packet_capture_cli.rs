@@ -62,6 +62,7 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
                 "name": null,
                 "link_type": 1,
                 "snap_length": 64,
+                "capture_statistics": null,
                 "packets": 2,
                 "captured_bytes": 6,
                 "truncated_packets": 1,
