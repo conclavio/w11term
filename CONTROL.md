@@ -1503,6 +1503,8 @@ Select a populated interval, then choose **Open interval in Wireshark** to open 
 
 Expand **IP conversations** to see up to ten outer IPv4 or IPv6 address pairs ranked by captured bytes, with the total and bytes in each direction. This works offline with Ethernet (including up to four 802.1Q or 802.1ad tags), Linux cooked v1 and v2, raw IP, and BSD or Npcap loopback captures. Each captured record contributes once, across all interfaces, with the link header included in its recorded byte count. The panel reports packets without classifiable IP headers and packets omitted after the first 4,096 distinct pairs. A tracked pair continues to accumulate traffic after that limit. JSON exposes the same coverage and ranking under `ip_conversations`, with packet and byte counts in both `a_to_b` and `b_to_a`. [Link types](https://www.iana.org/assignments/pcap)
 
+Select a ranked pair and choose **Open conversation in Wireshark** to open the original capture with both directions of that outer IP pair. The filter uses the layer operator in Wireshark 4.0 or later. [Wireshark layer filters](https://www.wireshark.org/docs/man-pages/wireshark-filter.html#_the_layer_operator) · [Wireshark 4.0 release notes](https://www.wireshark.org/docs/relnotes/wireshark-4.0.0.html)
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

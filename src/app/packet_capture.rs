@@ -1,10 +1,15 @@
 use super::*;
-use std::path::{Path, PathBuf};
+use std::{
+    net::IpAddr,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 use w11term::{
     control::PacketCaptureOptions,
     ssh::{
         CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureInterfaces, PacketCapturePlan,
-        open_capture_in_wireshark, open_capture_interval_in_wireshark,
+        open_capture_conversation_in_wireshark, open_capture_in_wireshark,
+        open_capture_interval_in_wireshark,
     },
 };
 
@@ -32,6 +37,7 @@ pub enum Action {
     TimelineExpanded(bool),
     SelectTimelineInterval(PathBuf, usize),
     ConversationsExpanded(bool),
+    SelectConversation(PathBuf, Option<usize>),
     Tmpfs(bool),
     Review,
     Save,
@@ -40,6 +46,7 @@ pub enum Action {
     ChooseWireshark,
     OpenWireshark,
     OpenTimelineInterval(PathBuf, usize),
+    OpenConversation(PathBuf),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -58,6 +65,11 @@ enum FileChoice {
     Capture,
     Save,
     Wireshark,
+}
+
+enum WiresharkFilter {
+    Interval(Range<i128>),
+    Conversation(IpAddr, IpAddr),
 }
 
 enum LoadedCapture {
@@ -180,6 +192,7 @@ pub(super) struct Panel {
     timeline_expanded: bool,
     timeline_interval: Option<usize>,
     conversations_expanded: bool,
+    selected_conversation: Option<usize>,
     wireshark: Option<PathBuf>,
     pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
@@ -630,34 +643,60 @@ impl Panel {
                     ));
                 }
                 if !conversations.top.is_empty() {
-                    rows.push(text("rank-order", "Ranked by captured bytes"));
+                    let select_path = capture.path.clone();
+                    let open_path = capture.path.clone();
+                    let list = ListView::new()
+                        .automation_name("IP conversations by captured bytes")
+                        .max_height(280.0)
+                        .selected_index(self.selected_conversation)
+                        .on_selection_changed(ctx.callback(move |index| {
+                            message(Action::SelectConversation(select_path.clone(), index))
+                        }))
+                        .collection_slot(
+                            ListViewSlot::Items,
+                            conversations.top.iter().map(|pair| {
+                                let total = pair.total();
+                                let label = format!("{} ↔ {}", pair.a, pair.b);
+                                let totals = format!(
+                                    "{} packets · {} captured bytes",
+                                    total.packets, total.captured_bytes
+                                );
+                                let directions = format!(
+                                    "Left to right {} bytes · Right to left {} bytes",
+                                    pair.a_to_b.captured_bytes, pair.b_to_a.captured_bytes
+                                );
+                                KeyedView::new(
+                                    label.as_str(),
+                                    ListViewItem::new().automation_name(&label).content(
+                                        StackPanel::new().spacing(2.0).children((
+                                            TextBlock::new()
+                                                .text(label.clone())
+                                                .text_wrapping(TextWrapping::Wrap),
+                                            TextBlock::new()
+                                                .text(totals)
+                                                .text_wrapping(TextWrapping::Wrap),
+                                            TextBlock::new()
+                                                .text(directions)
+                                                .text_wrapping(TextWrapping::Wrap),
+                                        )),
+                                    ),
+                                )
+                            }),
+                        );
+                    rows.extend([
+                        text("rank-order", "Ranked by captured bytes"),
+                        KeyedView::new("ranked-conversations", list),
+                        KeyedView::new(
+                            "open-conversation",
+                            Button::new()
+                                .is_enabled(idle && self.selected_conversation.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    message(Action::OpenConversation(open_path.clone()))
+                                }))
+                                .content("Open conversation in Wireshark"),
+                        ),
+                    ]);
                 }
-                rows.extend(conversations.top.iter().map(|pair| {
-                    let total = pair.total();
-                    let label = format!("{} ↔ {}", pair.a, pair.b);
-                    let totals = format!(
-                        "{} packets · {} captured bytes",
-                        total.packets, total.captured_bytes
-                    );
-                    let directions = format!(
-                        "Left to right {} bytes · Right to left {} bytes",
-                        pair.a_to_b.captured_bytes, pair.b_to_a.captured_bytes
-                    );
-                    KeyedView::new(
-                        label.as_str(),
-                        StackPanel::new().spacing(2.0).children((
-                            TextBlock::new()
-                                .text(label.clone())
-                                .text_wrapping(TextWrapping::Wrap),
-                            TextBlock::new()
-                                .text(totals)
-                                .text_wrapping(TextWrapping::Wrap),
-                            TextBlock::new()
-                                .text(directions)
-                                .text_wrapping(TextWrapping::Wrap),
-                        )),
-                    )
-                }));
                 files.push(KeyedView::new(
                     "local-conversations",
                     Expander::new()
@@ -899,7 +938,14 @@ impl TerminalApp {
                 }
             }
             Action::Finished(ticket, result) => self.packet_capture_finished(ticket, result, ctx),
-            action if self.packet_capture.open && self.packet_capture.pending.is_none() => {
+            action
+                if self.packet_capture.open
+                    && (self.packet_capture.pending.is_none()
+                        || matches!(
+                            action,
+                            Action::SelectConversation(..) | Action::ConversationsExpanded(_)
+                        )) =>
+            {
                 self.packet_capture_input(action, ctx);
             }
             _ => (),
@@ -954,6 +1000,14 @@ impl TerminalApp {
             }
             Action::TimelineExpanded(expanded) => panel.timeline_expanded = expanded,
             Action::ConversationsExpanded(expanded) => panel.conversations_expanded = expanded,
+            Action::SelectConversation(path, index) => {
+                if let Some(LoadedCapture::Local(capture)) = &panel.loaded
+                    && capture.path == path
+                {
+                    panel.selected_conversation =
+                        index.filter(|&index| index < capture.summary.conversations.top.len());
+                }
+            }
             Action::SelectTimelineInterval(path, index) => {
                 if let Some(LoadedCapture::Local(capture)) = &panel.loaded
                     && capture.path == path
@@ -979,23 +1033,36 @@ impl TerminalApp {
                 });
             }
             Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
-            Action::OpenWireshark | Action::OpenTimelineInterval(..) => {
+            Action::OpenWireshark
+            | Action::OpenTimelineInterval(..)
+            | Action::OpenConversation(_) => {
                 let Some(capture) = &panel.loaded else { return };
-                let interval = if let Action::OpenTimelineInterval(path, peak_index) = action {
-                    let LoadedCapture::Local(local) = capture else {
-                        return;
-                    };
-                    if !panel.timeline_expanded || local.path != path {
-                        return;
+                let filter = match (action, capture) {
+                    (Action::OpenWireshark, _) => None,
+                    (
+                        Action::OpenTimelineInterval(path, peak_index),
+                        LoadedCapture::Local(local),
+                    ) if panel.timeline_expanded && local.path == path => {
+                        let Some(interval) = local.summary.timeline.as_ref().and_then(|timeline| {
+                            timeline
+                                .occupied_interval(panel.timeline_interval.unwrap_or(peak_index))
+                        }) else {
+                            return;
+                        };
+                        Some(WiresharkFilter::Interval(interval))
                     }
-                    let Some(interval) = local.summary.timeline.as_ref().and_then(|timeline| {
-                        timeline.occupied_interval(panel.timeline_interval.unwrap_or(peak_index))
-                    }) else {
-                        return;
-                    };
-                    Some(interval)
-                } else {
-                    None
+                    (Action::OpenConversation(path), LoadedCapture::Local(local))
+                        if panel.conversations_expanded && local.path == path =>
+                    {
+                        let Some(pair) = panel
+                            .selected_conversation
+                            .and_then(|index| local.summary.conversations.top.get(index))
+                        else {
+                            return;
+                        };
+                        Some(WiresharkFilter::Conversation(pair.a, pair.b))
+                    }
+                    _ => return,
                 };
                 let capture = capture.path().to_owned();
                 let configured = panel.wireshark.clone();
@@ -1004,11 +1071,15 @@ impl TerminalApp {
                     let executable = configured.or_else(default_wireshark).context(
                         "Wireshark was not found. Choose its executable to open the capture.",
                     )?;
-                    if let Some(interval) = interval {
-                        open_capture_interval_in_wireshark(&capture, &executable, interval)?;
-                    } else {
-                        open_capture_in_wireshark(&capture, &executable)?;
-                    }
+                    match filter {
+                        None => open_capture_in_wireshark(&capture, &executable),
+                        Some(WiresharkFilter::Interval(interval)) => {
+                            open_capture_interval_in_wireshark(&capture, &executable, interval)
+                        }
+                        Some(WiresharkFilter::Conversation(a, b)) => {
+                            open_capture_conversation_in_wireshark(&capture, &executable, a, b)
+                        }
+                    }?;
                     Ok(Some(Outcome::Opened))
                 });
             }
@@ -1182,6 +1253,7 @@ impl TerminalApp {
                 panel.timeline_expanded = false;
                 panel.timeline_interval = None;
                 panel.conversations_expanded = false;
+                panel.selected_conversation = None;
                 panel.activity = None;
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,

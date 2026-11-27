@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     io::{BufReader, Read, Seek},
+    net::IpAddr,
     ops::Range,
     path::{Path, PathBuf},
     time::Duration,
@@ -439,6 +440,35 @@ pub fn open_capture_interval_in_wireshark(
     launch_wireshark(path, executable, Some(&filter))
 }
 
+pub fn open_capture_conversation_in_wireshark(
+    path: &Path,
+    executable: &Path,
+    a: IpAddr,
+    b: IpAddr,
+) -> Result<u32> {
+    let filter = wireshark_conversation_filter(a, b)?;
+    launch_wireshark(path, executable, Some(&filter))
+}
+
+fn wireshark_conversation_filter(a: IpAddr, b: IpAddr) -> Result<String> {
+    let protocol = match (a, b) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => "ip",
+        (IpAddr::V6(_), IpAddr::V6(_)) => "ipv6",
+        _ => bail!("Choose two addresses from the same IP version"),
+    };
+    // Layers are numbered separately for IPv4 and IPv6. Require this IP
+    // version to appear first so IP-in-IP uses the same addresses as the summary.
+    let outer = format!(r#"frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*{protocol}(?::|$)""#);
+    let direction =
+        |source, dest| format!("{protocol}.src#1 == {source} && {protocol}.dst#1 == {dest}");
+    let forward = direction(a, b);
+    if a == b {
+        return Ok(format!("{outer} && {forward}"));
+    }
+    let reverse = direction(b, a);
+    Ok(format!("{outer} && (({forward}) || ({reverse}))"))
+}
+
 fn wireshark_interval_filter(interval: Range<i128>) -> Result<String> {
     use chrono::{DateTime, Datelike, SecondsFormat};
     ensure!(
@@ -761,6 +791,38 @@ impl ClassicPcap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wireshark_conversation_filter_matches_both_directions_at_the_outer_ip_layer() {
+        let a = "192.0.2.1".parse().unwrap();
+        let b = "192.0.2.2".parse().unwrap();
+        let v6 = "2001:db8::1".parse().unwrap();
+        let v6_peer = "2001:db8::2".parse().unwrap();
+        assert_eq!(
+            wireshark_conversation_filter(a, b).unwrap(),
+            concat!(
+                r#"frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip(?::|$)" && "#,
+                "((ip.src#1 == 192.0.2.1 && ip.dst#1 == 192.0.2.2) || ",
+                "(ip.src#1 == 192.0.2.2 && ip.dst#1 == 192.0.2.1))"
+            )
+        );
+        assert_eq!(
+            wireshark_conversation_filter(v6, v6_peer).unwrap(),
+            concat!(
+                r#"frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ipv6(?::|$)" && "#,
+                "((ipv6.src#1 == 2001:db8::1 && ipv6.dst#1 == 2001:db8::2) || ",
+                "(ipv6.src#1 == 2001:db8::2 && ipv6.dst#1 == 2001:db8::1))"
+            )
+        );
+        assert_eq!(
+            wireshark_conversation_filter(v6, v6).unwrap(),
+            concat!(
+                r#"frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ipv6(?::|$)" && "#,
+                "ipv6.src#1 == 2001:db8::1 && ipv6.dst#1 == 2001:db8::1"
+            )
+        );
+        assert!(wireshark_conversation_filter(a, v6).is_err());
+    }
 
     #[test]
     fn wireshark_interval_filters_keep_exact_utc_bounds_and_cross_the_epoch() {

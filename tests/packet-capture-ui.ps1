@@ -35,18 +35,50 @@ $bothDirections = [char]0x2194
     7,0,8,0, 5,0,0,0,0,0,0,0, 60,0,0,0
 ))
 [IO.File]::WriteAllBytes($partialCapture, [byte[]]([IO.File]::ReadAllBytes($olderCapture) + @(6,0,0,0,36,0,0,0,0,0,0,0)))
-[IO.File]::WriteAllBytes($conversationCapture, [byte[]]@(
-    212,195,178,161, 2,0,4,0, 0,0,0,0, 0,0,0,0, 64,0,0,0, 1,0,0,0,
-    # Ethernet IPv4 in each direction, then a non-IP Ethernet record.
-    1,0,0,0, 0,0,0,0, 34,0,0,0, 34,0,0,0,
-    0,0,0,0,0,0, 0,0,0,0,0,0, 8,0,
-    69,0,0,20, 0,0,0,0, 64,0,0,0, 192,0,2,1, 192,0,2,2,
-    2,0,0,0, 0,0,0,0, 38,0,0,0, 38,0,0,0,
-    0,0,0,0,0,0, 0,0,0,0,0,0, 8,0,
-    69,0,0,24, 0,0,0,0, 64,0,0,0, 192,0,2,2, 192,0,2,1, 0,0,0,0,
-    3,0,0,0, 0,0,0,0, 14,0,0,0, 14,0,0,0,
-    0,0,0,0,0,0, 0,0,0,0,0,0, 8,6
-))
+$eth4 = [byte[]](@(0) * 12 + @(8,0))
+$eth6 = [byte[]](@(0) * 12 + @(134,221))
+$ipv4 = [byte[]]@(69,0,0,20, 0,0,0,0, 64,253,0,0, 192,0,2,1, 192,0,2,2)
+$reverse = [byte[]]($ipv4 + @(0,0,0,0))
+$reverse[3] = 24
+$reverse[15] = 2
+$reverse[19] = 1
+$ipv6 = [byte[]]( @(96,0,0,0,0,0,59,64) +
+    [Net.IPAddress]::Parse('2001:db8::1').GetAddressBytes() +
+    [Net.IPAddress]::Parse('2001:db8::2').GetAddressBytes() )
+$ipv4Tunnel = [byte[]]$ipv4.Clone()
+$ipv4Tunnel[3] = 60
+$ipv4Tunnel[9] = 41
+$ipv6Tunnel = [byte[]]$ipv6.Clone()
+$ipv6Tunnel[5] = 20
+$ipv6Tunnel[6] = 4
+$sameVersionTunnel = [byte[]]$ipv4.Clone()
+$sameVersionTunnel[3] = 40
+$sameVersionTunnel[9] = 4
+$sameVersionTunnel[15] = 3
+$sameVersionTunnel[19] = 4
+$writer = [IO.BinaryWriter]::new([IO.File]::Create($conversationCapture))
+try {
+    $writer.Write([byte[]]@(212,195,178,161, 2,0,4,0, 0,0,0,0, 0,0,0,0, 128,0,0,0, 1,0,0,0))
+    $number = 0
+    foreach ($frame in @(
+        ,([byte[]]($eth4 + $ipv4))
+        ,([byte[]]($eth4 + $reverse))
+        ,([byte[]](@(0) * 12 + @(8,6)))
+        ,([byte[]]($eth6 + $ipv6))
+        ,([byte[]]($eth4 + $ipv4Tunnel + $ipv6))
+        ,([byte[]]($eth6 + $ipv6Tunnel + $ipv4))
+        ,([byte[]]($eth4 + $sameVersionTunnel + $ipv4))
+    )) {
+        $number++
+        $writer.Write([uint32]$number)
+        $writer.Write([uint32]0)
+        $writer.Write([uint32]$frame.Length)
+        $writer.Write([uint32]$frame.Length)
+        $writer.Write($frame)
+    }
+} finally {
+    $writer.Dispose()
+}
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
 using System.IO;
@@ -107,6 +139,18 @@ function Open-PacketSection([string]$Id) {
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $expander
+}
+
+function Open-Conversation([string]$Label, [string]$Filter) {
+    $row = Wait-Until "the conversation row '$Label' can be selected" {
+        Find-Element $Label ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Open conversation in Wireshark'
+    $null = Wait-Until "Wireshark receives the original file and display filter for '$Label'" {
+        $filterPath = $conversationCapture + '.filter'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $Filter
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -219,25 +263,35 @@ try {
         throw 'CLI inspection did not preserve complete records in the partial capture'
     }
     Select-Capture $conversationCapture
-    $null = Wait-Until 'the IPv4 conversation capture opens offline' {
-        Find-Element "PCAP${dot}158 bytes"
+    $null = Wait-Until 'the conversation capture opens offline' {
+        Find-Element $conversationCapture
     }
     $expander = Open-PacketSection 'packet-ip-conversations'
     $null = Wait-Until 'the address pair shows totals and bytes in both directions' {
         (Find-Element "192.0.2.1 $bothDirections 192.0.2.2" -Visible) -and
-        (Find-Element "Tracked IP pairs 1${dot}Unclassified packets 1") -and
-        (Find-Element "2 packets${dot}72 captured bytes") -and
-        (Find-Element "Left to right 34 bytes${dot}Right to left 38 bytes")
+        (Find-Element "Tracked IP pairs 3${dot}Unclassified packets 1") -and
+        (Find-Element "3 packets${dot}146 captured bytes") -and
+        (Find-Element "Left to right 108 bytes${dot}Right to left 38 bytes")
     }
     $summary = & $Cli inspect-packet-capture $conversationCapture | ConvertFrom-Json
     $conversation = $summary.ip_conversations.top[0]
-    if ($LASTEXITCODE -ne 0 -or $summary.ip_conversations.tracked_pairs -ne 1 -or
+    if ($LASTEXITCODE -ne 0 -or $summary.ip_conversations.tracked_pairs -ne 3 -or
         $summary.ip_conversations.unclassified_packets -ne 1 -or $summary.ip_conversations.untracked_packets -ne 0 -or
         $conversation.a -cne '192.0.2.1' -or $conversation.b -cne '192.0.2.2' -or
-        $conversation.a_to_b.packets -ne 1 -or $conversation.a_to_b.captured_bytes -ne 34 -or
+        $conversation.a_to_b.packets -ne 2 -or $conversation.a_to_b.captured_bytes -ne 108 -or
         $conversation.b_to_a.packets -ne 1 -or $conversation.b_to_a.captured_bytes -ne 38) {
         throw 'The CLI conversation ranking differs from the offline capture panel'
     }
+    $null = Wait-Until 'conversation launch needs a selected row' {
+        $open = Find-Element 'Open conversation in Wireshark' $button
+        $open -and !$open.Current.IsEnabled
+    }
+    $ipv4Filter = 'frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip(?::|$)" && ' +
+        '((ip.src#1 == 192.0.2.1 && ip.dst#1 == 192.0.2.2) || (ip.src#1 == 192.0.2.2 && ip.dst#1 == 192.0.2.1))'
+    $ipv6Filter = 'frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ipv6(?::|$)" && ' +
+        '((ipv6.src#1 == 2001:db8::1 && ipv6.dst#1 == 2001:db8::2) || (ipv6.src#1 == 2001:db8::2 && ipv6.dst#1 == 2001:db8::1))'
+    Open-Conversation "192.0.2.1 $bothDirections 192.0.2.2" $ipv4Filter
+    Open-Conversation "2001:db8::1 $bothDirections 2001:db8::2" $ipv6Filter
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'
