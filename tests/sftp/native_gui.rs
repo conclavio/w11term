@@ -2768,6 +2768,44 @@ async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews and applies shell dotfiles on a connected SSH pane"]
+async fn native_command_reference_applies_reviewed_ssh_dotfiles() {
+    let (source, remote, _, server) = fixture_server(false).await;
+    let Source::Ssh(ssh) = source else {
+        unreachable!();
+    };
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    fs::write(
+        remote.path().join(".bashrc"),
+        "# keep my local shell settings\n",
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("dotfiles-remote-folder"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("ssh-dotfiles-review-ui.ps1", &ssh, state.path());
+
+    let store = remote.path().join(".config/w11term/dotfiles");
+    let active = fs::read_to_string(store.join("bash-current")).unwrap();
+    let version = store.join(format!("bash-{}", active.trim()));
+    assert_eq!(
+        fs::read_to_string(version.join("environment.sh")).unwrap(),
+        "export EDITOR=vi\n"
+    );
+    assert_eq!(
+        fs::read_to_string(version.join("prompt.sh")).unwrap(),
+        "PS1='verified> '\n"
+    );
+    let shell = fs::read_to_string(remote.path().join(".bashrc")).unwrap();
+    assert!(shell.starts_with("# keep my local shell settings\n"));
+    assert!(shell.contains("bash-current"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "looks up offline TLDR and installed SSH tool pages and inserts an edited example without submitting it"]
 async fn native_command_reference_follows_powershell_and_ssh() {
     let transports = Arc::new(AtomicUsize::new(0));

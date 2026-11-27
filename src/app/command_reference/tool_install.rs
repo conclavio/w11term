@@ -365,8 +365,7 @@ impl TerminalApp {
         if let Action::Open(target) = action {
             if current.as_ref().is_none_or(|(pane, _)| *pane != target)
                 || !self.command_reference.open
-                || self.command_reference.private_page.is_some()
-                || self.command_reference.tool_install.is_some()
+                || self.command_reference.subpanel_open()
             {
                 return;
             }
@@ -497,7 +496,7 @@ impl TerminalApp {
                                 None => Operation::PreviewToolBundle { bundle },
                             };
                             let timeout = Duration::from_secs(if apply { 600 } else { 30 });
-                            run_pane_tool_job(input, target, operation, timeout, None)
+                            run_pane_sftp_job(input, target, operation, timeout, None)
                         })();
                         if apply {
                             message(Action::Applied(ticket, decode(result)))

@@ -135,7 +135,7 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let operation = Operation::ReviewToolPath { review };
-                        let result = run_pane_tool_job(
+                        let result = run_pane_sftp_job(
                             input,
                             target,
                             operation,

@@ -4,6 +4,7 @@ use w11term::events::{ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncSt
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod catalog;
+mod dotfiles;
 mod download;
 mod private_page;
 mod tool_install;
@@ -31,6 +32,7 @@ pub enum Action {
     ToolPage(Arc<()>, usize),
     Private(private_page::Action),
     ToolInstall(tool_install::Action),
+    Dotfiles(dotfiles::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,7 +41,7 @@ pub struct ToolPane {
     generation: u64,
 }
 
-fn run_pane_tool_job(
+fn run_pane_sftp_job(
     input: tokio::sync::mpsc::UnboundedSender<Command>,
     target: ToolPane,
     operation: Operation,
@@ -59,7 +61,7 @@ fn run_pane_tool_job(
         .map_err(|_| "SSH session has closed".to_owned())?;
     response
         .blocking_recv()
-        .map_err(|_| "SSH tool operation interrupted".to_owned())?
+        .map_err(|_| "SSH file operation interrupted".to_owned())?
 }
 
 fn tool_sync_summary(report: &ToolBundleSyncReport) -> String {
@@ -111,6 +113,7 @@ pub(super) struct Panel {
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
     tool_install: Option<tool_install::Installer>,
+    dotfiles: Option<dotfiles::Installer>,
 }
 
 fn pane_platform(source: Option<&Source>) -> Platform {
@@ -137,9 +140,14 @@ impl Panel {
         self.draft = None;
         self.private_page = None;
         self.tool_install = None;
+        self.dotfiles = None;
         if let Some(lookup) = self.tools.take() {
             lookup.cancel.cancel();
         }
+    }
+
+    fn subpanel_open(&self) -> bool {
+        self.private_page.is_some() || self.tool_install.is_some() || self.dotfiles.is_some()
     }
 
     fn set_query(&mut self, text: String) {
@@ -230,6 +238,9 @@ impl Panel {
         if let Some(installer) = &self.tool_install {
             return installer.view(tool_pane, tool_sync, ctx);
         }
+        if let Some(installer) = &self.dotfiles {
+            return installer.view(tool_pane, ctx);
+        }
         let target = if self
             .draft
             .as_ref()
@@ -284,6 +295,13 @@ impl Panel {
                             ))
                         }))
                         .content("Install SSH tools"),
+                    Button::new()
+                        .on_click(ctx.callback(move |_| {
+                            Message::CommandReference(Action::Dotfiles(dotfiles::Action::Open(
+                                target,
+                            )))
+                        }))
+                        .content("Apply SSH dotfiles"),
                 )),
             ));
             if let Some(report) = tool_sync {
@@ -682,7 +700,7 @@ impl TerminalApp {
 
     fn start_reference_load(&mut self, refresh: bool, ctx: &ComponentContext<Self>) {
         let panel = &mut self.command_reference;
-        if panel.loading || panel.private_page.is_some() || panel.tool_install.is_some() {
+        if panel.loading || panel.subpanel_open() {
             return;
         }
         panel.loading = true;
@@ -740,7 +758,7 @@ impl TerminalApp {
                     if scope.is_cancelled() || cancel.is_cancelled() {
                         return Err("Installed tools lookup cancelled".into());
                     }
-                    let value = run_pane_tool_job(
+                    let value = run_pane_sftp_job(
                         input,
                         target,
                         Operation::InstalledTools,
@@ -775,7 +793,7 @@ impl TerminalApp {
         let panel = &mut self.command_reference;
         match action {
             Action::Open | Action::Selection(_) => {
-                if panel.private_page.is_some() || panel.tool_install.is_some() {
+                if panel.subpanel_open() {
                     return;
                 }
                 let was_open = panel.open;
@@ -841,6 +859,7 @@ impl TerminalApp {
             Action::Refresh => self.start_reference_load(true, ctx),
             Action::Private(action) => panel.author_private_page(action, auto, ctx),
             Action::ToolInstall(action) => self.tool_install_action(action, ctx),
+            Action::Dotfiles(action) => self.reference_dotfiles_action(action, ctx),
             Action::ListTools(target) => self.start_tool_lookup(target, ctx),
             Action::ListedTools(request, result) => {
                 if let Some(lookup) = &mut panel.tools

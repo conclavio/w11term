@@ -1262,6 +1262,8 @@ Direct pipe clients send
 
 ### Preview and apply SSH dotfiles
 
+From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle, Bash or Zsh, and an optional startup directory for Zsh. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
+
 `sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
 
 Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.

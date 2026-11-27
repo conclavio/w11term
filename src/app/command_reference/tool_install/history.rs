@@ -444,7 +444,7 @@ impl TerminalApp {
                         result_message(
                             ticket,
                             work,
-                            run_pane_tool_job(input, target, operation, timeout, None),
+                            run_pane_sftp_job(input, target, operation, timeout, None),
                         )
                     },
                     rejected,
