@@ -2,14 +2,18 @@ use super::classic_little_endian;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::PathBuf,
 };
+
+mod summary;
+use summary::Summary;
 
 pub struct LocalCapture {
     pub path: PathBuf,
     pub bytes: u64,
     format: Format,
+    pub summary: Summary,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,15 +25,18 @@ enum Format {
 impl LocalCapture {
     pub fn open(path: PathBuf) -> Result<Self> {
         ensure!(path.is_absolute(), "Choose an absolute capture file path");
-        let mut file = File::open(&path).context("Opening the capture file")?;
+        let file = File::open(&path).context("Opening the capture file")?;
         let metadata = file.metadata().context("Reading capture file metadata")?;
         ensure!(metadata.is_file(), "Choose a capture file");
         let bytes = metadata.len();
+        let mut file = BufReader::with_capacity(64 * 1024, file);
         let format = read_format(&mut file, bytes)?;
+        let summary = Summary::scan(&mut file, bytes, &format);
         Ok(Self {
             path,
             bytes,
             format,
+            summary,
         })
     }
 

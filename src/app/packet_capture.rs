@@ -463,13 +463,57 @@ impl Panel {
                 ));
             }
         } else if let Some(LoadedCapture::Local(capture)) = &self.loaded {
+            let summary = &capture.summary;
             files.extend([
                 text("local-capture-path", capture.path.display().to_string()),
                 text(
                     "local-capture-details",
                     format!("{} · {} bytes", capture.format_label(), capture.bytes),
                 ),
+                text(
+                    "local-packet-counts",
+                    format!(
+                        "Packets {} · {} captured bytes · {} truncated",
+                        summary.packets, summary.captured_bytes, summary.truncated_packets
+                    ),
+                ),
             ]);
+            if let Some(span) = summary.span_ns() {
+                files.push(text(
+                    "local-packet-span",
+                    format!(
+                        "Timestamp span {} s · {} of {} packets timestamped",
+                        seconds_text(span),
+                        summary.timestamped_packets,
+                        summary.packets
+                    ),
+                ));
+            } else if summary.packets != 0 {
+                files.push(text("local-packet-span", "No usable packet timestamps"));
+            }
+            if summary.interfaces != 0 {
+                let mut types: Vec<_> = summary
+                    .link_types
+                    .iter()
+                    .copied()
+                    .take(8)
+                    .map(link_type)
+                    .collect();
+                let more = summary.link_types.len().saturating_sub(types.len());
+                if more != 0 {
+                    types.push(format!("{more} more"));
+                }
+                files.push(text(
+                    "local-link-types",
+                    format!("Interfaces {} · {}", summary.interfaces, types.join(", ")),
+                ));
+            }
+            if let Some(issue) = &summary.issue {
+                files.push(text(
+                    "local-summary-issue",
+                    format!("Partial packet summary · {issue}"),
+                ));
+            }
         }
         if self.loaded.is_some() {
             files.extend([
@@ -501,6 +545,27 @@ impl Panel {
                 ),
             ))
     }
+}
+
+fn seconds_text(ns: u128) -> String {
+    let fraction = format!("{:09}", ns % 1_000_000_000);
+    let digits = fraction.trim_end_matches('0').len().max(3);
+    format!("{}.{}", ns / 1_000_000_000, &fraction[..digits])
+}
+
+fn link_type(value: u16) -> String {
+    match value {
+        0 => "BSD loopback",
+        1 => "Ethernet",
+        101 => "Raw IP",
+        105 => "IEEE 802.11",
+        108 => "OpenBSD loopback",
+        113 => "Linux cooked",
+        127 => "IEEE 802.11 with Radiotap",
+        276 => "Linux cooked v2",
+        _ => return format!("Link type {value}"),
+    }
+    .into()
 }
 
 fn default_wireshark() -> Option<PathBuf> {

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    io::{BufReader, Read},
+    io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -655,34 +655,63 @@ fn count_packet_records(
     header: &[u8; 24],
     size: u64,
 ) -> Result<u32> {
-    let little = classic_little_endian(header[..4].try_into().unwrap())
-        .context("The transferred file is not a classic pcap capture")?;
-    let number = if little {
-        u32::from_le_bytes
-    } else {
-        u32::from_be_bytes
-    };
-    let version = if little { [2, 0, 4, 0] } else { [0, 2, 0, 4] };
-    ensure!(header[4..8] == version, "Unsupported pcap file version");
-    let snap = number(header[16..20].try_into().unwrap());
-    ensure!(snap > 0, "Invalid pcap snapshot length");
+    let format = ClassicPcap::parse(header)?;
     let mut remaining = size - 24;
     let mut packets = 0;
     while remaining > 0 {
-        ensure!(remaining >= 16, "The pcap packet header is truncated");
-        let mut header = [0; 16];
-        file.read_exact(&mut header)?;
-        let caplen = number(header[8..12].try_into().unwrap());
-        let wirelen = number(header[12..16].try_into().unwrap());
-        ensure!(
-            caplen <= snap && caplen <= wirelen && u64::from(caplen) <= remaining - 16,
-            "The pcap packet is incomplete or invalid"
-        );
-        file.seek_relative(i64::from(caplen))?;
-        remaining -= 16 + u64::from(caplen);
+        format.read_packet(file, &mut remaining)?;
         packets += 1;
     }
     Ok(packets)
+}
+
+struct ClassicPcap {
+    number: fn([u8; 4]) -> u32,
+    snap: u32,
+    nanoseconds: bool,
+    link_type: u16,
+}
+
+impl ClassicPcap {
+    fn parse(header: &[u8; 24]) -> Result<Self> {
+        let little = classic_little_endian(header[..4].try_into().unwrap())
+            .context("The transferred file is not a classic pcap capture")?;
+        let number: fn([u8; 4]) -> u32 = if little {
+            u32::from_le_bytes
+        } else {
+            u32::from_be_bytes
+        };
+        let version = if little { [2, 0, 4, 0] } else { [0, 2, 0, 4] };
+        ensure!(header[4..8] == version, "Unsupported pcap file version");
+        let snap = number(header[16..20].try_into().unwrap());
+        ensure!(snap > 0, "Invalid pcap snapshot length");
+        Ok(Self {
+            number,
+            snap,
+            nanoseconds: matches!(
+                &header[..4],
+                [0x4d, 0x3c, 0xb2, 0xa1] | [0xa1, 0xb2, 0x3c, 0x4d]
+            ),
+            link_type: (number(header[20..24].try_into().unwrap()) & 0xffff) as u16,
+        })
+    }
+
+    fn read_packet(&self, file: &mut (impl Read + Seek), remaining: &mut u64) -> Result<[u32; 4]> {
+        ensure!(*remaining >= 16, "The pcap packet header is truncated");
+        let mut header = [0; 16];
+        file.read_exact(&mut header)?;
+        let fields = std::array::from_fn(|index| {
+            (self.number)(header[index * 4..index * 4 + 4].try_into().unwrap())
+        });
+        let [_, _, caplen, wirelen] = fields;
+        ensure!(
+            caplen <= self.snap && caplen <= wirelen && u64::from(caplen) <= *remaining - 16,
+            "The pcap packet is incomplete or invalid"
+        );
+        file.seek_relative(i64::from(caplen))?;
+        *remaining -= 16 + u64::from(caplen);
+        Ok(fields)
+    }
 }
 
 #[cfg(test)]

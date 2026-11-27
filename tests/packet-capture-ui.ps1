@@ -5,6 +5,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $destination = Join-Path $State 'reviewed capture.pcap'
 $olderCapture = Join-Path $State 'older capture.pcapng'
+$partialCapture = Join-Path $State 'incomplete capture.pcapng'
 $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
@@ -17,10 +18,14 @@ $value = [System.Windows.Automation.ValuePattern]::Pattern
 $toggle = [System.Windows.Automation.TogglePattern]::Pattern
 $dot = ' ' + [char]0xb7 + ' '
 [IO.File]::WriteAllBytes($olderCapture, [byte[]]@(
-    # Little-endian Section Header Block and an empty Ethernet interface.
+    # Little-endian section, Ethernet interface, two timed packets and an untimed packet.
     10,13,13,10, 28,0,0,0, 77,60,43,26, 1,0,0,0, 255,255,255,255,255,255,255,255, 28,0,0,0,
-    1,0,0,0, 20,0,0,0, 1,0,0,0, 255,255,0,0, 20,0,0,0
+    1,0,0,0, 20,0,0,0, 1,0,0,0, 255,255,0,0, 20,0,0,0,
+    6,0,0,0, 36,0,0,0, 0,0,0,0, 0,0,0,0, 64,66,15,0, 4,0,0,0, 8,0,0,0, 0,0,0,0, 36,0,0,0,
+    6,0,0,0, 36,0,0,0, 0,0,0,0, 0,0,0,0, 96,227,22,0, 4,0,0,0, 4,0,0,0, 0,0,0,0, 36,0,0,0,
+    3,0,0,0, 20,0,0,0, 4,0,0,0, 0,0,0,0, 20,0,0,0
 ))
+[IO.File]::WriteAllBytes($partialCapture, [byte[]]([IO.File]::ReadAllBytes($olderCapture) + @(6,0,0,0,36,0,0,0,0,0,0,0)))
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
 using System.IO;
@@ -81,16 +86,19 @@ try {
     Click 'Packet capture'
     Select-Capture $olderCapture
     $null = Wait-Until 'an earlier capture opens before any SSH connection' {
-        Find-Element "PCAPNG${dot}48 bytes"
+        (Find-Element "PCAPNG${dot}140 bytes") -and
+            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated") -and
+            (Find-Element "Timestamp span 0.500 s${dot}2 of 3 packets timestamped") -and
+            (Find-Element "Interfaces 1${dot}Ethernet")
     }
     Select-Capture $invalidCapture
     $null = Wait-Until 'a non-capture file leaves the previous capture selected' {
-        (Find-Element 'Choose a PCAP or PCAPNG capture file') -and (Find-Element "PCAPNG${dot}48 bytes")
+        (Find-Element 'Choose a PCAP or PCAPNG capture file') -and (Find-Element "PCAPNG${dot}140 bytes")
     }
     Click 'Return to diagnostics overview'
     Click ('Reopen ' + [IO.Path]::GetFileName($olderCapture))
     $null = Wait-Until 'recent packet capture reopens and is validated again' {
-        (Find-Element "PCAPNG${dot}48 bytes") -and
+        (Find-Element "PCAPNG${dot}140 bytes") -and
         !(Find-Element 'Choose a PCAP or PCAPNG capture file') -and
         !(Find-Element 'Diagnostics overview panel')
     }
@@ -100,6 +108,13 @@ try {
     $null = Wait-Until 'the local capture reaches Wireshark without an SSH pane' {
         $opened = $olderCapture + '.opened'
         [IO.File]::Exists($opened) -and [IO.File]::ReadAllText($opened) -ceq '-r'
+    }
+    Select-Capture $partialCapture
+    $null = Wait-Until 'a damaged capture retains its complete packets and can open in Wireshark' {
+        $open = Find-Element 'Open in Wireshark' $button
+        $open -and $open.Current.IsEnabled -and
+            (Find-Element "Partial packet summary${dot}Incomplete or invalid PCAPNG block length") -and
+            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated")
     }
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'

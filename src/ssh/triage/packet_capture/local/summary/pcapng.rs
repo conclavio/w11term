@@ -1,0 +1,275 @@
+use super::{NANOS_PER_SECOND, Summary, check_record_limit};
+use anyhow::{Context, Result, bail, ensure};
+use std::io::{Read, Seek};
+
+const SECTION: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
+const MAX_INTERFACES: u32 = 4096;
+const MAX_INTERFACE_OPTIONS: u64 = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum Order {
+    Little,
+    Big,
+}
+
+impl Order {
+    fn read(magic: [u8; 4]) -> Result<Self> {
+        match magic {
+            [0x4d, 0x3c, 0x2b, 0x1a] => Ok(Self::Little),
+            [0x1a, 0x2b, 0x3c, 0x4d] => Ok(Self::Big),
+            _ => bail!("Invalid PCAPNG byte order"),
+        }
+    }
+
+    fn u16(self, bytes: [u8; 2]) -> u16 {
+        match self {
+            Self::Little => u16::from_le_bytes(bytes),
+            Self::Big => u16::from_be_bytes(bytes),
+        }
+    }
+
+    fn u32(self, bytes: [u8; 4]) -> u32 {
+        match self {
+            Self::Little => u32::from_le_bytes(bytes),
+            Self::Big => u32::from_be_bytes(bytes),
+        }
+    }
+
+    fn i64(self, bytes: [u8; 8]) -> i64 {
+        match self {
+            Self::Little => i64::from_le_bytes(bytes),
+            Self::Big => i64::from_be_bytes(bytes),
+        }
+    }
+}
+
+struct Interface {
+    link_type: u16,
+    snap: u32,
+    resolution: u8,
+    offset_seconds: i64,
+}
+
+impl Interface {
+    fn timestamp_ns(&self, ticks: u64) -> i128 {
+        let base = if self.resolution & 0x80 != 0 {
+            2_u128
+        } else {
+            10
+        };
+        let ticks_ns = u128::from(ticks) * u128::from(NANOS_PER_SECOND);
+        let ns = base
+            .checked_pow(u32::from(self.resolution & 0x7f))
+            .map_or(0, |divisor| ticks_ns / divisor);
+        i128::from(self.offset_seconds) * i128::from(NANOS_PER_SECOND) + ns as i128
+    }
+}
+
+enum Entry {
+    Section(Order),
+    Interface(Interface),
+    Packet {
+        captured: u32,
+        original: u32,
+        timestamp: Option<i128>,
+    },
+    Other,
+}
+
+pub(super) fn scan(
+    summary: &mut Summary,
+    file: &mut (impl Read + Seek),
+    mut remaining: u64,
+) -> Result<()> {
+    let mut order = None;
+    let mut interfaces = Vec::new();
+    let mut blocks = 0;
+    while remaining > 0 {
+        check_record_limit(blocks)?;
+        ensure!(remaining >= 12, "Incomplete PCAPNG block header");
+        let mut kind = [0; 4];
+        let mut size = [0; 4];
+        file.read_exact(&mut kind)?;
+        file.read_exact(&mut size)?;
+        let section = kind == SECTION;
+        let (endian, header_size) = if section {
+            ensure!(remaining >= 28, "Incomplete PCAPNG section header");
+            let mut magic = [0; 4];
+            file.read_exact(&mut magic)?;
+            (Order::read(magic)?, 12)
+        } else {
+            (order.context("Missing PCAPNG section header")?, 8)
+        };
+        let total = u64::from(endian.u32(size));
+        let minimum = if section { 28 } else { 12 };
+        ensure!(
+            total >= minimum && total <= remaining && total.is_multiple_of(4),
+            "Incomplete or invalid PCAPNG block length"
+        );
+        let mut block = Block {
+            file,
+            order: endian,
+            remaining: total - header_size - 4,
+        };
+        let entry = if section {
+            let major = block.u16()?;
+            let minor = block.u16()?;
+            ensure!(
+                major == 1 && matches!(minor, 0 | 2),
+                "Unsupported PCAPNG section version {major}.{minor}"
+            );
+            Entry::Section(endian)
+        } else {
+            match endian.u32(kind) {
+                1 => {
+                    ensure!(
+                        summary.interfaces < MAX_INTERFACES,
+                        "Reached the PCAPNG scan limit of {MAX_INTERFACES} interfaces"
+                    );
+                    Entry::Interface(block.interface()?)
+                }
+                2 => block.timed_packet(&interfaces, true)?,
+                3 => block.simple_packet(&interfaces)?,
+                6 => block.timed_packet(&interfaces, false)?,
+                _ => Entry::Other,
+            }
+        };
+        block.finish(size)?;
+        match entry {
+            Entry::Section(endian) => {
+                order = Some(endian);
+                interfaces.clear();
+            }
+            Entry::Interface(interface) => {
+                summary.interface(interface.link_type);
+                interfaces.push(interface);
+            }
+            Entry::Packet {
+                captured,
+                original,
+                timestamp,
+            } => {
+                summary.packet(captured, original, timestamp);
+            }
+            Entry::Other => (),
+        }
+        remaining -= total;
+        blocks += 1;
+    }
+    Ok(())
+}
+
+struct Block<'a, T> {
+    file: &'a mut T,
+    order: Order,
+    remaining: u64,
+}
+
+impl<T: Read + Seek> Block<'_, T> {
+    fn read<const N: usize>(&mut self) -> Result<[u8; N]> {
+        ensure!(self.remaining >= N as u64, "Incomplete PCAPNG block");
+        let mut field = [0; N];
+        self.file.read_exact(&mut field)?;
+        self.remaining -= N as u64;
+        Ok(field)
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(self.order.u16(self.read()?))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(self.order.u32(self.read()?))
+    }
+
+    fn skip(&mut self, bytes: u64) -> Result<()> {
+        ensure!(self.remaining >= bytes, "Incomplete PCAPNG block");
+        self.file.seek_relative(bytes as i64)?;
+        self.remaining -= bytes;
+        Ok(())
+    }
+
+    fn finish(mut self, size: [u8; 4]) -> Result<()> {
+        self.skip(self.remaining)?;
+        let mut trailer = [0; 4];
+        self.file.read_exact(&mut trailer)?;
+        ensure!(size == trailer, "PCAPNG block lengths disagree");
+        Ok(())
+    }
+
+    fn interface(&mut self) -> Result<Interface> {
+        let link_type = self.u16()?;
+        self.skip(2)?;
+        let mut interface = Interface {
+            link_type,
+            snap: self.u32()?,
+            resolution: 6,
+            offset_seconds: 0,
+        };
+        ensure!(
+            self.remaining <= MAX_INTERFACE_OPTIONS,
+            "PCAPNG interface options exceed the summary scan limit"
+        );
+        while self.remaining > 0 {
+            let code = self.u16()?;
+            let size = u64::from(self.u16()?);
+            match (code, size) {
+                (0, 0) => break,
+                (9, 1) => {
+                    interface.resolution = self.read::<1>()?[0];
+                    self.skip(3)?;
+                }
+                (14, 8) => interface.offset_seconds = self.order.i64(self.read()?),
+                (0 | 9 | 14, _) => bail!("Invalid PCAPNG interface option length"),
+                _ => self.skip(size.next_multiple_of(4))?,
+            }
+        }
+        Ok(interface)
+    }
+
+    fn timed_packet(&mut self, interfaces: &[Interface], obsolete: bool) -> Result<Entry> {
+        let id = if obsolete {
+            let id = u32::from(self.u16()?);
+            self.skip(2)?;
+            id
+        } else {
+            self.u32()?
+        };
+        let interface = interfaces
+            .get(id as usize)
+            .context("PCAPNG packet refers to an unknown interface")?;
+        let ticks = (u64::from(self.u32()?) << 32) | u64::from(self.u32()?);
+        let captured = self.u32()?;
+        let original = self.u32()?;
+        ensure!(
+            u64::from(captured).next_multiple_of(4) <= self.remaining,
+            "Incomplete PCAPNG packet data"
+        );
+        Ok(Entry::Packet {
+            captured,
+            original,
+            timestamp: Some(interface.timestamp_ns(ticks)),
+        })
+    }
+
+    fn simple_packet(&mut self, interfaces: &[Interface]) -> Result<Entry> {
+        let interface = interfaces
+            .first()
+            .context("PCAPNG packet refers to an unknown interface")?;
+        let original = self.u32()?;
+        let captured = if interface.snap == 0 {
+            original
+        } else {
+            original.min(interface.snap)
+        };
+        ensure!(
+            u64::from(captured).next_multiple_of(4) == self.remaining,
+            "Invalid PCAPNG simple packet length"
+        );
+        Ok(Entry::Packet {
+            captured,
+            original,
+            timestamp: None,
+        })
+    }
+}
