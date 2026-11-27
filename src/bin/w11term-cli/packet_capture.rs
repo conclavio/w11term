@@ -9,7 +9,8 @@ use w11term::ssh::open_capture_in_wireshark;
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] preview-packet-capture --pane ID --interface NAME [CAPTURE OPTIONS]\n",
     "w11term-cli [--pid PID] capture-packets --pane ID --interface NAME [CAPTURE OPTIONS] ",
-    "--connection-generation N --review-id ID --output-file PATH [--wireshark PATH]\n",
+    "--connection-generation N --review-id ID --output-file PATH [--job-id HEX] [--wireshark PATH]\n",
+    "w11term-cli [--pid PID] stop-packet-capture --pane ID --connection-generation N --job-id HEX\n",
     "CAPTURE OPTIONS: [--filter EXPR] [--snap-length BYTES] [--seconds N] [--max-mib N] ",
     "[--packet-limit N] [--scratch-directory PATH] [--tmpfs]",
 );
@@ -20,29 +21,33 @@ pub(super) fn parse(
     pane: Option<u64>,
 ) -> Result<(Request, Option<PathBuf>)> {
     let capture = verb == "capture-packets";
+    let stop = verb == "stop-packet-capture";
     let mut flags = BTreeMap::new();
     let mut tmpfs = false;
     while let Some(flag) = args.next() {
         if flag == "--tmpfs" {
-            ensure!(!tmpfs, "specify --tmpfs only once");
+            ensure!(!stop && !tmpfs, "invalid --tmpfs for {verb}");
             tmpfs = true;
             continue;
         }
-        let accepted = matches!(
-            flag.as_str(),
-            "--pane"
-                | "--interface"
-                | "--filter"
-                | "--snap-length"
-                | "--seconds"
-                | "--max-mib"
-                | "--packet-limit"
-                | "--scratch-directory"
-        ) || capture
-            && matches!(
-                flag.as_str(),
-                "--connection-generation" | "--review-id" | "--output-file" | "--wireshark"
-            );
+        let accepted = flag == "--pane"
+            || !stop
+                && matches!(
+                    flag.as_str(),
+                    "--interface"
+                        | "--filter"
+                        | "--snap-length"
+                        | "--seconds"
+                        | "--max-mib"
+                        | "--packet-limit"
+                        | "--scratch-directory"
+                )
+            || (capture || stop) && matches!(flag.as_str(), "--connection-generation" | "--job-id")
+            || capture
+                && matches!(
+                    flag.as_str(),
+                    "--review-id" | "--output-file" | "--wireshark"
+                );
         ensure!(accepted, "unsupported packet capture option {flag}");
         let value = args
             .next()
@@ -65,6 +70,21 @@ pub(super) fn parse(
         .or(pane_arg)
         .filter(|pane| *pane > 0)
         .context("provide a positive --pane ID")?;
+    if stop {
+        return Ok((
+            Request::StopPacketCapture {
+                pane,
+                connection_generation: flags
+                    .remove("--connection-generation")
+                    .context("provide --connection-generation from the reviewed plan")?
+                    .parse()?,
+                job_id: flags
+                    .remove("--job-id")
+                    .context("provide --job-id from the capture command")?,
+            },
+            None,
+        ));
+    }
     let options = PacketCaptureOptions {
         interface: flags
             .remove("--interface")
@@ -112,6 +132,7 @@ pub(super) fn parse(
         review_id: flags
             .remove("--review-id")
             .context("provide --review-id from the reviewed plan")?,
+        job_id: flags.remove("--job-id"),
         output_file: path::absolute(
             flags
                 .remove("--output-file")
@@ -145,6 +166,46 @@ pub(super) fn open_in_wireshark(reply: &mut Reply, executable: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_matches_the_reviewed_pane_generation_and_job() {
+        let job = "0123456789abcdef0123456789abcdef";
+        let args = [
+            "--pane",
+            "7",
+            "--connection-generation",
+            "3",
+            "--job-id",
+            job,
+        ];
+        let (request, viewer) = parse(
+            "stop-packet-capture",
+            args.into_iter().map(str::to_owned),
+            None,
+        )
+        .unwrap();
+        let Request::StopPacketCapture {
+            pane,
+            connection_generation,
+            job_id,
+        } = request
+        else {
+            panic!("expected a stop request");
+        };
+        assert_eq!(
+            (pane, connection_generation.get(), job_id.as_str()),
+            (7, 3, job)
+        );
+        assert!(viewer.is_none());
+        assert!(
+            parse(
+                "stop-packet-capture",
+                args.into_iter().chain(["--tmpfs"]).map(str::to_owned),
+                None
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn missing_wireshark_keeps_the_saved_capture_in_the_reply() {

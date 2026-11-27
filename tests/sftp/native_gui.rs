@@ -71,6 +71,7 @@ async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
     };
     let state = tempfile::tempdir().unwrap();
     let started = remote.path().join("pcap-started");
+    fs::write(remote.path().join("pcap-wait-for-stop"), []).unwrap();
     fs::write(
         state.path().join("pcap-start-marker"),
         started.to_str().unwrap(),
@@ -79,6 +80,7 @@ async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
     drive_mixed_gui("packet-capture-ui.ps1", &ssh, state.path());
     let request = fs::read_to_string(started).unwrap();
     assert!(request.contains("capture 'lo' 192 1 15 1024 yes '/dev/shm' 'udp and dst port 4321'"));
+    assert!(remote.path().join("pcap-stopped").is_file());
     assert!(remote.path().join("pcap-verified").is_file());
     assert_eq!(
         fs::read(state.path().join("reviewed capture.pcap")).unwrap(),

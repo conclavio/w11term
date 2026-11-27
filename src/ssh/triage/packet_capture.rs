@@ -1,5 +1,7 @@
 use super::{
-    ArtifactMessages, ConnectionShare, PendingChannel, Target, diagnostic_destination, quote,
+    ArtifactMessages, ConnectionShare, PendingChannel, Target,
+    capture_job::{CaptureStop, Kind, validate_job},
+    diagnostic_destination, quote,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -156,11 +158,29 @@ impl Target {
     }
 
     pub fn save_packet_capture_blocking(self, plan: Plan, path: PathBuf) -> Result<Capture> {
+        self.save_packet_capture_with_stop_blocking(0, plan, path, CaptureStop::default())
+    }
+
+    pub fn save_packet_capture_with_stop_blocking(
+        self,
+        pane: u64,
+        plan: Plan,
+        path: PathBuf,
+        stop: CaptureStop,
+    ) -> Result<Capture> {
         ensure!(
             self.generation == plan.connection_generation,
             "The reviewed SSH connection changed. Review again."
         );
-        crate::ssh::NETWORK.block_on(self.capture_packets(plan.options, &plan.review_id, path))
+        let job = format!("{:032x}", rand::random::<u128>());
+        crate::ssh::NETWORK.block_on(self.capture_packets(
+            pane,
+            plan.options,
+            &plan.review_id,
+            &job,
+            path,
+            stop,
+        ))
     }
 
     pub(crate) async fn preview_packet_capture(
@@ -224,10 +244,15 @@ impl Target {
 
     pub(crate) async fn capture_packets(
         mut self,
+        pane: u64,
         options: PacketCaptureOptions,
         review_id: &str,
+        job: &str,
         path: PathBuf,
+        stop: CaptureStop,
     ) -> Result<Capture> {
+        check_before_launch(&stop)?;
+        let job = validate_job(job)?;
         let parent = diagnostic_destination(&path, "packet capture")?.to_owned();
         let review_id = crate::sftp::normalize_sha256(review_id)?;
         let plan = self.preview_packet_capture(options).await?;
@@ -238,8 +263,10 @@ impl Target {
         let _busy = self.link.try_lock_diagnostic()?;
         let timeout =
             Duration::from_secs(u64::from(plan.options.seconds) + CAPTURE_OVERHEAD_SECONDS);
-        let capture =
-            tokio::time::timeout(timeout, capture_and_download(&self.link, &plan, &parent));
+        let capture = tokio::time::timeout(
+            timeout,
+            capture_and_download(&self.link, &plan, pane, job, &parent, stop),
+        );
         let (file, mut capture) = tokio::select! {
             biased;
             _ = self.lease.changed() => bail!("The reviewed SSH connection closed during packet capture"),
@@ -254,6 +281,20 @@ impl Target {
         })
         .await?
     }
+
+    pub(crate) fn stop_packet_capture(&self, pane: u64, job: &str) -> Result<()> {
+        self.link
+            .capture_jobs()
+            .stop(Kind::Packets, self.generation, pane, validate_job(job)?)
+    }
+}
+
+fn check_before_launch(stop: &CaptureStop) -> Result<()> {
+    ensure!(
+        !stop.is_requested(),
+        "Packet capture stopped before tcpdump started"
+    );
+    Ok(())
 }
 
 pub fn open_capture_in_wireshark(path: &Path, executable: &Path) -> Result<u32> {
@@ -307,9 +348,19 @@ fn command(
 async fn capture_and_download(
     link: &ConnectionShare,
     plan: &Plan,
+    pane: u64,
+    job: &str,
     parent: &Path,
+    stop: CaptureStop,
 ) -> Result<(tempfile::NamedTempFile, Capture)> {
-    let job = format!("{:032x}", rand::random::<u128>());
+    check_before_launch(&stop)?;
+    let registration = link.capture_jobs().register(
+        Kind::Packets,
+        plan.connection_generation,
+        pane,
+        job,
+        &stop,
+    )?;
     let handle = link.handle();
     let mut guard = PendingChannel(Some(
         handle
@@ -318,6 +369,7 @@ async fn capture_and_download(
             .context("Opening packet capture channel")?,
     ));
     let channel = guard.0.as_mut().unwrap();
+    check_before_launch(&stop)?;
     channel
         .exec(
             true,
@@ -326,12 +378,13 @@ async fn capture_and_download(
                 "capture",
                 &plan.scratch_directory,
                 &plan.scratch_id,
-                &job,
+                job,
             ),
         )
         .await?;
     let mut messages = ArtifactMessages::new("Packet capture");
-    let line = messages.line(channel).await?;
+    let line = stop.ready(&mut messages, channel).await?;
+    drop(registration);
     let parts: Vec<_> = line.split('\t').collect();
     let ["w11term-packet-ready-v1", reason, size, hash] = parts.as_slice() else {
         bail!("Invalid packet capture completion record");
@@ -342,7 +395,7 @@ async fn capture_and_download(
         "Remote packet capture exceeded its reviewed byte budget"
     );
     ensure!(
-        matches!(*reason, "time" | "packets"),
+        matches!(*reason, "time" | "packets" | "stopped"),
         "Unknown packet capture stop reason"
     );
     let sha256 = crate::sftp::normalize_sha256(hash)?;
@@ -368,14 +421,12 @@ async fn capture_and_download(
         "The packet capture cleanup was not acknowledged"
     );
     messages.finish(channel).await?;
-    let stop_reason = if *reason == "time" {
-        "time-limit"
-    } else if packets != plan.effective_packet_limit {
-        "capture-ended"
-    } else if plan.options.packet_limit == Some(plan.effective_packet_limit) {
-        "packet-limit"
-    } else {
-        "byte-budget"
+    let stop_reason = match *reason {
+        "time" => "time-limit",
+        "stopped" => "stopped",
+        _ if packets != plan.effective_packet_limit => "capture-ended",
+        _ if plan.options.packet_limit == Some(plan.effective_packet_limit) => "packet-limit",
+        _ => "byte-budget",
     };
     let stderr = String::from_utf8_lossy(&messages.stderr);
     Ok((

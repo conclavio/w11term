@@ -28,9 +28,9 @@ def line(process):
     return process.stdout.readline().decode().rstrip("\n")
 
 
-def wait_for_file(path):
+def wait_for_file(path, *, minimum_size=0):
     deadline = time.monotonic() + 4
-    while not path.exists():
+    while not path.exists() or path.stat().st_size < minimum_size:
         assert time.monotonic() < deadline, path
         time.sleep(0.02)
 
@@ -67,10 +67,43 @@ def smoke():
                     decoded = subprocess.run(["tcpdump", "-nn", "-r", path, "-A"],
                                              capture_output=True, check=True, timeout=5)
                     assert decoded.stdout.count(b"w11term pcap fixture") == 3, decoded.stdout
-                    out, err = capture.communicate(b"verified\n", timeout=5)
+                    # A stop crossing the ready record must allow verification.
+                    out, err = capture.communicate(b"stop\nverified\n", timeout=5)
                     assert capture.returncode == 0 and out == b"w11term-packet-complete-v1\n", (out, err)
                     assert b"3 packets captured" in err
                     assert not work.exists()
+                finally:
+                    done.set()
+                    traffic.join(timeout=1)
+                    if capture.poll() is None:
+                        capture.kill()
+
+            stopped_job = uuid.uuid4().hex
+            stopped = root / f"w11term-pcap-{stopped_job}"
+            done.clear()
+            traffic = threading.Thread(target=send, daemon=True)
+            with subprocess.Popen(run("capture", root, port, mount=mount_id,
+                                      job=stopped_job, count=2048, seconds=20),
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as capture:
+                traffic.start()
+                try:
+                    path = stopped / "capture.pcap"
+                    wait_for_file(path, minimum_size=25)
+                    capture.stdin.write(b"stop\n")
+                    capture.stdin.flush()
+                    status, reason, size, digest = line(capture).split("\t")
+                    assert (status, reason) == ("w11term-packet-ready-v1", "stopped")
+                    data = path.read_bytes()
+                    assert len(data) == int(size) and hashlib.sha256(data).hexdigest() == digest
+                    decoded = subprocess.run(["tcpdump", "-nn", "-r", path, "-A"],
+                                             capture_output=True, check=True, timeout=5)
+                    packets = decoded.stdout.count(b"w11term pcap fixture")
+                    assert 0 < packets < 2048, packets
+                    out, err = capture.communicate(b"verified\n", timeout=5)
+                    assert capture.returncode == 0 and out == b"w11term-packet-complete-v1\n", (out, err)
+                    assert f"{packets} packets captured".encode() in err
+                    assert not stopped.exists()
                 finally:
                     done.set()
                     traffic.join(timeout=1)
@@ -115,7 +148,7 @@ def smoke():
             low = subprocess.run(run("inspect", root, port, script=worker),
                                  capture_output=True, timeout=5)
             assert low.returncode != 0 and b"cannot meet the capture budget" in low.stderr
-            print("Real tcpdump captured and reopened a loopback exchange. The scratch budget, lease, and disconnect cleanup passed.")
+            print("Real tcpdump passed packet and time limits, early stop, late stop acknowledgement, and disconnect cleanup.")
 
 
 if __name__ == "__main__":

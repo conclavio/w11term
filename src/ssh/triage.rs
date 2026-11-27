@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path, time::Duration};
 use tokio::sync::watch;
 
+pub(super) mod capture_job;
 pub(crate) mod cpu_profile;
 mod findings;
 pub(crate) mod packet_capture;

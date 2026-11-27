@@ -26,6 +26,8 @@ pub use sharing::{ConnectionShare, SshTransport, VerifiedSshPeer, VerifiedSshRou
 pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing, TransportWatch};
 pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};
+pub use triage::capture_job::CaptureStop;
+pub use triage::capture_job::CaptureStop as SyscallCaptureStop;
 pub use triage::cpu_profile::launch::{CpuLaunchOptions, CpuLaunchPlan, CpuWorkloadOutcome};
 pub use triage::cpu_profile::{
     CpuProfilePlan, CpuProfileSummary, PERF_DATA_TRANSFER_SECONDS, PerfDataArtifact,
@@ -33,9 +35,7 @@ pub use triage::cpu_profile::{
 pub use triage::packet_capture::{
     Capture as PacketCapture, Plan as PacketCapturePlan, open_capture_in_wireshark,
 };
-pub use triage::syscall_capture::{
-    Capture as SyscallCapture, Plan as SyscallCapturePlan, SyscallCaptureStop,
-};
+pub use triage::syscall_capture::{Capture as SyscallCapture, Plan as SyscallCapturePlan};
 pub use triage::{
     Finding as TriageFinding, Plan as TriagePlan, Report as TriageReport,
     Resource as TriageResource, SampleStatus as TriageSampleStatus, Target as TriageTarget,

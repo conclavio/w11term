@@ -1,15 +1,15 @@
 use super::{
-    ArtifactMessages, ConnectionShare, PendingChannel, Target, diagnostic_destination, quote,
+    ArtifactMessages, ConnectionShare, PendingChannel, Target,
+    capture_job::{CaptureStop, Kind, validate_job},
+    diagnostic_destination, quote,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
     time::Duration,
 };
-use tokio::sync::watch;
 
 const SCRIPT: &str = include_str!("syscall-capture.sh");
 const REVIEW_DEADLINE: Duration = Duration::from_secs(8);
@@ -100,91 +100,12 @@ fn safe_path(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
 }
 
-struct Active {
-    generation: u64,
-    pane: u64,
-    job: String,
-    stop: SyscallCaptureStop,
-}
-
-#[derive(Clone)]
-pub struct SyscallCaptureStop(watch::Sender<bool>);
-
-impl Default for SyscallCaptureStop {
-    fn default() -> Self {
-        Self(watch::channel(false).0)
-    }
-}
-
-impl SyscallCaptureStop {
-    pub fn request(&self) {
-        self.0.send_replace(true);
-    }
-
-    pub fn is_requested(&self) -> bool {
-        *self.0.borrow()
-    }
-
-    fn check_before_launch(&self) -> Result<()> {
-        ensure!(
-            !self.is_requested(),
-            "Syscall capture stopped before launching the command"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-pub(in crate::ssh) struct ActiveJobs(Mutex<Option<Active>>);
-
-impl ActiveJobs {
-    fn lock(&self) -> MutexGuard<'_, Option<Active>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn register(
-        &self,
-        generation: u64,
-        pane: u64,
-        job: &str,
-        stop: SyscallCaptureStop,
-    ) -> Result<(Registration<'_>, watch::Receiver<bool>)> {
-        let mut active = self.lock();
-        ensure!(
-            active.is_none(),
-            "A syscall capture is active on this SSH transport"
-        );
-        let requested = stop.0.subscribe();
-        *active = Some(Active {
-            generation,
-            pane,
-            job: job.into(),
-            stop,
-        });
-        Ok((Registration(self), requested))
-    }
-
-    fn stop(&self, generation: u64, pane: u64, job: &str) -> Result<()> {
-        let active = self.lock();
-        let active = active
-            .as_ref()
-            .filter(|current| {
-                current.job == job && current.pane == pane && current.generation == generation
-            })
-            .context("No matching running syscall capture on the selected pane")?;
-        active.stop.request();
-        Ok(())
-    }
-}
-
-struct Registration<'a>(&'a ActiveJobs);
-
-impl Drop for Registration<'_> {
-    fn drop(&mut self) {
-        *self.0.lock() = None;
-    }
+fn check_before_launch(stop: &CaptureStop) -> Result<()> {
+    ensure!(
+        !stop.is_requested(),
+        "Syscall capture stopped before launching the command"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -222,7 +143,7 @@ impl Target {
         pane: u64,
         plan: Plan,
         path: PathBuf,
-        stop: SyscallCaptureStop,
+        stop: CaptureStop,
     ) -> Result<Capture> {
         ensure!(
             self.generation == plan.connection_generation,
@@ -315,15 +236,8 @@ impl Target {
         job: &str,
         path: PathBuf,
     ) -> Result<Capture> {
-        self.capture_with_stop(
-            pane,
-            options,
-            review_id,
-            job,
-            path,
-            SyscallCaptureStop::default(),
-        )
-        .await
+        self.capture_with_stop(pane, options, review_id, job, path, CaptureStop::default())
+            .await
     }
 
     async fn capture_with_stop(
@@ -333,9 +247,9 @@ impl Target {
         review_id: &str,
         job: &str,
         path: PathBuf,
-        stop: SyscallCaptureStop,
+        stop: CaptureStop,
     ) -> Result<Capture> {
-        stop.check_before_launch()?;
+        check_before_launch(&stop)?;
         let job = validate_job(job)?;
         let review_id = crate::sftp::normalize_sha256(review_id)?;
         let parent = diagnostic_destination(&path, "syscall capture")?.to_owned();
@@ -367,20 +281,9 @@ impl Target {
 
     pub(crate) fn stop_syscall_capture(&self, pane: u64, job: &str) -> Result<()> {
         self.link
-            .syscall_capture()
-            .stop(self.generation, pane, validate_job(job)?)
+            .capture_jobs()
+            .stop(Kind::Syscalls, self.generation, pane, validate_job(job)?)
     }
-}
-
-fn validate_job(job: &str) -> Result<&str> {
-    ensure!(
-        job.len() == 32
-            && job
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "Use a 32-character lowercase hexadecimal --job-id"
-    );
-    Ok(job)
 }
 
 fn command(options: &SyscallOptions, capture: Option<(&Plan, &str)>) -> String {
@@ -421,12 +324,16 @@ async fn capture_and_download(
     pane: u64,
     job: &str,
     parent: &Path,
-    stop: SyscallCaptureStop,
+    stop: CaptureStop,
 ) -> Result<(tempfile::NamedTempFile, Capture)> {
-    stop.check_before_launch()?;
-    let (registration, mut requested) =
-        link.syscall_capture()
-            .register(plan.connection_generation, pane, job, stop.clone())?;
+    check_before_launch(&stop)?;
+    let registration = link.capture_jobs().register(
+        Kind::Syscalls,
+        plan.connection_generation,
+        pane,
+        job,
+        &stop,
+    )?;
     let handle = link.handle();
     let mut guard = PendingChannel(Some(
         handle
@@ -435,18 +342,12 @@ async fn capture_and_download(
             .context("Opening syscall trace channel")?,
     ));
     let channel = guard.0.as_mut().unwrap();
-    stop.check_before_launch()?;
+    check_before_launch(&stop)?;
     channel
         .exec(true, command(&plan.options, Some((plan, job))))
         .await?;
     let mut messages = ArtifactMessages::new("Syscall capture");
-    let line = tokio::select! {
-        line = messages.line(channel) => line?,
-        _ = async { let _ = requested.wait_for(|&stop| stop).await; } => {
-            channel.data(b"stop\n".as_slice()).await?;
-            messages.line(channel).await?
-        }
-    };
+    let line = stop.ready(&mut messages, channel).await?;
     drop(registration);
     let fields: Vec<_> = line.split('\t').collect();
     let ["w11term-syscall-ready-v1", reason, code, size, hash] = fields.as_slice() else {
@@ -494,21 +395,10 @@ async fn capture_and_download(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn stop_requested_before_the_worker_subscribes_stays_requested() {
-        let jobs = ActiveJobs::default();
-        let stop = SyscallCaptureStop::default();
+    #[test]
+    fn stop_requested_before_launch_prevents_the_command() {
+        let stop = CaptureStop::default();
         stop.request();
-        assert!(stop.check_before_launch().is_err());
-
-        let (_registration, mut receiver) = jobs.register(1, 2, "fixture", stop).unwrap();
-        let requested = tokio::time::timeout(
-            Duration::from_secs(1),
-            receiver.wait_for(|&requested| requested),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(*requested);
+        assert!(check_before_launch(&stop).is_err());
     }
 }

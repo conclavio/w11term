@@ -83,8 +83,13 @@ try {
     if ([IO.File]::Exists($startMarker)) { throw 'Capture started before a destination was chosen' }
     $null = Wait-Until 'enter the capture path' { [FixtureDialog]::SetFilename($dialog, $destination, 'packet-capture.pcap') }
     $null = Wait-Until 'save the capture path' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'tcpdump is running on the reviewed SSH pane' { [IO.File]::Exists($startMarker) }
+    $null = Control @('focus-pane','--pane',"$local")
+    Wait-Focus $local
+    Click 'Stop and save'
     $null = Wait-Until 'verified capture published on Windows' {
         (Find-Element 'Saved packet capture') -and (Find-Element 'Packets dropped by kernel 0') -and
+            (Find-Element "Stopped by request`nPackets captured 1${dot}44 bytes") -and
             [IO.File]::Exists($destination)
     }
 

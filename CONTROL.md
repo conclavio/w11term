@@ -1445,7 +1445,7 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 
 ### Capture Linux packets and open Wireshark
 
-In the Windows app, select a connected Linux SSH pane and open **More → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. It reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
+In the Windows app, select a connected Linux SSH pane and open **More → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. **Stop and save** asks the running tcpdump to finish writing its capture, then transfers the verified file. The result reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
 
 Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
 
@@ -1455,8 +1455,11 @@ Use a connected Linux SSH pane and review the interface, literal tcpdump filter,
 $packetOptions = @('--pane', $pane, '--interface', 'lo', '--filter', 'udp port 4096', '--seconds', '10', '--max-mib', '8', '--tmpfs')
 $plan = (& $ctl --pid 12345 preview-packet-capture @packetOptions | ConvertFrom-Json).result.plan
 $plan
-& $ctl --pid 12345 capture-packets @packetOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --output-file '.\loopback.pcap' --wireshark 'C:\Program Files\Wireshark\Wireshark.exe'
+$job = [guid]::NewGuid().ToString('N')
+& $ctl --pid 12345 capture-packets @packetOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --job-id $job --output-file '.\loopback.pcap' --wireshark 'C:\Program Files\Wireshark\Wireshark.exe'
 ```
+
+Run `stop-packet-capture --pane ID --connection-generation N --job-id HEX` from a separate prompt to finish the matching capture early. Use the pane, connection generation and job ID from the capture command. Choose a fresh job ID for each run. The stop reply confirms the request, and the original command returns the saved capture and its stop reason. Omit `--job-id` when a script only needs to wait for the automatic packet or time limit.
 
 Defaults are 15 seconds, a 192-byte snap length, a 16 MiB budget, and `/tmp` scratch storage. Use `--tmpfs` to verify a RAM-backed mount, which defaults to `/dev/shm`, or choose a path with `--scratch-directory`. The worker requires 1 MiB of free-space headroom and applies a shared Linux-account capture lease. The effective packet limit is the smaller of `--packet-limit` and the number of maximum-size packet records that fit in the budget. A time limit interrupts tcpdump so it can finish writing and report drops.
 

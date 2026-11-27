@@ -75,7 +75,12 @@ sink=$!
 ) </dev/null > "$work/capture.pcap" 2> "$work/stderr" &
 capture=$!
 (
-    if ! IFS= read -r ignored <&8; then
+    if IFS= read -r request <&8; then
+        if [[ $request == stop ]]; then
+            : > "$work/stopped"
+            kill -TERM "$capture" 2>/dev/null || :
+        fi
+    else
         : > "$work/disconnected"
         kill -TERM "$capture" 2>/dev/null || :
     fi
@@ -92,17 +97,36 @@ sink=
 [[ ! -e $work/disconnected ]] || exit 1
 cat -- "$work/diagnostics" >&2
 case "$status" in
-    0) stop=packets ;;
+    0)
+        if [[ -e $work/stopped ]]; then stop=stopped; else stop=packets; fi
+        ;;
+    143)
+        [[ -e $work/stopped ]] || fail 'tcpdump was terminated unexpectedly.'
+        stop=stopped
+        ;;
     124) stop=time ;;
     *) fail "tcpdump failed (status $status)." ;;
 esac
 size=$(wc -c < "$work/capture.pcap")
+if [[ $stop == stopped ]] && (( size < 24 )); then
+    fail 'Packet capture stopped before tcpdump produced a capture.'
+fi
 (( size >= 24 && size <= budget_kib * 1024 )) || fail 'The capture is empty or exceeded its byte budget.'
 digest=$(sha256sum < "$work/capture.pcap")
 printf 'w11term-packet-ready-v1\t%s\t%s\t%s\n' "$stop" "$size" "${digest%% *}"
 # The SSH client verifies the SFTP artifact before acknowledging. EOF also
 # releases the lease, and the deadline cleans abandoned files on a broken link.
-if IFS= read -r -t 60 acknowledgement <&8 && [[ $acknowledgement == verified ]]; then
+read_acknowledgement() {
+    local start=$SECONDS remaining acknowledgement
+    IFS= read -r -t 60 acknowledgement <&8 || return 1
+    # A Stop crossing the ready record must not discard the completed capture.
+    if [[ $acknowledgement == stop ]]; then
+        remaining=$((60 - (SECONDS - start)))
+        (( remaining > 0 )) && IFS= read -r -t "$remaining" acknowledgement <&8 || return 1
+    fi
+    [[ $acknowledgement == verified ]]
+}
+if read_acknowledgement; then
     rm -rf -- "$work" || fail 'Could not clean up the remote capture.'
     trap - EXIT
     printf 'w11term-packet-complete-v1\n'

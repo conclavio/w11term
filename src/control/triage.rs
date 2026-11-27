@@ -1,5 +1,5 @@
 use super::*;
-use crate::ssh::{TriageReport, TriageTarget, triage::cpu_profile::Recording};
+use crate::ssh::{CaptureStop, TriageReport, TriageTarget, triage::cpu_profile::Recording};
 use std::num::NonZeroU64;
 
 impl Registry {
@@ -120,17 +120,37 @@ impl Registry {
         options: PacketCaptureOptions,
         connection_generation: NonZeroU64,
         review_id: &str,
+        job_id: Option<String>,
         output_file: PathBuf,
     ) -> Result<Value> {
         let target = self
             .diagnostic_target(pane, Some(connection_generation))
             .await?;
+        let job_id = job_id.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
         let capture = target
-            .capture_packets(options, review_id, output_file)
+            .capture_packets(
+                pane,
+                options,
+                review_id,
+                &job_id,
+                output_file,
+                CaptureStop::default(),
+            )
             .await?;
         Ok(
-            json!({ "pane": pane, "connection_generation": connection_generation, "capture": capture }),
+            json!({ "pane": pane, "connection_generation": connection_generation, "job_id": job_id, "capture": capture }),
         )
+    }
+
+    pub(super) async fn stop_packet_capture(
+        &self,
+        pane: u64,
+        generation: NonZeroU64,
+        job_id: &str,
+    ) -> Result<Value> {
+        let target = self.diagnostic_target(pane, Some(generation)).await?;
+        target.stop_packet_capture(pane, job_id)?;
+        Ok(json!({ "pane": pane, "job_id": job_id, "stop_requested": true }))
     }
 
     async fn diagnostic_target(

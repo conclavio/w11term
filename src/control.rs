@@ -102,7 +102,14 @@ pub enum Request {
         options: PacketCaptureOptions,
         connection_generation: std::num::NonZeroU64,
         review_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
         output_file: PathBuf,
+    },
+    StopPacketCapture {
+        pane: u64,
+        connection_generation: std::num::NonZeroU64,
+        job_id: String,
     },
     Record {
         pane: u64,
@@ -1498,6 +1505,7 @@ impl Registry {
                 options,
                 connection_generation,
                 review_id,
+                job_id,
                 output_file,
             } => {
                 self.capture_packets(
@@ -1505,9 +1513,18 @@ impl Registry {
                     options,
                     connection_generation,
                     &review_id,
+                    job_id,
                     output_file,
                 )
                 .await
+            }
+            Request::StopPacketCapture {
+                pane,
+                connection_generation,
+                job_id,
+            } => {
+                self.stop_packet_capture(pane, connection_generation, &job_id)
+                    .await
             }
             Request::CaptureCpuProfile {
                 pane,

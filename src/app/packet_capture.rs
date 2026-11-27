@@ -2,7 +2,7 @@ use super::*;
 use std::path::PathBuf;
 use w11term::{
     control::PacketCaptureOptions,
-    ssh::{PacketCapture, PacketCapturePlan, open_capture_in_wireshark},
+    ssh::{CaptureStop, PacketCapture, PacketCapturePlan, open_capture_in_wireshark},
 };
 
 pub(super) const LABEL: &str = "Packet capture";
@@ -25,6 +25,7 @@ pub enum Action {
     Tmpfs(bool),
     Review,
     Save,
+    Stop(Arc<()>),
     ChooseWireshark,
     OpenWireshark,
     Finished(Arc<()>, Result<Option<Outcome>, String>),
@@ -128,6 +129,7 @@ pub(super) struct Panel {
     saved: Option<PacketCapture>,
     wireshark: Option<PathBuf>,
     pending: Option<Arc<()>>,
+    stop: Option<CaptureStop>,
     status: Option<String>,
 }
 
@@ -247,6 +249,19 @@ impl Panel {
                 ),
             ),
         ];
+        if let Some((stop, ticket)) = self.stop.as_ref().zip(self.pending.as_ref()) {
+            let ticket = ticket.clone();
+            fields.insert(
+                0,
+                KeyedView::new(
+                    "stop",
+                    Button::new()
+                        .is_enabled(!stop.is_requested())
+                        .on_click(ctx.callback(move |_| message(Action::Stop(ticket.clone()))))
+                        .content("Stop and save"),
+                ),
+            );
+        }
         if active.is_none() {
             fields.push(text("choose-pane", "Select a connected Linux SSH pane."));
         }
@@ -293,6 +308,7 @@ impl Panel {
         }
         if let Some(saved) = &self.saved {
             let reason = match saved.stop_reason {
+                "stopped" => "Stopped by request",
                 "time-limit" => "Time limit reached",
                 "packet-limit" => "Packet limit reached",
                 "byte-budget" => "Packet ceiling for the byte budget reached",
@@ -384,6 +400,18 @@ impl TerminalApp {
                 self.packet_capture.open = true;
             }
             Action::Close => self.packet_capture.open = false,
+            Action::Stop(ticket) => {
+                let panel = &mut self.packet_capture;
+                if panel
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &ticket))
+                    && let Some(stop) = &panel.stop
+                {
+                    stop.request();
+                    panel.status = Some("Stop requested. Saving the completed capture…".into());
+                }
+            }
             Action::Finished(ticket, result) => self.packet_capture_finished(ticket, result, ctx),
             action if self.packet_capture.open && self.packet_capture.pending.is_none() => {
                 self.packet_capture_input(action, ctx);
@@ -519,6 +547,7 @@ impl TerminalApp {
             return;
         }
         panel.status = None;
+        panel.stop = None;
         match result {
             Ok(Some(Outcome::Reviewed(pane, plan))) => {
                 panel.review = Some(Review { pane, plan: *plan })
@@ -552,10 +581,10 @@ impl TerminalApp {
                 .triage_session()
                 .context("Select the reviewed SSH pane")?
                 .triage_target()?;
-            Ok((target, review.plan.clone()))
+            Ok((target, review.pane, review.plan.clone()))
         })();
         let panel = &mut self.packet_capture;
-        let (target, plan) = match result {
+        let (target, pane, plan) = match result {
             Ok(job) => job,
             Err(error) => {
                 panel.status = Some(format!("{error:#}"));
@@ -563,9 +592,11 @@ impl TerminalApp {
             }
         };
         let ticket = panel.begin("Capturing packets and transferring the completed file…");
+        let stop = CaptureStop::default();
+        panel.stop = Some(stop.clone());
         work(ctx, ticket, move || {
             target
-                .save_packet_capture_blocking(plan, path)
+                .save_packet_capture_with_stop_blocking(pane, plan, path, stop)
                 .map(|capture| Some(Outcome::Saved(capture)))
         });
     }

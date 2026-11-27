@@ -38,6 +38,37 @@ const SYSCALL_FIXTURE: &[u8] =
 const PCAP_FIXTURE: &[u8] = b"\xd4\xc3\xb2\xa1\x02\0\x04\0\0\0\0\0\0\0\0\0\xc0\0\0\0\x01\0\0\0\
     \x01\0\0\0\0\0\0\0\x04\0\0\0\x04\0\0\0\xab\xcd\xef\x01";
 
+fn packet_capture_ready(
+    session: &mut server::Session,
+    channel: ChannelId,
+    reason: &str,
+    bad_digest: bool,
+) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let sha256 = if bad_digest {
+        "0".repeat(64)
+    } else {
+        Sha256::digest(PCAP_FIXTURE)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    session.extended_data(
+        channel,
+        1,
+        b"1 packet captured\n2 packets received by filter\n0 packets dropped by kernel\n".to_vec(),
+    )?;
+    session.data(
+        channel,
+        format!(
+            "w11term-packet-ready-v1\t{reason}\t{}\t{sha256}\n",
+            PCAP_FIXTURE.len()
+        )
+        .into_bytes(),
+    )?;
+    Ok(())
+}
+
 fn perf_data_header() -> String {
     use sha2::{Digest, Sha256};
     let digest: String = Sha256::digest(PERF_DATA_FIXTURE)
@@ -291,24 +322,14 @@ impl server::Handler for Peer {
                     self.root.join(format!("pcap-ack-{c}")),
                     remote.to_str().unwrap(),
                 )?;
-                use sha2::{Digest, Sha256};
-                let sha256 = if self.root.join("pcap-bad-digest").exists() {
-                    "0".repeat(64)
-                } else {
-                    Sha256::digest(PCAP_FIXTURE)
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect()
-                };
-                s.extended_data(c, 1, b"1 packet captured\n2 packets received by filter\n0 packets dropped by kernel\n".to_vec())?;
-                s.data(
-                    c,
-                    format!(
-                        "w11term-packet-ready-v1\tpackets\t{}\t{sha256}\n",
-                        PCAP_FIXTURE.len()
-                    )
-                    .into_bytes(),
-                )?;
+                if !self.root.join("pcap-wait-for-stop").is_file() {
+                    packet_capture_ready(
+                        s,
+                        c,
+                        "packets",
+                        self.root.join("pcap-bad-digest").is_file(),
+                    )?;
+                }
             }
             return Ok(());
         }
@@ -654,6 +675,14 @@ impl server::Handler for Peer {
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
         let capture_marker = self.root.join(format!("pcap-ack-{c}"));
+        if data == b"stop\n"
+            && capture_marker.is_file()
+            && self.root.join("pcap-wait-for-stop").is_file()
+        {
+            fs::write(self.root.join("pcap-stopped"), [])?;
+            packet_capture_ready(s, c, "stopped", false)?;
+            return Ok(());
+        }
         if data == b"verified\n"
             && let Ok(remote) = fs::read_to_string(&capture_marker)
         {
@@ -2176,22 +2205,24 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
             .unwrap(),
         "udp and port 4096"
     );
-    let request = |name: &str, options| Request::CapturePackets {
+    let generation = plan["connection_generation"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let request = |name: &str, options, job_id| Request::CapturePackets {
         pane: 1,
         options,
-        connection_generation: plan["connection_generation"]
-            .as_u64()
-            .unwrap()
-            .try_into()
-            .unwrap(),
+        connection_generation: generation,
         review_id: plan["review_id"].as_str().unwrap().into(),
+        job_id,
         output_file: local.path().join(name),
     };
     let scratch = remote.path().join("dev/shm");
     let mut changed = options.clone();
     changed.seconds += 1;
     let error = registry
-        .execute(request("stale.pcap", changed), callback.clone())
+        .execute(request("stale.pcap", changed, None), callback.clone())
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("Review again"));
@@ -2199,7 +2230,10 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
 
     fs::write(remote.path().join("pcap-bad-digest"), []).unwrap();
     let error = registry
-        .execute(request("corrupt.pcap", options.clone()), callback.clone())
+        .execute(
+            request("corrupt.pcap", options.clone(), None),
+            callback.clone(),
+        )
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("SHA-256 digest"));
@@ -2208,7 +2242,10 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
     fs::remove_file(remote.path().join("pcap-bad-digest")).unwrap();
 
     let result = registry
-        .execute(request("reviewed capture.pcap", options), callback)
+        .execute(
+            request("reviewed capture.pcap", options.clone(), None),
+            callback.clone(),
+        )
         .await
         .unwrap();
     let capture = &result["capture"];
@@ -2222,6 +2259,52 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
         fs::read(local.path().join("reviewed capture.pcap")).unwrap(),
         PCAP_FIXTURE
     );
+    let job = "0123456789abcdef0123456789abcdef";
+    let started = remote.path().join("pcap-started");
+    fs::remove_file(&started).unwrap();
+    fs::remove_file(remote.path().join("pcap-verified")).unwrap();
+    fs::write(remote.path().join("pcap-wait-for-stop"), []).unwrap();
+    let stop = |job_id: &str| Request::StopPacketCapture {
+        pane: 1,
+        connection_generation: generation,
+        job_id: job_id.into(),
+    };
+    let capture = registry.execute(
+        request("stopped.pcap", options, Some(job.into())),
+        callback.clone(),
+    );
+    let requested = async {
+        while !started.is_file() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let error = registry
+            .execute(stop("00000000000000000000000000000000"), callback.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No matching running packet capture")
+        );
+        assert!(!remote.path().join("pcap-stopped").exists());
+        registry.execute(stop(job), callback.clone()).await.unwrap()
+    };
+    let (capture, requested) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(capture, requested)
+    })
+    .await
+    .unwrap();
+    assert_eq!(requested["stop_requested"], true);
+    let stopped = capture.unwrap();
+    assert_eq!(stopped["job_id"], job);
+    assert_eq!(stopped["capture"]["stop_reason"], "stopped");
+    assert_eq!(stopped["capture"]["packets"], 1);
+    assert_eq!(
+        fs::read(local.path().join("stopped.pcap")).unwrap(),
+        PCAP_FIXTURE
+    );
+    assert!(remote.path().join("pcap-verified").exists());
+    assert!(registry.execute(stop(job), callback.clone()).await.is_err());
     server.abort();
 }
 
