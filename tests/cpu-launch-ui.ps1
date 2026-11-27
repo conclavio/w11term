@@ -88,10 +88,30 @@ try {
     }
     if ([IO.File]::Exists($marker)) { throw 'The workload started before destination confirmation' }
     $null = Wait-Until 'confirm recording destination' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'timeout profile was saved and opened' {
-        (Find-Element 'Captured CPU profile') -and
-        (Find-Element 'Command reached its time limit') -and (Find-Element '2 samples') -and
-        (Find-Element "Raw perf recording saved to $raw")
+    $rawPrefix = 'Raw perf recording saved to '
+    $profileText = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    try {
+        $null = Wait-Until 'timeout profile was saved and opened' {
+            if (!(Find-Element 'Captured CPU profile') -or
+                !(Find-Element 'Command reached its time limit') -or
+                !(Find-Element '2 samples') -or ![IO.File]::Exists($folded)) { return }
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $profileText)) {
+                $name = $item.Current.Name
+                if ($name.StartsWith($rawPrefix, [StringComparison]::Ordinal) -and
+                    [FixtureDialog]::SameFile($raw, $name.Substring($rawPrefix.Length))) {
+                    return $true
+                }
+            }
+        }
+    } catch {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $names = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $profileText) |
+            ForEach-Object { $_.Current.Name } |
+            Where-Object { $_ -match 'profile|perf|samples|command|captur' } | Select-Object -Last 24
+        throw "$_. Folded file exists: $([IO.File]::Exists($folded)). Raw file exists: $([IO.File]::Exists($raw)). Workload started: $([IO.File]::Exists($marker)). Profile controls: $($names -join ' | ')"
     }
     $lines = [IO.File]::ReadAllLines($folded)
     if (($lines -join '|') -cne 'cpu worker;child 1|cpu worker;main 1') {
