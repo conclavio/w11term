@@ -1,3 +1,4 @@
+use crate::diagnostic_history::{Artifact, Kind as DiagnosticKind};
 use anyhow::{Context, Result, bail, ensure};
 use russh::keys::{HashAlg, PublicKey, ssh_key::Fingerprint};
 use serde::{Deserialize, Serialize};
@@ -1109,6 +1110,7 @@ impl Source {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub source: Source,
+    pub diagnostic: Option<Artifact>,
     pub workspace: Option<String>,
     pub switch_workspace: bool,
     pub expected_workspace_key: Option<String>,
@@ -1129,6 +1131,7 @@ impl Options {
     pub fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Option<Self>> {
         let mut args = args.into_iter();
         let mut source = Source::Demo;
+        let mut diagnostic = None;
         let mut profile = None;
         let mut workspace_name = None;
         let mut switch_workspace = false;
@@ -1149,6 +1152,34 @@ impl Options {
         let mut cols = None;
         let mut rows = None;
         while let Some(arg) = args.next() {
+            let diagnostic_kind = match arg.as_str() {
+                "--open-cpu-profile" => Some(DiagnosticKind::CpuProfile),
+                "--open-triage-report" => Some(DiagnosticKind::TriageReport),
+                "--open-packet-capture" => Some(DiagnosticKind::PacketCapture),
+                "--open-syscall-trace" => Some(DiagnosticKind::SyscallTrace),
+                _ => None,
+            };
+            if let Some(kind) = diagnostic_kind {
+                let artifact = diagnostic.get_or_insert_with(|| Artifact {
+                    kind,
+                    paths: Vec::new(),
+                });
+                ensure!(
+                    artifact.kind == kind,
+                    "Choose one kind of saved diagnostic per launch"
+                );
+                ensure!(
+                    artifact.paths.len() < kind.max_paths(),
+                    "Too many {arg} paths (maximum {})",
+                    kind.max_paths()
+                );
+                let path = value(&mut args, &arg)?;
+                artifact.paths.push(
+                    std::path::absolute(Path::new(&path))
+                        .with_context(|| format!("Resolving the {arg} file path"))?,
+                );
+                continue;
+            }
             explicit_source |= matches!(
                 arg.as_str(),
                 "--demo" | "--replay" | "--replay-timed" | "--profile" | "ssh" | "--tab"
@@ -1156,7 +1187,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term --open-cpu-profile PATH\n  w11term --open-triage-report PATH\n  w11term --open-packet-capture PATH\n  w11term --open-syscall-trace PATH [--open-syscall-trace PATH ...]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -1244,6 +1275,11 @@ impl Options {
             }
         }
         ensure!(
+            diagnostic.is_none()
+                || !(explicit_source || workspace_name.is_some() || list_profiles || benchmark),
+            "A saved diagnostic launch cannot be combined with a terminal source, workspace, --tab, --list-profiles or --benchmark"
+        );
+        ensure!(
             workspace_name.is_none() || !(explicit_source || list_profiles || benchmark),
             "--workspace cannot be combined with a terminal source, --tab, --list-profiles or --benchmark"
         );
@@ -1306,6 +1342,7 @@ impl Options {
                 .with_context(|| format!("unknown profile {name}; use --list-profiles"))?;
         } else if !explicit_source
             && !ssh_override
+            && diagnostic.is_none()
             && workspace_name.is_none()
             && !benchmark
             && smoke_seconds.is_none()
@@ -1403,6 +1440,7 @@ impl Options {
         );
         Ok(Some(Self {
             source,
+            diagnostic,
             workspace: workspace_name,
             switch_workspace,
             expected_workspace_key,
@@ -1883,6 +1921,22 @@ mod tests {
             parse(&["--replay", "sample.vt"]).source,
             Source::Replay("sample.vt".into())
         );
+        for (option, kind) in [
+            ("--open-cpu-profile", DiagnosticKind::CpuProfile),
+            ("--open-triage-report", DiagnosticKind::TriageReport),
+            ("--open-packet-capture", DiagnosticKind::PacketCapture),
+            ("--open-syscall-trace", DiagnosticKind::SyscallTrace),
+        ] {
+            let launch = parse(&[option, "saved diagnostic.42"]);
+            assert_eq!(launch.initial_profile, None);
+            assert_eq!(launch.source, Source::Demo);
+            let artifact = launch.diagnostic.unwrap();
+            assert_eq!(artifact.kind, kind);
+            assert_eq!(
+                artifact.paths,
+                [std::path::absolute("saved diagnostic.42").unwrap()]
+            );
+        }
 
         doc["startup_profile"] = "Local".into();
         std::fs::write(&path, doc.to_string()).unwrap();
@@ -1892,6 +1946,51 @@ mod tests {
         assert_eq!(parse(&[]).source, Source::Demo);
         std::fs::write(&path, b"{").unwrap();
         assert_eq!(parse(&[]).source, Source::Demo);
+    }
+
+    #[test]
+    fn diagnostic_launch_preserves_split_order_and_rejects_conflicting_sources() {
+        let flag = "--open-syscall-trace";
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                ["--profiles", "profiles.json"]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .map(str::to_owned),
+            )
+        };
+        let paths = parse(&[flag, "run.98", flag, "run.32"])
+            .unwrap()
+            .unwrap()
+            .diagnostic
+            .unwrap()
+            .paths;
+        assert_eq!(
+            paths,
+            ["run.98", "run.32"].map(|path| std::path::absolute(path).unwrap())
+        );
+        for args in [
+            &[flag][..],
+            &[flag, ""],
+            &[flag, "run.32", "--open-cpu-profile", "report.folded"],
+            &[
+                "--open-triage-report",
+                "before.json",
+                "--open-triage-report",
+                "after.json",
+            ],
+            &["--profile", "Remote", flag, "run.32"],
+            &[flag, "run.32", "--tab", "Remote"],
+            &["--switch-workspace", "admin", flag, "run.32"],
+            &[flag, "run.32", "--demo"],
+            &[flag, "run.32", "--benchmark"],
+            &["--replay", "session.vt", flag, "run.32"],
+            &[flag, "run.32", "--list-profiles"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+        let oversized = [flag, "run.32"].repeat(DiagnosticKind::SyscallTrace.max_paths() + 1);
+        assert!(parse(&oversized).is_err());
     }
 
     #[test]

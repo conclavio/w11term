@@ -516,18 +516,8 @@ impl TerminalApp {
         } else {
             (self.width * 0.4).clamp(265.0, 520.0)
         };
-        Grid::new()
-            .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
-            .keyed_children([
-                KeyedView::new("terminal", Border::new().content(content)),
-                KeyedView::new(
-                    "triage",
-                    Border::new()
-                        .grid_column(1)
-                        .background(Color::rgb(35, 35, 35))
-                        .content(self.triage.view(active, self.export.pending.is_none(), ctx)),
-                ),
-            ])
+        let panel = self.triage.view(active, self.export.pending.is_none(), ctx);
+        self.diagnostics_layout(content, "triage", panel, width)
     }
 
     pub(super) fn triage_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
@@ -659,7 +649,10 @@ impl TerminalApp {
         }
         let panel = &mut self.triage;
         match action {
-            Action::Close => panel.open = false,
+            Action::Close => {
+                panel.open = false;
+                self.close_empty_diagnostics_window(ctx);
+            }
             Action::Progress(ticket, count, total) => {
                 if let Some(activity) = &mut panel.activity {
                     activity

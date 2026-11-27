@@ -5828,7 +5828,7 @@ impl Component for TerminalApp {
                 osc52,
             )
         } else {
-            if !child_window {
+            if !child_window && options.diagnostic.is_none() {
                 tabs.insert(
                     live_tab_sized(
                         label.clone(),
@@ -8509,7 +8509,7 @@ impl Component for TerminalApp {
             .interaction
             .application_tab_titles;
         let title = self.tabs.active_id().map_or_else(
-            || std::borrow::Cow::Borrowed("Terminal"),
+            || std::borrow::Cow::Borrowed(self.diagnostics_title().unwrap_or("Terminal")),
             |id| self.tab_label(id, application_titles),
         );
         if self.keyboard.hwnd().is_some() {

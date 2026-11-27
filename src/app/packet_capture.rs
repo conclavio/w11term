@@ -514,18 +514,8 @@ fn default_wireshark() -> Option<PathBuf> {
 impl TerminalApp {
     pub(super) fn with_packet_capture(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.4).clamp(285.0, 520.0);
-        Grid::new()
-            .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
-            .keyed_children([
-                KeyedView::new("terminal", Border::new().content(content)),
-                KeyedView::new(
-                    "packet-capture",
-                    Border::new()
-                        .grid_column(1)
-                        .background(Color::rgb(35, 35, 35))
-                        .content(self.packet_capture.view(self.profile_connection(), ctx)),
-                ),
-            ])
+        let panel = self.packet_capture.view(self.profile_connection(), ctx);
+        self.diagnostics_layout(content, "packet-capture", panel, width)
     }
 
     pub(super) fn packet_capture_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
@@ -534,7 +524,10 @@ impl TerminalApp {
                 self.command_reference.close();
                 self.set_diagnostics_drawer(Some(diagnostics::Drawer::PacketCapture));
             }
-            Action::Close => self.packet_capture.open = false,
+            Action::Close => {
+                self.packet_capture.open = false;
+                self.close_empty_diagnostics_window(ctx);
+            }
             Action::Stop(ticket) => {
                 let panel = &mut self.packet_capture;
                 if panel

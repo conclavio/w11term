@@ -24,6 +24,16 @@ pub enum Kind {
     SyscallTrace,
 }
 
+impl Kind {
+    pub(crate) fn max_paths(self) -> usize {
+        if self == Self::SyscallTrace {
+            MAX_PATHS
+        } else {
+            1
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     pub kind: Kind,
@@ -34,12 +44,7 @@ impl Artifact {
     fn valid(&self) -> bool {
         let count = self.paths.len();
         count > 0
-            && count
-                <= if self.kind == Kind::SyscallTrace {
-                    MAX_PATHS
-                } else {
-                    1
-                }
+            && count <= self.kind.max_paths()
             && self.paths.iter().all(|path| path.is_absolute())
     }
 }

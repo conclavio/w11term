@@ -311,7 +311,10 @@ impl TerminalApp {
                 self.set_diagnostics_drawer(Some(Drawer::Overview));
                 self.edit_diagnostics_recent(Edit::Load, ctx);
             }
-            Action::Close => self.diagnostics_open = false,
+            Action::Close => {
+                self.diagnostics_open = false;
+                self.close_empty_diagnostics_window(ctx);
+            }
             Action::Recent(entry, action)
                 if self.diagnostics_open
                     && self
@@ -321,7 +324,7 @@ impl TerminalApp {
                         .any(|current| current.entry.artifact == entry.artifact) =>
             {
                 match action {
-                    RecentAction::Open => self.open_recent_diagnostic(&entry.artifact, ctx),
+                    RecentAction::Open => self.open_diagnostic_artifact(&entry.artifact, ctx),
                     RecentAction::Pin(pinned) => {
                         self.edit_diagnostics_recent(Edit::Pin(entry, pinned), ctx)
                     }
@@ -434,7 +437,11 @@ impl TerminalApp {
         );
     }
 
-    fn open_recent_diagnostic(&mut self, artifact: &Artifact, ctx: &ComponentContext<Self>) {
+    pub(super) fn open_diagnostic_artifact(
+        &mut self,
+        artifact: &Artifact,
+        ctx: &ComponentContext<Self>,
+    ) {
         match (artifact.kind, artifact.paths.as_slice()) {
             (Kind::TriageReport, [path]) => {
                 self.set_diagnostics_drawer(Some(Drawer::Triage));
@@ -502,17 +509,46 @@ impl TerminalApp {
 
     pub(super) fn with_diagnostics(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.38).clamp(270.0, 460.0);
+        self.diagnostics_layout(content, "diagnostics", self.diagnostics_view(ctx), width)
+    }
+
+    pub(super) fn diagnostics_title(&self) -> Option<&'static str> {
+        [
+            (self.packet_capture.open, packet_capture::LABEL),
+            (self.flame_graph.open, flame_graph::LABEL),
+            (self.triage.open, triage::LABEL),
+            (self.diagnostics_open, LABEL),
+        ]
+        .into_iter()
+        .find_map(|(open, label)| open.then_some(label))
+    }
+
+    fn diagnostics_window_is_empty(&self) -> bool {
+        self.tabs.active_id().is_none() && self.incoming.is_none() && self.outgoing.is_none()
+    }
+
+    pub(super) fn close_empty_diagnostics_window(&self, ctx: &ComponentContext<Self>) {
+        if self.diagnostics_window_is_empty() {
+            let _ = ctx.window().request_close();
+        }
+    }
+
+    pub(super) fn diagnostics_layout(
+        &self,
+        content: View,
+        key: &'static str,
+        panel: View,
+        width: f64,
+    ) -> View {
+        let frame = Border::new().background(Color::rgb(35, 35, 35));
+        if self.diagnostics_window_is_empty() {
+            return frame.content(panel);
+        }
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
             .keyed_children([
                 KeyedView::new("terminal", Border::new().content(content)),
-                KeyedView::new(
-                    "diagnostics",
-                    Border::new()
-                        .grid_column(1)
-                        .background(Color::rgb(35, 35, 35))
-                        .content(self.diagnostics_view(ctx)),
-                ),
+                KeyedView::new(key, frame.grid_column(1).content(panel)),
             ])
     }
 

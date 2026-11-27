@@ -1453,6 +1453,15 @@ Open **More → Diagnostics → Diagnostics overview** or search for **Diagnosti
 
 Use **Back** in the triage, flame graph, or packet capture panel to return to the overview. Open saved reports, folded stacks, and syscall traces even when you have no active SSH connection. Each live capture still has its own target review and start action.
 
+Use `w11term.exe` to launch directly into the corresponding offline viewer. Paths can be relative to the working directory or absolute. Repeat `--open-syscall-trace` for all parts of a split trace. A diagnostics-only window uses the full width and starts without opening a terminal or applying the startup profile.
+
+```powershell
+.\w11term.exe --open-cpu-profile '.\worker profile.folded'
+.\w11term.exe --open-triage-report '.\linux-triage.json'
+.\w11term.exe --open-packet-capture '.\capture.pcapng'
+.\w11term.exe --open-syscall-trace '.\run.321' --open-syscall-trace '.\run.322'
+```
+
 **Activity** shows jobs started from the app in this window, with the original SSH endpoint, current state, and the latest result still available in each tool. Packet and syscall captures report their stop reason and saved path. Select an activity to return to the running job or its result even after switching panes. Linux performance triage shows the live count of checks that have finished, including checks that returned an error. **Stop and keep report** ends the collection early. The report retains collected output, labels unfinished checks as incomplete, and records that you stopped the collection.
 
 ### Capture Linux packets and open Wireshark

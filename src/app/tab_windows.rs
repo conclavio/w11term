@@ -624,6 +624,9 @@ impl TerminalApp {
                     } else if !self.window_restored {
                         self.restore_window();
                     }
+                    if let Some(artifact) = self.window_launch.diagnostic.take() {
+                        self.open_diagnostic_artifact(&artifact, ctx);
+                    }
                 }
                 Err(error) => {
                     let error = format!("Registering window: {error}");

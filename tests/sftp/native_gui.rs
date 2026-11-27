@@ -60,6 +60,13 @@ fn native_syscall_trace_viewer_groups_calls_and_keeps_original_records() {
     drive_gui("syscall-trace-view-ui.ps1", state.path());
 }
 
+#[test]
+#[ignore = "starts each saved diagnostics viewer without opening the configured startup profile"]
+fn native_saved_diagnostics_open_directly_without_terminal_panes() {
+    let state = tempfile::tempdir().unwrap();
+    drive_gui("diagnostic-launch-ui.ps1", state.path());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reviews an SSH packet capture, saves verified bytes and opens a local viewer"]
 async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {

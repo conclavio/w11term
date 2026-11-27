@@ -459,23 +459,13 @@ impl TerminalApp {
 
     pub(super) fn with_flame_graph(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.67).clamp(275.0, 1100.0);
-        Grid::new()
-            .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
-            .keyed_children([
-                KeyedView::new("terminal", Border::new().content(content)),
-                KeyedView::new(
-                    "flame-graph",
-                    Border::new()
-                        .grid_column(1)
-                        .background(Color::rgb(35, 35, 35))
-                        .content(self.flame_graph.view(
-                            self.window_height,
-                            self.profile_connection(),
-                            self.export.pending.is_none(),
-                            ctx,
-                        )),
-                ),
-            ])
+        let panel = self.flame_graph.view(
+            self.window_height,
+            self.profile_connection(),
+            self.export.pending.is_none(),
+            ctx,
+        );
+        self.diagnostics_layout(content, "flame-graph", panel, width)
     }
 
     pub(super) fn flame_graph_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
@@ -488,6 +478,7 @@ impl TerminalApp {
             Action::Close => {
                 panel.open = false;
                 panel.hovered = None;
+                self.close_empty_diagnostics_window(ctx);
             }
             Action::Stop(ticket) => {
                 if panel
