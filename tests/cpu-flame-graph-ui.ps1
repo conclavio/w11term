@@ -11,11 +11,20 @@ $comparisonPath = Join-Path $State 'filtered CPU comparison.json'
 $dot = ' ' + [char]0xb7 + ' '
 $arrow = ' ' + [char]0x2192 + ' '
 $callerArrow = ' ' + [char]0x2190 + ' '
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'diagnostic-path-copy.txt'
 
 function Click-GraphButton([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
         $item = Find-Element $Name $button
         if ($item -and $item.Current.IsEnabled) { $item }
+    })
+}
+
+function Choose-DiagnosticFileAction([string]$Filename, [string]$Action) {
+    $triggerName = "File actions for $Filename"
+    Invoke-Button (Get-NativeMenuAction $triggerName $Action -Reveal {
+        $trigger = Find-Element $triggerName $button
+        if ($trigger -and $trigger.Current.IsEnabled -and $trigger.Current.IsOffscreen) { $trigger.SetFocus() }
     })
 }
 
@@ -137,17 +146,31 @@ try {
         (Find-Element 'Reopen worker profile.folded' $button) -and
         (Find-Element 'Reopen after recording.folded' $button)
     }
+    Choose-DiagnosticFileAction 'worker profile.folded' 'Pin'
+    $null = Wait-Until 'a baseline was saved as pinned' {
+        (Find-Element 'Pinned files') -and (Find-Element 'Reopen worker profile.folded' $button)
+    }
     Close-FixtureApp $app
     $app = $null
     $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui-restart.log')
     $window = Wait-InputWindow
     Run-Palette 'Diagnostics overview'
+    $null = Wait-Until 'pinned files still appear after restarting' { Find-Element 'Pinned files' }
+    Choose-DiagnosticFileAction 'worker profile.folded' 'Copy path'
+    $null = Wait-Until 'copy puts the exact pinned path on the clipboard' {
+        $copied = Read-ClipboardFixture
+        $copied -and [FixtureDialog]::SameFile($copied, $folded)
+    }
     Click-GraphButton 'Reopen worker profile.folded'
     $null = Wait-Until 'recent CPU profile reopened after a full restart' {
         (Find-Element '4 samples') -and !(Find-Element 'Diagnostics overview panel')
     }
     Click-GraphButton 'Return to diagnostics overview'
-    Click-GraphButton 'Forget after recording.folded'
+    Choose-DiagnosticFileAction 'worker profile.folded' 'Unpin'
+    $null = Wait-Until 'unpin moves the baseline into recent files' {
+        !(Find-Element 'Pinned files') -and (Find-Element 'Reopen worker profile.folded' $button)
+    }
+    Choose-DiagnosticFileAction 'after recording.folded' 'Forget'
     $null = Wait-Until 'forget removes the persisted entry and keeps the artifact' {
         if (Find-Element 'Reopen after recording.folded' $button) { return }
         $catalog = Join-Path $env:W11TERM_DATA_DIR 'recent-diagnostics.json'

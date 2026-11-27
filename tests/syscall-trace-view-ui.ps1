@@ -29,6 +29,7 @@ $edit = [System.Windows.Automation.ControlType]::Edit
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $byListItem = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $listItem)
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'copied-trace-paths.txt'
 [IO.File]::WriteAllText($profiles, '{"profiles":{}}')
 [IO.File]::WriteAllText($trace, @'
 501 1740000000.000000 openat(AT_FDCWD, "/tmp/retry", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000001>
@@ -314,7 +315,24 @@ try {
         if (!$item) { $item = Find-Element 'Reopen clock trace.602' $button }
         if ($item -and $item.Current.IsEnabled) { $item }
     }
-    Invoke-Button $recent
+    $openRecentLabel = $recent.Current.Name
+    $triggerName = 'File actions for ' + $openRecentLabel.Substring('Reopen '.Length)
+    Invoke-Button (Get-NativeMenuAction $triggerName 'Copy paths' -Reveal {
+        $trigger = Find-Element $triggerName $button
+        if ($trigger -and $trigger.Current.IsEnabled -and $trigger.Current.IsOffscreen) { $trigger.SetFocus() }
+    })
+    $paths = Wait-Until 'clipboard has the split trace paths' { Read-ClipboardFixture }
+    $paths = $paths -split '\r\n'
+    $catalog = [IO.File]::ReadAllText((Join-Path $env:W11TERM_DATA_DIR 'recent-diagnostics.json')) | ConvertFrom-Json
+    $recorded = $catalog.entries | Where-Object {
+        $_.paths.Count -eq 2 -and ('Reopen ' + [IO.Path]::GetFileName($_.paths[0])) -ceq $openRecentLabel
+    }
+    if ($paths.Count -ne 2 -or !$recorded -or
+        ![FixtureDialog]::SameFile($paths[0], $recorded.paths[0]) -or
+        ![FixtureDialog]::SameFile($paths[1], $recorded.paths[1])) {
+        throw 'Copy paths did not preserve the split trace selection order'
+    }
+    Click $openRecentLabel
     $null = Wait-Until 'recent split trace retains both sources and their order' {
         $raw = Raw-Text
         (Find-Element 'Files merged by time of day') -and (Find-TraceGroup '*PID 602*close*+30.000 ms*') -and

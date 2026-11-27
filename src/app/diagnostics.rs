@@ -1,6 +1,6 @@
 use super::*;
-use std::collections::VecDeque;
-use w11term::diagnostic_history::{Artifact, Kind, Store};
+use std::{cell::OnceCell, collections::VecDeque};
+use w11term::diagnostic_history::{Artifact, Entry, Kind, Store};
 
 pub(super) const LABEL: &str = "Diagnostics overview";
 
@@ -15,23 +15,35 @@ pub(super) enum Drawer {
 pub enum Action {
     Open,
     Close,
-    OpenRecent(Arc<Artifact>),
-    ForgetRecent(Arc<Artifact>),
-    RecentReady(Result<Vec<Artifact>, String>),
+    Recent(Arc<Entry>, RecentAction),
+    RecentReady(Result<Vec<Entry>, String>),
+}
+
+pub enum RecentAction {
+    Open,
+    Pin(bool),
+    CopyPaths,
+    Forget,
 }
 
 enum Edit {
     Load,
     Remember(Artifact),
-    Forget(Arc<Artifact>),
+    Pin(Arc<Entry>, bool),
+    Forget(Arc<Entry>),
 }
 
 #[derive(Default)]
 pub(super) struct Recent {
-    entries: Vec<Arc<Artifact>>,
+    entries: Vec<RecentRow>,
     edits: VecDeque<Edit>,
     pending: bool,
-    error: Option<String>,
+    status: Option<String>,
+}
+
+struct RecentRow {
+    entry: Arc<Entry>,
+    menu: OnceCell<Menu>,
 }
 
 pub(super) struct Activity {
@@ -124,6 +136,50 @@ fn ssh_endpoint(user: &str, host: &str, port: u16) -> String {
     }
 }
 
+fn diagnostic_file_menu(
+    row: &RecentRow,
+    filename: &str,
+    ready: bool,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let name = format!("File actions for {filename}");
+    // Keep the open flyout's callback valid across terminal redraws.
+    let menu = row.menu.get_or_init(|| {
+        let entry = row.entry.clone();
+        let pin = if entry.pinned { "Unpin" } else { "Pin" };
+        let copy = if entry.artifact.paths.len() == 1 {
+            "Copy path"
+        } else {
+            "Copy paths"
+        };
+        Menu::new(
+            [
+                MenuItem::item("pin", pin),
+                MenuItem::item("copy-paths", copy),
+                MenuItem::separator("remove"),
+                MenuItem::item("forget", "Forget"),
+            ],
+            ctx.callback(move |label: String| {
+                let action = match label.as_str() {
+                    label if label == pin => RecentAction::Pin(!entry.pinned),
+                    label if label == copy => RecentAction::CopyPaths,
+                    "Forget" => RecentAction::Forget,
+                    _ => return Message::ControlIdle,
+                };
+                Message::Diagnostics(Action::Recent(entry.clone(), action))
+            }),
+        )
+    });
+    title_tools::button(&name)
+        .is_enabled(ready)
+        .content(
+            FontIcon::new()
+                .glyph("\u{e712}")
+                .tooltip_with(title_tools::below(name)),
+        )
+        .menu(menu.clone())
+}
+
 pub(super) fn menu() -> MenuItem {
     MenuItem::submenu(
         "diagnostics",
@@ -183,23 +239,47 @@ impl TerminalApp {
                 self.edit_diagnostics_recent(Edit::Load, ctx);
             }
             Action::Close => self.diagnostics_open = false,
-            Action::OpenRecent(artifact)
-                if self.diagnostics_open && self.diagnostics_recent.entries.contains(&artifact) =>
+            Action::Recent(entry, action)
+                if self.diagnostics_open
+                    && self
+                        .diagnostics_recent
+                        .entries
+                        .iter()
+                        .any(|current| current.entry.artifact == entry.artifact) =>
             {
-                self.open_recent_diagnostic(artifact, ctx);
-            }
-            Action::ForgetRecent(artifact) if self.diagnostics_open => {
-                self.edit_diagnostics_recent(Edit::Forget(artifact), ctx);
+                match action {
+                    RecentAction::Open => self.open_recent_diagnostic(&entry.artifact, ctx),
+                    RecentAction::Pin(pinned) => {
+                        self.edit_diagnostics_recent(Edit::Pin(entry, pinned), ctx)
+                    }
+                    RecentAction::CopyPaths => self.copy_diagnostic_paths(&entry.artifact),
+                    RecentAction::Forget => self.edit_diagnostics_recent(Edit::Forget(entry), ctx),
+                }
             }
             Action::RecentReady(result) if self.diagnostics_recent.pending => {
                 let recent = &mut self.diagnostics_recent;
                 recent.pending = false;
                 match result {
                     Ok(entries) => {
-                        recent.entries = entries.into_iter().map(Arc::new).collect();
-                        recent.error = None;
+                        let mut previous = std::mem::take(&mut recent.entries);
+                        recent.entries = entries
+                            .into_iter()
+                            .map(|entry| {
+                                if let Some(index) =
+                                    previous.iter().position(|row| *row.entry == entry)
+                                {
+                                    previous.swap_remove(index)
+                                } else {
+                                    RecentRow {
+                                        entry: Arc::new(entry),
+                                        menu: OnceCell::new(),
+                                    }
+                                }
+                            })
+                            .collect();
+                        recent.status = None;
                     }
-                    Err(error) => recent.error = Some(error),
+                    Err(error) => recent.status = Some(error),
                 }
                 self.write_next_diagnostics_edit(ctx);
             }
@@ -243,7 +323,8 @@ impl TerminalApp {
                     match edit {
                         Edit::Load => store.list(),
                         Edit::Remember(artifact) => store.remember(&artifact),
-                        Edit::Forget(artifact) => store.forget(&artifact),
+                        Edit::Pin(entry, pinned) => store.set_pinned(&entry.artifact, pinned),
+                        Edit::Forget(entry) => store.forget(&entry.artifact),
                     }
                 })()
                 .map_err(|error: anyhow::Error| format!("{error:#}"));
@@ -255,7 +336,7 @@ impl TerminalApp {
         );
     }
 
-    fn open_recent_diagnostic(&mut self, artifact: Arc<Artifact>, ctx: &ComponentContext<Self>) {
+    fn open_recent_diagnostic(&mut self, artifact: &Artifact, ctx: &ComponentContext<Self>) {
         match (artifact.kind, artifact.paths.as_slice()) {
             (Kind::TriageReport, [path]) => {
                 self.set_diagnostics_drawer(Some(Drawer::Triage));
@@ -277,6 +358,23 @@ impl TerminalApp {
             }
             _ => (),
         }
+    }
+
+    fn copy_diagnostic_paths(&mut self, artifact: &Artifact) {
+        let result = artifact
+            .paths
+            .iter()
+            .map(|path| {
+                path.to_str()
+                    .context("This path cannot be represented as text")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .and_then(|paths| w11term::clipboard::write(&paths.join("\r\n")));
+        self.diagnostics_recent.status = Some(match result {
+            Ok(()) if artifact.paths.len() == 1 => "Copied file path".into(),
+            Ok(()) => format!("Copied {} file paths", artifact.paths.len()),
+            Err(error) => format!("Could not copy file paths · {error:#}"),
+        });
     }
 
     pub(super) fn with_diagnostics(&self, content: View, ctx: &ViewContext<Self>) -> View {
@@ -341,7 +439,16 @@ impl TerminalApp {
             ),
         ];
         let activity = self.diagnostics_activity_rows(ctx);
-        let recent = self.diagnostics_recent_rows(ctx);
+        let pinned = self.diagnostics_stored_rows(true, ctx);
+        let recent = self.diagnostics_stored_rows(false, ctx);
+        let status = self.diagnostics_recent.status.as_ref().map(|status| {
+            KeyedView::new(
+                "recent-status",
+                TextBlock::new()
+                    .text(triage::display_output(status))
+                    .text_wrapping(TextWrapping::Wrap),
+            )
+        });
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .children((
@@ -369,7 +476,9 @@ impl TerminalApp {
                                     .text(triage::display_output(&destination))
                                     .text_wrapping(TextWrapping::Wrap),
                             ))
+                            .chain(status)
                             .chain(activity)
+                            .chain(pinned)
                             .chain(rows)
                             .chain(recent),
                         ),
@@ -378,24 +487,33 @@ impl TerminalApp {
             ))
     }
 
-    fn diagnostics_recent_rows(&self, ctx: &ViewContext<Self>) -> Vec<KeyedView> {
+    fn diagnostics_stored_rows(&self, pinned: bool, ctx: &ViewContext<Self>) -> Vec<KeyedView> {
         let recent = &self.diagnostics_recent;
-        if recent.entries.is_empty() && recent.error.is_none() {
-            return Vec::new();
-        }
-        let mut rows = vec![KeyedView::new(
-            "recent-diagnostics",
-            TextBlock::new().text("Recent files").font_size(16.0),
-        )];
-        if let Some(error) = &recent.error {
-            rows.push(KeyedView::new(
-                "recent-error",
-                TextBlock::new()
-                    .text(triage::display_output(error))
-                    .text_wrapping(TextWrapping::Wrap),
-            ));
-        }
-        rows.extend(recent.entries.iter().enumerate().map(|(index, artifact)| {
+        let mut rows = Vec::new();
+        for (index, row) in recent
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.entry.pinned == pinned)
+        {
+            let entry = &row.entry;
+            if rows.is_empty() {
+                rows.push(KeyedView::new(
+                    if pinned {
+                        "pinned-heading"
+                    } else {
+                        "recent-heading"
+                    },
+                    TextBlock::new()
+                        .text(if pinned {
+                            "Pinned files"
+                        } else {
+                            "Recent files"
+                        })
+                        .font_size(16.0),
+                ));
+            }
+            let artifact = &entry.artifact;
             let path = &artifact.paths[0];
             let filename = path
                 .file_name()
@@ -414,9 +532,9 @@ impl TerminalApp {
             } else {
                 String::new()
             };
-            let open = artifact.clone();
-            let forget = artifact.clone();
-            KeyedView::new(
+            let open = entry.clone();
+            let menu = diagnostic_file_menu(row, &filename, !recent.pending, ctx);
+            rows.push(KeyedView::new(
                 format!("recent-{index}"),
                 StackPanel::new().spacing(3.0).children((
                     Grid::new()
@@ -427,21 +545,17 @@ impl TerminalApp {
                                 .automation_name(format!("Reopen {filename}"))
                                 .horizontal_alignment(HorizontalAlignment::Stretch)
                                 .on_click(ctx.callback(move |_| {
-                                    Message::Diagnostics(Action::OpenRecent(open.clone()))
+                                    Message::Diagnostics(Action::Recent(
+                                        open.clone(),
+                                        RecentAction::Open,
+                                    ))
                                 }))
                                 .content(
                                     TextBlock::new()
                                         .text(&filename)
                                         .text_trimming(TextTrimming::CharacterEllipsis),
                                 ),
-                            Button::new()
-                                .grid_column(1)
-                                .automation_name(format!("Forget {filename}"))
-                                .is_enabled(!recent.pending)
-                                .on_click(ctx.callback(move |_| {
-                                    Message::Diagnostics(Action::ForgetRecent(forget.clone()))
-                                }))
-                                .content("Forget"),
+                            Border::new().grid_column(1).content(menu),
                         )),
                     TextBlock::new()
                         .text(triage::display_output(&format!(
@@ -450,8 +564,8 @@ impl TerminalApp {
                         )))
                         .text_wrapping(TextWrapping::Wrap),
                 )),
-            )
-        }));
+            ));
+        }
         rows
     }
 

@@ -8,10 +8,11 @@ use std::{
     time::Duration,
 };
 
-const MAX_ENTRIES: usize = 12;
+const MAX_RECENT: usize = 12;
+const MAX_PINNED: usize = 12;
 const MAX_PATHS: usize = 256;
 const MAX_ENTRY_BYTES: usize = 512 * 1024;
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const LABEL: &str = "recent diagnostics files";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +47,19 @@ impl Artifact {
 #[derive(Serialize, Deserialize)]
 struct Catalog {
     version: u8,
-    entries: Vec<Artifact>,
+    entries: Vec<Entry>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    #[serde(flatten)]
+    pub artifact: Artifact,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+}
+
+fn pinned_count(entries: &[Entry]) -> usize {
+    entries.iter().take_while(|entry| entry.pinned).count()
 }
 
 pub struct Store {
@@ -79,26 +92,30 @@ impl Store {
         );
         let catalog: Catalog =
             serde_json::from_slice(&bytes).context("Reading recent diagnostics files")?;
+        let pinned = pinned_count(&catalog.entries);
+        let recent = &catalog.entries[pinned..];
         ensure!(
             catalog.version == 1
-                && catalog.entries.len() <= MAX_ENTRIES
-                && catalog.entries.iter().all(Artifact::valid),
+                && pinned <= MAX_PINNED
+                && recent.len() <= MAX_RECENT
+                && recent.iter().all(|entry| !entry.pinned)
+                && catalog.entries.iter().all(|entry| entry.artifact.valid()),
             "Recent diagnostics file has invalid entries",
         );
-        for artifact in &catalog.entries {
+        for entry in &catalog.entries {
             ensure!(
-                serde_json::to_vec_pretty(artifact)?.len() <= MAX_ENTRY_BYTES,
+                serde_json::to_vec_pretty(&entry.artifact)?.len() <= MAX_ENTRY_BYTES,
                 "Recent diagnostics file has an oversized entry",
             );
         }
         Ok(catalog)
     }
 
-    pub fn list(&self) -> Result<Vec<Artifact>> {
+    pub fn list(&self) -> Result<Vec<Entry>> {
         Ok(self.load()?.entries)
     }
 
-    pub fn remember(&self, artifact: &Artifact) -> Result<Vec<Artifact>> {
+    pub fn remember(&self, artifact: &Artifact) -> Result<Vec<Entry>> {
         ensure!(
             artifact.valid(),
             "Recent diagnostics requires absolute artifact paths"
@@ -108,23 +125,61 @@ impl Store {
             "The artifact has too many path bytes to remember",
         );
         self.update(|entries| {
-            entries.retain(|entry| entry != artifact);
-            entries.insert(0, artifact.clone());
-            entries.truncate(MAX_ENTRIES);
+            if let Some(index) = entries.iter().position(|entry| entry.artifact == *artifact) {
+                if entries[index].pinned {
+                    return Ok(());
+                }
+                entries.remove(index);
+            }
+            let pinned = pinned_count(entries);
+            entries.insert(
+                pinned,
+                Entry {
+                    artifact: artifact.clone(),
+                    pinned: false,
+                },
+            );
+            entries.truncate(pinned + MAX_RECENT);
+            Ok(())
         })
     }
 
-    pub fn forget(&self, artifact: &Artifact) -> Result<Vec<Artifact>> {
-        self.update(|entries| entries.retain(|entry| entry != artifact))
+    pub fn set_pinned(&self, artifact: &Artifact, pin: bool) -> Result<Vec<Entry>> {
+        self.update(|entries| {
+            let index = entries
+                .iter()
+                .position(|entry| entry.artifact == *artifact)
+                .context("The diagnostic artifact is no longer in the list")?;
+            if entries[index].pinned == pin {
+                return Ok(());
+            }
+            ensure!(
+                !pin || pinned_count(entries) < MAX_PINNED,
+                "Unpin a diagnostic artifact before pinning another",
+            );
+            let mut entry = entries.remove(index);
+            entry.pinned = pin;
+            let index = if pin { 0 } else { pinned_count(entries) };
+            entries.insert(index, entry);
+            entries.truncate(pinned_count(entries) + MAX_RECENT);
+            Ok(())
+        })
     }
 
-    fn update(&self, change: impl Fn(&mut Vec<Artifact>)) -> Result<Vec<Artifact>> {
+    pub fn forget(&self, artifact: &Artifact) -> Result<Vec<Entry>> {
+        self.update(|entries| {
+            entries.retain(|entry| entry.artifact != *artifact);
+            Ok(())
+        })
+    }
+
+    fn update(&self, change: impl Fn(&mut Vec<Entry>) -> Result<()>) -> Result<Vec<Entry>> {
         // Two open windows can finish captures together. Retry contention
         // briefly, and always read the catalog under the write lock.
         for attempt in 0..=20 {
             let result = crate::stored_json::update(&self.path, LABEL, || {
                 let mut catalog = self.load()?;
-                change(&mut catalog.entries);
+                change(&mut catalog.entries)?;
                 Ok(catalog)
             });
             match result {
@@ -164,10 +219,9 @@ mod tests {
         assert!(open().list().unwrap().is_empty());
         open().remember(&artifact).unwrap();
         open().remember(&artifact).unwrap();
-        assert_eq!(
-            open().list().unwrap().as_slice(),
-            std::slice::from_ref(&artifact)
-        );
+        let entries = open().list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].artifact, artifact);
         open().forget(&artifact).unwrap();
         assert!(open().list().unwrap().is_empty());
         assert_eq!(std::fs::read(first).unwrap(), b"trace");
@@ -197,6 +251,53 @@ mod tests {
         });
         let entries = (Store { path }).list().unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(artifacts.iter().all(|artifact| entries.contains(artifact)));
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| entries.iter().any(|entry| entry.artifact == *artifact))
+        );
+    }
+
+    #[test]
+    fn legacy_entries_can_be_pinned_and_survive_recent_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            path: dir.path().join("history.json"),
+        };
+        let baseline = Artifact {
+            kind: Kind::CpuProfile,
+            paths: vec![dir.path().join("baseline.folded")],
+        };
+        std::fs::write(
+            &store.path,
+            serde_json::to_vec(&serde_json::json!({"version":1,"entries":[&baseline]})).unwrap(),
+        )
+        .unwrap();
+        assert!(!store.list().unwrap()[0].pinned);
+        store.set_pinned(&baseline, true).unwrap();
+        for index in 0..=MAX_RECENT {
+            store
+                .remember(&Artifact {
+                    kind: Kind::CpuProfile,
+                    paths: vec![dir.path().join(format!("{index}.folded"))],
+                })
+                .unwrap();
+        }
+        let entries = store.remember(&baseline).unwrap();
+        assert_eq!(entries.len(), MAX_RECENT + 1);
+        assert_eq!(entries[0].artifact, baseline);
+        assert!(entries[0].pinned);
+        assert_eq!(pinned_count(&entries), 1);
+        assert!(entries[1..].iter().all(|entry| !entry.pinned));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.artifact.paths[0].ends_with("0.folded"))
+        );
+
+        let entries = store.set_pinned(&baseline, false).unwrap();
+        assert_eq!(entries.len(), MAX_RECENT);
+        assert_eq!(entries[0].artifact, baseline);
+        assert_eq!(pinned_count(&entries), 0);
     }
 }

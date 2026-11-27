@@ -1445,7 +1445,7 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 
 ### Open SSH diagnostics
 
-**Recent files** in **Diagnostics overview** remembers the last 12 Linux triage reports, folded CPU profiles, packet captures, or syscall trace sets opened or saved in the Windows app. The list survives app restarts. Split syscall traces reopen as one set in their original selection order. Packet captures reopen in the capture panel, where you can choose **Open in Wireshark**. **Forget** removes the entry from the list and leaves the artifact on disk.
+**Recent files** in **Diagnostics overview** remembers the last 12 Linux triage reports, folded CPU profiles, packet captures, or syscall trace sets opened or saved in the Windows app. The list survives app restarts. Use the file actions menu to **Pin** up to 12 baselines in a separate section. **Unpin** moves a baseline back to recent files. **Copy path** copies the full Windows path. For split syscall traces, **Copy paths** copies one path per line in the original selection order, and reopening loads the same set. Packet captures reopen in the capture panel, where you can choose **Open in Wireshark**. **Forget** removes the entry from the list and leaves the artifact on disk.
 
 Open **More → Diagnostics → Diagnostics overview** or search for **Diagnostics overview** in the command palette. The overview shows the connected SSH endpoint for the focused pane and updates when you switch panes. Use its entries to open Linux performance triage, CPU flame graph, packet capture, or the syscall trace viewer. The tools retain their direct command-palette entries.
 
