@@ -61,10 +61,11 @@ pub enum Action {
     Expand(bool),
     Text(Field, String),
     Shell(Option<usize>),
+    PinVersion(bool),
     Browse,
     Picked(Arc<()>, Result<Option<PathBuf>, String>),
     Approve,
-    Reviewed(Arc<()>, Box<DotfileSync>, Result<(), String>),
+    Reviewed(Arc<()>, Box<DotfileSync>, Result<Option<String>, String>),
     Bundle(bundle::Action),
     Disable,
 }
@@ -78,6 +79,7 @@ pub(super) struct Editor {
     zdotdir: String,
     zsh: bool,
     approved: Option<Box<DotfileSync>>,
+    pin_version: bool,
     snapshot_version: Option<String>,
     checking: Option<Arc<()>>,
     browsing: Option<Arc<()>>,
@@ -96,6 +98,7 @@ impl Editor {
             fingerprint: settings.fingerprint.clone(),
             zdotdir: settings.zdotdir.clone().unwrap_or_default(),
             zsh: settings.shell == DotfileShell::Zsh,
+            pin_version: settings.bundle_sha256.is_some(),
             approved,
             ..Default::default()
         }
@@ -136,6 +139,7 @@ impl Editor {
         editor.fingerprint = fingerprint;
         editor.zsh = saved.shell == DotfileShell::Zsh;
         editor.zdotdir = zdotdir.unwrap_or_default();
+        editor.pin_version = true;
         editor.snapshot_version = Some(saved.bundle_sha256);
         Ok(())
     }
@@ -157,6 +161,11 @@ impl Editor {
         Ok(DotfileSync {
             bundle: base.join(self.bundle.trim()),
             shell,
+            bundle_sha256: self
+                .approved
+                .as_ref()
+                .filter(|_| self.pin_version)
+                .and_then(|approval| approval.bundle_sha256.clone()),
             zdotdir: zdotdir.map(str::to_owned),
             host,
             user,
@@ -188,8 +197,10 @@ impl Editor {
             ))
         };
         let current = self.approved.as_deref().is_some_and(|approved| {
-            self.candidate(draft, base)
-                .is_ok_and(|candidate| candidate == *approved)
+            self.pin_version == approved.bundle_sha256.is_some()
+                && self
+                    .candidate(draft, base)
+                    .is_ok_and(|candidate| candidate == *approved)
         });
         let (header, status) = match &self.approved {
             Some(settings) if current => (
@@ -294,8 +305,32 @@ impl Editor {
                     .text(format!("Saved dotfile version {version}"))
                     .text_wrapping(TextWrapping::Wrap),
             ));
+        } else if let Some(version) = self
+            .approved
+            .as_deref()
+            .filter(|_| current)
+            .and_then(|settings| settings.bundle_sha256.as_deref())
+        {
+            content.push(KeyedView::new(
+                "pinned-version",
+                TextBlock::new()
+                    .text(format!("Pinned dotfile version {version}"))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
         }
         content.extend([
+            KeyedView::new(
+                "pin-version",
+                CheckBox::new()
+                    .automation_name("Pin approved dotfile version")
+                    .is_checked(self.pin_version)
+                    .on_is_checked_changed(
+                        ctx.callback(move |pin| {
+                            Message::ProfileDotfiles(id, Action::PinVersion(pin))
+                        }),
+                    )
+                    .content("Pin approved dotfile version"),
+            ),
             KeyedView::new(
                 "actions",
                 StackPanel::new()
@@ -423,6 +458,7 @@ impl TerminalApp {
                 };
                 let request = Arc::new(());
                 let snapshot_version = draft.dotfiles.snapshot_version.clone();
+                let pin_version = draft.dotfiles.pin_version;
                 draft.dotfiles.checking = Some(request.clone());
                 draft.dotfiles.error = None;
                 let rejected = Message::ProfileDotfiles(
@@ -436,9 +472,13 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let result = DotfileBundle::load(&settings.bundle)
-                            .and_then(|bundle| match snapshot_version {
-                                Some(version) => bundle.verify_version(settings.shell, &version),
-                                None => bundle.validate(settings.shell),
+                            .and_then(|bundle| match (snapshot_version, pin_version) {
+                                (Some(version), pin) => {
+                                    bundle.verify_version(settings.shell, &version)?;
+                                    Ok(pin.then_some(version))
+                                }
+                                (None, true) => bundle.content_version(settings.shell).map(Some),
+                                (None, false) => bundle.validate(settings.shell).map(|()| None),
                             })
                             .map_err(|err| format!("Checking the dotfiles bundle: {err:#}"));
                         Message::ProfileDotfiles(id, Action::Reviewed(request, settings, result))
@@ -446,7 +486,7 @@ impl TerminalApp {
                     rejected,
                 );
             }
-            Action::Reviewed(request, settings, result) => {
+            Action::Reviewed(request, mut settings, result) => {
                 if draft
                     .dotfiles
                     .checking
@@ -463,7 +503,8 @@ impl TerminalApp {
                     return;
                 }
                 match result {
-                    Ok(()) => {
+                    Ok(version) => {
+                        settings.bundle_sha256 = version;
                         draft.dotfiles.approved = Some(settings);
                         draft.dotfiles.snapshot_version = None;
                         draft.dotfiles.error = None;
@@ -556,6 +597,13 @@ impl TerminalApp {
                 }
             }
             Action::Shell(None) => {}
+            Action::PinVersion(pin) => {
+                if draft.dotfiles.pin_version != pin {
+                    draft.dotfiles.pin_version = pin;
+                    draft.dotfiles.checking = None;
+                    draft.dotfiles.error = None;
+                }
+            }
             Action::Disable => {
                 draft.dotfiles.approved = None;
                 draft.dotfiles.checking = None;

@@ -57,7 +57,12 @@ pub(crate) async fn sync_login_dotfiles(
     let bundle = tokio::task::spawn_blocking(move || DotfileBundle::load(&bundle_path))
         .await?
         .context("Opening the configured dotfiles bundle")?;
-    bundle.validate(shell)?;
+    match &settings.bundle_sha256 {
+        Some(version) => bundle
+            .verify_version(shell, version)
+            .context("The pinned dotfiles bundle changed. Review it in the SSH profile.")?,
+        None => bundle.validate(shell)?,
+    }
     let plan = engine
         .dotfiles_plan_at(home, &bundle, shell, zdotdir)
         .await?;
@@ -187,11 +192,15 @@ impl DotfileBundle {
         Ok(())
     }
 
-    pub fn verify_version(&self, shell: DotfileShell, sha256: &str) -> Result<()> {
+    pub fn content_version(&self, shell: DotfileShell) -> Result<String> {
         self.validate(shell)?;
         let [environment, prompt] = self.fragments(shell);
+        Ok(bundle_id(&environment, &prompt))
+    }
+
+    pub fn verify_version(&self, shell: DotfileShell, sha256: &str) -> Result<()> {
         ensure!(
-            bundle_id(&environment, &prompt) == sha256,
+            self.content_version(shell)? == sha256,
             "The dotfiles bundle does not reproduce version {sha256}"
         );
         Ok(())

@@ -1324,7 +1324,7 @@ Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list 
 
 Select an active or older version in **Dotfile versions** and choose **Save selected dotfile bundle** to write a new Windows JSON manifest. The manifest contains the verified environment and prompt fragments for the selected shell. Choose that shell when reviewing the saved manifest for another SSH account. The destination must be a new file.
 
-For the profile that opened the connected pane, choose **Review saved dotfiles in this SSH profile** after saving. The profile editor shows the saved digest, verified host-key fingerprint, SFTP home, shell, and optional Zsh startup directory. **Approve dotfiles sync** checks that the manifest still reproduces the saved version. Choose **Save profile changes** to use it on the next connection.
+For the profile that opened the connected pane, choose **Review saved dotfiles in this SSH profile** after saving. The profile editor shows the saved digest, verified host-key fingerprint, SFTP home, shell, and optional Zsh startup directory. **Approve dotfiles sync** checks that the manifest still reproduces the saved version. This handoff selects **Pin approved dotfile version** by default. Choose **Save profile changes** to use it on the next connection.
 
 Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
 
@@ -1334,7 +1334,9 @@ In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bund
 
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
 
-The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
+Select **Pin approved dotfile version** before approving to record the digest of the shared environment and the selected shell fragment. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
+
+The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. An optional `bundle_sha256` field stores the pin shown in the editor. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
 
 ```json
 {
