@@ -7,10 +7,13 @@ use std::{
     fmt,
     io::{self, BufWriter, Write},
     net::{IpAddr, SocketAddr},
+    num::NonZeroU128,
 };
 
 mod protocols;
+mod rates;
 use protocols::{ProtocolChange, TcpFlagComparison};
+use rates::AverageRateComparison;
 
 #[derive(Serialize)]
 pub struct CaptureComparison {
@@ -18,10 +21,18 @@ pub struct CaptureComparison {
     pub before: CaptureSide,
     pub after: CaptureSide,
     pub totals_delta: Option<CountsDelta>,
+    pub average_rates: AverageRateComparison,
     pub protocol_changes: Vec<ProtocolChange>,
     pub tcp_flag_comparison: Option<TcpFlagComparison>,
     pub conversation_changes: Vec<ConversationChange>,
     pub transport_changes: Vec<ConversationChange>,
+    pub rate_only_changes: RateOnlyChanges,
+}
+
+#[derive(Serialize)]
+pub struct RateOnlyChanges {
+    pub ip_conversations: Vec<ConversationChange>,
+    pub transport_conversations: Vec<ConversationChange>,
 }
 
 #[derive(Serialize)]
@@ -58,6 +69,7 @@ pub struct ConversationChange {
     pub before: Option<DirectionalTraffic>,
     pub after: Option<DirectionalTraffic>,
     pub delta: Option<TrafficDelta>,
+    pub average_rates: Option<AverageRateComparison>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -132,7 +144,17 @@ impl CaptureComparison {
                 - i64::from(before.truncated_packets),
         });
         let sides = [&before, &after];
-        let conversation_changes = compare_pairs(
+        let rate_spans = sides.map(CaptureSide::average_rate_span);
+        let average_rates = AverageRateComparison::new(
+            sides.map(|side| {
+                Some(Traffic {
+                    packets: side.packets,
+                    captured_bytes: side.captured_bytes,
+                })
+            }),
+            rate_spans,
+        );
+        let (conversation_changes, ip_rate_only) = compare_pairs(
             sources.map(|source| {
                 source.summary.conversations.pairs().map(|pair| {
                     (
@@ -149,8 +171,9 @@ impl CaptureComparison {
             }),
             sides.map(|side| side.complete && side.untracked_packets == 0),
             complete,
+            rate_spans,
         );
-        let transport_changes = compare_pairs(
+        let (transport_changes, transport_rate_only) = compare_pairs(
             sources.map(|source| {
                 source.summary.transport_conversations.pairs().map(|pair| {
                     (
@@ -168,16 +191,25 @@ impl CaptureComparison {
             }),
             sides.map(|side| side.has_port_coverage() && side.transport_untracked_packets == 0),
             sides.into_iter().all(CaptureSide::has_port_coverage),
+            sides.map(|side| {
+                side.average_rate_span()
+                    .filter(|_| side.has_port_coverage())
+            }),
         );
         Self {
             schema_version: 1,
             before,
             after,
             totals_delta,
+            average_rates,
             protocol_changes,
             tcp_flag_comparison,
             conversation_changes,
             transport_changes,
+            rate_only_changes: RateOnlyChanges {
+                ip_conversations: ip_rate_only,
+                transport_conversations: transport_rate_only,
+            },
         }
     }
 
@@ -246,6 +278,10 @@ impl CaptureComparison {
         } else {
             writeln!(output, "\nCapture deltas unavailable for a partial scan")?;
         }
+        writeln!(output, "\nAverage rates over each recorded timestamp span")?;
+        for line in self.average_rates.report_lines() {
+            writeln!(output, "{line}")?;
+        }
         writeln!(
             output,
             "\nIP protocol changes · {}",
@@ -259,8 +295,30 @@ impl CaptureComparison {
                 writeln!(output, "{line}")?;
             }
         }
-        write_conversation_changes(&mut output, "IP", &self.conversation_changes)?;
-        write_conversation_changes(&mut output, "TCP and UDP", &self.transport_changes)?;
+        write_conversation_changes(
+            &mut output,
+            "IP conversation changes",
+            &self.conversation_changes,
+        )?;
+        write_conversation_changes(
+            &mut output,
+            "TCP and UDP conversation changes",
+            &self.transport_changes,
+        )?;
+        for (heading, changes) in [
+            (
+                "IP conversations with rate-only changes",
+                &self.rate_only_changes.ip_conversations,
+            ),
+            (
+                "TCP and UDP conversations with rate-only changes",
+                &self.rate_only_changes.transport_conversations,
+            ),
+        ] {
+            if !changes.is_empty() {
+                write_conversation_changes(&mut output, heading, changes)?;
+            }
+        }
         output.flush()
     }
 }
@@ -269,7 +327,8 @@ fn compare_pairs<T: IntoIterator<Item = (ConversationEndpoints, DirectionalTraff
     sources: [T; 2],
     missing_is_zero: [bool; 2],
     deltas_available: bool,
-) -> Vec<ConversationChange> {
+    rate_spans: [Option<NonZeroU128>; 2],
+) -> (Vec<ConversationChange>, Vec<ConversationChange>) {
     let mut pairs: BTreeMap<_, [Option<DirectionalTraffic>; 2]> = BTreeMap::new();
     for (index, source) in sources.into_iter().enumerate() {
         for (endpoints, traffic) in source {
@@ -281,18 +340,21 @@ fn compare_pairs<T: IntoIterator<Item = (ConversationEndpoints, DirectionalTraff
         .filter_map(|(endpoints, [before, after])| {
             let before = before.or_else(|| missing_is_zero[0].then(DirectionalTraffic::default));
             let after = after.or_else(|| missing_is_zero[1].then(DirectionalTraffic::default));
-            if before == after {
+            let totals = [before, after].map(|traffic| traffic.map(DirectionalTraffic::total));
+            let average_rates = AverageRateComparison::new(totals, rate_spans);
+            if before == after && !average_rates.changed() {
                 return None;
             }
-            let delta = before
-                .zip(after)
+            let delta = totals[0]
+                .zip(totals[1])
                 .filter(|_| deltas_available)
-                .map(|(before, after)| TrafficDelta::between(before.total(), after.total()));
+                .map(|(before, after)| TrafficDelta::between(before, after));
             Some(ConversationChange {
                 endpoints,
                 before,
                 after,
                 delta,
+                average_rates: average_rates.has_observation().then_some(average_rates),
             })
         })
         .collect();
@@ -306,18 +368,16 @@ fn compare_pairs<T: IntoIterator<Item = (ConversationEndpoints, DirectionalTraff
         (Reverse(rank), change.endpoints)
     });
     changes
+        .into_iter()
+        .partition(|change| change.before != change.after)
 }
 
 fn write_conversation_changes(
     mut output: impl Write,
-    category: &str,
+    heading: &str,
     changes: &[ConversationChange],
 ) -> io::Result<()> {
-    writeln!(
-        output,
-        "\n{category} conversation changes · {}",
-        changes.len()
-    )?;
+    writeln!(output, "\n{heading} · {}", changes.len())?;
     for change in changes {
         writeln!(output, "\n{}", change.endpoints)?;
         for (role, traffic) in [("Before", change.before), ("After", change.after)] {
@@ -343,11 +403,24 @@ fn write_conversation_changes(
         } else {
             writeln!(output, "Change · Unavailable")?;
         }
+        if let Some(rates) = change.average_rates {
+            for line in rates.report_lines() {
+                writeln!(output, "{line}")?;
+            }
+        }
     }
     Ok(())
 }
 
 impl CaptureSide {
+    fn average_rate_span(&self) -> Option<NonZeroU128> {
+        if self.complete && self.timestamped_packets == self.packets {
+            self.timestamp_span_ns.and_then(NonZeroU128::new)
+        } else {
+            None
+        }
+    }
+
     fn has_port_coverage(&self) -> bool {
         self.complete && self.packets_without_ports == 0 && self.unresolved_protocol_packets == 0
     }

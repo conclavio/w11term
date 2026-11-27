@@ -36,13 +36,20 @@ fn raw_ip_capture(pairs: impl IntoIterator<Item = (u32, u32)>) -> Vec<u8> {
 }
 
 fn raw_capture(packets: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<u8> {
+    raw_capture_with_spacing(packets, 1)
+}
+
+fn raw_capture_with_spacing(
+    packets: impl IntoIterator<Item = impl AsRef<[u8]>>,
+    spacing_seconds: u32,
+) -> Vec<u8> {
     let mut bytes = classic_capture()[..24].to_vec();
     bytes[20] = 101;
     for (index, packet) in packets.into_iter().enumerate() {
         let packet = packet.as_ref();
         let size = packet.len() as u32;
         bytes.extend(
-            [10 + index as u32, 0, size, size]
+            [10 + index as u32 * spacing_seconds, 0, size, size]
                 .into_iter()
                 .flat_map(u32::to_le_bytes),
         );
@@ -382,6 +389,69 @@ fn compares_transport_pairs_beyond_the_ranked_summary_and_keeps_protocols_distin
 }
 
 #[test]
+fn compares_average_rates_over_the_full_window_and_reports_rate_only_conversations() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "baseline.pcap";
+    let after = "current.pcap";
+    let flows = || [1012, 1012, 1013].map(|port| raw_transport_packet(17, port, false));
+    fs::write(root.join(before), raw_capture(flows())).unwrap();
+    let read_report = |spacing| {
+        fs::write(root.join(after), raw_capture_with_spacing(flows(), spacing)).unwrap();
+        let output = compare(root, before, after, &[]);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let report = read_report(2);
+    assert_eq!(report["totals_delta"]["packets"], 0);
+    assert_eq!(
+        report["average_rates"],
+        json!({
+            "before": {"packets_per_second": 1.5, "captured_bytes_per_second": 42.0},
+            "after": {"packets_per_second": 0.75, "captured_bytes_per_second": 21.0},
+            "delta": {"packets_per_second": -0.75, "captured_bytes_per_second": -21.0}
+        })
+    );
+    assert_eq!(report["conversation_changes"], json!([]));
+    assert_eq!(report["transport_changes"], json!([]));
+    let ip = &report["rate_only_changes"]["ip_conversations"][0];
+    assert_eq!(ip["average_rates"], report["average_rates"]);
+    let pairs = report["rate_only_changes"]["transport_conversations"]
+        .as_array()
+        .unwrap();
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(pairs[0]["a"], "192.0.2.1:1012");
+    assert_eq!(
+        pairs[0]["average_rates"]["delta"],
+        json!({"packets_per_second": -0.5, "captured_bytes_per_second": -14.0})
+    );
+    let text = compare(root, before, after, &["--format", "text"]);
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("Average change · -0.750 packets/s, -21.000 captured bytes/s"));
+    assert!(text.contains("TCP and UDP conversations with rate-only changes · 2"));
+
+    let same = read_report(1);
+    assert_eq!(same["rate_only_changes"]["ip_conversations"], json!([]));
+    assert_eq!(
+        same["rate_only_changes"]["transport_conversations"],
+        json!([])
+    );
+    let zero_span = read_report(0);
+    assert_eq!(zero_span["after"]["timestamp_span_ns"], "0");
+    assert_eq!(
+        zero_span["average_rates"]["before"]["packets_per_second"],
+        1.5
+    );
+    assert!(zero_span["average_rates"]["after"].is_null());
+    assert!(zero_span["average_rates"]["delta"].is_null());
+    assert_eq!(
+        zero_span["rate_only_changes"]["transport_conversations"],
+        json!([])
+    );
+}
+
+#[test]
 fn tracking_limit_keeps_observed_transport_deltas_but_cannot_prove_missing_pairs() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -482,6 +552,10 @@ fn compares_protocols_and_withholds_tcp_flag_deltas_when_headers_are_unavailable
     assert_eq!(udp["protocol"], 17);
     assert_eq!(udp["after"]["a_to_b"]["packets"], 1);
     assert!(udp["delta"].is_null());
+    assert_eq!(udp["average_rates"]["before"]["packets_per_second"], 0.0);
+    assert!(udp["average_rates"]["after"].is_null());
+    assert!(udp["average_rates"]["delta"].is_null());
+    assert!(report["average_rates"]["after"].is_object());
 
     packets[2][7] = 0;
     let mut unresolved_v6 = vec![0_u8; 40];

@@ -69,13 +69,27 @@ impl Comparison {
     }
 
     fn page_count(&self) -> usize {
-        self.rows().len().div_ceil(ROWS_PER_PAGE).max(1)
+        self.row_count().div_ceil(ROWS_PER_PAGE).max(1)
     }
 
-    fn rows(&self) -> &[PacketConversationChange] {
+    fn row_count(&self) -> usize {
+        self.row_groups().iter().map(|group| group.len()).sum()
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &PacketConversationChange> {
+        self.row_groups().into_iter().flatten()
+    }
+
+    fn row_groups(&self) -> [&[PacketConversationChange]; 2] {
         match self.conversation_view {
-            ConversationView::Ip => &self.model.conversation_changes,
-            ConversationView::Transport => &self.model.transport_changes,
+            ConversationView::Ip => [
+                &self.model.conversation_changes,
+                &self.model.rate_only_changes.ip_conversations,
+            ],
+            ConversationView::Transport => [
+                &self.model.transport_changes,
+                &self.model.rate_only_changes.transport_conversations,
+            ],
         }
     }
 
@@ -110,12 +124,12 @@ impl Comparison {
                 if view == self.conversation_view && page == self.page =>
             {
                 self.selected =
-                    row.filter(|&row| row < ROWS_PER_PAGE && start + row < self.rows().len());
+                    row.filter(|&row| row < ROWS_PER_PAGE && start + row < self.row_count());
             }
             Change::Source(source) if source < self.paths.len() => self.source = source,
             Change::ProtocolsExpanded(expanded) => self.protocols_expanded = expanded,
             Change::Open(view, page) if view == self.conversation_view && page == self.page => {
-                let pair = self.rows().get(start + self.selected?)?;
+                let pair = self.rows().nth(start + self.selected?)?;
                 let filter = match pair.endpoints {
                     PacketConversationEndpoints::Ip { a, b } => {
                         WiresharkFilter::Conversation(a, b, None)
@@ -141,7 +155,7 @@ impl Comparison {
         let model = &self.model;
         let view = self.conversation_view;
         let category = view.category();
-        let conversations = self.rows();
+        let conversation_count = self.row_count();
         let action = |change| {
             let revision = Arc::clone(&self.revision);
             ctx.callback(move |_| message(Action::Comparison(revision.clone(), change)))
@@ -229,6 +243,23 @@ impl Comparison {
                 "Capture deltas unavailable for a partial scan",
             ));
         }
+        fields.push(KeyedView::new(
+            "average-rates",
+            StackPanel::new().spacing(3.0).keyed_children(
+                std::iter::once(text(
+                    "heading",
+                    "Average rates over each recorded timestamp span",
+                ))
+                .chain(
+                    model
+                        .average_rates
+                        .report_lines()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, line)| text(&format!("rate-{index}"), line)),
+                ),
+            ),
+        ));
         if !model.protocol_changes.is_empty() || model.tcp_flag_comparison.is_some() {
             let mut rows = Vec::new();
             if self.protocols_expanded {
@@ -296,10 +327,10 @@ impl Comparison {
             ),
             text(
                 "changes",
-                format!("{category} conversation changes {}", conversations.len()),
+                format!("{category} conversation changes {conversation_count}"),
             ),
         ]);
-        if conversations.is_empty() {
+        if conversation_count == 0 {
             fields.push(text(
                 "empty",
                 format!("No changes in observed {category} conversations"),
@@ -330,7 +361,7 @@ impl Comparison {
                     )),
             ));
         }
-        if !conversations.is_empty() {
+        if conversation_count != 0 {
             let page = self.page;
             let row_revision = Arc::clone(&self.revision);
             let source_revision = Arc::clone(&self.revision);
@@ -346,7 +377,7 @@ impl Comparison {
                         }))
                         .collection_slot(
                             ListViewSlot::Items,
-                            conversations.iter().skip(page * ROWS_PER_PAGE).take(ROWS_PER_PAGE).map(|change| {
+                            self.rows().skip(page * ROWS_PER_PAGE).take(ROWS_PER_PAGE).map(|change| {
                                 let label = change.endpoints.to_string();
                                 let mut details = vec![text("endpoints", label.clone())];
                                 for (side, traffic) in [("Before", change.before), ("After", change.after)] {
@@ -368,6 +399,13 @@ impl Comparison {
                                     ),
                                 );
                                 details.push(text("delta", delta));
+                                if let Some(rates) = change.average_rates {
+                                    details.extend(
+                                        rates.report_lines().into_iter().enumerate().map(|(index, line)| {
+                                            text(&format!("rate-{index}"), line)
+                                        }),
+                                    );
+                                }
                                 KeyedView::new(
                                     label.as_str(),
                                     ListViewItem::new().automation_name(&label).content(

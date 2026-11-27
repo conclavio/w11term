@@ -7,6 +7,7 @@ $destination = Join-Path $State 'reviewed capture.pcap'
 $olderCapture = Join-Path $State 'older capture.pcapng'
 $partialCapture = Join-Path $State 'incomplete capture.pcapng'
 $conversationCapture = Join-Path $State 'IP conversations.pcap'
+$slowerCapture = Join-Path $State 'IP conversations spaced out.pcap'
 $protocolCapture = Join-Path $State 'IP protocols.pcap'
 $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
@@ -58,7 +59,7 @@ $sameVersionTunnel[3] = 40
 $sameVersionTunnel[9] = 4
 $sameVersionTunnel[15] = 3
 $sameVersionTunnel[19] = 4
-function Write-CaptureFixture([string]$Path, [uint32]$LinkType, [byte[][]]$Frames) {
+function Write-CaptureFixture([string]$Path, [uint32]$LinkType, [byte[][]]$Frames, [uint32]$Spacing = 1) {
     $writer = [IO.BinaryWriter]::new([IO.File]::Create($Path))
     try {
         $writer.Write([byte[]]@(212,195,178,161, 2,0,4,0, 0,0,0,0, 0,0,0,0, 128,0,0,0))
@@ -66,7 +67,7 @@ function Write-CaptureFixture([string]$Path, [uint32]$LinkType, [byte[][]]$Frame
         $number = 0
         foreach ($frame in $Frames) {
             $number++
-            $writer.Write([uint32]$number)
+            $writer.Write([uint32]($number * $Spacing))
             $writer.Write([uint32]0)
             $writer.Write([uint32]$frame.Length)
             $writer.Write([uint32]$frame.Length)
@@ -76,7 +77,7 @@ function Write-CaptureFixture([string]$Path, [uint32]$LinkType, [byte[][]]$Frame
         $writer.Dispose()
     }
 }
-Write-CaptureFixture $conversationCapture 1 @(
+$conversationFrames = @(
     ,([byte[]]($eth4 + $ipv4))
     ,([byte[]]($eth4 + $reverse))
     ,([byte[]](@(0) * 12 + @(8,6)))
@@ -85,6 +86,8 @@ Write-CaptureFixture $conversationCapture 1 @(
     ,([byte[]]($eth6 + $ipv6Tunnel + $ipv4))
     ,([byte[]]($eth4 + $sameVersionTunnel + $ipv4))
 )
+Write-CaptureFixture $conversationCapture 1 $conversationFrames
+Write-CaptureFixture $slowerCapture 1 $conversationFrames 2
 $protocolFrames = [System.Collections.Generic.List[byte[]]]::new()
 $servicePorts = [byte[]]@(0xc0, 0x00, 0x01, 0xbb)
 foreach ($flags in @(0x02, 0x12, 0x04, 0x11, 0x02)) {
@@ -375,6 +378,7 @@ try {
         (Find-Element "Before${dot}IP conversations.pcap${dot}PCAP") -and
         (Find-Element "After${dot}older capture.pcapng${dot}PCAPNG") -and
         (Find-Element "Capture change${dot}-4 packets${dot}-330 captured bytes${dot}+1 truncated") -and
+        (Find-Element "After average${dot}Unavailable") -and
         (Find-Element 'IP conversation changes 3') -and
         (Find-Element "192.0.2.1 $bothDirections 192.0.2.2") -and
         (Find-Element "Change${dot}-3 packets${dot}-146 captured bytes")
@@ -433,11 +437,22 @@ try {
     $null = Wait-Until 'comparison returns to the original before capture' {
         Find-Element $conversationCapture
     }
+    Select-Capture $slowerCapture $compareCaptureLabel 'Choose after packet capture'
+    $null = Wait-Until 'equal packet counts show slower rates across the longer capture window' {
+        (Find-Element "Capture change${dot}+0 packets${dot}+0 captured bytes${dot}+0 truncated") -and
+        (Find-Element "Before average${dot}1.167 packets/s, 57.000 captured bytes/s") -and
+        (Find-Element "After average${dot}0.583 packets/s, 28.500 captured bytes/s") -and
+        (Find-Element "Average change${dot}-0.583 packets/s, -28.500 captured bytes/s") -and
+        (Find-Element 'IP conversation changes 3') -and
+        (Find-Element "Average change${dot}-0.250 packets/s, -12.167 captured bytes/s")
+    }
+    Click 'Back to capture'
     Select-Capture $partialCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'partial comparison preserves the issue and withholds capture deltas' {
         (Find-Element "After${dot}incomplete capture.pcapng${dot}PCAPNG") -and
         (Find-Element "Partial scan${dot}Incomplete or invalid PCAPNG block length") -and
         (Find-Element 'Capture deltas unavailable for a partial scan') -and
+        (Find-Element "After average${dot}Unavailable") -and
         (Find-Element "After${dot}Pair coverage unavailable")
     }
     Click 'Back to capture'
