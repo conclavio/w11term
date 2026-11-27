@@ -331,7 +331,7 @@ Add a searchable **Command reference** side panel inspired by Tealdeer. Search f
 
 Cache an attributed, versioned tldr-pages index on Windows for offline use. Choose the platform from the selected pane, such as Linux in WSL or a verified Linux SSH session and Windows in a local PowerShell session. Expose a platform override for an unknown or unusual remote. Prefer a matching platform page, fall back to `common`, and label examples from other platforms. Keep the last usable cache during a failed refresh. Support local pages for private commands and utilities installed from a bundle. [tldr-pages client specification](https://github.com/tldr-pages/tldr/blob/main/CLIENT-SPECIFICATION.md)
 
-**Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the network unavailable. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
+**Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities
 
