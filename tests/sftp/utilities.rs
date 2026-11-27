@@ -433,6 +433,158 @@ fn rollback(id: &str, preview: Option<&Value>) -> Operation {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pruning_only_deletes_reviewed_inactive_files_and_can_resume() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "x86_64", "/", "/usr/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let version = |variant| {
+        let arch = UtilityArchitecture::X86_64;
+        let mut code = executable(arch, None);
+        code[255] = variant;
+        Operation::PreviewToolBundle {
+            bundle: UtilityBundle {
+                version: 1,
+                name: "portable".into(),
+                bin_directory: ".local/bin".into(),
+                tools: ["jq", "rg"]
+                    .into_iter()
+                    .map(|name| UtilityTool {
+                        name: name.into(),
+                        builds: vec![build(local.path(), name, arch, code.clone())],
+                    })
+                    .collect(),
+            },
+        }
+    };
+    let store = remote.join(".local/share/w11term/tools/portable");
+    let selector = store.join("current");
+    let original = guarded_job(&pane, None, version(1)).await.unwrap();
+    guarded_job(&pane, None, apply(version(1), &original))
+        .await
+        .unwrap();
+    let old_selection = fs::read(&selector).unwrap();
+    let next = guarded_job(&pane, None, version(2)).await.unwrap();
+    guarded_job(&pane, None, apply(version(2), &next))
+        .await
+        .unwrap();
+    let active_selection = fs::read(&selector).unwrap();
+    let old = original["bundle_sha256"].as_str().unwrap();
+    let active = next["bundle_sha256"].as_str().unwrap();
+    let retained = store.join("versions").join(old);
+    let active_rg = store.join("versions").join(active).join("rg");
+    let launcher = remote.join(".local/bin/rg");
+    let launcher_contents = fs::read(&launcher).unwrap();
+    let prune = |id: &str, review: Option<&Value>| Operation::PruneToolBundleRelease {
+        name: "portable".into(),
+        bundle_sha256: id.into(),
+        review: review.map(|report| report["review"].as_str().unwrap().into()),
+    };
+
+    let error = guarded_job(&pane, None, prune(active, None))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("active tool release cannot be deleted"),
+        "{error}"
+    );
+    let untracked = retained.join("operator-notes");
+    fs::write(&untracked, "keep my notes").unwrap();
+    let error = guarded_job(&pane, None, prune(old, None))
+        .await
+        .unwrap_err();
+    assert!(error.contains("outside its manifest"), "{error}");
+    assert_eq!(fs::read_to_string(&untracked).unwrap(), "keep my notes");
+    fs::remove_file(&untracked).unwrap();
+
+    let preview = guarded_job(&pane, None, prune(old, None)).await.unwrap();
+    assert_eq!(preview["incomplete"], false);
+    assert_eq!(preview["files"][0]["name"], "jq");
+    assert_eq!(preview["files"][1]["name"], "rg");
+    assert_eq!(preview["files"][2]["name"], ".w11term-manifest.json");
+    let bytes: u64 = fs::read_dir(&retained)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert_eq!(preview["remaining_bytes"], bytes);
+    assert_eq!(fs::read(&selector).unwrap(), active_selection);
+    fs::write(&selector, old_selection).unwrap();
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("active tool release cannot be deleted"),
+        "{error}"
+    );
+    assert!(retained.join("jq").is_file());
+    fs::write(&selector, &active_selection).unwrap();
+
+    let old_rg = retained.join("rg");
+    let original_rg = fs::read(&old_rg).unwrap();
+    let mut edited_rg = original_rg.clone();
+    edited_rg[255] ^= 0xff;
+    fs::write(&old_rg, &edited_rg).unwrap();
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("Managed executable contents changed"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&old_rg).unwrap(), edited_rg);
+    assert!(retained.join("jq").is_file());
+    fs::write(&old_rg, original_rg).unwrap();
+
+    let fail = remote.join("refuse-delete-path");
+    fs::write(
+        &fail,
+        format!("/.local/share/w11term/tools/portable/versions/{old}/rg"),
+    )
+    .unwrap();
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("Deletion did not finish"), "{error}");
+    assert!(!retained.join("jq").exists());
+    assert!(retained.join("rg").is_file());
+    assert!(retained.join(".w11term-manifest.json").is_file());
+    assert_eq!(fs::read(&selector).unwrap(), active_selection);
+    fs::remove_file(fail).unwrap();
+
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    let partial = guarded_job(&pane, None, prune(old, None)).await.unwrap();
+    assert_eq!(partial["incomplete"], true);
+    assert_eq!(partial["remaining_bytes"], bytes - 256);
+    let removed = guarded_job(&pane, None, prune(old, Some(&partial)))
+        .await
+        .unwrap();
+    assert_eq!(removed["removed_bytes"], partial["remaining_bytes"]);
+    assert!(!retained.exists());
+    assert_eq!(fs::read(&selector).unwrap(), active_selection);
+    assert_eq!(fs::read(&active_rg).unwrap()[255], 2);
+    assert_eq!(fs::read(&launcher).unwrap(), launcher_contents);
+    let versions = guarded_job(&pane, None, Operation::ToolBundleVersions)
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(versions["versions"][0]["bundle_sha256"], active);
+
+    fs::create_dir(&retained).unwrap();
+    let empty = guarded_job(&pane, None, prune(old, None)).await.unwrap();
+    assert_eq!(empty["incomplete"], true);
+    assert_eq!(empty["remaining_bytes"], 0);
+    guarded_job(&pane, None, prune(old, Some(&empty)))
+        .await
+        .unwrap();
+    assert!(!retained.exists());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_managed_tools_keeps_exact_pins_and_can_be_rolled_back() {
     let (pane, _, root, _, server) = fixture(false).await;
     let remote = root.path();

@@ -1036,6 +1036,11 @@ impl Files {
         path: String,
         directory: bool,
     ) -> Result<Status, StatusCode> {
+        if fs::read_to_string(self.root.join("refuse-delete-path"))
+            .is_ok_and(|blocked| blocked == path)
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
         let trace = self.root.join("delete-trace.jsonl");
         if trace.is_file() {
             let mut log = fs::OpenOptions::new()

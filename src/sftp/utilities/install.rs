@@ -2,6 +2,7 @@ use super::*;
 use russh::ChannelMsg;
 use std::collections::BTreeMap;
 
+mod prune;
 mod remote_digest;
 
 const MANIFEST: &str = ".w11term-manifest.json";

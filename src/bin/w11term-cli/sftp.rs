@@ -33,6 +33,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   remove-from-tool-bundle NAME TOOL --review TOKEN\n\
   preview-tool-bundle-rollback NAME SHA256\n\
   rollback-tool-bundle NAME SHA256 --review TOKEN\n\
+  preview-tool-bundle-prune NAME SHA256\n\
+  prune-tool-bundle-release NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-resume NAME SHA256\n\
   resume-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-pause NAME SHA256\n\
@@ -364,13 +366,18 @@ pub fn parse(
         }
         "preview-tool-bundle-rollback"
         | "rollback-tool-bundle"
+        | "preview-tool-bundle-prune"
+        | "prune-tool-bundle-release"
         | "preview-tool-bundle-resume"
         | "resume-tool-bundle-updates"
         | "preview-tool-bundle-pause"
         | "pause-tool-bundle-updates" => {
             if matches!(
                 command.as_str(),
-                "rollback-tool-bundle" | "resume-tool-bundle-updates" | "pause-tool-bundle-updates"
+                "rollback-tool-bundle"
+                    | "prune-tool-bundle-release"
+                    | "resume-tool-bundle-updates"
+                    | "pause-tool-bundle-updates"
             ) {
                 let token = opts
                     .remove("--review")
@@ -383,6 +390,9 @@ pub fn parse(
                 }
                 "preview-tool-bundle-pause" | "pause-tool-bundle-updates" => {
                     "pause-tool-bundle-updates"
+                }
+                "preview-tool-bundle-prune" | "prune-tool-bundle-release" => {
+                    "prune-tool-bundle-release"
                 }
                 _ => "rollback-tool-bundle",
             };
@@ -659,6 +669,48 @@ mod tests {
                 ..
             } if name == "fleet" && tool == "rg" && review == token
         ));
+    }
+
+    #[test]
+    fn pruning_a_tool_release_requires_its_digest_and_a_review() {
+        let version = "a".repeat(64);
+        let token = "b".repeat(64);
+        let (_, preview) = p(&[
+            "--pane",
+            "9",
+            "preview-tool-bundle-prune",
+            "fleet",
+            &version,
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 9,
+            operation: Operation::PruneToolBundleRelease { name, bundle_sha256, review: None }, ..
+        } if name == "fleet" && bundle_sha256 == version));
+        assert!(
+            p(&[
+                "--pane",
+                "9",
+                "prune-tool-bundle-release",
+                "fleet",
+                &version
+            ])
+            .is_err()
+        );
+        let (_, apply) = p(&[
+            "--pane",
+            "9",
+            "prune-tool-bundle-release",
+            "fleet",
+            &version,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(apply, Request::Sftp {
+            pane: 9,
+            operation: Operation::PruneToolBundleRelease { bundle_sha256, review: Some(review), .. }, ..
+        } if bundle_sha256 == version && review == token));
     }
 
     #[test]

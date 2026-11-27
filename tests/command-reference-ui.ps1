@@ -72,6 +72,29 @@ function Select-InstalledTool([string]$Name) {
     }
     $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
 }
+function Select-ToolVersion([string]$Id, [string]$Suffix = '') {
+    $label = "portable${dot}$($Id.Substring(0,12))$Suffix"
+    $expandPattern = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selectPattern = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $null = Wait-Until "select retained bundle '$label'" {
+        if (Find-Element "SHA-256 $Id") { return $true }
+        $history = Find-Element 'Retained tool bundle versions' $combo
+        if ($history -and $history.Current.IsEnabled) {
+            try {
+                $popup = $history.GetCurrentPattern($expandPattern)
+                if ($popup.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+                    $history.SetFocus()
+                    $popup.Expand()
+                } else {
+                    $choice = Find-Element $label ([System.Windows.Automation.ControlType]::ListItem)
+                    if ($choice) { $choice.GetCurrentPattern($selectPattern).Select() }
+                }
+            } catch [System.Windows.Automation.ElementNotAvailableException] {
+                # WinUI replaces the dropdown's automation elements when it opens.
+            }
+        }
+    }
+}
 function Set-Manual([string]$Text) {
     $field = Wait-Until 'editable private Markdown box' {
         $control = Find-Element 'Private page Markdown' $edit
@@ -212,27 +235,7 @@ try {
     }
     Click 'Install SSH tools'
     Click 'Bundle versions'
-    $priorLabel = "portable${dot}$($oldId.Substring(0,12))"
-    $expandPattern = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $selectPattern = [System.Windows.Automation.SelectionItemPattern]::Pattern
-    $null = Wait-Until "select retained bundle '$priorLabel'" {
-        if (Find-Element "SHA-256 $oldId") { return $true }
-        $history = Find-Element 'Retained tool bundle versions' $combo
-        if ($history -and $history.Current.IsEnabled) {
-            try {
-                $popup = $history.GetCurrentPattern($expandPattern)
-                if ($popup.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
-                    $history.SetFocus()
-                    $popup.Expand()
-                } else {
-                    $prior = Find-Element $priorLabel ([System.Windows.Automation.ControlType]::ListItem)
-                    if ($prior) { $prior.GetCurrentPattern($selectPattern).Select() }
-                }
-            } catch [System.Windows.Automation.ElementNotAvailableException] {
-                # WinUI replaces the dropdown's automation elements when it opens.
-            }
-        }
-    }
+    Select-ToolVersion $oldId
     $beforeRollbackReview = [IO.File]::ReadAllText($selectorPath)
     Click 'Review rollback'
     $priorManifest = [IO.File]::ReadAllText((Join-Path $State 'fleet.json')) | ConvertFrom-Json
@@ -266,6 +269,36 @@ try {
         [IO.File]::ReadAllText($selectorPath).Contains("./versions/$oldId")
     }
     $held = [IO.File]::ReadAllText($selectorPath)
+    $discarded = ($beforeRollbackReview.TrimEnd() -split '/')[-1]
+    $discardedDir = Join-Path (Split-Path -Parent $selectorPath) "versions/$discarded"
+    $files = @(Get-ChildItem -LiteralPath $discardedDir -File -Force)
+    $bytes = [long]0
+    foreach ($file in $files) { $bytes += $file.Length }
+    if (Find-Element 'Review release deletion' $button) { throw 'An active release offered deletion' }
+    Select-ToolVersion $discarded
+    Click 'Review release deletion'
+    $null = Wait-Until 'deletion review lists the files and their total size' {
+        (Find-Element "Files to remove $($files.Count)${dot}$bytes bytes") -and
+            (Find-Element 'Deleting this release permanently removes it from rollback history.') -and
+            (Find-Element 'Delete reviewed release' $button -Visible)
+    }
+    if (!(Test-Path -LiteralPath $discardedDir) -or [IO.File]::ReadAllText($selectorPath) -cne $held) {
+        throw 'The deletion review changed the installed bundle'
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot confirm release deletion' {
+        $delete = Find-Element 'Delete reviewed release' $button
+        $delete -and !$delete.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Delete reviewed release'
+    $null = Wait-Until 'the inactive release is deleted and the active selector stays pinned' {
+        (Find-Element "Deleted retained release${dot}$bytes bytes") -and
+            !(Test-Path -LiteralPath $discardedDir) -and [IO.File]::ReadAllText($selectorPath) -ceq $held
+    }
+    Select-ToolVersion $oldId "${dot}Active${dot}Updates paused"
     $beforeSave = [IO.File]::ReadAllText($profiles)
     $snapshotRoot = Join-Path $State 'tool-bundle-snapshots'
     $null = Control @('focus-pane','--pane',"$localPane")

@@ -333,6 +333,12 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review: Option<String>,
     },
+    PruneToolBundleRelease {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     ResumeToolBundleUpdates {
         name: String,
         bundle_sha256: String,
@@ -1103,6 +1109,7 @@ pub(crate) async fn run(
                 | Operation::AddToToolBundle { .. }
                 | Operation::RemoveFromToolBundle { .. }
                 | Operation::RollbackToolBundle { .. }
+                | Operation::PruneToolBundleRelease { .. }
                 | Operation::PauseToolBundleUpdates { .. }
                 | Operation::ResumeToolBundleUpdates { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
@@ -1690,6 +1697,20 @@ impl Engine {
             } => {
                 self.rollback_utility_bundle(session, name, bundle_sha256, review.as_deref(), stage)
                     .await?
+            }
+            PruneToolBundleRelease {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.prune_tool_bundle_release(
+                    session,
+                    &name,
+                    &bundle_sha256,
+                    review.as_deref(),
+                    stage,
+                )
+                .await?
             }
             ResumeToolBundleUpdates {
                 name,

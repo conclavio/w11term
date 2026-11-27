@@ -1444,6 +1444,10 @@ Rollback uses the retained remote files. The client checks their hashes and exec
 
 The rollback preview includes `changes` in command-name order. Each row has an `action` of `add`, `remove`, `change`, or `keep`, plus `before` and `after` pins with `sha256` and `bytes`. A missing pin is `null`. The before pins come from the active release manifest so the review is available even if an active executable needs repair. `changes` is `null` if the active selector is invalid.
 
+To remove an inactive release permanently, select it in **Bundle versions**, choose **Review release deletion**, and confirm **Delete reviewed release**. The review lists the managed files and their total size. The active release and unrecognized files are protected. If cleanup is interrupted, refresh the versions and review the remaining files again. An inactive release that has lost its manifest can only be deleted if its directory is empty.
+
+For scripts, use `preview-tool-bundle-prune NAME SHA256` followed by `prune-tool-bundle-release NAME SHA256 --review TOKEN`. The preview reports `files`, `remaining_bytes`, and `incomplete`. The result reports `removed_bytes`.
+
 ### Sync a tool bundle on SSH connect
 
 Open **Settings → Edit profile → SSH tools**. Browse for the bundle manifest and enter the remote SFTP home and verified SHA256 host-key fingerprint. A pinned profile fingerprint also works. Select **Manage Bash PATH** or **Manage Zsh PATH** to append the launcher directory after the shell's existing PATH entries. Then select **Review tool bundle**, confirm the account and launcher directory, choose **Approve tool sync**, and save.
