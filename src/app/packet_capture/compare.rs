@@ -1,7 +1,6 @@
 use super::*;
 use w11term::ssh::PacketConversationChange;
 
-mod search;
 mod timeline;
 
 const ROWS_PER_PAGE: usize = 12;

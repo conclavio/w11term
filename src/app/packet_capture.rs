@@ -14,6 +14,8 @@ use w11term::{
 };
 
 mod compare;
+mod conversations;
+mod search;
 
 pub(super) const LABEL: &str = "Packet capture";
 
@@ -39,10 +41,11 @@ pub enum Action {
     TimelineExpanded(bool),
     SelectTimelineInterval(PathBuf, usize),
     ProtocolsExpanded(bool),
-    ConversationsExpanded(bool),
-    TransportConversationsExpanded(bool),
-    SelectTransportConversation(PathBuf, Option<usize>),
-    SelectConversation(PathBuf, Option<usize>),
+    LocalConversations(
+        Arc<LocalPacketCapture>,
+        compare::ConversationView,
+        conversations::Change,
+    ),
     LimitConversationInterval(PathBuf, bool),
     Tmpfs(bool),
     Review,
@@ -56,7 +59,6 @@ pub enum Action {
     OpenWireshark,
     OpenTimelineInterval(PathBuf),
     SaveTimelineExcerpt(PathBuf),
-    Conversation(PathBuf, compare::ConversationView, PairDestination),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -217,10 +219,8 @@ pub(super) struct Panel {
     timeline_expanded: bool,
     timeline_interval: Option<usize>,
     protocols_expanded: bool,
-    conversations_expanded: bool,
-    transport_conversations_expanded: bool,
-    selected_transport_conversation: Option<usize>,
-    selected_conversation: Option<usize>,
+    ip_conversations: conversations::List,
+    transport_conversations: conversations::List,
     limit_conversation_interval: bool,
     wireshark: Option<PathBuf>,
     pub(super) pending: Option<Arc<()>>,
@@ -266,10 +266,8 @@ impl Panel {
         self.timeline_expanded = false;
         self.timeline_interval = None;
         self.protocols_expanded = false;
-        self.conversations_expanded = false;
-        self.transport_conversations_expanded = false;
-        self.selected_transport_conversation = None;
-        self.selected_conversation = None;
+        self.ip_conversations = conversations::List::default();
+        self.transport_conversations = conversations::List::default();
         self.limit_conversation_interval = false;
         self.activity = None;
     }
@@ -767,232 +765,19 @@ impl Panel {
                             ),
                         ]),
                 ));
-                let conversations = &summary.conversations;
-                let mut rows = vec![text(
-                    "coverage",
-                    format!(
-                        "Tracked IP pairs {} · Unclassified packets {}",
-                        conversations.tracked_pairs, conversations.unclassified_packets
-                    ),
-                )];
-                if conversations.untracked_packets != 0 {
-                    rows.push(text(
-                        "limit",
-                        format!(
-                            "IP pair limit reached · {} packets omitted from the ranking",
-                            conversations.untracked_packets
-                        ),
-                    ));
-                }
-                if !conversations.top.is_empty() {
-                    let select_path = capture.path.clone();
-                    let open_path = capture.path.clone();
-                    let excerpt_path = capture.path.clone();
-                    let list = ListView::new()
-                        .automation_name("IP conversations by captured bytes")
-                        .max_height(280.0)
-                        .selected_index(self.selected_conversation)
-                        .on_selection_changed(ctx.callback(move |index| {
-                            message(Action::SelectConversation(select_path.clone(), index))
-                        }))
-                        .collection_slot(
-                            ListViewSlot::Items,
-                            conversations.top.iter().map(|pair| {
-                                let total = pair.total();
-                                let label = format!("{} ↔ {}", pair.a, pair.b);
-                                let totals = format!(
-                                    "{} packets · {} captured bytes",
-                                    total.packets, total.captured_bytes
-                                );
-                                let directions = format!(
-                                    "Left to right {} bytes · Right to left {} bytes",
-                                    pair.a_to_b.captured_bytes, pair.b_to_a.captured_bytes
-                                );
-                                KeyedView::new(
-                                    label.as_str(),
-                                    ListViewItem::new().automation_name(&label).content(
-                                        StackPanel::new().spacing(2.0).children((
-                                            TextBlock::new()
-                                                .text(label.clone())
-                                                .text_wrapping(TextWrapping::Wrap),
-                                            TextBlock::new()
-                                                .text(totals)
-                                                .text_wrapping(TextWrapping::Wrap),
-                                            TextBlock::new()
-                                                .text(directions)
-                                                .text_wrapping(TextWrapping::Wrap),
-                                        )),
-                                    ),
-                                )
-                            }),
-                        );
-                    rows.extend([
-                        text("rank-order", "Ranked by captured bytes"),
-                        KeyedView::new("ranked-conversations", list),
-                    ]);
-                    rows.extend(self.conversation_interval_checkbox(
-                        capture,
-                        "Limit to timeline interval",
-                        idle,
-                        ctx,
-                    ));
-                    rows.push(KeyedView::new(
-                        "open-conversation",
-                        Button::new()
-                            .is_enabled(idle && self.selected_conversation.is_some())
-                            .on_click(ctx.callback(move |_| {
-                                message(Action::Conversation(
-                                    open_path.clone(),
-                                    compare::ConversationView::Ip,
-                                    PairDestination::Wireshark,
-                                ))
-                            }))
-                            .content("Open conversation in Wireshark"),
-                    ));
-                    rows.push(KeyedView::new(
-                        "save-conversation-excerpt",
-                        Button::new()
-                            .is_enabled(idle && self.selected_conversation.is_some())
-                            .on_click(ctx.callback(move |_| {
-                                message(Action::Conversation(
-                                    excerpt_path.clone(),
-                                    compare::ConversationView::Ip,
-                                    PairDestination::Excerpt,
-                                ))
-                            }))
-                            .content("Save conversation excerpt…"),
-                    ));
-                }
-                files.push(KeyedView::new(
-                    "local-conversations",
-                    Expander::new()
-                        .automation_name("IP conversations")
-                        .automation_id("packet-ip-conversations")
-                        .is_expanded(self.conversations_expanded)
-                        .on_is_expanded_changed(
-                            ctx.callback(|expanded| {
-                                message(Action::ConversationsExpanded(expanded))
-                            }),
-                        )
-                        .slots([
-                            SlotView::new(
-                                ExpanderSlot::Header,
-                                TextBlock::new().text("IP conversations"),
-                            ),
-                            SlotView::new(
-                                ExpanderSlot::Content,
-                                StackPanel::new().spacing(6.0).keyed_children(rows),
-                            ),
-                        ]),
-                ));
             }
-            let transport = &summary.transport_conversations;
-            if transport.tracked_pairs != 0 || transport.packets_without_ports != 0 {
-                let mut rows = Vec::new();
-                if self.transport_conversations_expanded {
-                    rows.push(text(
-                        "coverage",
-                        format!(
-                            "Tracked transport pairs {} · TCP or UDP packets without ports {}",
-                            transport.tracked_pairs, transport.packets_without_ports,
-                        ),
-                    ));
-                    if transport.untracked_packets != 0 {
-                        rows.push(text(
-                            "limit",
-                            format!("Transport pair limit reached · {} packets omitted from the ranking", transport.untracked_packets),
-                        ));
-                    }
-                    if !transport.top.is_empty() {
-                        let select_path = capture.path.clone();
-                        let open_path = capture.path.clone();
-                        let excerpt_path = capture.path.clone();
-                        rows.push(KeyedView::new(
-                                "transport-pairs",
-                                ListView::new()
-                                    .automation_name("TCP and UDP port pairs by captured bytes")
-                                    .max_height(280.0)
-                                    .selected_index(self.selected_transport_conversation)
-                                    .on_selection_changed(ctx.callback(move |index| {
-                                        message(Action::SelectTransportConversation(select_path.clone(), index))
-                                    }))
-                                    .collection_slot(
-                                        ListViewSlot::Items,
-                                        transport.top.iter().map(|pair| {
-                                            let label = format!("{} · {} ↔ {}", ip_protocol_label(pair.protocol), pair.a, pair.b);
-                                            let total = pair.total();
-                                            KeyedView::new(
-                                                label.as_str(),
-                                                ListViewItem::new().automation_name(&label).content(
-                                                    StackPanel::new().spacing(3.0).keyed_children([
-                                                        text("endpoints", label.clone()),
-                                                        text("totals", format!("Packets {} · Captured bytes {}", total.packets, total.captured_bytes)),
-                                                        text("directions", format!(
-                                                            "Left to right {} packets, {} bytes · Right to left {} packets, {} bytes",
-                                                            pair.a_to_b.packets, pair.a_to_b.captured_bytes,
-                                                            pair.b_to_a.packets, pair.b_to_a.captured_bytes,
-                                                        )),
-                                                    ]),
-                                                ),
-                                            )
-                                        }),
-                                    ),
-                        ));
-                        rows.extend(self.conversation_interval_checkbox(
-                            capture,
-                            "Limit port pair to timeline interval",
-                            idle,
-                            ctx,
-                        ));
-                        rows.push(KeyedView::new(
-                            "open-transport-pair",
-                            Button::new()
-                                .is_enabled(idle && self.selected_transport_conversation.is_some())
-                                .on_click(ctx.callback(move |_| {
-                                    message(Action::Conversation(
-                                        open_path.clone(),
-                                        compare::ConversationView::Transport,
-                                        PairDestination::Wireshark,
-                                    ))
-                                }))
-                                .content("Open port pair in Wireshark"),
-                        ));
-                        rows.push(KeyedView::new(
-                            "save-port-pair-excerpt",
-                            Button::new()
-                                .is_enabled(idle && self.selected_transport_conversation.is_some())
-                                .on_click(ctx.callback(move |_| {
-                                    message(Action::Conversation(
-                                        excerpt_path.clone(),
-                                        compare::ConversationView::Transport,
-                                        PairDestination::Excerpt,
-                                    ))
-                                }))
-                                .content("Save port pair excerpt…"),
-                        ));
-                    }
-                }
-                files.push(KeyedView::new(
-                    "local-transport",
-                    Expander::new()
-                        .automation_name("TCP and UDP conversations")
-                        .automation_id("packet-transport-conversations")
-                        .is_expanded(self.transport_conversations_expanded)
-                        .on_is_expanded_changed(ctx.callback(|expanded| {
-                            message(Action::TransportConversationsExpanded(expanded))
-                        }))
-                        .slots([
-                            SlotView::new(
-                                ExpanderSlot::Header,
-                                TextBlock::new().text("TCP and UDP conversations"),
-                            ),
-                            SlotView::new(
-                                ExpanderSlot::Content,
-                                StackPanel::new().spacing(6.0).keyed_children(rows),
-                            ),
-                        ]),
-                ));
-            }
+            files.extend(self.conversation_browser(
+                capture,
+                compare::ConversationView::Ip,
+                idle,
+                ctx,
+            ));
+            files.extend(self.conversation_browser(
+                capture,
+                compare::ConversationView::Transport,
+                idle,
+                ctx,
+            ));
             if !summary.interfaces.is_empty() {
                 let mut types: Vec<_> = summary
                     .link_types
@@ -1245,11 +1030,12 @@ impl TerminalApp {
                     && (self.packet_capture.pending.is_none()
                         || matches!(
                             action,
-                            Action::SelectConversation(..)
-                                | Action::ProtocolsExpanded(_)
-                                | Action::ConversationsExpanded(_)
-                                | Action::TransportConversationsExpanded(_)
-                                | Action::SelectTransportConversation(..)
+                            Action::LocalConversations(
+                                _,
+                                _,
+                                conversations::Change::Expanded(_)
+                                    | conversations::Change::Select { .. }
+                            ) | Action::ProtocolsExpanded(_)
                                 | Action::Comparison(_, compare::Change::Pair { .. })
                                 | Action::Comparison(_, compare::Change::ProtocolsExpanded(_))
                                 | Action::Comparison(_, compare::Change::TimelineExpanded(_))
@@ -1309,24 +1095,17 @@ impl TerminalApp {
             }
             Action::TimelineExpanded(expanded) => panel.timeline_expanded = expanded,
             Action::ProtocolsExpanded(expanded) => panel.protocols_expanded = expanded,
-            Action::ConversationsExpanded(expanded) => panel.conversations_expanded = expanded,
-            Action::TransportConversationsExpanded(expanded) => {
-                panel.transport_conversations_expanded = expanded;
-            }
-            Action::SelectTransportConversation(path, index) => {
-                if let Some(LoadedCapture::Local(capture)) = &panel.loaded
-                    && capture.path == path
+            Action::LocalConversations(capture, view, change) => {
+                if panel.comparison.is_some()
+                    || !matches!(&panel.loaded, Some(LoadedCapture::Local(current)) if Arc::ptr_eq(current, &capture))
                 {
-                    panel.selected_transport_conversation = index
-                        .filter(|&index| index < capture.summary.transport_conversations.top.len());
+                    return;
                 }
-            }
-            Action::SelectConversation(path, index) => {
-                if let Some(LoadedCapture::Local(capture)) = &panel.loaded
-                    && capture.path == path
+                if let Some((endpoints, destination)) = panel
+                    .conversation_list_mut(view)
+                    .update(&capture, view, change)
                 {
-                    panel.selected_conversation =
-                        index.filter(|&index| index < capture.summary.conversations.top.len());
+                    self.local_conversation(capture, endpoints, destination, ctx);
                 }
             }
             Action::LimitConversationInterval(path, limit) => {
@@ -1441,9 +1220,6 @@ impl TerminalApp {
                 let capture = Arc::clone(capture);
                 self.save_capture_excerpt(move || capture.prepare_excerpt(bounds), ctx);
             }
-            Action::Conversation(path, view, destination) => {
-                self.local_conversation(&path, view, destination, ctx);
-            }
             Action::OpenWireshark | Action::OpenTimelineInterval(..) => {
                 let Some(capture) = &panel.loaded else { return };
                 let filter = match (action, capture) {
@@ -1469,37 +1245,12 @@ impl TerminalApp {
 
     fn local_conversation(
         &mut self,
-        path: &Path,
-        view: compare::ConversationView,
+        local: Arc<LocalPacketCapture>,
+        endpoints: PacketConversationEndpoints,
         destination: PairDestination,
         ctx: &ComponentContext<Self>,
     ) {
         let panel = &self.packet_capture;
-        let Some(LoadedCapture::Local(local)) = &panel.loaded else {
-            return;
-        };
-        if panel.comparison.is_some() || local.path != path {
-            return;
-        }
-        let endpoints = match view {
-            compare::ConversationView::Ip if panel.conversations_expanded => panel
-                .selected_conversation
-                .and_then(|index| local.summary.conversations.top.get(index))
-                .map(|pair| PacketConversationEndpoints::Ip {
-                    a: pair.a,
-                    b: pair.b,
-                }),
-            compare::ConversationView::Transport if panel.transport_conversations_expanded => panel
-                .selected_transport_conversation
-                .and_then(|index| local.summary.transport_conversations.top.get(index))
-                .map(|pair| PacketConversationEndpoints::Transport {
-                    protocol: pair.protocol,
-                    a: pair.a,
-                    b: pair.b,
-                }),
-            _ => None,
-        };
-        let Some(endpoints) = endpoints else { return };
         let interval = if panel.limit_conversation_interval {
             let Some(interval) = local
                 .summary
@@ -1520,7 +1271,6 @@ impl TerminalApp {
                 ctx,
             ),
             PairDestination::Excerpt => {
-                let local = Arc::clone(local);
                 self.save_capture_excerpt(
                     move || local.prepare_conversation_excerpt(endpoints, interval),
                     ctx,

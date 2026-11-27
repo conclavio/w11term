@@ -17,6 +17,14 @@ pub struct TransportConversations {
 }
 
 impl TransportConversations {
+    pub fn pair(&self, index: usize) -> Option<&TransportConversation> {
+        if index < self.top.len() {
+            self.top.get(index)
+        } else {
+            self.remaining.get(index - self.top.len())
+        }
+    }
+
     pub(in crate::ssh::triage::packet_capture::local) fn pairs(
         &self,
     ) -> impl Iterator<Item = &TransportConversation> {

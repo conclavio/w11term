@@ -10,6 +10,7 @@ $conversationCapture = Join-Path $State 'IP conversations.pcap'
 $slowerCapture = Join-Path $State 'IP conversations spaced out.pcap'
 $protocolCapture = Join-Path $State 'IP protocols.pcap'
 $manyPortsCapture = Join-Path $State 'Fifteen UDP conversations.pcap'
+$manyIpCapture = Join-Path $State 'Fifteen IP conversations.pcap'
 $emptyCapture = Join-Path $State 'Empty capture.pcap'
 $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
@@ -130,6 +131,13 @@ foreach ($port in 50001..50015) {
     $manyPortsFrames.Add($frame)
 }
 Write-CaptureFixture $manyPortsCapture 101 ($manyPortsFrames.ToArray())
+$manyIpFrames = [System.Collections.Generic.List[byte[]]]::new()
+foreach ($peer in 2..16) {
+    $frame = [byte[]]$ipv4.Clone()
+    $frame[19] = [byte]$peer
+    $manyIpFrames.Add($frame)
+}
+Write-CaptureFixture $manyIpCapture 101 ($manyIpFrames.ToArray())
 Write-CaptureFixture $emptyCapture 101 ([byte[][]]@())
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
@@ -246,6 +254,12 @@ function Select-ComparisonCaptureSide([string]$Name) {
         Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
     }
     $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+}
+
+function Udp-PortFilter([int]$Port) {
+    'frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip:udp(?::|$)" && ' +
+        "((ip.src#1 == 192.0.2.1 && udp.srcport#1 == $Port && ip.dst#1 == 192.0.2.2 && udp.dstport#1 == 443) || " +
+        "(ip.src#1 == 192.0.2.2 && udp.srcport#1 == 443 && ip.dst#1 == 192.0.2.1 && udp.dstport#1 == $Port))"
 }
 
 function Open-Conversation([string]$Label, [string]$Filter) {
@@ -765,7 +779,59 @@ try {
         [IO.File]::Exists($transportFilterPath) -and [IO.File]::ReadAllText($transportFilterPath) -ceq $tcpPortFilter
     }
     Click 'Back to capture'
+    Select-Capture $manyIpCapture
+    $null = Open-PacketSection 'packet-ip-conversations'
+    $null = Wait-Until 'standalone IP results have more than one page' {
+        (Find-Element 'Page 1 of 2') -and (Find-Element 'Next IP page' $button)
+    }
+    Set-Field 'Filter IP conversations' '192.0.2.16/32'
+    $row = Wait-Until 'standalone IP filtering finds a pair outside the top ten' {
+        if (Find-Element 'Matching IP pairs 1 of 15') {
+            Find-Element "192.0.2.1 $bothDirections 192.0.2.16" ([System.Windows.Automation.ControlType]::ListItem)
+        }
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $quietPair = Join-Path $State 'quiet IP pair.pcap'
+    Save-CaptureExcerpt ('Save conversation excerpt' + [char]0x2026) $quietPair
+    $report = & $Cli inspect-packet-capture $quietPair | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $report.packets -ne 1 -or $report.ip_conversations.top[0].b -cne '192.0.2.16') {
+        throw 'The selected lower-ranked IP pair did not export correctly'
+    }
+    Click 'Clear IP filter'
+    $null = Wait-Until 'clearing the standalone IP filter restores page one' {
+        (Find-Element 'Page 1 of 2') -and !(Find-Element 'Matching IP pairs 1 of 15')
+    }
     Select-Capture $manyPortsCapture
+    $null = Open-PacketSection 'packet-transport-conversations'
+    Click 'Next port pair page'
+    $row = Wait-Until 'the second standalone port page displays lower-ranked results' {
+        if (Find-Element 'Page 2 of 2') {
+            Find-Element "UDP${dot}192.0.2.1:50011 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
+        }
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Set-Field 'Filter port pairs' 'UDP 192.0.2.0/24 :50015'
+    $row = Wait-Until 'a standalone port filter clears the old selection and searches every page' {
+        $open = Find-Element 'Open port pair in Wireshark' $button
+        if ($open -and !$open.Current.IsEnabled -and (Find-Element 'Matching port pairs 1 of 15')) {
+            Find-Element "UDP${dot}192.0.2.1:50015 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
+        }
+    }
+    $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Open port pair in Wireshark'
+    $expected = Udp-PortFilter 50015
+    $null = Wait-Until 'Wireshark receives the lower-ranked standalone port pair' {
+        $filterPath = $manyPortsCapture + '.filter'
+        [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $expected
+    }
+    Set-Field 'Filter port pairs' 'tcp 50015'
+    $null = Wait-Until 'the standalone port view reports an empty filter result' {
+        Find-Element 'No port pairs match the filter'
+    }
+    Click 'Clear port pair filter'
+    $null = Wait-Until 'clearing the standalone port filter restores page one' {
+        (Find-Element 'Page 1 of 2') -and !(Find-Element 'Clear port pair filter' $button)
+    }
     Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'
     Select-ComparisonConversationType 'TCP and UDP ports'
     $null = Wait-Until 'the unfiltered transport comparison spans two pages' {
@@ -779,9 +845,7 @@ try {
     }
     $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     Click 'Open conversation in Wireshark'
-    $expected = 'frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip:udp(?::|$)" && ' +
-        '((ip.src#1 == 192.0.2.1 && udp.srcport#1 == 50015 && ip.dst#1 == 192.0.2.2 && udp.dstport#1 == 443) || ' +
-        '(ip.src#1 == 192.0.2.2 && udp.srcport#1 == 443 && ip.dst#1 == 192.0.2.1 && udp.dstport#1 == 50015))'
+    $expected = Udp-PortFilter 50015
     $null = Wait-Until 'Wireshark opens the filtered transport pair' {
         $filterPath = $olderCapture + '.filter'
         [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $expected
