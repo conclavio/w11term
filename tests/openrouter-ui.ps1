@@ -159,6 +159,57 @@ function Review-SyscallComparison {
     $null = Wait-Until 'the source can start another draft' { Find-Element 'Review syscall comparison evidence' }
 }
 
+function Review-CpuComparison {
+    $before = Join-Path $State 'private before profile.folded'
+    $after = Join-Path $State 'private after profile.folded'
+    [IO.File]::WriteAllText($before, "worker;scan;hot 40`nworker;scan;warm 10`nworker;scan;cold 10`nworker;outside-filter 40`n")
+    [IO.File]::WriteAllText($after, "worker;scan;hot 15`nworker;scan;warm 15`nworker;scan;cold 30`nworker;outside-filter 20`n")
+    $windowId = ((Control @('list-windows')).windows | Select-Object -First 1).window_id
+    $null = Control @('open-diagnostic','--window',"$windowId",'--kind','cpu-profile','--file',$before,'--compare-with',$after)
+    Set-Field 'Filter changed call stacks' 'scan'
+    Click 'Apply filter'
+    $dot = ' ' + [char]0xb7 + ' '
+    $arrow = ' ' + [char]0x2192 + ' '
+    $caller = ' ' + [char]0x2190 + ' '
+    $stack = "worker${arrow}scan${arrow}hot"
+    $detail = "Before 40 samples (40.00%)${dot}After 15 samples (18.75%)${dot}-21.25 pp"
+    $change = Wait-Until 'the hot stack can be selected from the filtered results' {
+        if (Find-Element "3 of 4 changed stacks${dot}Page 1 of 1") {
+            Find-Element "-21.25 pp${dot}hot${caller}scan" ([System.Windows.Automation.ControlType]::ListItem)
+        }
+    }
+    $change.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'the selected stack shows the measured shares' { Find-Element $detail }
+    Set-Field 'Filter changed call stacks' 'unapplied-cpu-filter'
+    Click ('Review comparison with OpenRouter' + [char]0x2026)
+    $seed = Wait-Until 'the CPU review shows the selected stack beside the comparison' {
+        $field = Find-Element $preview $edit
+        if ($field -and $field.Current.IsEnabled -and (Find-Element $detail)) {
+            $text = $field.GetCurrentPattern($value).Current.Value
+            $lines = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+            if ($text.Contains("Before: 100 samples total${dot}After: 80 samples total") -and
+                $text.Contains('3 of 4 changed stacks match the applied filter') -and
+                $lines.Contains("Selected stack`n$stack`n$detail") -and
+                $text.Contains("worker${arrow}scan${arrow}cold") -and
+                $text.Contains("worker${arrow}scan${arrow}warm")) { $text }
+        }
+    }
+    foreach ($excluded in @('unapplied-cpu-filter','outside-filter','private before profile.folded','private after profile.folded')) {
+        if ($seed.Contains($excluded)) { throw "CPU review unexpectedly included '$excluded'" }
+    }
+    Confirm-NoRequest 6
+    $edited = $seed.Replace("`r`n", "`r").Replace("`n", "`r").Replace($stack, "worker${arrow}scan${arrow}[redacted leaf]")
+    Set-Field $preview $edited
+    Click 'Review OpenRouter request'
+    $null = Wait-Until 'the revised CPU evidence is ready to send' { Find-Element 'Send reviewed request' $button }
+    Confirm-NoRequest 6
+    [IO.File]::WriteAllText((Join-Path $State 'approved-cpu'), $edited.Replace("`r", "`n"))
+    Click 'Send reviewed request'
+    $null = Wait-Until 'the CPU response and original comparison remain visible' {
+        (Find-Element 'reviewed the CPU profile changes') -and (Find-Element $detail)
+    }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', '"Palette PowerShell"', '--cols', '120', '--rows', '24') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -221,6 +272,7 @@ try {
     if (Find-Element 'late fixture reply') { throw 'Cancellation allowed a late response' }
     Review-VisibleSshPane
     Review-SyscallComparison
+    Review-CpuComparison
     Click 'Remove OpenRouter key'
     $null = Wait-Until 'saved key is removed' { Find-Element 'Saved OpenRouter API key removed' }
     if ((Find-Element 'late fixture reply') -or (Test-Path -LiteralPath $credential)) {

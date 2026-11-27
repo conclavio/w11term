@@ -144,11 +144,20 @@ impl TerminalApp {
         );
     }
 
+    pub(super) fn review_cpu_comparison_with_openrouter(
+        &mut self,
+        evidence: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.show_openrouter(Task::CpuComparison, Evidence::Text(evidence), ctx);
+    }
+
     fn show_openrouter(&mut self, task: Task, evidence: Evidence, ctx: &ComponentContext<Self>) {
-        self.set_diagnostics_drawer(
-            matches!(task, Task::Triage | Task::TriageComparison)
-                .then_some(diagnostics::Drawer::Triage),
-        );
+        self.set_diagnostics_drawer(match task {
+            Task::Triage | Task::TriageComparison => Some(diagnostics::Drawer::Triage),
+            Task::CpuComparison => Some(diagnostics::Drawer::FlameGraph),
+            _ => None,
+        });
         self.command_reference.close();
         let current = self
             .tabs
@@ -593,6 +602,7 @@ impl PageState {
                     Task::Triage => "Review Linux performance evidence",
                     Task::TriageComparison => "Review Linux performance changes",
                     Task::SyscallComparison => "Review syscall comparison evidence",
+                    Task::CpuComparison => "Review CPU profile changes",
                 },
             ),
             KeyedView::new(

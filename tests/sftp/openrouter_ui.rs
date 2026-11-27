@@ -41,7 +41,7 @@ async fn native_openrouter_requires_an_explicit_review_and_never_submits_the_rep
 fn serve(listener: TcpListener, directory: &Path) {
     listener.set_nonblocking(true).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    for index in 0..6 {
+    for index in 0..7 {
         let mut client = loop {
             match listener.accept() {
                 Ok((client, _)) => break client,
@@ -102,6 +102,15 @@ fn serve(listener: TcpListener, directory: &Path) {
                 let prompt = request["messages"][0]["content"].as_str().unwrap();
                 assert!(prompt.contains("quoted diagnostic evidence"));
                 assert!(prompt.contains("run side, source number, and line number"));
+            } else if index == 6 {
+                let expected = fs::read_to_string(directory.join("approved-cpu")).unwrap();
+                assert_eq!(text, expected);
+                assert!(text.contains("scan → [redacted leaf]"));
+                assert!(!text.contains("scan → hot"));
+                let prompt = request["messages"][0]["content"].as_str().unwrap();
+                assert!(prompt.contains("quoted diagnostic evidence"));
+                assert!(prompt.contains("percentage-point deltas"));
+                assert!(prompt.contains("latency or absolute CPU time"));
             } else {
                 assert_eq!(
                     text,
@@ -148,9 +157,13 @@ fn serve(listener: TcpListener, directory: &Path) {
                 "200 OK",
                 json!({"choices": [{"message": {"content": "explained the reviewed viewport"}}]}),
             ),
-            _ => (
+            5 => (
                 "200 OK",
                 json!({"choices": [{"message": {"content": "reviewed the syscall evidence"}}]}),
+            ),
+            _ => (
+                "200 OK",
+                json!({"choices": [{"message": {"content": "reviewed the CPU profile changes"}}]}),
             ),
         };
         let body = serde_json::to_string(&reply).unwrap();

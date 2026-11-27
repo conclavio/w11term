@@ -1,13 +1,17 @@
 use super::*;
-use w11term::cpu_profile::{Comparison, FilteredComparison};
+use crate::app::openrouter_assistance::clip;
+use std::fmt::Write as _;
+use w11term::cpu_profile::{Change, Comparison, FilteredComparison};
 
 const PAGE_SIZE: usize = 16;
+const REVIEW_OTHER_STACKS: usize = 10;
 
 pub enum Action {
     Back,
     Query(String),
     Filter,
     Export,
+    OpenRouter,
     Page(bool),
     Select(Arc<Comparison>, usize),
 }
@@ -75,6 +79,42 @@ impl ViewState {
         if Arc::ptr_eq(self.results.comparison(), comparison) && self.page_rows().contains(&id) {
             self.selected = Some(id);
         }
+    }
+
+    pub(super) fn openrouter_preview(&self) -> Option<String> {
+        let selected = self.selected?;
+        let comparison = self.results.comparison();
+        let selected_change = comparison.changes().get(selected)?;
+        let [before, after] = comparison.totals();
+        let matches = self.results.indices();
+        let scope = if self.results.matches_query("") {
+            "are shown"
+        } else {
+            "match the applied filter"
+        };
+        let mut preview = format!(
+            "CPU profile comparison\nBefore: {} total · After: {} total\n{} of {} changed stacks {scope}.\n\nSelected stack\n",
+            sample_count(before),
+            sample_count(after),
+            matches.len(),
+            comparison.changes().len(),
+        );
+        write_preview_stack(&mut preview, comparison, selected_change, 2048);
+        if matches.len() > 1 {
+            preview.push_str("\nOther matching stacks by absolute change in sample share\n");
+            for &id in matches
+                .iter()
+                .filter(|&&id| id != selected)
+                .take(REVIEW_OTHER_STACKS)
+            {
+                write_preview_stack(&mut preview, comparison, &comparison.changes()[id], 768);
+            }
+            let omitted = matches.len().saturating_sub(REVIEW_OTHER_STACKS + 1);
+            if omitted > 0 {
+                let _ = writeln!(preview, "{omitted} additional matching stacks omitted.");
+            }
+        }
+        Some(preview)
     }
 
     pub fn fields(
@@ -220,23 +260,7 @@ impl ViewState {
         ));
         if let Some(id) = self.selected {
             let change = &comparison.changes()[id];
-            let count = |side| {
-                let samples = change.counts()[side];
-                format!(
-                    "{} ({:.2}%)",
-                    sample_count(samples),
-                    sample_share(samples, comparison.totals()[side]),
-                )
-            };
-            fields.push(text(
-                "compare-detail",
-                format!(
-                    "Before {} · After {} · {}",
-                    count(0),
-                    count(1),
-                    comparison.delta(change),
-                ),
-            ));
+            fields.push(text("compare-detail", change_detail(comparison, change)));
             fields.push(KeyedView::new(
                 "compare-stack",
                 TextBlock::new()
@@ -244,9 +268,55 @@ impl ViewState {
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
+            fields.push(KeyedView::new(
+                "compare-review",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(send(|| Action::OpenRouter))
+                    .content("Review comparison with OpenRouter…"),
+            ));
         }
         fields
     }
+}
+
+fn change_detail(comparison: &Comparison, change: &Change) -> String {
+    let count = |side| {
+        let samples = change.counts()[side];
+        format!(
+            "{} ({:.2}%)",
+            sample_count(samples),
+            sample_share(samples, comparison.totals()[side]),
+        )
+    };
+    format!(
+        "Before {} · After {} · {}",
+        count(0),
+        count(1),
+        comparison.delta(change),
+    )
+}
+
+fn write_preview_stack(
+    output: &mut String,
+    comparison: &Comparison,
+    change: &Change,
+    limit: usize,
+) {
+    let stack = change.stack(comparison);
+    if stack.len() > limit {
+        let (profile, frame) = change.stack_end(comparison);
+        let leaf = &profile.frame(frame).name;
+        let _ = writeln!(
+            output,
+            "{}… (leaf {})",
+            clip(&stack, limit),
+            clip(leaf, 256)
+        );
+    } else {
+        let _ = writeln!(output, "{stack}");
+    }
+    let _ = writeln!(output, "{}", change_detail(comparison, change));
 }
 
 fn source(comparison: &Comparison, side: usize) -> String {
@@ -308,6 +378,25 @@ mod tests {
         state.filtered(state.results.comparison().filter("PARENT"));
         state.page(true);
         state.query = "typed but never applied".into();
+        let comparison = state.results.comparison();
+        let selected = &comparison.changes()[state.selected.unwrap()];
+        let preview = state.openrouter_preview().unwrap();
+        assert!(preview.contains(&format!(
+            "Selected stack\n{}\n{}",
+            selected.stack(comparison),
+            change_detail(comparison, selected),
+        )));
+        assert!(preview.contains("18 of 20 changed stacks match the applied filter"));
+        assert!(preview.contains("7 additional matching stacks omitted"));
+        assert!(preview.contains(r"\u{202e}"));
+        for omitted in [
+            "before.folded",
+            "after.folded",
+            "typed but never applied",
+            "outside-filter",
+        ] {
+            assert!(!preview.contains(omitted));
+        }
         let snapshot = state.results.clone();
         state.filtered(state.results.comparison().filter(""));
 

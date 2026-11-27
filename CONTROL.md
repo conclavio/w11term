@@ -1596,6 +1596,8 @@ In a triage comparison, **Review comparison with OpenRouter…** drafts an edita
 
 In a syscall comparison, select a change and its evidence pair, then choose **Review comparison with OpenRouter…**. The draft shows the selected outcomes, relative timing and numbered source lines, plus a bounded list of changes within the applied filter. The preview includes normalized remote resource and executable names. Raw syscall lines and local filenames stay in the viewer. Use **Back to syscall viewer** to return to the same comparison.
 
+In a CPU profile comparison, select a stack and choose **Review comparison with OpenRouter…**. The comparison stays beside the draft. The preview includes the two sample totals, the selected stack, and up to ten other stacks ranked by change in sample share within the applied filter. It uses symbol names and sample counts while leaving the local source names in the comparison. The review interprets shifts in sample share as relative measurements.
+
 Edit the preview to remove any details you want to keep local. The preview accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
 
 The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.

@@ -458,7 +458,13 @@ impl TerminalApp {
     }
 
     pub(super) fn with_flame_graph(&self, content: View, ctx: &ViewContext<Self>) -> View {
-        let width = (self.width * 0.67).clamp(275.0, 1100.0);
+        let review_visible = self.flame_graph.comparison.is_some()
+            && self
+                .tabs
+                .active()
+                .is_some_and(|tab| matches!(tab.page, Page::OpenRouter(_)));
+        let fraction = if review_visible { 0.5 } else { 0.67 };
+        let width = (self.width * fraction).clamp(275.0, 1100.0);
         let panel = self.flame_graph.view(
             self.window_height,
             self.profile_connection(),
@@ -586,6 +592,13 @@ impl TerminalApp {
                     compare::Action::Query(query) => view.query = query,
                     compare::Action::Page(forward) => view.page(forward),
                     compare::Action::Select(comparison, id) => view.select(&comparison, id),
+                    compare::Action::OpenRouter => {
+                        if panel.open
+                            && let Some(evidence) = view.openrouter_preview()
+                        {
+                            self.review_cpu_comparison_with_openrouter(evidence, ctx);
+                        }
+                    }
                     compare::Action::Export => {
                         let snapshot = view.results.clone();
                         self.begin_text_export(
