@@ -8,7 +8,9 @@ use std::{
     sync::Arc,
 };
 
+mod comparison;
 mod descriptors;
+pub(super) use comparison::{Comparison, Kind as ComparisonKind, Row as ComparisonRow};
 pub(super) use descriptors::{DescriptorReport, Lifetime};
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -327,6 +329,23 @@ impl Trace {
             &self.sources[usize::from(raw.source)].path,
             slice(&self.sources, raw),
         )
+    }
+
+    fn with_call<T>(&self, event: &Event, read: impl FnOnce(&str, &str) -> T) -> Option<T> {
+        let line = String::from_utf8_lossy(slice(&self.sources, event.first));
+        let (_, _, body) = prefix(&line, None);
+        let paired = event.last.and_then(|raw| {
+            let row = String::from_utf8_lossy(slice(&self.sources, raw));
+            let (_, _, row) = prefix(&row, None);
+            let (_, continuation) = resumed(row)?;
+            Some(format!(
+                "{}{continuation}",
+                body.strip_suffix("<unfinished ...>")?.trim_end()
+            ))
+        });
+        let (_, arguments) = paired.as_deref().unwrap_or(body).split_once('(')?;
+        let (arguments, result) = call_end(arguments)?;
+        Some(read(arguments, result.trim_start()))
     }
 
     pub fn relative_start(&self, index: usize) -> Option<u64> {

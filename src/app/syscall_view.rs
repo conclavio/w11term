@@ -2,6 +2,7 @@ use super::*;
 use std::fmt::Write as _;
 use trace::{Filter, Group, Raw, Trace};
 
+mod compare;
 mod handles;
 mod trace;
 
@@ -22,6 +23,7 @@ pub enum Action {
     Groups(TabId, bool),
     Originals(TabId, bool),
     Handles(handles::Action),
+    Compare(compare::Action),
 }
 
 #[derive(Default)]
@@ -36,6 +38,7 @@ pub(super) struct PageState {
     raw_page: usize,
     selected: Option<usize>,
     descriptors: handles::ViewState,
+    comparison: compare::ViewState,
 }
 
 impl TerminalApp {
@@ -78,6 +81,7 @@ impl TerminalApp {
                             page.query.clear();
                             page.filter = Filter::default();
                             page.descriptors = Default::default();
+                            page.comparison = Default::default();
                             page.reset_position();
                         }
                         Ok(None) => (),
@@ -139,6 +143,7 @@ impl TerminalApp {
                 }
             }
             Action::Handles(action) => self.syscall_handles_action(action, ctx),
+            Action::Compare(action) => self.syscall_compare_action(action, ctx),
             Action::Show => (),
         }
     }
@@ -312,6 +317,10 @@ impl PageState {
             };
             header.push(KeyedView::new("order", TextBlock::new().text(order)));
         }
+        if self.comparison.open {
+            return self.comparison.view(id, header, idle, ctx);
+        }
+        header.push(self.comparison.launch(id, idle, ctx));
         header.push(self.descriptors.switch(id, idle, ctx));
         if self.descriptors.open {
             return self.descriptors.view(id, trace, header, idle, ctx);

@@ -6,6 +6,8 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $trace = Join-Path $State 'reviewed calls.strace'
 $first = Join-Path $State 'split trace.501'
 $second = Join-Path $State 'split trace.502'
+$working = Join-Path $State 'working diag.strace'
+$failing = Join-Path $State 'failing diag.strace'
 $openLabel = 'Open syscall trace' + [char]0x2026
 $dot = ' ' + [char]0xb7 + ' '
 $times = [char]0xd7
@@ -17,6 +19,10 @@ $rawId = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'syscall-original-text')
 $descriptorId = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'descriptor-original-text')
+$workingId = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'comparison-working-original')
+$failingId = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'comparison-failing-original')
 $edit = [System.Windows.Automation.ControlType]::Edit
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $byListItem = [System.Windows.Automation.PropertyCondition]::new(
@@ -39,6 +45,22 @@ $byListItem = [System.Windows.Automation.PropertyCondition]::new(
 '@ + [char]10)
 [IO.File]::WriteAllText($first, '1740000010.011000 close(5</tmp/split>) = 0 <0.000002>' + [char]10)
 [IO.File]::WriteAllText($second, '1740000010.001000 open("/tmp/split", O_RDONLY) = 5</tmp/split> <0.000003>' + [char]10)
+[IO.File]::WriteAllText($working, @'
+21 1700000000.000000 execve("/bin/diag", ["diag"], NULL) = 0 <0.000001>
+21 1700000000.001000 openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = 3</tmp/settings> <0.000001>
+21 1700000000.002000 close(3</tmp/settings>) = 0 <0.000001>
+21 1700000000.003000 openat(AT_FDCWD, "/tmp/data", O_RDONLY) = 3</tmp/data> <0.000001>
+21 1700000000.004000 read(3</tmp/data>, "a", 1) = 1 <0.000001>
+21 1700000000.005000 read(3</tmp/data>, "b", 1) = 1 <0.000001>
+21 1700000000.006000 close(3</tmp/data>) = 0 <0.000001>
+'@ + [char]10)
+[IO.File]::WriteAllText($failing, @'
+77 1800000000.000000 execve("/bin/diag", ["diag"], NULL) = 0 <0.000001>
+77 1800000000.001000 openat(AT_FDCWD, "/tmp/settings", O_RDONLY) = -1 ENOENT (No such file or directory) <0.010001>
+77 1800000000.003000 openat(AT_FDCWD, "/tmp/data", O_RDONLY) = 8</tmp/data> <0.000001>
+77 1800000000.004000 read(8</tmp/data>, "a", 1) = 1 <0.000001>
+77 1800000000.006000 close(8</tmp/data>) = 0 <0.000001>
+'@ + [char]10)
 $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($trace))
 
 function Click([string]$Name) {
@@ -48,8 +70,8 @@ function Click([string]$Name) {
     })
 }
 
-function Open-Trace([string]$Text) {
-    Click $openLabel
+function Open-Trace([string]$Text, [string]$Start = $openLabel) {
+    Click $Start
     $dialog = Wait-Until 'owned trace file dialog' { Find-OwnedDialog 'Open syscall trace' }
     $null = Wait-Until 'enter trace source path' { [FixtureDialog]::SetFilename($dialog, $Text, '') }
     $null = Wait-Until 'select trace source' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -137,6 +159,39 @@ try {
         (Find-Element 'Files merged by epoch timestamp') -and
         (Find-TraceGroup '*PID 501*close*10.000 ms*') -and
         $raw -and $raw.Contains('split trace.502')
+    }
+
+    Open-Trace $working
+    $null = Wait-Until 'working trace replaces split inputs' {
+        Find-TraceGroup '*PID 21*openat*"/tmp/settings"*OK*'
+    }
+    Open-Trace $failing ('Compare with failing trace' + [char]0x2026)
+    $null = Wait-Until 'first divergence identifies the failed open and the per-call delta' {
+        $left = Raw-Text $workingId
+        $right = Raw-Text $failingId
+        (Find-TraceGroup 'First divergence*Changed result*openat*"/tmp/settings"*') -and
+            (Find-Element 'Selected call duration delta +10.000 ms') -and
+            $left -and $right -and $left.Contains('3</tmp/settings>') -and
+            $right.Contains('ENOENT') -and $left.Contains('+1.000 ms from run start') -and
+            $right.Contains('+1.000 ms from run start')
+    }
+    $reads = Wait-Until 'FD reuse is normalized before comparing read counts' {
+        Find-TraceGroup 'Changed count*read*/tmp/data*'
+    }
+    $reads.GetCurrentPattern($select).Select()
+    $null = Wait-Until 'the excess read has its own evidence' {
+        $left = Raw-Text $workingId
+        $right = Raw-Text $failingId
+        (Find-Element "Working 2${dot}Failing 1${dot}Count delta -1") -and
+            $left -and $right -and $left.Contains('read(3</tmp/data>, "b"') -and
+            $right.Contains('No corresponding call')
+    }
+    Click 'Previous comparison evidence'
+    $null = Wait-Until 'the aligned reads show each original descriptor number' {
+        $left = Raw-Text $workingId
+        $right = Raw-Text $failingId
+        $left -and $right -and $left.Contains('read(3</tmp/data>, "a"') -and
+            $right.Contains('read(8</tmp/data>, "a"')
     }
     if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($trace)) -cne $before) { throw 'The viewer changed the original trace' }
 } finally {

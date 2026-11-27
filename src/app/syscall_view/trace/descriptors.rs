@@ -1,4 +1,4 @@
-use super::{Event, Outcome, Raw, Trace, argument_values, call_end, prefix, resumed, slice};
+use super::{Event, Outcome, Raw, Trace, argument_values, prefix, slice};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -115,6 +115,33 @@ pub struct DescriptorReport {
 }
 
 impl DescriptorReport {
+    pub(super) fn comparison_bindings(&self) -> impl Iterator<Item = (usize, u32, usize)> + '_ {
+        self.lifetimes.iter().flat_map(|life| {
+            life.steps.iter().filter_map(move |step| {
+                matches!(
+                    step.change,
+                    Change::Used | Change::Ended(End::Closed | End::ClosedWithError | End::Invalid)
+                )
+                .then_some((step.event, life.fd, life.family))
+            })
+        })
+    }
+
+    pub(super) fn comparison_roots(&self) -> impl Iterator<Item = (usize, usize, &str, bool)> + '_ {
+        self.lifetimes
+            .iter()
+            .enumerate()
+            .filter(|(id, life)| *id == life.family)
+            .map(|(id, life)| {
+                let start = life.steps[0];
+                (
+                    id,
+                    start.event,
+                    &*life.resource,
+                    matches!(start.change, Change::Began(Origin::Observed)),
+                )
+            })
+    }
     pub(in crate::app::syscall_view) fn search(&self, trace: &Trace, query: &str) -> Vec<usize> {
         let query = query.trim().to_lowercase();
         let pid = query
@@ -268,25 +295,10 @@ impl Trace {
         ) {
             return Ok(());
         }
-        let line = String::from_utf8_lossy(slice(&self.sources, event.first));
-        let (_, _, body) = prefix(&line, None);
-        let paired = event.last.and_then(|raw| {
-            let row = String::from_utf8_lossy(slice(&self.sources, raw));
-            let (_, _, row) = prefix(&row, None);
-            let (_, continuation) = resumed(row)?;
-            Some(format!(
-                "{}{continuation}",
-                body.strip_suffix("<unfinished ...>")?.trim_end()
-            ))
-        });
-        let call = paired.as_deref().unwrap_or(body);
-        let Some((arguments, result)) = call
-            .split_once('(')
-            .and_then(|(_, arguments)| call_end(arguments))
-        else {
-            return Ok(());
-        };
-        builder.apply(task, index, event, arguments, result)
+        self.with_call(event, |arguments, result| {
+            builder.apply(task, index, event, arguments, result)
+        })
+        .unwrap_or(Ok(()))
     }
 }
 
@@ -793,7 +805,7 @@ impl Builder {
     }
 }
 
-fn descriptor_input(syscall: &str) -> bool {
+pub(super) fn descriptor_input(syscall: &str) -> bool {
     matches!(
         syscall,
         "read"
