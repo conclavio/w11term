@@ -38,6 +38,7 @@ struct Link {
     known_hosts: Option<PathBuf>,
     runtime: runtime::Handle,
     forward_channels: Arc<Semaphore>,
+    dotfiles_sync: tokio::sync::Mutex<()>,
 }
 
 impl Drop for Link {
@@ -105,6 +106,7 @@ impl ConnectionShare {
             known_hosts: prompts.and_then(Prompts::known_hosts).map(PathBuf::from),
             runtime: runtime::Handle::current(),
             forward_channels: Arc::new(Semaphore::new(super::local_forward::MAX_CHANNELS_PER_LINK)),
+            dotfiles_sync: tokio::sync::Mutex::new(()),
         }))
     }
     pub fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
@@ -131,6 +133,9 @@ impl ConnectionShare {
     }
     pub(super) fn fingerprint(&self) -> &str {
         &self.0.verified.fingerprint
+    }
+    pub(super) async fn lock_dotfiles_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.dotfiles_sync.lock().await
     }
     pub fn options(&self) -> &SshOptions {
         &self.0.options

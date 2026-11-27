@@ -525,6 +525,7 @@ struct ProfileDraft {
     proxy_jump: Vec<w11term::options::JumpHost>,
     jump_editor: profile_jumps::Editor,
     local_forwards: Vec<w11term::options::LocalForwardPreset>,
+    dotfiles: Option<Box<w11term::options::DotfileSync>>,
     forward_editor: profile_forwards::Editor,
     durable: bool,
     saved: bool,
@@ -567,6 +568,7 @@ impl Default for ProfileDraft {
             proxy_jump: Vec::new(),
             jump_editor: Default::default(),
             local_forwards: Vec::new(),
+            dotfiles: None,
             forward_editor: Default::default(),
             durable: false,
             saved: false,
@@ -639,6 +641,7 @@ impl ProfileDraft {
             player,
             proxy_jump: self.proxy_jump.clone(),
             local_forwards: self.local_forwards.clone(),
+            dotfiles: self.dotfiles.clone(),
             group_prompt: (!self.group_prompt.trim().is_empty())
                 .then(|| self.group_prompt.clone().try_into())
                 .transpose()?,
@@ -666,6 +669,7 @@ impl ProfileDraft {
         Self {
             proxy_jump: options.proxy_jump.clone(),
             local_forwards: options.local_forwards.clone(),
+            dotfiles: options.dotfiles.clone(),
             name,
             durable: options.durable,
             host: options.host.clone(),
@@ -9688,6 +9692,7 @@ mod profile_ui_tests {
                 authentication,
                 host_key: Some("SHA256:test".into()),
                 host_key_alias: Some("cockpit.example".into()),
+                dotfiles: None,
                 group_prompt: Some("rack-[12]>>".to_owned().try_into().unwrap()),
                 proxy_jump: Vec::new(),
                 local_forwards: Vec::new(),

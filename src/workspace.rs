@@ -849,6 +849,7 @@ mod tests {
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             durable: false,
+            dotfiles: None,
             group_prompt: None,
             player: Default::default(),
         }

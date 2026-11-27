@@ -344,13 +344,8 @@ pub fn parse(
                 fields.insert("target".into(), json!(target));
             } else {
                 let manifest = path()?;
-                let bytes = super::read_limited(
-                    std::fs::File::open(&manifest)
-                        .with_context(|| format!("Opening dotfiles bundle {manifest}"))?,
-                )?;
-                let bundle: DotfileBundle =
-                    serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
-                        .context("Reading the dotfiles bundle JSON")?;
+                let bundle = DotfileBundle::load(std::path::Path::new(&manifest))
+                    .with_context(|| format!("Opening dotfiles bundle {manifest}"))?;
                 bundle.validate(shell)?;
                 fields.insert("bundle".into(), json!(bundle));
             }

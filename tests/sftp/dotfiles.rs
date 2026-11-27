@@ -1,6 +1,9 @@
 use super::*;
 use sha2::{Digest, Sha256};
-use w11term::sftp::{DotfileBundle, DotfileShell, DotfileTarget, Operation};
+use w11term::{
+    options::DotfileSync,
+    sftp::{DotfileBundle, DotfileShell, DotfileTarget, Operation},
+};
 
 fn bundle(shell: DotfileShell, zdotdir: Option<&str>) -> Operation {
     Operation::PreviewDotfiles {
@@ -323,7 +326,10 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         .await
         .unwrap();
     assert_eq!(restored["changed"], true);
-    assert_eq!(fs::read_to_string(&selector).unwrap(), format!("{id}\n"));
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        format!("{id}\nmanual\n")
+    );
     let repeat = guarded_job(&pane, None, switch(Some(id), None))
         .await
         .unwrap();
@@ -368,4 +374,173 @@ async fn dotfiles_review_cannot_be_used_on_another_ssh_pane() {
     assert!(!root.path().join(".config").exists());
     first_server.abort();
     second_server.abort();
+}
+
+fn connect_options(source: Source, local: &std::path::Path) -> SshOptions {
+    let Source::Ssh(mut options) = source else {
+        unreachable!()
+    };
+    let settings = DotfileSync {
+        bundle: "Fleet dotfiles.json".into(),
+        shell: DotfileShell::Bash,
+        zdotdir: None,
+        host: options.host.clone(),
+        user: options.user.clone(),
+        port: options.port,
+        fingerprint: options.host_key.clone().unwrap(),
+        home: "/".into(),
+    };
+    options.dotfiles = Some(Box::new(settings));
+    let mut options: SshOptions =
+        serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
+    options
+        .prepare_profile_connection(&local.join("profiles.json"))
+        .unwrap();
+    options
+}
+
+async fn login(options: &SshOptions, selector: &str, expected: &str) -> Session {
+    let pane = Session::start_sized(
+        Source::Ssh(options.clone()),
+        wezterm_term::TerminalSize {
+            cols: 120,
+            ..Default::default()
+        },
+    );
+    let probe = format!("dotfiles-at-shell:{selector}");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let frame = pane.frames.load();
+            if frame.connection_generation != 0
+                && frame.rows.iter().any(|row| row.as_str().contains(&probe))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        let frame = pane.frames.load();
+        let text = frame
+            .rows
+            .iter()
+            .take(4)
+            .map(|row| row.as_str().into_owned())
+            .collect::<Vec<_>>();
+        panic!(
+            "Waiting for {probe}: {error}; screen: {text:?}; {:?}",
+            pane.events.since(0).events
+        )
+    });
+    let batch = pane.events.since(0);
+    let sync = batch
+        .events
+        .iter()
+        .find(|e| e.kind == "dotfiles-sync")
+        .unwrap();
+    assert_eq!(sync.data["status"], expected, "{sync:?}");
+    pane
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_sync_activates_before_the_shell_and_respects_manual_selections() {
+    let (source, remote, _, server) = fixture_connections(false, 7).await;
+    let root = remote.path();
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("dotfiles-shell-probe"), []).unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let options = connect_options(source, local.path());
+    let path = local.path().join("Fleet dotfiles.json");
+    let write = |prompt| fs::write(&path, serde_json::to_vec(&manifest(prompt)).unwrap()).unwrap();
+    let id = |prompt: &str| {
+        let environment = "export PROJECT=local\n";
+        let mut sha = Sha256::new_with_prefix(b"w11term-dotfiles-v1\0");
+        sha.update((environment.len() as u64).to_le_bytes());
+        sha.update(environment);
+        sha.update(format!("PS1='{prompt}> '\n"));
+        sha.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    write("first");
+    let first = id("first");
+    drop(login(&options, &first, "updated").await);
+    drop(login(&options, &first, "current").await);
+    write("second");
+    let second = id("second");
+    let pane = login(&options, &second, "updated").await;
+    let restore = guarded_job(&pane, None, switch(Some(&first), None))
+        .await
+        .unwrap();
+    guarded_job(&pane, None, switch(Some(&first), Some(&restore)))
+        .await
+        .unwrap();
+    drop(pane);
+    let pane = login(&options, &first, "held").await;
+    let disable = guarded_job(&pane, None, switch(None, None)).await.unwrap();
+    guarded_job(&pane, None, switch(None, Some(&disable)))
+        .await
+        .unwrap();
+    drop(pane);
+    fs::remove_file(&path).unwrap();
+    let pane = login(&options, "disabled", "held").await;
+
+    write("second");
+    let preview = guarded_job(
+        &pane,
+        None,
+        Operation::PreviewDotfiles {
+            bundle: manifest("second"),
+            shell: DotfileShell::Bash,
+            zdotdir: None,
+        },
+    )
+    .await
+    .unwrap();
+    guarded_job(&pane, None, apply("second", &preview))
+        .await
+        .unwrap();
+    drop(pane);
+    drop(login(&options, &second, "current").await);
+    let active = root.join(".config/w11term/dotfiles");
+    let prompt = active.join(format!("bash-{second}/prompt.sh"));
+    fs::write(&prompt, "PS1='remote edit> '\n").unwrap();
+    write("first");
+    drop(login(&options, &second, "skipped").await);
+    assert_eq!(
+        fs::read_to_string(active.join("bash-current")).unwrap(),
+        format!("{second}\n")
+    );
+    assert_eq!(fs::read_to_string(prompt).unwrap(), "PS1='remote edit> '\n");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_sync_with_a_mismatched_approval_still_opens_a_shell() {
+    let (source, remote, opens, server) = fixture_connections(false, 2).await;
+    fs::write(remote.path().join("dotfiles-shell-probe"), []).unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let mut options = connect_options(source, local.path());
+    fs::write(
+        &options.dotfiles.as_ref().unwrap().bundle,
+        serde_json::to_vec(&manifest("first")).unwrap(),
+    )
+    .unwrap();
+    let reviewed = options.dotfiles.clone();
+    options.dotfiles.as_mut().unwrap().user = "another-account".into();
+    drop(login(&options, "absent", "skipped").await);
+    assert_eq!(opens.load(Ordering::Relaxed), 1, "only the shell channel");
+    assert!(!remote.path().join(".config").exists());
+    options.dotfiles = reviewed;
+    options.dotfiles.as_mut().unwrap().home = "/another-home".into();
+    drop(login(&options, "absent", "skipped").await);
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        3,
+        "second login checks the SFTP home"
+    );
+    assert!(!remote.path().join(".config").exists());
+    server.abort();
 }

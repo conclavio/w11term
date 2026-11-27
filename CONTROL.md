@@ -1305,6 +1305,26 @@ Use the same two commands with `disabled` to stop loading managed dotfiles in ne
 
 Direct pipe clients use `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. Include the returned `"review"` to publish the switch.
 
+### Sync dotfiles on SSH connect
+
+To opt an SSH profile into sync, add a `dotfiles` object to that profile in `profiles.json`. Use the destination's verified host-key fingerprint and SFTP home. A relative bundle path resolves beside the profile catalog. For Zsh with an alternate directory under the approved home, add `"zdotdir":"relative/directory"`.
+
+```json
+{
+  "bundle": "Fleet dotfiles.json",
+  "shell": "bash",
+  "host": "dev.example.net",
+  "user": "operator",
+  "port": 22,
+  "fingerprint": "SHA256:REPLACE_WITH_VERIFIED_HOST_FINGERPRINT",
+  "home": "/home/operator"
+}
+```
+
+On an ordinary SSH shell launch or reconnect, w11term checks that the verified host, account, port, fingerprint, and SFTP home match this approval. It then reads the local bundle and stages updates before requesting the shell. Sync verifies the currently active files and hooks before replacing their selection. The operation has a ten-second deadline, and a skipped or timed-out sync leaves opening the SSH shell available. The pane status and its `dotfiles-sync` event explain the result. Sync applies to ordinary SSH shells. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
+
+A reviewed manual switch holds the chosen bundle on later logins, including when you choose `disabled`. Use a fresh manual preview and `apply-dotfiles` with the bundle you want to return to automatic sync.
+
 ### Run SFTP operations
 
 ```powershell

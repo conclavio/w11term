@@ -1598,6 +1598,63 @@ async fn run_channel(
             .channel
             .close_game_session_on_drop(shell.link.as_ref().clone());
     }
+    let mut dotfiles_notice = None;
+    if !managed
+        && sharing.startup.is_none()
+        && !options.player.rustmush
+        && let Some(settings) = options.dotfiles.clone()
+    {
+        output
+            .send(Event::Status("Checking SSH dotfiles".into()))
+            .await?;
+        let sync = tokio::time::timeout(Duration::from_secs(10), async {
+            anyhow::ensure!(
+                settings.approves(shell.link.verified_endpoint()),
+                "The profile's dotfiles approval does not match the verified SSH account"
+            );
+            let _guard = shell.link.lock_dotfiles_sync().await;
+            crate::sftp::sync_login_dotfiles(&shell.link.handle(), &settings).await
+        });
+        tokio::pin!(sync);
+        let result = loop {
+            tokio::select! {
+                biased;
+                message = input.recv() => match message {
+                    Some(message) => offline(message, size, options),
+                    None => return Ok(()),
+                },
+                result = &mut sync => break result,
+            }
+        };
+        match result {
+            Ok(Ok(status)) => {
+                events.push(
+                    "dotfiles-sync",
+                    serde_json::json!({"generation": generation, "status": status}),
+                );
+                if status == "held" {
+                    dotfiles_notice = Some("Dotfiles sync paused by manual selection".into());
+                }
+            }
+            Ok(Err(error)) => {
+                let detail: String = format!("{error:#}")
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(480)
+                    .collect();
+                events.push("dotfiles-sync", serde_json::json!({"generation": generation, "status": "skipped", "detail": detail}));
+                dotfiles_notice = Some(format!("Dotfiles sync skipped: {detail}"));
+            }
+            Err(_) => {
+                let detail = "Dotfiles sync reached its 10-second deadline. Preview to check the active bundle.";
+                events.push(
+                    "dotfiles-sync",
+                    serde_json::json!({"generation": generation, "status": "unconfirmed", "detail": detail}),
+                );
+                dotfiles_notice = Some(detail.into());
+            }
+        }
+    }
     let channel = shell.channel.channel();
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
@@ -1801,7 +1858,12 @@ async fn run_channel(
                         program.ready();
                         events.push("connected", serde_json::json!({"generation":generation}));
                         output.send(Event::Connected(generation)).await?;
-                        output.send(Event::Status(format!("{}@{}:{}", options.user, options.host, options.port))).await?;
+                        let mut status = format!("{}@{}:{}", options.user, options.host, options.port);
+                        if let Some(notice) = dotfiles_notice.take() {
+                            status.push_str(" · ");
+                            status.push_str(&notice);
+                        }
+                        output.send(Event::Status(status)).await?;
                     }
                 },
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),

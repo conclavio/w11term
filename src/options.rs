@@ -467,6 +467,8 @@ pub struct SshOptions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_forwards: Vec<LocalForwardPreset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dotfiles: Option<Box<DotfileSync>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_prompt: Option<GroupPromptPattern>,
     #[serde(default)]
     pub durable: bool,
@@ -475,6 +477,31 @@ pub struct SshOptions {
 }
 
 pub const MAX_JUMPS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DotfileSync {
+    pub bundle: PathBuf,
+    pub shell: crate::sftp::DotfileShell,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zdotdir: Option<String>,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub fingerprint: String,
+    pub home: String,
+}
+
+impl DotfileSync {
+    pub(crate) fn approves(&self, endpoint: (&str, &str, u16, &str)) -> bool {
+        (
+            self.host.as_str(),
+            self.user.as_str(),
+            self.port,
+            self.fingerprint.as_str(),
+        ) == endpoint
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct JumpHost {
@@ -518,6 +545,7 @@ impl From<JumpHost> for SshOptions {
             host_key_alias: hop.host_key_alias,
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
+            dotfiles: None,
             group_prompt: None,
             durable: false,
             player: PlayerOptions::default(),
@@ -586,6 +614,12 @@ impl SshOptions {
         );
         self.validate_route()?;
         let base = catalog.parent().unwrap_or(Path::new("."));
+        if let Some(sync) = &mut self.dotfiles
+            && sync.bundle.is_relative()
+            && !sync.bundle.as_os_str().is_empty()
+        {
+            sync.bundle = base.join(&sync.bundle);
+        }
         if let Some(key) = self.player.device_key.as_deref_mut()
             && key.is_relative()
         {
@@ -2087,6 +2121,7 @@ mod tests {
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             durable: false,
+            dotfiles: None,
             group_prompt: None,
         };
         assert!(options.validate_route().is_err());
