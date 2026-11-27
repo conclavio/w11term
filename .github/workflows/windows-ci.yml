@@ -179,6 +179,15 @@ jobs:
         run: python3 tests/linux-triage.py
       - name: Verify CPU profile identity, byte limits, deadline and cleanup
         run: python3 tests/linux-cpu-profile.py
+      - name: Resolve a live CPU hotspot with perf
+        shell: bash
+        run: |
+          previous=$(sysctl -n kernel.perf_event_paranoid)
+          if (( previous > 2 )); then
+            trap 'sudo sysctl -q -w "kernel.perf_event_paranoid=$previous"' EXIT
+            sudo sysctl -q -w kernel.perf_event_paranoid=2
+          fi
+          python3 tests/linux-cpu-profile.py --live
 
   remote-mux:
     name: Stock Linux multiplexers over SSH

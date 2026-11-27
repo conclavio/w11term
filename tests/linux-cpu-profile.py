@@ -4,8 +4,8 @@ import base64
 import os
 import re
 import shlex
-import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -119,12 +119,6 @@ def fixture_tests():
 
 
 def live_perf_smoke():
-    if not shutil.which("perf") or subprocess.run(
-        ["perf", "--version"], capture_output=True, timeout=4
-    ).returncode:
-        print("Live perf smoke skipped: perf for the runner kernel is unavailable.")
-        return
-
     with tempfile.TemporaryDirectory(prefix="w11term-perf-live.") as root:
         executable = Path(root) / "hotspot"
         subprocess.run(
@@ -148,11 +142,6 @@ int main(void) { hot_loop(); return 0; }
                     capture_output=True,
                     timeout=14,
                 )
-                if profile.returncode and any(reason in profile.stderr.lower() for reason in (
-                    b"permission", b"operation not permitted", b"perf_event_paranoid",
-                )):
-                    print("Live perf smoke skipped: the runner denied perf_event_open.")
-                    return
                 assert profile.returncode == 0, profile.stderr
                 assert re.search(rb"(?m)^\s*" + pid.encode() + rb" +\d+\.\d+: +cpu-clock(?::u)?:",
                                  profile.stdout), profile.stdout[:2000]
@@ -164,5 +153,8 @@ int main(void) { hot_loop(); return 0; }
 
 
 if __name__ == "__main__":
-    fixture_tests()
-    live_perf_smoke()
+    if sys.argv[1:] == ["--live"]:
+        live_perf_smoke()
+    else:
+        assert len(sys.argv) == 1, "Usage: linux-cpu-profile.py [--live]"
+        fixture_tests()
