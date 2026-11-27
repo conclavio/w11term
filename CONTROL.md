@@ -1589,6 +1589,14 @@ Choose **Compare profiles** to use the open recording as **Before** and pick a s
 
 Choose **Export comparison…** to save a new JSON file. Schema version 1 records both source file names and sample totals, the applied filter, and every matching change in the same order as the viewer across all pages. Each row includes its full stack as an array of original symbols, both sample counts and shares, and the signed change in percentage points.
 
+Scripts can use `compare-cpu-profiles` with the same Before/After order, file size limit, and case-insensitive literal filter. The command requires no running w11term instance or SSH connection. It writes the same JSON report to stdout by default. With `--output-file`, it saves the report to a new file and prints a CLI reply whose `result.path` is the absolute destination. Errors return a nonzero exit code and a JSON error reply on stderr.
+
+```powershell
+$report = & $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --filter 'worker' | ConvertFrom-Json
+$report.changes
+& $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --output-file '.\comparison.json'
+```
+
 ### Run SFTP operations
 
 ```powershell

@@ -1,6 +1,15 @@
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::BTreeMap, path};
-use w11term::control::{CpuCallGraph, CpuProfileOptions, Request};
+use std::{
+    collections::BTreeMap,
+    io::Write,
+    path::{self, PathBuf},
+    sync::Arc,
+};
+use w11term::{
+    control::{CpuCallGraph, CpuProfileOptions, Reply, Request},
+    cpu_profile::{Comparison, Profile},
+    transcript,
+};
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] preview-cpu-profile --pane ID --target-pid PID ",
@@ -9,6 +18,52 @@ pub(super) const HELP: &str = concat!(
     "[--seconds N] [--frequency HZ] [--call-graph fp|dwarf] ",
     "--connection-generation N --process-start-ticks N --output-file PATH [--perf-data PATH]",
 );
+
+pub(super) const COMPARE_VERB: &str = "compare-cpu-profiles";
+pub(super) const COMPARE_HELP: &str =
+    "w11term-cli compare-cpu-profiles BEFORE AFTER [--filter TEXT] [--output-file PATH]";
+
+pub(super) fn compare_files(args: &[String], mut stdout: impl Write) -> Result<()> {
+    let mut args = args.iter();
+    let before = args.next().context("provide the BEFORE folded profile")?;
+    let after = args.next().context("provide the AFTER folded profile")?;
+    let mut filter = None;
+    let mut output_file = None;
+    while let Some(flag) = args.next() {
+        let target = match flag.as_str() {
+            "--filter" => &mut filter,
+            "--output-file" => &mut output_file,
+            _ => bail!("unknown option {flag} for {COMPARE_VERB}"),
+        };
+        ensure!(target.is_none(), "specify {flag} only once");
+        *target = Some(
+            args.next()
+                .with_context(|| format!("{flag} requires a value"))?,
+        );
+    }
+    let paths = [PathBuf::from(before), PathBuf::from(after)];
+    let open = |side: usize, name: &str| {
+        Profile::open(&paths[side])
+            .with_context(|| format!("Reading the {name} CPU profile {}", paths[side].display()))
+            .map(Arc::new)
+    };
+    let profiles = [open(0, "before")?, open(1, "after")?];
+    let comparison = Arc::new(Comparison::new(profiles, paths));
+    let report = comparison.filter(filter.map_or("", String::as_str));
+    if let Some(output_file) = output_file {
+        let output_file = path::absolute(output_file)?;
+        transcript::save_with(&output_file, false, |file| report.write_json(file))?;
+        let reply = Reply::from_result(Ok(serde_json::json!({"path": output_file})));
+        serde_json::to_writer(&mut stdout, &reply)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    } else {
+        report
+            .write_json(stdout)
+            .context("Writing the CPU profile comparison")?;
+    }
+    Ok(())
+}
 
 pub(super) fn parse(
     verb: &str,

@@ -1,14 +1,13 @@
 use super::*;
 use plot::{Plot, Range};
-use profile::{Profile, Search};
 use std::path::PathBuf;
+use w11term::cpu_profile::{FilteredComparison, Profile, Search, sample_share};
 use w11term::diagnostic_history::Kind as ArtifactKind;
 use w11term::ssh::{CaptureStop, CpuProfileSummary};
 
 mod capture;
 mod compare;
 mod plot;
-mod profile;
 pub(super) use capture::Connection;
 
 pub(super) const LABEL: &str = "CPU flame graph";
@@ -37,7 +36,7 @@ pub enum Outcome {
         view: Box<compare::ViewState>,
         install_baseline: bool,
     },
-    ComparisonFiltered(String, Vec<usize>),
+    ComparisonFiltered(FilteredComparison),
     Reviewed(Box<capture::Review>),
     Destination(Box<capture::Recording>),
     Captured(Arc<Profile>, PathBuf, CpuProfileSummary),
@@ -258,7 +257,7 @@ impl Panel {
                 "matches",
                 format!(
                     "{hits} matching {unit} · {:.1}% of samples{cursor}",
-                    plot::share(self.search.samples, total),
+                    sample_share(self.search.samples, total),
                 ),
             ));
         }
@@ -348,7 +347,7 @@ impl Panel {
                 "{} · {} · {:.1}% of capture",
                 focus.name,
                 sample_count(focus.samples),
-                plot::share(focus.samples, total)
+                sample_share(focus.samples, total)
             ),
         ));
         if focus.parent != 0 {
@@ -597,19 +596,19 @@ impl TerminalApp {
                     compare::Action::Page(forward) => view.page(forward),
                     compare::Action::Select(comparison, id) => view.select(&comparison, id),
                     compare::Action::Export => {
-                        let snapshot = compare::Snapshot::capture(view);
+                        let snapshot = view.results.clone();
                         self.begin_text_export(
                             text_export::Subject::CpuComparison,
-                            move |output| snapshot.write(output),
+                            move |output| snapshot.write_json(output),
                             ctx,
                         );
                     }
                     compare::Action::Filter => {
-                        let query = view.query.trim().to_owned();
-                        if query == view.applied {
+                        if view.results.matches_query(&view.query) {
                             return;
                         }
-                        let comparison = view.comparison.clone();
+                        let query = view.query.clone();
+                        let comparison = view.results.comparison().clone();
                         let ticket = panel.begin("Filtering changed call stacks…");
                         let rejected = message(Action::Finished(
                             ticket.clone(),
@@ -618,8 +617,7 @@ impl TerminalApp {
                         ctx.spawn_background_with_rejection(
                             move |scope| {
                                 let outcome = (!scope.is_cancelled()).then(|| {
-                                    let rows = comparison.filter(&query);
-                                    Outcome::ComparisonFiltered(query, rows)
+                                    Outcome::ComparisonFiltered(comparison.filter(&query))
                                 });
                                 message(Action::Finished(ticket, Ok(outcome)))
                             },
@@ -669,9 +667,9 @@ impl TerminalApp {
                         panel.comparison = Some(*view);
                         self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);
                     }
-                    Ok(Some(Outcome::ComparisonFiltered(query, rows))) => {
+                    Ok(Some(Outcome::ComparisonFiltered(results))) => {
                         if let Some(comparison) = &mut panel.comparison {
-                            comparison.filtered(query, rows);
+                            comparison.filtered(results);
                         }
                     }
                     Ok(Some(Outcome::Reviewed(review))) => {

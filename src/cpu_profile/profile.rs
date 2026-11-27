@@ -18,10 +18,10 @@ struct Node<'a> {
     children: BTreeMap<&'a str, usize>,
 }
 
-pub(super) struct Frame {
+pub struct Frame {
     pub name: String,
     pub samples: u64,
-    pub own_samples: u64,
+    pub(super) own_samples: u64,
     pub parent: usize,
     pub depth: usize,
     pub start: u64,
@@ -59,7 +59,7 @@ impl Profile {
         Self::parse(input.trim_start_matches('\u{feff}'))
     }
 
-    pub(super) fn parse(input: &str) -> Result<Self> {
+    pub fn parse(input: &str) -> Result<Self> {
         let mut nodes = vec![Node {
             name: "All samples",
             ..Node::default()
@@ -160,7 +160,7 @@ impl Profile {
         Ok(())
     }
 
-    pub(super) fn frame(&self, id: usize) -> &Frame {
+    pub fn frame(&self, id: usize) -> &Frame {
         &self.frames[id]
     }
 
@@ -192,7 +192,7 @@ impl Profile {
         matched
     }
 
-    pub(super) fn search(&self, query: &str) -> Search {
+    pub fn search(&self, query: &str) -> Search {
         let Some(needle) = symbol_pattern(query) else {
             return Search::default();
         };
@@ -236,7 +236,7 @@ pub(super) fn symbol_pattern(query: &str) -> Option<regex::Regex> {
 }
 
 #[derive(Default)]
-pub(super) struct Search {
+pub struct Search {
     pub matches: Vec<usize>,
     pub samples: u64,
     highlighted: Vec<bool>,

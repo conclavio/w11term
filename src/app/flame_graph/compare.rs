@@ -1,8 +1,5 @@
-use super::{profile::symbol_pattern, *};
-use std::cmp::{Ordering, Reverse};
-
-mod export;
-pub(super) use export::Snapshot;
+use super::*;
+use w11term::cpu_profile::{Comparison, FilteredComparison};
 
 const PAGE_SIZE: usize = 16;
 
@@ -15,157 +12,9 @@ pub enum Action {
     Select(Arc<Comparison>, usize),
 }
 
-pub struct Comparison {
-    profiles: [Arc<Profile>; 2],
-    paths: [PathBuf; 2],
-    totals: [u64; 2],
-    changes: Vec<Change>,
-}
-
-struct Change {
-    frames: [Option<usize>; 2],
-    counts: [u64; 2],
-    magnitude: u128,
-    increased: bool,
-}
-
-impl Comparison {
-    fn new(profiles: [Arc<Profile>; 2], paths: [PathBuf; 2]) -> Self {
-        let [before, after] = &profiles;
-        let totals = [before.frame(0).samples, after.frame(0).samples];
-        let mut changes = Vec::new();
-        let mut pending = vec![[Some(0), Some(0)]];
-        while let Some(frames) = pending.pop() {
-            let counts = std::array::from_fn(|side| {
-                frames[side].map_or(0, |id| profiles[side].frame(id).own_samples)
-            });
-            // Cross multiply to test equality and rank changes without rounding,
-            // even for recordings whose totals approach u64::MAX.
-            let left = u128::from(counts[0]) * u128::from(totals[1]);
-            let right = u128::from(counts[1]) * u128::from(totals[0]);
-            if left != right {
-                changes.push(Change {
-                    frames,
-                    counts,
-                    magnitude: left.abs_diff(right),
-                    increased: right > left,
-                });
-            }
-
-            let [mut left, mut right] = std::array::from_fn(|side| {
-                frames[side]
-                    .map_or(&[][..], |id| profiles[side].row(id, 1))
-                    .iter()
-                    .copied()
-                    .peekable()
-            });
-            loop {
-                // Siblings are in original symbol order. Only pair equal
-                // symbols under the same chain of callers.
-                let pair = match (left.peek(), right.peek()) {
-                    (Some(&a), Some(&b)) => match before.symbol(a).cmp(after.symbol(b)) {
-                        Ordering::Less => [left.next(), None],
-                        Ordering::Equal => [left.next(), right.next()],
-                        Ordering::Greater => [None, right.next()],
-                    },
-                    (Some(_), None) => [left.next(), None],
-                    (None, Some(_)) => [None, right.next()],
-                    (None, None) => break,
-                };
-                pending.push(pair);
-            }
-        }
-        changes.sort_unstable_by_key(|change| (Reverse(change.magnitude), change.frames));
-        Self {
-            profiles,
-            paths,
-            totals,
-            changes,
-        }
-    }
-
-    pub fn filter(&self, query: &str) -> Vec<usize> {
-        let Some(needle) = symbol_pattern(query) else {
-            return (0..self.changes.len()).collect();
-        };
-        let paths = self
-            .profiles
-            .each_ref()
-            .map(|profile| profile.matching_paths(&needle));
-        self.changes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, change)| {
-                change
-                    .frames
-                    .iter()
-                    .enumerate()
-                    .any(|(side, id)| id.is_some_and(|id| paths[side][id]))
-                    .then_some(index)
-            })
-            .collect()
-    }
-
-    fn delta_points(&self, change: &Change) -> f64 {
-        let denominator = u128::from(self.totals[0]) * u128::from(self.totals[1]);
-        let pp = 100.0 * (change.magnitude as f64 / denominator as f64);
-        if change.increased { pp } else { -pp }
-    }
-
-    fn delta(&self, change: &Change) -> String {
-        let pp = self.delta_points(change);
-        let sign = if change.increased { '+' } else { '-' };
-        if pp.abs() < 0.005 {
-            format!("{sign}<0.01 pp")
-        } else {
-            format!("{pp:+.2} pp")
-        }
-    }
-}
-
-impl Change {
-    fn stack_end<'a>(&self, comparison: &'a Comparison) -> (&'a Profile, usize) {
-        if let Some(before) = self.frames[0] {
-            (&comparison.profiles[0], before)
-        } else {
-            (
-                &comparison.profiles[1],
-                self.frames[1].expect("changed stack"),
-            )
-        }
-    }
-
-    fn stack_frames<'a>(&self, comparison: &'a Comparison) -> (&'a Profile, Vec<usize>) {
-        let (profile, mut id) = self.stack_end(comparison);
-        let mut ids = Vec::with_capacity(profile.frame(id).depth);
-        while id != 0 {
-            ids.push(id);
-            id = profile.frame(id).parent;
-        }
-        ids.reverse();
-        (profile, ids)
-    }
-
-    fn stack(&self, comparison: &Comparison) -> String {
-        let (profile, ids) = self.stack_frames(comparison);
-        let mut path = ids
-            .into_iter()
-            .map(|id| profile.frame(id).name.as_str())
-            .collect::<Vec<_>>()
-            .join(" → ");
-        if let Some((end, _)) = path.char_indices().nth(32768) {
-            path.truncate(end);
-            path.push('…');
-        }
-        path
-    }
-}
-
 pub struct ViewState {
-    pub comparison: Arc<Comparison>,
     pub query: String,
-    pub applied: String,
-    visible: Arc<[usize]>,
+    pub results: FilteredComparison,
     page: usize,
     selected: Option<usize>,
 }
@@ -173,42 +22,41 @@ pub struct ViewState {
 impl ViewState {
     pub fn new(before: Arc<Profile>, after: Arc<Profile>, paths: [PathBuf; 2]) -> Self {
         let comparison = Arc::new(Comparison::new([before, after], paths));
-        let visible = comparison.filter("");
+        let results = comparison.filter("");
         Self {
-            comparison,
             query: String::new(),
-            applied: String::new(),
-            selected: visible.first().copied(),
-            visible: visible.into(),
+            selected: results.indices().first().copied(),
+            results,
             page: 0,
         }
     }
 
-    pub fn filtered(&mut self, query: String, rows: Vec<usize>) {
-        self.applied = query;
-        self.visible = rows.into();
+    pub fn filtered(&mut self, results: FilteredComparison) {
+        self.results = results;
         self.page = 0;
-        self.selected = self.visible.first().copied();
+        self.selected = self.results.indices().first().copied();
     }
 
     pub(super) fn after_path(&self) -> &std::path::Path {
-        &self.comparison.paths[1]
+        &self.results.comparison().paths()[1]
     }
 
     pub(super) fn before_source(&self) -> (Arc<Profile>, PathBuf) {
+        let comparison = self.results.comparison();
         (
-            self.comparison.profiles[0].clone(),
-            self.comparison.paths[0].clone(),
+            comparison.profiles()[0].clone(),
+            comparison.paths()[0].clone(),
         )
     }
 
     fn page_rows(&self) -> &[usize] {
         let first = self.page * PAGE_SIZE;
-        &self.visible[first..(first + PAGE_SIZE).min(self.visible.len())]
+        let indices = self.results.indices();
+        &indices[first..(first + PAGE_SIZE).min(indices.len())]
     }
 
     fn page_count(&self) -> usize {
-        self.visible.len().div_ceil(PAGE_SIZE).max(1)
+        self.results.indices().len().div_ceil(PAGE_SIZE).max(1)
     }
 
     pub fn page(&mut self, forward: bool) {
@@ -224,7 +72,7 @@ impl ViewState {
     }
 
     pub fn select(&mut self, comparison: &Arc<Comparison>, id: usize) {
-        if Arc::ptr_eq(&self.comparison, comparison) && self.page_rows().contains(&id) {
+        if Arc::ptr_eq(self.results.comparison(), comparison) && self.page_rows().contains(&id) {
             self.selected = Some(id);
         }
     }
@@ -238,7 +86,7 @@ impl ViewState {
         let send = |action: fn() -> Action| {
             ctx.callback(move |_| message(super::Action::Compare(action())))
         };
-        let comparison = &self.comparison;
+        let comparison = self.results.comparison();
         let mut fields = vec![
             KeyedView::new(
                 "compare-back",
@@ -257,7 +105,7 @@ impl ViewState {
                     .content("Export comparison…"),
             ),
         ];
-        if comparison.changes.is_empty() {
+        if comparison.changes().is_empty() {
             fields.push(text(
                 "compare-empty",
                 "No changes in call stack sample shares.",
@@ -280,12 +128,12 @@ impl ViewState {
                         })),
                     Button::new()
                         .grid_column(1)
-                        .is_enabled(idle && self.query.trim() != self.applied)
+                        .is_enabled(idle && !self.results.matches_query(&self.query))
                         .on_click(send(|| Action::Filter))
                         .content("Apply filter"),
                 )),
         ));
-        if self.visible.is_empty() {
+        if self.results.indices().is_empty() {
             fields.push(text(
                 "compare-no-match",
                 "No changed call stacks match the filter.",
@@ -296,8 +144,8 @@ impl ViewState {
             "compare-count",
             format!(
                 "{} of {} changed stacks · Page {} of {}",
-                self.visible.len(),
-                comparison.changes.len(),
+                self.results.indices().len(),
+                comparison.changes().len(),
                 self.page + 1,
                 self.page_count(),
             ),
@@ -342,7 +190,7 @@ impl ViewState {
                 .collection_slot(
                     ListViewSlot::Items,
                     self.page_rows().iter().map(|&id| {
-                        let change = &comparison.changes[id];
+                        let change = &comparison.changes()[id];
                         let (profile, frame_id) = change.stack_end(comparison);
                         let frame = profile.frame(frame_id);
                         let symbol: String = frame.name.chars().take(128).collect();
@@ -371,12 +219,13 @@ impl ViewState {
                 ),
         ));
         if let Some(id) = self.selected {
-            let change = &comparison.changes[id];
+            let change = &comparison.changes()[id];
             let count = |side| {
+                let samples = change.counts()[side];
                 format!(
                     "{} ({:.2}%)",
-                    sample_count(change.counts[side]),
-                    plot::share(change.counts[side], comparison.totals[side]),
+                    sample_count(samples),
+                    sample_share(samples, comparison.totals()[side]),
                 )
             };
             fields.push(text(
@@ -401,7 +250,7 @@ impl ViewState {
 }
 
 fn source(comparison: &Comparison, side: usize) -> String {
-    let path = &comparison.paths[side];
+    let path = &comparison.paths()[side];
     let filename = path
         .file_name()
         .unwrap_or(path.as_os_str())
@@ -409,13 +258,14 @@ fn source(comparison: &Comparison, side: usize) -> String {
     let side_label = ["Before", "After"][side];
     format!(
         "{side_label} · {filename} · {}",
-        sample_count(comparison.totals[side])
+        sample_count(comparison.totals()[side])
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     fn compare(before: &str, after: &str) -> ViewState {
         let parse = |input| Arc::new(Profile::parse(input).unwrap());
@@ -424,68 +274,6 @@ mod tests {
             parse(after),
             [PathBuf::new(), PathBuf::new()],
         )
-    }
-
-    #[test]
-    fn doubling_every_count_preserves_sample_shares() {
-        let state = compare("main 4\nmain;hot 6", "main 8\nmain;hot 12");
-        assert!(state.comparison.changes.is_empty());
-    }
-
-    #[test]
-    fn ranks_exact_stacks_by_normalized_self_samples_and_searches_callers() {
-        let state = compare(
-            "main 2\nmain;worker 5\nother;worker 3",
-            "main 2\nmain;worker 6\nmain;new 12",
-        );
-        let comparison = state.comparison;
-        let rows: Vec<_> = comparison
-            .changes
-            .iter()
-            .map(|change| {
-                (
-                    change.stack(&comparison),
-                    change.counts,
-                    comparison.delta(change),
-                )
-            })
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("main → new".into(), [0, 12], "+60.00 pp".into()),
-                ("other → worker".into(), [3, 0], "-30.00 pp".into()),
-                ("main → worker".into(), [5, 6], "-20.00 pp".into()),
-                ("main".into(), [2, 2], "-10.00 pp".into()),
-            ]
-        );
-        assert_eq!(comparison.filter("mAin"), [0, 2, 3]);
-        assert_eq!(comparison.filter("WORKER"), [1, 2]);
-        assert!(comparison.filter("main|worker").is_empty());
-    }
-
-    #[test]
-    fn distinguishes_raw_symbols_that_display_the_same_way() {
-        let state = compare("root;foo\u{202e}bar 1", "root;foo\\u{202e}bar 1");
-        assert_eq!(state.comparison.changes.len(), 2);
-        assert_eq!(state.comparison.changes[0].counts, [0, 1]);
-        assert_eq!(state.comparison.changes[1].counts, [1, 0]);
-        assert_eq!(state.comparison.filter("foo\\u{202e}bar"), [0, 1]);
-    }
-
-    #[test]
-    fn full_range_sample_counts_do_not_overflow() {
-        let before = format!("left {}", u64::MAX);
-        let after = format!("right {}", u64::MAX);
-        let state = compare(&before, &after);
-        assert_eq!(
-            state.comparison.delta(&state.comparison.changes[0]),
-            "+100.00 pp"
-        );
-        assert_eq!(
-            state.comparison.delta(&state.comparison.changes[1]),
-            "-100.00 pp"
-        );
     }
 
     #[test]
@@ -498,11 +286,61 @@ mod tests {
         assert_eq!(state.selected, Some(0));
         state.page(true);
         assert_eq!(state.selected, Some(PAGE_SIZE));
-        state.select(&state.comparison.clone(), 0);
+        state.select(&state.results.comparison().clone(), 0);
         assert_eq!(state.selected, Some(PAGE_SIZE));
-        let matched = state.comparison.filter("replacement");
-        state.filtered("replacement".into(), matched);
+        state.filtered(state.results.comparison().filter("replacement"));
         assert_eq!(state.page_count(), 1);
         assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn snapshot_exports_every_applied_match_and_keeps_original_symbols() {
+        let stack_count = PAGE_SIZE + 2;
+        let mut before: String = (0..stack_count)
+            .map(|id| format!("parent;leaf-{id}\u{202e}symbol 1\n"))
+            .collect();
+        before.push_str("outside-filter 2\n");
+        let mut state = ViewState::new(
+            Arc::new(Profile::parse(&before).unwrap()),
+            Arc::new(Profile::parse("new-stack 7").unwrap()),
+            ["folder/before.folded".into(), "folder/after.folded".into()],
+        );
+        state.filtered(state.results.comparison().filter("PARENT"));
+        state.page(true);
+        state.query = "typed but never applied".into();
+        let snapshot = state.results.clone();
+        state.filtered(state.results.comparison().filter(""));
+
+        let mut bytes = Vec::new();
+        snapshot.write_json(&mut bytes).unwrap();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["filter"], "PARENT");
+        assert_eq!(
+            report["before"],
+            json!({
+                "file_name": "before.folded",
+                "total_samples": stack_count + 2,
+            })
+        );
+        assert_eq!(
+            report["after"],
+            json!({
+                "file_name": "after.folded",
+                "total_samples": 7,
+            })
+        );
+        assert_eq!(report["total_changed_stacks"], stack_count + 2);
+        let rows = report["changes"].as_array().unwrap();
+        assert_eq!(rows.len(), stack_count);
+        assert_eq!(rows[0]["stack"], json!(["parent", "leaf-0\u{202e}symbol"]));
+        for row in rows {
+            assert_eq!(row["before_samples"], 1);
+            assert_eq!(row["after_samples"], 0);
+            assert_eq!(row["after_percent"].as_f64().unwrap(), 0.0);
+            let before_percent = row["before_percent"].as_f64().unwrap();
+            let delta = row["delta_percentage_points"].as_f64().unwrap();
+            assert!((before_percent + delta).abs() < 1.0e-12);
+        }
     }
 }

@@ -20,7 +20,7 @@ mod syscall_capture;
 #[path = "w11term-cli/tool_bundles.rs"]
 mod tool_bundles;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] rename-workspace --name OLD --to NEW\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] rename-workspace --name OLD --to NEW\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nControl commands without --pid require exactly one live instance. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -295,7 +295,7 @@ async fn main() -> ExitCode {
         println!(
             "\nw11term-cli [--pid PID] preview-linux-triage --pane ID\nw11term-cli [--pid PID] linux-triage --pane ID --connection-generation N --output-file PATH"
         );
-        println!("\n{}", cpu_profile::HELP);
+        println!("\n{}\n{}", cpu_profile::HELP, cpu_profile::COMPARE_HELP);
         println!("\n{}", packet_capture::HELP);
         println!("\n{}", syscall_capture::HELP);
         return ExitCode::SUCCESS;
@@ -303,6 +303,23 @@ async fn main() -> ExitCode {
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {
         println!("{}", tool_bundles::HELP);
         return ExitCode::SUCCESS;
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == cpu_profile::COMPARE_VERB)
+    {
+        if args[1..] == ["--help"] || args[1..] == ["-h"] {
+            println!("{}", cpu_profile::COMPARE_HELP);
+            return ExitCode::SUCCESS;
+        }
+        return match cpu_profile::compare_files(&args[1..], std::io::stdout().lock()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let reply = Reply::from_result(Err(error));
+                eprintln!("{}", serde_json::to_string(&reply).unwrap());
+                ExitCode::FAILURE
+            }
+        };
     }
     let mut success_check = None;
     let result = if args

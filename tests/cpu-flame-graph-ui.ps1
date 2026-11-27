@@ -124,6 +124,12 @@ try {
         $row.before_percent -ne 75 -or $row.after_percent -ne 25 -or $row.delta_percentage_points -ne -50) {
         throw "The export does not describe the applied CPU comparison. $([IO.File]::ReadAllText($comparisonPath))"
     }
+    $cliPath = Join-Path $State 'offline CPU comparison.json'
+    $null = & $Cli compare-cpu-profiles $folded $after --filter MAIN --output-file $cliPath
+    if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliPath)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($comparisonPath))) {
+        throw 'CLI comparison differs from the GUI export with the same profiles and filter'
+    }
     Click-GraphButton 'Back to flame graph'
     $null = Wait-Until 'return to the original zoom and symbol search' {
         (Find-Element 'Zoomed to main') -and

@@ -1,4 +1,3 @@
-use super::profile::{Frame, Profile, Search};
 use crate::native_drawing::NativeDrawing;
 use anyhow::{Context, Result};
 use std::{
@@ -8,6 +7,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+use w11term::cpu_profile::{Frame, Profile, Search, sample_share as share};
 use windows_canvas::{
     Canvas, ColorF, DrawingSession, Invalidator, ParagraphAlignment, Rect, TextFormat, WordWrapping,
 };
@@ -199,10 +199,6 @@ fn draw(
         }
     }
     Ok(())
-}
-
-pub(super) fn share(samples: u64, total: u64) -> f64 {
-    100.0 * samples as f64 / total as f64
 }
 
 pub(super) fn export(profile: &Profile, zoom: usize, path: &Path) -> Result<()> {

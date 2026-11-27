@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod conpty;
 pub mod control;
 pub mod copy_mode;
+pub mod cpu_profile;
 pub mod demo;
 pub mod diagnostic_history;
 pub mod durable;
