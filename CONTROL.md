@@ -1445,6 +1445,10 @@ $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-to
 
 ### Capture Linux packets and open Wireshark
 
+In the Windows app, select a connected Linux SSH pane and open **More → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. It reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
+
+Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
+
 Use a connected Linux SSH pane and review the interface, literal tcpdump filter, limits, and scratch location. Pass the same capture options and the returned connection generation and review ID to record. The host needs tcpdump, Bash, GNU coreutils, flock, the SSH SFTP subsystem, and permission to capture on the selected interface. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)
 
 ```powershell

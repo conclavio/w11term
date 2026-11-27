@@ -30,6 +30,14 @@ pub struct PacketCaptureOptions {
 }
 
 impl PacketCaptureOptions {
+    pub const DEFAULT_SECONDS: u8 = 15;
+    pub const DEFAULT_SNAP_LENGTH: u32 = 192;
+    pub const DEFAULT_MAX_MIB: u8 = 16;
+
+    pub fn default_scratch_directory(tmpfs: bool) -> &'static str {
+        if tmpfs { "/dev/shm" } else { "/tmp" }
+    }
+
     pub fn validate(self) -> Result<Self> {
         ensure!(
             self.interface.len() <= 63
@@ -110,25 +118,25 @@ impl PacketCaptureOptions {
     }
 }
 
-#[derive(Serialize)]
-pub(crate) struct Plan {
+#[derive(Clone, Serialize)]
+pub struct Plan {
     pub connection_generation: u64,
-    host: String,
-    user: String,
-    port: u16,
-    host_key_fingerprint: String,
-    options: PacketCaptureOptions,
-    scratch_directory: String,
-    scratch_filesystem: String,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub host_key_fingerprint: String,
+    pub options: PacketCaptureOptions,
+    pub scratch_directory: String,
+    pub scratch_filesystem: String,
     #[serde(skip)]
     scratch_id: String,
-    effective_packet_limit: u32,
-    tcpdump_arguments: Vec<String>,
-    review_id: String,
+    pub effective_packet_limit: u32,
+    pub tcpdump_arguments: Vec<String>,
+    pub review_id: String,
 }
 
 #[derive(Serialize)]
-pub(crate) struct Capture {
+pub struct Capture {
     pub path: PathBuf,
     pub bytes: u64,
     pub sha256: String,
@@ -140,6 +148,21 @@ pub(crate) struct Capture {
 }
 
 impl Target {
+    pub fn preview_packet_capture_blocking(
+        mut self,
+        options: PacketCaptureOptions,
+    ) -> Result<Plan> {
+        crate::ssh::NETWORK.block_on(self.preview_packet_capture(options))
+    }
+
+    pub fn save_packet_capture_blocking(self, plan: Plan, path: PathBuf) -> Result<Capture> {
+        ensure!(
+            self.generation == plan.connection_generation,
+            "The reviewed SSH connection changed. Review again."
+        );
+        crate::ssh::NETWORK.block_on(self.capture_packets(plan.options, &plan.review_id, path))
+    }
+
     pub(crate) async fn preview_packet_capture(
         &mut self,
         options: PacketCaptureOptions,
@@ -231,6 +254,31 @@ impl Target {
         })
         .await?
     }
+}
+
+pub fn open_capture_in_wireshark(path: &Path, executable: &Path) -> Result<u32> {
+    ensure!(
+        executable.is_absolute()
+            && executable
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")),
+        "Choose a Windows Wireshark executable"
+    );
+    ensure!(
+        executable.is_file(),
+        "Wireshark executable was not found at {}",
+        executable.display()
+    );
+    ensure!(
+        path.is_absolute() && path.is_file(),
+        "The saved capture file is unavailable"
+    );
+    Ok(std::process::Command::new(executable)
+        .arg("-r")
+        .arg(path)
+        .spawn()?
+        .id())
 }
 
 fn command(

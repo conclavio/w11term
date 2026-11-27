@@ -23,6 +23,34 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews an SSH packet capture, saves verified bytes and opens a local viewer"]
+async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, _, server) =
+        fixture_counting_accepts(false, 1, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let started = remote.path().join("pcap-started");
+    fs::write(
+        state.path().join("pcap-start-marker"),
+        started.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("packet-capture-ui.ps1", &ssh, state.path());
+    let request = fs::read_to_string(started).unwrap();
+    assert!(request.contains("capture 'lo' 192 1 15 1024 yes '/dev/shm' 'udp and dst port 4321'"));
+    assert!(remote.path().join("pcap-verified").is_file());
+    assert_eq!(
+        fs::read(state.path().join("reviewed capture.pcap")).unwrap(),
+        PCAP_FIXTURE
+    );
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reviews and launches a Linux command for CPU profiling from the Windows viewer"]
 async fn native_cpu_launch_reviews_literal_arguments_and_displays_the_timeout_profile() {
     let transports = Arc::new(AtomicUsize::new(0));

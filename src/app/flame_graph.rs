@@ -409,6 +409,7 @@ impl TerminalApp {
             Action::Open => {
                 self.command_reference.close();
                 self.triage.open = false;
+                self.packet_capture.open = false;
                 panel.open = true;
             }
             Action::Close => {

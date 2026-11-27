@@ -277,6 +277,7 @@ impl server::Handler for Peer {
                 anyhow::ensure!(
                     job.len() == 32 && job.bytes().all(|byte| byte.is_ascii_hexdigit())
                 );
+                fs::write(self.root.join("pcap-started"), args)?;
                 let remote = self
                     .root
                     .join("dev")

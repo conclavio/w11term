@@ -95,6 +95,7 @@ mod keyboard_copy;
 mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod packet_capture;
 mod pane_broadcast;
 mod pane_colors;
 mod pane_picker;
@@ -1046,6 +1047,7 @@ fn tab_menu_message(label: String) -> Message {
         command_reference::LABEL => Message::CommandReference(command_reference::Action::Open),
         triage::LABEL => Message::Triage(triage::Action::Open),
         flame_graph::LABEL => Message::FlameGraph(flame_graph::Action::Open),
+        packet_capture::LABEL => Message::PacketCapture(packet_capture::Action::Open),
         command_reference::SELECTION => {
             Message::CommandReference(command_reference::Action::Selection(None))
         }
@@ -1355,6 +1357,7 @@ pub struct TerminalApp {
     command_reference: command_reference::Panel,
     triage: triage::Panel,
     flame_graph: flame_graph::Panel,
+    packet_capture: packet_capture::Panel,
     dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     rotation_hover: Option<pane_view::RotationHover>,
@@ -1542,6 +1545,7 @@ pub enum Message {
     CommandReference(command_reference::Action),
     Triage(triage::Action),
     FlameGraph(flame_graph::Action),
+    PacketCapture(packet_capture::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -4719,6 +4723,7 @@ impl TerminalApp {
             MenuItem::item("command-reference", command_reference::LABEL),
             MenuItem::item("linux-triage", triage::LABEL),
             MenuItem::item("cpu-flame-graph", flame_graph::LABEL),
+            MenuItem::item("packet-capture", packet_capture::LABEL),
             command_menu_item(
                 "command-reference-selection",
                 command_reference::SELECTION,
@@ -5935,6 +5940,7 @@ impl Component for TerminalApp {
             command_reference: Default::default(),
             triage: Default::default(),
             flame_graph: Default::default(),
+            packet_capture: Default::default(),
             dividers: Rc::default(),
             measured_layout: None,
             rotation_hover: None,
@@ -6388,6 +6394,7 @@ impl Component for TerminalApp {
                     if (live.files.open
                         && !self.command_reference.open
                         && !self.triage.open
+                        && !self.packet_capture.open
                         && !self.flame_graph.open)
                         != open
                     {
@@ -7777,6 +7784,7 @@ impl Component for TerminalApp {
             Message::CommandReference(action) => self.command_reference_action(action, context),
             Message::Triage(action) => self.triage_action(action, context),
             Message::FlameGraph(action) => self.flame_graph_action(action, context),
+            Message::PacketCapture(action) => self.packet_capture_action(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();
@@ -8536,7 +8544,9 @@ impl Component for TerminalApp {
         } else {
             Border::new().into()
         };
-        let content = if self.flame_graph.open {
+        let content = if self.packet_capture.open {
+            self.with_packet_capture(content, context)
+        } else if self.flame_graph.open {
             self.with_flame_graph(content, context)
         } else if self.triage.open {
             self.with_triage(content, context)

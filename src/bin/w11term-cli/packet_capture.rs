@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
-    path::{self, PathBuf},
+    path::{self, Path, PathBuf},
 };
 use w11term::control::{PacketCaptureOptions, Reply, Request};
+use w11term::ssh::open_capture_in_wireshark;
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] preview-packet-capture --pane ID --interface NAME [CAPTURE OPTIONS]\n",
@@ -74,19 +75,19 @@ pub(super) fn parse(
             .map(|value| value.parse())
             .transpose()
             .context("invalid snap length")?
-            .unwrap_or(192),
+            .unwrap_or(PacketCaptureOptions::DEFAULT_SNAP_LENGTH),
         seconds: flags
             .remove("--seconds")
             .map(|value| value.parse())
             .transpose()
             .context("invalid capture duration")?
-            .unwrap_or(15),
+            .unwrap_or(PacketCaptureOptions::DEFAULT_SECONDS),
         max_mib: flags
             .remove("--max-mib")
             .map(|value| value.parse())
             .transpose()
             .context("invalid capture budget")?
-            .unwrap_or(16),
+            .unwrap_or(PacketCaptureOptions::DEFAULT_MAX_MIB),
         packet_limit: flags
             .remove("--packet-limit")
             .map(|value| value.parse())
@@ -94,7 +95,7 @@ pub(super) fn parse(
             .context("invalid packet limit")?,
         scratch_directory: flags
             .remove("--scratch-directory")
-            .unwrap_or_else(|| if tmpfs { "/dev/shm" } else { "/tmp" }.into()),
+            .unwrap_or_else(|| PacketCaptureOptions::default_scratch_directory(tmpfs).into()),
         require_tmpfs: tmpfs,
     }
     .validate()?;
@@ -129,27 +130,11 @@ pub(super) fn open_in_wireshark(reply: &mut Reply, executable: PathBuf) {
         return;
     };
     let opened = (|| -> Result<_> {
-        ensure!(
-            executable
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")),
-            "Choose a Windows Wireshark executable"
-        );
-        ensure!(
-            executable.is_file(),
-            "Wireshark executable was not found at {}",
-            executable.display()
-        );
         let capture = result
             .pointer("/capture/path")
             .and_then(serde_json::Value::as_str)
             .context("No packet capture path was returned")?;
-        Ok(std::process::Command::new(&executable)
-            .arg("-r")
-            .arg(capture)
-            .spawn()?
-            .id())
+        open_capture_in_wireshark(Path::new(capture), &executable)
     })();
     match opened {
         Ok(pid) => result["wireshark_pid"] = pid.into(),

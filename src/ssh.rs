@@ -30,6 +30,9 @@ pub use triage::cpu_profile::launch::{CpuLaunchOptions, CpuLaunchPlan, CpuWorklo
 pub use triage::cpu_profile::{
     CpuProfilePlan, CpuProfileSummary, PERF_DATA_TRANSFER_SECONDS, PerfDataArtifact,
 };
+pub use triage::packet_capture::{
+    Capture as PacketCapture, Plan as PacketCapturePlan, open_capture_in_wireshark,
+};
 pub use triage::{
     Finding as TriageFinding, Plan as TriagePlan, Report as TriageReport,
     Resource as TriageResource, SampleStatus as TriageSampleStatus, Target as TriageTarget,

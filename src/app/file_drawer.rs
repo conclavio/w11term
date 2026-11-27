@@ -3498,11 +3498,12 @@ impl TerminalApp {
             return;
         };
         if visible
-            && (self.command_reference.open || self.triage.open)
+            && (self.command_reference.open || self.triage.open || self.packet_capture.open)
             && matches!(action, Toggle | OpenHere | ShowTransfer(_))
         {
             self.command_reference.close();
             self.triage.open = false;
+            self.packet_capture.open = false;
             if matches!(action, Toggle) && tab.files.open {
                 return;
             }

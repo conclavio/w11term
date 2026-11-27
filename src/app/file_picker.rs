@@ -61,6 +61,8 @@ pub(super) enum Purpose {
     OpenTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
     SaveCpuProfile(PathBuf),
+    SavePacketCapture(PathBuf),
+    WiresharkExecutable(PathBuf),
     FlameGraph {
         path: PathBuf,
         export: bool,
@@ -218,6 +220,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
                 | Purpose::OpenTriageReport(_)
+                | Purpose::WiresharkExecutable(_)
                 | Purpose::FlameGraph { export: false, .. }
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
@@ -240,6 +243,32 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let multiple = matches!(purpose, Purpose::UploadFiles);
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
+            Purpose::SavePacketCapture(path) | Purpose::WiresharkExecutable(path) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if clsid == FileSaveDialog {
+                    dialog.SetTitle(w!("Save packet capture"))?;
+                    dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                        pszName: w!("Packet capture"),
+                        pszSpec: w!("*.pcap"),
+                    }])?;
+                    dialog.SetDefaultExtension(w!("pcap"))?;
+                    dialog.SetFileName(w!("packet-capture.pcap"))?;
+                    options |= FOS_NOTESTFILECREATE;
+                    options &= !FOS_OVERWRITEPROMPT;
+                } else {
+                    dialog.SetTitle(w!("Choose Wireshark executable"))?;
+                    dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                        pszName: w!("Windows applications"),
+                        pszSpec: w!("*.exe"),
+                    }])?;
+                    options |= FOS_FILEMUSTEXIST;
+                }
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
             Purpose::SaveCpuProfile(path) => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 dialog.SetTitle(w!("Save CPU profile"))?;

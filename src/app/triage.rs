@@ -450,6 +450,7 @@ impl TerminalApp {
         if matches!(action, Action::Open) {
             self.command_reference.close();
             self.flame_graph.open = false;
+            self.packet_capture.open = false;
             self.triage.open = true;
             if self.triage.content.is_some() || self.triage.pending.is_some() {
                 return;
