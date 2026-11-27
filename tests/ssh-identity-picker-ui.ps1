@@ -78,10 +78,15 @@ function Set-DotfileFragment([string]$Name, [string]$Text) {
     $field.GetCurrentPattern($value).SetValue($Text.Replace("`n", "`r"))
     $null = Wait-Until "the multiline dotfile fragment '$Name' is retained" { (Dotfile-Fragment $Name) -ceq $Text }
 }
-function Save-DotfilesBundle([string]$Action, [string]$Suggestion, [string]$Path) {
+function Save-DotfilesBundle([string]$Action, [string]$Path) {
     Invoke-Button (Wait-DotfileControl $Action $button)
     $dialog = Wait-Until 'owned dotfiles bundle save dialog' { Find-OwnedDialog 'Save new dotfiles bundle' }
-    $null = Wait-Until 'enter the new dotfiles bundle path' { [FixtureDialog]::SetFilename($dialog, $Path, $Suggestion) }
+    $null = Wait-Until "enter a draft filename for '$Action'" {
+        [FixtureDialog]::SetCommonDialogFilename($dialog, "$Path.draft")
+    }
+    $null = Wait-Until "replace the draft filename for '$Action'" {
+        [FixtureDialog]::SetCommonDialogFilename($dialog, $Path)
+    }
     $null = Wait-Until 'save the local dotfiles bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'the created bundle is selected in the profile' {
         $field = Find-Element 'Dotfiles bundle' $edit
@@ -200,7 +205,7 @@ try {
     Set-DotfileFragment 'Bash startup fragment' $bash
     Set-DotfileFragment 'Zsh startup fragment' $zsh
     $created = Join-Path $State 'Authored dotfiles.json'
-    Save-DotfilesBundle 'Save dotfiles bundle' 'dotfiles.json' $created
+    Save-DotfilesBundle 'Save dotfiles bundle' $created
     $originalHash = File-Sha256 $created
     $initial = [IO.File]::ReadAllText($created) | ConvertFrom-Json
     if ($initial.version -ne 1 -or $initial.environment -cne $shared -or
@@ -215,7 +220,7 @@ try {
     $revisedBash = "PS1='revised> '`nalias ll='ls -lh'"
     Set-DotfileFragment 'Bash startup fragment' $revisedBash
     $revision = Join-Path $State 'Revised dotfiles.json'
-    Save-DotfilesBundle 'Save dotfiles revision' 'Authored dotfiles-revision.json' $revision
+    Save-DotfilesBundle 'Save dotfiles revision' $revision
     $updated = [IO.File]::ReadAllText($revision) | ConvertFrom-Json
     $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles.bundle
     if ($updated.environment -cne $shared -or $updated.bash -cne $revisedBash -or
