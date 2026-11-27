@@ -281,7 +281,17 @@ try {
     Click-GraphButton 'Return to diagnostics overview'
     Choose-DiagnosticFileAction 'worker profile.folded' 'Use as baseline'
     $null = Wait-Until 'pinned CPU profile is the baseline' { Find-Element "Baseline${dot}worker profile.folded" }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $bounds = $root.Current.BoundingRectangle
+    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
+    $resize.Resize($bounds.Width, [Math]::Round(340 * $scale))
+    $null = Wait-Until 'the after profile action is below the visible diagnostics area' {
+        $action = Find-Element 'File actions for after recording.folded' $button
+        $action -and $action.Current.IsOffscreen
+    }
     Choose-DiagnosticFileAction 'after recording.folded' 'Compare with baseline'
+    $resize.Resize($bounds.Width, $bounds.Height)
     $null = Wait-Until 'saved CPU comparison uses both source paths and the expected side' {
         (Find-Element "Before${dot}worker profile.folded${dot}4 samples") -and
         (Find-Element "After${dot}after recording.folded${dot}20 samples") -and

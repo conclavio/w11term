@@ -12,10 +12,7 @@ $button = [System.Windows.Automation.ControlType]::Button
 
 function Choose-DiagnosticFileAction([string]$Filename, [string]$Action) {
     $triggerName = "File actions for $Filename"
-    Invoke-Button (Get-NativeMenuAction $triggerName $Action -Reveal {
-        $trigger = Find-Element $triggerName $button
-        if ($trigger -and $trigger.Current.IsEnabled -and $trigger.Current.IsOffscreen) { $trigger.SetFocus() }
-    })
+    Invoke-Button (Get-ScrollableMenuAction $triggerName $Action)
 }
 
 function Sessions { (Control @('list')).sessions }
