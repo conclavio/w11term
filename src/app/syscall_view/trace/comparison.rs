@@ -103,10 +103,9 @@ impl Comparison {
                 if let Some(&event) = orders[side]
                     .get(row_index(span, row.sample))
                     .filter(|_| !span.is_empty())
+                    && let Some(elapsed) = traces[side].relative_start(event)
                 {
-                    if let Some(elapsed) = traces[side].relative_start(event) {
-                        time = Some(time.map_or(elapsed, |current: u64| current.min(elapsed)));
-                    }
+                    time = Some(time.map_or(elapsed, |current: u64| current.min(elapsed)));
                 }
             }
             time.unwrap_or(u64::MAX)
@@ -636,15 +635,14 @@ impl<'a> Normalized<'a> {
                         resource = "Descriptor range".into();
                         uncertain = true;
                     }
-                    name if super::descriptors::descriptor_input(name)
+                    name if (super::descriptors::descriptor_input(name)
                         || matches!(
                             name,
                             "accept" | "accept4" | "close" | "dup" | "dup2" | "dup3"
-                        ) =>
+                        ))
+                        && fd_number(first).is_some() =>
                     {
-                        if fd_number(first).is_some() {
-                            resource = self.logical_fd(index, first, &mut uncertain);
-                        }
+                        resource = self.logical_fd(index, first, &mut uncertain);
                     }
                     _ => (),
                 }
