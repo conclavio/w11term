@@ -46,7 +46,7 @@ fi
 record_status=0
 (
     ulimit -f "$record_kib" || exit 2
-    exec perf record --no-buildid-cache --no-inherit -e cpu-clock:u \
+    exec perf record --no-buildid-cache --no-inherit --all-user --user-callchains -e cpu-clock:u \
         -F "$frequency" --call-graph "$call_graph" -p "$pid" \
         -o "$work/perf.data" -- sleep "$seconds"
 ) > /dev/null || record_status=$?

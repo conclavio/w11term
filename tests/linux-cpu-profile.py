@@ -25,7 +25,8 @@ if args == ["--version"]:
 if args[0] == "record":
     expected_pid = os.environ["W11TERM_TEST_PID"]
     assert args[:args.index("-o")] == [
-        "record", "--no-buildid-cache", "--no-inherit", "-e", "cpu-clock:u",
+        "record", "--no-buildid-cache", "--no-inherit", "--all-user", "--user-callchains",
+        "-e", "cpu-clock:u",
         "-F", "99", "--call-graph", "dwarf,8192", "-p", expected_pid,
     ]
     destination = Path(args[args.index("-o") + 1])
