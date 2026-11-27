@@ -7,6 +7,7 @@ use w11term::control::{PacketCaptureOptions, Reply, Request};
 use w11term::ssh::open_capture_in_wireshark;
 
 pub(super) const HELP: &str = concat!(
+    "w11term-cli [--pid PID] list-packet-interfaces --pane ID\n",
     "w11term-cli [--pid PID] preview-packet-capture --pane ID --interface NAME [CAPTURE OPTIONS]\n",
     "w11term-cli [--pid PID] capture-packets --pane ID --interface NAME [CAPTURE OPTIONS] ",
     "--connection-generation N --review-id ID --output-file PATH [--job-id HEX] [--wireshark PATH]\n",
@@ -20,11 +21,16 @@ pub(super) fn parse(
     mut args: impl Iterator<Item = String>,
     pane: Option<u64>,
 ) -> Result<(Request, Option<PathBuf>)> {
+    let listing = verb == "list-packet-interfaces";
     let capture = verb == "capture-packets";
     let stop = verb == "stop-packet-capture";
     let mut flags = BTreeMap::new();
     let mut tmpfs = false;
     while let Some(flag) = args.next() {
+        ensure!(
+            !listing || flag == "--pane",
+            "unsupported packet capture option {flag}"
+        );
         if flag == "--tmpfs" {
             ensure!(!stop && !tmpfs, "invalid --tmpfs for {verb}");
             tmpfs = true;
@@ -71,6 +77,9 @@ pub(super) fn parse(
         .or(pane_arg)
         .filter(|pane| *pane > 0)
         .context("provide a positive --pane ID")?;
+    if listing {
+        return Ok((Request::ListPacketInterfaces { pane }, None));
+    }
     if stop {
         return Ok((
             Request::StopPacketCapture {

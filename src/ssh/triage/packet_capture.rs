@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     io::{BufReader, Read},
     path::{Path, PathBuf},
     time::Duration,
@@ -16,6 +17,8 @@ const SCRIPT: &str = include_str!("packet-capture.sh");
 const RING_WORKER: &str = include_str!("packet-ring.py");
 const CAPTURE_FILE: &str = "capture.pcap";
 const METADATA_BYTES: usize = 4096;
+const INTERFACE_BYTES: usize = 64 * 1024;
+const MAX_INTERFACES: usize = 512;
 const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 mod ring;
@@ -46,16 +49,7 @@ impl PacketCaptureOptions {
 
     pub fn validate(self) -> Result<Self> {
         ensure!(
-            self.interface.len() <= 63
-                && self
-                    .interface
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && self
-                    .interface
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-:@".contains(&b)),
+            valid_interface(&self.interface),
             "Select a Linux interface such as eth0, lo, or any"
         );
         ensure!(
@@ -145,6 +139,70 @@ impl PacketCaptureOptions {
     }
 }
 
+fn valid_interface(name: &str) -> bool {
+    name.len() <= 63
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-:@".contains(&b))
+}
+
+#[derive(Serialize)]
+pub struct CaptureInterface {
+    pub name: String,
+    pub detail: String,
+}
+
+#[derive(Serialize)]
+pub struct CaptureInterfaces {
+    pub interfaces: Vec<CaptureInterface>,
+    pub truncated: bool,
+}
+
+fn parse_interfaces(bytes: &[u8]) -> CaptureInterfaces {
+    let lines = String::from_utf8_lossy(bytes);
+    let mut interfaces = Vec::new();
+    let mut seen = HashSet::new();
+    for line in lines.lines() {
+        let Some((index, entry)) = line.split_once('.') else {
+            continue;
+        };
+        if index.parse::<std::num::NonZeroU32>().is_err()
+            || !index.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let name = entry.split_whitespace().next().unwrap_or_default();
+        if !valid_interface(name) || !entry.starts_with(name) {
+            continue;
+        }
+        let detail = entry[name.len()..].trim();
+        if !detail.is_empty() && !detail.starts_with(['(', '[']) {
+            continue;
+        }
+        if !seen.insert(name) {
+            continue;
+        }
+        if interfaces.len() == MAX_INTERFACES {
+            return CaptureInterfaces {
+                interfaces,
+                truncated: true,
+            };
+        }
+        interfaces.push(CaptureInterface {
+            name: name.into(),
+            detail: crate::events::display_field(detail),
+        });
+    }
+    CaptureInterfaces {
+        interfaces,
+        truncated: false,
+    }
+}
+
 #[derive(Clone, Copy, Serialize)]
 pub struct Rotation {
     pub files: u8,
@@ -198,6 +256,25 @@ struct CaptureFile {
     packets: u32,
 }
 impl Target {
+    pub fn list_packet_interfaces_blocking(mut self) -> Result<CaptureInterfaces> {
+        crate::ssh::NETWORK.block_on(self.list_packet_interfaces())
+    }
+
+    pub(crate) async fn list_packet_interfaces(&mut self) -> Result<CaptureInterfaces> {
+        let (stdout, _) = self
+            .run_diagnostic(
+                "packet capture interface listing",
+                format!(
+                    "/bin/bash -c {} w11term-packet-capture interfaces",
+                    quote(SCRIPT)
+                ),
+                Duration::from_secs(8),
+                INTERFACE_BYTES,
+            )
+            .await?;
+        Ok(parse_interfaces(&stdout))
+    }
+
     pub fn preview_packet_capture_blocking(
         mut self,
         options: PacketCaptureOptions,
@@ -604,6 +681,47 @@ fn count_packet_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_list_preserves_literal_names_and_skips_unselectable_entries() {
+        let list = parse_interfaces(
+            concat!(
+                "1.enp0s3 [Up, Running]\n",
+                "2.any (Pseudo-device) [Up, Running]\n",
+                "3.lo [Up, Running, Loopback]\r\n",
+                "4.veth.100@peer [Up]\n",
+                "  dummy0 [NoCapture]\n",
+                "5.-some-option [Up]\n",
+                "6.enp0s3 (duplicate)\n",
+                "7.bad trailing text\n",
+                "0.zero\n",
+                "8.can0 [Up\x1b[0m]\n",
+            )
+            .as_bytes(),
+        );
+        assert!(!list.truncated);
+        assert_eq!(
+            list.interfaces
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["enp0s3", "any", "lo", "veth.100@peer", "can0"]
+        );
+        assert_eq!(list.interfaces[1].detail, "(Pseudo-device) [Up, Running]");
+        assert!(!list.interfaces[4].detail.contains('\x1b'));
+    }
+
+    #[test]
+    fn interface_catalog_is_bounded_and_reports_truncation() {
+        use std::fmt::Write;
+        let mut wire = String::new();
+        for number in 1..=MAX_INTERFACES + 1 {
+            writeln!(wire, "{number}.eth{number}").unwrap();
+        }
+        let list = parse_interfaces(wire.as_bytes());
+        assert_eq!(list.interfaces.len(), MAX_INTERFACES);
+        assert!(list.truncated);
+    }
 
     #[test]
     fn budget_reserves_room_for_each_complete_packet_record() {

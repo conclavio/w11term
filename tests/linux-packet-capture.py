@@ -20,6 +20,8 @@ RING = Path("src/ssh/triage/packet-ring.py").read_text()
 
 
 def run(mode, root, port, *, mount="", job="", count=3, seconds=8, script=SCRIPT, slots=None):
+    if mode == "interfaces":
+        return ["/bin/bash", "-c", script, "w11term-packet-capture", mode]
     args = [
         "/bin/bash", "-c", script, "w11term-packet-capture", mode, "lo", "192",
         str(count), str(seconds), "1024", "yes", str(root), f"udp and dst port {port}",
@@ -145,6 +147,10 @@ def smoke():
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
             receiver.bind(("127.0.0.1", 0))
             port = receiver.getsockname()[1]
+            devices = subprocess.run(run("interfaces", root, port), capture_output=True, check=True, timeout=8)
+            assert re.search(rb"^\d+\.lo(?:\s|$)", devices.stdout, re.MULTILINE), devices.stdout
+            assert not list(root.glob("w11term-pcap-*"))
+            print("Listed the Linux loopback device without starting a packet capture.")
             preflight = subprocess.run(run("inspect", root, port), capture_output=True, check=True, timeout=10)
             marker, kind, mount_id, resolved = preflight.stdout.decode().strip().split("\t")
             assert marker == "w11term-packet-plan-v1" and kind == "tmpfs" and resolved == str(root)

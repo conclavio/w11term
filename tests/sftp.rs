@@ -320,7 +320,12 @@ impl server::Handler for Peer {
             .and_then(|command| command.rsplit_once("' w11term-packet-capture "))
         {
             s.channel_success(c)?;
-            if args.starts_with("inspect ") {
+            if args == "interfaces" {
+                s.data(c, b"1.eth0 [Up, Running, Connected]\n2.any (Pseudo-device) [Up, Running]\n3.lo [Up, Running, Loopback]\n".as_slice())?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+            } else if args.starts_with("inspect ") {
                 s.data(
                     c,
                     b"w11term-packet-plan-v1\ttmpfs\t12:34\t/dev/shm\n".to_vec(),

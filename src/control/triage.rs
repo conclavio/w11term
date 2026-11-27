@@ -76,6 +76,17 @@ impl Registry {
         Ok(json!({ "pane": pane, "plan": target.preview_packet_capture(options).await? }))
     }
 
+    pub(super) async fn list_packet_interfaces(&self, pane: u64) -> Result<Value> {
+        let mut target = self.diagnostic_target(pane, None).await?;
+        let list = target.list_packet_interfaces().await?;
+        Ok(json!({
+            "pane": pane,
+            "connection_generation": target.connection_generation(),
+            "interfaces": list.interfaces,
+            "truncated": list.truncated,
+        }))
+    }
+
     pub(super) async fn preview_syscall_capture(
         &self,
         pane: u64,

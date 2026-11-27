@@ -137,7 +137,10 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                 let request = cpu_profile::parse(&arg, args, pane)?;
                 return Ok(Invocation::new(pid, request));
             }
-            "preview-packet-capture" | "capture-packets" | "stop-packet-capture"
+            "list-packet-interfaces"
+            | "preview-packet-capture"
+            | "capture-packets"
+            | "stop-packet-capture"
                 if verb.is_none() =>
             {
                 ensure!(

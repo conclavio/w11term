@@ -52,7 +52,33 @@ try {
     Wait-Focus $remote
     $null = Control @('wait-ssh-connected','--pane',"$remote",'--timeout','15')
     Run-Palette 'Packet capture'
-    Set-Field 'Linux network interface' 'lo'
+    $catalog = Control @('list-packet-interfaces','--pane',"$remote")
+    if (($catalog.interfaces.name -join ',') -cne 'eth0,any,lo' -or $catalog.truncated) {
+        throw 'The CLI interface list did not match the reviewed SSH pane'
+    }
+    Click 'List capture interfaces'
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $null = Wait-Until 'capture interface picker loaded' { Find-Element 'Capture interfaces' $combo }
+    if ([IO.File]::Exists($startMarker)) { throw 'Interface discovery started a capture' }
+    $null = Control @('focus-pane','--pane',"$local")
+    Wait-Focus $local
+    $null = Wait-Until 'the SSH interface list is unavailable from PowerShell' {
+        $listButton = Find-Element 'List capture interfaces' $button
+        $listButton -and !$listButton.Current.IsEnabled -and !(Find-Element 'Capture interfaces' $combo)
+    }
+    $null = Control @('focus-pane','--pane',"$remote")
+    Wait-Focus $remote
+    $dropdown = Wait-Until 'returning to the same SSH connection restores the picker' { Find-Element 'Capture interfaces' $combo }
+    $dropdown.SetFocus()
+    $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $loopback = Wait-Until 'tcpdump loopback device can be chosen' {
+        Find-Element "lo${dot}[Up, Running, Loopback]" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $loopback.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'selecting a device fills the editable interface field' {
+        $field = Find-Element 'Linux network interface' $edit
+        $field -and $field.GetCurrentPattern($value).Current.Value -ceq 'lo'
+    }
     Set-Field 'Maximum capture size in MiB' '1'
     Set-Field 'Packet limit (optional)' '1'
     $ram = Wait-Until 'RAM scratch option' { Find-Element 'Use RAM-backed scratch storage' $check }

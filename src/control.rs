@@ -80,6 +80,9 @@ pub enum Request {
         pane: u64,
         options: PacketCaptureOptions,
     },
+    ListPacketInterfaces {
+        pane: u64,
+    },
     PreviewSyscallCapture {
         pane: u64,
         options: SyscallOptions,
@@ -1471,6 +1474,7 @@ impl Registry {
             Request::PreviewPacketCapture { pane, options } => {
                 self.preview_packet_capture(pane, options).await
             }
+            Request::ListPacketInterfaces { pane } => self.list_packet_interfaces(pane).await,
             Request::PreviewSyscallCapture { pane, options } => {
                 self.preview_syscall_capture(pane, options).await
             }

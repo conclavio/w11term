@@ -2,7 +2,10 @@ use super::*;
 use std::path::PathBuf;
 use w11term::{
     control::PacketCaptureOptions,
-    ssh::{CaptureStop, PacketCapture, PacketCapturePlan, open_capture_in_wireshark},
+    ssh::{
+        CaptureStop, PacketCapture, PacketCaptureInterfaces, PacketCapturePlan,
+        open_capture_in_wireshark,
+    },
 };
 
 pub(super) const LABEL: &str = "Packet capture";
@@ -23,6 +26,8 @@ pub enum Action {
     Open,
     Close,
     Edit(Field, String),
+    ListInterfaces,
+    SelectInterface(flame_graph::Connection, String),
     Tmpfs(bool),
     Review,
     Save,
@@ -33,6 +38,7 @@ pub enum Action {
 }
 
 pub enum Outcome {
+    Interfaces(flame_graph::Connection, PacketCaptureInterfaces),
     Reviewed(u64, Box<PacketCapturePlan>),
     Destination(PathBuf),
     Saved(PacketCapture),
@@ -138,6 +144,7 @@ impl Review {
 pub(super) struct Panel {
     pub(super) open: bool,
     inputs: Inputs,
+    interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
     saved: Option<PacketCapture>,
     wireshark: Option<PathBuf>,
@@ -205,6 +212,52 @@ impl Panel {
                 "Linux network interface",
                 &inputs.interface,
             ),
+            KeyedView::new(
+                "list-interfaces",
+                button("List capture interfaces", idle && active.is_some(), || {
+                    Action::ListInterfaces
+                }),
+            ),
+        ];
+        if let Some((source, list)) = &self.interfaces
+            && Some(*source) == active
+            && !list.interfaces.is_empty()
+        {
+            let source = *source;
+            let selected = list
+                .interfaces
+                .iter()
+                .position(|entry| entry.name == inputs.interface);
+            let names: Vec<_> = list
+                .interfaces
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
+            let labels = list.interfaces.iter().map(|entry| {
+                if entry.detail.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{} · {}", entry.name, entry.detail)
+                }
+            });
+            fields.push(KeyedView::new(
+                "interfaces",
+                ComboBox::new()
+                    .automation_name("Capture interfaces")
+                    .placeholder_text("Choose an interface")
+                    .is_enabled(idle)
+                    .items_source(labels)
+                    .selected_index(selected)
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index
+                            .and_then(|index| names.get(index))
+                            .map_or(Message::ControlIdle, |name| {
+                                message(Action::SelectInterface(source, name.clone()))
+                            })
+                    })),
+            ));
+        }
+        fields.extend([
             input(
                 "filter",
                 Field::Filter,
@@ -267,7 +320,7 @@ impl Panel {
                     || Action::Review,
                 ),
             ),
-        ];
+        ]);
         if let Some((stop, ticket)) = self.stop.as_ref().zip(self.pending.as_ref()) {
             let ticket = ticket.clone();
             fields.insert(
@@ -466,6 +519,7 @@ impl TerminalApp {
     }
 
     fn packet_capture_input(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        let active = self.profile_connection();
         let panel = &mut self.packet_capture;
         match action {
             Action::Edit(field, value) => {
@@ -490,6 +544,18 @@ impl TerminalApp {
                 panel.review = None;
                 panel.status = None;
             }
+            Action::ListInterfaces => self.list_packet_interfaces(ctx),
+            Action::SelectInterface(source, name) if active == Some(source) => {
+                if panel.inputs.interface != name
+                    && panel.interfaces.as_ref().is_some_and(|(bound, list)| {
+                        *bound == source && list.interfaces.iter().any(|entry| entry.name == name)
+                    })
+                {
+                    panel.inputs.interface = name;
+                    panel.review = None;
+                    panel.status = None;
+                }
+            }
             Action::Review => self.review_packet_capture(ctx),
             Action::Save => self.choose_capture_file(false, ctx),
             Action::ChooseWireshark => self.choose_capture_file(true, ctx),
@@ -508,6 +574,34 @@ impl TerminalApp {
             }
             _ => (),
         }
+    }
+
+    fn list_packet_interfaces(&mut self, ctx: &ComponentContext<Self>) {
+        let result = (|| -> anyhow::Result<_> {
+            let session = self
+                .triage_session()
+                .context("Select a connected Linux SSH pane")?;
+            let target = session.triage_target()?;
+            let source = flame_graph::Connection {
+                pane: session.pane_id,
+                generation: target.connection_generation(),
+            };
+            Ok((source, target))
+        })();
+        let panel = &mut self.packet_capture;
+        let (source, target) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                panel.status = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let ticket = panel.begin("Listing capture interfaces…");
+        work(ctx, ticket, move || {
+            target
+                .list_packet_interfaces_blocking()
+                .map(|list| Some(Outcome::Interfaces(source, list)))
+        });
     }
 
     fn review_packet_capture(&mut self, ctx: &ComponentContext<Self>) {
@@ -584,6 +678,7 @@ impl TerminalApp {
         result: Result<Option<Outcome>, String>,
         ctx: &ComponentContext<Self>,
     ) {
+        let active = self.profile_connection();
         let panel = &mut self.packet_capture;
         if panel
             .pending
@@ -595,6 +690,21 @@ impl TerminalApp {
         panel.status = None;
         panel.stop = None;
         match result {
+            Ok(Some(Outcome::Interfaces(source, list))) => {
+                if active == Some(source) {
+                    panel.status = if list.interfaces.is_empty() {
+                        Some(
+                            "No capture interfaces reported. Enter a name directly to review it."
+                                .into(),
+                        )
+                    } else if list.truncated {
+                        Some("Showing the first 512 capture interfaces. You can also enter a name directly.".into())
+                    } else {
+                        None
+                    };
+                }
+                panel.interfaces = Some((source, list));
+            }
             Ok(Some(Outcome::Reviewed(pane, plan))) => {
                 panel.review = Some(Review { pane, plan: *plan })
             }

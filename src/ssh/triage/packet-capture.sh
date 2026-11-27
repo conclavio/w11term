@@ -2,19 +2,27 @@
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 unset CDPATH
-mode=$1 interface=$2 snaplen=$3 count=$4 seconds=$5 budget_kib=$6
-require_tmpfs=$7 root=$8 filter=$9
-shift 9
-expected_mount=$1 job=$2
-slots=0
-if [[ ${3:-} == w11term-ring-v1 ]]; then slots=$4 ring_worker=$5; fi
+mode=$1
 
 fail() {
     printf '%s\n' "$*" >&2
     exit 2
 }
 [[ $(uname -s) == Linux ]] || fail 'Packet capture requires Linux.'
-for tool in tcpdump flock timeout mkdir stat df tail id sha256sum mkfifo head cat wc rm; do
+for tool in tcpdump timeout; do
+    command -v "$tool" >/dev/null || fail "Packet capture requires $tool."
+done
+if [[ $mode == interfaces ]]; then
+    exec timeout -k 1s 4s tcpdump -D
+fi
+
+interface=$2 snaplen=$3 count=$4 seconds=$5 budget_kib=$6
+require_tmpfs=$7 root=$8 filter=$9
+shift 9
+expected_mount=$1 job=$2
+slots=0
+if [[ ${3:-} == w11term-ring-v1 ]]; then slots=$4 ring_worker=$5; fi
+for tool in flock mkdir stat df tail id sha256sum mkfifo head cat wc rm; do
     command -v "$tool" >/dev/null || fail "Packet capture requires $tool."
 done
 if [[ $slots != 0 ]]; then
