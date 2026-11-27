@@ -347,7 +347,6 @@ impl Panel {
                         .content(StackPanel::new().spacing(8.0).keyed_children(fields)),
                 ),
             ))
-            .into()
     }
 }
 
