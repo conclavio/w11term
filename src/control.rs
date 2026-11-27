@@ -229,6 +229,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_id: Option<WindowId>,
     },
+    RenameWorkspace {
+        name: String,
+        new_name: String,
+    },
     RepairWorkspace {
         window_id: WindowId,
         name: String,
@@ -1686,6 +1690,15 @@ impl Registry {
                 Ok(json!({ "workspaces": workspaces }))
             }
             Request::GetWorkspace { name, window_id } => self.get_workspace(&name, window_id).await,
+            Request::RenameWorkspace { name, new_name } => {
+                tokio::task::spawn_blocking(move || {
+                    let store = crate::workspace::WorkspaceStore::open()?;
+                    let expected = store.entry(&name)?;
+                    store.rename(&name, &new_name, &expected)?;
+                    Ok(json!({ "old_name": name, "name": new_name }))
+                })
+                .await?
+            }
             Request::RepairWorkspace {
                 window_id,
                 name,

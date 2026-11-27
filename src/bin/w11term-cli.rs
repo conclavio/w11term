@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] rename-workspace --name OLD --to NEW\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -92,6 +92,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "open-ssh-group"
             | "open-workspace"
             | "get-workspace"
+            | "rename-workspace"
             | "repair-workspace"
             | "save-workspace"
             | "get-ssh-group-roster"
@@ -812,6 +813,44 @@ mod tests {
             "get-workspace --name Fleet --new-window",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn renames_an_existing_workspace_in_the_process_catalog() {
+        let (pid, request) = parse(
+            [
+                "--pid",
+                "7",
+                "rename-workspace",
+                "--name",
+                "Fleet Ops",
+                "--to",
+                "Production Ops",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "verb":"rename-workspace","name":"Fleet Ops","new_name":"Production Ops"
+            })
+        );
+        for invalid in [
+            "rename-workspace --name fleet",
+            "rename-workspace --to ops",
+            "rename-workspace --name fleet --to ops --to other",
+            "rename-workspace --name fleet --name lab --to ops",
+            "rename-workspace --name fleet --to ops --window 1",
+            "rename-workspace --name fleet --to ops --pane 1",
+            "rename-workspace --name fleet --to ops --overwrite",
+        ] {
+            assert!(
+                parse(invalid.split_whitespace().map(str::to_owned)).is_err(),
+                "{invalid}"
+            );
         }
     }
 

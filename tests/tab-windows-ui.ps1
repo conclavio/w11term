@@ -1519,6 +1519,33 @@ function Test-ControlSaveWorkspace {
         [IO.File]::ReadAllText($catalog) -cne $beforeFailure) {
         throw 'A failed save changed the workspace catalog'
     }
+    $renamed = 'CLI Production Ops'
+    $failed = & $Cli --pid $app.Id rename-workspace --name $name --to 'two-windows' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*already exists*') {
+        throw 'Rename did not reject an existing workspace name'
+    }
+    $failed = & $Cli --pid $app.Id rename-workspace --name $renamed --to $name | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*Unknown workspace*' -or
+        [IO.File]::ReadAllText($catalog) -cne $beforeFailure) {
+        throw 'A failed rename changed the workspace catalog'
+    }
+    $preview = Control @('get-workspace','--name',$name)
+    $rename = Control @('rename-workspace','--name',$name,'--to',$renamed)
+    $names = (Control @('list-workspaces')).workspaces.name
+    if ($rename.old_name -cne $name -or $rename.name -cne $renamed -or $names -ccontains $name -or
+        $names -cnotcontains $renamed -or @((Control @('list')).sessions).Count -ne $beforeSave) {
+        throw 'Rename did not update the catalog in place'
+    }
+    $preview.name = $renamed
+    $afterRename = Control @('get-workspace','--name',$renamed)
+    if ((ConvertTo-Json -InputObject $afterRename -Depth 12 -Compress) -cne
+        (ConvertTo-Json -InputObject $preview -Depth 12 -Compress)) {
+        throw 'Rename changed the workspace layout'
+    }
+    $afterClaim = (Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).workspace_windows |
+        Where-Object window_id -eq $ssh.window_id
+    if ($afterClaim.workspace -cne $claim.workspace) { throw 'Rename changed the open workspace registration' }
+    Expect-Focus $otherWindow $other.pane 'Renaming a saved workspace leaves the foreground window focused'
     Close-FixtureWindow $otherWindow
     $null = Wait-Until 'the temporary foreground window has closed' {
         @((Control @('list-windows')).windows).Count -eq 1
@@ -1528,7 +1555,7 @@ function Test-ControlSaveWorkspace {
     Type-In $origin 'source-saved/'
     Expect-Text $ssh.id 'source-saved/'
 
-    $reopened = Control @('open-workspace','--new-window','--name',$name)
+    $reopened = Control @('open-workspace','--new-window','--name',$renamed)
     $copy = Wait-DetachedWindow $origin
     $freshSsh = $reopened.tabs[0].panes[0]
     $freshShell = $reopened.tabs[0].panes[1]

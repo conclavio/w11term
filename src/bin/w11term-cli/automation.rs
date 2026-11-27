@@ -66,6 +66,7 @@ pub(super) fn parse(
     let mut expected_query = None;
     let mut record_output = None;
     let mut name = None;
+    let mut new_name = None;
     let mut new_window = false;
     let mut axis = None;
     let mut target_pane = None;
@@ -222,6 +223,7 @@ pub(super) fn parse(
                         | "open-workspace"
                         | "save-workspace"
                         | "get-workspace"
+                        | "rename-workspace"
                         | "repair-workspace"
                         | "rename-tab"
                         | "rename-pane"
@@ -229,6 +231,10 @@ pub(super) fn parse(
             {
                 ensure!(name.is_none(), "specify --name only once");
                 name = Some(value(&mut args)?);
+            }
+            "--to" if verb == "rename-workspace" => {
+                ensure!(new_name.is_none(), "specify --to only once");
+                new_name = Some(value(&mut args)?);
             }
             "--replace" if verb == "repair-workspace" => {
                 let missing = value(&mut args)?;
@@ -599,6 +605,17 @@ pub(super) fn parse(
                 .context("provide a saved workspace name with --name")?,
             window_id,
         },
+        "rename-workspace" => {
+            ensure!(pane.is_none(), "rename-workspace does not accept --pane");
+            Request::RenameWorkspace {
+                name: name
+                    .filter(|name| !name.trim().is_empty())
+                    .context("provide a saved workspace name with --name")?,
+                new_name: new_name
+                    .filter(|name| !name.trim().is_empty())
+                    .context("provide a new workspace name with --to")?,
+            }
+        }
         "repair-workspace" => {
             workspace_profile_replacements(&workspace_replacements)?;
             Request::RepairWorkspace {

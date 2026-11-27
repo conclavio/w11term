@@ -55,6 +55,8 @@ Replies include `window_id`, `tab_id`, the explicit `name` (null after reset), a
 
 Pane leaves include `pane_name`, `font_size`, and a `source` with `kind`, the nullable `profile` name, and `startup` and `durable` flags. The preview omits connection settings, credential and recording paths, launch commands, and durable session identifiers. With `--window`, `profile_check` gives that `window_id` and its `missing_ssh_profiles`. This checks saved SSH profile names against the selected window's catalog. Without a window, `profile_check` is null. Direct pipe clients can send `{"verb":"get-workspace","name":"Fleet Ops","window_id":2}`.
 
+`rename-workspace --name OLD --to NEW` renames a recipe in the saved workspace catalog. The new name must be unused. The layout and workspace identity carry over, so the workspace switcher still recognizes an open window under the new name. The reply gives `old_name` and `name`. The command preserves live sessions and desktop focus. Direct pipe clients can send `{"verb":"rename-workspace","name":"Fleet Ops","new_name":"Production Ops"}`.
+
 `repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]` replaces missing SSH profile references in a saved workspace. Each pair updates every pane that refers to `OLD`. The command checks the selected window's SSH profile catalog and applies the same connection checks as the GUI repair, including for startup commands and durable sessions. All requested replacements are saved together, and the workspace keeps its identity. The reply includes `name`, `window_id`, the `replacements` object keyed by old name, and `updated_panes`. Repair changes the saved recipe while leaving live sessions and desktop focus in place.
 
 Direct pipe clients can send `{"verb":"repair-workspace","window_id":2,"name":"Fleet Ops","replacements":[{"missing":"ops-old","replacement":"ops"}]}`.
@@ -76,6 +78,7 @@ The reply contains `name`, `window_id`, and `tabs` in saved order. Each tab cont
 & $ctl --pid 12345 save-workspace --window 2 --name 'Fleet Ops'
 & $ctl --pid 12345 open-workspace --window 2 --name 'Fleet Ops' --activate
 & $ctl --pid 12345 open-workspace --new-window --name 'Fleet Ops'
+& $ctl --pid 12345 rename-workspace --name 'Fleet Ops' --to 'Production Ops'
 ```
 
 `resize` routes to the window that owns the pane, including after a live tab transfer. Closing one window leaves the process pipe and the remaining windows’ sessions accessible.
