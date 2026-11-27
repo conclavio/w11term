@@ -121,11 +121,24 @@ try {
     }
     Select-InstalledTool 'rg'
     $null = Wait-Until 'installed command opened its private Linux reference' {
-        (Find-Element 'Team rg notes') -and (Find-Element "Linux${dot}Custom page")
+        (Find-Element 'Team rg notes') -and (Find-Element "Linux${dot}Custom page") -and
+            (Find-Element "Managed SSH launcher${dot}portable") -and (Find-Element '/.local/bin/rg')
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    Wait-Platform 'Auto (Windows)'
+    $null = Wait-Until 'SSH launcher hidden on the PowerShell pane' {
+        (Find-Element 'rg') -and !(Find-Element '/.local/bin/rg')
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    $null = Wait-Until 'launcher returns on the same SSH connection' {
+        (Find-Element 'Team rg notes') -and (Find-Element '/.local/bin/rg')
     }
     Select-InstalledTool 'mdd'
     $null = Wait-Until 'installed mdd opened its bundled manual' {
-        (Find-Element 'mdd') -and (Find-Element "Linux${dot}w11term manual")
+        (Find-Element 'mdd') -and (Find-Element "Linux${dot}w11term manual") -and
+            (Find-Element '/.local/bin/mdd') -and !(Find-Element '/.local/bin/rg')
     }
     Click 'Install SSH tools'
     $null = Wait-Until 'configured profile manifest offered' { Find-Element (Join-Path $State 'fleet.json') }
@@ -188,7 +201,8 @@ try {
     Click 'Back to command reference'
     Select-InstalledTool 'netwatch'
     $null = Wait-Until 'newly installed tool is visible on the same pane' {
-        (Find-Element 'netwatch') -and (Find-Element "Linux${dot}w11term manual")
+        (Find-Element 'netwatch') -and (Find-Element "Linux${dot}w11term manual") -and
+            (Find-Element '/.local/bin/netwatch')
     }
     Click 'Install SSH tools'
     Click 'Bundle versions'
@@ -250,6 +264,9 @@ try {
     }
     Click 'Back to tool installer'
     Click 'Back to command reference'
+    $null = Wait-Until 'rollback invalidates the previously seen launcher' {
+        (Find-Element 'netwatch') -and !(Find-Element '/.local/bin/netwatch')
+    }
     Set-Field 'Search command reference' 'crew report'
     Click 'New private page'
     $manual = @'

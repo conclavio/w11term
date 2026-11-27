@@ -190,12 +190,6 @@ impl Panel {
         })
     }
 
-    fn page<'a>(&'a self, results: &[Key]) -> Option<(&'a catalog::Page, Platform)> {
-        let key = results.get(self.selected).or_else(|| results.first())?;
-        let page = self.library.as_ref()?.catalog.page(key)?;
-        Some((page, key.platform))
-    }
-
     fn private_page_target(&self, preferred: Platform) -> Option<(Key, bool)> {
         let library = self.library.as_ref().filter(|_| !self.loading)?;
         let name = catalog::query(&self.query);
@@ -251,6 +245,15 @@ impl Panel {
         });
         let preferred = self.platform.unwrap_or(auto);
         let results = self.results(preferred);
+        let selected = results.get(self.selected).or_else(|| results.first());
+        let page = selected.and_then(|key| {
+            let page = self.library.as_ref()?.catalog.page(key)?;
+            Some((page, key.platform))
+        });
+        let lookup = self
+            .tools
+            .as_ref()
+            .filter(|lookup| Some(lookup.pane) == tool_pane);
         let mut pieces = vec![KeyedView::new(
             "status",
             TextBlock::new()
@@ -265,7 +268,6 @@ impl Panel {
                 .text_wrapping(TextWrapping::Wrap),
         )];
         if let Some(target) = tool_pane {
-            let lookup = self.tools.as_ref().filter(|lookup| lookup.pane == target);
             pieces.push(KeyedView::new(
                 "installed-tools",
                 StackPanel::new().spacing(6.0).children((
@@ -338,7 +340,7 @@ impl Panel {
                     }),
             ));
         }
-        if let Some((page, platform)) = self.page(&results) {
+        if let Some((page, platform)) = page {
             pieces.extend([
                 KeyedView::new("title", TextBlock::new().font_size(22.0).text(&page.title)),
                 KeyedView::new(
@@ -352,6 +354,31 @@ impl Panel {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             ]);
+        }
+        if let Some(Ok(installed)) = lookup.and_then(|lookup| lookup.result.as_ref()) {
+            let command = match selected {
+                Some(key) if matches!(key.platform, LINUX | COMMON) => Some(key.name.as_str()),
+                None if self.exact && preferred == LINUX => Some(self.query.as_str()),
+                _ => None,
+            };
+            for tool in installed
+                .tools
+                .iter()
+                .filter(|tool| Some(tool.name.as_str()) == command)
+            {
+                pieces.push(KeyedView::new(
+                    format!("managed-launcher-{}", tool.bundle),
+                    StackPanel::new().spacing(4.0).children((
+                        TextBlock::new().text(format!("Managed SSH launcher · {}", tool.bundle)),
+                        TextBlock::new()
+                            .text(&tool.path)
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                    )),
+                ));
+            }
+        }
+        if let Some((page, _)) = page {
             if let Some(link) = &page.link {
                 let url = link.clone();
                 pieces.push(KeyedView::new(
