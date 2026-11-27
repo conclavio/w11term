@@ -8,9 +8,16 @@ const MANIFEST_LIMIT: text_preview::PreviewLimit = text_preview::PreviewLimit {
     limit: "the 32 KiB tool manifest limit",
 };
 const LOCK_READY: &[u8] = b"w11term-tools-locked-v1\n";
+const MAX_INSPECTED_BUNDLES: usize = 32;
 const MUTATING: &str =
     "Tool bundle activation did not finish. Preview again to check the active version.";
 type Ssh = russh::client::Handle<crate::ssh::Handler>;
+
+fn valid_tool_permissions(attrs: &FileAttributes) -> bool {
+    attrs
+        .permissions
+        .is_some_and(|mode| mode & 0o170000 == 0o100000 && mode & 0o100 != 0 && mode & 0o7022 == 0)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +43,12 @@ impl Release {
         Ok(digest_hex(digest))
     }
 
-    fn validate(&self, name: &str, architecture: UtilityArchitecture, id: &str) -> Result<()> {
+    fn validate(
+        &self,
+        name: &str,
+        architecture: Option<UtilityArchitecture>,
+        id: &str,
+    ) -> Result<()> {
         let valid_tools = (1..=16).contains(&self.tools.len())
             && self
                 .tools
@@ -52,13 +64,26 @@ impl Release {
             valid_tools
                 && self.tools.iter().map(|tool| tool.bytes).sum::<u64>() <= MAX_LOCAL_BUILD_BYTES
                 && self.name == name
-                && self.architecture == architecture
+                && architecture.is_none_or(|expected| self.architecture == expected)
                 && valid_bin_directory(&self.bin_directory)
                 && self.id()? == id,
             "Retained tool manifest does not match the reviewed version {id}"
         );
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InstalledTool {
+    pub name: String,
+    pub bundle: String,
+    pub path: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct InstalledTools {
+    pub tools: Vec<InstalledTool>,
+    pub skipped_bundles: usize,
 }
 
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
@@ -81,6 +106,90 @@ pub(super) struct InstallPlan {
 }
 
 impl Engine {
+    pub(in crate::sftp) async fn installed_tools(
+        &self,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<InstalledTools> {
+        let home = self.dotfile_home().await?;
+        let root = under_home(&home, STORE);
+        let directory = self.utility_directories(&home, STORE).await?;
+        ensure!(
+            directory.blocked_at.is_none(),
+            "Managed tool directory is blocked"
+        );
+        let mut installed = InstalledTools::default();
+        if !directory.create.is_empty() {
+            return Ok(installed);
+        }
+        let mut names = BTreeSet::new();
+        for entry in self.read_directory(&root, cancel, true).await? {
+            let name = entry.filename;
+            if safe_component(&name)
+                && !name.starts_with('.')
+                && EntryKind::from_permissions(entry.attrs.permissions)
+                    == Some(EntryKind::Directory)
+            {
+                names.insert(name);
+            }
+        }
+        installed.skipped_bundles = names.len().saturating_sub(MAX_INSPECTED_BUNDLES);
+        for name in names.into_iter().take(MAX_INSPECTED_BUNDLES) {
+            ensure!(
+                !cancel.is_some_and(TransferCancel::is_cancelled),
+                "Installed tools lookup cancelled"
+            );
+            match self.installed_bundle_tools(&home, &name).await {
+                Ok(tools) => installed.tools.extend(tools),
+                Err(error) if error.downcast_ref::<Error>().is_some_and(transport_error) => {
+                    return Err(error);
+                }
+                Err(_) => installed.skipped_bundles += 1,
+            }
+        }
+        installed
+            .tools
+            .sort_unstable_by(|a, b| (&a.name, &a.bundle).cmp(&(&b.name, &b.bundle)));
+        Ok(installed)
+    }
+
+    async fn installed_bundle_tools(&self, home: &str, name: &str) -> Result<Vec<InstalledTool>> {
+        let relative = format!("{STORE}/{name}");
+        let store = under_home(home, &relative);
+        let managed = self
+            .utility_directories(home, &format!("{relative}/versions"))
+            .await?;
+        let selector = self.utility_selector_state(&store, &managed).await?;
+        ensure!(!selector.conflict, "Invalid active tool bundle selector");
+        let Some(id) = &selector.version else {
+            return Ok(Vec::new());
+        };
+        let release = self
+            .utility_release_manifest(&store, name, None, id)
+            .await?;
+        let bin = self
+            .utility_directories(home, &release.bin_directory)
+            .await?;
+        let launchers = self.launcher_actions(home, &store, &release, &bin).await?;
+        let mut tools = Vec::new();
+        for (tool, (path, action)) in release.tools.into_iter().zip(launchers) {
+            if action != "managed" {
+                continue;
+            }
+            let executable = format!("{store}/versions/{id}/{}", tool.name);
+            if self.utility_lstat(&executable).await?.is_some_and(|attrs| {
+                valid_tool_permissions(&attrs) && attrs.size == Some(tool.bytes)
+            }) {
+                tools.push(InstalledTool {
+                    name: tool.name,
+                    bundle: name.to_owned(),
+                    path,
+                });
+            }
+        }
+        self.check_selector(&store, &selector).await?;
+        Ok(tools)
+    }
+
     pub(super) fn utility_review(&self, report: &Value) -> Result<String> {
         let mut digest = Sha256::new_with_prefix(self.dotfiles_review_scope.to_le_bytes());
         digest.update(b"w11term-tools-review-v1\0");
@@ -273,7 +382,7 @@ impl Engine {
                 .utility_release_manifest(
                     &plan.store,
                     &plan.release.name,
-                    plan.release.architecture,
+                    Some(plan.release.architecture),
                     active,
                 )
                 .await?;
@@ -421,7 +530,7 @@ impl Engine {
         id: &str,
     ) -> Result<Release> {
         let release = self
-            .utility_release_manifest(store, name, architecture, id)
+            .utility_release_manifest(store, name, Some(architecture), id)
             .await?;
         let directory = format!("{store}/versions/{id}");
         for tool in &release.tools {
@@ -435,7 +544,7 @@ impl Engine {
         &self,
         store: &str,
         name: &str,
-        architecture: UtilityArchitecture,
+        architecture: Option<UtilityArchitecture>,
         id: &str,
     ) -> Result<Release> {
         let directory = format!("{store}/versions/{id}");
@@ -462,7 +571,7 @@ impl Engine {
             return Ok(true);
         };
         let manifest = self
-            .utility_release_manifest(store, &release.name, release.architecture, active)
+            .utility_release_manifest(store, &release.name, Some(release.architecture), active)
             .await?;
         Ok(manifest.bin_directory == release.bin_directory)
     }
@@ -470,11 +579,7 @@ impl Engine {
     async fn verify_tool_file(&self, path: &str, tool: &StoredTool) -> Result<()> {
         let attrs = self.raw.lstat(path).await?.attrs;
         ensure!(
-            attrs
-                .permissions
-                .is_some_and(|mode| mode & 0o170000 == 0o100000
-                    && mode & 0o100 != 0
-                    && mode & 0o7022 == 0),
+            valid_tool_permissions(&attrs),
             "Managed executable permissions changed at {path}"
         );
         let actual = self

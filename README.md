@@ -69,6 +69,8 @@ Open **More → Command palette…** or press **Ctrl+Shift+K** to search actions
 
 Open **More → Command reference** to browse short tldr-pages manuals beside the terminal. Search for a command or subcommand, such as `rg` or `git checkout`. **Look up selected command** starts a search from highlighted terminal text. The platform defaults to Windows for local shells and Linux for WSL and SSH. Use the platform dropdown for a different remote OS. Each result identifies its platform and links to the command's documentation where available.
 
+In a connected SSH pane, **Installed SSH tools** lists active commands from w11term-managed bundles on that host. Choose a command to open its exact Linux or common page. Select **Installed SSH tools** again after a bundle update or rollback to recheck the remote launchers.
+
 Use **Settings → Edit profile → SSH tools** to sync an approved bundle of Linux utilities before login or reconnect. The profile can append its launcher directory to Bash or Zsh's `PATH`. The control CLI can preview, install, and roll back bundles on an existing SSH connection. [SSH tool bundle setup](CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
 Choose **Use Linux essentials** in the profile editor to prepare `rg`, `jq`, `dust`, and `hyperfine` for Linux x86-64 and ARM64. `w11term-cli fetch-tool-bundle` can also download pinned builds to the Windows cache. [Download a pinned SSH tool bundle](CONTROL.md#download-a-pinned-ssh-tool-bundle)

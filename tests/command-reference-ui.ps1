@@ -9,6 +9,17 @@ $selection = [System.Windows.Automation.SelectionPattern]::Pattern
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $dot = ' ' + [char]0xb7 + ' '
 $wire = [IO.File]::ReadAllText((Join-Path $State 'ssh-wire'))
+$privatePages = Join-Path $env:W11TERM_DATA_DIR 'command-reference/pages/linux'
+$null = [IO.Directory]::CreateDirectory($privatePages)
+[IO.File]::WriteAllText((Join-Path $privatePages 'rg.md'), @'
+# Team rg notes
+
+> Search code in the team workspace.
+
+- Search source:
+
+`rg {{pattern}} src`
+'@)
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -56,6 +67,7 @@ try {
         $field -and $field.Current.HasKeyboardFocus
     }
     Wait-Platform 'Auto (Windows)'
+    if (Find-Element 'Installed SSH tools' $button) { throw 'A PowerShell pane offered SSH tool lookup' }
     Search 'rg' 'Common'
     Search 'Get-ChildItem' 'Windows'
     Click 'Edit example 1'
@@ -72,6 +84,19 @@ try {
         $insert = Find-Element 'Insert into terminal' $button
         !$insert -or !$insert.Current.IsEnabled
     }
+    Click 'Installed SSH tools'
+    $tools = Wait-Until 'active remote tools offered lookup' { Find-Element 'Installed SSH commands' $combo }
+    $tools.SetFocus()
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $tools.GetCurrentPattern($expand).Expand()
+    $choice = Wait-Until 'installed rg from the portable bundle' {
+        Find-Element "rg${dot}portable" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'installed command opened its private Linux reference' {
+        (Find-Element 'Team rg notes') -and (Find-Element "Linux${dot}Custom page")
+    }
+    if ([IO.File]::ReadAllText($wire)) { throw 'Looking up a managed tool wrote to the SSH shell' }
     Search 'ip' 'Linux'
     Click 'Edit example 1'
     Set-Field 'Edit command example' 'ip address'

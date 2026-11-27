@@ -310,6 +310,10 @@ async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
     fs::write(remote.join("posix-rename-version"), "1").unwrap();
     fs::write(remote.join("transfer-trace"), []).unwrap();
     fs::write(remote.join("fixture-copy-data"), []).unwrap();
+    let empty = guarded_job(&pane, None, Operation::InstalledTools)
+        .await
+        .unwrap();
+    assert_eq!(empty, json!({"tools": [], "skipped_bundles": 0}));
     let version = |byte| {
         let mut binary = executable(UtilityArchitecture::X86_64, None);
         binary[255] = byte;
@@ -332,6 +336,17 @@ async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
                 executable(UtilityArchitecture::X86_64, None),
             )],
         });
+        if byte == 2 {
+            bundle.tools.push(UtilityTool {
+                name: "team-report".into(),
+                builds: vec![build(
+                    local.path(),
+                    "team-report",
+                    UtilityArchitecture::X86_64,
+                    executable(UtilityArchitecture::X86_64, None),
+                )],
+            });
+        }
         Operation::PreviewToolBundle { bundle }
     };
     let a = guarded_job(&pane, None, version(1)).await.unwrap();
@@ -400,6 +415,13 @@ async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
     );
     assert!(selector().ends_with(&format!("versions/{b_id}\n")));
     assert_eq!(launcher(), original_launcher);
+    let current = guarded_job(&pane, None, Operation::InstalledTools)
+        .await
+        .unwrap();
+    assert_eq!(
+        current["tools"][2],
+        json!({"name":"team-report", "bundle":"portable", "path":"/.local/bin/team-report"})
+    );
 
     fs::remove_file(local.path().join("rg")).unwrap();
     fs::remove_file(local.path().join("jq")).unwrap();
@@ -427,6 +449,22 @@ async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
     assert_eq!(restored["uploaded"], false);
     assert!(selector().ends_with(&format!("versions/{a_id}\n")));
     assert_eq!(launcher(), original_launcher);
+    let current = guarded_job(&pane, None, Operation::InstalledTools)
+        .await
+        .unwrap();
+    assert_eq!(current["tools"].as_array().unwrap().len(), 2);
+    assert!(
+        remote.join(".local/bin/team-report").exists(),
+        "rollback leaves an inactive launcher"
+    );
+    fs::remove_file(remote.join(".local/bin/jq")).unwrap();
+    let current = guarded_job(&pane, None, Operation::InstalledTools)
+        .await
+        .unwrap();
+    assert_eq!(
+        current["tools"],
+        json!([{"name":"rg", "bundle":"portable", "path":"/.local/bin/rg"}])
+    );
     let trace = fs::read_to_string(remote.join("transfer-trace")).unwrap();
     assert_eq!(
         trace
@@ -530,6 +568,20 @@ fn approved_login(source: Source, local: &std::path::Path) -> SshOptions {
         .prepare_profile_connection(&local.join("profiles.json"))
         .unwrap();
     restored
+}
+
+#[cfg(feature = "ui-smoke")]
+pub(super) fn reference_tool_profile(
+    source: Source,
+    local: &std::path::Path,
+    remote: &std::path::Path,
+) -> SshOptions {
+    probe_response(remote, "x86_64", "/", "/usr/bin:/.local/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    save_login_manifest(local, 1);
+    let mut profile = approved_login(source, local);
+    profile.tool_bundle.as_mut().unwrap().add_to_path = None;
+    profile
 }
 
 async fn wait_tool_login(pane: &Session, generation: u64, status: &str, path: Option<&str>) {

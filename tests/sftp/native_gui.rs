@@ -2557,18 +2557,18 @@ async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "looks up offline TLDR pages and inserts an edited example without submitting it"]
+#[ignore = "looks up offline TLDR and installed SSH tool pages and inserts an edited example without submitting it"]
 async fn native_command_reference_follows_powershell_and_ssh() {
-    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
-        unreachable!()
-    };
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (source, remote, _, server) = fixture_counting_accepts(false, 2, transports.clone()).await;
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join("ssh-wire"), trace.to_str().unwrap()).unwrap();
+    let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
     drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
     assert_eq!(fs::read(trace).unwrap(), b"ip address");
-    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(transports.load(Ordering::Relaxed), 1, "SSH TCP connections");
     server.abort();
 }
 

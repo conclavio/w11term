@@ -35,8 +35,9 @@ pub use dotfiles::{
 };
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{
-    UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityDownload, UtilityTool,
-    export_starter_tool_bundle, fetch_tool_bundle, prepare_starter_tool_bundle,
+    InstalledTool, InstalledTools, UtilityArchitecture, UtilityBuild, UtilityBundle,
+    UtilityDownload, UtilityTool, export_starter_tool_bundle, fetch_tool_bundle,
+    prepare_starter_tool_bundle,
 };
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
@@ -231,6 +232,7 @@ pub enum CopyDestination {
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
     Info,
+    InstalledTools,
     PreviewToolBundle {
         bundle: UtilityBundle,
     },
@@ -969,6 +971,9 @@ pub(crate) async fn run(
                 Operation::PreviewToolBundle { .. } => {
                     JobStage::Checking("Tool bundle preview did not finish")
                 }
+                Operation::InstalledTools => {
+                    JobStage::Checking("Installed tools lookup did not finish")
+                }
                 Operation::ApplyToolBundle { .. } | Operation::RollbackToolBundle { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
                 }
@@ -1511,6 +1516,7 @@ impl Engine {
             Info => {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
             }
+            InstalledTools => serde_json::to_value(self.installed_tools(cancel).await?)?,
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             ApplyToolBundle { bundle, review } => {
                 self.apply_utility_bundle(session, bundle, &review, stage)

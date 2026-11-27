@@ -1,5 +1,6 @@
 use super::*;
 use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, Platform, WINDOWS};
+use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod catalog;
 mod download;
@@ -22,6 +23,22 @@ pub enum Action {
     Link(String),
     Refresh,
     Loaded(Result<Loaded, String>),
+    ListTools(ToolPane),
+    ListedTools(Arc<()>, Result<InstalledTools, String>),
+    ToolPage(Arc<()>, usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ToolPane {
+    pane: u64,
+    generation: u64,
+}
+
+struct ToolLookup {
+    pane: ToolPane,
+    request: Arc<()>,
+    cancel: TransferCancel,
+    result: Option<Result<InstalledTools, String>>,
 }
 
 struct Draft {
@@ -31,6 +48,7 @@ struct Draft {
 
 struct Search {
     query: String,
+    exact: bool,
     platform: Platform,
     results: Vec<Key>,
 }
@@ -42,6 +60,7 @@ pub(super) struct Panel {
     library: Option<Loaded>,
     error: Option<String>,
     query: String,
+    exact: bool,
     platform: Option<Platform>,
     cached: RefCell<Option<Search>>,
     selected: usize,
@@ -49,6 +68,7 @@ pub(super) struct Panel {
     query_field: ElementRef<TextBox>,
     draft_field: ElementRef<TextBox>,
     focus: u64,
+    tools: Option<ToolLookup>,
 }
 
 fn pane_platform(source: Option<&Source>) -> Platform {
@@ -73,12 +93,16 @@ impl Panel {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.draft = None;
+        if let Some(lookup) = self.tools.take() {
+            lookup.cancel.cancel();
+        }
     }
 
     fn set_query(&mut self, text: String) {
         let text = text.chars().take(128).filter(|c| !c.is_control()).collect();
         if self.query != text {
             self.query = text;
+            self.exact = false;
             self.selected = 0;
             self.draft = None;
         }
@@ -86,25 +110,33 @@ impl Panel {
 
     fn results(&self, platform: Platform) -> std::cell::Ref<'_, [Key]> {
         let previous = self.cached.borrow();
-        if previous
-            .as_ref()
-            .is_none_or(|search| search.query != self.query || search.platform != platform)
-        {
+        if previous.as_ref().is_none_or(|search| {
+            search.query != self.query || search.platform != platform || search.exact != self.exact
+        }) {
             drop(previous);
             let results = self
                 .library
                 .as_ref()
                 .map(|loaded| {
-                    loaded
-                        .catalog
-                        .search(&self.query, platform)
-                        .into_iter()
-                        .map(|(key, _)| key.clone())
-                        .collect()
+                    if self.exact {
+                        loaded
+                            .catalog
+                            .exact(&self.query, platform)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        loaded
+                            .catalog
+                            .search(&self.query, platform)
+                            .into_iter()
+                            .map(|(key, _)| key.clone())
+                            .collect()
+                    }
                 })
                 .unwrap_or_default();
             self.cached.replace(Some(Search {
                 query: self.query.clone(),
+                exact: self.exact,
                 platform,
                 results,
             }));
@@ -124,6 +156,7 @@ impl Panel {
         &self,
         auto: Platform,
         origin: Option<clipboard_paste::Origin>,
+        tool_pane: Option<ToolPane>,
         ctx: &mut ViewContext<TerminalApp>,
     ) -> View {
         let target = if self
@@ -154,6 +187,23 @@ impl Panel {
                 })
                 .text_wrapping(TextWrapping::Wrap),
         )];
+        if let Some(target) = tool_pane {
+            let lookup = self.tools.as_ref().filter(|lookup| lookup.pane == target);
+            pieces.push(KeyedView::new(
+                "installed-tools",
+                Button::new()
+                    .is_enabled(lookup.is_none_or(|lookup| lookup.result.is_some()))
+                    .on_click(
+                        ctx.callback(move |_| Message::CommandReference(Action::ListTools(target))),
+                    )
+                    .content("Installed SSH tools"),
+            ));
+            if self.query.is_empty()
+                && let Some(lookup) = lookup
+            {
+                Self::tool_results(lookup, &mut pieces, ctx);
+            }
+        }
         if let Some(library) = &self.library {
             if results.is_empty() && !self.query.trim().is_empty() {
                 pieces.push(KeyedView::new(
@@ -350,9 +400,83 @@ impl Panel {
                 ),
             ])
     }
+
+    fn tool_results(
+        lookup: &ToolLookup,
+        pieces: &mut Vec<KeyedView>,
+        ctx: &ViewContext<TerminalApp>,
+    ) {
+        let status = match lookup.result.as_ref() {
+            None => Some("Reading installed tools…".into()),
+            Some(Err(error)) => Some(error.clone()),
+            Some(Ok(result)) => {
+                if !result.tools.is_empty() {
+                    let request = lookup.request.clone();
+                    pieces.push(KeyedView::new(
+                        "installed-commands",
+                        ComboBox::new()
+                            .automation_name("Installed SSH commands")
+                            .placeholder_text("Choose a command to look up")
+                            .items_source(
+                                result
+                                    .tools
+                                    .iter()
+                                    .map(|tool| format!("{} · {}", tool.name, tool.bundle)),
+                            )
+                            .selected_index(None)
+                            .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                                index.map_or(Message::ControlIdle, |index| {
+                                    Message::CommandReference(Action::ToolPage(
+                                        request.clone(),
+                                        index,
+                                    ))
+                                })
+                            })),
+                    ));
+                }
+                if result.skipped_bundles != 0 {
+                    Some(format!(
+                        "Managed bundles skipped ({})",
+                        result.skipped_bundles
+                    ))
+                } else {
+                    result
+                        .tools
+                        .is_empty()
+                        .then(|| "No active managed tools on this host".into())
+                }
+            }
+        };
+        if let Some(status) = status {
+            pieces.push(KeyedView::new(
+                "tools-status",
+                TextBlock::new()
+                    .text(status)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+    }
 }
 
 impl TerminalApp {
+    fn reference_tool_target(&self) -> Option<(ToolPane, &Session)> {
+        let Page::Terminal(live) = &self.tabs.active()?.page else {
+            return None;
+        };
+        let session = &live.session;
+        if !matches!(live.source, Source::Ssh(_)) {
+            return None;
+        }
+        let generation = session.ssh_connection_generation()?;
+        Some((
+            ToolPane {
+                pane: session.pane_id,
+                generation,
+            },
+            session,
+        ))
+    }
+
     fn reference_platform(&self) -> Platform {
         pane_platform(self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(&live.source),
@@ -392,6 +516,7 @@ impl TerminalApp {
                         .content(self.command_reference.view(
                             self.reference_platform(),
                             self.reference_origin(),
+                            self.reference_tool_target().map(|(target, _)| target),
                             ctx,
                         )),
                 ),
@@ -442,12 +567,73 @@ impl TerminalApp {
         );
     }
 
+    fn start_tool_lookup(&mut self, target: ToolPane, ctx: &ComponentContext<Self>) {
+        let Some((current, session)) = self.reference_tool_target() else {
+            return;
+        };
+        if current != target || !self.command_reference.open {
+            return;
+        }
+        let input = session.input.clone();
+        let panel = &mut self.command_reference;
+        if panel
+            .tools
+            .as_ref()
+            .is_some_and(|lookup| lookup.pane == current && lookup.result.is_none())
+        {
+            return;
+        }
+        if let Some(previous) = panel.tools.take() {
+            previous.cancel.cancel();
+        }
+        let request = Arc::new(());
+        let rejected = Message::CommandReference(Action::ListedTools(
+            request.clone(),
+            Err("Installed tools worker unavailable".into()),
+        ));
+        let cancel = TransferCancel::default();
+        panel.tools = Some(ToolLookup {
+            pane: target,
+            request: request.clone(),
+            cancel: cancel.clone(),
+            result: None,
+        });
+        panel.set_query(String::new());
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = (|| -> Result<InstalledTools, String> {
+                    if scope.is_cancelled() || cancel.is_cancelled() {
+                        return Err("Installed tools lookup cancelled".into());
+                    }
+                    let (reply, response) = tokio::sync::oneshot::channel();
+                    input
+                        .send(Command::Sftp(Job {
+                            expected_generation: Some(target.generation),
+                            operation: Operation::InstalledTools,
+                            deadline: tokio::time::Instant::now() + Duration::from_secs(12),
+                            reply,
+                            progress: None,
+                            cancel: Some(cancel),
+                        }))
+                        .map_err(|_| "SSH session has closed".to_owned())?;
+                    let value = response
+                        .blocking_recv()
+                        .map_err(|_| "Installed tools lookup interrupted".to_owned())??;
+                    serde_json::from_value(value).map_err(|error| error.to_string())
+                })();
+                Message::CommandReference(Action::ListedTools(request, result))
+            },
+            rejected,
+        );
+    }
+
     pub(super) fn command_reference_action(
         &mut self,
         action: Action,
         ctx: &ComponentContext<Self>,
     ) {
         let origin = self.reference_origin();
+        let tool_pane = self.reference_tool_target().map(|(target, _)| target);
         let selected = match action {
             Action::Selection(target) => target
                 .or_else(|| self.paste_origin())
@@ -518,6 +704,28 @@ impl TerminalApp {
             }
             Action::Link(link) => Self::open_link(&link),
             Action::Refresh => self.start_reference_load(true, ctx),
+            Action::ListTools(target) => self.start_tool_lookup(target, ctx),
+            Action::ListedTools(request, result) => {
+                if let Some(lookup) = &mut panel.tools
+                    && Arc::ptr_eq(&lookup.request, &request)
+                {
+                    lookup.result = Some(result);
+                }
+            }
+            Action::ToolPage(request, index) => {
+                if let Some(lookup) = panel.tools.as_ref()
+                    && Some(lookup.pane) == tool_pane
+                    && Arc::ptr_eq(&lookup.request, &request)
+                    && panel.query.is_empty()
+                    && let Some(Ok(tools)) = &lookup.result
+                    && let Some(tool) = tools.tools.get(index)
+                {
+                    panel.set_query(tool.name.clone());
+                    panel.exact = true;
+                    panel.platform = None;
+                    panel.focus = panel.focus.wrapping_add(1);
+                }
+            }
             Action::Loaded(result) => {
                 panel.loading = false;
                 match result {

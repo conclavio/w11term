@@ -128,6 +128,17 @@ impl Catalog {
         self.pages.get(key)
     }
 
+    pub(super) fn exact(&self, text: &str, preferred: Platform) -> Option<Key> {
+        let name = query(text);
+        [preferred, COMMON]
+            .into_iter()
+            .map(|platform| Key {
+                platform,
+                name: name.clone(),
+            })
+            .find(|key| self.pages.contains_key(key))
+    }
+
     fn archive(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() <= MAX_ARCHIVE,
@@ -360,6 +371,15 @@ mod tests {
             assert!(!page.examples.is_empty());
             assert!(page.link.is_some());
         }
+    }
+
+    #[test]
+    fn installed_tool_lookup_uses_an_exact_platform_or_common_page() {
+        let catalog = Catalog::archive(BUNDLED).unwrap();
+        assert_eq!(catalog.exact("ip", LINUX).unwrap().platform, LINUX);
+        assert_eq!(catalog.exact("rg", LINUX).unwrap().platform, COMMON);
+        assert!(catalog.exact("get-childitem", LINUX).is_none());
+        assert!(catalog.exact("git check", LINUX).is_none());
     }
 
     #[test]
