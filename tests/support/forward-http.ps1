@@ -32,12 +32,21 @@ function Expect-Closed($Client) {
     } finally { $Client.Dispose() }
 }
 function Expect-Refused([int]$Port) {
-    $client = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
-    try {
-        if (!$client.ConnectAsync($loopback, $Port).Wait(3000)) { throw "Local port $Port timed out instead of refusing" }
-        throw "Local port $Port still accepts clients"
-    } catch {
-        $cause = $_.Exception.GetBaseException()
-        if ($cause -isnot [Net.Sockets.SocketException] -or $cause.SocketErrorCode -ne 'ConnectionRefused') { throw }
-    } finally { $client.Dispose() }
+    # A slow Windows runner can miss the first loopback result. Require an
+    # actual refusal, and fail immediately if any probe still connects.
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $client = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
+        try {
+            if ($client.ConnectAsync($loopback, $Port).Wait(3000)) {
+                throw "Local port $Port still accepts clients"
+            }
+        } catch {
+            $cause = $_.Exception.GetBaseException()
+            if ($cause -is [Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq 'ConnectionRefused') {
+                return
+            }
+            throw
+        } finally { $client.Dispose() }
+    }
+    throw "Local port $Port timed out on all three attempts instead of refusing"
 }
