@@ -68,6 +68,7 @@ pub(super) enum Purpose {
     OpenSyscallTrace(PathBuf),
     SaveSyscallTrace(PathBuf),
     SyscallComparison,
+    CpuComparison,
     FlameGraph {
         path: PathBuf,
         export: bool,
@@ -594,6 +595,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
             | Purpose::GroupRunComparison(_)
             | Purpose::FolderComparison
             | Purpose::SyscallComparison
+            | Purpose::CpuComparison
             | Purpose::SftpTransferHistory
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
@@ -648,6 +650,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                         "syscall-comparison.txt",
                         w!("txt"),
                     ),
+                    Purpose::CpuComparison => (
+                        w!("Save CPU profile comparison"),
+                        "cpu-profile-comparison.json",
+                        w!("json"),
+                    ),
                     Purpose::SftpTransferHistory => (
                         w!("Save recent SFTP transfers as JSON"),
                         "sftp-transfers.json",
@@ -677,7 +684,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 dialog.SetDefaultExtension(extension)?;
                 // The atomic writer creates its own sibling file and reports any write errors.
                 options |= FOS_NOTESTFILECREATE;
-                if matches!(purpose, Purpose::SyscallComparison) {
+                if matches!(purpose, Purpose::SyscallComparison | Purpose::CpuComparison) {
                     options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                     options &= !FOS_OVERWRITEPROMPT;
                     None

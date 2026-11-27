@@ -7,6 +7,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $folded = Join-Path $State 'worker profile.folded'
 $after = Join-Path $State 'after recording.folded'
 $svgPath = Join-Path $State 'hot branch.svg'
+$comparisonPath = Join-Path $State 'filtered CPU comparison.json'
 $dot = ' ' + [char]0xb7 + ' '
 $arrow = ' ' + [char]0x2192 + ' '
 $callerArrow = ' ' + [char]0x2190 + ' '
@@ -97,6 +98,30 @@ try {
         (Find-Element ('1 of 3 changed stacks' + $dot + 'Page 1 of 1')) -and
         (Find-Element ('Before 3 samples (75.00%)' + $dot + 'After 5 samples (25.00%)' + $dot + '-50.00 pp')) -and
         (Find-Element ('worker' + $arrow + 'main' + $arrow + 'hot_loop'))
+    }
+    $edit = Find-Element 'Filter changed call stacks' ([System.Windows.Automation.ControlType]::Edit)
+    $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('read_file')
+    $null = Wait-Until 'the draft filter is ready to apply' {
+        $apply = Find-Element 'Apply filter' $button
+        $apply -and $apply.Current.IsEnabled
+    }
+    Click-GraphButton ('Export comparison' + [char]0x2026)
+    $dialog = Wait-Until 'owned comparison save dialog' { Find-OwnedDialog 'Save CPU profile comparison' }
+    $null = Wait-Until 'enter the comparison destination' {
+        [FixtureDialog]::SetFilename($dialog, $comparisonPath, 'cpu-profile-comparison.json')
+    }
+    $null = Wait-Until 'save the applied comparison' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'comparison JSON published' { [IO.File]::Exists($comparisonPath) }
+    $exported = [IO.File]::ReadAllText($comparisonPath) | ConvertFrom-Json
+    $row = $exported.changes[0]
+    if ($exported.schema_version -ne 1 -or $exported.filter -cne 'MAIN' -or
+        $exported.before.file_name -cne 'worker profile.folded' -or $exported.before.total_samples -ne 4 -or
+        $exported.after.file_name -cne 'after recording.folded' -or $exported.after.total_samples -ne 20 -or
+        $exported.total_changed_stacks -ne 3 -or $exported.changes.Count -ne 1 -or
+        ($row.stack -join ';') -cne 'worker;main;hot_loop' -or
+        $row.before_samples -ne 3 -or $row.after_samples -ne 5 -or
+        $row.before_percent -ne 75 -or $row.after_percent -ne 25 -or $row.delta_percentage_points -ne -50) {
+        throw "The export does not describe the applied CPU comparison. $([IO.File]::ReadAllText($comparisonPath))"
     }
     Click-GraphButton 'Back to flame graph'
     $null = Wait-Until 'return to the original zoom and symbol search' {

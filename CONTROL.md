@@ -1579,6 +1579,8 @@ Width represents samples. Callers are below their callees. Hover for the sample 
 
 Choose **Compare profiles** to use the open recording as **Before** and pick a second folded file as **After**. The offline comparison ranks exact call stacks by their change in share of total samples. Each sample contributes to its full recorded stack once. The detail shows both counts, their shares, and the change in percentage points. Use recordings of comparable workloads and sampling configurations to interpret the result. Filter by any symbol in the call chain, or choose **Back to flame graph** to resume the original zoom and search. [Normalizing CPU profiles](https://www.brendangregg.com/blog/2014-11-09/differential-flame-graphs.html)
 
+Choose **Export comparison…** to save a new JSON file. Schema version 1 records both source file names and sample totals, the applied filter, and every matching change in the same order as the viewer across all pages. Each row includes its full stack as an array of original symbols, both sample counts and shares, and the signed change in percentage points.
+
 ### Run SFTP operations
 
 ```powershell

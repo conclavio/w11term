@@ -120,6 +120,7 @@ impl Panel {
         &self,
         window_height: f64,
         active: Option<Connection>,
+        export_idle: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let send = |action: fn() -> Action| ctx.callback(move |_| message(action()));
@@ -142,7 +143,7 @@ impl Panel {
             ));
         }
         if let Some(comparison) = &self.comparison {
-            fields.extend(comparison.fields(idle, ctx));
+            fields.extend(comparison.fields(idle, export_idle, ctx));
         } else if let Some(capture) = &self.capture {
             fields.extend(capture.fields(active, idle, ctx));
         } else {
@@ -425,6 +426,7 @@ impl TerminalApp {
                         .content(self.flame_graph.view(
                             self.window_height,
                             self.profile_connection(),
+                            self.export.pending.is_none(),
                             ctx,
                         )),
                 ),
@@ -537,6 +539,14 @@ impl TerminalApp {
                     compare::Action::Query(query) => view.query = query,
                     compare::Action::Page(forward) => view.page(forward),
                     compare::Action::Select(comparison, id) => view.select(&comparison, id),
+                    compare::Action::Export => {
+                        let snapshot = compare::Snapshot::capture(view);
+                        self.begin_text_export(
+                            text_export::Subject::CpuComparison,
+                            move |output| snapshot.write(output),
+                            ctx,
+                        );
+                    }
                     compare::Action::Filter => {
                         let query = view.query.trim().to_owned();
                         if query == view.applied {

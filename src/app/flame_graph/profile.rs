@@ -216,14 +216,19 @@ impl Profile {
     }
 }
 
-pub(super) fn symbol_pattern(query: &str) -> Option<regex::Regex> {
+pub(super) fn symbol_query(query: &str) -> &str {
     let query = query.trim();
     let end = query
         .char_indices()
         .nth(256)
         .map_or(query.len(), |(index, _)| index);
-    (end != 0).then(|| {
-        regex::RegexBuilder::new(&regex::escape(&query[..end]))
+    &query[..end]
+}
+
+pub(super) fn symbol_pattern(query: &str) -> Option<regex::Regex> {
+    let query = symbol_query(query);
+    (!query.is_empty()).then(|| {
+        regex::RegexBuilder::new(&regex::escape(query))
             .case_insensitive(true)
             .build()
             .expect("short literal symbol search")

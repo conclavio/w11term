@@ -1,12 +1,16 @@
 use super::{profile::symbol_pattern, *};
 use std::cmp::{Ordering, Reverse};
 
+mod export;
+pub(super) use export::Snapshot;
+
 const PAGE_SIZE: usize = 16;
 
 pub enum Action {
     Back,
     Query(String),
     Filter,
+    Export,
     Page(bool),
     Select(Arc<Comparison>, usize),
 }
@@ -102,14 +106,19 @@ impl Comparison {
             .collect()
     }
 
-    fn delta(&self, change: &Change) -> String {
+    fn delta_points(&self, change: &Change) -> f64 {
         let denominator = u128::from(self.totals[0]) * u128::from(self.totals[1]);
         let pp = 100.0 * (change.magnitude as f64 / denominator as f64);
+        if change.increased { pp } else { -pp }
+    }
+
+    fn delta(&self, change: &Change) -> String {
+        let pp = self.delta_points(change);
         let sign = if change.increased { '+' } else { '-' };
-        if pp < 0.005 {
+        if pp.abs() < 0.005 {
             format!("{sign}<0.01 pp")
         } else {
-            format!("{sign}{pp:.2} pp")
+            format!("{pp:+.2} pp")
         }
     }
 }
@@ -126,16 +135,24 @@ impl Change {
         }
     }
 
-    fn stack(&self, comparison: &Comparison) -> String {
+    fn stack_frames<'a>(&self, comparison: &'a Comparison) -> (&'a Profile, Vec<usize>) {
         let (profile, mut id) = self.stack_end(comparison);
-        let mut names = Vec::new();
+        let mut ids = Vec::with_capacity(profile.frame(id).depth);
         while id != 0 {
-            let frame = profile.frame(id);
-            names.push(frame.name.as_str());
-            id = frame.parent;
+            ids.push(id);
+            id = profile.frame(id).parent;
         }
-        names.reverse();
-        let mut path = names.join(" → ");
+        ids.reverse();
+        (profile, ids)
+    }
+
+    fn stack(&self, comparison: &Comparison) -> String {
+        let (profile, ids) = self.stack_frames(comparison);
+        let mut path = ids
+            .into_iter()
+            .map(|id| profile.frame(id).name.as_str())
+            .collect::<Vec<_>>()
+            .join(" → ");
         if let Some((end, _)) = path.char_indices().nth(32768) {
             path.truncate(end);
             path.push('…');
@@ -148,7 +165,7 @@ pub struct ViewState {
     pub comparison: Arc<Comparison>,
     pub query: String,
     pub applied: String,
-    visible: Vec<usize>,
+    visible: Arc<[usize]>,
     page: usize,
     selected: Option<usize>,
 }
@@ -162,14 +179,14 @@ impl ViewState {
             query: String::new(),
             applied: String::new(),
             selected: visible.first().copied(),
-            visible,
+            visible: visible.into(),
             page: 0,
         }
     }
 
     pub fn filtered(&mut self, query: String, rows: Vec<usize>) {
         self.applied = query;
-        self.visible = rows;
+        self.visible = rows.into();
         self.page = 0;
         self.selected = self.visible.first().copied();
     }
@@ -201,7 +218,12 @@ impl ViewState {
         }
     }
 
-    pub fn fields(&self, idle: bool, ctx: &ViewContext<TerminalApp>) -> Vec<KeyedView> {
+    pub fn fields(
+        &self,
+        idle: bool,
+        export_idle: bool,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> Vec<KeyedView> {
         let send = |action: fn() -> Action| {
             ctx.callback(move |_| message(super::Action::Compare(action())))
         };
@@ -216,6 +238,13 @@ impl ViewState {
             ),
             text("compare-before", source(comparison, 0)),
             text("compare-after", source(comparison, 1)),
+            KeyedView::new(
+                "compare-export",
+                Button::new()
+                    .is_enabled(idle && export_idle)
+                    .on_click(send(|| Action::Export))
+                    .content("Export comparison…"),
+            ),
         ];
         if comparison.changes.is_empty() {
             fields.push(text(
