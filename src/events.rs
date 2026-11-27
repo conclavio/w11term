@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
+mod dotfile_sync;
 mod group_command;
 mod group_transcript;
 mod inbox;
@@ -18,6 +19,7 @@ mod kitty_notification;
 mod running_output;
 mod ssh_attempt;
 mod tool_bundle;
+pub use dotfile_sync::{DotfileSyncReport, DotfileSyncStatus};
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
@@ -232,6 +234,7 @@ struct State {
     notify_long_commands: bool,
     ssh_connection_phase: Option<SshConnectionPhase>,
     connected_generation: Option<u64>,
+    dotfile_sync: Option<Arc<DotfileSyncReport>>,
     tool_bundle_sync: Option<Arc<ToolBundleSyncReport>>,
     pane_process: PaneProcessState,
     ssh_attempts: ssh_attempt::Attempts,
@@ -1244,6 +1247,30 @@ impl Events {
         self.append(self.state.lock().unwrap(), kind, data, None);
     }
 
+    pub(crate) fn record_dotfile_sync(&self, report: DotfileSyncReport) {
+        const KIND: &str = "dotfiles-sync";
+        let data = (report.status != DotfileSyncStatus::NotRun)
+            .then(|| Self::bounded_data(KIND, serde_json::json!(&report)));
+        let mut state = self.state.lock().unwrap();
+        state.dotfile_sync = Some(Arc::new(report));
+        if let Some(data) = data {
+            Self::append_locked(&mut state, KIND, data, EventLinks::default());
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// The login outcome is retained independently of the event journal.
+    pub fn dotfile_sync(&self, generation: u64) -> Option<Arc<DotfileSyncReport>> {
+        self.state
+            .lock()
+            .unwrap()
+            .dotfile_sync
+            .as_ref()
+            .filter(|report| report.generation == generation)
+            .cloned()
+    }
+
     pub(crate) fn record_tool_bundle_sync(&self, report: ToolBundleSyncReport) {
         const KIND: &str = "tool-bundle-sync";
         let data = (report.status != ToolBundleSyncStatus::NotRun)
@@ -1496,6 +1523,53 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotfile_sync_report_survives_journal_eviction_and_is_scoped_to_the_connection() {
+        use crate::sftp::DotfileShell;
+
+        let events = Events::default();
+        events.record_dotfile_sync(DotfileSyncReport {
+            generation: 1,
+            shell: DotfileShell::Bash,
+            status: DotfileSyncStatus::Skipped,
+            detail: Some("Startup hook changed".into()),
+        });
+        let event = events.since(0).events.pop().unwrap();
+        assert_eq!(event.kind, "dotfiles-sync");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "generation": 1, "status": "skipped", "detail": "Startup hook changed",
+            })
+        );
+        for _ in 0..CAPACITY {
+            events.push("title", Value::Null);
+        }
+        assert!(
+            events
+                .since_kind(0, Some("dotfiles-sync"))
+                .events
+                .is_empty()
+        );
+        let report = events.dotfile_sync(1).unwrap();
+        assert_eq!(report.detail.as_deref(), Some("Startup hook changed"));
+        assert_eq!(report.shell, DotfileShell::Bash);
+        assert!(events.dotfile_sync(2).is_none());
+
+        let cursor = events.cursor();
+        events.record_dotfile_sync(DotfileSyncReport {
+            generation: 2,
+            shell: DotfileShell::Zsh,
+            status: DotfileSyncStatus::NotRun,
+            detail: Some("Alternate startup".into()),
+        });
+        assert!(events.dotfile_sync(1).is_none());
+        let report = events.dotfile_sync(2).unwrap();
+        assert_eq!(report.status, DotfileSyncStatus::NotRun);
+        assert_eq!(report.shell, DotfileShell::Zsh);
+        assert!(events.since(cursor).events.is_empty());
+    }
 
     #[test]
     fn tool_sync_report_survives_journal_eviction_and_matches_only_its_connection() {

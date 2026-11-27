@@ -1334,7 +1334,9 @@ The same approval can be set in the profile's `dotfiles` object in `profiles.jso
 }
 ```
 
-On an ordinary SSH shell launch or reconnect, w11term checks that the verified host, account, port, fingerprint, and SFTP home match this approval. It then reads the local bundle and stages updates before requesting the shell. Sync verifies the currently active files and hooks before replacing their selection. The operation has a ten-second deadline, and a skipped or timed-out sync leaves opening the SSH shell available. The pane status and its `dotfiles-sync` event explain the result. Sync applies to ordinary SSH shells. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
+On an ordinary SSH shell launch or reconnect, w11term checks that the verified host, account, port, fingerprint, and SFTP home match this approval. It then reads the local bundle and stages updates before requesting the shell. Sync verifies the currently active files and hooks before replacing their selection. The operation has a ten-second deadline, and a skipped or timed-out sync leaves opening the SSH shell available.
+
+**More → Command reference** shows the dotfile sync outcome for the active SSH connection. Open **Apply SSH dotfiles** for the reason when sync is skipped or unconfirmed. A rollback or disabled selector appears as **Paused by manual selection** on the next login. The `dotfiles-sync` event remains available to scripts. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths, and the installer explains why login sync was skipped for those sessions.
 
 A reviewed manual switch holds the chosen bundle on later logins, including when you choose `disabled`. Use a fresh manual preview and `apply-dotfiles` with the bundle you want to return to automatic sync.
 

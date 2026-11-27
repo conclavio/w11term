@@ -1,4 +1,5 @@
 use super::*;
+use crate::events::DotfileSyncStatus;
 
 mod tool_path;
 
@@ -16,7 +17,7 @@ const MAX_LISTED_VERSIONS: usize = 64;
 pub(crate) async fn sync_login_dotfiles(
     session: &russh::client::Handle<crate::ssh::Handler>,
     settings: &crate::options::DotfileSync,
-) -> Result<&'static str> {
+) -> Result<DotfileSyncStatus> {
     let shell = settings.shell;
     let zdotdir = settings.zdotdir.as_deref();
     validate_zdotdir(shell, zdotdir)?;
@@ -43,7 +44,7 @@ pub(crate) async fn sync_login_dotfiles(
             .as_deref()
             .is_some_and(selector_held)
     {
-        return Ok("held");
+        return Ok(DotfileSyncStatus::Held);
     }
 
     let bundle_path = settings.bundle.clone();
@@ -55,7 +56,7 @@ pub(crate) async fn sync_login_dotfiles(
         .dotfiles_plan_at(home, &bundle, shell, zdotdir)
         .await?;
     if plan.selector.before.as_deref().is_some_and(selector_held) {
-        return Ok("held");
+        return Ok(DotfileSyncStatus::Held);
     }
     if let Some(active) = plan.selector.active_version() {
         engine
@@ -69,9 +70,9 @@ pub(crate) async fn sync_login_dotfiles(
         .await
         .with_context(|| stage.interrupted())?;
     Ok(if changed.is_empty() {
-        "current"
+        DotfileSyncStatus::Current
     } else {
-        "updated"
+        DotfileSyncStatus::Updated
     })
 }
 

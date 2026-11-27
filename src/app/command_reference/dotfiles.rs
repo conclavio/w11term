@@ -1,6 +1,7 @@
 use super::*;
 use serde::Deserialize;
 use std::path::PathBuf;
+use w11term::events::DotfileSyncStatus;
 use w11term::sftp::{DotfileBundle, DotfileShell, validate_zdotdir};
 
 mod history;
@@ -150,6 +151,22 @@ fn detail(key: impl Into<String>, text: String) -> KeyedView {
     )
 }
 
+pub(super) fn login_summary(report: &DotfileSyncReport) -> String {
+    let shell = match report.shell {
+        DotfileShell::Bash => "Bash",
+        DotfileShell::Zsh => "Zsh",
+    };
+    let outcome = match report.status {
+        DotfileSyncStatus::Updated => "Updated",
+        DotfileSyncStatus::Current => "Already current",
+        DotfileSyncStatus::Held => "Paused by manual selection",
+        DotfileSyncStatus::Skipped => "Skipped",
+        DotfileSyncStatus::Unconfirmed => "Unconfirmed",
+        DotfileSyncStatus::NotRun => "Skipped for this session",
+    };
+    format!("Dotfiles at login · {shell} · {outcome}")
+}
+
 impl Installer {
     fn begin(&mut self, work: Work) -> Arc<()> {
         let ticket = Arc::new(());
@@ -177,7 +194,12 @@ impl Installer {
         Ok(path.map(str::to_owned))
     }
 
-    pub(super) fn view(&self, current: Option<ToolPane>, ctx: &ViewContext<TerminalApp>) -> View {
+    pub(super) fn view(
+        &self,
+        current: Option<ToolPane>,
+        login_sync: Option<&DotfileSyncReport>,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         let connected = current == Some(self.target);
         if let Some(history) = &self.history {
             return history.view(self, connected, ctx);
@@ -195,6 +217,14 @@ impl Installer {
                 TextBlock::new().text("Apply SSH dotfiles").font_size(18.0),
             ),
             detail("account", self.account.clone()),
+        ];
+        if let Some(report) = login_sync.filter(|_| connected) {
+            fields.push(detail("login-sync", login_summary(report)));
+            if let Some(reason) = &report.detail {
+                fields.push(detail("login-sync-detail", reason.clone()));
+            }
+        }
+        fields.extend([
             detail(
                 "source",
                 self.bundle.as_ref().map_or_else(
@@ -218,7 +248,7 @@ impl Installer {
                         .on_selection_changed(ctx.callback(|index| message(Action::Shell(index)))),
                 )),
             ),
-        ];
+        ]);
         if self.shell == DotfileShell::Zsh {
             fields.push(KeyedView::new(
                 "zdotdir",

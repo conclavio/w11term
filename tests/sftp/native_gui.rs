@@ -2768,6 +2768,36 @@ async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "shows the approved dotfiles login result for the pane's current SSH connection"]
+async fn native_command_reference_reports_the_current_dotfile_login_sync() {
+    let (source, remote, _, server) = fixture_connections(false, 2).await;
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut ssh = super::dotfiles::connect_options(source, state.path());
+    ssh.player.reconnect = true;
+    let bundle = &ssh.dotfiles.as_ref().unwrap().bundle;
+    fs::write(bundle, br#"{"version":1,"bash":"export EDITOR=vi"}"#).unwrap();
+
+    drive_mixed_gui("ssh-dotfile-login-status-ui.ps1", &ssh, state.path());
+
+    let selector = remote.path().join(".config/w11term/dotfiles/bash-current");
+    let active = fs::read_to_string(selector).unwrap();
+    let id = active.strip_suffix('\n').unwrap();
+    assert_eq!(id.len(), 64);
+    assert_eq!(
+        fs::read_to_string(
+            remote
+                .path()
+                .join(format!(".config/w11term/dotfiles/bash-{id}/prompt.sh"))
+        )
+        .unwrap(),
+        "export EDITOR=vi\n"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reviews and applies shell dotfiles on a connected SSH pane"]
 async fn native_command_reference_applies_reviewed_ssh_dotfiles() {
     let (source, remote, _, server) = fixture_server(false).await;

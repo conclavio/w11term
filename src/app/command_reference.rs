@@ -1,6 +1,8 @@
 use super::*;
 use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, PageSource, Platform, WINDOWS};
-use w11term::events::{ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus};
+use w11term::events::{
+    DotfileSyncReport, ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus,
+};
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod catalog;
@@ -230,6 +232,7 @@ impl Panel {
         origin: Option<clipboard_paste::Origin>,
         tool_pane: Option<ToolPane>,
         tool_sync: Option<&ToolBundleSyncReport>,
+        dotfile_sync: Option<&DotfileSyncReport>,
         ctx: &mut ViewContext<TerminalApp>,
     ) -> View {
         if let Some(editor) = &self.private_page {
@@ -239,7 +242,7 @@ impl Panel {
             return installer.view(tool_pane, tool_sync, ctx);
         }
         if let Some(installer) = &self.dotfiles {
-            return installer.view(tool_pane, ctx);
+            return installer.view(tool_pane, dotfile_sync, ctx);
         }
         let target = if self
             .draft
@@ -309,6 +312,14 @@ impl Panel {
                     "tool-login-sync",
                     TextBlock::new()
                         .text(tool_sync_summary(report))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+            if let Some(report) = dotfile_sync {
+                pieces.push(KeyedView::new(
+                    "dotfile-login-sync",
+                    TextBlock::new()
+                        .text(dotfiles::login_summary(report))
                         .text_wrapping(TextWrapping::Wrap),
                 ));
             }
@@ -652,6 +663,8 @@ impl TerminalApp {
         let tools = self.reference_tool_target();
         let tool_sync =
             tools.and_then(|(target, session)| session.events.tool_bundle_sync(target.generation));
+        let dotfile_sync =
+            tools.and_then(|(target, session)| session.events.dotfile_sync(target.generation));
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
             .keyed_children([
@@ -666,6 +679,7 @@ impl TerminalApp {
                             self.reference_origin(),
                             tools.map(|(target, _)| target),
                             tool_sync.as_deref(),
+                            dotfile_sync.as_deref(),
                             ctx,
                         )),
                 ),

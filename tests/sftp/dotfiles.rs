@@ -454,7 +454,7 @@ async fn dotfiles_review_cannot_be_used_on_another_ssh_pane() {
     second_server.abort();
 }
 
-fn connect_options(source: Source, local: &std::path::Path) -> SshOptions {
+pub(super) fn connect_options(source: Source, local: &std::path::Path) -> SshOptions {
     let Source::Ssh(mut options) = source else {
         unreachable!()
     };
@@ -518,6 +518,10 @@ async fn login(options: &SshOptions, selector: &str, expected: &str) -> Session 
         .find(|e| e.kind == "dotfiles-sync")
         .unwrap();
     assert_eq!(sync.data["status"], expected, "{sync:?}");
+    let generation = pane.ssh_connection_generation().unwrap();
+    let report = pane.events.dotfile_sync(generation).unwrap();
+    assert_eq!(report.shell, DotfileShell::Bash);
+    assert_eq!(serde_json::to_value(&*report).unwrap(), sync.data);
     pane
 }
 
