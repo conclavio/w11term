@@ -96,7 +96,7 @@ pub struct ToolBundleVersions {
     pub omitted_versions: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RetainedToolVersion {
     pub bundle: String,
     pub bundle_sha256: String,
@@ -131,8 +131,10 @@ impl Engine {
     ) -> Result<InstalledTools> {
         let home = self.dotfile_home().await?;
         let names = self.tool_bundle_names(&home, cancel).await?;
-        let mut installed = InstalledTools::default();
-        installed.skipped_bundles = names.len().saturating_sub(MAX_INSPECTED_BUNDLES);
+        let mut installed = InstalledTools {
+            skipped_bundles: names.len().saturating_sub(MAX_INSPECTED_BUNDLES),
+            ..Default::default()
+        };
         for name in names.into_iter().take(MAX_INSPECTED_BUNDLES) {
             ensure!(
                 !cancel.is_some_and(TransferCancel::is_cancelled),
