@@ -59,6 +59,21 @@ function File-Sha256([string]$Path) {
         $hash.Dispose()
     }
 }
+function Select-ToolPreset([string]$Name) {
+    $presets = Wait-Until 'built-in tool preset selector' { Find-Element 'Built-in Linux tool bundle' $combo }
+    $presets.SetFocus()
+    $pattern = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $popup = $presets.GetCurrentPattern($pattern)
+    $popup.Expand()
+    $choice = Wait-Until "visible tool preset '$Name'" { Find-Element $Name $item -Visible }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+function Tool-Check([string]$Name) {
+    $type = [System.Windows.Automation.ControlType]::CheckBox
+    $check = Wait-Until "checkbox for '$Name'" { Find-Element "Include $Name" $type }
+    return $check.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+}
 function Pick-Key([string]$Name) {
     Click $browseLabel
     $dialog = Wait-Until 'owned SSH key picker' { Find-OwnedDialog $pickTitle }
@@ -213,33 +228,46 @@ try {
         !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle)
     }
 
-    $presets = Wait-Until 'built-in tool preset selector' { Find-Element 'Built-in Linux tool bundle' $combo }
-    $presets.SetFocus()
-    $presetPopup = $presets.GetCurrentPattern($expand)
-    $presetPopup.Expand()
-    $admin = Wait-Until 'visible admin tools preset' { Find-Element 'Linux admin tools' $item -Visible }
-    $admin.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    if ($presetPopup.Current.ExpandCollapseState -eq 'Expanded') { $presetPopup.Collapse() }
+    Select-ToolPreset 'Linux admin tools'
     $null = Wait-Until 'admin preset selected without modifying the custom bundle' {
         (Find-Element 'Use Linux admin tools' $button) -and
             [FixtureDialog]::SameFile($toolBundle, (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value)
     }
 
+    Select-ToolPreset 'Custom tools'
+    $null = Wait-Until 'empty selection cannot start a download' {
+        $use = Find-Element 'Use selected tools' $button
+        $use -and !$use.Current.IsEnabled
+    }
+    foreach ($tool in @('rg','jq','mdd')) {
+        $check = Tool-Check $tool
+        if ($check.Current.ToggleState -ne 'Off') { throw "Fresh custom selection preselected $tool" }
+        $check.Toggle()
+        $null = Wait-Until "tool '$tool' selected" { (Tool-Check $tool).Current.ToggleState -eq 'On' }
+    }
+    $null = Wait-Until 'three-tool selection enables the download' {
+        (Find-Element 'Use selected tools' $button).Current.IsEnabled
+    }
+    if (![FixtureDialog]::SameFile($toolBundle, (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value)) {
+        throw 'Toggling the catalog selection prematurely changed the manifest'
+    }
+
     if ($env:W11TERM_VERIFY_STARTER_DOWNLOAD -eq '1') {
-        Click 'Use Linux admin tools'
+        Click 'Use selected tools'
         Click 'Cancel tool download'
         $null = Wait-Until 'starter download cancelled' { Find-Element 'Tool download cancelled' }
         $toolField = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
         if (![FixtureDialog]::SameFile($toolBundle, $toolField)) { throw 'Cancelling changed the selected manifest' }
 
-        Click 'Use Linux admin tools'
-        $null = Wait-Until 'verified admin builds ready' {
-            Find-Element 'Linux admin tools is ready. Review the bundle to approve sync.'
+        Click 'Use selected tools'
+        $null = Wait-Until 'selected builds ready' {
+            Find-Element 'Selected tools are ready. Review the bundle to approve sync.'
         }
-        $adminManifest = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
-        if ([IO.Path]::GetFileName($adminManifest) -cne 'linux-admin-tools.json') { throw 'Admin manifest was not selected' }
-        $starter = [IO.File]::ReadAllText($adminManifest) | ConvertFrom-Json
-        if (@($starter.tools.builds).Count -ne 18) { throw 'Expected 18 builds in the admin manifest' }
+        $selectedManifest = (Find-Element 'Tool bundle manifest' $edit).GetCurrentPattern($value).Current.Value
+        $starter = [IO.File]::ReadAllText($selectedManifest) | ConvertFrom-Json
+        if (($starter.tools.name -join ',') -cne 'rg,jq,mdd' -or @($starter.tools.builds).Count -ne 6) {
+            throw 'The custom manifest did not contain just the six selected tool builds'
+        }
         foreach ($build in $starter.tools.builds) {
             $cached = Join-Path $env:W11TERM_DATA_DIR "tools/cache/v1/$($build.sha256)"
             if ((File-Sha256 $cached) -cne $build.sha256) {
@@ -249,6 +277,8 @@ try {
         if (([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle) {
             throw 'Selecting the starter authorized deployment before review'
         }
+        $cacheDirectory = Join-Path $env:W11TERM_DATA_DIR 'tools/cache/v1'
+        if ([IO.Directory]::GetFiles($cacheDirectory).Count -ne 6) { throw 'The picker cached an unselected build' }
         Click 'Review tool bundle'
         $review = 'linux-essentials ' + [char]0x2192 + ' test@example.test:22 ' + [char]0x00b7 + ' /home/test/.local/bin'
         $null = Wait-Until 'starter destination reviewed' { Find-Element $review }
@@ -257,8 +287,22 @@ try {
         $null = Wait-Until 'starter approval saved' {
             $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
             $tools.name -ceq 'linux-essentials' -and $tools.add_to_path.shell -ceq 'bash' -and
-                [FixtureDialog]::SameFile($adminManifest, $tools.bundle)
+                [FixtureDialog]::SameFile($selectedManifest, $tools.bundle)
         }
+
+        $null = $app.CloseMainWindow()
+        if (!$app.WaitForExit(5000)) { throw 'w11term did not close after saving' }
+        $app.Dispose()
+        $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+        $window = Wait-InputWindow
+        Click 'Tab menu'
+        Click 'Settings' $menu
+        Click 'Edit profile fixture'
+        Set-NativeExpansion 'SSH tools' $true
+        foreach ($tool in @('rg','jq','mdd')) {
+            if ((Tool-Check $tool).Current.ToggleState -ne 'On') { throw "Reopened profile lost $tool" }
+        }
+        if ((Tool-Check 'netwatch').Current.ToggleState -ne 'Off') { throw 'Reopened profile selected an omitted tool' }
     }
 } finally {
     if (!$app.HasExited) {

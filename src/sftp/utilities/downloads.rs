@@ -1,6 +1,7 @@
 use super::*;
 use std::borrow::Cow;
 use std::io::{Cursor, Write};
+use std::sync::LazyLock;
 
 const MAX_RESOURCE: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_PLAIN: u64 = 256 * 1024 * 1024;
@@ -9,43 +10,111 @@ const STARTER_MANIFEST: &[u8] = include_bytes!("../../../examples/tool-bundles/e
 const ADMIN_ADDITIONS: &[u8] =
     include_bytes!("../../../examples/tool-bundles/admin-additions.json");
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+const CUSTOM_PREFIX: &str = "linux-tools-";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ToolBundlePreset {
     #[default]
     Essentials,
     Admin,
+    Custom(BTreeSet<String>),
 }
 
 impl ToolBundlePreset {
-    pub const ALL: [Self; 2] = [Self::Essentials, Self::Admin];
+    pub const LABELS: [&str; 3] = ["Linux essentials", "Linux admin tools", "Custom tools"];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
+        Self::LABELS[self.index()]
+    }
+
+    pub fn index(&self) -> usize {
         match self {
-            Self::Essentials => "Linux essentials",
-            Self::Admin => "Linux admin tools",
+            Self::Essentials => 0,
+            Self::Admin => 1,
+            Self::Custom(_) => 2,
         }
     }
 
-    fn bytes(self) -> Result<Cow<'static, [u8]>> {
+    pub fn from_managed_path(path: &Path) -> Option<Self> {
+        let digest = path.parent()?;
+        let directory = digest.parent()?;
+        let hash = digest.file_name()?.to_str()?;
+        if directory.file_name()? != "bundles"
+            || directory.parent()?.file_name()? != "tools"
+            || normalize_sha256(hash).ok()?.as_str() != hash
+        {
+            return None;
+        }
+        match path.file_name()?.to_str()? {
+            "linux-essentials.json" => Some(Self::Essentials),
+            "linux-admin-tools.json" => Some(Self::Admin),
+            file => {
+                // The visible filename is enough to restore the editor offline.
+                let names = file.strip_prefix(CUSTOM_PREFIX)?.strip_suffix(".json")?;
+                let tools: BTreeSet<_> = names.split(',').map(str::to_owned).collect();
+                tools
+                    .iter()
+                    .all(|name| builtin_tool_names().contains(name))
+                    .then_some(Self::Custom(tools))
+            }
+        }
+    }
+
+    fn bytes(&self) -> Result<Cow<'static, [u8]>> {
         match self {
             Self::Essentials => Ok(Cow::Borrowed(STARTER_MANIFEST)),
-            Self::Admin => {
-                // Share launcher ownership and rollback history with Linux essentials.
-                let mut bundle: UtilityBundle = serde_json::from_slice(STARTER_MANIFEST)?;
-                let additions: Vec<UtilityTool> = serde_json::from_slice(ADMIN_ADDITIONS)?;
-                bundle.tools.extend(additions);
+            Self::Admin | Self::Custom(_) => {
+                let mut bundle = tool_catalog()?;
+                if let Self::Custom(names) = self {
+                    ensure!(!names.is_empty(), "Choose at least one built-in tool");
+                    for name in names {
+                        ensure!(
+                            bundle.tools.iter().any(|tool| tool.name == *name),
+                            "Unknown built-in tool {name}"
+                        );
+                    }
+                    bundle.tools.retain(|tool| names.contains(&tool.name));
+                }
                 bundle.validate()?;
                 Ok(Cow::Owned(serde_json::to_vec_pretty(&bundle)?))
             }
         }
     }
 
-    fn filename(self) -> &'static str {
+    fn filename(&self) -> String {
         match self {
-            Self::Essentials => "linux-essentials.json",
-            Self::Admin => "linux-admin-tools.json",
+            Self::Essentials => "linux-essentials.json".into(),
+            Self::Admin => "linux-admin-tools.json".into(),
+            Self::Custom(tools) => {
+                let names = tools
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{CUSTOM_PREFIX}{names}.json")
+            }
         }
     }
+}
+
+fn tool_catalog() -> Result<UtilityBundle> {
+    // Share remote launcher ownership and rollback history across the built-in selections.
+    let mut bundle: UtilityBundle = serde_json::from_slice(STARTER_MANIFEST)?;
+    let additions: Vec<UtilityTool> = serde_json::from_slice(ADMIN_ADDITIONS)?;
+    bundle.tools.extend(additions);
+    Ok(bundle)
+}
+
+pub fn builtin_tool_names() -> &'static [String] {
+    static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+        tool_catalog()
+            .expect("valid embedded tool catalog")
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    });
+    &NAMES
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -216,7 +285,7 @@ pub(super) fn cache_dir() -> Result<PathBuf> {
 }
 
 /// Export a built-in Linux manifest without overwriting a file.
-pub fn export_builtin_tool_bundle(path: &Path, preset: ToolBundlePreset) -> Result<PathBuf> {
+pub fn export_builtin_tool_bundle(path: &Path, preset: &ToolBundlePreset) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
     write_builtin_manifest(&path, &preset.bytes()?, false, preset)?;
     Ok(path)
@@ -224,7 +293,7 @@ pub fn export_builtin_tool_bundle(path: &Path, preset: ToolBundlePreset) -> Resu
 
 /// Select a version of a built-in manifest and cache its builds on Windows.
 pub fn prepare_builtin_tool_bundle(
-    preset: ToolBundlePreset,
+    preset: &ToolBundlePreset,
     cancelled: impl Fn() -> bool,
 ) -> Result<PathBuf> {
     ensure!(!cancelled(), "Tool download cancelled");
@@ -242,7 +311,7 @@ pub fn prepare_builtin_tool_bundle(
 fn managed_builtin_manifest(
     data: &Path,
     bytes: &[u8],
-    preset: ToolBundlePreset,
+    preset: &ToolBundlePreset,
 ) -> Result<PathBuf> {
     // Keep each app version's pins available to profiles that already reference them.
     let digest = digest_hex(Sha256::new_with_prefix(bytes));
@@ -257,7 +326,7 @@ fn write_builtin_manifest(
     path: &Path,
     bytes: &[u8],
     reuse: bool,
-    preset: ToolBundlePreset,
+    preset: &ToolBundlePreset,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -397,7 +466,7 @@ mod tests {
     fn managed_starter_reuses_only_the_exact_builtin_manifest() {
         let data = tempfile::tempdir().unwrap();
         let preset = ToolBundlePreset::Essentials;
-        let path = managed_builtin_manifest(data.path(), STARTER_MANIFEST, preset).unwrap();
+        let path = managed_builtin_manifest(data.path(), STARTER_MANIFEST, &preset).unwrap();
         assert_eq!(
             path.parent().unwrap().file_name().unwrap(),
             digest(STARTER_MANIFEST).as_str()
@@ -405,20 +474,39 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), STARTER_MANIFEST);
         assert_eq!(UtilityBundle::load(&path).unwrap().name, "linux-essentials");
         assert_eq!(
-            managed_builtin_manifest(data.path(), STARTER_MANIFEST, preset).unwrap(),
+            managed_builtin_manifest(data.path(), STARTER_MANIFEST, &preset).unwrap(),
             path
         );
 
         let admin = ToolBundlePreset::Admin;
         let expanded =
-            managed_builtin_manifest(data.path(), &admin.bytes().unwrap(), admin).unwrap();
+            managed_builtin_manifest(data.path(), &admin.bytes().unwrap(), &admin).unwrap();
         assert_ne!(path.parent(), expanded.parent());
         assert_eq!(std::fs::read(&path).unwrap(), STARTER_MANIFEST);
 
         std::fs::write(&path, "user edit").unwrap();
-        let error = managed_builtin_manifest(data.path(), STARTER_MANIFEST, preset).unwrap_err();
+        let error = managed_builtin_manifest(data.path(), STARTER_MANIFEST, &preset).unwrap_err();
         assert!(error.to_string().contains("manifest was modified"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "user edit");
+    }
+
+    #[test]
+    fn managed_custom_choice_can_be_recognized_when_a_profile_is_reopened() {
+        let data = tempfile::tempdir().unwrap();
+        let preset = ToolBundlePreset::Custom(["mdd".to_owned(), "rg".to_owned()].into());
+        let bytes = preset.bytes().unwrap();
+        let path = managed_builtin_manifest(data.path(), &bytes, &preset).unwrap();
+        let name = path.file_name().unwrap();
+        assert_eq!(name, "linux-tools-mdd,rg.json");
+        assert_eq!(ToolBundlePreset::from_managed_path(&path), Some(preset));
+        assert_eq!(
+            ToolBundlePreset::from_managed_path(&data.path().join(name)),
+            None
+        );
+        assert_eq!(
+            ToolBundlePreset::from_managed_path(&path.with_file_name("linux-tools-unknown.json")),
+            None
+        );
     }
 
     fn digest(bytes: &[u8]) -> String {

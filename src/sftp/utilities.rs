@@ -8,8 +8,8 @@ mod install;
 mod login;
 use build::{LibcVersion, Verified};
 pub use downloads::{
-    ToolBundlePreset, UtilityDownload, export_builtin_tool_bundle, fetch_tool_bundle,
-    prepare_builtin_tool_bundle,
+    ToolBundlePreset, UtilityDownload, builtin_tool_names, export_builtin_tool_bundle,
+    fetch_tool_bundle, prepare_builtin_tool_bundle,
 };
 use install::{InstallPlan, Release, StoredTool};
 pub use install::{InstalledTool, InstalledTools};

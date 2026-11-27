@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use w11term::{
     options::{ToolPath, ToolSync},
     sftp::{
-        DotfileShell, ToolBundlePreset, UtilityBundle, prepare_builtin_tool_bundle,
-        validate_dotfiles_home, validate_zdotdir,
+        DotfileShell, ToolBundlePreset, UtilityBundle, builtin_tool_names,
+        prepare_builtin_tool_bundle, validate_dotfiles_home, validate_zdotdir,
     },
 };
 
@@ -26,6 +26,7 @@ pub enum Action {
     Browse,
     Picked(Arc<()>, Result<Option<String>, String>),
     Preset(Option<usize>),
+    Tool(&'static str, bool),
     Starter,
     StarterFinished(Arc<()>, Result<String, String>),
     Review,
@@ -71,6 +72,7 @@ impl Editor {
                 });
         Self {
             bundle: settings.bundle.to_string_lossy().into_owned(),
+            preset: ToolBundlePreset::from_managed_path(&settings.bundle).unwrap_or_default(),
             home: settings.home.clone(),
             fingerprint: settings.fingerprint.clone(),
             zdotdir,
@@ -185,6 +187,10 @@ impl Editor {
             "Tool sync off".into()
         };
         let idle = self.work.is_none() && self.starter.is_none();
+        let custom = match &self.preset {
+            ToolBundlePreset::Custom(names) => Some(names),
+            _ => None,
+        };
         let mut fields = vec![
             KeyedView::new(
                 "bundle",
@@ -211,25 +217,54 @@ impl Editor {
                         ComboBox::new()
                             .automation_name("Built-in Linux tool bundle")
                             .is_enabled(idle)
-                            .items_source(ToolBundlePreset::ALL.map(ToolBundlePreset::label))
-                            .selected_index(
-                                ToolBundlePreset::ALL
-                                    .iter()
-                                    .position(|preset| *preset == self.preset),
-                            )
+                            .items_source(ToolBundlePreset::LABELS)
+                            .selected_index(self.preset.index())
                             .on_selection_changed(ctx.callback(move |index| {
                                 Message::ProfileTools(id, Action::Preset(index))
                             })),
                         Button::new()
-                            .is_enabled(self.work.is_none())
+                            .is_enabled(
+                                self.work.is_none() && custom.is_none_or(|names| !names.is_empty()),
+                            )
                             .on_click(send(Action::Starter))
                             .content(if self.starter.is_some() {
                                 "Cancel tool download".into()
+                            } else if custom.is_some() {
+                                "Use selected tools".into()
                             } else {
                                 format!("Use {}", self.preset.label())
                             }),
                     )),
             ),
+        ];
+        if let Some(selected) = custom {
+            let names = builtin_tool_names();
+            let columns = 3;
+            fields.push(KeyedView::new(
+                "custom-tools",
+                Grid::new()
+                    .columns(vec![GridLength::Star(1.0); columns])
+                    .rows(vec![GridLength::Auto; names.len().div_ceil(columns)])
+                    .column_spacing(8.0)
+                    .keyed_children(names.iter().enumerate().map(|(index, name)| {
+                        let name = name.as_str();
+                        KeyedView::new(
+                            name,
+                            CheckBox::new()
+                                .grid_row((index / columns) as i32)
+                                .grid_column((index % columns) as i32)
+                                .automation_name(format!("Include {name}"))
+                                .is_enabled(idle)
+                                .is_checked(selected.contains(name))
+                                .on_is_checked_changed(ctx.callback(move |value| {
+                                    Message::ProfileTools(id, Action::Tool(name, value))
+                                }))
+                                .content(name),
+                        )
+                    })),
+            ));
+        }
+        fields.extend([
             KeyedView::new(
                 "home",
                 field(
@@ -261,7 +296,7 @@ impl Editor {
                         })),
                 )),
             ),
-        ];
+        ]);
         if self.path_mode == 2 {
             fields.push(KeyedView::new(
                 "zdotdir",
@@ -345,11 +380,38 @@ impl TerminalApp {
             Action::Preset(Some(index))
                 if draft.tool_bundle.work.is_none() && draft.tool_bundle.starter.is_none() =>
             {
-                if let Some(preset) = ToolBundlePreset::ALL.get(index) {
-                    draft.tool_bundle.preset = *preset;
+                let editor = &mut draft.tool_bundle;
+                if index == editor.preset.index() {
+                    return;
                 }
+                editor.preset = match index {
+                    0 => ToolBundlePreset::Essentials,
+                    1 => ToolBundlePreset::Admin,
+                    2 => match ToolBundlePreset::from_managed_path(Path::new(&editor.bundle)) {
+                        Some(preset @ ToolBundlePreset::Custom(_)) => preset,
+                        _ => ToolBundlePreset::Custom(Default::default()),
+                    },
+                    _ => return,
+                };
+                editor.edited();
             }
             Action::Preset(_) => (),
+            Action::Tool(name, checked) => {
+                let editor = &mut draft.tool_bundle;
+                if editor.work.is_none()
+                    && editor.starter.is_none()
+                    && let ToolBundlePreset::Custom(names) = &mut editor.preset
+                {
+                    let changed = if checked {
+                        names.insert(name.to_owned())
+                    } else {
+                        names.remove(name)
+                    };
+                    if changed {
+                        editor.edited();
+                    }
+                }
+            }
             Action::Text(field, value) => {
                 let editor = &mut draft.tool_bundle;
                 let slot = match field {
@@ -418,7 +480,7 @@ impl TerminalApp {
                     return;
                 }
                 editor.feedback = None;
-                let preset = editor.preset;
+                let preset = editor.preset.clone();
                 let request = Arc::new(());
                 let rejected = Message::ProfileTools(
                     id,
@@ -430,7 +492,7 @@ impl TerminalApp {
                 let work_request = request.clone();
                 let task = ctx.spawn_background_with_rejection(
                     move |cancel| {
-                        let result = prepare_builtin_tool_bundle(preset, || cancel.is_cancelled())
+                        let result = prepare_builtin_tool_bundle(&preset, || cancel.is_cancelled())
                             .and_then(|path| {
                                 path.into_os_string().into_string().map_err(|_| {
                                     anyhow::anyhow!(
@@ -458,10 +520,16 @@ impl TerminalApp {
                     Ok(path) => {
                         editor.bundle = path;
                         editor.edited();
-                        editor.feedback = Some(format!(
-                            "{} is ready. Review the bundle to approve sync.",
-                            editor.preset.label()
-                        ));
+                        editor.feedback = Some(match &editor.preset {
+                            ToolBundlePreset::Custom(_) => {
+                                "Selected tools are ready. Review the bundle to approve sync."
+                                    .into()
+                            }
+                            preset => format!(
+                                "{} is ready. Review the bundle to approve sync.",
+                                preset.label()
+                            ),
+                        });
                     }
                     Err(error) => editor.feedback = Some(error),
                 }

@@ -1329,15 +1329,17 @@ A reviewed manual switch holds the chosen bundle on later logins, including when
 
 ### Download a pinned SSH tool bundle
 
-In **Settings → Edit profile → SSH tools**, select **Linux essentials** or **Linux admin tools** and choose **Use** for that preset. The download runs in the background and selects the prepared manifest when it finishes. Review the host and account, approve sync, and save the profile. Each preset revision has its own local manifest, so earlier approvals keep their pins until you select and approve a new version.
+In **Settings → Edit profile → SSH tools**, select a preset or pick individual utilities under **Custom tools**. Choose **Use selected tools** for a custom set. The download runs in the background and selects the prepared manifest when it finishes. Review the host and account, approve sync, and save the profile. Each selection and preset revision has its own local manifest, so earlier approvals keep their pins until you select and approve a new version.
 
-**Linux essentials** includes `rg`, `jq`, `dust`, and `hyperfine`. **Linux admin tools** adds `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. Both presets share the `linux-essentials` bundle name and `.local/bin` launchers for updates and rollback. Linux `x86_64` and `aarch64` are supported. Omit `--architecture` to fetch both. Use manual preview and apply for a first transfer that needs more than the login sync deadline.
+**Linux essentials** includes `rg`, `jq`, `dust`, and `hyperfine`. **Linux admin tools** adds `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. The presets and custom selections share the `linux-essentials` bundle name and `.local/bin` launchers for updates and rollback. Profiles that connect to the same account update the same active set. Omitted launchers become dormant and can be restored by rollback. Linux `x86_64` and `aarch64` are supported. Omit `--architecture` to fetch both. Use manual preview and apply for a first transfer that needs more than the login sync deadline.
 
 ```powershell
 & $ctl fetch-tool-bundle --example '.\Linux essentials.json'
 & $ctl fetch-tool-bundle '.\Linux essentials.json' --architecture x86_64
 & $ctl fetch-tool-bundle --example '.\Linux admin tools.json' --preset admin
 & $ctl fetch-tool-bundle '.\Linux admin tools.json' --architecture x86_64
+& $ctl fetch-tool-bundle --example '.\My Linux tools.json' --tools 'rg,jq,mdd'
+& $ctl fetch-tool-bundle '.\My Linux tools.json'
 ```
 
 Each build in a version-1 manifest can use a `download` object in place of `path`. Set `format` to `raw` for a single executable. For `tar-gz` or `zip`, also set `member` to its path inside the archive and `archive_sha256` to the hash of the complete archive. The build's top-level `sha256` always pins the executable, and the client verifies its Linux ELF architecture before caching it. [Essentials pins](examples/tool-bundles/essentials.json) · [Admin additions](examples/tool-bundles/admin-additions.json)
