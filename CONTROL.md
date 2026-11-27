@@ -1424,6 +1424,8 @@ Installation verifies the uploaded files over SFTP and publishes the version und
 
 Use `preview-tool-bundle-add BUNDLE.json` and `add-to-tool-bundle BUNDLE.json --review TOKEN` to add tools to the named bundle. The review shows the retained executables and checks their hashes. The addition keeps the active bundle's launcher directory and each existing tool's exact binary, including when the input names an existing tool. It uses the manifest's launcher directory when creating a bundle. A new version pauses automatic sync for that bundle so an older profile manifest cannot remove the added tools on reconnect. Use **Bundle versions** to review a rollback or resume automatic updates.
 
+From **Installed SSH tools**, select a command and choose **Review removing** for its bundle. **Remove reviewed SSH tool** activates a release that keeps the other commands and their exact executable pins. The removed command's managed launcher becomes dormant, including when you remove the last tool. Previous releases remain available for rollback, and automatic sync pauses until you resume it. User-owned launcher paths are left in place. Scripts can use `preview-tool-bundle-remove NAME TOOL` and `remove-from-tool-bundle NAME TOOL --review TOKEN`.
+
 ```powershell
 $addition = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-add '.\Extra tools.json' | ConvertFrom-Json).result.sftp
 & $ctl --pid 12345 sftp --pane $pane add-to-tool-bundle '.\Extra tools.json' --review $addition.review
@@ -1466,7 +1468,7 @@ On an ordinary SSH connect or reconnect, w11term checks the verified endpoint an
 
 When the login PATH update is skipped, **Review PATH repair** checks the approved startup files over the current SSH connection. The review shows each file and the current and proposed text for any managed block it would replace. **Apply reviewed PATH repair** validates the review and writes the changes for new shells. Replacement requires one complete marker pair and preserves the text around it. Duplicate or incomplete marker pairs require manual correction.
 
-A manual rollback or addition pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+A manual rollback, addition, or removal pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
 
 ```powershell
 $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-tools $activeSha256 | ConvertFrom-Json).result.sftp

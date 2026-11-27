@@ -29,6 +29,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   apply-tool-bundle BUNDLE.json --review TOKEN\n\
   preview-tool-bundle-add BUNDLE.json\n\
   add-to-tool-bundle BUNDLE.json --review TOKEN\n\
+  preview-tool-bundle-remove NAME TOOL\n\
+  remove-from-tool-bundle NAME TOOL --review TOKEN\n\
   preview-tool-bundle-rollback NAME SHA256\n\
   rollback-tool-bundle NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-resume NAME SHA256\n\
@@ -347,6 +349,17 @@ pub fn parse(
                 .with_context(|| format!("Opening the tool bundle {manifest}"))?;
             fields.insert("bundle".into(), json!(bundle));
         }
+        "preview-tool-bundle-remove" | "remove-from-tool-bundle" => {
+            if command == "remove-from-tool-bundle" {
+                let token = opts
+                    .remove("--review")
+                    .context("Preview the tool removal and supply --review")?;
+                fields.insert("review".into(), json!(normalize_sha256(&token)?));
+            }
+            fields.insert("op".into(), json!("remove-from-tool-bundle"));
+            fields.insert("name".into(), json!(path()?));
+            fields.insert("tool".into(), json!(path()?));
+        }
         "preview-tool-bundle-rollback"
         | "rollback-tool-bundle"
         | "preview-tool-bundle-resume"
@@ -605,6 +618,40 @@ mod tests {
         assert!(matches!(request, Request::Sftp {
             pane: 9, operation: Operation::RollbackToolBundle { review: Some(review), bundle_sha256, .. }, ..
         } if review == token && bundle_sha256 == version));
+    }
+
+    #[test]
+    fn removing_a_tool_requires_a_review_for_one_bundle_and_command() {
+        let (_, preview) =
+            p(&["--pane", "9", "preview-tool-bundle-remove", "fleet", "rg"]).unwrap();
+        assert!(matches!(
+            preview,
+            Request::Sftp {
+                pane: 9,
+                operation: Operation::RemoveFromToolBundle { name, tool, review: None },
+                ..
+            } if name == "fleet" && tool == "rg"
+        ));
+        assert!(p(&["--pane", "9", "remove-from-tool-bundle", "fleet", "rg"]).is_err());
+        let token = "b".repeat(64);
+        let (_, apply) = p(&[
+            "--pane",
+            "9",
+            "remove-from-tool-bundle",
+            "fleet",
+            "rg",
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(
+            apply,
+            Request::Sftp {
+                pane: 9,
+                operation: Operation::RemoveFromToolBundle { name, tool, review: Some(review) },
+                ..
+            } if name == "fleet" && tool == "rg" && review == token
+        ));
     }
 
     #[test]

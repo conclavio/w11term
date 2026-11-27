@@ -10,6 +10,7 @@ mod dotfiles;
 mod download;
 mod private_page;
 mod tool_install;
+mod tool_removal;
 
 pub(super) const LABEL: &str = "Command reference";
 pub(super) const SELECTION: &str = "Look up selected command";
@@ -34,6 +35,7 @@ pub enum Action {
     ToolPage(Arc<()>, usize),
     Private(private_page::Action),
     ToolInstall(tool_install::Action),
+    ToolRemoval(tool_removal::Action),
     Dotfiles(dotfiles::Action),
 }
 
@@ -115,6 +117,7 @@ pub(super) struct Panel {
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
     tool_install: Option<tool_install::Installer>,
+    tool_removal: Option<tool_removal::Panel>,
     dotfiles: Option<dotfiles::Installer>,
 }
 
@@ -142,6 +145,7 @@ impl Panel {
         self.draft = None;
         self.private_page = None;
         self.tool_install = None;
+        self.tool_removal = None;
         self.dotfiles = None;
         if let Some(lookup) = self.tools.take() {
             lookup.cancel.cancel();
@@ -149,7 +153,10 @@ impl Panel {
     }
 
     fn subpanel_open(&self) -> bool {
-        self.private_page.is_some() || self.tool_install.is_some() || self.dotfiles.is_some()
+        self.private_page.is_some()
+            || self.tool_install.is_some()
+            || self.tool_removal.is_some()
+            || self.dotfiles.is_some()
     }
 
     fn set_query(&mut self, text: String) {
@@ -240,6 +247,9 @@ impl Panel {
         }
         if let Some(installer) = &self.tool_install {
             return installer.view(tool_pane, tool_sync, ctx);
+        }
+        if let Some(removal) = &self.tool_removal {
+            return removal.view(tool_pane, ctx);
         }
         if let Some(installer) = &self.dotfiles {
             return installer.view(tool_pane, dotfile_sync, ctx);
@@ -413,6 +423,9 @@ impl Panel {
                 .iter()
                 .filter(|tool| Some(tool.name.as_str()) == command)
             {
+                let bundle = tool.bundle.clone();
+                let name = tool.name.clone();
+                let label = format!("Review removing {name} from {bundle}");
                 pieces.push(KeyedView::new(
                     format!("managed-launcher-{}", tool.bundle),
                     StackPanel::new().spacing(4.0).children((
@@ -421,6 +434,13 @@ impl Panel {
                             .text(&tool.path)
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::CommandReference(Action::ToolRemoval(
+                                    tool_removal::Action::Open(bundle.clone(), name.clone()),
+                                ))
+                            }))
+                            .content(label),
                     )),
                 ));
             }
@@ -891,6 +911,7 @@ impl TerminalApp {
             Action::Refresh => self.start_reference_load(true, ctx),
             Action::Private(action) => panel.author_private_page(action, auto, ctx),
             Action::ToolInstall(action) => self.tool_install_action(action, ctx),
+            Action::ToolRemoval(action) => self.tool_removal_action(action, ctx),
             Action::Dotfiles(action) => self.reference_dotfiles_action(action, ctx),
             Action::ListTools(target) => self.start_tool_lookup(target, ctx),
             Action::ListedTools(request, result) => {

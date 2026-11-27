@@ -2922,7 +2922,7 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
 #[ignore = "looks up offline TLDR and installed SSH tool pages and inserts an edited example without submitting it"]
 async fn native_command_reference_follows_powershell_and_ssh() {
     let transports = Arc::new(AtomicUsize::new(0));
-    let (source, remote, _, server) = fixture_counting_accepts(false, 2, transports.clone()).await;
+    let (source, remote, _, server) = fixture_counting_accepts(false, 3, transports.clone()).await;
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -2965,11 +2965,20 @@ async fn native_command_reference_follows_powershell_and_ssh() {
             .unwrap()
             .ends_with("/portable/current/netwatch\n")
     );
+    let store = remote.path().join(".local/share/w11term/tools/portable");
+    let current = fs::read_to_string(store.join("current")).unwrap();
+    let selected = store.join(current.lines().nth(1).unwrap());
+    assert!(!selected.join("mdd").exists());
+    assert_eq!(
+        fs::read(selected.join("rg")).unwrap(),
+        fs::read(state.path().join("rg")).unwrap()
+    );
+    assert!(remote.path().join(".local/bin/mdd").exists());
     assert_eq!(fs::read(trace).unwrap(), b"ip address");
     assert_eq!(
         transports.load(Ordering::Relaxed),
-        2,
-        "original shell and a new login using the saved tool bundle"
+        3,
+        "original shell and separate logins before and after removing a tool"
     );
     server.abort();
 }

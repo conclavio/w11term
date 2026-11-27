@@ -523,6 +523,7 @@ impl Engine {
             store: store_path,
             id: bundle_sha256,
             manual,
+            configure_launchers: true,
         })
     }
 

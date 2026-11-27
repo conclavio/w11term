@@ -321,6 +321,12 @@ pub enum Operation {
         bundle: UtilityBundle,
         review: Option<String>,
     },
+    RemoveFromToolBundle {
+        name: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     RollbackToolBundle {
         name: String,
         bundle_sha256: String,
@@ -1069,7 +1075,8 @@ pub(crate) async fn run(
                     JobStage::Checking("Dotfiles history lookup did not finish")
                 }
                 Operation::PreviewToolBundle { .. }
-                | Operation::AddToToolBundle { review: None, .. } => {
+                | Operation::AddToToolBundle { review: None, .. }
+                | Operation::RemoveFromToolBundle { review: None, .. } => {
                     JobStage::Checking("Tool bundle preview did not finish")
                 }
                 Operation::InstalledTools => {
@@ -1088,6 +1095,7 @@ pub(crate) async fn run(
                 }
                 Operation::ApplyToolBundle { .. }
                 | Operation::AddToToolBundle { .. }
+                | Operation::RemoveFromToolBundle { .. }
                 | Operation::RollbackToolBundle { .. }
                 | Operation::ResumeToolBundleUpdates { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
@@ -1662,6 +1670,10 @@ impl Engine {
             }
             AddToToolBundle { bundle, review } => {
                 self.add_to_utility_bundle(session, bundle, review.as_deref(), stage)
+                    .await?
+            }
+            RemoveFromToolBundle { name, tool, review } => {
+                self.remove_from_utility_bundle(session, &name, &tool, review.as_deref(), stage)
                     .await?
             }
             RollbackToolBundle {

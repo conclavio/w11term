@@ -52,7 +52,7 @@ impl Release {
         architecture: Option<UtilityArchitecture>,
         id: &str,
     ) -> Result<()> {
-        let valid_tools = (1..=16).contains(&self.tools.len())
+        let valid_tools = self.tools.len() <= 16
             && self
                 .tools
                 .windows(2)
@@ -124,6 +124,7 @@ pub(super) struct InstallPlan {
     pub store: String,
     pub id: Option<String>,
     pub manual: bool,
+    pub configure_launchers: bool,
 }
 
 impl Engine {
@@ -366,6 +367,10 @@ impl Engine {
         let release = self
             .utility_release_manifest(&store, name, None, &id)
             .await?;
+        ensure!(
+            !release.tools.is_empty(),
+            "This active release contains no SSH tools to save"
+        );
         let directory = std::path::absolute(directory)?;
         let staging = tokio::task::spawn_blocking(move || -> Result<_> {
             std::fs::create_dir_all(&directory)?;
@@ -514,6 +519,95 @@ impl Engine {
         Ok(result)
     }
 
+    pub(in crate::sftp) async fn remove_from_utility_bundle(
+        &self,
+        session: &Ssh,
+        name: &str,
+        tool: &str,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        ensure!(valid_command_name(tool), "Invalid tool command name");
+        let (host, home) = tokio::try_join!(probe(session), self.dotfile_home())?;
+        ensure!(
+            home == host.home,
+            "SSH probe and SFTP disagree on the account's home"
+        );
+        let store = managed_tool_store(&home, name)?;
+        let managed = self
+            .utility_directories(&home, &format!("{STORE}/{name}/versions"))
+            .await?;
+        ensure!(
+            managed.create.is_empty() && managed.blocked_at.is_none(),
+            "Managed tool bundle directory was not found"
+        );
+        let selector = self.utility_selector_state(&store, &managed).await?;
+        ensure!(!selector.conflict, "Invalid active tool bundle selector");
+        let active = selector
+            .version
+            .as_deref()
+            .context("No active tool bundle")?;
+        let mut release = self
+            .utility_release_manifest(&store, name, Some(host.architecture), active)
+            .await?;
+        let index = release
+            .tools
+            .iter()
+            .position(|entry| entry.name == tool)
+            .with_context(|| {
+                format!("{tool} is absent from the active bundle. Refresh installed tools.")
+            })?;
+        let removed = release.tools.remove(index);
+        for kept in &release.tools {
+            self.verify_tool_file(&format!("{store}/versions/{active}/{}", kept.name), kept)
+                .await
+                .with_context(|| format!("Verifying retained tool {}", kept.name))?;
+        }
+        let bin = self
+            .utility_directories(&home, &release.bin_directory)
+            .await?;
+        let launcher = under_home(&home, &format!("{}/{tool}", release.bin_directory));
+        let launcher_status = self
+            .utility_launcher(&launcher, &format!("{store}/current/{tool}"), &bin)
+            .await?;
+        let id = release.id()?;
+        let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
+        let report = json!({
+            "operation": "remove-from-tool-bundle",
+            "bundle": name, "bundle_sha256": id, "home": home,
+            "removed": removed, "kept": release.tools,
+            "launcher": launcher, "launcher_status": launcher_status, "current": selector,
+            "ready": atomic, "supports_atomic_replace": atomic,
+            "automatic_sync_paused": true,
+        });
+        let plan = InstallPlan {
+            report,
+            selected: release
+                .tools
+                .iter()
+                .cloned()
+                .map(|tool| (tool, None))
+                .collect(),
+            release,
+            selector,
+            bin,
+            managed,
+            home,
+            store,
+            id: Some(id),
+            manual: true,
+            configure_launchers: false,
+        };
+        let Some(review) = review else {
+            return self.review_utility_plan(plan);
+        };
+        self.check_utility_review(&plan.report, review)?;
+        let mut result = self.activate_utility_plan(session, &plan, stage).await?;
+        result["removed"] = plan.report["removed"].clone();
+        result["automatic_sync_paused"] = json!(true);
+        Ok(result)
+    }
+
     pub(super) async fn activate_utility_plan(
         &self,
         session: &Ssh,
@@ -534,7 +628,9 @@ impl Engine {
         self.check_entry_parent(store).await?;
         with_lock(session, store, async {
             self.check_selector(store, &plan.selector).await?;
-            self.check_launchers(&plan.home, store, &plan.release).await?;
+            if plan.configure_launchers {
+                self.check_launchers(&plan.home, store, &plan.release).await?;
+            }
             let version_path = format!("{store}/versions/{id}");
             let (uploaded, copied_tools) = if self.utility_lstat(&version_path).await?.is_some() {
                 self.verify_utility_release(session, store, &plan.release.name, plan.release.architecture, id).await?;
@@ -543,7 +639,11 @@ impl Engine {
                 let copied = self.stage_utility_release(plan, id).await?;
                 (copied.len() < plan.selected.len(), copied)
             };
-            let launchers = self.create_launchers(&plan.home, store, &plan.release, &plan.bin).await?;
+            let launchers = if plan.configure_launchers {
+                self.create_launchers(&plan.home, store, &plan.release, &plan.bin).await?
+            } else {
+                0
+            };
             let changed = self.switch_utility_selector(store, id, plan.manual, &plan.selector).await?;
             Ok(json!({
                 "bundle": plan.release.name, "bundle_sha256": id, "previous_bundle_sha256": plan.selector.version,

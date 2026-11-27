@@ -359,6 +359,8 @@ Built-in Linux manuals offer **Review installing** for the selected command. Rev
 
 Use **Bundle versions → Save pinned bundle on Windows** to capture the active Linux builds as a verified local manifest. **Review in this SSH profile** opens a review for the authenticated account, ready for approval and saving. [Save an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
+Select a command from **Installed SSH tools** to review removing it. The new release keeps the remaining pins and pauses automatic updates. Use **Bundle versions** to restore the previous release. [Remove a managed tool](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
 **Manage PATH for new shells** reviews Bash or Zsh startup-file changes for the installed bundle. It can append the verified launcher directory after existing entries or remove its managed blocks while preserving the surrounding settings. [Manual PATH management](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
 With profile approval, a connection can sync a bundle before opening the shell. **Manage Bash PATH** or **Manage Zsh PATH** appends the launcher directory after existing entries so tools already on the account's `PATH` keep precedence. The command-reference panel shows the sync result and offers PATH repair or resuming updates after a reviewed rollback. Scripts can also review an addition to an active tool bundle and keep its existing binaries and launcher directory. A new version from an addition pauses login sync until automatic updates are resumed. [Sync approval and PATH behavior](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)

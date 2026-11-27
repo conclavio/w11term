@@ -402,6 +402,44 @@ try {
         ![IO.File]::ReadAllText($selectorPath).TrimEnd().EndsWith("`nversions/$oldId")) {
         throw "Unexpected pinned bundle sync on a new login: $($sync | ConvertTo-Json -Depth 5 -Compress)"
     }
+    Wait-Focus $reconnected
+    Run-Palette 'Command reference'
+    Select-InstalledTool 'mdd'
+    Click 'Review removing mdd from portable'
+    $beforeRemoval = [IO.File]::ReadAllText($selectorPath)
+    $null = Wait-Until 'removal identifies the launcher and retained rg pin' {
+        $labels = Get-NativeTextLabels
+        $apply = Find-Element 'Remove reviewed SSH tool' $button
+        (Find-Element 'Remove mdd from portable') -and
+            ($labels | Where-Object { $_.StartsWith("Managed launcher becomes inactive`n/.local/bin/mdd") }) -and
+            ($labels | Where-Object { $_.StartsWith("Keep rg`nSHA-256 ") }) -and $apply -and $apply.Current.IsEnabled
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne $beforeRemoval) { throw 'Review changed the active release' }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot remove the reviewed tool' {
+        $apply = Find-Element 'Remove reviewed SSH tool' $button
+        $apply -and !$apply.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$reconnected")
+    Wait-Focus $reconnected
+    Click 'Remove reviewed SSH tool'
+    $null = Wait-Until 'mdd is removed from the active release and bundle updates are paused' {
+        (Find-Element 'Removed mdd from portable') -and
+            [IO.File]::ReadAllText($selectorPath).TrimEnd().Split("`n")[-1].StartsWith('./versions/')
+    }
+    Click 'Back to command reference'
+    Select-InstalledTool 'rg'
+    $null = Wait-Until 'rg remains available after the removal' { Find-Element '/.local/bin/rg' }
+    Click 'Close command reference'
+    $afterRemoval = [IO.File]::ReadAllText($selectorPath)
+    $nextLogin = (Control @('open','--profile','palette-ssh','--activate')).pane
+    Wait-Text $nextLogin 'tools-at-shell:'
+    $sync = (Control @('events','--pane',"$nextLogin",'--kind','tool-bundle-sync')).journal.events
+    if ($sync.Count -ne 1 -or $sync[0].data.status -cne 'held' -or
+        [IO.File]::ReadAllText($selectorPath) -cne $afterRemoval) {
+        throw "Login must preserve the removal even when the saved profile still includes mdd: $($sync | ConvertTo-Json -Depth 5 -Compress)"
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
