@@ -86,7 +86,9 @@ def smoke():
                 wait_for_file(abandoned / "capture.pcap")
                 blocked = subprocess.run(run("capture", root, port, mount=mount_id, job=uuid.uuid4().hex),
                                          input=b"", capture_output=True, timeout=4)
-                assert blocked.returncode != 0 and b"already active" in blocked.stderr
+                assert blocked.returncode != 0 and b"already active" in blocked.stderr, (
+                    blocked.returncode, blocked.stdout, blocked.stderr, capture.poll(),
+                )
                 out, err = capture.communicate(b"", timeout=5)
                 assert capture.returncode != 0 and not out, (out, err)
                 assert not abandoned.exists()
