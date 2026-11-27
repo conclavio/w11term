@@ -298,6 +298,37 @@ try {
         (Find-Element "Deleted retained release${dot}$bytes bytes") -and
             !(Test-Path -LiteralPath $discardedDir) -and [IO.File]::ReadAllText($selectorPath) -ceq $held
     }
+    Click 'Back to tool installer'
+    $null = Wait-Until 'original pinned manifest offered' { Find-Element (Join-Path $State 'fleet.json') }
+    $installedRg = Join-Path (Split-Path -Parent $selectorPath) "versions/$oldId/rg"
+    $originalRg = [IO.File]::ReadAllBytes($installedRg)
+    $damagedRg = [byte[]]$originalRg.Clone()
+    $damagedRg[-1] = $damagedRg[-1] -bxor 255
+    [IO.File]::WriteAllBytes($installedRg, $damagedRg)
+    Click 'Review bundle'
+    $null = Wait-Until 'repair review offers the exact pinned build' {
+        (Get-NativeTextLabels | Where-Object {
+            $_.StartsWith("Replace changed executable${dot}rg") -and $_.Contains("Pinned SHA-256 $oldPin")
+        }) -and (Find-Element 'Automatic sync stays paused for this bundle.')
+    }
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($installedRg)) -cne [Convert]::ToBase64String($damagedRg)) {
+        throw 'Review replaced the executable before approval'
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot confirm executable repair' {
+        $repair = Find-Element 'Repair from reviewed bundle' $button
+        $repair -and !$repair.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Repair from reviewed bundle'
+    $null = Wait-Until 'repair restored the exact bytes and kept the active selector paused' {
+        (Get-NativeTextLabels | Where-Object { $_.StartsWith("Repaired tool bundle portable${dot}rg") }) -and
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($installedRg)) -ceq [Convert]::ToBase64String($originalRg) -and
+            [IO.File]::ReadAllText($selectorPath) -ceq $held
+    }
+    Click 'Bundle versions'
     Select-ToolVersion $oldId "${dot}Active${dot}Updates paused"
     $beforeSave = [IO.File]::ReadAllText($profiles)
     $snapshotRoot = Join-Path $State 'tool-bundle-snapshots'

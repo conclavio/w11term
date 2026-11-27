@@ -359,6 +359,8 @@ Built-in Linux manuals offer **Review installing** for the selected command. Rev
 
 Use **Bundle versions → Save pinned bundle on Windows** to capture the active Linux builds as a verified local manifest. **Review in this SSH profile** opens a review for the authenticated account, ready for approval and saving. [Save an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
+Use that saved manifest or the original bundle to repair missing or damaged executables. The reviewed install identifies the affected commands and restores their exact pinned builds. [Repair an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
 Select a command from **Installed SSH tools** to review removing it. The new release keeps the remaining pins and pauses automatic updates. Use **Bundle versions** to restore the previous release. [Remove a managed tool](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
 In **Bundle versions**, review and permanently delete an inactive release to reclaim space on the SSH host. The review shows the file names and their total size before confirmation. [Delete an inactive release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
