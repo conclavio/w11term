@@ -66,7 +66,16 @@ def verify_ring_writer():
         assert proc.returncode != 0 and not proc.stdout and b"incomplete packet" in proc.stderr
 
 
-def live_ring(root, port, mount):
+def first_ring_packet(path):
+    try:
+        with path.open("rb") as source:
+            packet = re.search(rb"fixture-ring-(\d{7})", source.read(24 + 16 + 192))
+    except FileNotFoundError:
+        return None
+    return int(packet[1]) if packet else None
+
+
+def live_ring(root, port, mount, *, stop_early=False):
     job = uuid.uuid4().hex
     work = root / f"w11term-pcap-{job}"
     done = threading.Event()
@@ -80,16 +89,29 @@ def live_ring(root, port, mount):
                 index += 1
 
     traffic = threading.Thread(target=send, daemon=True)
+    limit = 0 if stop_early else 6500
     with subprocess.Popen(run("capture", root, port, mount=mount, job=job,
-                              slots=2, count=6500, seconds=20),
+                              slots=2, count=limit, seconds=30),
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE) as capture:
         traffic.start()
         try:
+            if stop_early:
+                deadline = time.monotonic() + 14
+                while True:
+                    first = first_ring_packet(work / "segment-0.pcap")
+                    second = first_ring_packet(work / "segment-1.pcap")
+                    if first is not None and second is not None and first > second:
+                        break
+                    assert time.monotonic() < deadline, "the rolling capture did not wrap before Stop"
+                    time.sleep(0.01)
+                capture.stdin.write(b"stop\n")
+                capture.stdin.flush()
             marker, reason, metadata = line(capture).split("\t")
-            assert (marker, reason) == ("w11term-packet-ring-v1", "packets")
+            assert (marker, reason) == ("w11term-packet-ring-v1", "stopped" if stop_early else "packets")
             manifest = json.loads(metadata)
-            assert manifest["packets"] == 6500
+            if not stop_early:
+                assert manifest["packets"] == limit
             segments = manifest["segments"]
             assert len(segments) == 2
             assert segments[0]["sequence"] > 0
@@ -105,7 +127,7 @@ def live_ring(root, port, mount):
                 decoded = subprocess.run(["tcpdump", "-n", "-r", path, "-A"],
                                          capture_output=True, check=True, timeout=5)
                 packet_ids.extend(map(int, re.findall(rb"fixture-ring-(\d{7})", decoded.stdout)))
-            assert 0 < len(packet_ids) < 6500
+            assert 0 < len(packet_ids) < manifest["packets"]
             assert all(a < b for a, b in zip(packet_ids, packet_ids[1:]))
             out, err = capture.communicate(b"verified\n", timeout=5)
             assert capture.returncode == 0 and out == b"w11term-packet-complete-v1\n", (out, err)
@@ -231,7 +253,9 @@ def smoke():
                                  capture_output=True, timeout=5)
             assert low.returncode != 0 and b"cannot meet the capture budget" in low.stderr
             live_ring(root, port, mount_id)
+            live_ring(root, port, mount_id, stop_early=True)
             print("Real tcpdump rolled and reopened the retained packet files in capture order within 1 MiB.")
+            print("Real tcpdump stopped and finalized a wrapped buffer without a packet limit.")
             print("Real tcpdump passed packet and time limits, early stop, late stop acknowledgement, and disconnect cleanup.")
 
 
